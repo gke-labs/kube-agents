@@ -167,7 +167,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
 
    It prints `next`. An empty line means `today`, and nothing below applies.
 
-2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and, once a chat backend is configured, the A2A gateway. A first boot can take over fifteen minutes.
+2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and the A2A gateway, which every `next` install runs (on the console door alone when no chat backend is configured). A first boot can take over fifteen minutes.
 
    ```bash
    kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=25m
@@ -190,7 +190,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
    | `BusProvisioned`      | `True` | `ProvisionJobComplete` |
    | `BusCredentialsReady` | `True` | `CalloutServing`       |
 
-   `A2AGateway` and `A2AVerifier` appear only when something needs a look. `A2AGateway` `False` with `NoChatBackend` means no chat backend is enabled, so the operator runs no A2A gateway, and the install still reaches `Ready` with a message saying so; with `WaitingForReplica` a backend has come back and the gateway's replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
+   `A2AGateway` and `A2AVerifier` appear only when something needs a look. With no chat backend enabled the A2A gateway runs on the console door alone. `A2AGateway` `False` with `WaitingForReplica` appears only after an upgrade from an operator that ran no A2A gateway without a chat backend: the gateway is back at one replica, and that replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
 
 4. **List the A2A pods.** Every pod the A2A stack runs carries the label `app.kubernetes.io/part-of=a2a-next`, so this lists them apart from step 4's pods:
 
@@ -236,6 +236,10 @@ The installer collected your answers, wrote `install.env` and `terraform.tfvars`
 When adopting an existing cluster, four settings stay `gcloud` pre-steps because a Terraform data source cannot express them: CMEK database encryption, Workload Identity pool enablement, node-pool migration to `GKE_METADATA` (requires `--migrate-node-pools`), and legacy Calico NetworkPolicy enforcement (requires `--enable-network-policy`; `--accept-no-network-policy` installs without it instead and changes nothing on the cluster). On freshly created clusters, setting the managed OpenTelemetry collection scope stays a `gcloud` post-step (no provider field exists). The one-shot GitHub App key import into KMS also runs outside Terraform, so the PEM never enters state.
 
 Changing your mind later is the same engine: running the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) opens a Day-2 control panel whose **Save & Apply** regenerates `terraform.tfvars` and re-applies.
+
+## Verify and explore your install
+
+Once `Ready` holds, in either mode, check the install by talking to it. [First prompts](/kube-agents/install/first-prompts/) gives the one message to send first, what a healthy answer contains and how long it took on a measured run, what the first message also brings with it, and five things to ask next.
 
 ## Common flags and toggles
 

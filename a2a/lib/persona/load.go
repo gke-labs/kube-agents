@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
@@ -39,7 +41,9 @@ var (
 	// tool mcp__<server>__<tool>.
 	serverRE  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9_]{0,30}[a-z0-9])?$`)
 	mcpToolRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
-	paramRE   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+	// paramRE is lib's, so a name a persona declares is one a submission
+	// can carry (lib.TaskParameters).
+	paramRE   = lib.TaskParameterNameRE
 	harnessRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 	commandRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
 	// importRE is anything a Claude Code @-import could be: an "@" anywhere,

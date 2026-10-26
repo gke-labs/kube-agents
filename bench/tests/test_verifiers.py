@@ -56,6 +56,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
+    WorkerBudgetVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     PullRequestOpenedVerifier,
@@ -1377,6 +1378,52 @@ def test_worker_commands_after_result_a_partial_capture_is_error_unless_a_hit_wa
     assert required.verify(5.0).status == "fail"
 
 
+# A required-only check that sets the switch to read the calls as typed
+# (``after_result_pattern: "(?!)"``, as the collector cases do) is not the
+# ordered retry check: a gap beside a found run, an untimed call, and a
+# command the log shows but the trajectory missed must not turn its pass
+# into an error or a fail (#3128, #3831 review).
+_AS_TYPED_RUN = WorkerCommandsVerifier(
+    type="worker_commands", after_result_pattern="(?!)", required_runs=[{"script": "collect.py", "word_patterns": ["^ai-security-audit$"]}]
+)
+_COLLECT = "mkdir -p /opt/data/scratch && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+
+
+def test_worker_commands_as_typed_a_gap_beside_a_found_run_is_a_pass():
+    transcript.set("ok", _TRAJECTORY + [_terminal(_COLLECT, at=1)], worker_commands=[{"task": "t_1", "command": "mkdir -p /opt/data/scratch + 1 command"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    # No window was used, so the reason names none.
+    assert "opened the window" not in res.reason and "forbidden pattern(s) graded nothing" not in res.reason
+    # A run missing from a gapped capture may be in the unread part: still an
+    # error, and the reason names the run, not a forbidden pattern.
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls", at=1)], worker_commands=[{"task": "t_1", "command": "ls"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason and "run collect.py" in res.reason and "forbidden" not in res.reason
+    # The ordered check keeps its rule: a clean read with a gap is an error.
+    transcript.set("ok", _TRAJECTORY + [_terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=1)], worker_capture_gaps=["card t_9: locked"])
+    assert _RETRY.verify(5.0).status == "error"
+
+
+def test_worker_commands_as_typed_an_untimed_call_is_graded():
+    _stash_terminal([_terminal(_COLLECT, at=None)])
+    assert _AS_TYPED_RUN.verify(5.0).status == "pass"
+
+
+def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_still_counts():
+    # The #2959 shape: the session-store read returned a strict subset of
+    # the card's calls with no gap recorded; the log row carries the run.
+    one_line = "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)], worker_commands=[{"task": "t_1", "command": one_line}], worker_capture_gaps=[])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "2 worker command(s) (1 tagged calls as typed and 1 from the card log)" in res.reason
+    # A row that renders the same text as a call is not counted twice.
+    transcript.set("ok", _TRAJECTORY + [_terminal(one_line, at=1)], worker_commands=[{"task": "t_1", "command": one_line}])
+    assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason
+
+
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():
     raw = {"raw": '{"command": "kubectl apply -f /tmp/dns.yaml \\u1'}
     _stash_terminal(
@@ -1547,6 +1594,209 @@ def test_worker_agents_missing_profile_with_capture_gaps_is_error_not_fail():
     assert res.status == "error"
     assert not res.success
     assert gap in res.reason
+
+
+# ------------------------------------------------------------ worker_budget
+
+
+def _exhausted(used: int, cap: int) -> str:
+    return f"Iteration budget exhausted ({used}/{cap}) — task could not complete within the allowed iterations"
+
+
+def _notice(used: int, cap: int) -> str:
+    return (f"turn-{used}\n\n[SYSTEM NOTICE — iteration budget checkpoint] You have used {used} of {cap} "
+            "iterations. Checkpoint durable progress now, then continue the task; do not stop solely because of this warning.")
+
+
+def _stash_runs(runs, *, calls: int = 3, gaps=None, notice: str | None = None) -> None:
+    worker = [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * calls
+    if notice is not None:
+        worker = worker + [{"name": "terminal", "args": {}, "result": notice, "agent": "platform", "task": "t_1"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_runs=runs, worker_capture_gaps=gaps)
+
+
+def _budget(budget: int = 90) -> WorkerBudgetVerifier:
+    return WorkerBudgetVerifier(type="worker_budget", budget=budget)
+
+
+def test_worker_budget_passes_when_a_worker_ran_out_of_the_declared_budget():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(90, 90)}], calls=91)
+    res = _budget(90).verify(5.0)
+    assert res.success, res.reason
+    assert "t_1 exhausted 90/90" in res.reason
+
+
+def test_worker_budget_passes_on_the_checkpoint_notice_when_the_worker_stopped_at_it():
+    # The worker heeded Hermes' 90% notice and completed its card short of the
+    # wall: no exhaustion record, but the notice names the cap in force.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=137, notice=_notice(135, 150))
+    res = _budget(150).verify(5.0)
+    assert res.success, res.reason
+    assert "t_1 checkpoint 135/150" in res.reason
+
+
+def test_worker_budget_fails_when_the_checkpoint_notice_names_another_cap():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=230, notice=_notice(225, 250))
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "250-turn budget, not 150" in res.reason
+
+
+def test_worker_budget_ignores_a_notice_another_session_quoted_in_a_search_result():
+    # session_search returns other transcripts' text inside a JSON string: the
+    # seam before the notice is an escaped newline there, not a paragraph break.
+    quoted = '{"results": [{"snippet": "turn-224\\n\\n[SYSTEM NOTICE — iteration budget checkpoint] You have used 225 of 250 iterations."}]}'
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=40, notice=quoted)
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
+
+
+def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
+    # The pod's redactor failed to load, so every result is the withheld marker:
+    # the notice may have been there. Nothing named plus a completed attempt is
+    # an error here, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
+def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
+    # A worker killed mid-call leaves one call with no result row; the notice
+    # would have landed on one of the other 200 readable results, so the plain
+    # failure (the regression the case exists for) stands.
+    worker = ([{"name": "terminal", "args": {}, "result": None, "agent": "platform", "task": "t_1"}]
+              + [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * 200)
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+                                {"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
+
+
+def test_worker_budget_withheld_results_do_not_mask_an_exhaustion_row():
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 151
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(150, 150)}])
+    assert _budget(150).verify(5.0).success
+
+
+def test_worker_budget_reads_both_the_notice_and_the_exhaustion():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(150, 150)}], calls=151, notice=_notice(135, 150))
+    res = _budget(150).verify(5.0)
+    assert res.success, res.reason
+    assert "exhausted 150/150" in res.reason and "checkpoint 135/150" in res.reason
+
+
+def test_worker_budget_fails_when_the_cap_in_force_was_another_number():
+    # The red this check exists for: the profile's 250 reached the worker.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(250, 250)}])
+    res = _budget(90).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "250-turn budget, not 90" in res.reason and "exhausted 250/250" in res.reason
+
+
+def test_worker_budget_fails_when_no_worker_ran_out_and_names_the_calls():
+    # The card finished inside a larger cap: nothing recorded a number, which
+    # is the other way the cap in force can be larger than the declared one.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed",
+                  "error": None}], calls=120)
+    res = _budget(90).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "t_1: 120 call(s)" in res.reason
+    assert "t_1=completed" in res.reason
+
+
+def test_worker_budget_a_card_archived_at_the_ceiling_is_error_not_fail():
+    # The harness archives a card still running at its delegation ceiling,
+    # which closes the attempt ``reclaimed``: nothing recorded a cap, so this
+    # is not evidence that the cap was wrong.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "reclaimed", "outcome": "reclaimed",
+                  "error": "archived by the bench"}], calls=40)
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "none finished its card" in res.reason and "t_1=reclaimed" in res.reason
+
+
+def test_worker_budget_an_open_or_crashed_attempt_is_error_not_fail():
+    for outcome in (None, "crashed"):
+        _stash_runs([{"task": "t_1", "profile": "platform", "status": outcome or "running", "outcome": outcome, "error": None}])
+        assert _budget(90).verify(5.0).status == "error", outcome
+
+
+def test_worker_budget_no_run_rows_at_all_is_error_not_fail():
+    _stash_runs([], calls=0)
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "no run rows" in res.reason
+
+
+def test_worker_budget_a_reclaimed_attempt_does_not_mask_an_exhausted_one():
+    _stash_runs([
+        {"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(90, 90)},
+        {"task": "t_1", "profile": "platform", "status": "reclaimed", "outcome": "reclaimed", "error": None},
+    ])
+    assert _budget(90).verify(5.0).success
+
+
+def test_worker_budget_no_exhaustion_on_an_incomplete_capture_is_error_not_fail():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed",
+                  "error": None}], gaps=["card t_9: locked"])
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason
+
+
+def test_worker_budget_gaps_do_not_mask_an_exhaustion():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(90, 90)}], gaps=["card t_9: locked"])
+    assert _budget(90).verify(5.0).success
+
+
+def test_worker_budget_reads_a_retry_that_ran_out_after_a_first_attempt_that_crashed():
+    _stash_runs([
+        {"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+        {"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(88, 90)},
+    ])
+    res = _budget(90).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_budget_is_error_without_a_stash_or_without_run_rows():
+    assert _budget(90).verify(5.0).status == "error"
+    transcript.set("ok", _TRAJECTORY)  # a run that delegated nothing, or whose board was unread
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "no delegated card's run rows" in res.reason
+
+
+def test_worker_budget_must_name_a_positive_budget():
+    with pytest.raises(ValidationError):
+        WorkerBudgetVerifier(type="worker_budget", budget=0)
+    with pytest.raises(ValidationError):
+        WorkerBudgetVerifier(type="worker_budget")
+
+
+def test_worker_budget_is_published_and_registered():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert eps["worker_budget"] == "kube_agents_bench.verifiers:WorkerBudgetVerifier"
+    assert isinstance(parse_node({"type": "worker_budget", "budget": 90}), WorkerBudgetVerifier)
 
 
 def test_worker_agents_gaps_do_not_mask_a_match():
@@ -3926,6 +4176,18 @@ def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
     assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
 
 
+def test_every_finding_named_does_not_grade_a_not_rechecked_id(token, github):
+    # The note and id-only tiers of the held span show no row for a previous
+    # finding on a target the run did not check; the span lists its id.
+    _stash_report()
+    held = (
+        "\n<!-- audit-held:begin -->\n<!-- audit-held-ids: [] -->\n"
+        f'<!-- audit-not-rechecked-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    )
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
 def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
     _stash_report()
     body = _ledger_body(
@@ -4178,7 +4440,7 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
         / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
     )
     ids = set(re.findall(r'^ {4}"([a-z0-9-]+)": AuditSpec\($', script.read_text(), re.M))
-    assert len(ids) == 9, ids  # the parse itself must not silently find nothing
+    assert len(ids) == 10, ids  # the parse itself must not silently find nothing
     assert ids == set(verifiers.LEDGER_AUDIT_IDS)
     literal = LedgerIssueContainsVerifier.model_fields["audit"].annotation
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
@@ -4197,6 +4459,21 @@ def test_the_complete_block_regex_reads_what_audit_report_writes():
     body = _ledger_body() + template.replace("{payload}", payload) + "\n"
     parsed = verifiers._finding_ids(body)
     assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
+def test_the_not_rechecked_regex_reads_what_audit_report_writes():
+    """_NOT_RECHECKED_IDS_RE copies the list that audit_report's held span writes.
+    Build that list from the script's own name and template, so a change on that
+    side fails here and not as a grade on a not-re-checked id."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    ).read_text()
+    (name,) = re.findall(r'^NOT_RECHECKED_IDS_COMMENT = "([^"]+)"$', source, re.M)
+    assert 'f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"' in source
+    comment = f"<!-- {name}: {json.dumps(['a.b.c.d', 'e.f.g.h'])} -->"
+    (payload,) = verifiers._NOT_RECHECKED_IDS_RE.findall(comment)
+    assert json.loads(payload) == ["a.b.c.d", "e.f.g.h"]
 
 
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
@@ -4403,6 +4680,68 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     _pr_head_routes(github, changed_files=1)
     github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
+# ---- removed_paths: a delete is the removal of the declaring manifest
+
+_NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
+_REMOVED = [f"{_NS_DIR}/namespace.yaml", f"{_NS_DIR}/configmap.yaml", f"{_NS_DIR}/kustomization.yaml"]
+
+
+def test_a_pull_request_that_removes_every_declaring_file_passes(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_pull_request_that_leaves_one_declaring_file_is_a_fail(token, github):
+    """The kustomization.yaml left behind recreates the namespace."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=2)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED[:2]))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "fail"
+    assert _REMOVED[2] in res.reason and "removed_paths" in res.reason
+
+
+def test_a_marker_or_an_edit_is_not_a_removal(token, github):
+    """Adding a "delete" marker or annotating the manifest in place changes a
+    file and passes every other clause; neither removes the declaration."""
+    for entry in (
+        {"filename": f"{_NS_DIR}/delete-me.yaml", "status": "added"},
+        {"filename": f"{_NS_DIR}/namespace.yaml", "status": "modified"},
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=1)
+        _pr_files_route(github, entry)
+        assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail", entry
+        assert _pr_check().verify(5.0).status == "pass", entry
+
+
+def test_a_rename_is_not_a_removal(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {"filename": "attic/namespace.yaml", "previous_filename": f"{_NS_DIR}/namespace.yaml", "status": "renamed"},
+    )
+    assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail"
+
+
+def test_removed_paths_unreadable_files_are_unevaluable(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
 
@@ -5637,6 +5976,34 @@ def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, git
     res = _pr_check().verify(5.0)
     assert res.status == "error" and not res.success, res.reason
     assert names in res.reason and "commits page" in res.reason, res.reason
+
+
+@pytest.mark.parametrize(
+    "status, body, says",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "needs `pull_requests: read`"),
+    ],
+)
+def test_a_refused_credential_is_named_as_the_one_the_request_carried(
+    token, github, monkeypatch, tmp_path, status, body, says
+):
+    """After a renewal BENCH_GITHUB_TOKEN_FILE and BENCH_GITHUB_TOKEN hold
+    different tokens and the request carries the file's, so a 401 or 403 that
+    blamed the variable sent the reader to a token nobody sent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert f"the token in BENCH_GITHUB_TOKEN {says}" in res.reason, res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error", res.reason
+    assert f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file}) {says}" in res.reason, res.reason
+    assert "in BENCH_GITHUB_TOKEN " not in res.reason, res.reason
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
@@ -8556,6 +8923,213 @@ def test_worker_commands_required_run_names_what_did_not_run():
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
 
 
+# ------------------------------- the retrospective's drained-budget case's line
+#
+# The budget's declared line, read out of its task file: the planted object under
+# catalogue entry 1. An aside after the number is tolerated (the fold strips
+# closers, not words); another entry number fails the objective as the wrong
+# entry; a second number or a hedge after the right one fails it too. Same fold
+# and grounding as the webhook case.
+
+_BUDGET_CASE = TASKS / "upgrades-retrospective-drained-budget" / "task.yaml"
+_BUDGET_SPEC = yaml.safe_load(_BUDGET_CASE.read_text(encoding="utf-8"))
+_BUDGET_OBJECTIVE = "slot-b-budget-is-catalogue-entry-1"
+_BUDGET_LINE = "seeded-b/seeded-upgrade/PodDisruptionBudget/pinned-batch-runner: entry 1"
+_BUDGET_REPORT_LINE = "Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
+_BUDGET_OTHER_LINE = "seeded-b/seeded-upgrade/Deployment/pinned-batch-runner: entry 1"
+
+
+def _budget_case_verdict(text: str):
+    check = next(e["check"] for e in _BUDGET_SPEC["verification_spec"] if e["name"] == _BUDGET_OBJECTIVE)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="budget-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_BUDGET_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _BUDGET_LINE,
+        _BUDGET_LINE + ".",
+        # an aside after the number: a parenthetical (its closer folded off), a clause
+        _BUDGET_LINE + " (the budget forbids the eviction)",
+        _BUDGET_LINE + " (maxUnavailable 0)",
+        _BUDGET_LINE + ", the drain stalled on it for 40 minutes",
+        _BUDGET_LINE + " \u2014 fix: give the budget room before the next upgrade",
+        # the line among others
+        _BUDGET_REPORT_LINE + "\n\n" + _BUDGET_LINE + "\n" + _BUDGET_OTHER_LINE + "\n",
+    ],
+)
+def test_drained_budget_declared_line_accepted(text):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "pass", (verdict.reason, text)
+
+
+@pytest.mark.parametrize(
+    "text, forbidden",
+    [
+        # another entry number, with or without an aside: the forbid names the wrong entry
+        (_BUDGET_LINE[:-1] + "7", True),
+        (_BUDGET_LINE[:-1] + "11", True),
+        (_BUDGET_LINE[:-1] + "7 (the budget forbids the eviction)", True),
+        # the right number kept open: a second number, a `/`-joined alternative, a hedge
+        (_BUDGET_LINE + " or 7", True),
+        (_BUDGET_LINE + " or entry 7", True),
+        (_BUDGET_LINE + "/7", True),
+        (_BUDGET_LINE + "?", True),
+        (_BUDGET_LINE + " (possibly 11)", True),
+        (_BUDGET_LINE + ", tentatively", True),
+        # no line for the budget: the objective's miss alone, no forbid
+        (_BUDGET_REPORT_LINE + "\n" + _BUDGET_OTHER_LINE, False),
+    ],
+)
+def test_drained_budget_declared_line_refused(text, forbidden):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "fail", text
+    assert ("forbidden patterns matched" in verdict.reason) is forbidden, (verdict.reason, text)
+
+
+# ------------------------------- the retrospective cases' route and report-file checks
+#
+# The route: the worker reached the retrospective's store, its collector, or the
+# job's chat record (`chat_report_upgrade-retrospective.json`, the fleet-audit
+# skill's record of the last run's report), in its terminal or with `read_file`.
+# The objective is an `any` of the two reads because the harness records them
+# apart: `worker_commands` sees terminal commands, `tool_called` the tagged
+# `read_file` call. The command and read sets are the dev install's: the green
+# on-demand runs read the chat record in the terminal and, on 2026-10-21, with
+# `read_file` alone; a drained-budget run ran the collector; the reds answered
+# from the readiness tooling or from the scratch manifest and findings files,
+# which are not admitted (the cases' headers say why).
+
+_ON_DEMAND_CASE = TASKS / "upgrades-retrospective-on-demand" / "task.yaml"
+_ON_DEMAND_SPEC = yaml.safe_load(_ON_DEMAND_CASE.read_text(encoding="utf-8"))
+_ROUTE_OBJECTIVE = "the-answer-comes-from-the-retrospective"
+_REPORT_FILE_OBJECTIVE = "the-reply-names-the-report-file"
+_ON_DEMAND_GREEN_COMMANDS = [
+    "ls -la /opt/data/state/fleet-upgrade-verification/",
+    "ls -la /opt/data/scratch/",
+    "cat /opt/data/scratch/chat_report_upgrade-retrospective.json",
+    "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json",
+    "cat /opt/data/scratch/chat_manifest_api_deprecations.json",
+]
+_COLLECTOR_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --probe-lock",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json",
+]
+_READINESS_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness",
+    "cat /opt/data/state/fleet-upgrade-verification/channel-default.json",
+    "kubectl get pdb -A",
+]
+# The 2026-10-21 drained-budget reds: the harness manifest and the ledger document.
+_SCRATCH_FILE_COMMANDS = [
+    "find /opt/data/scratch -iname '*retrospective*' -o -iname '*report*' -o -iname '*upgrade*' 2>/dev/null",
+    "cat /opt/data/scratch/findings_upgrade-retrospective.json",
+    "cat /opt/data/scratch/manifest_upgrade-retrospective.json | grep -E 'check\": \"(upgrade-broke-workload)' -A 10",
+]
+_CHAT_RECORD_PATH = "/opt/data/scratch/chat_report_upgrade-retrospective.json"
+_SAVED_REPORT_PATH = "/opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
+_DATED_REPORT_JSON_PATH = "/opt/data/upgrade-retrospective/reports/20261021T100016Z.json"
+_FINDINGS_PATH = "/opt/data/scratch/findings_upgrade-retrospective.json"
+_MANIFEST_PATH = "/opt/data/scratch/manifest_upgrade-retrospective.json"
+_COLLECTOR_SOURCE_PATH = "/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py"
+_RETROSPECTIVE_CASES = ["upgrades-retrospective-on-demand", "upgrades-retrospective-drained-budget"]
+
+
+def _route_entry(case: str) -> VerificationEntry:
+    """The route objective as the runner evaluates it: an `any` compound has no
+    `verify` of its own, so the entry goes through `VerifierAgent.run_entry`."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    return VerificationEntry.model_validate(next(e for e in spec["verification_spec"] if e["name"] == _ROUTE_OBJECTIVE))
+
+
+def _worker_read(path: str, status: str = "completed") -> dict:
+    """A platform worker's `read_file` call, tagged as the capture tags it."""
+    return {
+        "name": "read_file",
+        "args": {"offset": 1, "limit": 2000, "path": path},
+        "result": '{"content": "1|..."}',
+        "status": status,
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+        "at": 10.0,
+    }
+
+
+def _stash_route(commands: list[str], reads: list[dict]) -> None:
+    """The route's two records: the card's terminal commands and the worker's tagged
+    calls. A tagged `kanban_complete` shows the capture ran, as every worker's does."""
+    done = {"name": "kanban_complete", "args": {}, "result": "ok", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 20.0}
+    transcript.set("ok", _TRAJECTORY + reads + [done], worker_commands=[{"task": "t_1", "command": c} for c in commands])
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+@pytest.mark.parametrize(
+    "commands, reads, status",
+    [
+        # the terminal: the chat record, the collector, the store
+        (_ON_DEMAND_GREEN_COMMANDS, [], "pass"),
+        (_COLLECTOR_COMMANDS, [], "pass"),
+        (["ls -l /opt/data/upgrade-retrospective/reports/", "readlink /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], [], "pass"),
+        # the same sources with read_file and no terminal command that names them
+        ([], [_worker_read(_CHAT_RECORD_PATH)], "pass"),
+        (["find /opt/data -type f -name '*retrospective*.json'"], [_worker_read(_CHAT_RECORD_PATH), _worker_read(_MANIFEST_PATH)], "pass"),
+        ([], [_worker_read(_SAVED_REPORT_PATH)], "pass"),
+        ([], [_worker_read(_DATED_REPORT_JSON_PATH)], "pass"),
+        # not the retrospective: the readiness tooling, another stream's record, the
+        # scratch manifest and findings files, a read that failed, the collector's source
+        (_READINESS_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/", "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json"], [], "fail"),
+        (_SCRATCH_FILE_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/"], [_worker_read(_FINDINGS_PATH), _worker_read(_MANIFEST_PATH)], "fail"),
+        ([], [_worker_read(_CHAT_RECORD_PATH, status="error")], "fail"),
+        ([], [_worker_read(_COLLECTOR_SOURCE_PATH)], "fail"),
+    ],
+)
+def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(case, commands, reads, status):
+    _stash_route(commands, reads)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == status, (case, commands, reads, verdict.reason)
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+def test_retrospective_route_with_no_tagged_worker_call_is_an_error_not_a_fail(case):
+    # Card log lines with no tagged call: the terminal leaf grades the lines and fails,
+    # the read_file leaf cannot observe its subject, and the `any` reports the unknown
+    # rather than a fail, as `worker_commands` itself does on an absent capture.
+    _stash_commands(_READINESS_COMMANDS)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == "error", verdict.reason
+
+
+@pytest.mark.parametrize(
+    "final_message, passes",
+    [
+        ("Checking the upgrade retrospective. Report: /opt/data/scratch/chat_report_upgrade-retrospective.json", True),
+        # the latest link where the collector writes it, and the root spelling the SOP once gave
+        ("Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md (produced 2026-10-21T10:00Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md (produced 2026-10-20T20:45Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z.md", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z-scoped.md", True),
+        ("The fleet upgrade report file is located at: /opt/data/state/fleet-upgrade-verification/channel-default.json", False),
+        ("Report: /opt/data/scratch/chat_manifest_fleet_upgrade.json", False),
+        # the 2026-10-21 reds: the ledger document and the harness manifest are not the report
+        ("Answered from:\n`/opt/data/scratch/findings_upgrade-retrospective.json`", False),
+        ("**/opt/data/scratch/manifest_upgrade-retrospective.json**", False),
+        ("Source: /opt/data/scratch/run_upgrade-retrospective.json", False),
+    ],
+)
+def test_retrospective_reply_names_the_report_or_the_chat_record(final_message, passes):
+    check = next(e["check"] for e in _ON_DEMAND_SPEC["verification_spec"] if e["name"] == _REPORT_FILE_OBJECTIVE)
+    transcript.set(final_message, [], final_message=final_message)
+    assert parse_node(check).verify(1.0).success is passes, final_message
+
+
 # The readiness case for the same catalogue entry grades the readiness report's
 # own output: a fifth declared-line slot quotes the cell the report prints for
 # the finding. That cell carries a `;`, which keeps `_VALUE_WRAP` from removing
@@ -9932,3 +10506,643 @@ def test_verified_claims_backed_a_stored_command_that_is_only_a_marker_matches_n
     out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
     res = _grade_claims(_block("kubectl", "web-1  1/1"), [_terminal("[REDACTED_SECRET]", result=out)])
     assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+# The readiness-rule cases for catalogue entries 2, 13, 16 and 19 carry the same cell
+# slot: each quotes what its rule's `describe` (or, where the rule filed a note, the
+# rule's note line) prints on the seeded fleet, and each cell carries a `;`, so the
+# same wraps are held to the same fold through each case's shipped entry. The
+# fleet's own values (a node's name, the per-namespace counts, the disk) are left
+# open by the patterns and stand in here as the fleet would print them.
+_SURGE_CASE = "upgrades-readiness-surge-capacity"
+_DATAPLANE_CASE = "upgrades-readiness-legacy-dataplane"
+_CONTAINERD_CASE = "upgrades-readiness-containerd-socket"
+_INTREE_CASE = "upgrades-readiness-intree-volume"
+_DEFAULTS_CASE = "upgrades-readiness-changed-defaults"
+_DEPRECATED_CASE = "upgrades-readiness-deprecated-api-callers"
+_SLOT_NAMES = dict(zip(_SLOT_LETTERS, _SLOTS))
+_SURGE_CELL = (
+    "surge-capacity: pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists; "
+    "draining its node gke-seeded-b-no-surge-pool-1a2b3c4d-x9y8 leaves 250m CPU / 256Mi of pods with no node to take them "
+    "(0m / 0Mi free on the nodes they may schedule on): Deployment seeded-upgrade/pinned-batch-runner (250m / 256Mi, pinned to the pool)"
+)
+_DATAPLANE_RISK_CELL = (
+    "network-dataplane: legacy dataplane with policy enforcement off and NetworkPolicies in seeded-debug (1), seeded-upgrade (2): "
+    "the policies apply nowhere today and start to apply the moment enforcement turns on, at the node rebuild that follows enabling "
+    "the network policy add-on or on a Dataplane V2 cluster (in the listing: platform-agent-host, each enforcing its own policies); test what they deny before either"
+)
+_DATAPLANE_NOTE_LINE = "network-dataplane: legacy dataplane, policy enforcement off; network policies: none, nothing to enforce"
+_CONTAINERD_NOTE_LINE = (
+    "container-runtime: 1 workload(s) mount the container runtime socket (DaemonSet seeded-shapes/node-runtime-probe); "
+    "no pool's containerd major changes at the target"
+)
+# The rule's risk cell, the line the case admits on a fleet whose pool does change major.
+_CONTAINERD_RISK_CELL = (
+    "container-runtime: pool default-pool (COS_CONTAINERD) runs containerd 1 on its nodes (containerd://1.7.34) and the target's node image "
+    "ships containerd 2; mounting the runtime socket: DaemonSet seeded-shapes/node-runtime-probe (/run/containerd/containerd.sock)"
+)
+# The two lines cut at the rule's own `; `, as an agent that splits the note column on its
+# separator hands them back; the case's patterns stop before it.
+_CONTAINERD_NOTE_CUT = _CONTAINERD_NOTE_LINE.split("; ", 1)[0]
+_CONTAINERD_RISK_CUT = _CONTAINERD_RISK_CELL.split("; ", 1)[0]
+_INTREE_CELL = (
+    "in-tree-volumes: PersistentVolume intree-pd (in-tree gcePersistentDisk seeded-a-intree-pd, claim seeded-shapes/intree-pd, Bound) "
+    "attaches through CSI migration for Deployment seeded-shapes/intree-pd-reader; move it to pd.csi.storage.gke.io"
+)
+# The changed-defaults rule's three forms for the planted namespace: the note on the fleet as it
+# stands (no crossed minor changes a baseline check), the note for a crossed minor that only
+# widens the allowlist, and the risk for one that tightens it. The counts and minors are the
+# fleet's; the case's pattern stops before them.
+_DEFAULTS_NOTE_CELL = "changed-defaults: 1 namespace follows latest with no enforced check changing between 1.35 and 1.36 per the table"
+_DEFAULTS_LOOSENS_CELL = "changed-defaults: seeded-defaults follows latest; 1.37 only widens the baseline allowlist, which rejects nothing new"
+# The note the rule files first once the channel default passes the table's last minor; the prompt
+# asks for the first of the rule's entries, so the case admits it.
+_DEFAULTS_PAST_TABLE_CELL = "changed-defaults: the defaults table ends at 1.36 (read 2026-10-13); minors after it up to the target 1.37 are not graded, and a row per minor from its release notes refreshes the table"
+_DEFAULTS_RISK_CELL = (
+    "changed-defaults: namespace seeded-defaults: pod-security.kubernetes.io/enforce=baseline, pod-security.kubernetes.io/enforce-version=latest: "
+    "follows the running minor, so the enforced baseline rule set changes at 1.34; 1.34: the host field of probes and lifecycle hooks must be unset "
+    "(https://kubernetes.io/docs/concepts/security/pod-security-standards/)"
+)
+# The deprecated-api-callers rule's risk for the planted writer (the user agent, the count and
+# the last write are the fleet's; the case's pattern stops after the API), the same line cut at
+# the rule's first `; ` as an agent that splits the column there hands it back, and the note the
+# other clusters carry, where only the provider's endpoint-controller writes Endpoints.
+_DEPRECATED_CELL = (
+    "deprecated-api-callers: system:serviceaccount:seeded-deprecation:legacy-endpoints-writer via Python-urllib/3.12 writes core/v1 endpoints "
+    "(1008 writes in 7d, last 2026-10-20T19:50:03Z): deprecated and still served; the next removal is the outage, so plan the migration now; "
+    "successor discovery.k8s.io/v1 EndpointSlice (Endpoints deprecated in 1.33, KEP-4974)"
+)
+_DEPRECATED_CELL_CUT = _DEPRECATED_CELL.split("; ", 1)[0]
+_DEPRECATED_NOTE_LINE = "deprecated-api-callers: 1 provider caller of deprecated APIs not filed (system:serviceaccount:kube-system:endpoint-controller on core/v1 endpoints)"
+_CELL_WRAPS = ("{cell}", '"{cell}"', "'{cell}'", "\u201c{cell}\u201d", "<{cell}>", "`{cell}`")
+
+
+def _case_grades(case: str, objective: str, text: str) -> bool:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="readiness-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _bare(cell: str) -> str:
+    """The cell as `report.json` carries it: the rule's text without the `<rule>: ` prefix the table adds."""
+    return cell.split(": ", 1)[1]
+
+
+def _without_cell_slot(text: str) -> str:
+    return "\n".join(line.rsplit("; cell:", 1)[0] for line in text.splitlines())
+
+
+def _surge_report(cell: str = _SURGE_CELL, grade: str = "blocker", other_cell: str = "none", other_rule: str = "none") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "b":
+            lines.append(f"{cluster}: pool that removes a node first: no-surge-pool; readiness rule: surge-capacity; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: pool that removes a node first: none; readiness rule: {other_rule}; graded as: none; cell: {other_cell}")
+    return "\n".join(lines)
+
+
+def _dataplane_report(risk_cell: str = _DATAPLANE_RISK_CELL, note_line: str = _DATAPLANE_NOTE_LINE, note_grade: str = "note") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        grade, cell = (note_grade, note_line) if letter == "c" else ("risk", risk_cell)
+        lines.append(f"{cluster}: kind Cluster; dataplane: legacy; network policies enforced: no; readiness rule: network-dataplane; graded as: {grade}; cell: {cell}")
+    return "\n".join(lines)
+
+
+def _containerd_report(cell: str = _CONTAINERD_NOTE_LINE, blocks: str = "no") -> str:
+    lines = [f"{_SLOT_NAMES['a']}/seeded-shapes/node-runtime-probe: kind DaemonSet; mounts the runtime socket: yes; blocks the upgrade: {blocks}; cell: {cell}"]
+    lines += [f"{cluster}: no runtime socket clients" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
+    return "\n".join(lines)
+
+
+def _defaults_report(cell: str = _DEFAULTS_NOTE_CELL, grade: str = "note", count: str = "1", rule: str = "changed-defaults") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "a":
+            lines.append(f"{cluster}: kind Cluster; namespaces whose pod security version follows the running minor: {count}; readiness rule: {rule}; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: kind Cluster; namespaces whose pod security version follows the running minor: 0; readiness rule: none; graded as: none; cell: none")
+    return "\n".join(lines)
+
+
+def _intree_report(cell: str = _INTREE_CELL, addon: str = "on", blocks: str = "no") -> str:
+    lines = [f"{_SLOT_NAMES['a']}/intree-pd: kind PersistentVolume; pd csi driver add-on: {addon}; blocks the upgrade: {blocks}; cell: {cell}"]
+    lines += [f"{cluster}: no in-tree volumes" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
+    return "\n".join(lines)
+
+
+def _deprecated_report(cell: str = _DEPRECATED_CELL, grade: str = "risk", count: str = "1", rule: str = "deprecated-api-callers") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "a":
+            lines.append(f"{cluster}: kind Cluster; deprecated-api callers the report names: {count}; readiness rule: {rule}; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: kind Cluster; deprecated-api callers the report names: 0; readiness rule: deprecated-api-callers; graded as: note; cell: {_DEPRECATED_NOTE_LINE}")
+    return "\n".join(lines)
+
+
+_GROUP_CASE_REPORTS = {
+    _SURGE_CASE: (
+        ("every-seeded-cluster-has-a-declared-line", "the-laggard-names-no-surge-pool-as-a-blocker", "the-laggards-line-quotes-the-reports-cell", "the-other-clusters-declare-no-such-pool"),
+        lambda wrap: _surge_report(wrap.format(cell=_SURGE_CELL)),
+    ),
+    _DATAPLANE_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-declared-lines-say-the-dataplane-is-legacy",
+            "the-declared-lines-say-policies-are-not-enforced",
+            "the-declared-lines-name-the-reports-rule",
+            "the-declared-lines-grade-the-finding-by-the-clusters-policies",
+            "the-declared-lines-quote-the-reports-cell",
+        ),
+        lambda wrap: _dataplane_report(wrap.format(cell=_DATAPLANE_RISK_CELL), wrap.format(cell=_DATAPLANE_NOTE_LINE)),
+    ),
+    _CONTAINERD_CASE: (
+        ("the-planted-agent-is-named-and-does-not-block", "the-planted-agents-line-quotes-the-reports-text"),
+        lambda wrap: _containerd_report(wrap.format(cell=_CONTAINERD_NOTE_LINE)),
+    ),
+    _INTREE_CASE: (
+        ("the-planted-volume-is-named-with-the-addon-on-and-does-not-block", "the-planted-volumes-line-quotes-the-reports-cell"),
+        lambda wrap: _intree_report(wrap.format(cell=_INTREE_CELL)),
+    ),
+    _DEFAULTS_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-planted-clusters-line-counts-the-namespace",
+            "the-planted-clusters-line-names-the-reports-rule",
+            "the-planted-clusters-line-does-not-block",
+            "the-planted-clusters-line-quotes-the-reports-cell",
+        ),
+        lambda wrap: _defaults_report(wrap.format(cell=_DEFAULTS_NOTE_CELL)),
+    ),
+    _DEPRECATED_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-planted-clusters-line-counts-the-writer",
+            "the-planted-clusters-line-names-the-reports-rule",
+            "the-planted-clusters-line-grades-it-a-risk",
+            "the-planted-clusters-line-quotes-the-reports-cell",
+        ),
+        lambda wrap: _deprecated_report(wrap.format(cell=_DEPRECATED_CELL)),
+    ),
+}
+
+
+@pytest.mark.parametrize("case,objective", [(case, objective) for case, (objectives, _) in _GROUP_CASE_REPORTS.items() for objective in objectives])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_rule_cases_accept_the_cell_however_the_agent_wrapped_it(case, objective, wrap):
+    assert _case_grades(case, objective, _GROUP_CASE_REPORTS[case][1](wrap))
+
+
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_changes_major(wrap):
+    assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=_CONTAINERD_RISK_CELL)))
+
+
+@pytest.mark.parametrize("cell", [_CONTAINERD_NOTE_CUT, _CONTAINERD_RISK_CUT, _bare(_CONTAINERD_NOTE_CUT), _bare(_CONTAINERD_RISK_CUT)])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_containerd_case_accepts_the_rules_entry_cut_at_its_first_separator(cell, wrap):
+    assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=cell)))
+
+
+@pytest.mark.parametrize(
+    "case,objective,text",
+    [
+        # The cell as report.json carries it, with no rule prefix: the table adds the prefix when it
+        # renders, so an agent that reads the JSON copies the bare text, which the cases admit.
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report(_bare(_SURGE_CELL))),
+        # A no-finding cluster may name the rule that cleared it, with no grade and no cell.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="surge-capacity")),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(_bare(_DATAPLANE_RISK_CELL), _bare(_DATAPLANE_NOTE_LINE))),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_NOTE_LINE))),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_RISK_CELL))),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report(_bare(_INTREE_CELL))),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_NOTE_CELL))),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_RISK_CELL), grade="risk")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_bare(_DEPRECATED_CELL))),
+        # The entry cut at the rule's own first `; `, with and without the prefix: the pattern stops after the API.
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_DEPRECATED_CELL_CUT)),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_bare(_DEPRECATED_CELL_CUT))),
+    ],
+)
+def test_rule_cases_accept_the_bare_json_text_without_the_rule_prefix(case, objective, text):
+    assert _case_grades(case, objective, text)
+
+
+@pytest.mark.parametrize("cell,grade", [(_DEFAULTS_LOOSENS_CELL, "note"), (_DEFAULTS_RISK_CELL, "risk"), (_DEFAULTS_PAST_TABLE_CELL, "note")])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_defaults_case_accepts_the_rules_other_forms_on_a_fleet_that_crosses_a_baseline_change(cell, grade, wrap):
+    report = _defaults_report(wrap.format(cell=cell), grade=grade)
+    assert _case_grades(_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", report)
+    assert _case_grades(_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", report)
+
+
+@pytest.mark.parametrize(
+    "case,objective,text",
+    [
+        # A report whose rule is missing prints no cell: `none`, or another text under the rule's id.
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report("none")),
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report('"surge-capacity: something else"')),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(risk_cell="none")),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(note_line='"network-dataplane: something else"')),
+        # Slot c carries no policy: its line quotes the note, not a risk cell it does not have.
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(note_line=_DATAPLANE_RISK_CELL)),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report("none")),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report('"container-runtime: something else"')),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report("none")),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report('"in-tree-volumes: something else"')),
+        # The grade slot names its subject; a wrapped cell does not change the grade.
+        (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _surge_report(f'"{_SURGE_CELL}"', grade="risk")),
+        (_DATAPLANE_CASE, "the-declared-lines-grade-the-finding-by-the-clusters-policies", _dataplane_report(note_grade="risk")),
+        (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _containerd_report(f'"{_CONTAINERD_NOTE_LINE}"', blocks="yes")),
+        (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _intree_report(f'"{_INTREE_CELL}"', blocks="yes")),
+        # A cluster with no such pool declares no cell either.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_cell=_SURGE_CELL)),
+        # Another rule's id on a no-finding cluster is a reading of a finding the report did not make.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="drain-blocking-pdbs")),
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="surge-capacity", other_cell=_SURGE_CELL)),
+        # A line without the cell slot is the earlier frame and fails the slots that need it.
+        (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _without_cell_slot(_surge_report())),
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _without_cell_slot(_surge_report())),
+        (_DATAPLANE_CASE, "the-declared-lines-grade-the-finding-by-the-clusters-policies", _without_cell_slot(_dataplane_report())),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _without_cell_slot(_dataplane_report())),
+        (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _without_cell_slot(_containerd_report())),
+        (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _without_cell_slot(_intree_report())),
+        # The changed-defaults case: a missing or foreign cell, a blocker or `none` grade, a rule the
+        # report did not name, a count that denies the namespace, and the frame without the cell slot.
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report("none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report('"changed-defaults: something else"')),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_DATAPLANE_NOTE_LINE)),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _defaults_report(grade="blocker")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _defaults_report(grade="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-names-the-reports-rule", _defaults_report(rule="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="0")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _without_cell_slot(_defaults_report())),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_defaults_report())),
+        # The deprecated-api-callers case: a missing or foreign cell (the rule's own note for a cluster
+        # with no operator caller included), a blocker or note grade, a rule the report did not name,
+        # a count that denies the writer, and the frame without the cell slot.
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report("none")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report('"deprecated-api-callers: something else"')),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_DEPRECATED_NOTE_LINE)),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _deprecated_report(grade="blocker")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _deprecated_report(grade="note")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-names-the-reports-rule", _deprecated_report(rule="none")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-counts-the-writer", _deprecated_report(count="0")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _without_cell_slot(_deprecated_report())),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_deprecated_report())),
+    ],
+)
+def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
+    assert not _case_grades(case, objective, text)
+
+
+
+
+_PER_CLUSTER_CELL_WRAPS = [
+    "{cell}",
+    '"{cell}"',
+    "'{cell}'",
+    "“{cell}”",
+    "<{cell}>",
+    "`{cell}`",
+    # The column's other entries ahead of the rule's.
+    "cluster read failed; PDBs not graded; {cell}",
+]
+
+
+def _per_cluster_case_spec(case: str) -> dict:
+    return yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+
+
+# The per-cluster readiness cases for the workload rules of catalogue entries
+# 4, 10, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster,
+# `<cluster>: <rule id>: <object kind namespace/name|none>; blocks the upgrade:
+# <yes|no|none>; cell: <the rule's text|none>`: slot a's line names the planted
+# object, reads `no` and quotes the rule's own text; the other slots read `none`
+# in every slot, since the fleet plants each shape on slot a alone (the
+# client-addon-skew case also admits a kubectl client the cluster's audit log
+# names there, in the rule's own wording: `_CLIENT_CASE` below). The cases
+# first graded one line per object, anchored on the object's name, and the
+# dev-install runs passed none of them: the agent read `<cluster>/<object name>`
+# as `<project>/<cluster>`, which put the object's name after `; blocks the
+# upgrade:` where the anchor could not find it, left a note-column object out
+# of a list it built from the risks, or wrote the lines for a dozen other
+# objects and left the planted one out;
+# `test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame`
+# keeps that rendering red. The cell texts are the rules' own, as their unit
+# tests assert them (agents/platform/skills/fleet-upgrade-verification/scripts/
+# test_readiness_rules_workloads.py, and test_audit_rules.py for entry 10); the
+# pools, the kubelet version, the skew gap and the target are the fleet's, so
+# the cases' patterns stop before them. A cell carries a `;`, so a wrap the
+# agent kept around it survives `_VALUE_WRAP`, and a note's entry may come with
+# the note column's other entries before it; the cases admit any prefix before
+# the rule's text.
+_PER_CLUSTER_RULE_CASES = {
+    "upgrades-fleet-readiness-node-local-state": (
+        "Deployment seeded-shapes/cache-on-emptydir",
+        "data-on-the-node",
+        "data-on-the-node: Deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue (emptyDir; the name suggests state); "
+        "not a risk: a Deployment's emptyDir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload's",
+    ),
+    "upgrades-fleet-readiness-deprecated-node-label": (
+        "Deployment seeded-shapes/arch-pinned-worker",
+        "removed-node-label",
+        "removed-node-label: Deployment seeded-shapes/arch-pinned-worker: selects on beta.kubernetes.io/arch=amd64 (nodeSelector), deprecated since 1.14 "
+        "in favour of kubernetes.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods",
+    ),
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "Deployment seeded-shapes/cgroup-blind-jvm",
+        "cgroup-v2-runtime",
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, already on cgroup v2; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "Deployment seeded-shapes/multi-process-worker",
+        "group-oom-kill",
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job "
+        "on pool default-pool, on cgroup v2 with a kubelet at 1.33.4-gke.1000, which already group-kills; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-node-image-coupled-agent": (
+        "DaemonSet seeded-shapes/cni-shaped-agent",
+        "node-image-coupled-agent",
+        "node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the node's network and coupled to the node image: "
+        "mounts /etc/cni/net.d from the node; pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and get a new node image in this upgrade",
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "CronJob seeded-shapes/cuda-pinned-trainer",
+        "gpu-driver",
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries "
+        "that accelerator; the target driver cannot be read, and the pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked",
+    ),
+    "upgrades-fleet-readiness-retired-registry-image": (
+        "Deployment seeded-shapes/legacy-registry-pull",
+        "retired-registry",
+        "retired-registry: Deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io "
+        "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
+        "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and are rebuilt in this upgrade",
+    ),
+    "upgrades-readiness-client-addon-skew": (
+        "CronJob seeded-shapes/stale-kubectl-client",
+        "client-addon-skew",
+        "client-addon-skew: kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0): "
+        "7 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
+    ),
+}
+_CLIENT_CASE = "upgrades-readiness-client-addon-skew"
+# The other-slots objective is named for what it admits; the client case admits
+# a finding the audit log names besides `none`.
+_OTHERS_OBJECTIVE_OF = {_CLIENT_CASE: "the-other-clusters-read-none-or-the-reports-own-finding"}
+_PLANTED_OBJECTIVE = "the-planted-object-is-named-and-does-not-block"
+_CELL_OBJECTIVE = "the-planted-objects-line-quotes-the-reports-cell"
+_EVERY_SLOT_OBJECTIVE = "every-seeded-cluster-has-a-declared-line"
+_OTHERS_OBJECTIVE = "the-other-clusters-read-none"
+
+
+def _others_objective(case: str) -> str:
+    return _OTHERS_OBJECTIVE_OF.get(case, _OTHERS_OBJECTIVE)
+
+
+def _per_cluster_objectives(case: str) -> tuple[str, ...]:
+    return (_EVERY_SLOT_OBJECTIVE, _PLANTED_OBJECTIVE, _CELL_OBJECTIVE, _others_objective(case))
+# The other grades the same rules print for the same objects on another fleet
+# (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
+# the patterns stop before the pool-dependent tail, so these pass the cell slot too.
+_PER_CLUSTER_OTHER_CELLS = {
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm: container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 at the target; "
+        "the heap is then sized from the node and the container is OOM-killed"
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker: container supervisor runs a shell script that forks a background job "
+        "(heuristic: the process count is not readable from the API) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 "
+        "at the target; a kubelet at 1.34 then sets memory.oom.group and an OOM kill takes every process in the container"
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer requests nvidia.com/gpu with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 "
+        "on pool gpu-pool; the target 1.33 node image ships driver R535 (gpuDriverVersion DEFAULT), which serves CUDA 12.2; "
+        "forward-compatibility packages inside the image are not readable from the tag"
+    ),
+}
+# How the dev install's runs rendered a declared line: the project before the
+# cluster, the location after it, a bullet, emphasis, code, a stop.
+_PER_CLUSTER_RENDERINGS = (
+    "some-project/{line}",
+    "{cluster} (us-central1-a): {rest}",
+    "- {line}",
+    "**{cluster}**: {rest}",
+    "`{cluster}`: {rest}",
+    "{line}.",
+)
+
+
+def _one_role_per_slot() -> list[str]:
+    """One catalogue role per cluster slot. The runner records every seeded
+    cluster it reached whatever roles a case names, and `{cluster:<slot>}`
+    expands from that record, so the test directory reaches every slot as the
+    runner does; the cases themselves name the planted role alone."""
+    by_slot: dict[str, str] = {}
+    for role, spec in sorted(_catalog_roles().items()):
+        by_slot.setdefault(spec["cluster_slot"], role)
+    return [by_slot[slot] for slot in sorted(by_slot)]
+
+
+def _per_cluster_case_grades(case: str, objective: str, text: str) -> bool:
+    spec = _per_cluster_case_spec(case)
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="per-cluster-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]) + _one_role_per_slot(), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _per_cluster_line(cluster: str, rule: str, obj: str = "none", verdict: str = "none", cell: str = "none") -> str:
+    return f"{cluster}: {rule}: {obj}; blocks the upgrade: {verdict}; cell: {cell}"
+
+
+def _per_cluster_report(case: str, cell: str | None = None, obj: str | None = None, verdict: str = "no", others: dict[str, str] | None = None, slots=_SLOT_LETTERS) -> str:
+    """The declared lines: slot a's names the planted object (or `obj`) with
+    `verdict` and the shipped cell (or `cell`); every other slot reads `none` in
+    every slot unless `others` gives its line."""
+    planted, rule, shipped = _PER_CLUSTER_RULE_CASES[case]
+    lines = []
+    for letter in slots:
+        cluster = _SLOT_NAMES[letter]
+        if letter == "a":
+            lines.append(_per_cluster_line(cluster, rule, planted if obj is None else obj, verdict, shipped if cell is None else cell))
+        else:
+            lines.append((others or {}).get(letter) or _per_cluster_line(cluster, rule))
+    return "\n".join(lines)
+
+
+def _rendered(text: str, rendering: str) -> str:
+    out = []
+    for line in text.splitlines():
+        cluster, rest = line.split(": ", 1)
+        out.append(rendering.format(line=line, cluster=cluster, rest=rest))
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+@pytest.mark.parametrize("wrap", _PER_CLUSTER_CELL_WRAPS)
+def test_per_cluster_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    text = _per_cluster_report(case, cell=wrap.format(cell=cell))
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, text), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(case):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_bare(cell)))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_CELLS))
+def test_per_cluster_rule_case_accepts_the_rules_other_grade_on_another_fleet(case):
+    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_PER_CLUSTER_OTHER_CELLS[case]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+@pytest.mark.parametrize("rendering", _PER_CLUSTER_RENDERINGS)
+def test_per_cluster_rule_case_accepts_the_lines_as_the_agent_renders_them(case, rendering):
+    text = _rendered(_per_cluster_report(case), rendering)
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, text), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_a_wrapped_object_and_a_pod_standing_in(case):
+    planted, _rule, _cell = _PER_CLUSTER_RULE_CASES[case]
+    for obj in (f'"{planted}"', f"<{planted}>", planted.lower(), f"{planted}-7d9f8c6b5-x2k9q", f"{planted}-x2k9q"):
+        assert _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=obj)), obj
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
+    planted, rule, _cell = _PER_CLUSTER_RULE_CASES[case]
+    # A report whose rule is missing prints no cell: `none`, or another text under the rule's id, wrapped or not.
+    for foreign in ("none", f"{rule}: something else", f'"{rule}: something else"'):
+        assert not _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=foreign)), foreign
+    # A promoted verdict fails whatever the cell says, and so does a second slot-a line that contradicts the first.
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, verdict="yes"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, "\n".join([_per_cluster_report(case), _per_cluster_report(case, verdict="yes", slots="a")]))
+    # Slot a reading `none` in every slot, naming another object, or naming the object without its
+    # kind and namespace, is outside the vocabulary whatever the cell says.
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="none", verdict="none", cell="none"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="Deployment seeded-shapes/other-workload"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=planted.rsplit("/", 1)[1]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_needs_a_line_for_every_slot(case):
+    for missing in _SLOT_LETTERS:
+        text = _per_cluster_report(case, slots=tuple(s for s in _SLOT_LETTERS if s != missing))
+        assert not _per_cluster_case_grades(case, _EVERY_SLOT_OBJECTIVE, text), missing
+        if missing != "a":
+            assert not _per_cluster_case_grades(case, _others_objective(case), text), missing
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_a_finding_on_a_cluster_without_the_shape(case):
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    for letter in _SLOT_LETTERS[1:]:
+        cluster = _SLOT_NAMES[letter]
+        for wrong in (
+            # The planted finding copied onto another cluster.
+            _per_cluster_line(cluster, rule, planted, "no", cell),
+            # A verdict, or a cell, where the rule printed nothing.
+            _per_cluster_line(cluster, rule, "none", "no", "none"),
+            _per_cluster_line(cluster, rule, "none", "none", cell),
+        ):
+            assert not _per_cluster_case_grades(case, _others_objective(case), _per_cluster_report(case, others={letter: wrong})), wrong
+
+
+def _object_line_report(case: str) -> str:
+    """The rendering the dev install's runs produced under the earlier per-object
+    prompt: the project and the cluster where the frame asked for the cluster and
+    the object, the kind as its own slot, the object's name inside the cell."""
+    planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    kind = planted.split(" ", 1)[0].lower()
+    return "\n".join(
+        [
+            f"some-project/{_SLOT_NAMES['b']}: kind pdb; blocks the upgrade: yes; cell: seeded-upgrade/pinned-batch-runner (maxUnavailable: 0) over Deployment seeded-upgrade/pinned-batch-runner (1)",
+            f"some-project/{_SLOT_NAMES['a']}: kind {kind}; blocks the upgrade: no; cell: {_bare(cell)}",
+        ]
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame(case):
+    text = _object_line_report(case)
+    for objective in _per_cluster_objectives(case):
+        assert not _per_cluster_case_grades(case, objective, text), objective
+
+
+# What the client-addon-skew rule can add on a live fleet: a kubectl user agent
+# from a cluster's Admin Activity log (a human's or an agent's write in the last
+# seven days from a binary further than one minor from the target), filed on
+# any slot in the rule's own wording, and a note the rule prints for every
+# cluster, which is not a finding.
+_AUDIT_CLIENT_CELL = (
+    "client-addon-skew: kubectl v1.33 from principal operator@example.com (user agent kubectl/v1.33.2 (darwin/arm64) kubernetes/0b43ee2, "
+    "4 writes to apps/v1 deployments in 7d): 3 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver "
+    "(https://kubernetes.io/releases/version-skew-policy/#kubectl)"
+)
+_ADDON_CELL = (
+    "client-addon-skew: cert-manager v1.20 at Deployment cert-manager/cert-manager (image quay.io/jetstack/cert-manager-controller:v1.20.1): "
+    "cert-manager v1.20 supports Kubernetes 1.32 to 1.35 (https://cert-manager.io/docs/releases/, read 2026-10-09); the target 1.36 is outside it"
+)
+_GKE_ADDONS_NOTE = "client-addon-skew: GKE add-ons on: gcePersistentDiskCsiDriverConfig, httpLoadBalancing (GKE-managed; the cluster record carries no version, so not graded)"
+
+
+def test_client_addon_skew_case_keeps_one_line_per_cluster_with_the_planted_cronjob_first():
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    both = _per_cluster_report(_CLIENT_CASE, obj=f"{planted}, principal operator@example.com", cell=f"{cell}; {_AUDIT_CLIENT_CELL}")
+    for objective in _per_cluster_objectives(_CLIENT_CASE):
+        assert _per_cluster_case_grades(_CLIENT_CASE, objective, both), objective
+    # The principal before the CronJob is outside the vocabulary (a workload before a principal).
+    swapped = _per_cluster_report(_CLIENT_CASE, obj=f"principal operator@example.com, {planted}", cell=f"{_AUDIT_CLIENT_CELL}; {cell}")
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, swapped)
+    # Two lines for slot a, one per finding, contradict the one-line frame: the second names another object first.
+    two_lines = "\n".join([_per_cluster_report(_CLIENT_CASE), _per_cluster_line(_SLOT_NAMES["a"], rule, "principal operator@example.com", "no", _AUDIT_CLIENT_CELL)])
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, two_lines)
+
+
+@pytest.mark.parametrize("cell", [_AUDIT_CLIENT_CELL, _bare(_AUDIT_CLIENT_CELL), _ADDON_CELL])
+def test_client_addon_skew_case_admits_a_finding_the_report_files_on_another_cluster(cell):
+    _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    obj = "principal operator@example.com" if "principal" in cell else "Deployment cert-manager/cert-manager"
+    report = _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], rule, obj, "no", cell)})
+    for objective in _per_cluster_objectives(_CLIENT_CASE):
+        assert _per_cluster_case_grades(_CLIENT_CASE, objective, report), objective
+
+
+@pytest.mark.parametrize(
+    "obj,verdict,cell",
+    [
+        # The rule's note is not a finding: a cluster with the note alone reads none in every slot.
+        ("none", "none", _GKE_ADDONS_NOTE),
+        ("GKE add-ons", "no", _GKE_ADDONS_NOTE),
+        # A finding in the agent's words rather than the rule's, a hedged verdict, a blocker the rule never files.
+        ("principal operator@example.com", "no", "kubectl 1.33 is too old for this cluster"),
+        ("principal operator@example.com", "none", _AUDIT_CLIENT_CELL),
+        ("principal operator@example.com", "yes", _AUDIT_CLIENT_CELL),
+        ("none", "no", "none"),
+    ],
+)
+def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster(obj, verdict, cell):
+    _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    report = _per_cluster_report(_CLIENT_CASE, others={"c": _per_cluster_line(_SLOT_NAMES["c"], rule, obj, verdict, cell)})
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), report)
+

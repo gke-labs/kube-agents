@@ -65,10 +65,12 @@ class Gh:
     def path(self, suffix: str) -> str:
         return f"repos/{self.repo}/{suffix}"
 
-    def call(self, method: str, path: str, body: dict | None = None, paginate: bool = False):
-        """The decoded JSON response, a list for a paginated read, or None."""
+    def call(self, method: str, path: str, body: dict | None = None, paginate: bool = False, read: bool = False):
+        """The decoded JSON response, a list for a paginated read, or None.
+        ``read`` marks a POST that only reads (a GraphQL query), which a dry
+        run still sends."""
         self.last_failure = None
-        if self.dry_run and method in WRITE_METHODS:
+        if self.dry_run and method in WRITE_METHODS and not read:
             log(f"{DRY_RUN_PREFIX} {method} {path}\n{json.dumps(body, indent=2, ensure_ascii=False) if body else ''}")
             return None
         argv = [self.binary, "api", "-X", method, path]

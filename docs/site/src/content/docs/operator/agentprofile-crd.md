@@ -7,13 +7,13 @@ sidebar:
 
 The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona, worker and tools images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the `spec.mode: next` stack. On a PlatformAgent running `today` an `AgentProfile` renders nothing.
 
-An `AgentProfile` is not a Hermes profile. The platform agent's own profiles (the platform and cluster templates it scaffolds under `$HERMES_HOME/profiles`) are unrelated and unchanged.
+An `AgentProfile` is not a Hermes profile on its own: the platform and cluster templates the gateway scaffolds under `$HERMES_HOME/profiles` are unaffected by ordinary profiles. The one exception is a built-in optional specialist template shipped in the `platform-agent` image (`tse`, under `/opt/tse-template`): when a bound `AgentProfile` of that name resolves under `mode: next`, the operator also passes its name in `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment so the entrypoint scaffolds and syncs `$HERMES_HOME/profiles/tse` on startup (and archives it to `$HERMES_HOME/profiles/.deleted/tse` when the `AgentProfile` is removed).
 
 - **API group / version**: `kubeagents.x-k8s.io/v1alpha1`
 - **Kind**: `AgentProfile`
 - **Short Name**: `apr`
 - **Source**: [`k8s-operator/api/v1alpha1/agentprofile_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/agentprofile_types.go)
-- **Sample**: [`k8s-operator/examples/agentprofile-chat.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-chat.yaml)
+- **Samples**: [`k8s-operator/examples/agentprofile-chat.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-chat.yaml), [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml)
 
 ## Specification
 
@@ -47,6 +47,7 @@ spec:
     activeDeadlineSeconds: 1800
     ttlSecondsAfterFinished: 600
   concurrency: 2
+  allowedTiers: [read] # optional; absent means read alone
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
@@ -64,6 +65,8 @@ A profile binds to the PlatformAgent in its own namespace. With that agent on `m
 - A bus identity for that ServiceAccount in the auth callout's identity map. Its pods may publish task events and read task input for this profile's tasks, and use the topics the profile names. Nothing else. The scope is the profile, not one task: two pods of the same profile can reach each other's task subjects.
 - An agent card on `a2a.agents.<name>`, rendered from `spec.description`. Deleting the profile on a `mode: next` install publishes a tombstone in its place before the profile is removed. A profile deleted while its PlatformAgent is on `today`, while its namespace holds no PlatformAgent or more than one, or while the operator has no bus identity, is removed without one.
 
+When a bound `AgentProfile`'s name matches a built-in optional specialist template baked into the `platform-agent` image (`tse`), the operator also sets `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment (which triggers a gateway pod rollout when `tse` is added or removed so the entrypoint scaffolds or archives `$HERMES_HOME/profiles/tse`). Ordinary `AgentProfile` resources (such as `chat` or `auditor`) do not touch `KUBE_AGENTS_ENABLED_PROFILES` and do not roll the gateway pod.
+
 Deletion waits on the `kubeagents.x-k8s.io/agentprofile-finalizer` finalizer, which every profile reconciled on a `mode: next` install carries and which only the operator removes. Before rolling the operator back to a release without AgentProfiles, or uninstalling it, delete the profiles while the operator is still running. Otherwise `kubectl delete agentprofile` hangs, and so does deleting the CRD behind it. To clear one by hand (it publishes no tombstone, so the card stays on the directory):
 
 ```bash
@@ -76,7 +79,11 @@ The operator looks for AgentProfiles once, at startup. If the CRD isn't installe
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
-Nothing runs a pod from a profile yet. The dispatcher that turns a task into a Job for its profile comes later.
+`allowedTiers` lists the tiers the profile may run at, `read` and `unattended`. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
+
+Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates on a `mode: next` install. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy that lets its pods reach DNS, the bus and LiteLLM and nothing else, and only then admits that namespace on the bus's and LiteLLM's own policies. LiteLLM is reached without a key, so anyone who can create a pod in that namespace can use the install's model credentials. Treat pod create there like pod create in the agent's own namespace.
+
+Nothing runs a pod from a profile yet. The dispatcher and the warm workers come later.
 
 ## Status
 

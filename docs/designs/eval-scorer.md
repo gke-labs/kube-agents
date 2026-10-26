@@ -148,7 +148,7 @@ transport carries the task's lifecycle envelope as its trajectory (`inject.task`
 calls without their results, so it names no card. The delegation wait reads the cards from the
 pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
 can carry the delegated workers' tagged entries and token counts. The scorer still treats
-`worker_commands`, `worker_agents`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
+`worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
@@ -159,8 +159,8 @@ trajectory carries the transport's task marker (`_inject_record()` in `scoring.p
 router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
 or a marker that reports a loss (`_inject_blind()`); `test_scoring.py` holds the literals equal to
 the transport's. When it holds,
-every report entry the task declares whose check is made of `tool_called`, `worker_commands` or
-`worker_agents` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
+every report entry the task declares whose check is made of `tool_called`, `worker_commands`,
+`worker_agents` or `worker_budget` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
 into `trace_blind_checks` and `worker_blind_checks` by which condition applies; a compound mixing
 in an applicable leaf is not in either set, because that leaf can fail on any transport and
 setting the entry aside would hide it) is set aside as `not_applicable`, whatever
@@ -1042,7 +1042,9 @@ It is `ci-kube-agents-eval-nightly` in
 export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
-the part that matters.
+the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
+so record under the version key's `next` mode; `ci-kube-agents-eval-nightly-today` in the same file
+is the same recorder on a `today` install, and keeps today's window.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
@@ -1574,9 +1576,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
 - **The aggregate's sample floor is a placeholder for a real test.**
-  `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
-  repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
-  margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
+  `EVAL_AGGREGATE_MIN_SCORED` (default 30, ten admitted cases' worth when it was set) refuses to
+  compare below that many scored repetitions, because a flat margin at `n = 3` measures luck. It
+  is a floor rather than a wider margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
   actually scales is a two-proportion test. The store now holds the variance estimate that test
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition

@@ -75,7 +75,7 @@ import urllib.parse
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 # The shared scripts dir holds github_token_refresh and gitops_workspace (see
 # docker-entrypoint.sh: executable scripts are shared across profiles, not
@@ -478,6 +478,27 @@ AUDITS: dict[str, AuditSpec] = {
             ),
         ),
     ),
+    "upgrade-retrospective": AuditSpec(
+        "Upgrade Retrospective",
+        "upgrade_retrospective_sop.md",
+        # The seven ids the collector (`upgrade_retrospective.py`, `CHECK_READS`)
+        # emits; a failure still present from an earlier review is re-emitted
+        # under its original id with its persistence, never under one of its
+        # own. The collector grades an Error at `major` and a Warning at
+        # `minor`, never `critical`, and none of these slugs is on
+        # `MAJOR_SWEEP_CHECKS`, so `finish` opens no pull request on its own
+        # for this stream -- the design's guard against a retrospective that
+        # proposes manifest changes nobody asked for.
+        (
+            "upgrade-operation-failed",
+            "upgrade-broke-workload",
+            "node-broken-after-upgrade",
+            "upgrade-symptom-tentative",
+            "upgrade-symptom-unclassified",
+            "symptom-predates-upgrade",
+            "upgrade-log-volume-rose",
+        ),
+    ),
 }
 
 # The streams whose SOP runs a collector, and so the streams whose `finish`
@@ -500,6 +521,7 @@ COLLECTOR_AUDITS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -826,6 +848,13 @@ REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 # and the copy of the newest. report_status.py spells them the same way.
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# The neutral `state` of an open issue in the broker's `issue-view` answer.
+FORGE_ISSUE_OPEN = "open"
+# The envelope key that names the ledger issue a run left open when
+# `issue_number` cannot: a clean run that held the ledger open with no trusted
+# memory stores no `issue_number`, so the next run's trust check fails. This key
+# is not a trust claim; only the ledger lookup reads it.
+OPEN_LEDGER_KEY = "open_issue_number"
 # The chat report `finish` leaves for the relay: one record per stream in
 # SCRATCH_DIR, read over ssh by `session_kv_server.audit_chat_report`, which
 # spells these keys the same way.
@@ -844,11 +873,29 @@ CHAT_REPORT_TEXT_KEY = "text"
 # the same run must not turn silent, and the ids its ledger body marked new.
 CHAT_REPORT_SILENT_OK_KEY = "silent_ok"
 CHAT_REPORT_NEW_IDS_KEY = "new_ids"
-# Above a later `finish`'s report in the same entry: its counts are measured
-# against the report above it, or against what an earlier `finish` that died
-# before its report published, not against the previous run.
-CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts are against the report above."
+# Saved on the entry by the run's first `finish` of the repository, before it
+# touches the ledger: the previous run's ids it joined against, whether that
+# memory was known, and whether it was written under another id scheme. A
+# later `finish` reads the store the earlier one rewrote, so it joins against
+# these instead to count the whole run in its chat report.
+CHAT_REPORT_BASELINE_IDS_KEY = "run_baseline_ids"
+CHAT_REPORT_BASELINE_KNOWN_KEY = "run_baseline_known"
+CHAT_REPORT_BASELINE_STALE_KEY = "run_baseline_stale"
+# Every id the previous run filed, rendered or not (a body over budget cuts some):
+# none is new on any count of this run, as `finish`'s own count already holds.
+CHAT_REPORT_BASELINE_FILED_KEY = "run_baseline_filed"
+# Above a later `finish`'s report in the same entry. Its counts cover the whole
+# run when they came from the entry's baseline; otherwise (no ledger, a HELD
+# report, an entry an older image wrote) they are measured against the report
+# above it, or against what an earlier `finish` that died before its report
+# published.
+CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts cover the whole run, the report above included."
 CHAT_REPORT_RERUN_LABEL = (
+    "Re-run in this audit after an earlier finish published and stopped; "
+    "counts cover the whole run."
+)
+CHAT_REPORT_REFINISH_RELATIVE_LABEL = "Re-run in this audit; counts are against the report above."
+CHAT_REPORT_RERUN_RELATIVE_LABEL = (
     "Re-run in this audit after an earlier finish published and stopped; "
     "counts are against what it published."
 )
@@ -885,16 +932,10 @@ STORE_PATH_SEPARATOR = "%2F"
 NO_FORGE_REPO = "no_forge/local"
 NO_FORGE_STATUS = "NO_FORGE"
 NO_FORGE_MODE = "none"
-NO_FORGE_NOTE = (
-    "No forge is configured (no GitOps repository is registered in "
-    "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
-    "remediation pull request was opened. The findings are in the report store."
-)
+NO_FORGE_NOTE = "No GitOps repository is connected, so no ledger issue or fix pull requests were opened."
 NO_FORGE_UNSTORED_NOTE = (
-    "No forge is configured (no GitOps repository is registered in "
-    "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
-    "remediation pull request was opened. The report store write failed, so "
-    "the store may not hold this run: keep this message."
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened. "
+    "This run could not be saved on the install, so keep this message."
 )
 # A run whose repository resolved but cannot be reached through the broker:
 # the forge says that the repository is missing or that the install's
@@ -909,15 +950,19 @@ REACHABILITY_PROBE_VERB = "issue-list"
 REACHABILITY_PROBE_LIMIT = 1
 UNREACHABLE_NOTE = (
     "The repository {repo} could not be reached through the broker ({reason}), so "
-    "no ledger issue was written and no remediation {noun} was opened. The run did "
+    "{ledger} and no remediation {noun} was opened. The run did "
     "not choose another repository. {remedy} The findings are in the report store."
 )
 UNREACHABLE_UNSTORED_NOTE = (
     "The repository {repo} could not be reached through the broker ({reason}), so "
-    "no ledger issue was written and no remediation {noun} was opened. The run did "
+    "{ledger} and no remediation {noun} was opened. The run did "
     "not choose another repository. {remedy} The report store write failed, so the "
     "store may not hold this run: keep this message."
 )
+# What the unreachable note says of the ledger: an issue for the issue probe,
+# and the stored ledger for the store probe (`STORE_REACHABILITY_PROBE_VERB`).
+UNREACHABLE_ISSUE_LEDGER = "no ledger issue was written"
+UNREACHABLE_STORE_LEDGER = "the ledger in the report store was not updated"
 # What to do about an unreachable repository: the broker does not manage it,
 # or the forge cannot find it or refuses the credential.
 UNREACHABLE_NOT_MANAGED_REMEDY = (
@@ -951,8 +996,53 @@ NO_REPOSITORY_CHOSEN_KEY = "no_repository_chosen"
 # The run record's key for a run that took the no-forge path because its
 # repository could not be reached: `{"repo", "reason"}`. `finish` follows it.
 RUN_RECORD_UNREACHABLE_KEY = "unreachable"
+# The run record's key for the read that found that repository unreachable
+# (`REACHABILITY_PROBE_VERB` or `STORE_REACHABILITY_PROBE_VERB`). The note's
+# advice follows it, so `finish` asks the broker nothing to give it. A record
+# without it was written when the probe was always the issue listing.
+RUN_RECORD_PROBE_KEY = "probe"
 # The JSON line's key for the repository that could not be reached, and why.
 UNREACHABLE_REPO_KEY = "unreachable_repo"
+
+# Where a run keeps its ledger (version-control-support.md §8, "The ledger
+# without issues"). `forge`: a ledger issue on the repository. `store`: the
+# report store and chat. `start` decides (`resolve_reachable_repo`) and writes
+# the decision into the run record; `finish` follows it.
+LEDGER_FORGE = "forge"
+LEDGER_STORE = "store"
+# The run record's keys for that decision. A record without them was written
+# by an image older than the decision, and reads with the old meaning
+# (`this_runs_decision`).
+RUN_RECORD_LEDGER_KEY = "ledger"
+RUN_RECORD_REMEDIATION_KEY = "remediation"
+RUN_RECORD_REASON_KEY = "reason"
+# The JSON lines' keys on a run whose ledger is in the store and whose fixes
+# still open on the forge: `ledger` is `LEDGER_STORE`, and the note says why.
+LEDGER_KEY = "ledger"
+LEDGER_NOTE_KEY = "ledger_note"
+# The `status` of that run's `finish` and of its envelope. It is published
+# memory for the next run of the same repository (`previous_store_ledger`).
+STORE_LEDGER_STATUS = "STORE_LEDGER"
+# Why the ledger is in the store. A forge that has no issue verbs has no
+# issue tracker (Bitbucket). A forge with issues and no labels cannot find
+# its ledger issue, which is found by its label.
+STORE_LEDGER_NO_ISSUES_REASON = "{repo} is on a forge that has no issue tracker"
+STORE_LEDGER_NO_LABELS_REASON = (
+    "{repo} is on a forge that has no labels, and a ledger issue is found by its label"
+)
+STORE_LEDGER_NOTE = (
+    "{reason}, so the ledger is kept in the report store and sent to chat. "
+    "Remediation {noun}s still open on the forge; to ask for a fix, ask in chat."
+)
+STORE_LEDGER_UNSTORED_NOTE = (
+    "{reason}, so the ledger is kept in the report store and sent to chat. "
+    "Remediation {noun}s still open on the forge; to ask for a fix, ask in chat. "
+    "The report store write failed, so the store may not hold this run: keep this message."
+)
+# The read that proves such a repository can be reached: one open proposal.
+# The issue listing (`REACHABILITY_PROBE_VERB`) proves nothing on a forge
+# that has no issues.
+STORE_REACHABILITY_PROBE_VERB = "proposal-list"
 # The refusal when several repositories are managed and none has role gitops.
 # The audit never chooses one of them itself (gke-labs/kube-agents#2989).
 NO_GITOPS_ROLE_MESSAGE = (
@@ -982,9 +1072,182 @@ UNREADABLE_GITOPS_KEY_REMEDY = (
 )
 # The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
-# How many findings the chat summary names, most severe first; the store keeps
-# every one.
+# How many held ids the chat summary names, and how many findings it lists,
+# most severe first, for a run the store does not hold, whose summary is then
+# the only copy; the store keeps every one.
 NO_FORGE_SUMMARY_FINDINGS = 10
+# The rows the chat summary lists: the critical findings up to the first
+# number, else the top findings of the most severe level present up to the
+# second. Fewer critical rows than the ledger card's ten, because the summary
+# is the whole report and the rest are counted under the rows.
+NO_FORGE_SUMMARY_CRITICAL_ROWS = 3
+NO_FORGE_SUMMARY_TOP_ROWS = 2
+# The chat summary's lines. A row is the finding's short cluster name and a
+# plain phrase for its check (`CHECK_PHRASES`), its severity as inline code.
+SUMMARY_ROW = "`{severity}` {where}: {phrase}"
+SUMMARY_ROW_OBJECT = "{phrase} ({object})"
+SUMMARY_MORE = "{count} more ({breakdown}) {verb} saved on the install."
+SUMMARY_MORE_UNSTORED = "{count} more ({breakdown}) {verb} not listed here."
+SUMMARY_MORE_VERB = ("is", "are")
+SUMMARY_BREAKDOWN_PART = "{count} {severity}"
+SUMMARY_BREAKDOWN_SEPARATOR = ", "
+SUMMARY_HELD_MORE = ", and {count} more saved on the install"
+# The finding kind whose object is the cluster itself, which a row names once.
+CLUSTER_OBJECT_KIND = "Cluster"
+# The placeholder a phrase carries for the object it judged.
+PHRASE_OBJECT = "{object}"
+# The chat summary's and the chat report's headline: the count of the most
+# severe findings present and what changed, each clause only when it is not
+# zero.
+HEADLINE_LEAD = "{count} {severity} {noun}"
+HEADLINE_FINDINGS_NOUN = ("finding", "findings")
+HEADLINE_NO_FINDINGS = "no findings"
+HEADLINE_NEW = "{count} new"
+HEADLINE_RESOLVED = "{count} resolved"
+HEADLINE_CLAUSE_SEPARATOR = ", "
+HEADLINE_DELTA_UNKNOWN = "; the change since the last run is unknown"
+CLUSTERS_PHRASE = ("{count} cluster", "{count} clusters")
+CARRIED_PHRASE = ("{count} carried finding was", "{count} carried findings were")
+# A plain phrase for what each check found, for the chat summary of a run with
+# no ledger: "seeded-a: control plane is public", "seeded-a: payments-api runs a
+# privileged container". A phrase with `{object}` takes the name of the object
+# the finding judged; one without it names the cluster's own setting, and a
+# named object follows it in brackets. A finding whose check has no phrase, or
+# whose phrase needs an object it does not name, keeps its own title.
+# `test_every_check_has_a_plain_phrase` holds this to every roster in `AUDITS`.
+CHECK_PHRASES = {
+    # Security & RBAC Posture Audit
+    "privileged-container": "{object} runs a privileged container",
+    "host-namespace": "{object} shares the node's host namespaces",
+    "hostpath-mount": "{object} mounts a path from the node",
+    "cluster-admin-binding": "{object} grants cluster-admin",
+    "wildcard-rbac": "{object} grants wildcard permissions",
+    "netpol-missing": "{object} has no network policy",
+    "default-sa-automount": "{object} mounts the default service account's token",
+    "workload-identity-off": "Workload Identity is off",
+    "legacy-metadata": "legacy node metadata endpoints are on",
+    "public-control-plane": "control plane is public",
+    "podsecurity-gaps": "{object} doesn't enforce Pod Security",
+    "kcc-object-wedged": "{object} is stuck in Config Connector",
+    "image-floating-tag": "{object} uses a floating image tag",
+    "unbound-sa-automount": "{object} mounts a service account token it doesn't use",
+    "lb-world-open": "{object} is a load balancer open to the internet",
+    "anonymous-rbac-binding": "{object} grants access to anonymous users",
+    # Upgrade & Patch Readiness Audit
+    "master-behind": "control plane is behind its release channel",
+    "pool-skew": "{object} node pool lags the control plane",
+    "fleet-spread": "clusters run too many different versions",
+    "no-channel": "not enrolled in a release channel",
+    "no-autoupgrade": "{object} node pool has auto-upgrade off",
+    "no-autorepair": "{object} node pool has auto-repair off",
+    "no-maintenance-window": "no maintenance window is set",
+    "blocking-exclusion": "a maintenance exclusion blocks upgrades",
+    "stale-image-type": "{object} node pool uses a retired node image",
+    "no-notifications": "upgrade notifications are off",
+    "upgrade-blocked": "an upgrade is blocked",
+    # Workload Reliability Audit
+    "no-requests": "{object} sets no resource requests",
+    "no-memory-limit": "{object} has no memory limit",
+    "no-pdb": "{object} has no disruption budget",
+    "blocking-pdb": "{object} has a disruption budget that blocks node drains",
+    "no-hpa": "{object} has no autoscaler",
+    "hpa-cannot-scale": "{object} has an autoscaler that can't scale",
+    "rigid-scheduling": "{object} can only run on a narrow set of nodes",
+    "no-spread": "{object} isn't spread across zones or nodes",
+    "probes-readiness": "{object} has no readiness probe",
+    "probes-liveness": "{object} has no liveness probe",
+    "single-replica": "{object} runs a single replica",
+    "schedule-never-succeeds": "{object} can never be scheduled",
+    "rollout-drops-traffic": "{object} drops traffic during rollouts",
+    "strategy-causes-downtime": "{object} goes down during updates",
+    "cronjob-runs-overlap": "{object} starts runs that overlap",
+    "service-selects-nothing": "{object} selects no pods",
+    "service-port-unresolved": "{object} points at a port no pod exposes",
+    "liveness-preempts-readiness": "{object} restarts before it is ready",
+    "spread-not-achieved": "{object} isn't spread the way it asks",
+    "prestop-outlives-grace": "{object} is killed before its shutdown hook ends",
+    "rwo-claim-contended": "{object} shares a volume only one node can write",
+    "hpa-floors-at-one": "{object} can scale down to one replica",
+    "pdb-overlapping": "{object} has overlapping disruption budgets",
+    "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
+    # Fleet Waste Audit
+    "overrequest": "{object} requests far more than it uses",
+    "orphan-pv": "{object} is a volume nothing uses",
+    "unconsumed-pvc": "{object} is a volume claim no pod mounts",
+    "unattached-disk": "{object} is a disk attached to nothing",
+    "idle-address": "{object} is a reserved IP address in no use",
+    "orphan-lb": "{object} is a load balancer for a deleted service",
+    "idle-nodepool": "{object} node pool is idle",
+    "scaledown-blocked": "{object} blocks node scale-down",
+    "terminal-pods": "{object} has finished pods left behind",
+    "idle-namespace": "{object} namespace is idle",
+    "underrequest": "{object} requests less than it uses",
+    "unsized-workload": "{object} sets no requests to size it by",
+    "idle-workload": "{object} is idle",
+    "registry-no-cleanup": "{object} registry never deletes old images",
+    # Fleet Consistency Drift Audit
+    "release-channel": "release channel differs from its peers",
+    "shielded-nodes": "Shielded Nodes setting differs from its peers",
+    "secure-boot": "Secure Boot setting differs from its peers",
+    "integrity-monitoring": "integrity monitoring differs from its peers",
+    "network-policy": "network policy setting differs from its peers",
+    "private-nodes": "private nodes setting differs from its peers",
+    "private-endpoint": "private endpoint setting differs from its peers",
+    "authorized-networks": "authorized networks differ from its peers",
+    "logging-components": "logging differs from its peers",
+    "monitoring-components": "monitoring differs from its peers",
+    "managed-prometheus": "Managed Prometheus setting differs from its peers",
+    "binary-authorization": "Binary Authorization setting differs from its peers",
+    "node-autoprovisioning": "node auto-provisioning differs from its peers",
+    "pool-autoscaling": "node pool autoscaling differs from its peers",
+    "intra-node-visibility": "intranode visibility differs from its peers",
+    "datapath-provider": "dataplane differs from its peers",
+    "label-keys": "labels differ from its peers",
+    "image-type": "node image type differs from its peers",
+    "database-encryption": "secrets encryption differs from its peers",
+    "no-environment-label": "has no environment label",
+    "uncohorted": "differs from its peers on too many settings to compare",
+    # AI Workload Security Audit
+    "inference-endpoint-public": "{object} serves a model to the internet",
+    "model-remote-code-trusted": "{object} runs a model's remote code",
+    "weights-mount-writable": "{object} mounts model weights writable",
+    "model-artifact-unpinned-source": "{object} loads a model from an unpinned source",
+    "model-credential-plaintext-env": "{object} has a model credential in plain text",
+    "model-image-floating-tag": "{object} uses a floating model image tag",
+    # Fleet Stockout Prevention & Capacity Audit
+    "ccc-missing-fallbacks": "{object} compute class has no fallback",
+    "ccc-no-ondemand-floor": "{object} compute class has no on-demand fallback",
+    "ccc-large-vm-scarcity": "{object} compute class relies on scarce large machines",
+    "ccc-priority-starvation": "{object} compute class can starve its workloads",
+    "ccc-mixed-disk-generations": "{object} compute class mixes disk types",
+    "ccc-hyperdisk-incompatible": "{object} compute class can pick machines its disks don't support",
+    "quota-exhaustion-risk": "quota is close to running out",
+    "spot-scarcity-risk": "{object} depends on scarce Spot capacity",
+    "single-zone-nodepool": "{object} node pool sits in one zone",
+    "reservation-mismatch-risk": "a reservation doesn't match what runs",
+    "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
+    "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
+    # GCP Networking Fabric & VPC IPAM Audit
+    "subnet-ip-exhaustion": "subnet is running out of IP addresses",
+    "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
+    "psc-routing-deadlock": "a Private Service Connect route can't be reached",
+    "mtu-packet-fragmentation": "MTU settings fragment packets",
+    "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
+    "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
+    # GCE Compute Engine and MIG Fleet Audit
+    "gce-startup-script-status": "{object} startup script failed",
+    "mig-convergence-stalled": "{object} instance group isn't converging",
+    "sole-tenant-headroom": "sole-tenant nodes are nearly full",
+    "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+    # Upgrade Retrospective
+    "upgrade-operation-failed": "an upgrade operation failed",
+    "upgrade-broke-workload": "{object} broke after the upgrade",
+    "node-broken-after-upgrade": "{object} node stayed broken after its pool's rebuild",
+    "upgrade-symptom-tentative": "{object} may have been broken by the upgrade",
+    "upgrade-symptom-unclassified": "{object} shows a symptom after the upgrade that matches no known pattern",
+    "symptom-predates-upgrade": "{object} was already broken before the upgrade",
+    "upgrade-log-volume-rose": "{object} writes far more logs since the upgrade",
+}
 
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
@@ -1016,6 +1279,9 @@ CAPABILITY_VERBS_KEY = "verbs"
 CAPABILITY_LABELS_KEY = "labels"
 # The broker's refusal of a label field on a forge with no labels.
 LABELS_UNSUPPORTED_CODE = "LABELS_UNSUPPORTED"
+# The JSON line's and the envelope's key for why a store-ledger run could not
+# list its remediation proposals, and so ran with remediation off.
+REMEDIATION_REFUSED_KEY = "remediation_refused"
 
 # What a remediation is called when the forge's own noun cannot be read. Every
 # GitHub repository is spoken of this way; a GitLab one as a "merge request".
@@ -1205,6 +1471,17 @@ FINDING_HEADING = "#### "
 # that passed no manifest, so those rows survive a run that cannot re-evaluate
 # them; the identity lines themselves are the same shape as a finding's.
 HELD_SECTION_HEADING = "## Held by the collector"
+# The heading for the previous findings that sit on a target this run did not
+# read or did not check (`unread_held_entries`). They go in the same held span
+# as the collector-held rows, so the hidden block keeps their ids, but not in
+# the held-id list: a run without a manifest carries that list unchanged, and
+# these rows must go away when a run checks their target again. The second
+# spelling is for a body that also has collector-held rows above them.
+UNREAD_HELD_HEADING = "## Not re-checked this run"
+UNREAD_HELD_SUBHEADING = "### Not re-checked this run"
+# The key a held entry carries when it is held because its target was not
+# re-checked. Its value is the reason, which the row shows.
+UNREAD_REASON_KEY = "unread"
 # The renderer brackets the held section with these two comments, and the
 # readers key on them rather than on Markdown headings: a model-written line
 # beginning `## `, or an unbalanced fence, in any free-text field would end a
@@ -1224,6 +1501,14 @@ HELD_SECTION_END = "<!-- audit-held:end -->"
 # inference from it manufactured holds on streams that never had a manifest.
 HELD_IDS_COMMENT = "audit-held-ids"
 HELD_IDS_RE = re.compile(rf"<!--[ \t]*{HELD_IDS_COMMENT}:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+# Inside the same span every tier also writes the ids under _Not re-checked
+# this run_ (`UNREAD_HELD_HEADING`) as a second list. No run reads it back: the
+# next run reads these ids from the hidden block and their places from the
+# report store. It is for a reader of the body. The note and id-only tiers
+# show no row for them, and without the list a reader cannot tell them from
+# findings that the body cut for space (the bench's `every_finding_named`
+# check reads it for that reason).
+NOT_RECHECKED_IDS_COMMENT = "audit-not-rechecked-ids"
 HELD_CHECK_LINE_RE = re.compile(
     r"^- \*\*Check:\*\* `([^`\n]*)` — the collector ran `([^`\n]*)` there", re.M
 )
@@ -1410,6 +1695,14 @@ UNREPORTED_UNDER_GAP_KEY = "unreported_under_gap"
 # `unreported_under_gap` and that are still not published. The next run does
 # not report them again. A record without the key subtracts nothing.
 REPORTED_UNDER_GAP_KEY = "reported_under_gap"
+# On the stored envelope only: the title and place of each previous finding
+# that the run kept under _Not re-checked this run_ (`unread_held_entries`).
+# The note and id-only tiers of the held span write no row for them, and the
+# run's own document does not carry them, so without this key the next gap
+# run cannot tell where each one is and drops it. Only when not empty.
+NOT_RECHECKED_KEY = "not_rechecked"
+# The fields of one entry under `NOT_RECHECKED_KEY`.
+NOT_RECHECKED_FIELDS = ("id", "title", "check", "cluster", "namespace", "object")
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -1621,14 +1914,172 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
-# The end of the note `degrade_missing_remediations` writes for a manifest
-# file that the audit did not write.
+# What `redact_secrets` writes in place of a credential. The route notes
+# below use it too, so it is declared before them.
+REDACTED = "[redacted by audit_report.py]"
+# The notes `disclose_manual_remediation_routes` adds to a `manual` remediation
+# from the collector's candidate fields. Each value in a note is a path or a
+# name that `ROUTE_PATH_PATTERN` or `RECONCILER_PATTERN` accepts, and that
+# `redact_secrets` does not change, so the pass can find and remove the whole
+# note that an earlier copy of the text carries (`ROUTE_NOTE_PATTERN`) before
+# it writes the note again.
+DECLARED_NOTE_LEDE = "_(Declared in this repository at "
+DECLARED_NOTE = (
+    DECLARED_NOTE_LEDE + "`{path}`. Make the change in the repository, not on the live object.)_"
+)
+RELEASE_NOTE_LEDE = "_(Rendered by "
+RELEASE_NOTE = (
+    RELEASE_NOTE_LEDE + "{noun} declared at `{path}`. Make the change in that file: "
+    "the next sync or upgrade of the release can revert a patch to the live object.)_"
+)
+NAMESPACE_DIRECTORY_NOTE_LEDE = "_(A new object for this namespace belongs under "
+NAMESPACE_DIRECTORY_NOTE = NAMESPACE_DIRECTORY_NOTE_LEDE + "`{path}`.)_"
+# The namespace-directory note for the two `namespace_directory.source`
+# values that oblige the worker to do more than add a file. A Kustomize root
+# renders only the files that its `resources:` names. A directory for the
+# whole cluster supplies no namespace, and a cluster-scoped finding can get it.
+NAMESPACE_OVERLAY_NOTE = (
+    NAMESPACE_DIRECTORY_NOTE_LEDE + "the Kustomize root `{path}`. "
+    "List its file in the `resources:` of that root, or it does not render.)_"
+)
+NAMESPACE_CLUSTER_NOTE = (
+    "_(A new object for this cluster belongs under `{path}`. That directory serves the whole "
+    "cluster, so a namespaced object there must set `metadata.namespace`.)_"
+)
+# The `namespace_directory.source` values `collect.namespace_directories`
+# writes, copied because this script does not import the collector, and the
+# note for each. Another value gets `NAMESPACE_DIRECTORY_NOTE`, as `sibling`.
+NAMESPACE_DIRECTORY_NOTES = {
+    "sibling": NAMESPACE_DIRECTORY_NOTE,
+    "overlay": NAMESPACE_OVERLAY_NOTE,
+    "cluster": NAMESPACE_CLUSTER_NOTE,
+}
+RECONCILED_NOTE_LEDE = "_(Reconciled by "
+RECONCILED_NOTE = (
+    RECONCILED_NOTE_LEDE + "{reconciler}. The next sync or upgrade can revert a change made "
+    "by hand to the live object; make the change where that reconciler gets its configuration.)_"
+)
+# The characters a route note shows from a path or a name. The values come
+# from file names in the repository and from annotations on the live object,
+# which anyone who can edit the object can set. A value of these characters
+# cannot close its code span, start a link or an HTML tag, or mention a
+# user, so it shows as plain text. A path with another character gets no
+# location note.
+ROUTE_PATH_TEXT = r"[A-Za-z0-9_./-]+"
+ROUTE_PATH_PATTERN = re.compile(ROUTE_PATH_TEXT)
+# The longest path and the longest reconciler phrase that a route note shows.
+# The two longest notes with values at these caps take less than
+# `MAX_NOTE_CHARS`, so the route notes always leave room for the start of the
+# worker's note and its truncation mark. A longer path gets no location note,
+# and a longer reconciler is shown as `RECONCILER_UNNAMED`.
+ROUTE_PATH_MAX_CHARS = 512
+ROUTE_RECONCILER_MAX_CHARS = 512
+# A name in a reconciler: a Helm release, an Argo CD Application, or an
+# `app.kubernetes.io/managed-by` label value.
+ROUTE_NAME_TEXT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+# A namespace is a DNS label, which has no character that Markdown reads,
+# so it shows outside a code span, as `collect.reconciler_of` writes it.
+ROUTE_NAMESPACE_TEXT = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+# The three phrases `collect.reconciler_of` writes, copied because this script
+# does not import the collector. A reconciler that is not exactly one of
+# them is shown as `RECONCILER_UNNAMED`: the note then still says that a
+# change by hand can be reverted, and it shows nothing from the annotation.
+RECONCILER_TEMPLATE = (
+    "the Helm release `{name}`(?: in {namespace})?"
+    "|the Argo CD Application `{name}`"
+    "|`{name}`"
+)
+RECONCILER_TEXT = RECONCILER_TEMPLATE.format(name=ROUTE_NAME_TEXT, namespace=ROUTE_NAMESPACE_TEXT)
+RECONCILER_PATTERN = re.compile(RECONCILER_TEXT)
+RECONCILER_UNNAMED = "a controller whose name the audit does not show"
+# The `renderer` values `collect.release_declarations` writes, copied because
+# this script does not import the collector, and the noun the release note
+# uses for each. A Kustomize overlay has no values file, so "the chart
+# release" would send the reader to look for a file that does not exist.
+RELEASE_RENDERER_NOUNS = {
+    "helm": "the chart release",
+    "kustomize": "the Kustomize overlay",
+}
+RELEASE_RENDERER_FALLBACK_NOUN = "the release"
+# A value in an earlier route note, also after `redact_secrets` changed it.
+# A note that an older run wrote can hold a value that redaction changed, and
+# a note that the pattern does not find is written again on each run.
+ROUTE_REDACTED_TEXT = re.escape(REDACTED)
+ROUTE_STORED_PATH_TEXT = rf"(?:[A-Za-z0-9_./-]|{ROUTE_REDACTED_TEXT})+"
+ROUTE_STORED_RECONCILER_TEXT = RECONCILER_TEMPLATE.format(
+    name=rf"(?:[A-Za-z0-9_.-]|{ROUTE_REDACTED_TEXT})+",
+    namespace=rf"(?:[a-z0-9-]|{ROUTE_REDACTED_TEXT})+",
+)
+# One earlier route note, exactly as a template above writes it. A value can
+# hold no character of the text around it, so a match is always one whole
+# note, and a removal never leaves part of a note behind.
+ROUTE_NOUN_TEXT = "|".join(
+    re.escape(noun) for noun in (*RELEASE_RENDERER_NOUNS.values(), RELEASE_RENDERER_FALLBACK_NOUN)
+)
+ROUTE_NOTE_PATTERN = re.compile(
+    "|".join(
+        "(?:"
+        + re.escape(template)
+        .replace(re.escape("{path}"), ROUTE_STORED_PATH_TEXT)
+        .replace(re.escape("{noun}"), f"(?:{ROUTE_NOUN_TEXT})")
+        .replace(re.escape("{reconciler}"), f"(?:{ROUTE_STORED_RECONCILER_TEXT}|{re.escape(RECONCILER_UNNAMED)})")
+        + ")"
+        for template in (
+            DECLARED_NOTE,
+            RELEASE_NOTE,
+            NAMESPACE_DIRECTORY_NOTE,
+            NAMESPACE_OVERLAY_NOTE,
+            NAMESPACE_CLUSTER_NOTE,
+            RECONCILED_NOTE,
+        )
+    )
+)
+# What must not touch a path in a worker's note for the note to name that
+# path as a whole path: no path character before it, and no path character
+# after it, also after a full stop that ends a sentence.
+WHOLE_PATH_BEFORE = r"(?<![\w./-])"
+WHOLE_PATH_AFTER = r"(?!\.?[\w/-])"
+# The same, with the spaces before it, so that a removal keeps the newlines.
+ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
+# What a worker note is cut with when the route notes need its space.
+ROUTE_NOTE_TRUNCATED = " …(truncated)"
+# The remediation field that keeps the worker's note before that cut. The
+# stored document keeps it, and `carry_unchanged_findings` puts it back as
+# the note, so a cut that the route notes needed on one run does not stay on
+# the note of a later run that has room. Only `finish` writes it:
+# `validate_findings` removes it from the worker's document.
+ROUTE_UNCUT_NOTE_FIELD = "uncut_note"
+# What joins two route notes, and what puts the route notes on their own
+# paragraph after the worker's note. A paragraph of its own is outside any
+# code block the worker's note ends with.
+NOTE_SEPARATOR = " "
+ROUTE_PARAGRAPH_BREAK = "\n\n"
+CODE_FENCE = "```"
+# What closes a code fence that the worker's note leaves open.
+CODE_FENCE_CLOSE = "\n```"
+# The start and the end of the note `degrade_missing_remediations` writes,
+# after the worker's note, for a manifest file that the audit did not write.
+DEGRADED_REMEDIATION_LEDE = "_(The audit "
 DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run the audit.)_"
 # The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
 # fix that Config Connector reverts.
 KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
 # The sentence every note of `degrade_unlisted_kustomize_additions` holds.
 KUSTOMIZE_NOTE_MARK = "A new file in a Kustomize root renders only if its kustomization lists it."
+# The start of a note of `degrade_unlisted_kustomize_additions`: its own text
+# on one line, then the worker's file as a fenced YAML block, or, when no
+# line of the file fits, its own text with no block. The route-note pass
+# does not cut this text, because the block is the only published copy of
+# the fix.
+# Its own text ends at the end of its line when the block follows, and at
+# the first end of a note after the mark when the worker's note follows.
+KUSTOMIZE_NOTE_LINE_TEXT = re.escape(DEGRADED_REMEDIATION_LEDE) + r"[^\n]*" + re.escape(KUSTOMIZE_NOTE_MARK)
+KUSTOMIZE_NOTE_BLOCK_PATTERN = re.compile(
+    r"(?P<prefix>" + KUSTOMIZE_NOTE_LINE_TEXT + r"[^\n]*\.\)_)"
+    r"\n\n(?P<fence>`{3,})yaml\n(?P<body>.*?)\n(?P=fence)(?:\n|\Z)",
+    re.DOTALL,
+)
+KUSTOMIZE_NOTE_PREFIX_PATTERN = re.compile(r"(?P<prefix>" + KUSTOMIZE_NOTE_LINE_TEXT + r"[^\n]*?\.\)_)(?= |\Z)")
 # Text that `finish` itself writes into a remediation note. A note that holds
 # one of these is not the worker's wording, and `carry_unchanged_findings`
 # does not copy it: the pass that wrote it runs again on each run and writes
@@ -1830,6 +2281,32 @@ CLUSTERS_LISTED_KEY = "clusters_listed"
 MANIFEST_FINISHED_KEY = "finished_at"
 # The collector's wall-clock start. Read only for the `collect_s` timer.
 MANIFEST_STARTED_KEY = "started_at"
+# Two keys the upgrade retrospective's collector writes that say the manifest
+# is not one the SOP files from, so `load_manifest` refuses it for `draft`
+# and `finish` alike. `scoped`: the run was narrowed (no `--full`, or
+# `--cluster`, `--since`, `--after-upgrade`); a scoped run files no ledger
+# and the SOP hands it no `--manifest-file`, since a manifest that read a few
+# clusters would have `finish` announce every other cluster's finding
+# resolved. `after_reset`: the store was reset (`--reset-ledger`) and the run
+# is the baseline the SOP files nothing from, or a run before it; the ledger
+# keeps its findings until the next full run reads the fleet again.
+MANIFEST_SCOPED_KEY = "scoped"
+MANIFEST_AFTER_RESET_KEY = "after_reset"
+MANIFEST_SCOPED_REFUSAL = (
+    "--manifest-file: {path} carries {key}: true; the collector ran a scoped run (no "
+    "--full, or --cluster, --since or --after-upgrade), and the SOP hands a scoped run "
+    "no --manifest-file: it files no ledger. This manifest vouches for the clusters it "
+    "read and for no other, so a finish from it would announce every other cluster's "
+    "finding resolved. Run neither draft nor finish on it; only a full run's manifest "
+    "reaches finish."
+)
+MANIFEST_AFTER_RESET_REFUSAL = (
+    "--manifest-file: {path} carries {key}: true; the collector wrote it after "
+    "--reset-ledger archived its store, and no full run has written the new baseline "
+    "yet. The SOP files nothing from such a run: report from the collector's report "
+    "alone, and run neither draft nor finish on this manifest. The ledger keeps its "
+    "findings until the next full run reads the fleet again."
+)
 MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # How much of a collector's `error` a refusal quotes back.
@@ -1853,11 +2330,13 @@ COLLECTOR_COMMAND_UNRECORDED = "(the collector recorded no command for this chec
 # its identity — anchor, heading, `Where:` line — because that is what the next
 # run reads its location from; only the detail is capped.
 MAX_HELD_DETAIL_ROWS = 50
-# How many collector-held ids a ledger carries at once. The ids are a
+# How many held ids a ledger carries at once: the collector-held ids first,
+# then the ids held because a run did not check their target. The ids are a
 # monotone term in the hidden marker that no SOP-side edit can shrink, so
 # unbounded they could push a body past GitHub's limit on every run; kept in
-# sorted order so which ones survive the cap is deterministic, with the
-# overflow logged and stated in the body.
+# sorted order so which ones survive the cap is deterministic. Each overflow
+# is logged, and the body states it in every tier of the held span except the
+# id-only one, which has no text.
 MAX_HELD_IDS = 200
 # The coverage gaps a clean run files when the report store holds no memory of
 # the open ledger. The first when the collector still flags something the
@@ -1879,7 +2358,25 @@ LOST_MEMORY_UNGUARDED_GAP = (
     "until a run that reports findings rewrites it, or a human who has checked "
     "them closes it"
 )
-LOST_MEMORY_GAPS = (LOST_MEMORY_GAP, LOST_MEMORY_UNGUARDED_GAP)
+# The same two gaps on a run that keeps its ledger in the report store
+# (`_finish_store_ledger`). There is no ledger issue to hold open or for a
+# person to close, so the gap says what the run holds back: the stale closes.
+STORE_LOST_MEMORY_GAP = (
+    "the report store holds no trusted record of the stored ledger, so the "
+    "findings it carries are unknown, and the collector still flags something "
+    "this run did not report; no remediation fix is closed over it"
+)
+STORE_LOST_MEMORY_UNGUARDED_GAP = (
+    "the report store holds no trusted record of the stored ledger, so nothing "
+    "shows whether the findings it carries were fixed; no remediation fix is "
+    "closed until a run that reports findings stores the ledger again"
+)
+LOST_MEMORY_GAPS = (
+    LOST_MEMORY_GAP,
+    LOST_MEMORY_UNGUARDED_GAP,
+    STORE_LOST_MEMORY_GAP,
+    STORE_LOST_MEMORY_UNGUARDED_GAP,
+)
 # What a clean run says about a lost memory where a coverage gap would say
 # "did not see the whole fleet": the fleet may have been seen whole, and the
 # way out is a findings run or a maintainer, not better coverage.
@@ -2042,8 +2539,6 @@ def normalise_newlines(text: str | None) -> str:
         return ""
     return str(text).replace("\r\n", "\n").replace("\r", "\n")
 
-
-REDACTED = "[redacted by audit_report.py]"
 
 # Every hidden marker this harness reads — the delta block, the id scheme, the
 # finding markers, the held-section brackets — is an HTML comment, so a `<!--`
@@ -3045,6 +3540,8 @@ def report_envelope(
     ledger_held_open: bool = False,
     delta_known: bool = True,
     reported_under_gap: list[str] | None = None,
+    open_issue_number: int | None = None,
+    not_rechecked: list[dict] | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
 
@@ -3069,6 +3566,12 @@ def report_envelope(
     open ledger: `new_ids` and `resolved_ids` are then empty because the delta
     was withheld, not because nothing changed, and a reader must say so
     rather than print a zero.
+    `open_issue_number` names the ledger issue the run left open when
+    `issue_number` is None for the trust check (`OPEN_LEDGER_KEY`). Only
+    `find_existing_issue` reads it, to find a ledger the label listing left
+    out; `read_report_memory` does not, so the memory stays lost.
+    `not_rechecked` is the entries the run kept under _Not re-checked this
+    run_; each is stored with its title and place (`NOT_RECHECKED_KEY`).
     `finished_at` is the run's own generation timestamp, the one the ledger
     footer prints, so the envelope and the body agree about when it ran.
     The phase timers (`PHASE_TIMER_KEYS`) are copied from `payload`, and a
@@ -3099,6 +3602,7 @@ def report_envelope(
         "silent_ok": payload.get("silent_ok"),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
         "ledger_held_open": ledger_held_open,
+        **({OPEN_LEDGER_KEY: open_issue_number} if open_issue_number is not None else {}),
         "delta_known": delta_known,
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
@@ -3118,6 +3622,17 @@ def report_envelope(
         **(
             {REPORTED_UNDER_GAP_KEY: sorted(set(reported_under_gap))}
             if reported_under_gap
+            else {}
+        ),
+        # Only when not empty, as above.
+        **(
+            {
+                NOT_RECHECKED_KEY: [
+                    {field: str(entry.get(field) or "") for field in NOT_RECHECKED_FIELDS}
+                    for entry in sorted(not_rechecked, key=lambda e: str(e.get("id", "")))
+                ]
+            }
+            if not_rechecked
             else {}
         ),
     }
@@ -3361,8 +3876,77 @@ def save_chat_verdict(
         log(f"WARNING: chat report for {audit_id} not saved: {exc}")
 
 
+class RunBaseline(NamedTuple):
+    """The previous run's ids a `finish` counts its chat report against."""
+
+    ids: list[str]
+    known: bool
+    stale_scheme: bool
+    # Every id the previous run filed, rendered or not; never counted new.
+    filed: list[str]
+    # Read off the entry an earlier `finish` of this run saved it on.
+    from_entry: bool
+
+
+def run_baseline(
+    audit_id: str,
+    repo: str,
+    previous_ids: list[str],
+    delta_known: bool,
+    stale_scheme: bool,
+    filed_ids: Iterable[str],
+    now: datetime,
+) -> RunBaseline:
+    """The baseline on `repo`'s entry in this run, else this `finish`'s own, saved there.
+
+    Best-effort: never fails the run. Called before the ledger is touched, so a
+    `finish` that dies anywhere after it still leaves the baseline for its
+    re-run. Never replaced inside a run, so every later `finish` joins the one
+    the first saw. Saved only on an entry no `finish` has filled: an earlier
+    one that saved none (an older image, a failed write) leaves this one's
+    memory a mid-run snapshot, which no later `finish` may count from.
+    """
+    own = RunBaseline(list(previous_ids), bool(delta_known), bool(stale_scheme), sorted(set(filed_ids)), False)
+    record = _live_chat_record(audit_id, now)
+    filled = None if record is None else _filled_part(record, repo)
+    part = filled or (None if record is None else _pending_part(record, repo))
+    if part is None:
+        return own
+    ids = part.get(CHAT_REPORT_BASELINE_IDS_KEY)
+    known = part.get(CHAT_REPORT_BASELINE_KNOWN_KEY)
+    stale = part.get(CHAT_REPORT_BASELINE_STALE_KEY)
+    filed = part.get(CHAT_REPORT_BASELINE_FILED_KEY)
+    if (
+        isinstance(ids, list)
+        and all(isinstance(fid, str) for fid in ids)
+        and isinstance(known, bool)
+        and isinstance(stale, bool)
+        and isinstance(filed, list)
+        and all(isinstance(fid, str) for fid in filed)
+    ):
+        return RunBaseline(ids, known, stale, filed, True)
+    if filled is not None:
+        return own
+    part[CHAT_REPORT_BASELINE_IDS_KEY] = own.ids
+    part[CHAT_REPORT_BASELINE_KNOWN_KEY] = own.known
+    part[CHAT_REPORT_BASELINE_STALE_KEY] = own.stale_scheme
+    part[CHAT_REPORT_BASELINE_FILED_KEY] = own.filed
+    record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
+    try:
+        _write_chat_record(audit_id, record)
+    except OSError as exc:
+        log(f"WARNING: chat report baseline for {audit_id} not saved: {exc}")
+    return own
+
+
 def append_chat_report(
-    audit_id: str, repo: str, text: str, now: datetime, *, refinish: bool = False
+    audit_id: str,
+    repo: str,
+    text: str,
+    now: datetime,
+    *,
+    refinish: bool = False,
+    whole_run: bool = False,
 ) -> None:
     """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
 
@@ -3370,14 +3954,18 @@ def append_chat_report(
     the same run adds its report under the earlier one, so neither that report
     nor another repository's is lost. A `finish` with no such entry adds one,
     and with no current record (see `_current_chat_record`) opens one, so its
-    report still reaches the relay under a run of its own.
+    report still reaches the relay under a run of its own. `whole_run` says
+    the report's counts are the run's (see `run_baseline`), which its label
+    then says.
     """
+    refinish_label = CHAT_REPORT_REFINISH_LABEL if whole_run else CHAT_REPORT_REFINISH_RELATIVE_LABEL
+    rerun_label = CHAT_REPORT_RERUN_LABEL if whole_run else CHAT_REPORT_RERUN_RELATIVE_LABEL
     record = _live_chat_record(audit_id, now)
     part = None if record is None else _filled_part(record, repo)
     if part is not None and part.get(CHAT_REPORT_TEXT_KEY):
-        part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{CHAT_REPORT_REFINISH_LABEL}\n{text}"
+        part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{refinish_label}\n{text}"
     elif part is not None:
-        part[CHAT_REPORT_TEXT_KEY] = f"{CHAT_REPORT_RERUN_LABEL}\n{text}" if refinish else text
+        part[CHAT_REPORT_TEXT_KEY] = f"{rerun_label}\n{text}" if refinish else text
     else:
         record = _current_chat_record(audit_id, repo, now)
         pending = _pending_part(record, repo)
@@ -3397,7 +3985,13 @@ def append_chat_report(
         log(f"WARNING: chat report for {audit_id} not written: {exc}")
 
 
-def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bool = True) -> str:
+def render_chat_report(
+    audit_id: str,
+    payload: dict,
+    data: dict,
+    delta_known: bool = True,
+    counts: tuple[int, int] | None = None,
+) -> str:
     """The report the chat relay posts for a run that published to a ledger.
 
     Built from `finish`'s own line and the findings document, so the channel
@@ -3407,39 +4001,34 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
     (`slack_audit_report._ledger_line`). With no trusted memory of the previous
     run (`delta_known` false) the line's `new` and `resolved` are withheld
     zeros, so it says the change is unknown instead of counting them; a HELD
-    run prints no counts and keeps its own line.
+    run prints no counts and keeps its own line. A count of zero is left out
+    (:func:`findings_headline`). `counts`, (new, resolved), replace the
+    line's own for a later `finish` that counts the whole run.
     """
     findings = list(data.get("findings") or [])
-    clusters = len((data.get("scope") or {}).get("clusters") or [])
+    clusters = clusters_phrase(len((data.get("scope") or {}).get("clusters") or []))
     name = audit_name(audit_id)
     status = payload.get("status")
-    resolved = int(payload.get("resolved") or 0)
+    new, resolved = counts or (int(payload.get("new") or 0), int(payload.get("resolved") or 0))
     unaccounted = list(payload.get(UNACCOUNTED_KEY) or [])
     if status == "CLEAN" and delta_known:
-        head = f"{name}: clean, 0 findings, {resolved} resolved across {clusters} cluster(s)."
+        cleared = HEADLINE_CLAUSE_SEPARATOR + HEADLINE_RESOLVED.format(count=resolved) if resolved else ""
+        head = f"{name}: clean{cleared} across {clusters}."
     elif status == "HELD" and unaccounted:
+        carried = CARRIED_PHRASE[len(unaccounted) != 1].format(count=len(unaccounted))
         head = (
-            f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
-            f"{len(unaccounted)} carried finding(s) were not accounted for."
+            f"{name}: {HEADLINE_NO_FINDINGS} across {clusters}, but the ledger stays open: "
+            f"{carried} not accounted for."
         )
     elif status == "HELD":
         # `finish` holds a clean ledger open with nothing unaccounted only when
         # it could not read the issue's comments, where a `/remediate` may wait.
         head = (
-            f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
+            f"{name}: {HEADLINE_NO_FINDINGS} across {clusters}, but the ledger stays open: "
             f"its comments could not be read, so a /remediate there may be unanswered."
         )
-    elif not delta_known:
-        head = (
-            f"{name}: {findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
-            f"across {clusters} cluster(s); the change since the last run is unknown."
-        )
     else:
-        head = (
-            f"{name}: {int(payload.get('new') or 0)} new, {resolved} resolved; "
-            f"{findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
-            f"across {clusters} cluster(s)."
-        )
+        head = findings_headline(name, findings, new, resolved, delta_known)
     lines = [head]
     for label, key in (
         ("Pull requests opened", "prs_opened"),
@@ -3599,20 +4188,26 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
-def _newest_published_envelope(runs: Path) -> dict | None:
-    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
+def _ring_envelopes(runs: Path) -> list[dict]:
+    """The readable envelopes in the `runs/` ring, newest first."""
     try:
         paths = sorted(runs.glob("*.json"), reverse=True)
     except OSError:
-        return None
+        return []
+    envelopes = []
     for path in paths:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(envelope, dict) and not is_diverted(envelope):
-            return envelope
-    return None
+        if isinstance(envelope, dict):
+            envelopes.append(envelope)
+    return envelopes
+
+
+def _newest_published_envelope(runs: Path) -> dict | None:
+    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
+    return next((e for e in _ring_envelopes(runs) if not is_diverted(e)), None)
 
 
 def _envelope_document(envelope: object, key: str) -> dict | None:
@@ -3874,6 +4469,25 @@ def report_finding_places(
             check, cluster, namespace, _object = derive_finding_id(finding).split(".")
             places[published_id(finding)] = (check, cluster, namespace)
     return places
+
+
+def previous_filed_ids(
+    memory: dict | None, previous_body: str, existing_issue: int | None, stale_scheme: bool
+) -> set[str]:
+    """Every id the previous run filed, rendered or not; what `new` is measured against.
+
+    From the stored document when there is one (`report_filed`); else from the
+    complete block a body that cut findings for space wrote. Empty for a first
+    run, a seeded memory with no such block, or another identity scheme.
+    """
+    filed = report_filed(memory) if existing_issue is not None and not stale_scheme else None
+    if filed is not None:
+        return set(filed[0])
+    complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
+    try:
+        return set(json.loads(complete[-1])) if complete else set()
+    except (json.JSONDecodeError, TypeError):
+        return set()
 
 
 def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]] | None:
@@ -4906,6 +5520,9 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
+        # Only `finish` writes this field, and the carry puts it back as the
+        # note; a worker's copy would replace a later run's note with its own.
+        remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
         # Write the corrected spelling back, for the same reason the manifest
         # path above is normalised here: these strings are what get published,
         # and every reader downstream sees whatever they say.
@@ -5763,6 +6380,20 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     what they should have read. One project without it -- or no project
     target at all -- and the gap stands.
     """
+    return [
+        f"no {kind} targets were audited — {len(checks)} check(s) ran "
+        f"against nothing ({', '.join(checks)})"
+        for kind, checks in _stranded_kinds(audit_id, targets)
+    ]
+
+
+def _stranded_kinds(audit_id: str, targets: list) -> list[tuple[str, tuple[str, ...]]]:
+    """Each target kind the run enumerated none of, with the checks that ran nowhere.
+
+    The data behind `_unenumerated_kind_gaps`, which has the rules. Also read
+    by `unread_target_reason`: a previous finding on a target of such a kind
+    was not checked this run, although no entry names its target.
+    """
     spec = AUDITS.get(audit_id)
     if not spec or not spec.scopes or not targets:
         return []
@@ -5779,18 +6410,15 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     # project one, and a run with clusters and no project did not run it
     # "against nothing".
     covered = {check for kind, checks in spec.scopes if kind in seen for check in checks}
-    gaps = []
+    stranded: list[tuple[str, tuple[str, ...]]] = []
     for kind, checks in spec.scopes:
         if kind in seen or (kind == TARGET_KIND_CLUSTER and listed_empty):
             continue
         checks = tuple(c for c in checks if c not in covered)
         if not checks:
             continue
-        gaps.append(
-            f"no {kind} targets were audited — {len(checks)} check(s) ran "
-            f"against nothing ({', '.join(checks)})"
-        )
-    return gaps
+        stranded.append((kind, checks))
+    return stranded
 
 
 # --------------------------------------------------------------------------- #
@@ -5897,6 +6525,12 @@ def load_manifest(path: str, audit_id: str | None = None, command: str | None = 
             f"not {audit_id!r}; a manifest cross-checks the document against its own "
             "stream's roster and corroborates nothing about another's."
         )
+    # The two runs whose manifest the SOP never files from (the constants say
+    # why); a scoped run is the worker's error to pass at all, so it is named
+    # first when a manifest carries both.
+    for key, refusal in ((MANIFEST_SCOPED_KEY, MANIFEST_SCOPED_REFUSAL), (MANIFEST_AFTER_RESET_KEY, MANIFEST_AFTER_RESET_REFUSAL)):
+        if manifest.get(key):
+            raise ValidationError(refusal.format(path=path, key=key))
     if audit_id:
         stale = manifest_predates_run(manifest, audit_id)
         if stale:
@@ -6398,11 +7032,17 @@ def _remediation_is_file_backed(remediation: object) -> bool:
 
 
 def _harness_wrote_note(remediation: object) -> bool:
-    """Whether `finish` wrote part of the note in `remediation`."""
+    """Whether `finish` wrote part of the note in `remediation`, other than
+    the route notes (`HARNESS_NOTE_MARKS` has no route note).
+
+    The note before the route-note cut (`ROUTE_UNCUT_NOTE_FIELD`) counts too:
+    `_strip_route_notes` puts it back after a carry, so a mark that the cut
+    removed from the note must stop the carry all the same.
+    """
     if not isinstance(remediation, dict):
         return False
-    note = str(remediation.get("note") or "")
-    return any(mark in note for mark in HARNESS_NOTE_MARKS)
+    notes = (str(remediation.get(field) or "") for field in ("note", ROUTE_UNCUT_NOTE_FIELD))
+    return any(mark in note for note in notes for mark in HARNESS_NOTE_MARKS)
 
 
 def _remediation_may_carry(before: object, now: object) -> bool:
@@ -6417,9 +7057,11 @@ def _remediation_may_carry(before: object, now: object) -> bool:
     The other direction is safe and is the one the carry is for: a `gcloud`
     command from the previous run stays when the worker now writes `manual`.
 
-    Not when `finish` wrote part of either note. The pass that wrote it
-    runs again after the carry, so a copied note gets the text two times,
-    or keeps a statement that is not true for this run.
+    Not when `finish` wrote part of either note, other than the route notes,
+    which are stripped and written again (`_strip_route_notes`). The pass
+    that wrote the other parts runs again after the carry, so a copied note
+    gets the text two times, or keeps a statement that is not true for this
+    run.
     """
     if not isinstance(before, dict) or not isinstance(now, dict):
         return False
@@ -6483,9 +7125,28 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
                 finding[field] = copy.deepcopy(before[field])
                 changed = True
         if changed:
+            _strip_route_notes(finding.get("remediation"))
             normalise_finding_commands(finding)
             carried.append(fid)
     return carried
+
+
+def _strip_route_notes(remediation: object) -> None:
+    """Remove the route notes from a carried `remediation` note.
+
+    `disclose_manual_remediation_routes` writes them again from this run's
+    manifest after the carry, and calls this for a finding in its `skip` set,
+    which gets no route note. When the previous run cut the worker's note to give the route notes room,
+    the note before the cut (`ROUTE_UNCUT_NOTE_FIELD`) comes back in its place.
+    """
+    if not isinstance(remediation, dict):
+        return
+    uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+    note = uncut if isinstance(uncut, str) else str(remediation.get("note") or "")
+    if ROUTE_NOTE_PATTERN.search(note):
+        note = ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
+    if isinstance(uncut, str) or note != remediation.get("note"):
+        remediation["note"] = note
 
 
 def collector_flagged_ids(manifest: dict | None) -> set[str]:
@@ -8589,6 +9250,235 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     return sorted(held, key=lambda entry: entry["id"])
 
 
+def unread_target_reason(data: dict, check: str, cluster: str) -> str | None:
+    """Why this run did not check `check` on the target `cluster`, or None if it did.
+
+    The per-target form of `coverage_gaps`, for one previous finding. It
+    gives a reason in these cases:
+
+    - The target is in `scope.skipped`. The run did not read it.
+    - The target is in `scope.clusters`, the check is on its roster, and the
+      check is in neither `checks_run` nor `checks_not_applicable`. This is
+      also the case of a check in the collector's `checks_unevaluated`, which
+      `cross_check_manifest` keeps out of both lists.
+    - The target is in `scope.clusters`, the check is a derived one (the
+      stream's `derived` slugs, read from roster checks), and a roster check
+      that applies there is in neither list.
+    - No entry names the target, and its first segment names a project
+      target in `scope.skipped`. A project that the run did not read lists
+      none of its subnets or qualified clusters.
+    - No entry names the target, and the run enumerated no target of its
+      kind (`_stranded_kinds`).
+
+    In all other cases the run checked the target, or the target is not in
+    the fleet now. A check declared not applicable is a check the run looked
+    at, and a check that is neither on the target's roster nor derived is
+    not one this stream checks there. A target that has `limitations` and
+    that ran the check counts as checked: the text does not say which
+    findings it could not see. That target is still a coverage gap, so `resolved` stays
+    at zero.
+    """
+    name = str(cluster or "").strip()
+    if not name:
+        return None
+    scope = data.get("scope") or {}
+    audit_id = str(data.get("audit") or "")
+    key = _id_segment(name)
+    skipped_names = [
+        str(entry.get("cluster", ""))
+        for entry in scope.get("skipped") or []
+        if isinstance(entry, dict)
+    ]
+    skipped = {_id_segment(skipped_name) for skipped_name in skipped_names}
+    # Only the entries spelled as a project target. `_id_segment` makes a
+    # cluster named `project-acme` the same key as `project/acme`.
+    skipped_projects = {
+        _id_segment(skipped_name)
+        for skipped_name in skipped_names
+        if skipped_name.startswith(PROJECT_TARGET_PREFIX)
+    }
+    if key in skipped:
+        return f"`{_ident(name)}` was not read this run"
+    targets = [target for target in scope.get("clusters") or [] if isinstance(target, dict)]
+    for target in targets:
+        target_name = str(target.get("name", "")).strip()
+        if _id_segment(target_name) != key:
+            continue
+        ran = set(checks_ran(target))
+        na = set(checks_na(target))
+        if check in ran or check in na:
+            return None
+        roster = audit_target_checks(audit_id, target_name)
+        if check in roster:
+            return f"`{_ident(check)}` did not run on `{_ident(name)}` this run"
+        spec = AUDITS.get(audit_id)
+        if spec is None or check not in spec.derived:
+            return None
+        # A derived check is read from the roster checks, so it is not
+        # checked where one of them did not run.
+        missing = [c for c in roster if c not in ran and c not in na]
+        if not missing:
+            return None
+        return (
+            f"`{_ident(check)}` is read from checks that did not all run on "
+            f"`{_ident(name)}` this run ({', '.join(_ident(c) for c in missing)})"
+        )
+    if QUALIFIED_TARGET_SEPARATOR in name and not name.startswith(PROJECT_TARGET_PREFIX):
+        project = name.split(QUALIFIED_TARGET_SEPARATOR, 1)[0]
+        if _id_segment(PROJECT_TARGET_PREFIX + project) in skipped_projects:
+            return f"project `{_ident(project)}` was not read this run"
+    spec = AUDITS.get(audit_id)
+    kind = scoped_target_kind(spec, name) if spec else target_kind(name)
+    for stranded, checks in _stranded_kinds(audit_id, targets):
+        if stranded == kind and check in checks:
+            return f"no {kind} target was read this run"
+    return None
+
+
+def _stored_finding_places(memory: dict | None) -> dict[str, dict[str, str]]:
+    """{finding id: title, check, cluster, namespace, object} from the stored document the body renders.
+
+    `ledger_document` when the store has one, else `document`, which is how
+    `report_finding_titles` reads them. It also names the findings that the
+    body budget cut, so it gives the candidates and the places that have no
+    row in the previous body. `report_finding_titles` and
+    `report_finding_places` keep no object, and a held row needs one for its
+    `Where:` line, so they are not used here.
+
+    Then the entries under `NOT_RECHECKED_KEY`: the findings that the
+    stored run kept as not re-checked. That run's document does not carry
+    them, and its body has no row for them in the note and id-only tiers.
+    """
+    envelope = memory or {}
+    document = envelope.get("ledger_document")
+    if not isinstance(document, dict):
+        document = envelope.get("document")
+    findings = document.get("findings") if isinstance(document, dict) else None
+    places: dict[str, dict[str, str]] = {}
+    for finding in findings if isinstance(findings, list) else []:
+        if not isinstance(finding, dict) or not finding.get("id"):
+            continue
+        places.setdefault(
+            str(finding["id"]),
+            {
+                "title": str(finding.get("title") or "").strip(),
+                "check": str(finding.get("check") or "").strip(),
+                "cluster": str(finding.get("cluster") or "").strip(),
+                "namespace": str(finding.get("namespace") or "").strip(),
+                "object": str(finding.get("object") or "").strip(),
+            },
+        )
+    kept = envelope.get(NOT_RECHECKED_KEY)
+    for entry in kept if isinstance(kept, list) else []:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        places.setdefault(
+            str(entry["id"]),
+            {
+                field: str(entry.get(field) or "").strip()
+                for field in NOT_RECHECKED_FIELDS
+                if field != "id"
+            },
+        )
+    return places
+
+
+def unread_held_entries(
+    previous_body: str | None,
+    memory: dict | None,
+    data: dict,
+    *,
+    exclude: set[str],
+    previous_ids: list[str] | None = None,
+) -> list[dict]:
+    """The previous findings that sit on a target this run did not check, as held entries.
+
+    A findings run over a coverage gap writes the body again from its own
+    document. Without these entries, a previous finding on a target that the
+    run did not read went off the ledger and out of the hidden block. The
+    next full run then announced it as new if it was still there, and never
+    announced it as resolved if somebody fixed it during the gap. The
+    entries keep each such finding on the ledger, with its id in the hidden
+    block, out of `resolved` and out of the stale-close pass, until a run
+    checks its target again (`unread_target_reason`).
+
+    The candidates are the ids in the previous hidden block, plus the ids
+    the previous body cut for space: the findings of the stored document
+    that the body renders (`ledger_document`, else `document`, as
+    `report_finding_titles` reads them). Less `exclude` (the document's ids,
+    the withheld postures, the declared entries and the collector-held ids),
+    and less the ids the document lists under `resolved_because`: the run
+    says that those are gone, so it does not also say it did not check them.
+    The place of each comes from its row on the previous body (a full block,
+    or a one-line row under _Listed without detail_), or else from
+    that same stored document, or else from the stored entries the previous
+    run kept as not re-checked (`NOT_RECHECKED_KEY`), which is where the
+    place of a held id with no row is. An id with no known place is not
+    kept, and the log names it: a row
+    held by id alone never gets a place back, so it would stay for as long
+    as any gap stands, and a collector-held id-only row that the collector
+    stopped flagging would come back as not re-checked. The
+    `audit-findings-all` block of a truncated body is not read, because it
+    gives ids with no place. Under
+    another identity scheme the rows are spelled again (`_respelled_rows`)
+    and an id without a row is lost, as for every hold over a scheme change.
+
+    `previous_ids` replaces the hidden block on a run with no ledger body
+    (`_finish_without_forge`): the ids of the stored record, which is
+    trusted only under this `ID_SCHEME`.
+
+    Each entry has the shape of `collector_held_entries`, plus
+    `UNREAD_REASON_KEY` with the reason the row shows. Sorted by id.
+    """
+    from_body = previous_ids is None
+    if previous_ids is None:
+        previous_ids = parse_delta_block(previous_body)
+    if not previous_ids:
+        return []
+    places = _stored_finding_places(memory)
+    # The document says these are gone, so they are not also "not re-checked".
+    resolved = {
+        published_id(entry)
+        for entry in data.get("resolved_because") or []
+        if isinstance(entry, dict)
+    }
+    in_block = set(previous_ids)
+    previous_ids = list(previous_ids) + [fid for fid in places if fid not in in_block]
+    stale = from_body and parse_id_scheme(previous_body) != ID_SCHEME
+    respelled = _respelled_rows(previous_body) if stale else {}
+    for raw, where in parse_finding_locations(previous_body).items():
+        places[raw] = {**where, "check": raw.split(".", 1)[0]}
+    entries: dict[str, dict] = {}
+    for raw in previous_ids:
+        if stale and raw not in respelled:
+            continue
+        fid = respelled.get(raw, raw)
+        if fid in exclude or fid in resolved or fid in entries:
+            continue
+        place = places.get(raw)
+        if place is None:
+            log(
+                f"NOTE: {fid} is on the previous ledger with no recorded place, so this "
+                "run cannot tell if it checked its target; it is not kept as not re-checked."
+            )
+            continue
+        check = place.get("check") or raw.split(".", 1)[0]
+        reason = unread_target_reason(data, check, place.get("cluster", ""))
+        if reason is None:
+            continue
+        entries[fid] = {
+            "id": fid,
+            "title": place.get("title") or f"{check} on {place.get('object', '')}",
+            "check": check,
+            "cluster": place.get("cluster", ""),
+            "namespace": place.get("namespace", ""),
+            "object": place.get("object", ""),
+            "commands": [COLLECTOR_COMMAND_UNRECORDED],
+            UNREAD_REASON_KEY: reason,
+        }
+    return sorted(entries.values(), key=lambda entry: entry["id"])
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers — remediation grouping
 # --------------------------------------------------------------------------- #
@@ -8973,6 +9863,25 @@ def collector_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str
     )
 
 
+def unread_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
+    """Why a `/remediate` on a finding held over an unchecked target is neither refused nor acted on.
+
+    The sibling of `collector_hold_reason` for a row under _Not re-checked
+    this run_ (`unread_held_entries`): the finding is on the ledger, but this
+    run did not check its target, so there is no finding in the document to
+    act on and no reason to call the id a typo. Also for a finding past
+    `MAX_HELD_IDS`, which has no row, so the reply does not say the ledger
+    shows it.
+    """
+    return (
+        f"`{target}` is held because this run did not read or did not "
+        "check its target, so the run cannot tell if the finding is still there. "
+        f"There is no finding in the document to open a {noun} from. The request "
+        "stands: the first run whose document carries the finding acts on it, and "
+        "one that checks the target and no longer sees the finding says so"
+    )
+
+
 def collector_candidate_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a still-flagged id that was never on the ledger is deferred.
 
@@ -9048,6 +9957,7 @@ def parse_remediate_commands(
     collector_held: set[str] | None = None,
     collector_flagged: set[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    unread_held: set[str] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -9064,6 +9974,8 @@ def parse_remediate_commands(
     ledger under Declared intent — is refused with that file named, never as
     a typo; the still-flagged set has the declared ids taken out of it
     already (`still_flagged_ids`), so the two never name the same target.
+    `unread_held` is the ids the ledger keeps under _Not re-checked this
+    run_; a target among them is deferred the same way.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -9097,6 +10009,9 @@ def parse_remediate_commands(
     covered = declared_by_id(declared)
     held_ids = set(collector_held or ())
     flagged_ids = set(collector_flagged or ()) - held_ids
+    # The collector's word first, as on the clean branch: an id the
+    # collector still flags gets the collector's reason.
+    unread_ids = set(unread_held or ()) - held_ids - flagged_ids
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -9197,6 +10112,9 @@ def parse_remediate_commands(
                 continue
             if target in held_ids:
                 deferred.append(collector_hold_reason(target, noun))
+                continue
+            if target in unread_ids:
+                deferred.append(unread_hold_reason(target, noun))
                 continue
             if target in flagged_ids:
                 deferred.append(collector_candidate_reason(target, noun))
@@ -10897,6 +11815,7 @@ def _render_collector_held(
     preview: bool = False,
     carried: bool = False,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    unread_overflow: int = 0,
 ) -> list[str]:
     """The previous findings this run carries forward because the collector still flags them.
 
@@ -10917,11 +11836,107 @@ def _render_collector_held(
     Kept out of `## Findings` on purpose. These are not this run's findings —
     the document did not carry them — so they are not `new`, the sweep never
     sees them, and the heading says whose word they stand on.
+
+    An entry with `UNREAD_REASON_KEY` is held because this run did not check
+    its target (`unread_held_entries`). These rows come after the others,
+    under their own heading, and show the reason in place of the check line.
     """
     if not held:
         return []
+    unread = [entry for entry in held if entry.get(UNREAD_REASON_KEY)]
+    flagged = [entry for entry in held if not entry.get(UNREAD_REASON_KEY)]
+    out = ["", HELD_SECTION_BEGIN]
+    if flagged:
+        out += _render_flagged_held(
+            flagged, detail=detail, overflow=overflow, preview=preview, carried=carried, noun=noun
+        )
+    if unread:
+        out += _render_unread_held(unread, detail=detail, under_flagged=bool(flagged))
+    return out + _render_unread_overflow(unread_overflow, noun) + _held_span_close(held)
+
+
+def _render_unread_overflow(overflow: int, noun: str = DEFAULT_PROPOSAL_NOUN) -> list[str]:
+    """The line a held section ends with when `MAX_HELD_IDS` left unread held findings out."""
+    if not overflow:
+        return []
+    return [
+        "",
+        f"_{overflow} more previous finding(s) are on a target that this run did not "
+        f"check, and are not shown: the ledger holds at most {MAX_HELD_IDS} at once. "
+        f"Their {noun}s stay open, and a `/remediate` on one waits for a run "
+        "that checks its target._",
+    ]
+
+
+def _held_rows_intro(count: int) -> str:
+    """The sentence above the rows of `_render_unread_held` and in `_render_held_note`."""
+    return (
+        f"{count} previous finding(s) are on a target that this run did not read or "
+        "did not check. This run cannot tell if each one is still there, so the ledger "
+        "keeps it and does not show it as resolved. Each stays until a run checks its "
+        "target again; that run reports it again or shows it as resolved."
+    )
+
+
+def _render_unread_held(unread: list[dict], *, detail: bool, under_flagged: bool) -> list[str]:
+    """The rows for the previous findings on a target that this run did not check.
+
+    Each row has the identity lines of a finding, so the next run reads its
+    title and place back. The detail line gives the reason; it is capped and
+    dropped as the rows of `_render_flagged_held` are.
+    """
+    heading = UNREAD_HELD_SUBHEADING if under_flagged else UNREAD_HELD_HEADING
+    intro = (
+        _held_rows_intro(len(unread)) + " The automatic sweep passes over these; a "
+        "`/remediate <finding-id>` on one is held, not refused, until a document "
+        "carries the finding again."
+    )
+    out = ["", heading, "", intro]
+    for index, entry in enumerate(unread):
+        out.append("")
+        out += _held_identity_lines(entry)
+        if not detail or index >= MAX_HELD_DETAIL_ROWS:
+            continue
+        out.append(f"- **Not re-checked:** {entry.get(UNREAD_REASON_KEY)}.")
+        out.append(f"- **Finding id:** `{entry.get('id', '')}`")
+    return out
+
+
+def _held_identity_lines(entry: dict) -> list[str]:
+    """The anchor, heading and `Where:` line of one held row."""
+    fid = str(entry.get("id", ""))
+    if entry.get("location_unrecorded"):
+        # Carried by id alone: the previous body had no row. The heading
+        # keeps the marker reader joined; the location line says what is
+        # missing rather than inventing one from the id's segments.
+        return [
+            f'<a id="{_anchor_id(fid)}"></a>',
+            "",
+            f"#### {clip_text(str(entry.get('title', '')), MAX_TITLE_CHARS)} <!-- finding:{fid} -->",
+            "",
+            "- **Where:** not recorded on the previous ledger; carried by id.",
+        ]
+    return _finding_identity_lines(
+        fid,
+        str(entry.get("title", "")),
+        str(entry.get("cluster", "")),
+        str(entry.get("namespace", "")),
+        str(entry.get("object", "")),
+    )
+
+
+def _render_flagged_held(
+    held: list[dict],
+    *,
+    detail: bool,
+    overflow: int,
+    preview: bool,
+    carried: bool,
+    noun: str,
+) -> list[str]:
+    """The heading, the opening and the rows of the collector-held entries."""
     count_word = "finding" if len(held) == 1 else "findings"
-    out = ["", HELD_SECTION_BEGIN, HELD_SECTION_HEADING, ""]
+    out = [HELD_SECTION_HEADING, ""]
     if carried:
         # No collector ran this run, so nothing here may read as this run's
         # observation: the rows are held from a previous run's manifest, and
@@ -10956,25 +11971,7 @@ def _render_collector_held(
     for index, entry in enumerate(held):
         fid = str(entry.get("id", ""))
         out.append("")
-        if entry.get("location_unrecorded"):
-            # Carried by id alone: the previous body had no row. The heading
-            # keeps the marker reader joined; the location line says what is
-            # missing rather than inventing one from the id's segments.
-            out += [
-                f'<a id="{_anchor_id(fid)}"></a>',
-                "",
-                f"#### {clip_text(str(entry.get('title', '')), MAX_TITLE_CHARS)} <!-- finding:{fid} -->",
-                "",
-                "- **Where:** not recorded on the previous ledger; carried by id.",
-            ]
-        else:
-            out += _finding_identity_lines(
-                fid,
-                str(entry.get("title", "")),
-                str(entry.get("cluster", "")),
-                str(entry.get("namespace", "")),
-                str(entry.get("object", "")),
-            )
+        out += _held_identity_lines(entry)
         if not detail or index >= MAX_HELD_DETAIL_ROWS:
             continue
         commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
@@ -10991,7 +11988,7 @@ def _render_collector_held(
                 "there this run and still flags this object."
             )
         out.append(f"- **Finding id:** `{fid}`")
-    return out + _render_held_overflow(overflow, noun) + _held_span_close(held)
+    return out + _render_held_overflow(overflow, noun)
 
 
 def _render_held_note(
@@ -11001,6 +11998,7 @@ def _render_held_note(
     preview: bool = False,
     carried: bool = False,
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    unread_overflow: int = 0,
 ) -> list[str]:
     """The third tier for the held section: the count, and where the ids are.
 
@@ -11021,6 +12019,27 @@ def _render_held_note(
     """
     if not held:
         return []
+    unread = [entry for entry in held if entry.get(UNREAD_REASON_KEY)]
+    held = [entry for entry in held if not entry.get(UNREAD_REASON_KEY)]
+    # The rows of `_render_unread_held` in one sentence. Their ids are in the
+    # hidden block and not in the held-id list (see `UNREAD_HELD_HEADING`),
+    # and the report store keeps where each one is (`NOT_RECHECKED_KEY`), so
+    # the next gap run keeps them without a row.
+    unread_lines = (
+        [
+            "",
+            UNREAD_HELD_SUBHEADING if held else UNREAD_HELD_HEADING,
+            "",
+            _held_rows_intro(len(unread)) + " The body had no room for their rows; "
+            "their ids are in the hidden block below, and the report store keeps "
+            "where each one is.",
+        ]
+        if unread
+        else []
+    )
+    unread_lines += _render_unread_overflow(unread_overflow, noun)
+    if not held:
+        return ["", HELD_SECTION_BEGIN] + unread_lines + _held_span_close(unread)
     if carried:
         opening = (
             f"{len(held)} previous finding(s) held from a previous run's manifest; this "
@@ -11051,12 +12070,27 @@ def _render_held_note(
         HELD_SECTION_HEADING,
         "",
         opening,
-    ] + _render_held_overflow(overflow, noun) + _held_span_close(held)
+    ] + _render_held_overflow(overflow, noun) + unread_lines + _held_span_close(held + unread)
 
 
 def _held_span_close(held: list[dict]) -> list[str]:
-    """The held-id list and the closing comment every tier ends with."""
-    return ["", held_ids_comment([str(e.get("id", "")) for e in held]), HELD_SECTION_END]
+    """The held-id list and the closing comment every tier ends with.
+
+    The list leaves out the entries held because this run did not check
+    their target (`UNREAD_REASON_KEY`). A run without a manifest carries the
+    list unchanged, and those entries must go when a run checks the target
+    again. Their ids stay in the hidden block, which the next run reads, and
+    they go in a second list (`NOT_RECHECKED_IDS_COMMENT`) when there are any.
+    """
+    unread = [str(e.get("id", "")) for e in held if e.get(UNREAD_REASON_KEY)]
+    return [
+        "",
+        held_ids_comment(
+            [str(e.get("id", "")) for e in held if not e.get(UNREAD_REASON_KEY)]
+        ),
+        *([f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"] if unread else []),
+        HELD_SECTION_END,
+    ]
 
 
 def _render_held_ids_only(held: list[dict]) -> list[str]:
@@ -11064,7 +12098,9 @@ def _render_held_ids_only(held: list[dict]) -> list[str]:
 
     Charged to the budget ahead of the findings, so it always fits; the hold
     survives a body with no room for even the note, because the next run
-    reads the list and not the rows.
+    reads the list and not the rows. An entry held because this run did not
+    check its target is not in the list: the next run reads its id from the
+    hidden block and its place from the report store (`NOT_RECHECKED_KEY`).
     """
     if not held:
         return []
@@ -11423,6 +12459,7 @@ def render_issue_body(
     held_overflow: int = 0,
     held_preview: bool = False,
     held_carried: bool = False,
+    unread_overflow: int = 0,
     noun: str = "pull request",
     new_ids: set[str] | None = None,
     blocked_by: dict[str, dict] | None = None,
@@ -11447,7 +12484,9 @@ def render_issue_body(
     cap left out); they render under their own heading and their ids join the
     hidden block, so the next run reads them back — see
     `_render_collector_held`. `rendered_ids` stays the document's own, because
-    that is what `new` is measured against.
+    that is what `new` is measured against. `held` may also hold the previous
+    findings on a target this run did not check (`unread_held_entries`); they
+    render in the same span under their own heading.
 
     Everything but the findings renders and is measured first; whatever is left
     of BODY_BUDGET is the findings budget. The hidden delta block carries the
@@ -11571,6 +12610,7 @@ def render_issue_body(
             preview=held_preview,
             carried=held_carried,
             noun=noun,
+            unread_overflow=unread_overflow,
         ),
         _render_collector_held(
             held_entries,
@@ -11579,6 +12619,7 @@ def render_issue_body(
             preview=held_preview,
             carried=held_carried,
             noun=noun,
+            unread_overflow=unread_overflow,
         ),
         _render_held_note(
             held_entries,
@@ -11586,6 +12627,7 @@ def render_issue_body(
             preview=held_preview,
             carried=held_carried,
             noun=noun,
+            unread_overflow=unread_overflow,
         ),
     ):
         if len("\n".join(candidate_section)) <= max(BODY_BUDGET - spent, 0):
@@ -12584,15 +13626,20 @@ def forge_capabilities(repo: str) -> dict | None:
     network on the broker's side, so it is cheap, and it cannot change within
     a run.
     """
+    answer = capabilities_answer(repo)
+    if answer is None or not answer.get("forge") or answer.get("missing"):
+        return None
+    return answer
+
+
+def capabilities_answer(repo: str) -> dict | None:
+    """The broker's `capabilities` answer for `repo` as it came, asked once a run; None for a refusal."""
     if repo not in _CAPABILITIES:
         answer = try_forge(CAPABILITIES_OP, repo, {})
         if not isinstance(answer, dict):
             return None
         _CAPABILITIES[repo] = answer
-    answer = _CAPABILITIES[repo]
-    if not answer.get("forge") or answer.get("missing"):
-        return None
-    return answer
+    return _CAPABILITIES[repo]
 
 
 def forge_has_issue_verbs(repo: str) -> bool:
@@ -13035,6 +14082,13 @@ def written_in_this_run(audit_id: str, stamp: object) -> bool:
     older than the note's `started_at`, which `start` writes before it writes
     anything else. The stamps have whole seconds, so the note's time is
     compared to the second.
+
+    The note reads `time.time()`, so a stamp handed here must come from that
+    clock too (`time.gmtime(time.time())` or `datetime.now(timezone.utc)`),
+    never from `time.gmtime()` with no argument: that reads the coarse C
+    clock, which trails `time.time()` by a second for a moment after each
+    second boundary, and a record stamped in that moment would be disowned
+    by the run that wrote it.
     """
     started = inflight_started_at(audit_id, time.time())
     written = _utc_seconds(stamp)
@@ -13087,17 +14141,18 @@ def resolve_repo_or_no_forge(audit_id: str, repo: str | None = None) -> str:
     return resolved
 
 
-def unreachable_reason(repo: str) -> str | None:
+def unreachable_reason(repo: str, verb: str = REACHABILITY_PROBE_VERB) -> str | None:
     """Why the broker cannot reach `repo`, or None when it can, or when it cannot tell.
 
-    One cheap read (`REACHABILITY_PROBE_VERB`). A reason is returned only for
-    a refusal with a code in `unreachable_repo_codes()`, which is about the
-    repository and the credential. A lost broker raises `BrokerUnavailable`
-    from `forge`, as every other forge call does. Any other refusal returns
-    None: it is not about the repository, and the run continues as before.
+    One cheap read: `verb`, the listing the run's ledger needs. A reason is
+    returned only for a refusal with a code in `unreachable_repo_codes()`,
+    which is about the repository and the credential. A lost broker raises
+    `BrokerUnavailable` from `forge`, as every other forge call does. Any
+    other refusal returns None: it is not about the repository, and the run
+    continues as before.
     """
     try:
-        forge(REACHABILITY_PROBE_VERB, repo, {"state": "open", "limit": REACHABILITY_PROBE_LIMIT})
+        forge(verb, repo, {"state": "open", "limit": REACHABILITY_PROBE_LIMIT})
     except ForgeError as exc:
         code = getattr(exc.__cause__, "code", None)
         if code in unreachable_repo_codes():
@@ -13116,41 +14171,139 @@ def unreachable_repo_codes() -> frozenset[str]:
     return frozenset(gitops_preflight.REPOSITORY_CODES | {gitops_preflight.NOT_MANAGED_CODE})
 
 
-def resolve_reachable_repo(
-    audit_id: str, repo: str | None = None
-) -> tuple[str, tuple[str, str] | None]:
-    """`resolve_repo_or_no_forge`, then a check that the broker can reach the repository.
+class LedgerDecision(NamedTuple):
+    """Where a run keeps its ledger, whether remediation proposals open, and why.
 
-    Returns the repository and None, or `NO_FORGE_REPO` and the pair
-    (repository, reason) when the resolved repository cannot be reached. The
-    run then does not choose another repository: it keeps its findings in the
-    report store and sends them to chat, as a run with no repository does,
-    and `unreachable_note` says why. When several repositories are managed and
-    none can be chosen (`NoGitOpsRepo`), the pair is ("", the refusal): the
-    same path, and no repository.
+    version-control-support.md §8, "The ledger without issues":
+
+    - `forge`, remediation on: a ledger issue on `repo` (GitHub, GitLab).
+    - `store`, remediation on: `repo` is on a forge with no issue tracker, or
+      with no labels. The ledger is in the report store and goes to chat;
+      remediation proposals still open on `repo`. `reason` says why.
+    - `store`, remediation off: no repository to publish to, today's no-forge
+      path. `repo` is `NO_FORGE_REPO` when none is registered (`reason` None)
+      or none could be chosen (`reason` is the refusal); otherwise it is the
+      repository the broker could not reach, and `reason` says why.
+    """
+
+    repo: str
+    ledger: Literal["forge", "store"]
+    remediation: bool
+    reason: str | None
+    # The read that found `repo` unreachable, for the note's advice.
+    probe: str = REACHABILITY_PROBE_VERB
+
+    @property
+    def publish_repo(self) -> str:
+        """The repository the run publishes to, or `NO_FORGE_REPO` when it publishes nowhere."""
+        return self.repo if self.remediation else NO_FORGE_REPO
+
+    @property
+    def unreachable(self) -> tuple[str, str] | None:
+        """The pair the no-forge path reads: (repository, reason), or None.
+
+        None on a run that publishes and on an install with no repository; a
+        pair with no repository is a run for which none could be chosen.
+        """
+        if self.remediation or self.reason is None:
+            return None
+        return ("" if self.repo == NO_FORGE_REPO else self.repo, self.reason)
+
+    @property
+    def store_ledger(self) -> bool:
+        """Whether the ledger is in the store while remediation proposals still open."""
+        return self.ledger == LEDGER_STORE and self.remediation
+
+
+def no_forge_decision(unreachable: tuple[str, str] | None) -> LedgerDecision:
+    """The `store`, remediation-off decision for an `unreachable` pair, or for no repository."""
+    if unreachable is None:
+        return LedgerDecision(NO_FORGE_REPO, LEDGER_STORE, False, None)
+    repo, reason = unreachable
+    return LedgerDecision(repo or NO_FORGE_REPO, LEDGER_STORE, False, reason)
+
+
+def ledger_on_forge(repo: str) -> bool:
+    """Whether a ledger issue can be kept on `repo`'s forge: issue verbs and labels.
+
+    An answer that cannot be read is True for both (`forge_has_issue_verbs`,
+    `forge_has_labels`), so a transient fault never moves a ledger.
+    """
+    return store_ledger_reason(repo) is None
+
+
+def store_ledger_reason(repo: str) -> str | None:
+    """Why `repo`'s ledger goes to the report store, or None when it stays on the forge.
+
+    Asks both questions, so that `ensure_labels` later in the same process
+    knows a forge with no labels and sends no label call. An answer that
+    cannot be read keeps the forge path, and is asked once.
+    """
+    if forge_capabilities(repo) is None:
+        return None
+    issues = forge_has_issue_verbs(repo)
+    labels = forge_has_labels(repo)
+    if not issues:
+        return STORE_LEDGER_NO_ISSUES_REASON.format(repo=repo)
+    if not labels:
+        return STORE_LEDGER_NO_LABELS_REASON.format(repo=repo)
+    return None
+
+
+def resolve_reachable_repo(audit_id: str, repo: str | None = None) -> LedgerDecision:
+    """`resolve_repo_or_no_forge`, then the ledger decision for the repository.
+
+    `capabilities` says where the ledger goes (`store_ledger_reason`): a forge
+    with no issue verbs, or with no labels, keeps it in the report store and
+    still opens remediation proposals. Then one read checks that the broker
+    can reach the repository, with the listing that path needs. A repository
+    that cannot be reached gives the no-forge decision with the reason: the
+    run does not choose another repository, it keeps its findings in the
+    report store and sends them to chat, and `unreachable_note` says why.
+    When several repositories are managed and none can be chosen
+    (`NoGitOpsRepo`), the decision has no repository and the refusal as its
+    reason: the same path.
     """
     try:
         resolved = resolve_repo_or_no_forge(audit_id, repo)
     except NoGitOpsRepo as exc:
         # The same chat path as a run with no repository, with the reason and
-        # the remedy, and no repository chosen. "" is that pair's repository.
+        # the remedy, and no repository chosen.
         log(f"NO REPOSITORY CHOSEN: {exc}")
-        return NO_FORGE_REPO, ("", exc.message)
+        return no_forge_decision(("", exc.message))
     if resolved == NO_FORGE_REPO:
-        return resolved, None
-    reason = unreachable_reason(resolved)
-    if reason is None:
-        return resolved, None
-    log(f"UNREACHABLE: {resolved}: {reason}; the run keeps its findings in the report store")
-    return NO_FORGE_REPO, (resolved, reason)
+        return no_forge_decision(None)
+    store_reason = store_ledger_reason(resolved)
+    probe = STORE_REACHABILITY_PROBE_VERB if store_reason else REACHABILITY_PROBE_VERB
+    reason = unreachable_reason(resolved, probe)
+    if reason is not None:
+        log(f"UNREACHABLE: {resolved}: {reason}; the run keeps its findings in the report store")
+        return no_forge_decision((resolved, reason))._replace(probe=probe)
+    if store_reason is not None:
+        log(
+            f"LEDGER IN STORE: {store_reason}; the ledger goes to the report store and chat, "
+            "and remediation proposals still open on the forge"
+        )
+        return LedgerDecision(resolved, LEDGER_STORE, True, store_reason)
+    return LedgerDecision(resolved, LEDGER_FORGE, True, None)
 
 
-def unreachable_note(unreachable: tuple[str, str] | None, *, stored: bool = True) -> str:
+def unreachable_note(
+    unreachable: tuple[str, str] | None,
+    *,
+    stored: bool = True,
+    probe: str = REACHABILITY_PROBE_VERB,
+) -> str:
     """The no-forge note: why the run has no repository to publish to.
 
-    `unreachable` is the pair `resolve_reachable_repo` returns, or None for an
-    install that registers no repository. A pair with no repository is a run
-    for which several repositories are managed and none could be chosen.
+    `unreachable` is the decision's pair (`LedgerDecision.unreachable`), or
+    None for an install that registers no repository. A pair with no
+    repository is a run for which several repositories are managed and none
+    could be chosen. `probe` is the read that found the repository
+    unreachable (`LedgerDecision.probe`): a refused issue listing can mean
+    that the issues are off, and a refused proposal listing cannot. The note
+    asks the broker nothing, so a lost broker cannot stop the run after its
+    store write.
     """
     if unreachable is None:
         return NO_FORGE_NOTE if stored else NO_FORGE_UNSTORED_NOTE
@@ -13163,21 +14316,79 @@ def unreachable_note(unreachable: tuple[str, str] | None, *, stored: bool = True
     template = UNREACHABLE_NOTE if stored else UNREACHABLE_UNSTORED_NOTE
     if gitops_preflight.NOT_MANAGED_CODE in reason:
         remedy = UNREACHABLE_NOT_MANAGED_REMEDY
-    elif FORGE_FORBIDDEN_CODE in reason:
+    elif FORGE_FORBIDDEN_CODE in reason and probe == REACHABILITY_PROBE_VERB:
         remedy = UNREACHABLE_FORBIDDEN_REMEDY
     else:
         remedy = UNREACHABLE_FORGE_REMEDY
-    return template.format(repo=repo, reason=reason, noun=_proposal_noun(repo), remedy=remedy)
+    ledger = (
+        UNREACHABLE_ISSUE_LEDGER
+        if probe == REACHABILITY_PROBE_VERB
+        else UNREACHABLE_STORE_LEDGER
+    )
+    return template.format(
+        repo=repo, reason=reason, noun=_proposal_noun(repo), remedy=remedy, ledger=ledger
+    )
 
 
-def this_runs_decision(audit_id: str) -> tuple[str, tuple[str, str] | None] | None:
-    """The repository decision `start` recorded for the run now in flight, or None.
+def store_ledger_note(decision: LedgerDecision, *, stored: bool = True, noun: str | None = None) -> str:
+    """The note of a run whose ledger is in the store: why, and where the fixes go."""
+    template = STORE_LEDGER_NOTE if stored else STORE_LEDGER_UNSTORED_NOTE
+    return template.format(
+        reason=decision.reason or STORE_LEDGER_NO_ISSUES_REASON.format(repo=decision.repo),
+        noun=noun or _proposal_noun(decision.repo),
+    )
 
-    The repository (or `NO_FORGE_REPO`) and, for a repository that could not
-    be reached, the pair (repository, reason). None when there is no run
-    record, it does not parse, or it was not written by the run now in
-    flight (`written_in_this_run`): `finish` then resolves and probes on its
-    own.
+
+def _recorded_decision(data: dict) -> LedgerDecision | None:
+    """The decision a run record holds, or None when it does not parse.
+
+    A record written before the decision existed has no `ledger` key, and
+    reads with the old meaning: the no-forge path for `NO_FORGE_REPO` or an
+    `unreachable` pair, the forge path for a repository. A record whose keys
+    disagree with its repository does not parse.
+    """
+    repo = data.get("repo")
+    if not isinstance(repo, str) or not repo:
+        return None
+    unreachable = data.get(RUN_RECORD_UNREACHABLE_KEY)
+    pair = (
+        (unreachable["repo"], unreachable["reason"])
+        if isinstance(unreachable, dict)
+        and isinstance(unreachable.get("repo"), str)
+        and isinstance(unreachable.get("reason"), str)
+        else None
+    )
+    if pair is not None or repo == NO_FORGE_REPO:
+        old = no_forge_decision(pair)
+        probe = data.get(RUN_RECORD_PROBE_KEY)
+        if pair is not None and probe in (REACHABILITY_PROBE_VERB, STORE_REACHABILITY_PROBE_VERB):
+            old = old._replace(probe=probe)
+    else:
+        old = LedgerDecision(repo, LEDGER_FORGE, True, None)
+    if RUN_RECORD_LEDGER_KEY not in data:
+        return old
+    ledger = data.get(RUN_RECORD_LEDGER_KEY)
+    remediation = data.get(RUN_RECORD_REMEDIATION_KEY)
+    reason = data.get(RUN_RECORD_REASON_KEY)
+    if ledger not in (LEDGER_FORGE, LEDGER_STORE) or not isinstance(remediation, bool):
+        return None
+    if reason is not None and not isinstance(reason, str):
+        return None
+    if ledger == LEDGER_STORE and remediation:
+        if repo == NO_FORGE_REPO or pair is not None:
+            return None
+        return LedgerDecision(repo, LEDGER_STORE, True, reason)
+    if (old.ledger, old.remediation) != (ledger, remediation):
+        return None
+    return old
+
+
+def this_runs_decision(audit_id: str) -> LedgerDecision | None:
+    """The ledger decision `start` recorded for the run now in flight, or None.
+
+    None when there is no run record, it does not parse (`_recorded_decision`),
+    or it was not written by the run now in flight (`written_in_this_run`):
+    `finish` then resolves and probes on its own.
     """
     try:
         data = json.loads(Path(run_record_path_for(audit_id)).read_text(encoding="utf-8"))
@@ -13185,38 +14396,33 @@ def this_runs_decision(audit_id: str) -> tuple[str, tuple[str, str] | None] | No
         return None
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return None
-    repo = data.get("repo")
-    if not isinstance(repo, str) or not repo:
+    decision = _recorded_decision(data)
+    if decision is None:
         return None
     if not written_in_this_run(audit_id, data.get(RUN_RECORD_STARTED_KEY)):
         return None
-    unreachable = data.get(RUN_RECORD_UNREACHABLE_KEY)
-    if (
-        isinstance(unreachable, dict)
-        and isinstance(unreachable.get("repo"), str)
-        and isinstance(unreachable.get("reason"), str)
-    ):
-        return repo, (unreachable["repo"], unreachable["reason"])
-    return repo, None
+    return decision
 
 
-def finish_target(audit_id: str, repo: str | None) -> tuple[str, tuple[str, str] | None]:
-    """The repository `finish` publishes to, and why there is none when it is unreachable.
+def finish_target(audit_id: str, repo: str | None) -> LedgerDecision:
+    """The ledger decision `finish` follows.
 
     `finish` follows the decision `start` recorded for this run: the same
-    repository with no second probe, or the no-forge path with the same
-    reason. A `--repo` that names another repository than the one `start`
-    chose, or a run with no record of its own, is resolved and probed here.
+    repository and the same ledger with no second probe, or the no-forge path
+    with the same reason. If `finish` decided again, a forge that changed
+    between the two steps would split one run across two ledgers. A `--repo`
+    that names another repository than the one `start` chose, or a run with
+    no record of its own, is resolved and probed here.
     """
     decided = this_runs_decision(audit_id)
     if decided is not None:
-        recorded, unreachable = decided
-        target = unreachable[0] if unreachable else recorded
+        unreachable = decided.unreachable
+        target = unreachable[0] if unreachable else decided.publish_repo
         explicit = str(repo or "").strip()
         if not explicit or (
             target != NO_FORGE_REPO and _ledger_key(explicit) == _ledger_key(target)
         ):
-            return recorded, unreachable
+            return decided
     return resolve_reachable_repo(audit_id, repo)
 
 
@@ -13394,8 +14600,9 @@ def find_existing_issue(
     if not forge_has_labels(repo):
         raise GitHubLookupError(
             f"the ledger for audit:{audit_id} in {repo} is found by its label, and "
-            "this forge has no labels, so the ledger cannot be kept on it; this "
-            "harness cannot run this audit against a repository on such a forge"
+            "this forge has no labels, so the ledger cannot be kept on it. Run "
+            "`start` again: it reads the forge's capabilities and keeps the ledger "
+            "of such a forge in the report store"
         )
     try:
         answer = forge(
@@ -13425,7 +14632,7 @@ def find_existing_issue(
             "issue was found; merge or close the remediation backlog on this label"
         )
     if not issues:
-        return None, None, None, None
+        return _ledger_the_listing_left_out(repo, audit_id)
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
@@ -13444,6 +14651,94 @@ def find_existing_issue(
         body if isinstance(body, str) else None,
         title if isinstance(title, str) else None,
     )
+
+
+def _stored_ledger_numbers(audit_id: str, repo: str) -> list[int]:
+    """The ledger issues the report store names for this stream and `repo`, highest first.
+
+    Each envelope in `latest.json` and the `runs/` ring gives its
+    `issue_number`, and its `OPEN_LEDGER_KEY` when a run held the ledger open
+    with no trusted memory. An envelope that `is_diverted` marks never names a
+    ledger, and neither does one written for another repository. An absent or
+    unreadable store names none. The ring keeps `REPORT_HISTORY` envelopes, so
+    the list is short, and it usually has one number.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError:
+        return []
+    envelopes = _ring_envelopes(directory / REPORT_RUNS_DIR)
+    try:
+        envelopes.append(json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+    numbers: set[int] = set()
+    for envelope in envelopes:
+        if not isinstance(envelope, dict) or is_diverted(envelope):
+            continue
+        if _ledger_key(envelope.get("repo")) != _ledger_key(repo):
+            continue
+        for key in ("issue_number", OPEN_LEDGER_KEY):
+            number = envelope.get(key)
+            if isinstance(number, int) and not isinstance(number, bool):
+                numbers.add(number)
+    return sorted(numbers, reverse=True)
+
+
+def _ledger_the_listing_left_out(
+    repo: str, audit_id: str
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """The open ledger an empty label listing left out, or the four Nones.
+
+    GitHub's label-filtered issue list can leave out an open, labelled issue
+    for a short time, most likely just after a label write, and
+    `ensure_labels` runs a second or two before every lookup. Read as
+    "no ledger", `finish` opens a second ledger with no memory, and the first
+    ledger's state (its held rows, its carried findings) is lost.
+
+    So an empty listing is checked against the issues the report store names
+    (`_stored_ledger_numbers`), highest first, as a full listing picks the
+    highest number. Each issue is read directly, and the first one that is
+    still open and still carries `audit:<id>` is the ledger. A closed issue
+    stays closed: a clean full run closes the ledger on purpose, and the next
+    finding opens a fresh one. A failed read stops the search and gives the
+    empty listing it was: a lower number is not the ledger while a higher one
+    could still be.
+
+    An open, labelled issue that no envelope in the store names (opened by
+    hand, or by a run whose store write failed and that later runs did not
+    name) stays out of reach until the listing shows it again.
+    """
+    none: tuple[None, None, None, None] = (None, None, None, None)
+    label = f"audit:{audit_id}".lower()
+    for number in _stored_ledger_numbers(audit_id, repo):
+        answer = try_forge("issue-view", repo, {"number": number})
+        issue = (answer or {}).get("issue")
+        if not isinstance(issue, dict):
+            log(
+                f"The label listing for audit:{audit_id} in {repo} was empty, and this run "
+                f"could not read #{number}, which the report store names; treating the "
+                "stream as having no open ledger."
+            )
+            return none
+        labels = [str(name).lower() for name in issue.get("labels") or []]
+        if str(issue.get("state") or "").lower() != FORGE_ISSUE_OPEN or label not in labels:
+            continue
+        log(
+            f"WARNING: the label listing for audit:{audit_id} in {repo} left out #{number}, "
+            "which the report store names and which is open and carries the label; "
+            f"updating #{number}. The forge's label index can lag a label write."
+        )
+        body = issue.get("body")
+        title = issue.get("title")
+        url = issue.get("url")
+        return (
+            number,
+            url if isinstance(url, str) and url else None,
+            body if isinstance(body, str) else None,
+            title if isinstance(title, str) else None,
+        )
+    return none
 
 
 def fetch_issue_body(repo: str, number: int) -> str | None:
@@ -14746,7 +16041,7 @@ def write_run_record(
     *,
     searched: list[str] | None = None,
     sources: list[dict] | None = None,
-    unreachable: tuple[str, str] | None = None,
+    decision: LedgerDecision | None = None,
 ) -> str:
     """Record which repositories this run's declared-intent step must search.
 
@@ -14763,10 +16058,13 @@ def write_run_record(
     collector manifest's `finished_at` against, so this is also the moment the
     run becomes able to tell its own collection from the last one's.
 
-    `unreachable` is the repository and the reason when `start` took the
-    no-forge path because the broker could not reach the repository;
-    `finish` follows that decision (`finish_target`).
+    `decision` is where `start` keeps the ledger (`resolve_reachable_repo`):
+    its `ledger`, `remediation` and `reason`, and for a repository the broker
+    could not reach, the repository and the reason under `unreachable`, as
+    the code before the decision wrote it. `finish` follows the decision
+    (`finish_target`). Without one, the record is a forge run's for `repo`.
     """
+    unreachable = decision.unreachable if decision is not None else None
     path = run_record_path_for(audit_id)
     Path(path).write_text(
         json.dumps(
@@ -14778,8 +16076,20 @@ def write_run_record(
                 RUN_RECORD_SOURCES_KEY: list(sources or []),
                 RUN_RECORD_STARTED_KEY: datetime.now(timezone.utc).strftime(RUN_TIMESTAMP_FORMAT),
                 **(
-                    {RUN_RECORD_UNREACHABLE_KEY: {"repo": unreachable[0], "reason": unreachable[1]}}
+                    {
+                        RUN_RECORD_UNREACHABLE_KEY: {"repo": unreachable[0], "reason": unreachable[1]},
+                        RUN_RECORD_PROBE_KEY: decision.probe,
+                    }
                     if unreachable
+                    else {}
+                ),
+                **(
+                    {
+                        RUN_RECORD_LEDGER_KEY: decision.ledger,
+                        RUN_RECORD_REMEDIATION_KEY: decision.remediation,
+                        RUN_RECORD_REASON_KEY: decision.reason,
+                    }
+                    if decision is not None
                     else {}
                 ),
             }
@@ -15671,7 +16981,7 @@ def degrade_missing_remediations(
         remediation["kind"] = "manual"
         remediation["path"] = ""
         remediation["note"] = (f"{note} " if note else "") + (
-            f"_(The audit {reason}. {DEGRADED_REMEDIATION_TAIL}"
+            f"{DEGRADED_REMEDIATION_LEDE}{reason}. {DEGRADED_REMEDIATION_TAIL}"
         )
         degraded.append(fid)
     return degraded
@@ -15725,22 +17035,32 @@ def _manifest_note_block(root: Path, path: str, prefix: str) -> str:
     except (OSError, ValidationError):
         return ""
     lines = text.rstrip("\n").splitlines()
+    return _sized_manifest_block(
+        lines, True, lambda block: len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+    )
 
-    def render(kept: list[str]) -> str:
-        return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
 
-    def fits(block: str) -> bool:
-        return len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+def _manifest_block_text(kept: list[str]) -> str:
+    """The lines `kept` as the fenced YAML block of a Kustomize note."""
+    return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
 
+
+def _sized_manifest_block(lines: list[str], whole_file: bool, fits: Callable[[str], bool]) -> str:
+    """The longest block of `lines` that `fits` accepts, or "".
+
+    The block keeps at most MANUAL_NOTE_MANIFEST_LINES lines, and ends in
+    MANUAL_NOTE_TRUNCATED when it keeps less than the whole file. `lines` is
+    the whole file only when `whole_file` is true. The fences are always
+    closed, because the block is cut by lines and not by characters."""
     whole = lines[:MANUAL_NOTE_MANIFEST_LINES]
-    if len(whole) == len(lines) and fits(render(whole)):
-        return render(whole)
+    if whole_file and len(whole) == len(lines) and fits(_manifest_block_text(whole)):
+        return _manifest_block_text(whole)
     kept: list[str] = []
     for line in whole:
-        if not fits(render(kept + [line, MANUAL_NOTE_TRUNCATED])):
+        if not fits(_manifest_block_text(kept + [line, MANUAL_NOTE_TRUNCATED])):
             break
         kept.append(line)
-    block = render(kept + [MANUAL_NOTE_TRUNCATED])
+    block = _manifest_block_text(kept + [MANUAL_NOTE_TRUNCATED])
     return block if fits(block) else ""
 
 
@@ -15882,6 +17202,19 @@ class UnwrittenFix(NamedTuple):
     declared: bool
 
 
+def promised_paths(findings: list[dict]) -> dict[str, str]:
+    """Finding id to the path each `manifest` remediation names.
+
+    Taken before `degrade_missing_remediations`, which blanks the path of a
+    fix that was not written, for `unwritten_sweep_fixes` to read.
+    """
+    return {
+        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
+        for f in findings
+        if (f.get("remediation") or {}).get("kind") == "manifest"
+    }
+
+
 def unwritten_sweep_fixes(
     findings: list[dict],
     manifest: dict | None,
@@ -15889,6 +17222,7 @@ def unwritten_sweep_fixes(
     degraded: list[str],
     audit_id: str,
     prs: list[dict],
+    log_prefix: str = "",
 ) -> dict[str, UnwrittenFix]:
     """Finding id to where its fix belongs, for each fix the sweep would
     open if only it had been written.
@@ -15943,7 +17277,7 @@ def unwritten_sweep_fixes(
     # carries -- open, merged, or closed by a person -- is answered; the
     # generated check is left to `plan_generated_fixes`, which tells its own
     # pull request from another.
-    carried = {fid for pr in prs if not pr_closed_by_harness(pr) for fid in parse_delta_block(pr.get("body"))}
+    carried = _delta_carried_fixes(prs)
     unwritten: dict[str, UnwrittenFix] = {}
     for finding in findings:
         fid = str(finding.get("id", ""))
@@ -15954,12 +17288,10 @@ def unwritten_sweep_fixes(
             continue
         # Either shape: a promised file for a withheld budget is the same budget.
         if derive_finding_id(finding) in withheld:
-            log(f"{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
+            log(f"{log_prefix}{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
             continue
         if fid in degraded_set and promised.get(fid):
-            as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
-            pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
-            if pr is None or pr_closed_by_harness(pr):
+            if not _promised_fix_carried(prs, audit_id, fid, promised[fid]):
                 unwritten[fid] = UnwrittenFix(promised[fid], declared=False)
             continue
         remediation = finding.get("remediation") or {}
@@ -15969,6 +17301,445 @@ def unwritten_sweep_fixes(
         if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
     return unwritten
+
+
+def _delta_carried_fixes(prs: list[dict], *, open_only: bool = False) -> set[str]:
+    """Every finding id that the delta block of a pull request names, when the
+    harness did not close that pull request: open, merged, or closed by a person.
+    With `open_only`, only an open pull request counts."""
+    counted = _pr_is_open if open_only else (lambda pr: not pr_closed_by_harness(pr))
+    return {fid for pr in prs if counted(pr) for fid in parse_delta_block(pr.get("body"))}
+
+
+def _pr_is_open(pr: dict) -> bool:
+    """Whether the pull request is open: not merged and not closed."""
+    return str(pr.get("state") or "").upper() == "OPEN" and not pr_is_merged(pr)
+
+
+def _promised_fix_carried(
+    prs: list[dict], audit_id: str, fid: str, path: str, *, open_only: bool = False
+) -> bool:
+    """Whether a pull request that the harness did not close is on the branch
+    that the promised `path` names, as the sweep joins a fix to its branch.
+    With `open_only`, only an open pull request counts."""
+    as_written = {"id": fid, "remediation": {"kind": "manifest", "path": path}}
+    pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
+    if pr is None:
+        return False
+    return _pr_is_open(pr) if open_only else not pr_closed_by_harness(pr)
+
+
+def pr_carried_fixes(
+    promised: dict[str, str], degraded: list[str], audit_id: str, prs: list[dict]
+) -> set[str]:
+    """The finding ids whose fix an open pull request carries.
+
+    By the joins `unwritten_sweep_fixes` uses: a finding that the delta block
+    of a pull request names, and a degraded fix whose promised path names the
+    branch of a pull request. Only an open pull request counts. A merged pull
+    request whose finding still reproduces did not fix it, and a pull request
+    that a person closed refused the fix, so for both the reader must make
+    the change by hand.
+    """
+    carried = _delta_carried_fixes(prs, open_only=True)
+    carried.update(
+        fid
+        for fid in degraded
+        if promised.get(fid) and _promised_fix_carried(prs, audit_id, fid, promised[fid], open_only=True)
+    )
+    return carried
+
+
+def route_note_skip(
+    unwritten: dict[str, UnwrittenFix],
+    declines: dict[str, str],
+    planned: dict[str, tuple[str, str]],
+    carried: set[str],
+) -> set[str]:
+    """The findings that `disclose_manual_remediation_routes` gives no route note.
+
+    A fix that `finish` wrote (`planned`), a fix that the worker declined, and
+    a fix that an open pull request carries (`carried`, `pr_carried_fixes`).
+    The row already gives the answer for each, and a note that sends the
+    reader to the repository asks for the same change again. A fix that a
+    merged pull request did not fix, or that a person refused, gets the route
+    notes: the reader must make that change by hand.
+    """
+    return {fid for fid in unwritten if fid in declines} | set(planned) | set(carried)
+
+
+class RouteEvidence(NamedTuple):
+    """What the collector found about where a finding's fix belongs.
+
+    Every field is `""` when the candidate does not carry it. An empty field
+    is no claim: the collector attaches a field only where it resolved one,
+    and a missing `declaration` can mean that the index was empty, that two
+    files declare the object, or that content mode could not copy the YAML.
+    A path that `ROUTE_PATH_PATTERN` does not accept is also `""`, and a
+    reconciler that `RECONCILER_PATTERN` does not accept is
+    `RECONCILER_UNNAMED`, so every field is safe to show in Markdown.
+    """
+
+    declaration: str
+    release: str
+    renderer: str
+    namespace_directory: str
+    namespace_source: str
+    reconciler: str
+
+
+def _field_path(candidate: dict, field: str) -> str:
+    """The `path` inside one of the candidate's location fields, or `""`.
+
+    `""` also when the path has a character that `ROUTE_PATH_PATTERN` does not
+    accept: no location note is better than a note that a file name can
+    change into a link or a mention. And `""` when the path is longer than
+    `ROUTE_PATH_MAX_CHARS`, so that the route notes cannot fill the note, or
+    when `redact_secrets` changes it: the stored note would then show a path
+    that is not in the repository.
+    """
+    value = candidate.get(field)
+    path = str(value.get("path") or "").strip() if isinstance(value, dict) else ""
+    shown = len(path) <= ROUTE_PATH_MAX_CHARS and ROUTE_PATH_PATTERN.fullmatch(path)
+    return path if shown and redact_secrets(path) == path else ""
+
+
+def _shown_reconciler(candidate: dict) -> str:
+    """The candidate's `reconciler` as a route note shows it, or `""`.
+
+    The phrase comes from annotations on the live object. When it is not
+    exactly one of the phrases `collect.reconciler_of` writes, with safe
+    names, is longer than `ROUTE_RECONCILER_MAX_CHARS`, or is changed by
+    `redact_secrets`, the note shows `RECONCILER_UNNAMED` in its place.
+    """
+    reconciler = str(candidate.get("reconciler") or "").strip()
+    if not reconciler:
+        return reconciler
+    shown = len(reconciler) <= ROUTE_RECONCILER_MAX_CHARS and RECONCILER_PATTERN.fullmatch(reconciler)
+    if shown and redact_secrets(reconciler) == reconciler:
+        return reconciler
+    return RECONCILER_UNNAMED
+
+
+def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
+    """Finding id to the location fields of the candidate with that identity.
+
+    The same join `adopt_collector_evidence` makes: a candidate keyed as the
+    finding it vouches for. Only candidates that carry one of the fields are
+    included.
+    """
+    evidence: dict[str, RouteEvidence] = {}
+    for entry, candidate in _candidates(manifest):
+        release = candidate.get("release_declaration")
+        directory = candidate.get("namespace_directory")
+        found = RouteEvidence(
+            declaration=_field_path(candidate, "declaration"),
+            release=_field_path(candidate, "release_declaration"),
+            renderer=str((release or {}).get("renderer") or "") if isinstance(release, dict) else "",
+            namespace_directory=_field_path(candidate, "namespace_directory"),
+            namespace_source=str((directory or {}).get("source") or "") if isinstance(directory, dict) else "",
+            reconciler=_shown_reconciler(candidate),
+        )
+        if found.declaration or found.release or found.namespace_directory or found.reconciler:
+            evidence[_candidate_identity(entry, candidate)] = found
+    return evidence
+
+
+def _names_path(text: str, path: str) -> bool:
+    """Whether `text` names `path` as a whole path, not as part of a longer one."""
+    return bool(re.search(WHOLE_PATH_BEFORE + re.escape(path) + WHOLE_PATH_AFTER, text))
+
+
+def _location_note(found: RouteEvidence) -> tuple[str, str]:
+    """The path and the location note for one `manual` finding, or `("", "")`.
+
+    One location note at most, the most specific that the collector found:
+    the object's own file, then the release that renders it, then the
+    directory for a new object, with what its `source` obliges the reader to
+    do (`NAMESPACE_DIRECTORY_NOTES`).
+    """
+    if found.declaration:
+        return found.declaration, DECLARED_NOTE.format(path=found.declaration)
+    if found.release:
+        noun = RELEASE_RENDERER_NOUNS.get(found.renderer, RELEASE_RENDERER_FALLBACK_NOUN)
+        return found.release, RELEASE_NOTE.format(noun=noun, path=found.release)
+    if found.namespace_directory:
+        template = NAMESPACE_DIRECTORY_NOTES.get(found.namespace_source, NAMESPACE_DIRECTORY_NOTE)
+        return found.namespace_directory, template.format(path=found.namespace_directory)
+    return "", ""
+
+
+def _routed_note(found: RouteEvidence, worker_note: str) -> tuple[str, str]:
+    """The worker's note and the route notes for one `manual` finding, made to
+    fit `MAX_NOTE_CHARS` (`_fit_route_notes`).
+
+    The location note is not written when the worker's note names its path,
+    because it would only repeat the worker. That is decided on the worker's
+    note after the cut: when the cut removes the only mention of the path, the
+    location note is written. The reconciler note is independent of the
+    location note.
+    """
+    location, location_note = _location_note(found)
+    reconciled = [RECONCILED_NOTE.format(reconciler=found.reconciler)] if found.reconciler else []
+    if location_note and _names_path(worker_note, location):
+        fitted, added = _fit_route_notes(worker_note, reconciled)
+        if _names_path(fitted, location):
+            return fitted, added
+    notes = [location_note, *reconciled] if location_note else reconciled
+    return _fit_route_notes(worker_note, notes)
+
+
+def _split_harness_tail(note: str) -> tuple[str, str]:
+    """The worker's part of `note` and the note that `degrade_missing_remediations`
+    wrote at its end, or `(note, "")` when there is no such note."""
+    if not note.endswith(DEGRADED_REMEDIATION_TAIL):
+        return note, ""
+    start = note.rfind(DEGRADED_REMEDIATION_LEDE, 0, len(note) - len(DEGRADED_REMEDIATION_TAIL))
+    if start < 0:
+        return note, ""
+    return note[:start].rstrip(), note[start:]
+
+
+class KustomizeNoteHead(NamedTuple):
+    """The start of a note of `degrade_unlisted_kustomize_additions`.
+
+    `prefix` is its own text, `lines` the lines of the copied file without
+    the truncation line (None when the note has no block), `whole` whether
+    the block holds the whole file, and `rest` the worker's note after it.
+    """
+
+    prefix: str
+    lines: list[str] | None
+    whole: bool
+    rest: str
+
+
+def _split_kustomize_head(note: str) -> KustomizeNoteHead:
+    """`note` split after the text of `degrade_unlisted_kustomize_additions`,
+    or with an empty `prefix` when the note does not start with that text."""
+    found = KUSTOMIZE_NOTE_BLOCK_PATTERN.match(note)
+    if found:
+        lines = found.group("body").split("\n")
+        whole = lines[-1] != MANUAL_NOTE_TRUNCATED
+        return KustomizeNoteHead(
+            found.group("prefix"), lines if whole else lines[:-1], whole, note[found.end() :].strip()
+        )
+    found = KUSTOMIZE_NOTE_PREFIX_PATTERN.match(note)
+    if found:
+        return KustomizeNoteHead(found.group("prefix"), None, True, note[found.end() :].strip())
+    return KustomizeNoteHead("", None, True, note)
+
+
+def _is_kcc_reverted_note(note: str) -> bool:
+    """Whether `note` is the note of `degrade_reverted_gcloud_remediations`:
+    its prose in the first paragraph, then the worker's command in a fence."""
+    return KCC_REVERTED_NOTE_MARK in note.split(ROUTE_PARAGRAPH_BREAK, 1)[0]
+
+
+def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
+    """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
+
+    `notes` are the route notes in their order in the note. When they do not
+    all fit, the first ones are left out first, so the reconciler note, which
+    is last, is the last to go. With the caps on a path and a reconciler, the
+    reconciler note always fits with the truncation mark.
+
+    The cut is in the worker's part of the note only. The note that
+    `degrade_missing_remediations` wrote at the end stays whole: without it,
+    the stored note has no `HARNESS_NOTE_MARKS` entry. The cut goes into it
+    only when the reconciler note, or the last route note, leaves no room
+    for it.
+
+    The text of `degrade_unlisted_kustomize_additions` at the start of the
+    note, with the copied file, is not cut either: the block is the only
+    published copy of the fix. When the route notes do not fit with it, the
+    location note goes first. Then the block is made shorter by lines
+    (`_sized_manifest_block`) to make room for the reconciler note, and its
+    fences stay closed.
+
+    The note of `degrade_reverted_gcloud_remediations` is not cut at all: its
+    fenced command is the only pasteable copy of the end state. The route
+    notes that do not fit after it are left out.
+
+    A worker note that leaves a code fence open gets the fence closed, so the
+    text after it is prose. A cut never goes inside a code block: a worker
+    note with a fence loses its first code block and all the text after it,
+    and the text before the block is cut as needed. A cut always ends with
+    `ROUTE_NOTE_TRUNCATED`, and route notes that leave no room for it are left
+    out.
+
+    The length is measured after `publishable_text`, as the renderer measures
+    it: an escaped comment opener and a redaction placeholder make the text
+    longer, and a route note that the renderer cuts loses its end.
+    """
+    notes = [note for note in notes if note]
+    if not notes:
+        return worker_note, ""
+    if _is_kcc_reverted_note(worker_note):
+        # All of it is text that `finish` wrote, so nothing in it is cut.
+        head = KustomizeNoteHead(worker_note, None, True, "")
+    else:
+        head = _split_kustomize_head(worker_note)
+    block = ""
+    if head.lines is not None:
+        block = _manifest_block_text(head.lines if head.whole else [*head.lines, MANUAL_NOTE_TRUNCATED])
+    harness_head = head.prefix + block
+    body, tail = _split_harness_tail(head.rest)
+    for kept, harness in ((body, tail), (head.rest, "")) if tail else ((head.rest, ""),):
+        for first in range(len(notes)):
+            added = NOTE_SEPARATOR.join(notes[first:])
+            fitted = _cut_worker_note(kept, harness, added, harness_head)
+            if fitted is not None:
+                return fitted, added
+    if head.lines is None or not notes[-1].startswith(RECONCILED_NOTE_LEDE):
+        return worker_note, ""
+    # Only the reconciler note, and a shorter copy of the file.
+    added = notes[-1]
+    block = _sized_manifest_block(
+        head.lines,
+        head.whole,
+        lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None,
+    )
+    fitted = _cut_worker_note(head.rest, "", added, head.prefix + block)
+    return (fitted, added) if fitted is not None else (worker_note, "")
+
+
+def _cut_worker_note(body: str, tail: str, added: str, head: str = "") -> str | None:
+    """`body` cut so that it, `tail` and the route notes `added` fit
+    `MAX_NOTE_CHARS`, with `head` before it and `tail` after it, or None when
+    no cut fits. `head` and `tail` are text that `finish` wrote."""
+    if body.count(CODE_FENCE) % 2:
+        body += CODE_FENCE_CLOSE
+
+    def joined(cut: str) -> str:
+        # A fence line with text after it does not close the fence.
+        separator = ROUTE_PARAGRAPH_BREAK if cut.endswith(CODE_FENCE) else NOTE_SEPARATOR
+        worker = separator.join(part for part in (cut, tail) if part)
+        return (head + NOTE_SEPARATOR + worker if worker else head).strip()
+
+    def fits(cut: str) -> bool:
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (joined(cut), added) if part)
+        return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
+
+    if fits(body):
+        return joined(body)
+    if head and not body:
+        # No worker text to cut, so no truncation mark.
+        return None
+    prose = body[: body.index(CODE_FENCE)] if CODE_FENCE in body else body
+
+    def cut(room: int) -> str:
+        return (prose[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
+
+    # The longest cut that fits. Redaction can depend on the text after a
+    # match, so the result is checked again.
+    low, high = 0, len(prose)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(cut(middle)):
+            low = middle
+        else:
+            high = middle - 1
+    # The mark stays even when no character of the worker's note fits; route
+    # notes that leave no room for the mark are left out.
+    if fits(cut(low)):
+        return joined(cut(low))
+    return None
+
+
+def disclose_manual_remediation_routes(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str] = frozenset()
+) -> list[str]:
+    """Add to each `manual` remediation where its fix belongs, as the collector
+    found it. Returns the ids changed.
+
+    A `manual` remediation is prose that asks a person to make a change by
+    hand. It does not say where to make it, and on most objects the obvious
+    place, the live object, is the wrong one: the repository declares the
+    object, or a chart release renders it, or a controller can revert a patch
+    at its next sync or upgrade. A plain `helm install` release reverts a
+    field that the chart sets at the next `helm upgrade`, not before.
+    The collector resolved each of these against the repository and the live
+    object, and the SOPs tell the worker to use them, but the ledger showed
+    the fields only when the worker wrote them into its note.
+
+    The notes come only from fields the candidate carries:
+
+    - `declaration`: the file that declares the object;
+    - `release_declaration`: the chart release or Kustomize overlay that
+      renders it, and that the next sync or upgrade of the release can revert
+      a patch to the live object;
+    - `namespace_directory`: the directory where a new object belongs;
+    - `reconciler`: what reasserts the object's spec, and that its next sync
+      or upgrade can revert a change made by hand.
+
+    There is no note for a candidate without these fields. A missing
+    `declaration` is not a claim that no file declares the object, so a note
+    that says "not declared" would publish a claim that nobody measured.
+
+    A finding in `skip` gets no route note (`route_note_skip`): a fix that
+    `finish` wrote, that the worker declined with a published reason, or that
+    an open pull request carries. Only the route notes that its text copied
+    are removed. The same is true for a remediation that is not `manual`: a
+    worker can copy a route note into its own manifest fix, or into a note
+    that becomes the note of a fix that `finish` writes.
+
+    The pass first removes the route notes that the text already carries,
+    which a worker that copies the previous ledger brings back, and then
+    writes them again from this run's manifest. It removes them also when
+    this run's candidate carries no field. The route notes go in a paragraph
+    of their own after the worker's note. The worker's note is cut first when
+    the total is over `MAX_NOTE_CHARS`, because the renderer cuts from the
+    end and the route notes are at the end (`_fit_route_notes`).
+
+    The pass does not edit the worker's own words. A worker clause that
+    contradicts a note stays, and the note beside it is the correction.
+    """
+    evidence = route_evidence(manifest)
+    disclosed: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        remediation = finding.get("remediation")
+        if not isinstance(remediation, dict):
+            continue
+        if remediation.get("kind") != "manual" or fid in skip:
+            before = remediation.get("note")
+            _strip_route_notes(remediation)
+            if remediation.get("note") != before:
+                disclosed.append(fid)
+            continue
+        original = str(remediation.get("note") or "")
+        # The note before an earlier pass of this run cut it, when there was one.
+        uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+        worker_note = uncut if isinstance(uncut, str) else original.strip()
+        if ROUTE_NOTE_PATTERN.search(worker_note):
+            worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
+        found = evidence.get(derive_finding_id(finding))
+        fitted, added = _routed_note(found, worker_note) if found else (worker_note, "")
+        if fitted != worker_note:
+            remediation[ROUTE_UNCUT_NOTE_FIELD] = worker_note
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, added) if part)
+        if note != original.strip():
+            remediation["note"] = note
+            disclosed.append(fid)
+    return disclosed
+
+
+def disclose_manual_routes_and_log(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str], prefix: str = ""
+) -> None:
+    """Add the route notes, and log each finding that changed.
+
+    A run with no manifest writes no route note, but it still removes the
+    route notes that a worker copied from an earlier ledger.
+    """
+    by_id = {str(finding.get("id", "")): finding for finding in findings}
+    for fid in disclose_manual_remediation_routes(findings, manifest, skip):
+        note = str((by_id[fid].get("remediation") or {}).get("note") or "")
+        if ROUTE_NOTE_PATTERN.search(note):
+            log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
+        else:
+            log(f"{prefix}{fid}: removed the route notes that its remediation copied from an earlier ledger.")
 
 
 class KccDeclaration(NamedTuple):
@@ -16449,7 +18220,7 @@ def _head_sha(tree: Path) -> str:
 
 def _repo_file_url(repo: str) -> str | None:
     """The forge's `fileUrl` template from `capabilities`, or None when absent."""
-    answer = try_forge(CAPABILITIES_OP, repo, {})
+    answer = capabilities_answer(repo)
     if not isinstance(answer, dict):
         return None
     template = answer.get(CAPABILITY_FILE_URL_KEY)
@@ -16894,6 +18665,31 @@ def _open_ledger(
     return root, existing_issue, pending, carried
 
 
+def _open_store_ledger(repo: str, audit_id: str) -> tuple[Path, list[dict[str, str]]]:
+    """`start`'s half for a ledger kept in the store: the workspace, and what the stored ledger carries.
+
+    The repository is cloned as on the forge path, because the fixes still
+    open on it; no ledger issue is looked up, and there is no ledger thread
+    to read `/remediate` requests from. The findings the stored ledger
+    carries are read off the body the previous run stored
+    (`previous_store_ledger`), as `_open_ledger` reads them off the stored
+    body of the issue.
+    """
+    refresh_credentials(repo)
+    root = ensure_workspace(repo, audit_id, reset=True)
+    ensure_labels(repo, audit_id)
+    # `start` lists no remediation proposals, so it cannot tell a first run
+    # from a lost memory; `finish` lists them and decides.
+    memory, _known = previous_store_ledger(audit_id, repo, open_fix=None)
+    carried = [
+        {"id": fid, "check": fid.split(".", 1)[0], **where}
+        for fid, where in sorted(
+            parse_finding_locations(str((memory or {}).get("ledger_body") or "")).items()
+        )
+    ]
+    return root, carried
+
+
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     claim_in_flight(audit_id)
@@ -16925,7 +18721,8 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
             stale.unlink(missing_ok=True)
 
     opt_repo = getattr(args, "repo", None)
-    repo, unreachable = resolve_reachable_repo(audit_id, opt_repo)
+    decision = resolve_reachable_repo(audit_id, opt_repo)
+    repo, unreachable = decision.publish_repo, decision.unreachable
     # The relay posts what this file holds instead of the run's final message,
     # so a run that dies before its `finish` must not leave the previous run's
     # report there.
@@ -16933,9 +18730,12 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     no_forge = repo == NO_FORGE_REPO
     if no_forge:
         # The checks still run; only the ledger and the fixes have nowhere to go.
-        log(f"NO FORGE: {unreachable_note(unreachable)}")
+        log(f"NO FORGE: {unreachable_note(unreachable, probe=decision.probe)}")
         root = no_forge_workspace(audit_id)
         existing_issue, pending, carried = None, [], []
+    elif decision.store_ledger:
+        root, carried = _open_store_ledger(repo, audit_id)
+        existing_issue, pending = None, []
     else:
         root, existing_issue, pending, carried = _open_ledger(repo, audit_id)
 
@@ -16968,7 +18768,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
     )
     declarations_path = write_declarations(audit_id, repo, declarations)
     write_run_record(
-        audit_id, repo, context, searched=searched, sources=sources, unreachable=unreachable
+        audit_id, repo, context, searched=searched, sources=sources, decision=decision
     )
 
     print(
@@ -16986,8 +18786,20 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                 # a mode switch. `none` is an install with no forge: nothing
                 # publishes the fixes, and the workspace is empty.
                 "mode": NO_FORGE_MODE if no_forge else ("content" if content_mode() else "directory"),
-                **({"no_forge": unreachable_note(unreachable)} if no_forge else {}),
+                **(
+                    {"no_forge": unreachable_note(unreachable, probe=decision.probe)}
+                    if no_forge
+                    else {}
+                ),
                 **diverted_marker(unreachable),
+                # The ledger is in the report store and chat; the fixes still
+                # open on the forge. There is no ledger issue, so `issue` is
+                # null and a `/remediate` comes through chat.
+                **(
+                    {LEDGER_KEY: LEDGER_STORE, LEDGER_NOTE_KEY: store_ledger_note(decision)}
+                    if decision.store_ledger
+                    else {}
+                ),
                 # Where this stream's workspace actually is. The agent does not
                 # start in one and cannot guess this — the path carries a lease
                 # segment, and it is private to this audit, so a manifest
@@ -17391,7 +19203,9 @@ def _handle_finish_dry_run(
     # The same degradation the real run applies, so a dry run shows the body
     # that would actually be published rather than an optimistic one. Every
     # step below therefore sees the post-degradation findings, exactly as
-    # `handle_finish` does.
+    # `handle_finish` does. What each fix promised is kept first, because the
+    # degrade blanks the path and the route notes below need it.
+    promised_preview = promised_paths(findings)
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
@@ -17426,6 +19240,21 @@ def _handle_finish_dry_run(
                 "either, the real run publishes it as manual and names the "
                 "`resources:` line to add."
             )
+    # The notes the real run adds. The preview reads no pull request and no
+    # `--decline-fix`, so it leaves alone every fix the refusal would list,
+    # and it can leave out a note the real run adds.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        set(
+            unwritten_sweep_fixes(
+                findings, manifest, promised_preview, degraded, audit_id, [], log_prefix="DRY RUN: "
+            )
+        )
+        if findings and manifest is not None
+        else set(),
+        prefix="DRY RUN: ",
+    )
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -17977,6 +19806,11 @@ def handle_remediate(args: argparse.Namespace) -> None:
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
+    # A forge with no issue tracker, or no labels, keeps the ledger in the
+    # report store: there is no ledger issue to link, and the lookup would
+    # refuse. The fix still opens on the forge. Asked before the labels, so
+    # a forge with no labels gets no label call.
+    on_forge = ledger_on_forge(repo)
     ensure_labels(repo, audit_id, noun=noun)
 
     # A named finding whose manifest was never written cannot become a pull
@@ -18024,7 +19858,16 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
 
     issue_number = args.issue
-    if issue_number is None:
+    if issue_number is None and on_forge and not forge_has_labels(repo):
+        # `capabilities` could not be read, and `ensure_labels` then learnt
+        # that the forge has no labels: no ledger issue can be found on it,
+        # so the fix opens with no ledger link, as on the store path.
+        log(
+            f"{repo} has no labels, so no ledger issue of audit:{audit_id} can be "
+            f"found on it; the {noun} opens with no ledger link."
+        )
+        on_forge = False
+    if issue_number is None and on_forge:
         issue_number, _, _, _ = find_existing_issue(repo, audit_id)
 
     pr_by_finding, _ = reconcile_remediation_prs(
@@ -18072,12 +19915,18 @@ def handle_remediate(args: argparse.Namespace) -> None:
     sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
+        revival = (
+            "a `/remediate` comment on the ledger from someone with write access, "
+            "written after the close — or --override-human-close from the person "
+            "at the terminal."
+            if on_forge
+            else "--override-human-close from the person at the terminal; this "
+            "forge has no ledger issue to comment on."
+        )
         log(
             f"{fid}: a human closed its pull request "
             f"({pr.get('url') or '#' + str(pr.get('number', '?'))}), and that "
-            "close stands. Revival is a `/remediate` comment on the ledger "
-            "from someone with write access, written after the close — or "
-            "--override-human-close from the person at the terminal."
+            f"close stands. Revival is {revival}"
         )
     opened = _open_promoted_prs(
         repo,
@@ -18103,20 +19952,29 @@ def handle_remediate(args: argparse.Namespace) -> None:
     )
 
 
-def previous_no_forge_ids(audit_id: str) -> list[str] | None:
-    """The finding ids the previous run with no forge stored; None when unknowable.
+def _previous_store_envelope(
+    audit_id: str, store_repo: str, status: str, writer: str
+) -> tuple[dict | None, bool]:
+    """The newest trusted envelope in `store_repo`'s store, and whether it is knowable.
 
-    `[]` when the store holds no envelope for this key at all: the run is
-    first, and everything it finds is new. There is no public ledger to hold
-    the record against, so an envelope is trusted on its own when a run with
-    no forge wrote it for this key under this id scheme, and never when a run
-    diverted to the no-forge path wrote it (`is_diverted`). `latest.json` first;
-    when it is missing or untrusted, the newest such envelope in `runs/`, as
-    `previous_run_document` reads it: a failed write drops `latest.json` and
-    leaves the ring, and on this install nothing else remembers the run. A
-    store with envelopes and none trusted is unknowable rather than empty.
+    (None, True) when the store holds no envelope for this key at all: the
+    run is first, and everything it finds is new. There is no public ledger
+    to hold the record against, so an envelope is trusted on its own when a
+    run of `status` wrote it for this key under this id scheme, and never
+    when a run diverted to the no-forge path wrote it (`is_diverted`).
+    `latest.json` first; when it is missing or untrusted, the newest such
+    envelope in `runs/`, as `previous_run_document` reads it: a failed write
+    drops `latest.json` and leaves the ring, and on these runs nothing else
+    remembers the run. A store with envelopes and none trusted is (None,
+    False): unknowable rather than empty. `writer` names the run for the log.
+    The no-forge path reads it; it opens and closes no fix. The store-ledger
+    path, which closes fixes, reads `_store_ledger_envelope` instead.
     """
-    directory = reports_dir_for(audit_id, NO_FORGE_REPO)
+    try:
+        directory = reports_dir_for(audit_id, store_repo)
+    except ValueError as exc:
+        log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
+        return None, False
     candidates = [directory / REPORT_LATEST_NAME]
     try:
         candidates.extend(sorted((directory / REPORT_RUNS_DIR).glob("*.json"), reverse=True))
@@ -18124,26 +19982,261 @@ def previous_no_forge_ids(audit_id: str) -> list[str] | None:
         pass
     present = [path for path in candidates if path.exists()]
     if not present:
-        return []
+        return None, True
     for path in present:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        ids = envelope.get("current_ids") if isinstance(envelope, dict) else None
         if (
-            isinstance(ids, list)
+            isinstance(envelope, dict)
+            and isinstance(envelope.get("current_ids"), list)
             and not is_diverted(envelope)
-            and envelope.get("status") == NO_FORGE_STATUS
-            and _ledger_key(envelope.get("repo")) == _ledger_key(NO_FORGE_REPO)
+            and envelope.get("status") == status
+            and _ledger_key(envelope.get("repo")) == _ledger_key(store_repo)
             and envelope.get("id_scheme") == ID_SCHEME
         ):
-            return [str(fid) for fid in ids]
+            return envelope, True
     log(
-        f"WARNING: no report store record for {audit_id} was written by a run with no "
-        f"forge under id scheme {ID_SCHEME} and can be read; {MEMORY_UNKNOWABLE}"
+        f"WARNING: no report store record for {audit_id} was written by {writer} "
+        f"under id scheme {ID_SCHEME} and can be read; {MEMORY_UNKNOWABLE}"
     )
-    return None
+    return None, False
+
+
+def previous_no_forge_ids(audit_id: str) -> list[str] | None:
+    """The finding ids the previous run with no forge stored; None when unknowable.
+
+    `[]` when the store holds no envelope for this key at all. Read as
+    `_previous_store_envelope` says, from envelopes a run with no forge wrote.
+    """
+    envelope, known = _previous_store_envelope(
+        audit_id, NO_FORGE_REPO, NO_FORGE_STATUS, "a run with no forge"
+    )
+    if not known:
+        return None
+    return [str(fid) for fid in (envelope or {}).get("current_ids") or []]
+
+
+def previous_no_forge_record(audit_id: str) -> dict | None:
+    """The envelope the previous run with no forge stored; None when unknowable.
+
+    `{}` when the store holds no envelope for this key at all: the run is
+    first, and everything it finds is new. Read as `_previous_store_envelope`
+    says, from envelopes a run with no forge wrote. `_finish_without_forge`
+    reads the whole envelope, and not only its ids, because the places of the
+    findings it kept as not re-checked are in it (`NOT_RECHECKED_KEY`).
+    """
+    envelope, known = _previous_store_envelope(
+        audit_id, NO_FORGE_REPO, NO_FORGE_STATUS, "a run with no forge"
+    )
+    if not known:
+        return None
+    return envelope or {}
+
+
+def _store_ledger_envelope(
+    audit_id: str, repo: str, *, open_fix: bool | None = True
+) -> tuple[dict | None, bool]:
+    """The envelope the previous store-ledger run of `repo` wrote, and whether it is knowable.
+
+    Read as `read_report_memory` reads the memory of a ledger issue, with the
+    one difference that this ledger has no issue to vouch for it. `open_fix`
+    says whether a remediation proposal of this stream may be open: True when
+    the listing found one, False when it found none, and None when the caller
+    did not list them. None reads as True, and only the log says otherwise.
+
+    - No store directory for `repo` is (None, True) when no fix of this stream
+      is open: the run is first, as the forge path's first run is the one with
+      no open issue. With an open fix it is a lost memory (None, False): the
+      store went with its volume or its key, and the store is the only copy
+      of this ledger, where the forge path seeds from the issue.
+    - An absent or unreadable `latest.json` in a directory that exists is a
+      lost memory (None, False). `write_report` drops `latest.json` when its
+      write fails, so the newest envelope in `runs/` may be the run before the
+      one that failed; trusting it would miss what the failed run published.
+    - A diverted `latest.json` (`is_diverted`) defers to the newest envelope in
+      `runs/` that is not diverted (`_newest_published_envelope`). When there
+      is none, and the ring is shorter than `REPORT_HISTORY` and no fix of
+      this stream is open, no run ever stored a ledger here and nothing can
+      close: the run is first, as when a run that could not reach the
+      repository created the directory. Otherwise the memory stays lost: a
+      full ring may have aged a stored ledger out, and an open fix may come
+      from a ledger whose store write failed. The forge path seeds once from
+      the issue body there (`seed_memory_from_ledger`); this ledger has no
+      other copy, so it is lost until a findings run stores a new ledger.
+    - The envelope is trusted when a run that kept its ledger in the store
+      (`STORE_LEDGER_STATUS`) wrote it for this repository and it has a
+      readable ledger. Anything else is a lost memory, as a store written for
+      another issue is on the forge path; the ring is not searched past it.
+      The identity scheme is not a trust condition, as in `read_report_memory`:
+      `_finish_store_ledger` re-spells and withholds as `finish` does over a
+      stored body of another scheme.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError as exc:
+        log(f"WARNING: no report store for {audit_id}: {exc}; {MEMORY_UNKNOWABLE}")
+        return None, False
+    if not directory.exists():
+        if open_fix is False:
+            return None, True
+        if open_fix is None:
+            log(
+                f"No stored ledger for {audit_id} in {repo}; no listing of remediation "
+                "proposals was made, so it is not known here whether this is the first run"
+            )
+            return None, False
+        log(
+            f"No stored ledger for {audit_id} in {repo}, but a remediation proposal of this "
+            f"stream is open; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    path = directory / REPORT_LATEST_NAME
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log(
+            f"No stored ledger for {audit_id} in {repo}: latest.json is absent from a store "
+            f"that exists, as after a failed store write; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    except (OSError, ValueError) as exc:
+        log(
+            f"WARNING: stored ledger for {audit_id} in {repo} is unreadable "
+            f"({exc}{_ownership_note(exc)}); {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    if is_diverted(envelope):
+        runs = directory / REPORT_RUNS_DIR
+        envelope = _newest_published_envelope(runs)
+        if envelope is None and open_fix is False:
+            try:
+                ring = len(list(runs.glob("*.json")))
+            except OSError:
+                ring = REPORT_HISTORY
+            if ring < REPORT_HISTORY:
+                return None, True
+        if envelope is None:
+            log(
+                f"Stored reports for {audit_id} in {repo} are all from runs that could not "
+                f"reach it; {MEMORY_UNKNOWABLE}"
+            )
+            return None, False
+    if not (
+        isinstance(envelope, dict)
+        and envelope.get("status") == STORE_LEDGER_STATUS
+        and _ledger_key(envelope.get("repo")) == _ledger_key(repo)
+        and isinstance(envelope.get("current_ids"), list)
+        and isinstance(envelope.get("ledger_body"), str)
+    ):
+        log(
+            f"WARNING: the stored ledger for {audit_id} in {repo} was not written by a run "
+            f"that keeps its ledger in the store; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    return envelope, True
+
+
+def previous_store_ledger(
+    audit_id: str, repo: str, *, open_fix: bool | None = True
+) -> tuple[dict | None, bool]:
+    """The ledger that the previous store-ledger run of `repo` stored, and whether it is knowable.
+
+    The memory of a run whose forge has no issue tracker (`STORE_LEDGER_STATUS`):
+    its envelope in `repo`'s own store directory, read as
+    `_store_ledger_envelope` says. Its `ledger_body` is the ledger the run
+    rendered and its `current_ids` the ids that ledger carries. An envelope
+    that a no-forge run diverted here, or that a forge run wrote, is not this
+    memory. `open_fix` is as `_store_ledger_envelope` says.
+    """
+    envelope, known = _store_ledger_envelope(audit_id, repo, open_fix=open_fix)
+    if isinstance(envelope, dict) and envelope.get("ledger_held_open") and (
+        envelope.get("delta_known") is False
+    ):
+        # A clean run over a lost memory held a ledger it could not read. Its
+        # envelope carries no ledger, so the memory stays lost: trusting its
+        # empty ledger would let the next clean run close every fix.
+        log(
+            f"WARNING: the newest record for {audit_id} was stored over a lost memory "
+            f"and carries no ledger; {MEMORY_UNKNOWABLE}"
+        )
+        return None, False
+    return envelope, known
+
+def clusters_phrase(count: int) -> str:
+    """`1 cluster` / `2 clusters`."""
+    return CLUSTERS_PHRASE[count != 1].format(count=count)
+
+
+def findings_headline(
+    name: str, findings: list[dict], new: int, resolved: int, delta_known: bool
+) -> str:
+    """The audit line of a run that found something, or that found nothing and was not clean.
+
+    Leads with the count of the most severe findings present, as the Slack card
+    does, then what changed, a clause only for a count that is not zero, or
+    that the change is unknown.
+    "Fleet Stockout Prevention & Capacity Audit: 2 major findings, 1 new."
+    """
+    counts = severity_counts(findings)
+    severity = next((level for level in SEVERITIES if counts[level]), None)
+    if severity is None:
+        lead = HEADLINE_NO_FINDINGS
+    else:
+        count = counts[severity]
+        lead = HEADLINE_LEAD.format(
+            count=count, severity=severity, noun=HEADLINE_FINDINGS_NOUN[count != 1]
+        )
+    if not delta_known:
+        return f"{name}: {lead}{HEADLINE_DELTA_UNKNOWN}."
+    clauses = [lead]
+    if new:
+        clauses.append(HEADLINE_NEW.format(count=new))
+    if resolved:
+        clauses.append(HEADLINE_RESOLVED.format(count=resolved))
+    return f"{name}: {HEADLINE_CLAUSE_SEPARATOR.join(clauses)}."
+
+
+def _object_name(finding: dict) -> str:
+    """The name of the object a finding judged, or "" when it is the cluster itself."""
+    kind, _, name = str(finding.get("object") or "").rpartition("/")
+    cluster = str(finding.get("cluster") or "").rpartition("/")[2]
+    if kind.rpartition("/")[2] == CLUSTER_OBJECT_KIND or (not kind and name == cluster):
+        return ""
+    return name
+
+
+def summary_row(finding: dict) -> str:
+    """One finding as the chat summary lists it: "`critical` seeded-a: control plane is public".
+
+    The cluster by its short name, and the check's plain phrase
+    (`CHECK_PHRASES`) with the object it judged; the finding's own title where
+    the check has no phrase, or its phrase needs an object the finding does not
+    name. Redacted, because the cluster, the object and the title are the
+    model's words.
+    """
+    where = str(finding.get("cluster") or "").rpartition("/")[2]
+    obj = _object_name(finding)
+    phrase = CHECK_PHRASES.get(str(finding.get("check") or ""), "")
+    if PHRASE_OBJECT in phrase:
+        phrase = phrase.format(object=obj) if obj else ""
+    elif phrase and obj:
+        phrase = SUMMARY_ROW_OBJECT.format(phrase=phrase, object=obj)
+    text = phrase or " ".join(str(finding.get("title") or "").split())
+    row = SUMMARY_ROW.format(severity=finding.get("severity"), where=where, phrase=text)
+    return redact_secrets(row)
+
+
+def _summary_shown(ordered: list[dict]) -> list[dict]:
+    """The findings the summary lists: the critical ones up to their cap, else the top of the most severe level."""
+    if not ordered:
+        return []
+    severity = ordered[0].get("severity")
+    listed = [finding for finding in ordered if finding.get("severity") == severity]
+    cap = NO_FORGE_SUMMARY_CRITICAL_ROWS if severity == SEVERITIES[0] else NO_FORGE_SUMMARY_TOP_ROWS
+    return listed[:cap]
+
 
 def render_no_forge_summary(
     audit_id: str,
@@ -18155,57 +20248,89 @@ def render_no_forge_summary(
     held: list[str],
     note: str,
     dropped: int = 0,
+    unread: list[str] | None = None,
+    *,
+    stored: bool = True,
+    prs: dict | None = None,
+    unaccounted: Iterable[str] = (),
+    noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
-    """The chat summary of a run with no forge, which is the only report its operator gets.
+    """The chat summary of a run with no ledger issue, which is the only report its operator gets.
 
-    The headline counts, the most severe findings up to
-    `NO_FORGE_SUMMARY_FINDINGS` with the object each one names, the ids the
-    collector still flags that the document left out, how many of this run's
-    collector candidates the document does not carry (`dropped`), the
-    coverage gaps, and `note`. Redacted like the ledger body, because it is delivered to a
-    channel the same way.
+    The headline (:func:`findings_headline`), the most severe findings up to
+    `NO_FORGE_SUMMARY_CRITICAL_ROWS` or `NO_FORGE_SUMMARY_TOP_ROWS`
+    (:func:`summary_row`), or up to `NO_FORGE_SUMMARY_FINDINGS` of them when
+    the store write failed (`stored`) and this message is the only copy, a
+    line counting the rest by severity,
+    the ids the collector still flags that the document left out, the ids
+    kept because this run did not check their target (`unread`), how many of
+    this run's collector candidates the document does not carry (`dropped`),
+    the coverage gaps, and `note`. `slack_audit_report.summary_card` reads it
+    back into that card. Redacted like the ledger body, because it is delivered
+    to a channel the same way.
+
+    A run whose ledger is in the store and whose fixes open on the forge also
+    passes `prs`, its JSON line, for the links to the remediation proposals it
+    opened, found waiting and closed, and the refusal of their listing
+    (`REMEDIATION_REFUSED_KEY`), and `unaccounted`, the previous findings that
+    keep its ledger open. `noun` is the forge's word for them.
     """
     findings = list(data.get("findings") or [])
-    clusters = len((data.get("scope") or {}).get("clusters") or [])
-    counts = severity_counts(findings)
-    delta = (
-        f"; {len(new_ids)} new, {len(resolved_ids)} resolved since the last run"
-        if delta_known
-        else "; the change since the last run is unknown"
-    )
-    lines = [
-        f"{audit_name(audit_id)}: {findings_phrase(len(findings))} "
-        f"({counts['critical']} critical) across {clusters} cluster(s){delta}."
-    ]
+    lines = [findings_headline(audit_name(audit_id), findings, len(new_ids), len(resolved_ids), delta_known)]
     ordered = sort_findings(findings)
-    for finding in ordered[:NO_FORGE_SUMMARY_FINDINGS]:
-        where = "/".join(
-            part
-            for part in (
-                str(finding.get("cluster") or ""),
-                str(finding.get("namespace") or ""),
-                str(finding.get("object") or ""),
-            )
-            if part
+    shown = _summary_shown(ordered) if stored else ordered[:NO_FORGE_SUMMARY_FINDINGS]
+    lines.extend(summary_row(finding) for finding in shown)
+    left = severity_counts(ordered[len(shown):])
+    more = sum(left.values())
+    if more:
+        breakdown = SUMMARY_BREAKDOWN_SEPARATOR.join(
+            SUMMARY_BREAKDOWN_PART.format(count=count, severity=severity)
+            for severity, count in left.items()
+            if count
         )
-        lines.append(
-            f"- [{finding.get('severity')}] {redact_secrets(str(finding.get('title') or ''))} "
-            f"({redact_secrets(where)})"
-        )
-    if len(ordered) > NO_FORGE_SUMMARY_FINDINGS:
-        lines.append(f"- and {len(ordered) - NO_FORGE_SUMMARY_FINDINGS} more in the report store")
+        template = SUMMARY_MORE if stored else SUMMARY_MORE_UNSTORED
+        lines.append(template.format(count=more, breakdown=breakdown, verb=SUMMARY_MORE_VERB[more != 1]))
     if held:
-        shown = ", ".join(held[:NO_FORGE_SUMMARY_FINDINGS])
-        more = len(held) - NO_FORGE_SUMMARY_FINDINGS
+        shown_held = ", ".join(held[:NO_FORGE_SUMMARY_FINDINGS])
+        more_held = len(held) - NO_FORGE_SUMMARY_FINDINGS
         lines.append(
             "Still flagged by the collector but not in this run's document: "
+            + shown_held
+            + (SUMMARY_HELD_MORE.format(count=more_held) if more_held > 0 else "")
+        )
+    if unread:
+        shown = ", ".join(unread[:NO_FORGE_SUMMARY_FINDINGS])
+        more = len(unread) - NO_FORGE_SUMMARY_FINDINGS
+        lines.append(
+            "Not re-checked this run, because the run did not check their target, and "
+            "kept in the report store: "
             + shown
-            + (f", and {more} more in the report store" if more > 0 else "")
+            + (f", and {more} more" if more > 0 else "")
         )
     if dropped:
         lines.append(
             f"The collector flagged {dropped} candidate(s) this run's document does not carry; "
             f"the report store lists them under `{UNPUBLISHED_CANDIDATES_KEY}`."
+        )
+    for label, key in (
+        (f"{noun.capitalize()}s opened", "prs_opened"),
+        (f"{noun.capitalize()}s waiting for review", "prs_still_open"),
+        (f"{noun.capitalize()}s closed", "prs_closed"),
+    ):
+        urls = [str(url) for url in (prs or {}).get(key) or []]
+        if urls:
+            lines.append(f"{label}: " + ", ".join(urls))
+    refusal = (prs or {}).get(REMEDIATION_REFUSED_KEY)
+    if refusal:
+        lines.append(
+            "No fix was opened, updated or closed, because the remediation proposals "
+            f"could not be listed: {redact_secrets(str(refusal))}"
+        )
+    unaccounted = list(unaccounted)
+    if unaccounted:
+        lines.append(
+            "Not accounted for, so the ledger keeps them and no fix was closed: "
+            + ", ".join(unaccounted)
         )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
@@ -18246,6 +20371,7 @@ def _finish_without_forge(
     waiver: str,
     timers: Callable[[], dict],
     unreachable: tuple[str, str] | None = None,
+    probe: str = REACHABILITY_PROBE_VERB,
 ) -> None:
     """Keep a run on an install with no forge in the report store, and print its line.
 
@@ -18257,14 +20383,21 @@ def _finish_without_forge(
     repositories are managed and none could be chosen: its key is
     `no_repository_chosen`, and its envelope, marked so, goes under
     `NO_FORGE_REPO`. Either run is never silent, and its delta is unknown.
+    `probe` is the read that found the repository unreachable, which the
+    note's advice follows (`unreachable_note`).
 
     Everything `finish` does with a ledger is skipped: the issue, its delta
     comment, the remediation sweep and the stale closes all need a repository.
     The checks still ran. On an install with no repository, the delta is taken
-    against the previous no-forge envelope (never a marked one), and a
-    previous finding the collector still flags is held, as the ledger holds
-    it: the document leaving it out is not the condition clearing. The JSON
-    line carries a `summary` for the run to deliver to chat. A document
+    against the previous no-forge envelope (never a marked one), and the JSON
+    line carries a `summary` for the run to deliver to chat. A previous
+    finding the collector still flags is held, as the ledger holds it: the
+    document leaving it out is not the condition clearing. So is a previous
+    finding on a target this run did not read or did not check
+    (`unread_held_entries`), with its place stored under `NOT_RECHECKED_KEY`,
+    until a run checks the target again. A diverted run holds neither: its
+    envelope is marked, so no later run reads it as its previous record, and
+    the not-re-checked entries stay in the record that run reads. A document
     `finish` would refuse is refused the same way, since validation runs
     before this.
     """
@@ -18281,8 +20414,12 @@ def _finish_without_forge(
     # could be chosen) has no no-forge history of its own: that history is
     # from runs on an install with no repository, so comparing with it would
     # report a delta that means nothing. Its new and resolved counts are
-    # unknown, nothing is held, and an unknown delta is never quiet.
-    previous_ids = None if unreachable is not None else previous_no_forge_ids(audit_id)
+    # unknown, nothing is held, and an unknown delta is never quiet. That
+    # includes the not-re-checked entries: with no record, none are kept.
+    record = None if unreachable is not None else previous_no_forge_record(audit_id)
+    previous_ids = (
+        None if record is None else [str(fid) for fid in record.get("current_ids") or []]
+    )
     marker = diverted_marker(unreachable)
     store_repo = unreachable[0] if unreachable and unreachable[0] else NO_FORGE_REPO
     delta_known = previous_ids is not None
@@ -18294,7 +20431,29 @@ def _finish_without_forge(
         - set(current_ids)
         - set(finding_ids(postures_withheld(data)))
     )
-    stored_ids = sorted(set(current_ids) | set(held))
+    # The previous findings on a target this run did not check, as the
+    # ledger branch keeps them; only over a gap and with a trusted record.
+    unread_entries = (
+        unread_held_entries(
+            "",
+            record,
+            data,
+            exclude=set(current_ids)
+            | set(held)
+            | set(finding_ids(postures_withheld(data)))
+            | _declared_ids(data),
+            previous_ids=previous_ids,
+        )
+        if gaps and record
+        else []
+    )
+    unread = [entry["id"] for entry in unread_entries]
+    for entry in unread_entries:
+        log(
+            f"HELD: {entry['id']} is in the report store and this run did not check it "
+            f"({entry[UNREAD_REASON_KEY]}); it stays as not re-checked rather than resolved."
+        )
+    stored_ids = sorted(set(current_ids) | set(held) | set(unread))
     new_ids = sorted(set(current_ids) - set(previous_ids or []))
     # Over a coverage gap an absence means "not checked", not fixed.
     resolved_ids = [] if gaps else sorted(set(previous_ids or []) - set(stored_ids))
@@ -18345,6 +20504,7 @@ def _finish_without_forge(
         resolved_ids=resolved_ids,
         rendered_ids=stored_ids,
         delta_known=delta_known,
+        not_rechecked=unread_entries,
     )
     envelope.update(marker)
     # A diverted run wrote nothing to the ledger, so when its write fails the
@@ -18352,7 +20512,7 @@ def _finish_without_forge(
     stored = write_report(audit_id, envelope, now, ledger_unchanged=unreachable is not None)
     # The store is the only record on this install, so the note says whether
     # it holds this run rather than promising it.
-    note = unreachable_note(unreachable, stored=stored)
+    note = unreachable_note(unreachable, stored=stored, probe=probe)
     payload["no_forge"] = note
     payload.update(marker)
     # For the same reason, a run the store does not hold is never quiet. A
@@ -18361,10 +20521,633 @@ def _finish_without_forge(
     # operator that it does not.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored and unreachable is None
     payload["summary"] = render_no_forge_summary(
-        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
+        audit_id,
+        data,
+        gaps,
+        new_ids,
+        resolved_ids,
+        delta_known,
+        held,
+        note,
+        len(unpublished),
+        unread=unread,
+        stored=stored,
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
+    )
+    print(json.dumps(payload))
+
+
+class _FixPlan(NamedTuple):
+    """What `_plan_remediation_files` hands back to `finish`."""
+
+    remediation_prs: list[dict]
+    sweep_on: bool
+    unlinked_paths: frozenset[str]
+    file_url: str | None
+    file_ref: str
+    # Why the listing refused, when the caller let it (`listing_may_refuse`).
+    listing_refusal: str | None = None
+
+
+def _plan_remediation_files(
+    audit_id: str,
+    repo: str,
+    args: argparse.Namespace,
+    data: dict,
+    findings: list[dict],
+    *,
+    manifest: dict | None,
+    record: dict | None,
+    root: Path,
+    probe: _RepositoryProbe,
+    promised: dict[str, str],
+    degraded: list[str],
+    unlisted: list[str],
+    listing_may_refuse: bool = False,
+) -> _FixPlan:
+    """`finish`'s last step before it publishes: refuse an unwritten fix, then write the fixes it derives.
+
+    The same on both paths that open remediation proposals: the ledger issue's,
+    and the store ledger's. Lists the stream's proposals, refuses a fix the
+    sweep would open and the worker did not write (`unwritten_refusal_message`),
+    writes the fixes `finish` derives itself, and closes `probe`.
+
+    With `listing_may_refuse`, a refused listing does not stop the run: the
+    plan carries the refusal (`listing_refusal`), no proposal, the sweep off,
+    and no unwritten-fix refusal, because no fix can be told to exist. The
+    store ledger asks for this: its store write is the only record of the run.
+
+    Last, it adds the route notes to each `manual` remediation
+    (`disclose_manual_routes_and_log`), because both ledgers publish them.
+    """
+    listing_refusal = None
+    try:
+        remediation_prs = list_remediation_prs(repo, audit_id)
+    except GitHubLookupError as exc:
+        if not listing_may_refuse:
+            raise
+        listing_refusal = str(exc)
+        log(f"WARNING: {listing_refusal}; this run opens, syncs and closes no proposal.")
+        remediation_prs = []
+    sweep_on = auto_promotion_enabled() and listing_refusal is None
+    # The last point before anything is published. A fix the sweep would open
+    # and the worker did not write is refused until it is written or declined
+    # by name with a reason: refused once, a worker re-ran `finish` unchanged
+    # and the fix reached the ledger as `manual`. A declined fix publishes as
+    # `manual` with the reason on its row.
+    declines = dict(getattr(args, "decline_fix", None) or [])
+    # A promised path the containment check refused is no fix the sweep would
+    # open: writing at it is what the check stops, so it is not refused again
+    # as unwritten, and publishes `manual` with its SECURITY line as before.
+    # The install's switch (`sweep_on`) changes none of this: a `/remediate`
+    # there needs the written fix as much as the sweep does, so an unwritten
+    # one is refused, planned and written the same, and opened only on request.
+    unwritten = without_refused_paths(
+        unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
+        if findings and listing_refusal is None
+        else {},
+        degraded,
+        promised,
+        root,
+    )
+    # The worker wrote these fixes, and the Kustomize pass made them `manual`.
+    # A refusal would ask for the same file again, and one file cannot list
+    # itself in its kustomization.
+    unwritten = {fid: fix for fid, fix in unwritten.items() if fid not in unlisted}
+    # A fix `finish` can derive is written rather than refused, but only once
+    # the run is past the refusal, so a refused run leaves no file behind.
+    skipped: dict[str, str] = {}
+    try:
+        planned, answered = plan_generated_fixes(
+            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped
+        )
+        # A decline of a budget `finish` can write is not taken: the worker's
+        # reason was the shortcut the refusal exists to stop.
+        for fid in sorted(set(declines) & set(planned)):
+            if decline_names_a_pull_request(declines[fid]):
+                # A person's pull request already carrying the budget is the one
+                # decline the planner cannot see for itself; it stands.
+                planned.pop(fid)
+                continue
+            log(
+                f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget "
+                "itself unless the reason carries the URL of the pull request already carrying it"
+            )
+            declines.pop(fid)
+        decline_unwritten_fixes(findings, unwritten, declines)
+        remaining = {
+            fid: fix
+            for fid, fix in unwritten.items()
+            if fid not in declines and fid not in planned and fid not in answered
+        }
+        if remaining and has_run_record(audit_id, repo):
+            raise ValidationError(unwritten_refusal_message(remaining, skipped, sweep_off=not sweep_on))
+        write_generated_fixes(findings, planned, root)
+        unlinked_paths = _unlinked_manifest_paths(findings, manifest, planned, probe)
+        file_url = (
+            _repo_file_url(repo)
+            if any((f.get("remediation") or {}).get("kind") == "manifest" for f in findings)
+            else None
+        )
+        file_ref = (
+            _repo_file_ref(repo, root, data, record, probe)
+            if file_url is not None
+            else DEFAULT_FILE_REF
+        )
+    finally:
+        probe.close()
+    # After every pass that changes a remediation, so the notes describe the
+    # remediation that is published, on both ledgers. A fix that `finish`
+    # wrote, that the worker declined, or that an open pull request carries
+    # gets no route note (`route_note_skip`). A refused listing shows no pull
+    # request, so no fix counts as carried and each `manual` fix gets its
+    # notes: they still say where the fix belongs.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        route_note_skip(unwritten, declines, planned, pr_carried_fixes(promised, degraded, audit_id, remediation_prs)),
+    )
+    return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
+
+
+def _finish_store_ledger(
+    audit_id: str,
+    decision: LedgerDecision,
+    args: argparse.Namespace,
+    data: dict,
+    now: datetime,
+    *,
+    manifest: dict | None,
+    record: dict | None,
+    root: Path,
+    probe: _RepositoryProbe,
+    promised: dict[str, str],
+    degraded: list[str],
+    unlisted: list[str],
+    withheld: list[dict],
+    gaps: list[str],
+    still_flagged: set[str],
+    collector_speaks: bool,
+    collector_payload: Callable[[list[str]], dict],
+    shielded_ids: set[str],
+    shielded_namespaces: set[tuple[str, str]],
+    earlier: dict | None,
+    noun: str,
+    timers: Callable[[], dict],
+) -> None:
+    """Keep the ledger in the report store and chat, and open the fixes on the forge.
+
+    The run of a repository whose forge has no issue tracker, or no labels
+    (version-control-support.md §8). `finish` has already validated the
+    document, cloned the repository and applied every guard the forge path
+    applies before it publishes: the declaration, missing-file, Config
+    Connector and Kustomize demotions. What is left differs from the forge
+    path only where a ledger issue would be read or written:
+
+    - The memory is the previous run's envelope (`previous_store_ledger`): its
+      ids give the delta, and its `ledger_body`, the ledger this path renders
+      and stores but never posts, gives the held set, the locations `start`
+      prints and the clean-run join reads (`unaccounted_previous_findings`),
+      as the stored body of the issue gives them on the forge path.
+    - Over a coverage gap, a previous finding on a target this run did not
+      check stays on the stored ledger as not re-checked
+      (`unread_held_entries`), with its place under `NOT_RECHECKED_KEY`,
+      and its fix stays open, as on the forge path.
+    - The remediation proposals are found, opened and closed as on the forge
+      path, through the label-free paths on a forge with no labels: the
+      automatic sweep with its cap and switch, the label or marker sync, the
+      comment on a merged fix that did not clear, and the stale close, held
+      over a coverage gap or a previous finding this run did not account for.
+    - There is no ledger thread, so no `/remediate` is read here: a person asks
+      in chat, and the agent runs the `remediate` subcommand.
+    - The JSON line, the envelope and the chat summary carry the links. The
+      envelope is published memory, not a marked one: the next run of this
+      repository reads it, and the readers of the store show it.
+    """
+    repo = decision.repo
+    findings = list(data["findings"])
+    declared = [entry for entry in data.get("declared") or [] if isinstance(entry, dict)]
+    fix_plan = _plan_remediation_files(
+        audit_id, repo, args, data, findings,
+        manifest=manifest, record=record, root=root, probe=probe,
+        promised=promised, degraded=degraded, unlisted=unlisted,
+        listing_may_refuse=True,
+    )
+    remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
+    # A refused listing leaves the fixes unknown: this run opens, syncs and
+    # closes none, and its store write still keeps the findings.
+    listing_refusal = fix_plan.listing_refusal
+
+    # The store is the only copy of this ledger, so an absent one is a first
+    # run only when no fix of this stream is open (`_store_ledger_envelope`).
+    memory, delta_known = previous_store_ledger(
+        audit_id,
+        repo,
+        open_fix=listing_refusal is not None
+        or any(str(pr.get("state") or "").upper() == "OPEN" for pr in remediation_prs),
+    )
+    previous_ids = [str(fid) for fid in (memory or {}).get("current_ids") or []]
+    previous_body = str((memory or {}).get("ledger_body") or "")
+    previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
+    finding_places = report_finding_places(memory, data)
+    # The forge path's stale-scheme rule: ids stored under another identity
+    # scheme are spelled differently, so `resolved` and the ids no longer
+    # reported under a gap are withheld on a findings run, and no finding is
+    # marked new against them. The held set re-spells the stored rows
+    # (`collector_held_entries`, `carried_held_entries`). A clean run closes as
+    # the forge path's clean branch does, with no stale-scheme guard.
+    previous_scheme = parse_id_scheme(previous_body)
+    stale_scheme = bool(previous_ids) and previous_scheme != ID_SCHEME
+    if stale_scheme:
+        log(
+            f"Previous stored ledger's {len(previous_ids)} finding id(s) were written "
+            f"under identity scheme {previous_scheme} and this run uses {ID_SCHEME}; "
+            "withholding 'resolved' this run rather than reporting a rename as a fix."
+        )
+        _, residual = previous_marker_ids(previous_body)
+        if residual:
+            log(
+                f"WARNING: {residual} id(s) in the previous marker had no rendered row "
+                f"to re-derive under identity scheme {ID_SCHEME}; they leave the stored "
+                "ledger unheld with this rewrite, which is the cost of the scheme bump."
+            )
+    current_ids = finding_ids(findings)
+    withheld_ids = set(finding_ids(withheld))
+    held_exclude = set(current_ids) | withheld_ids
+    # The held set as the forge path builds it from the ledger issue's stored
+    # body: a previous finding the collector still flags and this document
+    # left out is held, because the document leaving it out is not the
+    # condition clearing. Without a manifest, the ids the previous body
+    # recorded as held are carried. Over a lost memory nothing is held.
+    held_entries: list[dict] = []
+    held_dropped: list[dict] = []
+    carried_without_manifest = False
+    if delta_known and manifest is not None:
+        held_entries, held_dropped = cap_held_entries(
+            collector_held_entries(
+                manifest, data, exclude=held_exclude, previous_body=previous_body
+            )
+        )
+    elif delta_known:
+        held_entries, held_dropped = cap_held_entries(
+            carried_held_entries(previous_body, exclude=held_exclude | _declared_ids(data))
+        )
+        if held_entries:
+            carried_without_manifest = True
+            still_flagged = {entry["id"] for entry in held_entries}
+    held = [entry["id"] for entry in held_entries]
+    if held_dropped:
+        log(
+            f"WARNING: the stored ledger stops tracking {len(held_dropped)} finding(s) the "
+            f"collector still flags; it holds at most {MAX_HELD_IDS} at once, lowest ids first."
+        )
+    # The previous findings on a target this run did not read or did not
+    # check, as the forge path keeps them (`unread_held_entries`): only over
+    # a gap and with a trusted stored ledger. A findings run renders them as
+    # rows under _Not re-checked this run_ in the stored body, after the
+    # collector-held entries and in the same `MAX_HELD_IDS`; a clean run
+    # keeps the previous body, which still carries them, so it has no cap.
+    # `unchecked_ids` also has the ids past the cap: their fixes stay open.
+    unread_entries: list[dict] = []
+    unread_dropped: list[dict] = []
+    if memory and delta_known and gaps:
+        unread_entries = unread_held_entries(
+            previous_body, memory, data, exclude=held_exclude | set(held) | _declared_ids(data)
+        )
+        if findings:
+            room = max(MAX_HELD_IDS - len(held_entries), 0)
+            unread_entries, unread_dropped = unread_entries[:room], unread_entries[room:]
+    unread_ids = {entry["id"] for entry in unread_entries}
+    unchecked_ids = unread_ids | {entry["id"] for entry in unread_dropped}
+    for entry in unread_entries:
+        log(
+            f"HELD: {entry['id']} is on the stored ledger and this run did not check it "
+            f"({entry[UNREAD_REASON_KEY]}); it stays on the ledger as not re-checked "
+            "rather than resolved."
+        )
+    if unread_dropped:
+        log(
+            f"WARNING: the stored ledger stops tracking {len(unread_dropped)} previous "
+            "finding(s) on a target this run did not check — it holds at most "
+            f"{MAX_HELD_IDS} at once. Their {noun}s stay open: "
+            + ", ".join(entry["id"] for entry in unread_dropped)
+        )
+    # Over a lost memory a clean run cannot tell what the stored ledger
+    # carried, so it closes no fix, as the forge path's lost-memory gap says.
+    if not delta_known and not findings:
+        gap = (
+            STORE_LOST_MEMORY_GAP
+            if (still_flagged - held_exclude)
+            else STORE_LOST_MEMORY_UNGUARDED_GAP
+        )
+        gaps = [*gaps, gap]
+        log(f"COVERAGE GAP: {gap}")
+    coverage_moved = coverage_changed(gaps, memory)
+    # A clean run with complete coverage closes stale fixes only when every
+    # finding the stored ledger carries under a check that ran again is
+    # explained: the clean-close guard of the forge path, on the stored body.
+    unaccounted = (
+        unaccounted_previous_findings(previous_body, data)
+        if not findings and delta_known and not gaps
+        else []
+    )
+    # And, as the forge path's clean branch does, every held finding: the
+    # collector still flags it whatever `resolved_because` says, so the close,
+    # the pull-request retirement and the `resolved` count all stop. A
+    # findings run does not fold them: there `still_flagged` keeps their fixes.
+    held_ids = {entry["id"] for entry in held_entries}
+    if not findings:
+        already_held = {entry["id"] for entry in unaccounted}
+        unaccounted = sorted(
+            unaccounted + [e for e in held_entries if e["id"] not in already_held],
+            key=lambda entry: entry["id"],
+        )
+        for fid in sorted(held_ids):
+            log(
+                f"STILL FLAGGED: {fid} is on the stored ledger and the collector still "
+                "flags it, so it is not resolved whatever the document says; no fix is "
+                "closed over it."
+            )
+    unaccounted_ids = [entry["id"] for entry in unaccounted]
+    for entry in unaccounted:
+        if entry["id"] in held_ids:
+            continue
+        log(
+            f"UNACCOUNTED: {entry['id']} ({entry['object']} in {entry['cluster']}) is on the "
+            f"stored ledger and this run says `{entry['check']}` ran there again, but it is "
+            "neither reported nor in resolved_because; no fix is closed over it."
+        )
+    # A clean run that did not account for the stored ledger leaves it as it
+    # was, as the forge path leaves an issue it holds open. Over a lost memory
+    # it holds a ledger it cannot read: the envelope then carries no ledger
+    # and says so (`delta_known` False), and `previous_store_ledger` reads it
+    # as a lost memory again, as the forge path stores no issue number.
+    held_open = not findings and bool(gaps or unaccounted or held) and (
+        bool(memory) or not delta_known
+    )
+    stored_ids = sorted(
+        set(previous_ids) if held_open else set(current_ids) | set(held) | unread_ids
+    )
+    new_ids = sorted(set(current_ids) - set(previous_ids)) if delta_known else []
+    # Over a coverage gap an absence means "not checked", not fixed.
+    resolved_ids = (
+        sorted(set(previous_ids) - set(stored_ids))
+        if delta_known and not gaps and not (stale_scheme and findings)
+        else []
+    )
+    published_ids = held_exclude | set(held) | unread_ids
+    already_reported = {
+        str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
+    } - published_ids
+    unreported_under_gap = (
+        sorted(set(previous_ids) - published_ids - already_reported)
+        if gaps and not stale_scheme
+        else []
+    )
+    reported_under_gap = sorted(already_reported | set(unreported_under_gap))
+
+    pr_by_finding, _ = reconcile_remediation_prs(audit_id, findings, remediation_prs)
+    claimed, _pr_urls = claimed_prs(pr_by_finding)
+    triage_reasons = triage_markers(findings, manifest)
+    if findings and not sweep_on:
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; a {noun} opens only when a person asks in chat.")
+    plan = promotion_candidates(
+        findings,
+        pr_by_finding,
+        [],
+        cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
+        requested_at={},
+        sweep_off=not sweep_on,
+        uncorroborated=uncorroborated_findings(findings, manifest),
+        triage_marked=set(triage_reasons),
+        vouched=collector_vouched_findings(findings, manifest),
+    )
+    for fid in plan.uncorroborated:
+        log(
+            f"{fid}: the collector ran this check on this cluster and emitted no candidate "
+            f"for this object, so the sweep will not open a {noun} on it; ask in chat for one."
+        )
+    for fid in plan.needs_triage:
+        log(
+            f"{fid}: the collector marked the fix `{triage_reasons.get(fid, '?')}` as needing "
+            f"a judgement it could not make, so the sweep will not open a {noun} on it; "
+            "ask in chat once you have decided."
+        )
+    for fid in plan.already_open:
+        log(f"{fid} already has an open remediation {noun}; not replacing it.")
+    if findings and listing_refusal is None:
+        sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
+        comment_on_merged_but_persisting(repo, audit_id, findings, claimed, now, noun=noun)
+
+    # Retiring a fix asserts that its finding no longer reproduces: not over a
+    # coverage gap, and not over a previous finding this run left unexplained,
+    # except the shield's close, which rests on the declaration.
+    hold_closes = bool(gaps or unaccounted)
+    if listing_refusal is not None:
+        prs_closed = []
+    elif hold_closes and not shielded_namespaces:
+        prs_closed: list[str] = []
+        log(
+            f"No remediation {noun} was closed as stale: coverage is partial or a "
+            "finding on the stored ledger is not accounted for."
+        )
+    else:
+        prs_closed = close_stale_remediation_prs(
+            repo,
+            audit_id,
+            remediation_prs,
+            # And every previous finding on a target this run did not check,
+            # the ones past `MAX_HELD_IDS` too: absence there is not evidence
+            # of a fix.
+            set(current_ids) | still_flagged | unchecked_ids,
+            previous_titles,
+            {},
+            now,
+            noun=noun,
+            sweep_off=not sweep_on,
+            branch_by_finding={
+                str(finding.get("id", "")): group_branch_for(audit_id, group)
+                for group in remediation_groups(findings)
+                for finding in group
+            },
+            shielded_ids=set() if hold_closes else shielded_ids,
+            shielded_namespaces=shielded_namespaces,
+            finding_places=finding_places,
+            shielded_only=hold_closes,
+        )
+
+    prs_opened = _open_promoted_prs(
+        repo,
+        audit_id,
+        findings,
+        plan.promote if listing_refusal is None else [],
+        pr_by_finding,
+        root=root,
+        issue_number=None,
+        generated_at=now,
+        noun=noun,
+        # As each opens: a `finish` that dies after one is re-run, and the
+        # re-run must not sweep again.
+        on_open=lambda: save_chat_verdict(audit_id, repo, False, [], now),
+    )
+    if prs_opened:
+        pr_by_finding, _ = reconcile_remediation_prs(
+            audit_id, findings, list_remediation_prs(repo, audit_id)
+        )
+    claimed, pr_urls = claimed_prs(pr_by_finding)
+    prs_still_open = [
+        url
+        for url in still_open_pr_urls(
+            pr_by_finding, prs_opened, carrying_prs(remediation_prs, findings)
+        )
+        if url not in prs_closed
+    ]
+
+    # The ledger this path keeps: the body the forge path would post, with the
+    # links of this run's fixes, stored and never posted. A clean run that held
+    # the stored ledger keeps the previous body, so the next run still knows
+    # what it carries.
+    if held_open:
+        ledger_body = previous_body
+    elif findings:
+        ledger_body = render_issue_body(
+            data,
+            generated_at=now,
+            audit_id=audit_id,
+            noun=noun,
+            gaps=gaps,
+            states={
+                str(f.get("id", "")): derive_finding_state(True, claimed.get(str(f.get("id", ""))))
+                for f in findings
+            },
+            pr_urls=pr_urls,
+            withheld=plan.withheld,
+            uncorroborated=plan.uncorroborated,
+            needs_triage=plan.needs_triage,
+            below_floor=plan.below_floor,
+            triage_reasons=triage_reasons,
+            switched_off=plan.switched_off,
+            held=held_entries + unread_entries,
+            held_overflow=len(held_dropped),
+            held_carried=carried_without_manifest,
+            unread_overflow=len(unread_dropped),
+            new_ids=set(new_ids) if delta_known and memory and not stale_scheme else None,
+            blocked_by=blocking_prs(pr_by_finding, claimed),
+            file_url=fix_plan.file_url,
+            file_ref=fix_plan.file_ref,
+            unlinked_paths=fix_plan.unlinked_paths,
+            swept_earlier=silent_floor(earlier),
+        ).body
+    else:
+        ledger_body = ""
+
+    # The document the held ledger renders, for the next run's titles, as the
+    # forge path keeps it: the one the memory carries when the memory was
+    # itself held open, else the memory's own document. A held run's own
+    # document is its empty set, not what the ledger renders.
+    ledger_document = None
+    # The places of the findings that the ledger keeps as not re-checked
+    # (`NOT_RECHECKED_KEY`): this run's entries, or, when it keeps the
+    # previous body, the entries the stored run recorded.
+    not_rechecked = unread_entries
+    if held_open:
+        kept = (memory or {}).get(NOT_RECHECKED_KEY)
+        not_rechecked = [e for e in kept if isinstance(e, dict)] if isinstance(kept, list) else []
+        carried = (memory or {}).get("ledger_document")
+        if not isinstance(carried, dict) and not (memory or {}).get("ledger_held_open"):
+            carried = (memory or {}).get("document")
+        if isinstance(carried, dict):
+            ledger_document = carried
+
+    reported_new = len(new_ids)
+    reported_resolved = len(resolved_ids)
+    payload = {
+        "status": STORE_LEDGER_STATUS,
+        "issue_url": None,
+        "new": reported_new,
+        "resolved": reported_resolved,
+        "prs_opened": prs_opened,
+        "prs_still_open": prs_still_open,
+        "prs_closed": prs_closed,
+        # The forge path's rule: nothing is wrong with the repository, so a
+        # scheduled run with nothing new stays silent. A lost memory, a delta,
+        # a new or changed gap, a finding no longer reported under a gap, a
+        # fix opened or closed, an unaccounted finding, or the collector
+        # speaking is news. A run the store does not hold is never silent
+        # (below).
+        "silent_ok": not (
+            not delta_known
+            or reported_new
+            or reported_resolved
+            or coverage_moved
+            or unreported_under_gap
+            or prs_opened
+            or prs_closed
+            or unaccounted
+            or collector_speaks
+            or listing_refusal
+        ),
+        "partial": bool(gaps),
+        "coverage_gaps": gaps,
+        "declared": len(declared),
+        POSTURES_WITHHELD_KEY: finding_ids(postures_withheld(data)),
+        UNACCOUNTED_KEY: unaccounted_ids,
+        **({REMEDIATION_REFUSED_KEY: listing_refusal} if listing_refusal else {}),
+        **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
+        **collector_payload(plan.uncorroborated),
+        "findings": len(findings),
+        "critical": severity_counts(findings)["critical"],
+        LEDGER_KEY: LEDGER_STORE,
+        **timers(),
+    }
+    apply_earlier_finish(payload, earlier)
+    save_chat_verdict(audit_id, repo, payload["silent_ok"], [], now)
+    envelope = report_envelope(
+        audit_id,
+        payload,
+        data,
+        now,
+        repo=repo,
+        issue_number=None,
+        ledger_body=ledger_body,
+        new_ids=new_ids,
+        resolved_ids=resolved_ids,
+        rendered_ids=stored_ids,
+        ledger_document=ledger_document,
+        ledger_held_open=held_open,
+        delta_known=delta_known,
+        reported_under_gap=reported_under_gap,
+        not_rechecked=not_rechecked,
+    )
+    envelope[LEDGER_KEY] = LEDGER_STORE
+    if listing_refusal:
+        envelope[REMEDIATION_REFUSED_KEY] = listing_refusal
+    stored = write_report(audit_id, envelope, now, ledger_unchanged=held_open)
+    note = store_ledger_note(decision, stored=stored, noun=noun)
+    payload[LEDGER_NOTE_KEY] = note
+    # The store is the only record of this ledger, so a run it does not hold
+    # is never quiet.
+    payload["silent_ok"] = bool(payload["silent_ok"]) and stored
+    payload["summary"] = render_no_forge_summary(
+        audit_id,
+        data,
+        gaps,
+        new_ids,
+        resolved_ids,
+        delta_known,
+        held,
+        note,
+        len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
+        unread=sorted(unread_ids),
+        stored=stored,
+        prs=payload,
+        unaccounted=unaccounted_ids,
+        noun=noun,
+    )
+    append_chat_report(
+        audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
     print(json.dumps(payload))
 
@@ -18517,10 +21300,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # holds the record to it; a dry run resolves nothing and compares only
     # when `--repo` was given.
     unreachable: tuple[str, str] | None = None
+    decision: LedgerDecision | None = None
     if args.dry_run:
         repo_hint = opt_repo
     else:
-        repo_hint, unreachable = finish_target(audit_id, opt_repo)
+        decision = finish_target(audit_id, opt_repo)
+        repo_hint, unreachable = decision.publish_repo, decision.unreachable
     record = read_run_record(audit_id, repo=repo_hint)
     # Before the dry-run split, so that the preview and the real run publish
     # the same words. After `adopt_collector_evidence`, which makes the
@@ -18595,12 +21380,17 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         _finish_without_forge(
             audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload,
             unreachable=unreachable,
+            probe=decision.probe if decision is not None else REACHABILITY_PROBE_VERB,
         )
         return
     earlier = earlier_finish(audit_id, repo, now)
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
+    if decision is not None and decision.store_ledger:
+        # Learnt from `capabilities` first, so a forge with no labels gets no
+        # label call: `start` learnt it in another process.
+        forge_has_labels(repo)
     ensure_labels(repo, audit_id, noun=noun)
 
     # A PodDisruptionBudget named at the workload's own declaration would be
@@ -18612,11 +21402,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report. What each promised is kept for
     # `unwritten_sweep_fixes`, since the degrade blanks the path.
-    promised = {
-        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
-        for f in findings
-        if (f.get("remediation") or {}).get("kind") == "manifest"
-    }
+    promised = promised_paths(findings)
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
@@ -18758,6 +21544,34 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"({len(group['objects'])} object(s)){claimed}. {', '.join(group['objects'])}"
         )
 
+    if decision is not None and decision.store_ledger:
+        # The forge has no issue tracker, or no labels: the ledger goes to the
+        # report store and chat, and the fixes still open on the forge.
+        _finish_store_ledger(
+            audit_id,
+            decision,
+            args,
+            data,
+            now,
+            manifest=manifest,
+            record=record,
+            root=root,
+            probe=probe,
+            promised=promised,
+            degraded=degraded,
+            unlisted=unlisted,
+            withheld=withheld,
+            gaps=gaps,
+            still_flagged=still_flagged,
+            collector_speaks=collector_speaks,
+            collector_payload=collector_payload,
+            shielded_ids=shielded_ids,
+            shielded_namespaces=shielded_namespaces,
+            earlier=earlier,
+            noun=noun,
+            timers=timer_payload,
+        )
+        return
     existing_issue, existing_url, existing_body, existing_title = find_existing_issue(
         repo, audit_id
     )
@@ -18793,6 +21607,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"{ID_SCHEME}; withholding 'resolved' this run rather than reporting "
             "a rename as a fix."
         )
+    filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
+    baseline = run_baseline(audit_id, repo, previous_ids, delta_known, stale_scheme, filed_cut, now)
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -18856,6 +21672,43 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             still_flagged = {entry["id"] for entry in held_entries}
     held_overflow = len(held_dropped)
     held_ids = {entry["id"] for entry in held_entries}
+    # The previous findings on a target this run did not read or did not
+    # check. Only the findings branch writes the body again, and it writes it
+    # from this run's document, so without these rows such a finding went off
+    # the ledger and out of the hidden block: the next full run announced it
+    # as new if it was still there, and never announced a fix made during the
+    # gap. They render as held rows (`_render_unread_held`), so their ids stay
+    # in the hidden block, out of `resolved` and out of the stale-close pass.
+    # Only over a gap: a run with no gap checked every target. The clean
+    # branch keeps the previous body as it is over a gap, so it renders no
+    # rows, but it uses the ids to defer `/remediate` and to keep the pull
+    # requests of these findings open in the shield's close. On the findings
+    # branch they share `MAX_HELD_IDS` with the collector-held entries, which
+    # come first. The clean branch has no cap: the body it keeps still carries
+    # every id, so each one stays unread.
+    unread_entries: list[dict] = []
+    unread_dropped: list[dict] = []
+    if existing_issue and delta_known and gaps:
+        unread_entries = unread_held_entries(
+            previous_body, memory, data, exclude=held_exclude | held_ids | _declared_ids(data)
+        )
+        if findings:
+            room = max(MAX_HELD_IDS - len(held_entries), 0)
+            unread_entries, unread_dropped = unread_entries[:room], unread_entries[room:]
+    unread_overflow = len(unread_dropped)
+    unread_ids = {entry["id"] for entry in unread_entries}
+    # Every previous finding on a target this run did not check, the ones past
+    # the cap too. The body carries only `unread_ids`, but the stale-close pass
+    # and `/remediate` use this set: a finding the cap left out is still not
+    # re-checked, so its pull request stays open and a `/remediate` on it waits,
+    # as for a collector-held finding past the cap.
+    unchecked_ids = unread_ids | {entry["id"] for entry in unread_dropped}
+    for entry in unread_entries:
+        log(
+            f"HELD: {entry['id']} is on the ledger and this run did not check it "
+            f"({entry[UNREAD_REASON_KEY]}); it stays on the ledger as not re-checked "
+            "rather than resolved."
+        )
     # The still-flagged ids the ledger does not carry: a `/remediate` on one is
     # deferred too, with wording that points at the JSON line rather than at a
     # section that does not name it.
@@ -18889,14 +21742,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A gap holds `resolved` at 0, so a finding that the stored run listed
     # and this run does not publish would leave the ledger with nothing said.
     # Such a run speaks, also when its gaps did not change. Published means
-    # this run's findings, the postures it withheld, and the held ids. An id
+    # this run's findings, the postures it withheld, the collector-held ids,
+    # and the ids kept under _Not re-checked this run_. An id
     # that an earlier run already reported this way, and that is still not
     # published, is not reported again (`REPORTED_UNDER_GAP_KEY` on the stored
     # record). The exception keys on what a run reported, not on the ledger
     # being held open: a run can hold the ledger open and report no id.
     # Withheld over a scheme bump, as `resolved` is: the ids on the two sides
     # are spelled differently, so every stored id would look missing.
-    published_ids = held_exclude | held_ids
+    published_ids = held_exclude | held_ids | unread_ids
     already_reported = {
         str(fid) for fid in (memory or {}).get(REPORTED_UNDER_GAP_KEY) or []
     } - published_ids
@@ -18939,74 +21793,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_collector_ids = [] if carried_without_manifest else [e["id"] for e in held_entries]
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
-    remediation_prs = list_remediation_prs(repo, audit_id)
-    sweep_on = auto_promotion_enabled()
-    # The last point before anything is published. A fix the sweep would open
-    # and the worker did not write is refused until it is written or declined
-    # by name with a reason: refused once, a worker re-ran `finish` unchanged
-    # and the fix reached the ledger as `manual`. A declined fix publishes as
-    # `manual` with the reason on its row.
-    declines = dict(getattr(args, "decline_fix", None) or [])
-    # A promised path the containment check refused is no fix the sweep would
-    # open: writing at it is what the check stops, so it is not refused again
-    # as unwritten, and publishes `manual` with its SECURITY line as before.
-    # The install's switch (`sweep_on`) changes none of this: a `/remediate`
-    # there needs the written fix as much as the sweep does, so an unwritten
-    # one is refused, planned and written the same, and opened only on request.
-    unwritten = without_refused_paths(
-        unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
-        if findings
-        else {},
-        degraded,
-        promised,
-        root,
+    fix_plan = _plan_remediation_files(
+        audit_id, repo, args, data, findings,
+        manifest=manifest, record=record, root=root, probe=probe,
+        promised=promised, degraded=degraded, unlisted=unlisted,
     )
-    # The worker wrote these fixes, and the Kustomize pass made them `manual`.
-    # A refusal would ask for the same file again, and one file cannot list
-    # itself in its kustomization.
-    unwritten = {fid: fix for fid, fix in unwritten.items() if fid not in unlisted}
-    # A fix `finish` can derive is written rather than refused, but only once
-    # the run is past the refusal, so a refused run leaves no file behind.
-    skipped: dict[str, str] = {}
-    try:
-        planned, answered = plan_generated_fixes(
-            findings, manifest, unwritten, declines, remediation_prs, root, probe, audit_id, skipped
-        )
-        # A decline of a budget `finish` can write is not taken: the worker's
-        # reason was the shortcut the refusal exists to stop.
-        for fid in sorted(set(declines) & set(planned)):
-            if decline_names_a_pull_request(declines[fid]):
-                # A person's pull request already carrying the budget is the one
-                # decline the planner cannot see for itself; it stands.
-                planned.pop(fid)
-                continue
-            log(
-                f"WARNING: {fid}: --decline-fix ignored; finish writes this PodDisruptionBudget "
-                "itself unless the reason carries the URL of the pull request already carrying it"
-            )
-            declines.pop(fid)
-        decline_unwritten_fixes(findings, unwritten, declines)
-        remaining = {
-            fid: fix
-            for fid, fix in unwritten.items()
-            if fid not in declines and fid not in planned and fid not in answered
-        }
-        if remaining and has_run_record(audit_id, repo):
-            raise ValidationError(unwritten_refusal_message(remaining, skipped, sweep_off=not sweep_on))
-        write_generated_fixes(findings, planned, root)
-        unlinked_paths = _unlinked_manifest_paths(findings, manifest, planned, probe)
-        file_url = (
-            _repo_file_url(repo)
-            if any((f.get("remediation") or {}).get("kind") == "manifest" for f in findings)
-            else None
-        )
-        file_ref = (
-            _repo_file_ref(repo, root, data, record, probe)
-            if file_url is not None
-            else DEFAULT_FILE_REF
-        )
-    finally:
-        probe.close()
+    remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
+    unlinked_paths, file_url, file_ref = fix_plan.unlinked_paths, fix_plan.file_url, fix_plan.file_ref
     # `latest.json` is dropped just before each call that rewrites what the
     # ledger says -- the findings rewrite, the coverage issue a clean run
     # opens, the refresh of an open coverage ledger -- and just after the
@@ -19072,7 +21865,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # not stale either: a pull request whose finding never reached
                 # a ledger body — opened by `/remediate`, or on a finding the
                 # body budget dropped — is still a fix for a live condition.
-                repo, audit_id, remediation_prs, still_flagged, previous_titles, {}, now,
+                # Nor is a previous finding on a target this run did not
+                # check (`unread_ids`): absence there is not evidence of a fix.
+                repo, audit_id, remediation_prs, still_flagged | unread_ids, previous_titles, {}, now,
                 # Over a gap or an unaccounted finding the close acts on the
                 # namespaces `start`'s file declares and on nothing the
                 # worker wrote; a complete run keeps the shield's ids too.
@@ -19130,8 +21925,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 flagged = [
                     t for t in targets if t in still_flagged and t not in withheld_ids
                 ]
+                # And one naming a previous finding on a target this run did
+                # not check: the ledger keeps it as not re-checked, so "no
+                # longer reproduces" would be false there as well.
+                unread = [
+                    t
+                    for t in targets
+                    if t in unread_ids and t not in withheld_ids and t not in flagged
+                ]
                 covered = [t for t in targets if t in covered_by_id]
-                if held or flagged:
+                if held or flagged or unread:
                     reply_to_deferrals(
                         repo,
                         existing_issue,
@@ -19145,7 +21948,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                                     if t in held_ids
                                     else collector_candidate_reason(t, noun)
                                     for t in flagged
-                                ],
+                                ]
+                                + [unread_hold_reason(t, noun) for t in unread],
                             }
                         ],
                         clean_comments,
@@ -19429,7 +22233,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # next run a trusted memory of an empty ledger — every finding the body
         # carries would be announced as new. The previous body carries forward
         # instead; with no memory of it, the envelope names no issue, so the
-        # next run's trust check fails as a lost memory should.
+        # next run's trust check fails as a lost memory should. The open
+        # ledger's number goes in `OPEN_LEDGER_KEY`, which the trust check
+        # does not read.
         body_untouched = (
             bool(existing_issue)
             and bool(gaps or unaccounted or held_unread)
@@ -19440,9 +22246,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # document the untouched body renders rides alongside as
         # `ledger_document`, for the next run's titles.
         ledger_document = None
+        # The open ledger's number whatever the memory. Without it, a ledger
+        # held open with no memory is named nowhere in the store, and the next
+        # run cannot find it when the label listing leaves it out.
+        open_issue = existing_issue if body_untouched else None
+        # The places of the findings the untouched body keeps as not
+        # re-checked, as the stored run recorded them (`NOT_RECHECKED_KEY`).
+        not_rechecked: list[dict] = []
         if body_untouched:
             stored_issue = existing_issue if memory else None
             stored_body, stored_ids = previous_body, previous_ids
+            kept = (memory or {}).get(NOT_RECHECKED_KEY)
+            not_rechecked = [e for e in kept if isinstance(e, dict)] if isinstance(kept, list) else []
             carried = (memory or {}).get("ledger_document")
             # A held-open run's own `document` is its empty set, not what the
             # body renders, and a seed has none: only a run that wrote the
@@ -19485,14 +22300,29 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 ledger_held_open=body_untouched,
                 delta_known=delta_known,
                 reported_under_gap=reported_under_gap,
+                open_issue_number=open_issue,
+                not_rechecked=not_rechecked,
             ),
             now,
             ledger_unchanged=body_untouched,
         )
+        # A HELD line prints no counts, so it keeps its own label.
+        whole_run = baseline.from_entry and payload["status"] == "CLEAN"
+        run_resolved = 0 if gaps else len(baseline.ids)
         append_chat_report(
-        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
-        refinish=bool(payload.get(REFINISH_KEY)),
-    )
+            audit_id,
+            repo,
+            render_chat_report(
+                audit_id,
+                payload,
+                data,
+                baseline.known if whole_run else delta_known,
+                (0, run_resolved) if whole_run else None,
+            ),
+            now,
+            refinish=bool(payload.get(REFINISH_KEY)),
+            whole_run=whole_run,
+        )
         print(json.dumps(payload))
         return
 
@@ -19520,7 +22350,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # their own heading and their ids join the hidden block — see
     # `_render_collector_held` — so they are neither `new` nor swept, and the
     # next run reads them back.
-    carried = held_entries
+    carried = held_entries + unread_entries
     # Said here and not before the branch split: only this branch rewrites the
     # marker, so only here does the ledger stop tracking anything. On a clean
     # run the untouched marker still carries every id it had.
@@ -19531,6 +22361,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "ids first. They stay on the JSON line as unpublished_candidates while "
             "the collector flags them and their pull requests stay open: "
             f"{', '.join(entry['id'] for entry in held_dropped)}"
+        )
+    if unread_dropped:
+        log(
+            f"WARNING: the ledger stops tracking {unread_overflow} previous "
+            "finding(s) on a target this run did not check — it holds at most "
+            f"{MAX_HELD_IDS} at once. Their pull requests stay open, and a "
+            "`/remediate` on one waits for a run that checks its target: "
+            + ", ".join(entry["id"] for entry in unread_dropped)
         )
 
     ledger_comments = (
@@ -19546,6 +22384,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         collector_held=held_ids,
         collector_flagged=candidate_only,
         noun=noun,
+        unread_held=unchecked_ids,
     )
     triage_reasons = triage_markers(findings, manifest)
     if not sweep_on:
@@ -19629,6 +22468,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
+        unread_overflow=unread_overflow,
         new_ids=new_marked,
         blocked_by=blocked_by,
         file_url=file_url,
@@ -19657,17 +22497,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # that one did not: a ledger that cut findings for space, and one written
     # before cut findings were listed, would announce them all on the first
     # run that has room.
-    if filed is not None:
-        new_ids = [fid for fid in new_ids if fid not in filed[0]]
-    else:
-        # A seeded memory has no document, but a body that cut findings named
-        # every one it filed in its complete block.
-        complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
-        try:
-            cut = set(json.loads(complete[-1])) if complete else set()
-        except (json.JSONDecodeError, TypeError):
-            cut = set()
-        new_ids = [fid for fid in new_ids if fid not in cut]
+    new_ids = [fid for fid in new_ids if fid not in filed_cut]
     # Held back again for the collector, on the same principle as the coverage
     # rule one source further out: a candidate the collector still emits is the
     # condition still holding, whatever this run's document did or did not say
@@ -19678,6 +22508,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # Less the withheld postures: those are the document's, held back by the
     # harness for want of a search, and already kept out of `resolved` by the
     # gap they file — naming them here would blame the collector for it.
+    # No filter is needed for the findings held because this run did not
+    # check their target: only a run with a gap holds one, and every reader
+    # of `resolved_ids` below (the delta comment, the count, the store) reads
+    # it as empty over a gap.
     contradicted = [fid for fid in resolved_ids if fid in still_flagged - held_exclude]
     if contradicted:
         resolved_ids = [fid for fid in resolved_ids if fid not in still_flagged]
@@ -19754,7 +22588,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # rendered, because a pull request can cover a finding that body
             # never had room for. Its pull request is not stale while the
             # condition is still observed, whatever the document left out.
-            set(current_ids) | still_flagged,
+            # And every finding held because this run did not check its
+            # target: absence there is not evidence of a fix. That includes
+            # the ones past `MAX_HELD_IDS`, which left the body but not the gap.
+            set(current_ids) | still_flagged | unchecked_ids,
             previous_titles,
             {},
             now,
@@ -19822,6 +22659,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
+                unread_overflow=unread_overflow,
                 new_ids=new_marked,
                 blocked_by=blocked_by,
                 file_url=file_url,
@@ -19993,12 +22831,34 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             rendered_ids=parse_delta_block(ledger_body),
             delta_known=delta_known,
             reported_under_gap=reported_under_gap,
+            # Their places, which the note and id-only tiers do not render.
+            not_rechecked=unread_entries,
         ),
         now,
     )
+    run_counts = None
+    if baseline.from_entry and baseline.known:
+        # The run's delta, on the yardsticks and filters this run's own took.
+        run_new, run_resolved = compute_delta(baseline.ids, rendered.rendered_ids, current_ids)
+        run_new = [fid for fid in run_new if fid not in set(baseline.filed)]
+        if any(fid in still_flagged - held_exclude for fid in run_resolved):
+            run_resolved = [fid for fid in run_resolved if fid not in still_flagged]
+        if gaps or baseline.stale_scheme:
+            run_resolved = []
+        run_counts = (len(run_new), len(run_resolved))
     append_chat_report(
-        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        audit_id,
+        repo,
+        render_chat_report(
+            audit_id,
+            payload,
+            data,
+            baseline.known if baseline.from_entry else delta_known,
+            run_counts,
+        ),
+        now,
         refinish=bool(payload.get(REFINISH_KEY)),
+        whole_run=baseline.from_entry,
     )
     print(json.dumps(payload))
 

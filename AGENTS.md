@@ -42,7 +42,7 @@ Tests live in many places. **Decide by whether a model call is in the loop:**
 - **Yes, and you plant the defect it has to find** — it is an eval in
   `bench/tasks/<name>/task.yaml` and runs in CI. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract (`make bench-case-check`, `scripts/test_task_registration.py`). **A change to
-  agent behaviour starts from one:** red locally, implement, green three times, registered:
+  agent behaviour starts from one:** red, implement, three greens, registered, or exempt:
   [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey in
   `bench/cuj/` ([`bench/cuj/README.md`](bench/cuj/README.md)). Manual by design: it grades a live
@@ -192,9 +192,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   merged disposition list under **Self-Review**: what you looked for, what was found, the context
   used. Mechanics: [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how the
-  change was exercised against a running installation ([INSTALL.md](INSTALL.md)), the red-to-green
-  eval loop for agent behaviour changes, or "Not live-tested" with the reason when no install can
-  reach it. Mechanics and shared-install lease rules:
+  change ran against a running installation ([INSTALL.md](INSTALL.md)), the eval loop or
+  exemption record for agent behaviour changes, or "Not live-tested" with the reason when no install
+  can reach it. Mechanics and shared-install lease rules:
   [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
   fixes into the sections rather than appending rounds; round-by-round history belongs in the
@@ -210,8 +210,8 @@ user" clauses here. Agents with a user in the loop follow this file.
   [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request), a
   declined bot thread excepted (below). Reply first, then resolve every addressed thread per
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations).
-- **You do not merge it; Tide does** once a reviewer's `lgtm` and an `OWNERS` approver's `approved`
-  are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
+- **You do not merge it; the merge queue does** once a reviewer's `lgtm` and an `OWNERS` approver's
+  `approved` are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
@@ -224,8 +224,8 @@ user" clauses here. Agents with a user in the loop follow this file.
 
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
 install (3 repetitions per active case, 1.5–3.5 hours against a 360-minute ceiling). Non-inert
-pushes restart it, so open the PR early and batch changes; a Tide retest after `main` moves reuses
-the head's green in minutes. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
+pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
+`main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
 or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
 inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
 mode and rollback: optional `pull-kube-agents-smoke-test-today` and a six-hourly periodic.

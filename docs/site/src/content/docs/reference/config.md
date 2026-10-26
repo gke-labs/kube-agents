@@ -98,7 +98,7 @@ toolsets:
   - kanban
 
 agent:
-  max_turns: 250
+  max_turns: 150
   disabled_toolsets:
     - browser
     - computer_use
@@ -171,7 +171,7 @@ A second, top-level gate distinct from `platform_toolsets`: listing `kanban` her
 
 ### `agent`
 
-`max_turns` is the per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet audits outgrow — the cost audit runs fourteen checks across every cluster and project and the drift audit twenty — so this profile raises it to 250. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler resolves `agent.max_turns` from `$HERMES_HOME/config.yaml`. Scoping it to this profile leaves the Planning Agent and the Cluster Agents on the default. The comment in the file itself records the runs that motivated the number.
+`max_turns` is the per-turn tool-calling iteration budget of the runs this profile spawns without one of their own: the kanban workers, which is every delegated chat request and every issue-resolver card. It is pinned rather than left unset because an unset key is not a smaller default on the pinned Hermes: a worker is a `hermes chat` process whose own defaults cap it at 500, and a gateway turn reads no cap at all. 150 is 1.4 times the most tool calls a worker was seen to make across a full presubmit run and a full nightly run; the largest was an upgrades audit requested through chat, which runs inside a card and has no budget of its own. The fleet audits need more — the cost audit runs fourteen checks across every cluster and project and the drift audit twenty — so each audit carries `max_turns: 250` on its roster entry in `agents/platform/cron/jobs.json`, which the image's cron scheduler reads ahead of this value ([the patch](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/apply_cron_job_max_turns.py)); before that patch the profile carried 250 and every worker ran with it. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler falls back to `agent.max_turns` from `$HERMES_HOME/config.yaml`. The operator's `spec.harness.tuning.platform.maxTurns` overlays this value; a roster entry's own `max_turns` raises its job above whichever is in force and never lowers it, so an operator value above 250 reaches the audits too. The Planning Agent and the Cluster Agents leave the key unset, which on the pinned Hermes means no cap on a gateway turn and the chat CLI's 500 on a kanban worker. The comment in the file itself records the runs that motivated both numbers.
 
 ### `context_file_max_chars`
 
@@ -206,7 +206,7 @@ Hermes plugins enabled:
 - **`incident_context`** — injects Kubernetes incident context into known chat threads on reply (`pre_gateway_dispatch` hook). The work happens on the Planning Agent, which enables it too: the pod runs a single gateway and it is homed at that profile, so an incident-thread reply is dispatched there and never here. It stands aside for a message that starts with `/`: `legacy_slash_commands` is on the same hook, and prepending the triage report first would move the command off the front of the line where that plugin's anchored pattern can no longer see it.
 - **`pr_opened`** — records each pull or merge request this profile's kanban workers open as a `pr_opened` event on their card (`transform_terminal_output` hook), once the forge confirms the agent's own credential opened it; with `KAGE_SLACK_UX` on, the gateway then posts it as its own message in the card's Slack thread ([ChatOps](/kube-agents/concepts/chatops/)). With [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) on, the operator's overlay enables it, since the back-fill never adds an entry to a list the live file already holds.
 
-The chat-ingress plugins — `session_store` (durable session state), `session_otel_bridge` (enriches OTel spans with session context, see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)) and `chat_metrics` (counts inbound messages and failed turns for `status.usage`) — run on the Planning Agent profile, which owns chat ingress. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
+The chat-ingress plugins — `session_store` (durable session state), `session_otel_bridge` (enriches OTel spans with session context, see [Session metadata](/kube-agents/concepts/observability/#session-metadata-plumbing)) and `chat_metrics` (counts inbound messages and failed turns, thumbs-down reactions and the board's cards that gave up for `status.usage`) — run on the Planning Agent profile, which owns chat ingress. Their sources live in [`agents/chat/defaults/plugins/`](https://github.com/gke-labs/kube-agents/tree/main/agents/chat/defaults/plugins).
 
 ## Related files
 

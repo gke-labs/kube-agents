@@ -37,7 +37,7 @@ import tomllib
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
-from kube_agents_bench import github_writes, transcript, verifiers
+from kube_agents_bench import forges, github_writes, transcript, verifiers
 from kube_agents_bench.verifiers import GitHubWritesVerifier
 from pydantic import ValidationError
 
@@ -268,6 +268,106 @@ def test_an_empty_repository_is_no_write(env, github):
     assert res.reason.startswith(f"no agent pull request or branch was written to {REPO}")
     assert res.raw["writes"] == []
 
+
+def test_the_renewed_token_file_is_read_over_the_token_the_unit_started_with(env, github, monkeypatch, tmp_path):
+    """oobe-first-run-audits' first repetition spent 1h18m in its stack, so the
+    token minted before devops-bench started had expired by the time this
+    check read GitHub, and the safeguard errored (rung 2) on a run that wrote
+    nothing. hack/ci-eval-pr.sh renews the token into BENCH_GITHUB_TOKEN_FILE
+    while the unit runs; the check reads that file at verify time."""
+    stash()
+    route_listing(github, "pulls-empty.json")
+    seen: list[str] = []
+
+    def renewed_only(url: str, tok: str, timeout: float):
+        seen.append(tok)
+        if tok != "ghs_renewed":
+            return (401, {"message": "Bad credentials"})
+        return github.get(url, tok, timeout)
+
+    monkeypatch.setattr(verifiers, "_http_get_json", renewed_only)
+    assert check().verify(5.0).status == "error", "the startup token alone is the expired one"
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert seen[-1] == "ghs_renewed"
+
+
+def test_an_empty_token_file_falls_back_to_the_environment(env, github, monkeypatch, tmp_path):
+    stash()
+    route_listing(github, "pulls-empty.json")
+    empty = tmp_path / "ledger-token"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(empty))
+    assert check().verify(5.0).status == "fail"
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(tmp_path / "missing"))
+    assert check().verify(5.0).status == "fail"
+
+
+#: Token-file contents that cannot be a token, each of which must fall back
+#: to BENCH_GITHUB_TOKEN rather than raise out of the check: bytes that are
+#: not UTF-8 (UnicodeDecodeError), whitespace alone, and inner whitespace or a
+#: second line, or a character outside Latin-1, which would otherwise reach
+#: the Authorization header and make http.client raise ValueError mid-request.
+NOT_A_TOKEN = {
+    "not-utf8": b"\xff\xfeghs_renewed\n",
+    "whitespace-only": b" \n\t\n",
+    "two-lines": b"ghs_renewed\nghs_other\n",
+    "inner-space": b"ghs re newed\n",
+    "control-char": b"ghs_\x00renewed\n",
+    "non-latin1": "ghs_renewed\u2019\n".encode(),
+}
+
+
+@pytest.mark.parametrize("content", NOT_A_TOKEN.values(), ids=NOT_A_TOKEN.keys())
+def test_a_token_file_that_is_not_one_token_falls_back_to_the_environment(
+    env, github, monkeypatch, tmp_path, content
+):
+    stash()
+    route_listing(github, "pulls-empty.json")
+    token_file = tmp_path / "ledger-token"
+    token_file.write_bytes(content)
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    assert forges.read_token(forges.FORGE_GITHUB) == "ghs_fake"
+    assert check().verify(5.0).status == "fail"
+
+
+def test_a_token_file_path_that_is_a_directory_falls_back_to_the_environment(env, monkeypatch, tmp_path):
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(tmp_path))
+    assert forges.read_token(forges.FORGE_GITHUB) == "ghs_fake"
+
+
+def test_the_token_source_names_the_credential_read_token_returned(env, monkeypatch, tmp_path):
+    """After a renewal the file and BENCH_GITHUB_TOKEN hold different tokens;
+    a diagnostic must name the one the request carried."""
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    assert forges.token_source(forges.FORGE_GITHUB) == (
+        f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file})"
+    )
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN_FILE")
+    assert forges.token_source(forges.FORGE_GITHUB) == "the token in BENCH_GITHUB_TOKEN"
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_other")
+    assert forges.token_source(forges.FORGE_GITHUB) == "the token in GITHUB_TOKEN"
+
+
+def test_no_credential_says_the_token_file_was_refused(env, monkeypatch, tmp_path):
+    stash()
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN")
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert "set one of BENCH_GITHUB_TOKEN, GITHUB_TOKEN to a token" in res.reason
+    assert "BENCH_GITHUB_TOKEN_FILE" not in res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_bytes(b"ghs_renewed\nghs_other\n")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert f"BENCH_GITHUB_TOKEN_FILE names {token_file}, which was refused" in res.reason
 
 def test_a_leftover_from_an_earlier_lease_is_not_this_runs(env, github):
     """The listing is newest update first and the walk stops at the first
@@ -601,3 +701,30 @@ def test_the_report_accepts_an_epoch_and_exits_non_zero_when_it_cannot_read(env,
     assert "could not list" in capsys.readouterr().err
     monkeypatch.delenv("BENCH_GITHUB_TOKEN")
     assert github_writes.main(["--repo", REPO, "--since", RUN_START.isoformat()]) == github_writes.EXIT_UNREADABLE
+
+
+def test_the_report_reads_the_token_file(env, github, capsys, monkeypatch, tmp_path):
+    """The CLI reads its credential through forges.read_token, so a runner
+    with only BENCH_GITHUB_TOKEN_FILE set can list the leftovers, and the
+    file's token is preferred over the variable's."""
+    route_listing(github, "pulls-empty.json")
+    seen: list[str] = []
+
+    def renewed_only(url: str, tok: str, timeout: float):
+        seen.append(tok)
+        if tok != "ghs_renewed":
+            return (401, {"message": "Bad credentials"})
+        return github.get(url, tok, timeout)
+
+    monkeypatch.setattr(verifiers, "_http_get_json", renewed_only)
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    assert github_writes.main(["--repo", REPO, "--since", RUN_START.isoformat()]) == 0
+    assert seen and set(seen) == {"ghs_renewed"}
+    monkeypatch.delenv("BENCH_GITHUB_TOKEN")
+    assert github_writes.main(["--repo", REPO, "--since", RUN_START.isoformat()]) == 0
+    capsys.readouterr()
+    token_file.write_text("", encoding="utf-8")
+    assert github_writes.main(["--repo", REPO, "--since", RUN_START.isoformat()]) == github_writes.EXIT_UNREADABLE
+    assert f"BENCH_GITHUB_TOKEN_FILE names {token_file}, which was refused" in capsys.readouterr().err

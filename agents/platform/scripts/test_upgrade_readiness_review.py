@@ -163,6 +163,66 @@ class TheMapping(unittest.TestCase):
         self.assertEqual(by_check["upgrade-zonal-control-plane"]["object"], review.CLUSTER_OBJECT)
         self.assertIn("Replace deprecated labels", by_check["upgrade-removed-node-label"]["recommendation"]["action"])
 
+    def test_an_entry_2_rule_row_carries_the_rules_own_remedy(self):
+        # The surge rule's Pod-range and accelerator shapes end with their remedy after the last
+        # `; ` outside parentheses; the surge-settings shape carries none and keeps the entry's
+        # mitigation, which names the default surge settings it lacks.
+        pod_range = "pod range 10.4.0.0/23 has 0 free /24 block(s) (2 of 2 hold a node) and the 2 surge node(s) of pool(s) default-pool (maxSurge 1), gpu-pool (maxSurge 1) each need one: a surge node with no block never registers and the pool upgrade stalls between versions; lower max-surge or add a secondary Pod range"
+        accelerator = "pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) with no reservation affinity: each surge node needs accelerator capacity the zone may not have, and a pool upgrade that cannot create one stalls between versions; hold a reservation for the surge node, or, on a pool with a spare accelerator node for the drained pods, set the in-place strategy (max-surge 0, max-unavailable 1)"
+        self.assertEqual(review.rule_remedy(pod_range), "Lower max-surge or add a secondary Pod range")
+        self.assertTrue(review.rule_remedy(accelerator).startswith("Hold a reservation for the surge node, or, on a pool with a spare accelerator node"))
+        self.assertEqual(review.rule_remedy("pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node) has no room for its displaced pods"), "")
+        m = member(
+            "seeded-b",
+            "blocked",
+            rules={"surge-capacity": {"entry": 2, "can_block": True, "blocking": 1, "risks": 1}},
+            rule_blocking=[{"rule": "surge-capacity", "entry": 2, "pool": "default-pool", "text": pod_range}],
+            risks=[{"rule": "surge-capacity", "entry": 2, "grade": "risk", "pool": "gpu-pool", "text": accelerator}],
+        )
+        actions = [f["recommendation"]["action"] for f in review.rule_findings(m)]
+        self.assertEqual(actions[0], "Lower max-surge or add a secondary Pod range")
+        self.assertTrue(actions[1].startswith("Hold a reservation for the surge node"), actions[1])
+        (settings,) = review.rule_findings(with_rules())[:1]
+        self.assertEqual(settings["recommendation"]["action"], review.ENTRY_MITIGATIONS[2])
+
+    def test_a_plan_level_rule_row_takes_its_own_title_remedy_and_rubric(self):
+        # The rollout-sequence precheck has no catalogue entry: the readiness report stamps
+        # `entry: None`, files one risk per existing sequence on the host project's first
+        # member and a note on the host's other members, so the week has one row per host.
+        text = (
+            "host project acme-fleet-host already holds RolloutSequence prod-train (2 stage(s): stage 1: projects acme-fleet-host, "
+            "selector resource.labels.env=='canary', soak 604800s (7d); stage 2: projects acme-fleet-host, selector none (every member), soak none); "
+            "the platform allows one per host project, so a plan that creates a second is refused (FAILED_PRECONDITION); "
+            "add the train as stages of prod-train, or plan it in a separate host project"
+        )
+        risk = {"rule": "rollout-sequence-precheck", "entry": None, "grade": "risk", "kind": "RolloutSequence", "namespace": "", "name": "prod-train", "object": "acme-fleet-host/prod-train", "host_project": "acme-fleet-host", "text": text}
+        rules = {"rollout-sequence-precheck": {"entry": None, "can_block": False, "blocking": 0, "risks": 1, "unknown": 0, "notes": 0}}
+        (row,) = review.rule_findings(member("prod-a", "ready", rules=rules, risks=[risk]))
+        self.assertEqual(row["check"], "upgrade-rollout-sequence-precheck")
+        self.assertEqual((row["namespace"], row["object"]), ("", "RolloutSequence/prod-train"))
+        self.assertEqual(row["title"], "A second RolloutSequence in the host project is refused: RolloutSequence/prod-train shapes the upgrade plan")
+        self.assertEqual(row["recommendation"]["action"], "Add the train as stages of prod-train, or plan it in a separate host project")
+        self.assertEqual(row["remediation"]["note"], row["recommendation"]["action"])
+        self.assertIn("(a plan-level rule, no catalogue entry)", row["recommendation"]["rationale"])
+        self.assertEqual(severity(row), "minor")
+        self.assertIsNone(row["_entry"])
+        fq.validate_finding(review.payload(row))
+        # The identity is the check, the host's first member and the sequence: the same row
+        # every week, and no second row for the host's other members, which carry a note.
+        self.assertEqual(review.item_id(row), fq.derive_finding_id("upgrade-rollout-sequence-precheck", PROJECT, "prod-a", "", "RolloutSequence/prod-train"))
+        noted = {"rollout-sequence-precheck": {**rules["rollout-sequence-precheck"], "risks": 0, "notes": 1}}
+        other = member("prod-b", "ready", rules=noted, notes=["rollout-sequence-precheck: precheck for host project acme-fleet-host filed on acme-prod/us-central1-a/prod-a"])
+        self.assertEqual(review.rule_findings(other), [])
+        # A blocker from a plan-level rule is critical like any rule's, under the rule's title.
+        (blocker,) = review.rule_findings(member("prod-a", "blocked", rules=rules, rule_blocking=[{**risk, "grade": "blocking"}]))
+        self.assertEqual(severity(blocker), "critical")
+        self.assertTrue(blocker["title"].endswith("RolloutSequence/prod-train blocks the upgrade"), blocker["title"])
+        # A plan-level rule the tables do not name keeps the default heading, rubric and mitigation.
+        (unnamed,) = review.rule_findings(member("prod-a", "ready", rules={"some-plan-rule": {"entry": None, "can_block": False}}, risks=[{"rule": "some-plan-rule", "entry": None, "text": "something is off; do this"}]))
+        self.assertTrue(unnamed["title"].startswith(review.DEFAULT_ENTRY_TITLE + ": this cluster"), unnamed["title"])
+        self.assertEqual(unnamed["recommendation"]["action"], review.DEFAULT_MITIGATION)
+        self.assertEqual(severity(unnamed), "major")
+
     def test_every_payload_is_one_the_queue_accepts(self):
         for m in (seeded_b(), gemma(), with_rules()):
             for item in review.member_findings(m):
@@ -240,10 +300,16 @@ class TheMapping(unittest.TestCase):
             # the worker on the live route cannot read the script's table, so the prose carries it.
             self.assertIn("blocker is critical", text, document.name)
             self.assertIn(split, text, document.name)
+            # The plan-level rules, graded by rule id, are named the same way.
+            for rule, values in review.RULE_RISK_RUBRIC.items():
+                self.assertIn(f"{review.severity_of({'rubric': review.rubric(values)})} for the plan-level `{rule}`", text, document.name)
 
     def test_the_rubric_table_covers_the_queue_anchors(self):
-        for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
+        for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + list(review.RULE_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
             fq.validate_rubric(review.rubric(values))
+        for rule in review.RULE_RISK_RUBRIC:
+            self.assertIn(rule, review.RULE_TITLES, rule)
+            self.assertIn(rule, review.RULE_REMEDY_RULES, rule)
 
 
 class Registration(unittest.TestCase):

@@ -7404,18 +7404,14 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 
 class DeclarationIndexIsACopyTest(unittest.TestCase):
-    """`workload_declarations` and `declaration_for` are duplicated from
-    `collect.py` rather than imported. Every collector here runs standalone
-    under `python3 <file>`; `fleet_stockout.py` imports a few leaf helpers
-    from its siblings, but this one keeps its own copy, for the reason
-    `fleet_waste.workload_declarations` gives.
-
-    Duplication is the convention, and drift is what it costs: two collectors
-    resolving the same object to different files, or one of them keeping a bug
-    the other fixed, with nothing failing to say so. These tests are the guard
-    the convention does not otherwise have -- they compare the executable code
-    and ignore the docstrings, which differ on purpose because each copy argues
-    from the findings its own stream published.
+    """The declaration index is `collect.py`'s: `workload_declarations`,
+    `declaration_for`, `release_declarations` and `release_declaration_for`
+    are imported from it, so the two collectors cannot resolve the same object
+    to different files. The first tests pin the imports. `release_of`,
+    `reconciler_of` and the internal-LB constants are still copies, so the
+    remaining tests compare their executable code with the original and ignore
+    the docstrings, which differ on purpose because each copy argues from the
+    findings its own stream published.
     """
 
     def test_the_internal_load_balancer_annotations_match_collect(self):
@@ -7448,13 +7444,15 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             out.append(ast.dump(fn))
         return out
 
-    def test_workload_declarations_matches_collect_py(self):
-        mine, theirs = self.bodies("workload_declarations")
-        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+    def test_workload_declarations_is_collect_py_s(self):
+        import collect
 
-    def test_declaration_for_matches_collect_py(self):
-        mine, theirs = self.bodies("declaration_for")
-        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+        self.assertIs(fw.workload_declarations, collect.workload_declarations)
+
+    def test_declaration_for_is_collect_py_s(self):
+        import collect
+
+        self.assertIs(fw.declaration_for, collect.declaration_for)
 
     def test_reconciler_of_matches_collect_py(self):
         # Under the same convention and with the same cost of drift: the phrase
@@ -7464,53 +7462,38 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
         mine, theirs = self.bodies("reconciler_of")
         self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
-    def test_the_release_resolver_matches_collect_py(self):
-        # Every half of the branch that resolves a rendered workload, under the
-        # same convention. Drift here is worse than in the pair above, because
-        # what these resolve to is a file a pull request rewrites: two
-        # collectors disagreeing about which Application declares a release
-        # means one of them opens a PR against the wrong chart.
-        for name in ("release_of", "_argocd_chart_source", "_argocd_kustomize_source", "_argocd_values_field", "release_declarations", "release_declaration_for"):
-            with self.subTest(function=name):
-                mine, theirs = self.bodies(name)
-                self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+    def test_the_release_index_is_collect_py_s(self):
+        import collect
+
+        self.assertIs(fw.release_declarations, collect.release_declarations)
+        self.assertIs(fw.release_declaration_for, collect.release_declaration_for)
+
+    def test_release_of_matches_collect_py(self):
+        # The half of the release branch that is still a copy. Drift here is
+        # worse than in reconciler_of: what the index resolves a release to is
+        # a file a pull request rewrites, so two collectors disagreeing about
+        # which release an object belongs to means one of them opens a PR
+        # against the wrong chart.
+        mine, theirs = self.bodies("release_of")
+        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
 
     def test_the_constants_it_reads_match_too(self):
         """An identical function over a different constant is a different
-        function. `GITOPS_CLUSTER_TREE_DEPTH` in particular decides which files
-        are indexed at all, so a copy that drifted here would index the whole
-        repository or none of it and still pass the two tests above.
+        function. `reconciler_of` and `release_of` read the five annotations
+        and labels, so a copy that drifted there would name a release
+        differently and still pass the two tests above; `main`'s clone check
+        and `collect`'s walks must agree on what `.git` is called.
         """
         import importlib
 
         collect = importlib.import_module("collect")
         for const in (
-            "GITOPS_CLUSTER_TREE_ROOT",
-            "GITOPS_CLUSTER_TREE_DEPTH",
             "GIT_DIR_NAME",
-            "MIRROR_RELEASES_WITHHELD_MARKER",
-            "KCC_API_GROUP_SUFFIX",
             "_HELM_RELEASE_ANNOTATION",
             "_HELM_NAMESPACE_ANNOTATION",
             "_ARGOCD_TRACKING_ANNOTATION",
             "_MANAGED_BY_LABEL",
             "_HELM_MANAGED_BY",
-            "ARGOCD_APPLICATION_KIND",
-            "ARGOCD_CLUSTER_SECRET_LABEL",
-            "ARGOCD_CLUSTER_SECRET_VALUE",
-            "ARGOCD_IN_CLUSTER_SERVER",
-            "FLUX_HELM_RELEASE_KIND",
-            "FLUX_HELM_REPOSITORY_KIND",
-            "RELEASE_KEY_APPLICATION",
-            "RELEASE_KEY_RELEASE",
-            "RELEASE_KEY_NAMESPACE",
-            "ARGOCD_VALUES_OBJECT_FIELD",
-            "ARGOCD_VALUES_STRING_FIELD",
-            "FLUX_VALUES_FIELD",
-            "ARGOCD_KUSTOMIZE_PATCHES_FIELD",
-            "RENDERER_HELM",
-            "RENDERER_KUSTOMIZE",
-            "KUSTOMIZATION_FILE_NAMES",
         ):
             with self.subTest(const=const):
                 self.assertEqual(getattr(fw, const), getattr(collect, const))
@@ -7760,12 +7743,16 @@ class ReleaseDeclarationsSurviveMalformedDocumentsTest(unittest.TestCase):
                     self.assertNotIn((*key_prefix, release), index)
 
     def test_each_malformed_document_is_skipped(self):
-        self.assert_skips_every_malformed_document(fw.release_declarations, ("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps"))
+        import collect
+
+        self.assert_skips_every_malformed_document(fw.release_declarations, ("prod-usc1", collect.RELEASE_KEY_RELEASE, "apps"))
 
     def test_the_chart_ref_form_still_indexes_on_an_empty_chart(self):
         """No `chart` at all is `spec.chartRef`, not a malformed template."""
         text = "kind: HelmRelease\nmetadata: {name: e, namespace: apps}\nspec: {chartRef: {kind: OCIRepository, name: e}}\n"
-        entry = self.index_with(fw.release_declarations, text)[("prod-usc1", fw.RELEASE_KEY_RELEASE, "apps", "e")]
+        import collect
+
+        entry = self.index_with(fw.release_declarations, text)[("prod-usc1", collect.RELEASE_KEY_RELEASE, "apps", "e")]
         self.assertEqual((entry["chart"], entry["values_field"]), ("", "spec.values"))
 
 
@@ -7786,9 +7773,9 @@ class CandidatesCarryTheirReleaseDeclarationTest(unittest.TestCase):
     A right-size is the fix a pull request carries best, and `resources` is the
     key nearly every chart publishes -- so a chart-rendered workload resolving
     to the file declaring its release is the difference between a diff and a
-    paragraph. `release_declarations` is a copy of `collect.py`'s
-    (`DeclarationIndexIsACopyTest`), tested on malformed documents in both
-    files; what is new here is the trip from `collect_fleet` through the thread
+    paragraph. `release_declarations` is `collect.py`'s, imported
+    (`DeclarationIndexIsACopyTest` pins it) and tested on malformed documents
+    here as well; what is new here is the trip from `collect_fleet` through the thread
     pool, into the per-cluster index `_releases_by_object` builds off the dump,
     and out through the `emit` closure.
     """

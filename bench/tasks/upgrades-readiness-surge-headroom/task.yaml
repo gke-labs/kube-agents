@@ -1,0 +1,178 @@
+# The readiness report blocks a pool whose surge node has no Pod IP block or no accelerator capacity
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 2: no spare capacity for the displaced
+# pods), the surge node's side of it. It grades the readiness report's `surge-capacity`
+# rule in the fleet-upgrade-verification skill (scripts/readiness_rules/capacity.py),
+# through the agent's answer to the fleet readiness question.
+#
+# Beside the placement half upgrades-readiness-surge-capacity grades (a pool that removes a
+# node before its replacement exists), the rule reads the surge node that must exist
+# before a drain: every pool below the target on the surge strategy with `maxSurge` above
+# 0. Per Pod range (the pool's own secondary range, else the cluster's), the free aligned
+# per-node blocks are counted against the pools' `maxSurge` sum, and fewer blocks than
+# surge nodes blocks: a surge node with no block never registers and the pool upgrade
+# stalls between versions. A pool carrying accelerators that surges with no reservation
+# affinity is a risk, not a blocker: the surge node needs accelerator capacity the zone may
+# not have, and the upgrade waits for it with the old node serving (catalogue entry 2).
+# Both findings name the numbers and the action (lower `max-surge` or add a secondary Pod
+# range; set the in-place strategy, `max-surge` 0 and `max-unavailable` 1, or hold a
+# reservation).
+#
+# Parked: the seeded fleet plants neither shape. A Pod secondary range is fixed at
+# cluster creation, so the short range is a new, small cluster slot (a /24 Pod range, one
+# pool whose `maxSurge` exceeds its free blocks), and an accelerator pool costs by the hour
+# on every pool project, which the fleet's rule forbids. Issue #3569 is the home of the
+# fixture; until it lands this case sits in `FIXTURE_NOT_READY` in
+# scripts/validate_bench_cases.py, registered in no roster, and the two reads are covered
+# by the rule's unit tests on a cluster record and node list recorded from a development
+# project's GPU cluster (scripts/test_rule_capacity.py). The role name and slot below are
+# the fixture's to settle; the objectives read the planted cluster's line only.
+#
+# What the deterministic checks read, and what they leave to the judge. The prompt asks
+# for one fixed-form line per seeded cluster; every pattern matches the whole declared
+# frame, anchored at both ends, with the line's decoration folded first, and the cluster
+# placeholder is the role's slot. The checks on the planted cluster's line read three
+# slots: the rule id, the grade (a blocker, which is the point of the fixture) and the
+# cell, the entry the report printed for the finding, copied as printed. The cell slot is
+# what proves the report ran: its pattern is wording only the rule's own text produces,
+# in either of the two forms the fixture may take (`pod range <range> has <n> free /<p>
+# block(s) (<held> of <total> hold a node) and the <need> surge node(s) of pool(s) ...` or
+# `pool <pool> (<accelerators>) surges (maxSurge <n>) with no reservation affinity`),
+# with or without the `surge-capacity: ` prefix the table adds and `report.json` does
+# not carry. The numbers are the fixture's, left open. No safeguard: the condition is a
+# setting of the cluster and its pools, which the fixture's Terraform declares and
+# reconciles, and the fixture catalogue's entry lists no object inside the cluster. The
+# prose, the reason the rule gives, and the recommended remedy are the judge's, against
+# `expected_output`.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with gcloud
+# container, gcloud logging read and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly, once the fixture exists.
+id: upgrades-readiness-surge-headroom
+name: Upgrade readiness blocks the pool whose surge node has no Pod IP block or accelerator capacity
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk, and say how many surge nodes its node pools
+  need for the upgrade (the sum of their max-surge settings) and whether the
+  cluster can create them. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per seeded cluster, in exactly this
+  form and with no other words on the line: "<cluster>: kind Cluster; surge
+  nodes the pools need: <count|none>; readiness rule: <the id of the report's
+  rule that graded the surge nodes|none>; graded as:
+  <blocker|risk|note|none>; cell: <the entry the report prints for that rule
+  on the cluster in its other blockers, risks or note column, copied as
+  printed|none>". Write each cluster name exactly as the API shows it, with no
+  brackets, quotes or parentheses around it. When a column holds several
+  entries separated by "; ", copy the one about the surge node (the Pod range
+  or the accelerator). Put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For the planted
+  cluster it says the pool upgrade cannot create its surge node: either the
+  cluster's Pod range has fewer free per-node blocks than the surge nodes the
+  pools need, naming the range, the free and held blocks and the pools with
+  their max-surge, so a surge node would never register, or a pool with
+  accelerators surges with no reservation affinity, naming the pool, its
+  accelerators and its max-surge, so the surge node needs capacity the zone
+  may not have. It says how the report grades it (the short Pod range a
+  blocker, the accelerator pool a risk), names the report's rule for it,
+  surge-capacity, and recommends the rule's action: lower
+  max-surge or add a secondary Pod range, or set the in-place strategy
+  (max-surge 0, max-unavailable 1) or hold a reservation. Other clusters'
+  blockers and risks come from the same run. It ends with one declared line
+  per seeded cluster; the planted cluster's names surge-capacity, reads
+  "graded as: blocker", and its cell is the rule's entry, beginning "pod range"
+  or "pool", with or without the "surge-capacity: " prefix. It cites no CVE
+  identifiers and changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule. The role is the one #3569
+# plants, not in the catalogue yet, which is why the case is parked.
+fixtures:
+  - surge-headroom
+
+verification_spec:
+  # The planted cluster's line, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame,
+  # anchored at both ends, with the line's decoration folded first. The slot
+  # letter is the fixture's to settle with the role.
+  - name: the-planted-cluster-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - surge-headroom
+      any_of_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+
+  # The report's own output: the rule id the other-blockers column and the
+  # JSON carry. An agent that read the range or the pool without the report
+  # has no id to give, and a report whose rule has regressed gives none.
+  - name: the-planted-clusters-line-names-the-reports-rule
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - surge-headroom
+      any_of_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: surge-capacity; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: (?!surge-capacity;)[^;\n]+; graded as: [^\n]+$'
+
+  # The grade is the rule's own and the point of the fixture: a surge node
+  # the cluster cannot create blocks the pool upgrade.
+  - name: the-planted-clusters-line-grades-it-a-blocker
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - surge-headroom
+      any_of_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: [^;\n]+; graded as: blocker; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!blocker;)[^;\n]+; cell: [^\n]+$'
+
+  # The report's own wording, in either of the fixture's two forms, with or
+  # without the rule prefix the table adds and the JSON does not carry. The
+  # skill paraphrases both and a gcloud read supplies neither; a report whose
+  # rule is missing prints no such text, so the slot reads `none` or
+  # something else and the line fails here, whatever the other slots say.
+  # The numbers are the fixture's, left open; the pattern admits one opener
+  # before the text, a quote or angle bracket the agent kept.
+  - name: the-planted-clusters-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - surge-headroom
+      any_of_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:surge-capacity: )?(?:pod range [^ \n]+ has [0-9]+ free /[0-9]+ block\(s\) \([0-9]+ of [0-9]+ hold a node\) and the [0-9]+ surge node\(s\) of pool\(s\) |pool [a-z0-9-]+ \([^)\n]*\) surges \(maxsurge [0-9]+\) with no reservation affinity)[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:e}(?:\s*\([^)\n]*\))?: kind cluster; surge nodes the pools need: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:surge-capacity: )?(?:pod range [^ \n]+ has [0-9]+ free /[0-9]+ block\(s\) \([0-9]+ of [0-9]+ hold a node\) and the [0-9]+ surge node\(s\) of pool\(s\) |pool [a-z0-9-]+ \([^)\n]*\) surges \(maxsurge [0-9]+\) with no reservation affinity))[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

@@ -202,9 +202,9 @@ class InjectLaneTest(unittest.TestCase):
         # the list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
         # phase. pdb-remediation-pr, which asks for its pull request by its
-        # own check, was the presubmit's one requesting case until its
-        # demotion to the nightly (2026-10-17, #3120), so today the list is
-        # empty and the log says "none";
+        # own check, was the presubmit's one requesting case from 2026-10-14
+        # until its demotion to the nightly (2026-10-17, #3120); since
+        # 2026-10-23 that case is vcs-spent-branch-reuse, so the log names it;
         # test_the_requesting_cases_are_named_for_the_second_phase below
         # covers a matrix that holds them.
         requesting = requesting_among(presubmit_tasks())

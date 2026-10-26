@@ -1161,7 +1161,7 @@ def roster_projects() -> tuple[set[str], dict[str, str]]:
         return set(), {}
     projects, unread = set(), {}
     for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or not home.is_dir():
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
             continue
         identity = profile_identity(home)
         if identity:
