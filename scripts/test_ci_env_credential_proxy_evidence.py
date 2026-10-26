@@ -6,9 +6,9 @@ and `collect_litellm_log`. The broker's admission queue is in its log and its
 Prometheus listener alone: the log used to be taken by the failure dump only
 and nothing in the job read the listener, so a green run kept no record of the
 queue it built up. These tests run the real function, lifted from the real file
-with the constants it reads, under bash with `kubectl` and `timeout` stubs on
-PATH, so the bounds it applies and the exit status it leaves behind are the
-ones the script has.
+with the byte-cap helper and constants it reads, under bash with `kubectl` and
+`timeout` stubs on PATH, so the bounds it applies and the exit status it leaves
+behind are the ones the script has.
 """
 
 import os

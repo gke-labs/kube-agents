@@ -6,7 +6,8 @@ what says why a pod was replaced or a container restarted mid-run: the bridge
 sidecar's log and its previous instance, the agent container's previous
 instance, per-container restarts and last terminations, and the namespace's
 events. These tests run the real function, lifted from the real file with the
-constants it reads, under bash with a `kubectl` stub on PATH.
+byte-cap helper and constants it reads, under bash with a `kubectl` stub on
+PATH.
 """
 
 import math

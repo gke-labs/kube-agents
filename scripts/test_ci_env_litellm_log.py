@@ -5,8 +5,9 @@ on green and red exits alike, beside `collect_gateway_log`. The thinking-replay
 hook's per-request "thinking replay: dropped N" line lives only in this log, so
 a green run that kept no litellm.log could not say whether the hook touched its
 traffic. These tests run the real function, lifted from the real file with the
-constants it reads, under bash with a `kubectl` stub on PATH, so the bounds it
-applies and the exit status it leaves behind are the ones the script has.
+byte-cap helper and constants it reads, under bash with a `kubectl` stub on
+PATH, so the bounds it applies and the exit status it leaves behind are the
+ones the script has.
 """
 
 import os

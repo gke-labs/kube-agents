@@ -259,21 +259,23 @@ collect_bench_results() {
 }
 
 # ─── Byte caps ───────────────────────────────────────────────────────────────
-# Every log the collectors below keep is bounded twice: kubectl's line tail,
-# then a byte cap, the last N bytes of what kubectl printed. The cap used to
-# be `| tail -c N` on the pipe. GNU tail takes exactly N there; uutils tail,
-# the coreutils of Ubuntu 25.10 and 26.04 (rust-coreutils 0.8 and 0.10; every
-# release since 0.0.16), keeps whole read chunks after a short read and prints
-# more than N (uutils/coreutils#15804), so a capture on such a runner ran past
-# its cap and the tests that pin the cap read 8851062 != 8388608. On a regular
-# file both implementations seek and take exactly N, so the stream is spooled
-# to a file first and the cap is taken from that; the watch tails in
-# _stop_agent_pod_watch already read files and are unchanged. Same contract
-# as the collectors: every command ends in `|| true`, a read that fails leaves
-# what it printed, and the spool is removed either way.
+# Every container log the `collect_*` functions below keep is bounded twice:
+# kubectl's line tail, then a byte cap, the last N bytes of what kubectl
+# printed. The cap used to be `| tail -c N` on the pipe. GNU tail takes
+# exactly N there; uutils tail, the coreutils of Ubuntu 26.04 (rust-coreutils
+# 0.8.0 and 0.10.0, and upstream 0.12.0), keeps whole read chunks after a
+# short read and prints more than N (uutils/coreutils#15804), so a capture on
+# such a runner ran past its cap and the tests that pin the cap read
+# 8851062 != 8388608. On a regular file both implementations seek and take
+# exactly N, so the stream is spooled to a file first and the cap is taken
+# from that; the watch tails in _stop_agent_pod_watch already read files and
+# are unchanged. Same contract as the collectors: every command ends in
+# `|| true`, a read that fails leaves what it printed (or the last N bytes of
+# what reached the spool if the disk fills mid-stream), and the spool is
+# removed either way.
 last_bytes() {
   local max="$1" out="$2" spool
-  spool="$(mktemp "${TMPDIR:-/tmp}/last-bytes.XXXXXX")" || spool="${out}.spool"
+  spool="$(mktemp "${TMPDIR:-/tmp}/last-bytes.XXXXXX" 2>/dev/null)" || spool="${out}.spool"
   cat > "${spool}" || true
   tail -c "${max}" "${spool}" > "${out}" || true
   rm -f -- "${spool}" || true

@@ -4,9 +4,9 @@
 on green and red exits alike (scripts/test_ci_eval_trap.py pins that), so a
 passing nightly whose repetitions ran to the delegation ceiling keeps the log
 that says what the dispatcher and the workers were doing. These tests run the
-real function, lifted from the real file with the constants it reads, under
-bash with a `kubectl` stub on PATH, so the bounds it applies and the exit
-status it leaves behind are the ones the script has.
+real function, lifted from the real file with the byte-cap helper and
+constants it reads, under bash with a `kubectl` stub on PATH, so the bounds it
+applies and the exit status it leaves behind are the ones the script has.
 """
 
 import os
@@ -82,13 +82,14 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
             *then,
         ]
     )
-    env = dict(
-        os.environ,
-        PATH=f"{stubs}:{os.environ['PATH']}",
-        ARTIFACTS=str(artifacts),
-        TARGET_NAMESPACE="test-ns",
+    env = {
+        **os.environ,
+        "PATH": f"{stubs}:{os.environ['PATH']}",
+        "ARTIFACTS": str(artifacts),
+        "TARGET_NAMESPACE": "test-ns",
+        "TMPDIR": str(tmp),
         **stub_env,
-    )
+    }
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False, env=env)
     return proc, artifacts / ARTIFACT
 
@@ -110,6 +111,18 @@ class GatewayLogCollectionTest(unittest.TestCase):
         proc, log = run_collect(STUB_LINES="200", STUB_LINE_BYTES=str(cap // 100))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(log.stat().st_size, cap)
+        self.assertEqual(list(log.parent.parent.glob("**/last-bytes.*")), [])
+        self.assertEqual(list(log.parent.glob("*.spool")), [])
+        # When mktemp cannot create a file in TMPDIR, last_bytes falls back to
+        # ${out}.spool and still removes the spool once the cap is taken.
+        proc, log = run_collect(
+            STUB_LINES="200",
+            STUB_LINE_BYTES=str(cap // 100),
+            TMPDIR="/nonexistent-last-bytes-tmpdir",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.stat().st_size, cap)
+        self.assertEqual(list(log.parent.glob("*.spool")), [])
 
     def test_a_kubectl_that_fails_leaves_the_status_alone(self):
         """The trap reads `$?` for the dumper after this runs, and a cluster
