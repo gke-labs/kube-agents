@@ -100,7 +100,7 @@ hand run that widens the window and advances no last-run time.
 with an outcome (`collected`; `unreachable` when its credentials failed;
 `gate-failed` when its reads failed, its project's listing failed or it is
 upgrading now; `out-of-scope` outside the fleet), the command behind each
-of the SOP's checks (`CHECK_READS`; an unchanged cluster carries all six,
+of the SOP's checks (`CHECK_READS`; an unchanged cluster carries all seven,
 backed by the operations listing that found no upgrade, or by the read the
 re-check made for the checks that read pods or nodes), `checks_unevaluated`
 for a check whose read ran and failed, never backed by the listing, a
@@ -226,7 +226,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 # Where the image and the shell sandbox ship the platform scripts the
 # collectors share (deploy/docker/Dockerfile and deploy/sandbox/Dockerfile
@@ -737,9 +737,14 @@ KUBECTL_READS = (
 SHAPE_READS = ("workloads", "storage", "webhooks", "endpointslices")
 # The reads that cost Info alone, the risks table and the next-upgrade line:
 # a failure there is a "Reads that failed" line, never a limitation and never
-# a partial run. Every other read decides or feeds one of the six checks
+# a partial run. Every other read decides or feeds one of the seven checks
 # (`CHECK_READS` names the deciding one; events, budgets, owners, workloads
 # and nodes feed the pod checks, the operations listing the node check).
+# The gate's Cloud Monitoring read (below, `LOG_VOLUME_*`) decides the
+# seventh check: a failure there leaves the check unevaluated with the read
+# named in the entry's limitations, as a deciding read's failure does, and
+# the cluster's gate pending; the review itself still counts as reviewed.
+LOG_VOLUME_READ = "log-volume"
 INFO_ONLY_READS = ("storage", "webhooks", "endpointslices")
 RECHECK_ERROR_PREFIX = "re-check: "
 # The checks the stream's SOP grades (governance/upgrade_retrospective_sop.md,
@@ -756,6 +761,10 @@ CHECK_NODE_BROKEN = "node-broken-after-upgrade"
 CHECK_SYMPTOM_TENTATIVE = "upgrade-symptom-tentative"
 CHECK_SYMPTOM_UNCLASSIFIED = "upgrade-symptom-unclassified"
 CHECK_SYMPTOM_PREDATES = "symptom-predates-upgrade"
+# The seventh check, the gate's log-volume reading: Cloud Logging ingestion
+# bytes per container in the seven days after the cluster's last upgrade
+# operation against the seven days before its first.
+CHECK_LOG_VOLUME = "upgrade-log-volume-rose"
 OPERATIONS_READ = "operations"
 OPERATIONS_LIST_FAILED_TEXT = OPERATIONS_READ + " list failed"
 CHECK_READS = (
@@ -765,6 +774,7 @@ CHECK_READS = (
     (CHECK_SYMPTOM_TENTATIVE, "pods"),
     (CHECK_SYMPTOM_UNCLASSIFIED, "pods"),
     (CHECK_SYMPTOM_PREDATES, "pods"),
+    (CHECK_LOG_VOLUME, LOG_VOLUME_READ),
 )
 # A kubectl read ran with KUBECONFIG in its environment; the recorded command
 # spells that out so it runs as published.
@@ -1289,6 +1299,94 @@ LEDGER_OPERATIONS_KEY = "operations_reviewed"
 ROUTE_FULL, ROUTE_SCOPED, ROUTE_AFTER_UPGRADE = "full", "scoped", "after-upgrade"
 ALREADY_REVIEWED_FORMAT = "already reviewed by the {route} route at {at}"
 NODE_AFTER_POOL_UPGRADE_ENTRY = ENTRY_NODE_AGENT
+
+# --------------------------------------------------------------------------- #
+# The gate: the post-upgrade diff plus Cloud Logging ingestion bytes by
+# container, seven days after the cluster's last upgrade operation against
+# seven days before its first. One verdict per reviewed cluster: `risk` when
+# the upgrade brought an Error or a Warning (a symptom group that does not
+# predate it and is not a recreation alone, or a failed operation) or a
+# container rose past both thresholds; `pending` while the after-week is not
+# complete, the review was partial or the Monitoring read failed; `clear`
+# otherwise. A family (the `upgrade-family` cluster label) holds while its
+# first-upgraded member's gate is `risk` or `pending`.
+# --------------------------------------------------------------------------- #
+# The Monitoring read path is the waste collector's: one session factory (the
+# broker's relay in the sandbox, ADC elsewhere), one timeSeries URL and one
+# `curl` label, imported rather than copied so the two stay in step.
+from fleet_waste import MONITORING_CURL_PREFIX, MONITORING_TIMESERIES_URL, URL_SAFE_PAIR_RE, SessionFn, default_monitoring_session  # noqa: E402
+
+MONITORING_PAGE_SIZE = "2000"
+MONITORING_TIMEOUT_S = 120
+MONITORING_MIN_TIMEOUT_S = 1
+MONITORING_PAGES_MAX = 10
+HTTP_OK = 200
+LOG_BYTES_METRIC = "logging.googleapis.com/byte_count"
+LOG_BYTES_RESOURCE_TYPE = "k8s_container"
+LOG_VOLUME_FILTER_FORMAT = 'metric.type="{metric}" AND resource.type="{resource}" AND resource.labels.cluster_name="{cluster}" AND resource.labels.location="{location}"'
+LOG_VOLUME_WINDOW = timedelta(days=7)
+LOG_VOLUME_ALIGNMENT = f"{int(LOG_VOLUME_WINDOW.total_seconds())}s"
+LOG_VOLUME_ALIGNER = "ALIGN_SUM"
+LOG_VOLUME_REDUCER = "REDUCE_SUM"
+LOG_VOLUME_GROUP_BY = ("resource.labels.namespace_name", "resource.labels.container_name")
+LOG_VOLUME_NAMESPACE_LABEL = "namespace_name"
+LOG_VOLUME_CONTAINER_LABEL = "container_name"
+# Both must hold for a breach: at least this many times the week before, and
+# at least this many bytes in the week after (a small container that doubles
+# is noise; a large one that doubles is the bill).
+LOG_VOLUME_RISK_RATIO = 2.0
+LOG_VOLUME_RISK_MIN_BYTES = 1 << 30
+LOG_VOLUME_TOP_ROWS = 5
+BYTES_PER_UNIT = 1024
+BYTES_UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
+GATE_CLEAR, GATE_RISK, GATE_PENDING = "clear", "risk", "pending"
+GATE_REASON_CLEAR = "no Error or Warning the upgrade brought, and no container past the log-volume thresholds"
+GATE_REASON_INCIDENT = "{count} Error(s) or Warning(s) the upgrade brought"
+GATE_REASON_INCIDENT_SUFFIX = "the upgrade brought"
+UNCHANGED_GATE_STATUS = "unchanged"
+UNCHANGED_GATE_REASON = "gate read again from the ledger's anchors"
+GATE_REASON_LOG_VOLUME = "{count} container(s) past the log-volume thresholds"
+GATE_REASON_AFTER_WEEK = "the after-week completes {at}"
+GATE_REASON_READ_FAILED = "the log-volume read failed ({error})"
+GATE_REASON_PARTIAL = "the review was partial ({reads})"
+GATE_REASON_NOT_REVIEWED = "the review did not finish ({error})"
+NO_MONITORING_SESSION_TEXT = "no Monitoring session"
+MONITORING_HTTP_ERROR_FORMAT = "HTTP {status}: {body}"
+MONITORING_NON_JSON_TEXT = "the Monitoring API returned a body that is not JSON"
+MONITORING_PAGES_TEXT = "more than {pages} pages of series"
+PART_GATE = "**Gate.**"
+PART_LOG_VOLUME = "**Log volume by container.**"
+GATE_LINE_FORMAT = "{part} {verdict}: {reasons}. Before: {before_start} to {first_start}; after: {last_end} to {after_end}{complete}."
+GATE_AFTER_WEEK_OPEN_FORMAT = " (after-week completes {at})"
+LOG_VOLUME_LINE_FORMAT = "{namespace}/{container}: {before} -> {after} per week ({ratio})"
+LOG_VOLUME_RATIO_FORMAT = "{ratio}x"
+LOG_VOLUME_NEW_RATIO = "new"
+LOG_VOLUME_HEAD_FORMAT = "{part} total {before} -> {after} per week; "
+LOG_VOLUME_BREACH_FORMAT = "{count} container(s) past the thresholds ({ratio}x and {floor} per week): "
+LOG_VOLUME_NO_BREACH_FORMAT = "none past the thresholds ({ratio}x and {floor} per week); the largest: "
+LOG_VOLUME_NO_SERIES_TEXT = "no container logged in either week"
+LOG_VOLUME_NOT_READ_FORMAT = "{part} not read: {error}."
+INCIDENT_LOG_VOLUME = "log-volume"
+LOG_VOLUME_OBJECT_KIND = "Container"
+LOG_VOLUME_ENTRIES_LABEL = "log volume"
+LOG_VOLUME_SYMPTOM_FORMAT = "Cloud Logging ingestion rose from {before} to {after} per week ({ratio}) in the seven days after the upgrade"
+LOG_VOLUME_MITIGATION = "prepare the logging exclusion for {namespace}/{container}, or hold the patch for the family"
+LOG_VOLUME_GUARD_TEXT = "no guard: the gate stands in the ledger's record until the cluster is reviewed again, and a pending one is read again on the next full run."
+FAMILY_LABEL_KEY = "upgrade-family"
+FAMILY_GO, FAMILY_HOLD, FAMILY_PENDING = "go", "hold", "pending"
+INFO_FAMILIES = "Families:"
+FAMILY_LINE_FORMAT = "- {family}: first upgraded {canary} (gate {verdict}: {reason}); rollout {rollout}; waiting: {waiting}"
+FAMILY_NO_CANARY_FORMAT = "- {family}: no member upgraded in this run's window; members: {members}"
+FAMILY_WAITING_NONE = "none"
+INFO_GATES_REREAD = "Gates re-read:"
+GATE_REREAD_LINE_FORMAT = "- {cluster}: {verdict} ({reasons})"
+LEDGER_GATE_KEY = "gate"
+# The manifest's stand-in for the argv of the Monitoring read, as `fleet_waste.py`
+# labels its usage read: `finish` accepts a `checks_run` command only if it names an
+# inspection binary, so the label is the `curl` that issues the same two requests.
+MONITORING_PAGE_SIZE_KEY = "pageSize"
+COMMAND_CHAIN = " && "
+LOG_VOLUME_NOT_MADE_REASON = f"{LOG_VOLUME_READ} read not made"
 
 
 def log(msg: str) -> None:
@@ -4532,6 +4630,334 @@ def _safe_next_upgrade(cluster: dict, server_config: dict | None, now: datetime,
         return _bare_next_upgrade()
 
 
+
+# --------------------------------------------------------------------------- #
+# The gate.
+# --------------------------------------------------------------------------- #
+
+
+def bytes_text(count: float | int) -> str:
+    """`316.1 MiB`, `1.2 GiB`: one decimal above bytes."""
+    value = float(count or 0)
+    unit = BYTES_UNITS[0]
+    for unit in BYTES_UNITS:
+        if value < BYTES_PER_UNIT or unit == BYTES_UNITS[-1]:
+            break
+        value /= BYTES_PER_UNIT
+    return f"{int(value)} {unit}" if unit == BYTES_UNITS[0] else f"{value:.1f} {unit}"
+
+
+def log_volume_params(cluster_name: str, location: str, start: datetime, end: datetime) -> dict:
+    """The timeSeries.list query for one week of ingestion bytes per
+    namespace and container: one point per series over the whole interval."""
+    return {
+        "filter": LOG_VOLUME_FILTER_FORMAT.format(metric=LOG_BYTES_METRIC, resource=LOG_BYTES_RESOURCE_TYPE, cluster=cluster_name, location=location),
+        "interval.startTime": fmt_ts(start),
+        "interval.endTime": fmt_ts(end),
+        "aggregation.alignmentPeriod": LOG_VOLUME_ALIGNMENT,
+        "aggregation.perSeriesAligner": LOG_VOLUME_ALIGNER,
+        "aggregation.crossSeriesReducer": LOG_VOLUME_REDUCER,
+        "aggregation.groupByFields": list(LOG_VOLUME_GROUP_BY),
+        "pageSize": MONITORING_PAGE_SIZE,
+    }
+
+
+def _week_bytes(session: SessionFn, project: str, params: dict, timeout: float) -> tuple[dict[tuple[str, str], int], str | None]:
+    """Bytes per (namespace, container) for one query, every page summed; the
+    error text when the read failed."""
+    url = MONITORING_TIMESERIES_URL.format(project=project)
+    totals: dict[tuple[str, str], int] = {}
+    query = dict(params)
+    for _ in range(MONITORING_PAGES_MAX):
+        try:
+            response = session.get(url, params=query, timeout=timeout)
+            status = getattr(response, "status_code", None)
+            text = getattr(response, "text", "")
+        except Exception as exc:  # noqa: BLE001 -- the read's error is the gate's reason
+            return totals, str(exc)[:ERROR_EXCERPT_CHARS]
+        if status != HTTP_OK:
+            return totals, MONITORING_HTTP_ERROR_FORMAT.format(status=status, body=str(text)[:ERROR_EXCERPT_CHARS])
+        try:
+            body = json.loads(text)
+        except ValueError:
+            return totals, MONITORING_NON_JSON_TEXT
+        for series in body.get("timeSeries") or []:
+            labels = (series.get("resource") or {}).get("labels") or {}
+            key = (str(labels.get(LOG_VOLUME_NAMESPACE_LABEL) or ""), str(labels.get(LOG_VOLUME_CONTAINER_LABEL) or ""))
+            for point in series.get("points") or []:
+                value = point.get("value") or {}
+                raw = value.get("int64Value") if value.get("int64Value") is not None else value.get("doubleValue")
+                totals[key] = totals.get(key, 0) + int(float(raw or 0))
+        token = body.get("nextPageToken")
+        if not token:
+            return totals, None
+        query = {**params, "pageToken": token}
+    return totals, MONITORING_PAGES_TEXT.format(pages=MONITORING_PAGES_MAX)
+
+
+def log_volume_rows(before: dict[tuple[str, str], int], after: dict[tuple[str, str], int], complete: bool) -> list[dict]:
+    """One row per container seen in either week, largest rise first; a
+    breach is a container at or above both thresholds, and only once the
+    after-week is complete (a partial week understates the rise)."""
+    rows = []
+    for key in set(before) | set(after):
+        b, a = int(before.get(key, 0)), int(after.get(key, 0))
+        ratio = (a / b) if b else None
+        breach = bool(complete and a >= LOG_VOLUME_RISK_MIN_BYTES and (ratio is None or ratio >= LOG_VOLUME_RISK_RATIO))
+        rows.append({"namespace": key[0], "container": key[1], "object": _object_ref(key[0], LOG_VOLUME_OBJECT_KIND, key[1]), "before_bytes": b, "after_bytes": a, "ratio": round(ratio, 2) if ratio is not None else None, "breach": breach})
+    return sorted(rows, key=lambda r: (-(r["after_bytes"] - r["before_bytes"]), r["object"]))
+
+
+def fetch_log_volume(session: SessionFn | None, project: str, cluster_name: str, location: str, first_start: datetime, last_end: datetime, *, now: datetime, timeout: float = MONITORING_TIMEOUT_S) -> dict:
+    """The two weeks around the upgrade: `[first_start - 7d, first_start]` and
+    `[last_end, last_end + 7d]`, the latter clamped to now and complete only
+    once now has passed its end. `error` is set when either read failed."""
+    after_end = last_end + LOG_VOLUME_WINDOW
+    complete = now >= after_end
+    before_params = log_volume_params(cluster_name, location, first_start - LOG_VOLUME_WINDOW, first_start)
+    after_params = log_volume_params(cluster_name, location, last_end, min(after_end, now))
+    out = {"before_start": fmt_ts(first_start - LOG_VOLUME_WINDOW), "first_start": fmt_ts(first_start), "last_end": fmt_ts(last_end), "after_end": fmt_ts(after_end), "after_complete": complete, "before_total": 0, "after_total": 0, "rows": [], "error": None, "requests": [before_params, after_params]}
+    if session is None:
+        out["error"] = NO_MONITORING_SESSION_TEXT
+        return out
+    before, error = _week_bytes(session, project, before_params, timeout)
+    if error is None:
+        after, error = _week_bytes(session, project, after_params, timeout)
+    if error is not None:
+        out["error"] = error
+        return out
+    out["rows"] = log_volume_rows(before, after, complete)
+    out["before_total"], out["after_total"] = sum(before.values()), sum(after.values())
+    return out
+
+
+def log_volume_command(project: str, requests: list[dict]) -> str:
+    """The two Monitoring requests as the `curl` lines that issue them, for
+    `checks_run`: every parameter the collector sent but the page size."""
+    url = MONITORING_TIMESERIES_URL.format(project=project)
+    curls = []
+    for params in requests:
+        args = [
+            f"-d {pair}" if URL_SAFE_PAIR_RE.match(pair) else f"--data-urlencode {shlex.quote(pair)}"
+            for key, value in params.items()
+            if key != MONITORING_PAGE_SIZE_KEY
+            for item in (value if isinstance(value, list) else [value])
+            for pair in [f"{key}={item}"]
+        ]
+        curls.append(" ".join([MONITORING_CURL_PREFIX, url, *args]))
+    return COMMAND_CHAIN.join(curls)
+
+
+def operation_window(operations: list[dict]) -> tuple[datetime, datetime] | None:
+    """The first start and the last end of the window's operations, from the
+    listing's raw records or the review's summaries; None without one."""
+    starts = [parse_ts(op.get("startTime") or op.get("start")) for op in operations or []]
+    ends = [parse_ts(op.get("endTime") or op.get("end")) or parse_ts(op.get("startTime") or op.get("start")) for op in operations or []]
+    starts, ends = [t for t in starts if t], [t for t in ends if t]
+    if not starts:
+        return None
+    return min(starts), max(ends or starts)
+
+
+def _new_incident_count(review: dict) -> int:
+    """The incidents the gate counts against the upgrade: a failed operation,
+    and a symptom group graded Error, or Warning that neither predates the
+    upgrade nor is a recreated pod alone (`_symptom_group_check`, the one rule
+    `triage` applies too)."""
+    wh = review.get("what_happened") or {}
+    count = sum(1 for op in wh.get("operations") or [] if _operation_failed(op))
+    groups: dict[str, list[dict]] = {}
+    for symptom in review.get("what_failed") or []:
+        groups.setdefault(symptom["object"], []).append(symptom)
+    upgrade_context = wh.get("status") == STATUS_UPGRADED or bool(wh.get("operations"))
+    for symptoms in groups.values():
+        _, severity, predates = _symptom_group_check(symptoms, upgrade_context)
+        recreated = any(s.get("recreated_only") for s in symptoms)
+        if severity == SEVERITY_ERROR or (not predates and not recreated):
+            count += 1
+    return count
+
+
+def _pending_gate(window: tuple[datetime, datetime] | None, reason: str) -> dict | None:
+    if window is None:
+        return None
+    first_start, last_end = window
+    after_end = last_end + LOG_VOLUME_WINDOW
+    return {"verdict": GATE_PENDING, "reasons": [reason], "first_start": fmt_ts(first_start), "last_end": fmt_ts(last_end), "after_complete_at": fmt_ts(after_end), "after_complete": False, "log_volume": None}
+
+
+def cluster_gate(review: dict, window: tuple[datetime, datetime] | None, session: SessionFn | None, now: datetime, timeout: float = MONITORING_TIMEOUT_S) -> dict | None:
+    """The reviewed cluster's gate; None for a cluster with no upgrade
+    operation in the window. A failed Monitoring read joins `read_errors`
+    under `LOG_VOLUME_READ`, which makes the seventh check unevaluated and
+    costs Info alone."""
+    if window is None:
+        return None
+    first_start, last_end = window
+    volume = fetch_log_volume(session, review["project"], review["name"], review["location"], first_start, last_end, now=now, timeout=timeout)
+    risk, pending = [], []
+    incidents = _new_incident_count(review)
+    if incidents:
+        risk.append(GATE_REASON_INCIDENT.format(count=incidents))
+    if review.get("partial"):
+        pending.append(GATE_REASON_PARTIAL.format(reads=", ".join(review["partial"])))
+    if volume["error"]:
+        if session is not None:
+            # A read that ran and failed; no session means no read was made.
+            review["read_errors"].append(f"{LOG_VOLUME_READ}: {volume['error']}")
+        pending.append(GATE_REASON_READ_FAILED.format(error=volume["error"]))
+    else:
+        breaches = [row for row in volume["rows"] if row["breach"]]
+        if breaches:
+            risk.append(GATE_REASON_LOG_VOLUME.format(count=len(breaches)))
+        if not volume["after_complete"]:
+            pending.append(GATE_REASON_AFTER_WEEK.format(at=volume["after_end"]))
+    verdict = GATE_RISK if risk else (GATE_PENDING if pending else GATE_CLEAR)
+    return {"verdict": verdict, "reasons": risk + pending or [GATE_REASON_CLEAR], "first_start": volume["first_start"], "last_end": volume["last_end"], "after_complete_at": volume["after_end"], "after_complete": volume["after_complete"], "log_volume": volume}
+
+
+def gate_record(gate: dict | None, seen_at: str) -> dict | None:
+    """What the ledger and the manifest keep of a gate: the verdict, its
+    reasons and the anchors a later run re-reads it from."""
+    if not gate:
+        return None
+    return {key: gate.get(key) for key in ("verdict", "reasons", "first_start", "last_end", "after_complete_at", "after_complete")} | {"recorded_at": seen_at}
+
+
+def reread_gate(record: dict, cluster: dict, session: SessionFn | None, now: datetime, timeout: float = MONITORING_TIMEOUT_S) -> dict:
+    """A gate read again from its ledger anchors on an unchanged cluster whose
+    after-week was open when it was read: the diff's part was decided at
+    review time and is carried (the reasons that name what the upgrade
+    brought), and the log-volume part and the after-week are read again."""
+    first_start, last_end = parse_ts(record.get("first_start")), parse_ts(record.get("last_end"))
+    carried = [reason for reason in record.get("reasons") or [] if reason.endswith(GATE_REASON_INCIDENT_SUFFIX)]
+    if not first_start or not last_end:
+        return {**record, "verdict": GATE_RISK if carried else GATE_PENDING, "reasons": carried + [GATE_REASON_READ_FAILED.format(error="the ledger record has no anchors")], "log_volume": None}
+    volume = fetch_log_volume(session, cluster["project"], cluster["name"], cluster["location"], first_start, last_end, now=now, timeout=timeout)
+    risk, pending = list(carried), []
+    if volume["error"]:
+        pending.append(GATE_REASON_READ_FAILED.format(error=volume["error"]))
+    else:
+        breaches = [row for row in volume["rows"] if row["breach"]]
+        if breaches:
+            risk.append(GATE_REASON_LOG_VOLUME.format(count=len(breaches)))
+        if not volume["after_complete"]:
+            pending.append(GATE_REASON_AFTER_WEEK.format(at=volume["after_end"]))
+    verdict = GATE_RISK if risk else (GATE_PENDING if pending else GATE_CLEAR)
+    return {"verdict": verdict, "reasons": risk + pending or [GATE_REASON_CLEAR], "first_start": volume["first_start"], "last_end": volume["last_end"], "after_complete_at": volume["after_end"], "after_complete": volume["after_complete"], "log_volume": volume}
+
+
+def family_of(cluster: dict) -> str | None:
+    value = (cluster.get("resourceLabels") or {}).get(FAMILY_LABEL_KEY)
+    return str(value) if value else None
+
+
+def family_verdicts(clusters: list[dict], gates: dict[str, dict | None]) -> list[dict]:
+    """One row per `upgrade-family` value among the listed clusters: the
+    members whose gate this run read (the canaries, the first-upgraded first),
+    the family's verdict (`hold` while any canary's gate is `risk`, `pending`
+    while any is `pending`, `go` once every one is `clear`, None with no
+    canary) and the members still waiting."""
+    members_by_family: dict[str, list[str]] = {}
+    for cluster in clusters:
+        family = family_of(cluster)
+        if family:
+            members_by_family.setdefault(family, []).append(cluster_key(cluster["project"], cluster["location"], cluster["name"]))
+    out = []
+    for family, members in sorted(members_by_family.items()):
+        canaries = sorted(((key, gates[key]) for key in members if gates.get(key)), key=lambda item: (item[1].get("first_start") or "", item[0]))
+        verdicts = [gate["verdict"] for _, gate in canaries]
+        if not canaries:
+            verdict = None
+        elif GATE_RISK in verdicts:
+            verdict = FAMILY_HOLD
+        elif GATE_PENDING in verdicts:
+            verdict = FAMILY_PENDING
+        else:
+            verdict = FAMILY_GO
+        canary_keys = {key for key, _ in canaries}
+        out.append({"family": family, "members": sorted(members), "canaries": [{"cluster": key, "verdict": gate["verdict"], "reasons": list(gate.get("reasons") or [])} for key, gate in canaries], "verdict": verdict, "waiting": [key for key in sorted(members) if key not in canary_keys]})
+    return out
+
+
+def _gate_lines(gate: dict | None) -> list[str]:
+    if not gate:
+        return []
+    complete = "" if gate.get("after_complete") else GATE_AFTER_WEEK_OPEN_FORMAT.format(at=gate.get("after_complete_at") or "?")
+    volume = gate.get("log_volume") or {}
+    lines = [GATE_LINE_FORMAT.format(part=PART_GATE, verdict=gate["verdict"], reasons=_cell("; ".join(gate.get("reasons") or [])), before_start=volume.get("before_start") or "?", first_start=gate.get("first_start") or "?", last_end=gate.get("last_end") or "?", after_end=gate.get("after_complete_at") or "?", complete=complete)]
+    if not volume:
+        return lines
+    if volume.get("error"):
+        return lines + [LOG_VOLUME_NOT_READ_FORMAT.format(part=PART_LOG_VOLUME, error=_cell(volume["error"]))]
+    rows = volume.get("rows") or []
+    breaches = [row for row in rows if row["breach"]]
+    shown = breaches or rows[:LOG_VOLUME_TOP_ROWS]
+    detail = "; ".join(LOG_VOLUME_LINE_FORMAT.format(namespace=_cell(row["namespace"]), container=_cell(row["container"]), before=bytes_text(row["before_bytes"]), after=bytes_text(row["after_bytes"]), ratio=_ratio_text(row["ratio"])) for row in shown) or LOG_VOLUME_NO_SERIES_TEXT
+    head = LOG_VOLUME_HEAD_FORMAT.format(part=PART_LOG_VOLUME, before=bytes_text(volume.get("before_total") or 0), after=bytes_text(volume.get("after_total") or 0))
+    head += (LOG_VOLUME_BREACH_FORMAT if breaches else LOG_VOLUME_NO_BREACH_FORMAT).format(count=len(breaches), ratio=LOG_VOLUME_RISK_RATIO, floor=bytes_text(LOG_VOLUME_RISK_MIN_BYTES))
+    return lines + [head + detail + "."]
+
+
+def _families_lines(families: list[dict]) -> list[str]:
+    if not families:
+        return []
+    lines = [INFO_FAMILIES, ""]
+    for row in families:
+        if row["verdict"] is None:
+            lines.append(FAMILY_NO_CANARY_FORMAT.format(family=_cell(row["family"]), members=", ".join(_cell(m) for m in row["members"])))
+            continue
+        first = row["canaries"][0]
+        lines.append(FAMILY_LINE_FORMAT.format(family=_cell(row["family"]), canary=_cell(first["cluster"]), verdict=first["verdict"], reason=_cell("; ".join(first["reasons"])), rollout=row["verdict"], waiting=", ".join(_cell(m) for m in row["waiting"]) or FAMILY_WAITING_NONE))
+    return lines + [""]
+
+
+def _log_volume_incidents(review: dict) -> list[dict]:
+    """One Warning per container past the thresholds on a reviewed cluster,
+    under the seventh check."""
+    volume = (review.get("gate") or {}).get("log_volume") or {}
+    incidents = []
+    for row in volume.get("rows") or []:
+        if not row["breach"]:
+            continue
+        incidents.append({
+            "kind": INCIDENT_LOG_VOLUME,
+            "severity": SEVERITY_WARNING,
+            "check": CHECK_LOG_VOLUME,
+            "cluster": review["cluster"],
+            "object": row["object"],
+            "system": False,
+            "entries": LOG_VOLUME_ENTRIES_LABEL,
+            "predates_upgrade": False,
+            "outside_fleet": bool(review.get("outside_fleet")),
+            "what_happened": review["what_happened"],
+            "symptoms": [],
+            "mitigations": [],
+            "guards": [],
+            "log_volume": row,
+        })
+    return incidents
+
+
+def _ratio_text(ratio) -> str:
+    return LOG_VOLUME_NEW_RATIO if ratio is None else LOG_VOLUME_RATIO_FORMAT.format(ratio=ratio)
+
+
+def _unchanged_what_happened(row: dict) -> dict:
+    """What an unchanged row's incident block says happened: nothing this run;
+    the gate was read again from the ledger's anchors."""
+    nu = row.get("next_upgrade") or {}
+    return {"status": UNCHANGED_GATE_STATUS, "reasons": [UNCHANGED_GATE_REASON], "channel": nu.get("channel"), "versions_before": None, "versions_after": {"control_plane": row.get("control_plane"), "node_pools": {}}, "cluster_status": "", "operations": []}
+
+
+def _log_volume_symptom_text(row: dict) -> str:
+    return LOG_VOLUME_SYMPTOM_FORMAT.format(before=bytes_text(row["before_bytes"]), after=bytes_text(row["after_bytes"]), ratio=_ratio_text(row["ratio"]))
+
+
+def _log_volume_mitigation_text(row: dict) -> str:
+    return LOG_VOLUME_MITIGATION.format(namespace=row["namespace"], container=row["container"])
+
+
 def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
     """`review_cluster` with the exception boundary the docstring promises:
     an object shape this collector did not expect is a failed read of that
@@ -4579,10 +5005,13 @@ def _safe_review(selection: Selection, ledger: dict, **kwargs) -> dict:
             "terminating": [],
             "skew_notes": [],
             "unavailable_workloads": [],
+            "gate": _pending_gate(operation_window(happened["operations"]), GATE_REASON_NOT_REVIEWED.format(error=f"{exc!r}"[:ERROR_EXCERPT_CHARS])),
+            "family": family_of(selection.cluster),
+            "reads_not_made": [LOG_VOLUME_READ] if operation_window(happened["operations"]) else [],
         }
 
 
-def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str, server_config: dict | None = None, now: datetime | None = None, operations_command: str | None = None) -> dict:
+def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: str, server_config: dict | None = None, now: datetime | None = None, operations_command: str | None = None, session: SessionFn | None = None, time_left: Callable[[], float] | None = None) -> dict:
     """`operations_command` is the project's operations listing as `collect`
     ran it, when it answered; without one the review vouches for no operation
     check; a review none of whose kubectl reads answered vouches for the
@@ -4613,6 +5042,8 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "terminating": [],
         "skew_notes": [],
         "unavailable_workloads": [],
+        "gate": None,
+        "family": family_of(cluster),
     }
     review["next_upgrade"] = _safe_next_upgrade(cluster, server_config, now or now_utc(), review["read_errors"])
     # A failed operation's guard needs no read: written whatever the reads do,
@@ -4623,11 +5054,16 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     first_op = min((parse_ts(op.get("startTime")) for op in ops if parse_ts(op.get("startTime"))), default=None)
     window_start = first_op or selection.window_start
     review["what_happened"]["symptom_window_start"] = fmt_ts(window_start)
+    # The gate's anchors: the window's first start and last end. A review
+    # that reads nothing leaves the gate pending on them.
+    gate_window = operation_window(ops)
     kubeconfig, error = fetch_credentials(cluster, run=run)
     if error:
         # Nothing was read: a partial attempt, re-selected next run.
         review["read_errors"].append(error)
         review["partial"] = list(CORE_READS)
+        review["gate"] = _pending_gate(gate_window, GATE_REASON_PARTIAL.format(reads=", ".join(CORE_READS)))
+        review["reads_not_made"] = [LOG_VOLUME_READ] if gate_window else []
         return review
     reads, errors = read_cluster(kubeconfig, run=run)
     review["read_errors"].extend(errors)
@@ -4638,6 +5074,8 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         # Nothing was evaluated, so nothing counts as answered: no guard of
         # this cluster may be dropped on this run's say-so, and no check ran.
         review["answered"] = []
+        review["gate"] = _pending_gate(gate_window, GATE_REASON_PARTIAL.format(reads=", ".join(review["partial"])))
+        review["reads_not_made"] = [LOG_VOLUME_READ] if gate_window else []
         return review
     commands = {name: command_text(argv, kubeconfig) for name, argv in KUBECTL_READS if name not in failed}
     if operations_command:
@@ -4702,6 +5140,26 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         "guards": [g["id"] for g in review["guards"]],
         "shape_reads_failed": [e for e in errors if e.split(":")[0] in SHAPE_READS],
     }
+    # Last, with the symptoms graded: the Monitoring read is the one read
+    # the deadline does not bound through `run`, so its own timeout holds it.
+    # The read gets the smaller of its own timeout and the time left under the
+    # run's deadline, as every subprocess does through `bounded_run`.
+    timeout = min(MONITORING_TIMEOUT_S, max(MONITORING_MIN_TIMEOUT_S, time_left())) if time_left else MONITORING_TIMEOUT_S
+    review["gate"] = cluster_gate(review, gate_window, session, now or now_utc(), timeout=timeout)
+    volume = (review["gate"] or {}).get("log_volume") or {}
+    if review["gate"] is None:
+        # No upgrade operation in the window: the operations listing that found
+        # none answers the seventh check, as it answers every check on an
+        # unchanged cluster.
+        if operations_command:
+            commands[LOG_VOLUME_READ] = operations_command
+            review["commands"] = checks_run(commands)
+    elif session is None:
+        # No read was made: the seventh check is unevaluated, not failed.
+        review["reads_not_made"] = [LOG_VOLUME_READ]
+    elif not volume.get("error"):
+        commands[LOG_VOLUME_READ] = log_volume_command(cluster["project"], volume.get("requests") or [])
+        review["commands"] = checks_run(commands)
     return review
 
 
@@ -4753,7 +5211,7 @@ def _incident_key(incident: dict) -> tuple[str, str]:
     return incident["cluster"], incident["object"]
 
 
-def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None, in_scope: set[str] | None = None, scope_reason: str = "", unlisted: set[str] | None = None, operation_guards: dict | None = None, listing_unread: set[str] | None = None) -> dict:
+def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], guards: list[dict], seen_at: str, removed: list[str] | None = None, rechecks: list[dict] | None = None, upgrading: list[dict] | None = None, in_scope: set[str] | None = None, scope_reason: str = "", unlisted: set[str] | None = None, operation_guards: dict | None = None, listing_unread: set[str] | None = None, families: list[dict] | None = None, gates_reread: list[dict] | None = None) -> dict:
     """Group the reviews into the report's three sections. An incident is one
     object on one cluster: its symptoms, their (C) rows and the guards it
     produced, plus the cluster's (A) summary."""
@@ -4809,6 +5267,10 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                     "mitigations": [],
                     "guards": [g for g in review["guards"] if g["object"] == obj],
                 }
+        for incident in _log_volume_incidents(review):
+            # A container past the thresholds: a Warning under the seventh
+            # check, and the reason the cluster's gate reads `risk`.
+            incidents[incident["object"]] = incident
         if review["reviewed"] or review.get("partial") and review["answered"]:
             # Every reviewed cluster gets an Info block: its next upgrade,
             # the risks present and the baseline recorded. A cluster none of
@@ -4827,9 +5289,18 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
                 "shapes": review["shapes"],
                 "managed_agents": review["managed_agents"],
                 "baseline": review["baseline"],
+                "gate": review.get("gate"),
+                "family": review.get("family"),
             })
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
+    # An unchanged cluster whose gate was read again this run files the
+    # containers past the thresholds the same way: the breach the seventh check
+    # exists to catch reaches a Sunday run through the re-read, since a cluster
+    # reviewed the week of its upgrade has its after-week open at review time.
+    for row in unchanged:
+        if row.get("gate"):
+            warnings.extend(_log_volume_incidents({"cluster": row["cluster"], "gate": row["gate"], "what_happened": _unchanged_what_happened(row), "outside_fleet": False}))
     # The reads a stale guard could not be re-observed through: a partial
     # review's core reads, or a reviewed cluster's failed shape read (an
     # entry-3 guard needs `workloads`).
@@ -4877,7 +5348,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     return {
         "errors": errors,
         "warnings": warnings,
-        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or []), "scoped": scope_reason, "operation_guards": operation_guards or {"refreshed": [], "cleared": [], "held": [], "unlisted": []}},
+        "info": {"clean": clean, "unchanged": unchanged, "failed_reads": failed_reads, "removed": list(removed or []), "rechecked": list(rechecks or []), "upgrading": list(upgrading or []), "scoped": scope_reason, "operation_guards": operation_guards or {"refreshed": [], "cleared": [], "held": [], "unlisted": []}, "families": list(families or []), "gates_reread": list(gates_reread or [])},
     }
 
 
@@ -4965,6 +5436,12 @@ def _incident_lines(incident: dict) -> list[str]:
         return lines + [""]
     lines += _what_happened_lines(incident["what_happened"])
     lines.append("")
+    if incident["kind"] == INCIDENT_LOG_VOLUME:
+        row = incident["log_volume"]
+        lines.append(f"{PART_WHAT_FAILED} {_cell(_log_volume_symptom_text(row))}")
+        lines.append(f"{PART_MITIGATE} {_cell(_log_volume_mitigation_text(row))}")
+        lines.append(f"{PART_MITIGATION_SET_UP} {LOG_VOLUME_GUARD_TEXT}")
+        return lines + [""]
     if incident["kind"] == INCIDENT_OPERATION:
         op = incident["operation"]
         lines.append(f"{PART_WHAT_FAILED} {_cell(op['type'])} on {_cell(op['target'])} ended {_cell(op['status'])}: {_cell(op['error'] or 'no error text')}")
@@ -5056,6 +5533,9 @@ def _cluster_block_lines(row: dict) -> list[str]:
         lines += [_cell(note), ""]
     lines += _next_upgrade_lines(row["next_upgrade"])
     lines.append("")
+    gate_lines = _gate_lines(row.get("gate"))
+    if gate_lines:
+        lines += gate_lines + [""]
     lines += _risks_lines(row["shapes"], row.get("managed_agents") or 0, list(row.get("partial") or []) + list((row.get("baseline") or {}).get("shape_reads_failed") or []))
     lines.append("")
     lines += _baseline_lines(row["baseline"])
@@ -5099,6 +5579,10 @@ def _incident_candidate(incident: dict, command: str | None) -> dict:
         excerpt = f"{op['type']} on {op['target']} ended {op['status']}: {op['error'] or 'no error text'}"
         capacity_shaped = any(marker in (op.get("error") or "").lower() for marker in CAPACITY_ERROR_MARKERS)
         impact = OPERATION_MITIGATE_TEXT + (f" {MITIGATIONS[ENTRY_CAPACITY]['mitigate_after']}" if capacity_shaped else "")
+    elif incident["kind"] == INCIDENT_LOG_VOLUME:
+        namespace, obj = _split_object(incident["object"])
+        excerpt = _log_volume_symptom_text(incident["log_volume"])
+        impact = _log_volume_mitigation_text(incident["log_volume"])
     elif incident["kind"] == INCIDENT_STALE_GUARD:
         # Every guard on the object in one candidate: one finding per object.
         namespace, obj = _split_object(incident["object"])
@@ -5265,6 +5749,8 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             # unevaluated, so a failed operation's Error is published.
             failed = {e.split(":")[0] for e in review["read_errors"]} | set(review.get("partial") or [])
             unevaluated = [{"check": check, "reason": f"{read} read failed"} for check, read in CHECK_READS if read in failed or (read == OPERATIONS_READ and review["project"] in operations_unread)]
+            not_made = set(review.get("reads_not_made") or [])
+            unevaluated += [{"check": check, "reason": LOG_VOLUME_NOT_MADE_REASON} for check, read in CHECK_READS if read in not_made and read not in failed]
             entry.update(outcome=MANIFEST_OUTCOME_COLLECTED, commands=commands, candidates=candidates_of(key, commands, unevaluated))
             if unevaluated:
                 entry["checks_unevaluated"] = unevaluated
@@ -5272,6 +5758,8 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             # storage, webhook, endpoint-slice and next-upgrade reads cost
             # Info alone (`INFO_ONLY_READS`).
             limiting = [e for e in review["read_errors"] if not info_only_error(e)]
+            if not_made - failed:
+                limiting.append(LOG_VOLUME_NOT_MADE_REASON)
             if review["project"] in operations_unread:
                 # The project's listing failed: the operation check is
                 # unevaluated above, and the listing is the limitation.
@@ -5288,6 +5776,8 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
             "incident_kinds": sorted({i["kind"] for i in incidents_by_cluster.get(key, [])}),
             "next_upgrade": review.get("next_upgrade"),
             "guards_written": [g["id"] for g in review.get("guards") or []],
+            "gate": gate_record(review.get("gate"), result["generated_at"]),
+            "family": review.get("family"),
         }
         entries.append(entry)
     for row in result["unchanged"]:
@@ -5298,7 +5788,7 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         entry = {
             "name": key, "project": project, "location": location,
             "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands, row.get("checks_unevaluated")),
-            "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run")},
+            "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run"), "gate": gate_record(row.get("gate"), result["generated_at"]), "family": row.get("family")},
         }
         # A re-check whose read failed: the checks it backs are unevaluated
         # and the read is a limitation, as on a review.
@@ -5430,6 +5920,12 @@ def render_report(result: dict) -> str:
         for row in info["unchanged"]:
             nu = row.get("next_upgrade") or {}
             lines.append(f"- {_cell(row['cluster'])} at {_cell(row['control_plane'])}; last upgrade operation {row.get('last_operation') or 'none recorded'}; next target {_cell(nu.get('target') or 'unknown')}{' (behind)' if nu.get('below_target') else ''}; last reviewed {row['last_run'] or 'never'}")
+        lines.append("")
+    lines += _families_lines(info.get("families") or [])
+    if info.get("gates_reread"):
+        lines += [INFO_GATES_REREAD, ""]
+        for item in info["gates_reread"]:
+            lines.append(GATE_REREAD_LINE_FORMAT.format(cluster=_cell(item["cluster"]), verdict=item["verdict"], reasons=_cell("; ".join(item.get("reasons") or []))))
         lines.append("")
     if info.get("upgrading"):
         lines += [INFO_UPGRADING, ""]
@@ -5622,6 +6118,9 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
         return min(since, last) if since and last else since
 
     partial = {r["cluster"] for r in reviews if r["partial"] and not r["reviewed"]} - (skip or set()) - (outside or set())
+    # The gate of every cluster reviewed with an operation in the window,
+    # pending ones included: the next run re-reads a pending one from here.
+    gates = {r["cluster"]: gate_record(r.get("gate"), seen_at) for r in reviews if r.get("gate") and r["cluster"] not in (outside or set())}
     if not advance:
         # A partial read is still recorded as one, so the next full run
         # re-selects the cluster whichever route attempted it.
@@ -5669,6 +6168,8 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
                 LEDGER_SKEW_FIRST_SEEN_KEY: _skews_first_seen(old.get(LEDGER_SKEW_FIRST_SEEN_KEY), baselines.get(key) if key in recorded_in_full else old.get("symptoms"), seen_at),
                 LEDGER_OPERATIONS_KEY: _operations_record(old.get(LEDGER_OPERATIONS_KEY) or [], covered, seen_at, route, floor_of(key)),
             }
+            if gates.get(key):
+                entries[key][LEDGER_GATE_KEY] = gates[key]
         if key in partial:
             entries.setdefault(key, {})["partial_read"] = seen_at
         elif key in recorded_in_full:
@@ -5682,7 +6183,7 @@ def _listing_error(project: str, failed_reads: list[str]) -> str:
     return line.split(": ", 1)[-1]
 
 
-def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None) -> dict:
+def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None, session: SessionFn | None = None, session_factory: Callable[[], SessionFn] | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
     configs, the reviews, the re-checks); the default is the figure the
     sibling collectors pin to the credential proxy's admitted count.
@@ -5691,7 +6192,11 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     projects); without it the run resolves the projects itself. `clock`
     and `started` bound the run: `RUN_DEADLINE_S` after `started` (the
     process's start when `main` calls, this call's otherwise) no further
-    cluster is read and the rest are held for the next run."""
+    cluster is read and the rest are held for the next run. `session` is
+    the gate's Monitoring session, or `session_factory` opens one when a
+    cluster needs it (`main` passes `default_monitoring_session`); with
+    neither, every gate that needs the read is pending and no read is made,
+    which is what a test without a fake session gets."""
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish
@@ -5817,6 +6322,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     # What the listings returned, a partial one's clusters included: those
     # are reviewed, and never also held as their project's unlisted ones.
     enumerated_keys = {cluster_key(c["project"], c["location"], c["name"]) for c in clusters}
+    # The listing before any --cluster narrowing: the families list reads every
+    # member, on a scoped run too.
+    listed_clusters = list(clusters)
     if forced:
         clusters = [c for c in clusters if cluster_key(c["project"], c["location"], c["name"]) in forced]
         # Against the listing before the status filter: a forced cluster the
@@ -5880,12 +6388,23 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         if shared_note:
             log(f"{kubeconfig_dir()}: {shared_note}")
 
+    # The gate's Monitoring session, opened once and only when a cluster
+    # needs it: a review with an operation in the window, or an unchanged
+    # cluster whose ledger gate is pending. A session that cannot be opened is
+    # one line under Reads that failed; every gate it would have read is pending.
+    pending_gates = {row["cluster"] for row in unchanged if ((ledger.get("clusters") or {}).get(row["cluster"]) or {}).get(LEDGER_GATE_KEY, {}).get("verdict") == GATE_PENDING}
+    if session is None and session_factory is not None and (any(s.operations for s in selected) or pending_gates):
+        try:
+            session = session_factory()
+        except Exception as exc:  # noqa: BLE001 -- the gate's reason, not the run's end
+            failed_reads.append(f"{LOG_VOLUME_READ}: {NO_MONITORING_SESSION_TEXT} ({exc!r})"[:ERROR_EXCERPT_CHARS])
+
     def review_or_defer(s: Selection) -> dict | None:
         # Checked as each review starts: past the deadline the cluster is
         # held, untouched in the ledger and the guards, for the next run.
         if not budget_left():
             return None
-        return _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now, operations_command=operations_commands.get(s.cluster["project"]))
+        return _safe_review(s, ledger, run=run, seen_at=seen_at, server_config=server_configs.get((s.cluster["project"], s.cluster["location"])), now=now, operations_command=operations_commands.get(s.cluster["project"]), session=session, time_left=lambda: RUN_DEADLINE_S - (clock() - run_started))
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         outcomes = list(pool.map(review_or_defer, selected))
@@ -6111,6 +6630,43 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
             row["limitations"] = "reads that failed: " + "; ".join(errors)
     new_ledger = ledger_after(ledger, reviews, clusters, seen_at, {s.key: s.operations for s in read}, removed, {row["cluster"] for row in upgrading} | set(deferred), refreshed_baselines, advance=not scoped, attempted={s.key for s in read}, route=route, since=since, outside=outside)
     new_ledger[LEDGER_PROJECTS_KEY] = sorted(new_fleet)
+    # A pending gate on an unchanged cluster is read again from its ledger
+    # anchors on a full run, inside the budget; the verdict and the family
+    # list move with it. A scoped run leaves it to the full run.
+    gates_reread: list[dict] = []
+    gates: dict[str, dict | None] = {r["cluster"]: r.get("gate") for r in reviews if r.get("gate")}
+    # A cluster not reviewed this run keeps the gate its ledger entry records
+    # (the ledger before this run's write, or after it, hold the same record for
+    # an unchanged cluster), so a family's hold outlives the run that found it;
+    # a pending one is read again on a full run, inside the budget.
+    for key, entry in (ledger.get("clusters") or {}).items():
+        record = entry.get(LEDGER_GATE_KEY)
+        if record and key not in gates and key in by_key:
+            gates[key] = dict(record)
+    if not scoped:
+        for row in unchanged:
+            record = (new_ledger["clusters"].get(row["cluster"]) or {}).get(LEDGER_GATE_KEY) or {}
+            # A gate read with its after-week complete stands; one read while
+            # the week was open (pending, or a risk the diff decided) is read
+            # again, since the week's log volume was not yet there to read.
+            if not record or record.get("after_complete") or row["cluster"] not in by_key or not budget_left():
+                continue
+            gate = reread_gate(record, by_key[row["cluster"]], session, now, timeout=min(MONITORING_TIMEOUT_S, max(MONITORING_MIN_TIMEOUT_S, RUN_DEADLINE_S - (clock() - run_started))))
+            row["gate"] = gates[row["cluster"]] = gate
+            row["family"] = family_of(by_key[row["cluster"]])
+            new_ledger["clusters"][row["cluster"]][LEDGER_GATE_KEY] = gate_record(gate, seen_at)
+            gates_reread.append({"cluster": row["cluster"], "verdict": gate["verdict"], "reasons": gate["reasons"]})
+            volume = gate.get("log_volume") or {}
+            if session is not None and volume.get("error"):
+                failed_reads.append(f"{row['cluster']}: {LOG_VOLUME_READ}: {volume['error']}")
+                row["commands"] = [c for c in row.get("commands") or [] if c["check"] != CHECK_LOG_VOLUME]
+                row.setdefault("checks_unevaluated", []).append({"check": CHECK_LOG_VOLUME, "reason": f"{LOG_VOLUME_READ} read failed"})
+                row["limitations"] = "; ".join(filter(None, [row.get("limitations"), f"reads that failed: {LOG_VOLUME_READ}: {volume['error']}"]))
+            elif session is not None:
+                # The check is backed by the read that answered, not the listing.
+                command = log_volume_command(by_key[row["cluster"]]["project"], volume.get("requests") or [])
+                row["commands"] = [({**c, "command": command} if c["check"] == CHECK_LOG_VOLUME else c) for c in row.get("commands") or []]
+    families = family_verdicts(listed_clusters, gates)
 
     # Read failures from inside a review join the top-level list so Info
     # names every one in one place.
@@ -6134,7 +6690,9 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
         "scope_reason": "; ".join(scope_reasons),
         "fleet": sorted(new_fleet),
         "outside_fleet": sorted(outside),
-        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters | set(unread_clusters) | set(held_clusters) | set(not_running) | set(deferred), operation_guards=operation_guards, listing_unread=operations_unread),
+        "sections": triage(reviews, unchanged, failed_reads, new_guards["guards"], seen_at, sorted(removed), rechecks, upgrading, in_scope={cluster_key(c["project"], c["location"], c["name"]) for c in clusters} if scoped else None, scope_reason="; ".join(scope_reasons), unlisted=unlisted_clusters | set(unread_clusters) | set(held_clusters) | set(not_running) | set(deferred), operation_guards=operation_guards, listing_unread=operations_unread, families=families, gates_reread=gates_reread),
+        "families": families,
+        "gates_reread": gates_reread,
         "operation_guards": operation_guards,
         "unread_clusters": unread_clusters,
         "held_clusters": held_clusters,
@@ -6477,7 +7035,7 @@ def main(argv: list[str] | None = None) -> int:
             if lock is None:
                 print(lock_held_line(lock_path, LOCK_WAIT) + exit_tail)
                 return 0
-        result = collect(args, discovery=discovery, started=run_started)
+        result = collect(args, discovery=discovery, started=run_started, session_factory=default_monitoring_session)
     except argparse.ArgumentTypeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE

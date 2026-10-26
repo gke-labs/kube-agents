@@ -45,9 +45,8 @@ gitops-drift-backlog-digest
 # the halves balance identically on the hint and this way balances better on
 # the clock.
 #
-# No periodic sets main-a or main-b today; the recorder logs "Nightly part:
-# main". This line is inert until they exist, which is why it is placed on
-# the arithmetic alone.
+# Placed on the arithmetic alone: no periodic set main-a or main-b when it
+# was added, so no night had measured the halves.
 gitops-drift-load-bearing-change-triage
 # Registered 2026-10-22 (#3583) at 1500s. With autoops-quiet-followup (1800s)
 # on main-a since #3617, the halves stand at 11250s (main-a) against 11100s
@@ -59,3 +58,11 @@ triage-start-burst
 # (11450s against 9600s), over the one-case tolerance; here they are 1450s
 # apart. Placed on the arithmetic alone, like the line above.
 monitoring-alert-policy-read
+
+# The two recorded-weeks cases of #3535 (upgrades-retrospective-log-volume-gate
+# and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
+# the retrospective's report store, priced at 600s each; each run applies and
+# tears it down, so the halves may split them. One here, the family case in
+# main-a: the halves read 13300s (main-a) against 12800s; both here they would
+# read 12700s against 13400s, also inside the 1800s the balance test allows.
+upgrades-retrospective-log-volume-gate

@@ -364,15 +364,18 @@ INFRASTRUCTURE_REASONS = frozenset(
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
 # the bridge's own deadline; under the api executor, the API server answered
 # with a 5xx or a failed 200, an unparseable completion, a body that broke
-# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess. Listed
-# for the record and the tests; an unknown token lands in the same class, so
-# nothing here is consulted to grade.
+# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess. On
+# either executor, an answer the bridge withheld because it was the model's own
+# reasoning under a `thought` or `thought:` line (#3206): the turn ran and produced no
+# answer. Listed for the record and the tests; an unknown token lands in the
+# same class, so nothing here is consulted to grade.
 REASON_HERMES_EXITED_NONZERO = "hermes-exited-nonzero"
 REASON_DEADLINE_EXCEEDED = "deadline-exceeded"
 REASON_HERMES_API_FAILED = "hermes-api-failed"
 REASON_HERMES_API_UNREADABLE = "hermes-api-unreadable"
 REASON_HERMES_API_READ_FAILED = "hermes-api-read-failed"
 REASON_HERMES_API_OVERSIZE = "hermes-api-oversize"
+REASON_HERMES_UNSTRUCTURED_REASONING = "hermes-unstructured-reasoning"
 PERSONA_REASONS = frozenset(
     {
         REASON_HERMES_EXITED_NONZERO,
@@ -381,6 +384,7 @@ PERSONA_REASONS = frozenset(
         REASON_HERMES_API_UNREADABLE,
         REASON_HERMES_API_READ_FAILED,
         REASON_HERMES_API_OVERSIZE,
+        REASON_HERMES_UNSTRUCTURED_REASONING,
     }
 )
 # The two canceled terminals. After this transport's own cancel the executor

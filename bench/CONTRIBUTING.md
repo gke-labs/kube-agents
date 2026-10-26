@@ -14,7 +14,9 @@ repositories that CI pulls from.
 
 1. Write the case under `bench/tasks/<name>/task.yaml`, and its OpenTofu stack, if it has
    one, under `bench/tf/prebuilt/<name>/`. These directories (along with shared modules under
-   `bench/tf/modules/`) are what the rules below scan.
+   `bench/tf/modules/`) are what the rules below scan. A stack declares the outputs
+   `cluster_name` and `cluster_location`: `devops-bench` reads them after the apply and
+   fails the run without them.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
 3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the

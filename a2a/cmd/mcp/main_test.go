@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/mcp"
 	"github.com/nats-io/nats.go"
 )
 
@@ -78,6 +81,110 @@ func TestConfigFromEnvRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 				t.Errorf("started with %s", name)
 			}
 		})
+	}
+}
+
+func toolNames(tools []mcp.Tool) []string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Definition.Name)
+	}
+	return names
+}
+
+// With no broker URL the pod has no broker, and inspect_pr is not offered:
+// a listed tool that can only fail misleads the caller's model.
+func TestConfigFromEnvWithoutABrokerOffersNoInspectPR(t *testing.T) {
+	s, err := configFromEnv(env(map[string]string{
+		envBusURL:          "tls://bus:4222",
+		envTokenFile:       file(t, "tok"),
+		envPasswordFile:    file(t, "pw"),
+		envBrokerTokenFile: filepath.Join(t.TempDir(), "absent"),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.broker != nil {
+		t.Error("a broker client with no broker URL")
+	}
+	names := toolNames(toolsFor(nil, nil, s.broker))
+	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl}
+	if !slices.Equal(names, want) {
+		t.Errorf("tools = %v, want %v (no %s)", names, want, mcp.ToolInspectPR)
+	}
+}
+
+func TestConfigFromEnvWithABrokerOffersInspectPR(t *testing.T) {
+	s, err := configFromEnv(env(map[string]string{
+		envBusURL:          "tls://bus:4222",
+		envTokenFile:       file(t, "tok"),
+		envPasswordFile:    file(t, "pw"),
+		envBrokerURL:       "http://platform-agent-credential-proxy.kubeagents-system.svc:8080",
+		envBrokerTokenFile: file(t, "broker-tok\n"),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.broker == nil {
+		t.Fatal("no broker client with a broker URL")
+	}
+	names := toolNames(toolsFor(nil, nil, s.broker))
+	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolInspectPR}
+	if !slices.Equal(names, want) {
+		t.Errorf("tools = %v, want %v", names, want)
+	}
+}
+
+// A broker URL set means inspect_pr was meant: without a usable broker token
+// the pod must not start, rather than start and drop the tool.
+func TestConfigFromEnvRefusesToStartWithABrokerAndNoUsableToken(t *testing.T) {
+	token, pass, brokerToken := file(t, "tok"), file(t, "pw"), file(t, "broker-tok")
+	base := map[string]string{
+		envBusURL: "tls://bus:4222", envTokenFile: token, envPasswordFile: pass,
+		envBrokerURL: "http://broker:8080", envBrokerTokenFile: brokerToken,
+	}
+	for name, override := range map[string]map[string]string{
+		"no broker token file":      {envBrokerTokenFile: ""},
+		"a missing broker token":    {envBrokerTokenFile: filepath.Join(t.TempDir(), "absent")},
+		"an empty broker token":     {envBrokerTokenFile: file(t, " \n")},
+		"a directory for the token": {envBrokerTokenFile: t.TempDir()},
+		"a broker URL with no host": {envBrokerURL: "http://"},
+		"a broker URL of no scheme": {envBrokerURL: "broker:8080"},
+		"a broker URL with a query": {envBrokerURL: "http://broker:8080?x=1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := map[string]string{}
+			for k, v := range base {
+				m[k] = v
+			}
+			for k, v := range override {
+				m[k] = v
+			}
+			if _, err := configFromEnv(env(m)); err == nil {
+				t.Errorf("started with %s", name)
+			}
+		})
+	}
+}
+
+// The config errors for the password file name the file, so the operator can
+// find the mount, and never its content: realMain logs them.
+func TestPasswordFileErrorsNameTheFileNotItsContent(t *testing.T) {
+	token := file(t, "tok")
+	for name, pass := range map[string]string{
+		"missing": filepath.Join(t.TempDir(), "absent"),
+		"empty":   file(t, "\n"),
+	} {
+		_, err := configFromEnv(env(map[string]string{envBusURL: "tls://bus:4222", envTokenFile: token, envPasswordFile: pass}))
+		if err == nil || !strings.Contains(err.Error(), pass) {
+			t.Errorf("%s: err = %v, want it to name %s", name, err, pass)
+		}
+	}
+	// Only line endings are trimmed, so a whitespace-only file is a password
+	// and there is no error after the read that could carry it.
+	s, err := configFromEnv(env(map[string]string{envBusURL: "tls://bus:4222", envTokenFile: token, envPasswordFile: file(t, " \n")}))
+	if err != nil || s.bus.Password != " " {
+		t.Fatalf("got %q, %v; want the one-space password", s.bus.Password, err)
 	}
 }
 

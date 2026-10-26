@@ -281,6 +281,17 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs Config Sync's RootSync CRD and one root-sync object reporting
+    # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
+    # API, so Config Sync is installed nowhere, and the seeded fleet plants no
+    # custom resource. The CRD alone is enough (no operator): apply the
+    # upstream CRD, create the object, write its status with
+    # `kubectl patch --subresource=status`. #2580's "Fixture & Eval" section
+    # specifies the object.
+    "compliance-configsync-stalled": (
+        "#2580: needs the Config Sync RootSync CRD and a Stalled root-sync object "
+        "on a seeded cluster; no pool project runs Config Sync"
+    ),
     # Needs a GitOps repository that declares the namespace under a path a
     # reconciler syncs; no pool project's repository has one. Run by hand on
     # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
@@ -461,6 +472,15 @@ FIXTURE_NOT_READY = {
         "and an accelerator pool costs by the hour on every pool project), so "
         "the surge-capacity rule's two surge halves are covered by unit tests on "
         "a recorded cluster record and node list until the fixture lands"
+    ),
+    "upgrades-readiness-rollout-sequence-precheck": (
+        "#3798: needs gkehub.googleapis.com enabled, roles/gkehub.viewer bound for "
+        "the agent's service account, a fleet, and the standing RolloutSequence "
+        "`seeded-train` on every pool project, so a worker's `gcloud container fleet "
+        "rolloutsequences list` on the eval project answers `existing 1; plan "
+        "blocked`, the line the case pins; no pool project has them today, so the "
+        "read fails for a reason that is not the case's, and the blocked path is "
+        "graded by the rule's unit tests on a recorded list"
     ),
 }
 

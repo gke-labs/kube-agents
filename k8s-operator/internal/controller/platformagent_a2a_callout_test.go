@@ -287,6 +287,9 @@ func nothingA2ALabelledSurvivesAFlipToToday(t *testing.T, mcpOn bool) {
 		for name, obj := range map[string]client.Object{
 			a2aMCPName(agent):       &appsv1.Deployment{},
 			a2aMCPAccessName(agent): &corev1.Secret{},
+			// The broker identity: the pod's own ServiceAccount, which
+			// must go with the rest of the MCP server on the flip.
+			a2aMCPServiceAccountName(agent): &corev1.ServiceAccount{},
 		} {
 			if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, obj); err != nil {
 				t.Fatalf("the MCP server's %s was not rendered under its flag, so sweeping it proves nothing: %v", name, err)
