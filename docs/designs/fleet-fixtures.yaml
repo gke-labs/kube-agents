@@ -240,7 +240,9 @@ fixtures:
       so the held version can be absent from REGULAR; while another roster or
       validMasterVersions still offers it (so on 2026-10-14; nothing in the
       stack keeps it) upgrade check 3.1 branch (a) does not fire and the
-      cluster carries branch (b) at major. See
+      cluster carries branch (b) at major. A held version newer than every
+      REGULAR patch of its minor is drift (`not_ahead_of_channel` in
+      fixtures.json): agents read it as current or ahead, not behind. See
       docs/designs/bench-fleet-catalog.md.
 
   - role: drift-outlier
