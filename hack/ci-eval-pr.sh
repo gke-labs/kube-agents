@@ -3109,10 +3109,15 @@ unit_cost_hint() {
     # autoops-warning-event-triage, the same plant-then-card shape, so it
     # launches early in its round rather than last at the default.
     autoops-warning-event-no-action-triage) echo 900 ;;
-    # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
-    # planted-pdb's 962s the one clean measurement. Priced with the 900 band
-    # so a nightly run launches them first. fleet-cost-idle-pool joined the
-    # nightly 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
+    # The full audits: 600-1300s a repetition on 2026-08-26, planted-pdb's
+    # 962s the one clean measurement. Priced with the 900 band so a nightly
+    # run launches them first. fleet-cost-idle-pool joined the nightly
+    # 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
+    # consistency-drift-outlier is on the blocking roster since 2026-10-26
+    # and ran 165-397s on the claude-opus-5-5 nightlies (median 198s); the
+    # hint stays, launching it early in each presubmit round and first in the
+    # nightly, and scripts/test_ci_eval_nightly.py's audit-band test holds
+    # these hints at 600 or more.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;

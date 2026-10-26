@@ -85,7 +85,7 @@ NIGHTLY_AT_SPLIT = [
     "obtainability-planted-pdb",
     "stockout-pinned-pool",
     "upgrade-readiness-lagging-cluster",
-    "consistency-drift-outlier",
+    "consistency-drift-outlier",  # promoted 2026-10-26 on its nightly record, consistency's roster seat after its probe's demotion (#3598)
     "obtainability-direct-query",
     "gpu-stress-test-diagnosis",
     "autoops-warning-event-triage",
@@ -235,6 +235,8 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
     # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
+    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the claude-opus-5-5 key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    ("consistency-drift-outlier", "cost-idle-pool-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -244,6 +246,7 @@ PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
+    ("consistency-drift-outlier", "cost-idle-pool-probe"),  # 2026-10-26, from the nightly file's frozen part
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster

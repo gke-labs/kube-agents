@@ -77,11 +77,15 @@
 #      transport failures; the worker filed its ledger issue even so.
 #   -- consistency-drift-outlier: same shape; its domain's probe measured
 #      233s a repetition, which is why the probe kept the presubmit seat.
-# All four hinted at 900s in unit_cost_hint so a nightly launches them first.
+#      Registered here after upgrade-readiness-lagging-cluster until
+#      2026-10-26, when it moved to presubmit-cases.txt and the blocking
+#      roster on its nightly record (docs/eval-gate-roster.md, "Admitted on
+#      the record since the split"), the consistency probe being nightly.
+# All four hinted at 900s in unit_cost_hint so a nightly launches them first
+# (consistency-drift-outlier now from presubmit-cases.txt).
 ./tasks/obtainability-planted-pdb/task.yaml
 ./tasks/stockout-pinned-pool/task.yaml
 ./tasks/upgrade-readiness-lagging-cluster/task.yaml
-./tasks/consistency-drift-outlier/task.yaml
 
 # Superseded in the presubmit by reliability-pdb-probe (same planted defect,
 # same question), not by any doubt: 1.0 on #984's live validation.
@@ -181,10 +185,11 @@
 
 # The drift stream's second full audit, nightly from the start (2026-09-18):
 # the same SOP-faithful shape and 900s band as consistency-drift-outlier
-# above, grading the collector-only `no-environment-label` check (SOP §4.14)
-# against the install's own unlabelled host cluster beside the labelled
-# seeded trio. Its domain's presubmit seat stayed with the probe (nightly
-# since 2026-10-21, #3598).
+# (registered above until its roster seat of 2026-10-26), grading the
+# collector-only `no-environment-label` check (SOP §4.14) against the
+# install's own unlabelled host cluster beside the labelled seeded trio. Its
+# domain's presubmit seat was the probe's until 2026-10-21 (#3598) and is
+# consistency-drift-outlier's since 2026-10-26.
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
@@ -790,7 +795,8 @@
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
 # Nightly rather than presubmit: consistency-authorized-networks-probe held
-# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Green on
+# the domain's presubmit seat (nightly too since 2026-10-21, #3598;
+# consistency-drift-outlier holds it since 2026-10-26). Green on
 # the SOUL.md drift row (#3398, #3609); ran as expected_fail from #3135 until
 # then.
 ./tasks/drift-chat-request-runs-collector/task.yaml
@@ -959,7 +965,8 @@
 # named the wrong facet, or (once) a tool error. The Claude nightlies pass
 # it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
 # lands, and the case passes the roster's bar, 90% over 20 runs, on the
-# Gemini nightly (#3598).
+# Gemini nightly (#3598). The domain's roster seat is consistency-drift-outlier
+# since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change

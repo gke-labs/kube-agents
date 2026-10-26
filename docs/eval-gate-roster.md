@@ -149,9 +149,9 @@ with a filed issue naming the exit condition:
   `enabled`, and the agent read that leftover block as configured or open and said seeded-c
   matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
-  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal leaves
-  `consistency` with no presubmit case, so the domain is on the `domains.yaml` allowlist until
-  it returns. Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
+  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal left
+  `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
+  consistency-drift-outlier took a roster seat on 2026-10-26 (below). Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
   case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
@@ -258,6 +258,40 @@ the reds that once argued for un-arming it belonged to the old vocabulary check.
 
 Admitted on the record since the split:
 
+- **consistency-drift-outlier**, 2026-10-26, the consistency domain's roster seat since its probe,
+  consistency-authorized-networks-probe, was demoted on 2026-10-21 (above), moved from
+  `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit. It is not
+  a probe but the full `fleet-consistency-drift` audit, one of the four recast out of the presubmit
+  on 2026-08-26 at 600–1300 s a repetition; on the `claude-opus-5-5-kubeagents-mcp` agent model it
+  runs at about 200 s. The record is the main nightly (`ci-kube-agents-eval-nightly`), read from
+  each build's `case-consistency-drift-outlier.json` and dated by the build's UTC start: 33 of 34
+  graded repetitions on the twelve nights that graded it, 2026-10-13 to 10-26. 10-21's build
+  uploaded nothing (#3616) and 10-25's hit its deadline before grading, so neither counts. The one
+  miss, on 2026-10-16 on the Gemini setup, was the Platform Agent fanning the audit out to cluster
+  agents: one of them filed the right ledger (seeded-c, authorized networks), but the main task
+  blocked and its answer carried no ledger URL, so the verifier found no ledger (10-16 also had one
+  infra repetition). Since the model change on 2026-10-19: 14 of 14 over the five graded nights,
+  5 of 5 of them under `spec.mode next`, the presubmit's mode and inject lane (2/2 on 10-24 with
+  one infra repetition, 3/3 on 10-26). Median repetition 198 s (165–397 s) over the fourteen. The
+  store reads `collecting: 5/5 runs recorded at this key across 2 recorded run(s), 15 more needed`
+  at the next-mode key and `collecting: 9/9 … across 3` at the Claude today-mode key, since the
+  model change and then next mode each reset it. The last Gemini key reads
+  `the record would admit it: 19/20 screening runs across 7 recorded run(s)`. So the citation is
+  the nightly record, as for pdb-remediation-pr and vcs-spent-branch-reuse below, and the eval
+  crew's approval of this line is the call that it suffices before the window fills. The probe's
+  failure does not carry over. This case is graded on the ledger's finding ids
+  (`ledger_issue_contains`, scope `finding_ids`: seeded-c and the `authorized-networks` check),
+  not on the reply, and the drift collector applies the SOP's rule that authorized networks is on
+  only when `enabled` is true (the rule #3605 asks the chat path to reach). It reads seeded-c's
+  `drift-outlier` role, whose catalog `state` assertion (`masterAuthorizedNetworksConfig.enabled`
+  never true) the hourly seeded-fleet scan runs. What the scan does not watch is the peers'
+  side and the cluster ages: the SOP leaves a cluster under 24 hours old out of every cohort, so
+  replacing any seeded cluster silences the finding for a day (`docs/designs/fleet-fixtures.yaml`).
+  What it costs: it requests no pull request (the lane's install turns the audits' remediation
+  sweep off, [The inject lane](#the-inject-lane)), so it runs in the first phase beside the other
+  cases, its three repetitions one after another on its task lock, hinted at 900 s in
+  `unit_cost_hint`. Taking the line took `consistency` off the `docs/designs/domains.yaml`
+  allowlist, and made the ledger path blocking (below).
 - **pdb-remediation-pr**, 2026-10-26
   ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), back from its demotion on
   2026-10-17 (rung-4 collapses on #2971, #3017 and #3329: the worker found checkout-gateway with
@@ -432,9 +466,12 @@ it, or a rung-1–3 red when the verifier errors. Since 2026-10-26 a remediation
 too: a pdb-remediation-pr fix that never becomes a pull request is a rung-4 red. What
 `rca-remediation-pr` alone grades, the RCA delegation chain ending in a pull request, is still
 nightly-only, so it is first seen by the next nightly that finishes grading. The eval crew took
-that trade with the policy; what makes a break on the ledger path block is the canary's roster
-line (#2013 step 4), and until it holds a pull request that touches that path should still say
-what it ran by hand.
+that trade with the policy. The ledger path blocks since 2026-10-26: consistency-drift-outlier,
+on the roster, runs the `fleet-consistency-drift` audit through the minted token, the cloned
+`*-infra` workspace and the ledger write, and is graded by `ledger_issue_contains`, so a change
+that stops a ledger being published is a rung-4 red, or a rung-1–3 red when the verifier errors.
+What the canary alone grades, the compliance stream and its planted binding, still blocks only at
+its roster line (#2013 step 4).
 
 ## The whole-suite rate
 
@@ -637,7 +674,8 @@ Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.t
 from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
-ledger case passes three repetitions anywhere, so the ledger path is the harness's to prove: the
+ledger case is in the lane (consistency-drift-outlier passes on the GitHub nightlies and holds a
+roster seat since 2026-10-26, but has no GitLab record), so the ledger path is the harness's to prove: the
 lease-time probe in [`docs/ci-pool-projects.md`](ci-pool-projects.md) 5.6, which says the forge
 takes a ledger, not that the agent publishes one; that stays a case's job once one earns a line. The GitLab
 nightly runs the same list once a night on its own leased project
