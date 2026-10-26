@@ -159,6 +159,19 @@ CI enforcement: `make docs-check` runs the same checks as
   service-account email in a non-placeholder project; it also fails when it
   finds no site page or derives no project ID. The rule is
   `.agents/rules/documentation.md`.
+- `docs-check-prose` — `scripts/check_docs_prose.py`; the prose on each page
+  under `docs/site/src/content/docs/` (frontmatter, fences, comments, generated
+  regions, component tags, code spans and link URLs set aside) may not carry
+  more banned words and phrases, "is not a X, it is Y" epigrams, or paragraphs,
+  table cells and sentences over the script's word limits than
+  `scripts/docs_prose_ratchet.json` records for it, per kind (the lists and
+  limits are the script's constants; the identifier table below names them). A
+  page with no entry must be clean, and a count below its entry fails until the
+  entry is lowered (`--write-ratchet` lowers or drops entries and never raises
+  or adds one). The rule is `.agents/rules/documentation.md`, "Write it
+  straight". The workflow has no step for this target yet; until it gains one,
+  CI holds the ratchet through `scripts/test_check_docs_prose.py` in the Python
+  unit-test job.
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
   and their combined size must stay inside the `BUDGET` that file sets.
@@ -289,6 +302,7 @@ identifier appears, add its source here.
 | Broken-main tracking: the `ci:main-broken` label, the watched workflows, the one-issue-per-episode marker, the sweep interval, the dismissal, older-episode-only and whole-read rules | `scripts/notify_broken_main.py` and `.github/workflows/main-broken-notify.yml`; the required-check roster the contract test enforces is `BROKEN_MAIN_WATCHED_WORKFLOWS` in `scripts/test_integration_contracts.py`; the trigger's `main`-only filter is held by `tests/test_pull_request_concurrency.py` |
 | Release-stage tracking: the `ci:release-stage-broken` label, the watched release pipelines, the one-issue-per-workflow marker and run stamp, the sweep interval, the candidate and first-failure log patterns, the Chat message shapes | `scripts/release/notify_release_stage_broken.py` (`WATCHED_WORKFLOWS`) and `.github/workflows/release-stage-broken-notify.yml`; the roster the contract test enforces is `RELEASE_STAGE_WATCHED_WORKFLOWS` in `scripts/test_integration_contracts.py`; the Chat variables are the CI-health poster's row below |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) and hard per-file rule cap (`.agents/rules/*.md`) | `BUDGET` and `RULE_FILE_BYTE_CAP` in `scripts/check_context_budget.py` |
+| Site prose ceilings and the banned word, phrase and epigram lists the prose check enforces, and each page's recorded counts | `PARAGRAPH_WORD_LIMIT`, `CELL_WORD_LIMIT`, `SENTENCE_WORD_LIMIT`, `BANNED_WORDS`, `BANNED_PHRASES`, `LEVERAGE_VERB_RE` and `ANTITHESIS_RES` in `scripts/check_docs_prose.py`; per-page ceilings in `scripts/docs_prose_ratchet.json` |
 | Who may set the `approved` and `lgtm` labels on a change | `OWNERS` (`approvers`; `reviewers` for `lgtm` only), `hack/OWNERS`, and `OWNERS_ALIASES`; the `skip_collaborators` switch that makes `lgtm` OWNERS-gated is `prow/oss/plugins.yaml` in `GoogleCloudPlatform/oss-test-infra` |
 | Which Prow presubmits run on a pull request, and the Prow plugin settings behind `lgtm` and `approved` | `prow/prowjobs/gke-labs/kube-agents/` and `prow/oss/plugins.yaml` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository; the labels the merge queue reads are the "Merge queue enqueue sweep" row above |
 | Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`; who may set the first two is the "Who may set" row above) and the `triage` permission grant | Prow in `GoogleCloudPlatform/oss-test-infra` and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
