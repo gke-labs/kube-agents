@@ -6423,6 +6423,11 @@ def _comment_alert_card(session_id: str, text: str, card: Optional[str] = None) 
 # the cost of forgetting is one more hour of waiting or one duplicate line.
 _FOLLOWUP_FIRST_ATTEMPT_AT: Dict[str, float] = {}
 _FOLLOWUP_CARD_POSTED: Set[str] = set()
+# Sessions whose card comment is being written right now: a second request
+# for one (the watcher's retry while the first still waits on the board's
+# lock) is answered 503 without touching the board, so the two cannot both
+# post when the lock frees.
+_FOLLOWUP_CARD_IN_FLIGHT: Set[str] = set()
 _FOLLOWUP_MEMORY_LIMIT = 10_000
 
 
@@ -6431,12 +6436,12 @@ def _followup_can_wait_for_card(session_id: str, now: Optional[float] = None) ->
     while the daemon's first attempt for the session is younger than
     FOLLOWUP_CARD_WAIT_SECONDS. The first call records the attempt."""
     moment = time.time() if now is None else now
+    first = _FOLLOWUP_FIRST_ATTEMPT_AT.setdefault(session_id, moment)
     if len(_FOLLOWUP_FIRST_ATTEMPT_AT) >= _FOLLOWUP_MEMORY_LIMIT:
         for sid, at in list(_FOLLOWUP_FIRST_ATTEMPT_AT.items()):
-            if moment - at >= FOLLOWUP_CARD_WAIT_SECONDS:
+            if sid != session_id and moment - at >= FOLLOWUP_CARD_WAIT_SECONDS:
                 _FOLLOWUP_FIRST_ATTEMPT_AT.pop(sid, None)
                 _FOLLOWUP_CARD_POSTED.discard(sid)
-    first = _FOLLOWUP_FIRST_ATTEMPT_AT.setdefault(session_id, moment)
     return moment - first < FOLLOWUP_CARD_WAIT_SECONDS
 
 
@@ -6517,15 +6522,26 @@ def _inject_followup(
     if not platform or not thread_id:
         if session_id in _FOLLOWUP_CARD_POSTED:
             return {"status": "followup"}  # the watcher's retry of a line already on the card
+        if session_id in _FOLLOWUP_CARD_IN_FLIGHT:
+            raise HTTPException(status_code=503, detail="no chat thread, and the card comment is still being written; retry")
         can_wait = _followup_can_wait_for_card(session_id)
         card = _card_for_alert_session(session_id)
         if not card or card == BOARD_UNREADABLE:
             if can_wait:
-                raise HTTPException(status_code=503, detail="no chat thread, and the alert's card is not on the board yet; retry")
-            logger.info(f"Follow-up for session {session_id}: no chat thread and no card; nothing posted")
+                why = "the board cannot say whether the alert has a card" if card == BOARD_UNREADABLE else "the alert's card is not on the board yet"
+                raise HTTPException(status_code=503, detail=f"no chat thread, and {why}; retry")
+            logger.info(f"Follow-up for session {session_id}: no chat thread and no card found within the hour; nothing posted")
             return {"status": "unrouted"}
-        if not _comment_alert_card(session_id, text, card=card):
-            raise HTTPException(status_code=503, detail=f"no chat thread, and the comment on card {card} did not land; retry")
+        _FOLLOWUP_CARD_IN_FLIGHT.add(session_id)
+        try:
+            landed = _comment_alert_card(session_id, text, card=card)
+        finally:
+            _FOLLOWUP_CARD_IN_FLIGHT.discard(session_id)
+        if not landed:
+            if can_wait:
+                raise HTTPException(status_code=503, detail=f"no chat thread, and the comment on card {card} did not land; retry")
+            logger.warning(f"Follow-up for session {session_id}: the comment on card {card} did not land within the hour; nothing posted")
+            return {"status": "unrouted"}
         _FOLLOWUP_CARD_POSTED.add(session_id)
         return {"status": "followup"}
     background_tasks.add_task(_post_followup, session_id, platform, chat_id, thread_id, text)

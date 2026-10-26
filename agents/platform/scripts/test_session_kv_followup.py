@@ -107,11 +107,27 @@ class FollowupInjectTest(unittest.TestCase):
         self.assertEqual((session_id, comment.call_args.kwargs), ("k8s-evt-nochat", {"card": "t_card1"}))
         self.assertIn("Quiet since 15:28 UTC", text)
 
-    def test_a_card_comment_that_does_not_land_asks_the_watcher_to_retry(self):
+    def test_a_card_comment_that_does_not_land_asks_the_watcher_to_retry_for_the_hour(self):
         with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1"), \
              patch.object(session_kv_server, "_comment_alert_card", return_value=False):
             resp = self.client.post("/sessions/k8s-evt-nochat/inject", json={"message": json.dumps(FOLLOWUP)})
-        self.assertEqual(resp.status_code, 503)
+            session_kv_server._FOLLOWUP_FIRST_ATTEMPT_AT["k8s-evt-nochat"] -= session_kv_server.FOLLOWUP_CARD_WAIT_SECONDS
+            later = self.client.post("/sessions/k8s-evt-nochat/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual((resp.status_code, later.json()), (503, {"status": "unrouted"}))
+
+    def test_a_second_request_while_the_comment_is_being_written_does_not_post_again(self):
+        # The watcher re-sends when its 10s client gives up while the first
+        # handler still waits on the board's write lock; the second is told to
+        # come back rather than queue a second line behind the first.
+        def slow_comment(session_id, text, card=None):
+            again = self.client.post("/sessions/k8s-evt-slow/inject", json={"message": json.dumps(FOLLOWUP)})
+            self.assertEqual(again.status_code, 503)
+            return True
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1"), \
+             patch.object(session_kv_server, "_comment_alert_card", side_effect=slow_comment) as comment:
+            first = self.client.post("/sessions/k8s-evt-slow/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual((first.json(), comment.call_count), ({"status": "followup"}, 1))
+        self.assertNotIn("k8s-evt-slow", session_kv_server._FOLLOWUP_CARD_IN_FLIGHT)
 
     def test_no_card_yet_waits_an_hour_from_the_first_attempt_and_is_unrouted_after(self):
         # The card may still be coming (triage queued, retried, running), or the

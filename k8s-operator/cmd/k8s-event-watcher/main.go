@@ -90,7 +90,8 @@ const (
 	// the line (for a session with a thread it posts after answering, so a
 	// chat failure past that point is invisible here, as for the alert; for
 	// one with a card but no thread the card line was already written), it
-	// had neither a thread nor a card to post into, or the inject failed,
+	// had neither a thread nor a card it could find within the hour to post
+	// into, or the inject failed,
 	// which includes the daemon's 503 for a card still to come, retried each
 	// sweep for an hour.
 	followupOutcomeSent     = "sent"
@@ -994,9 +995,9 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 		}
 		outcome := followupOutcomeSent
 		if answer.Status == injectStatusUnrouted {
-			// The daemon had neither a thread nor a card for the session (the
-			// alert never reached chat, and its card never came), so it posted
-			// nothing; there is nothing to retry.
+			// The daemon had neither a thread nor a card it could find within
+			// its hour for the session (the alert never reached chat, and its
+			// card never came), so it posted nothing; there is nothing to retry.
 			outcome = followupOutcomeUnrouted
 		}
 		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, outcome).Inc()
