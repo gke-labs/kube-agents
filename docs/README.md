@@ -125,7 +125,9 @@ CI enforcement: `make docs-check` runs the same checks as
   `scripts/generate_docs.py --check`; fails if a generated region or prompt
   line pin no longer matches its source.
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
-  resolve to **git-tracked** targets, and a `docs/designs/…` or
+  resolve to **git-tracked** targets, a `#fragment` on a link to a Markdown
+  file or a site page must name a heading or an explicit `id` there, and a
+  `docs/designs/…` or
   `docs/architecture/…` path cited from a code or configuration file (Python,
   Go, shell, Dockerfiles, YAML, Terraform, TypeScript) must be one too. The
   same script holds the **reachability rule**: every tracked `.md`/`.mdx`
