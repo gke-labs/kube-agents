@@ -94,7 +94,8 @@ def allowlist_shape_problems(entries) -> list[str]:
             problems.append(f"{name}: `slug` must be the domain's slug")
         elif slug in seen:
             problems.append(f"{name}: listed twice")
-        seen.add(slug)
+        else:
+            seen.add(slug)
         for key in sorted(set(entry) - set(ALLOWLIST_REQUIRED) - set(ALLOWLIST_OPTIONAL)):
             problems.append(f"{name}: unknown key `{key}`")
         for key in ("since", "expires"):
@@ -371,6 +372,12 @@ class TestAllowlistRules(unittest.TestCase):
         self.assertTrue(allowlist_shape_problems([{**RECORD, "issue": True}]))
         self.assertTrue(allowlist_shape_problems([{**RECORD, "owner": "@someone"}]))
 
+    def test_a_list_or_mapping_slug_is_reported_not_raised(self):
+        for slug in (["remediation"], {"name": "remediation"}):
+            with self.subTest(slug=slug):
+                problems = allowlist_shape_problems([{**RECORD, "slug": slug}, RECORD])
+                self.assertTrue(any("`slug` must be" in p for p in problems))
+
     def test_an_unknown_key_and_a_duplicate_are_refused(self):
         self.assertTrue(allowlist_shape_problems([{**RECORD, "expiry": D(2026, 10, 31)}]))
         self.assertTrue(allowlist_shape_problems([RECORD, RECORD]))
@@ -400,7 +407,7 @@ class TestAllowlistRules(unittest.TestCase):
         # The presubmit has no expiry test (module docstring); this pins that
         # the rule reads the real file the way the CI-health tick will.
         owners, entries = domain_allowlist.load()
-        far = max(e["expires"] for e in entries) + datetime.timedelta(days=1)
+        far = max((e["expires"] for e in entries), default=datetime.date.min) + datetime.timedelta(days=1)
         self.assertEqual([r.slug for r in expired_records(entries, owners, far)], [e["slug"] for e in entries])
 
     def test_a_held_out_case_must_be_an_off_roster_presubmit_seat_of_the_domain(self):
