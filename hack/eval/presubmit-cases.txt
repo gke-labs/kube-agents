@@ -112,7 +112,11 @@
 # the ledger (ledger_issue_contains on the finding ids, seeded-c and the
 # authorized-networks facet), not the reply, so the ledger path blocks with
 # it. It reads seeded-c's drift-outlier role, which the hourly fleet scan
-# asserts (masterAuthorizedNetworksConfig.enabled never true). It requests
+# asserts (masterAuthorizedNetworksConfig.enabled never true). The scan does
+# not yet assert the majority side: a peer (seeded-a, -b or -d) losing its
+# block, or any seeded cluster under a day old, leaves no baseline and fails
+# every repetition (#4015; docs/eval-gate-roster.md, "Demoting a flaky
+# case"). It requests
 # no pull request (the audit's remediation sweep is off on the inject lane,
 # #3439), so it runs in the first phase. Hinted at 600s in unit_cost_hint.
 # This line took consistency off the docs/designs/domains.yaml allowlist.

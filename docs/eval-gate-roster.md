@@ -284,9 +284,14 @@ Admitted on the record since the split:
   not on the reply, and the drift collector applies the SOP's rule that authorized networks is on
   only when `enabled` is true (the rule #3605 asks the chat path to reach). It reads seeded-c's
   `drift-outlier` role, whose catalog `state` assertion (`masterAuthorizedNetworksConfig.enabled`
-  never true) the hourly seeded-fleet scan runs. What the scan does not watch is the peers'
-  side and the cluster ages: the SOP leaves a cluster under 24 hours old out of every cohort, so
-  replacing any seeded cluster silences the finding for a day (`docs/designs/fleet-fixtures.yaml`).
+  never true) the hourly seeded-fleet scan runs. What the scan does not watch is the majority
+  side and the cluster ages. The SOP builds a baseline only when at least 2/3 of the cohort agree,
+  so one peer (seeded-a, -b or -d) losing its authorized-networks block leaves no baseline and no
+  finding. The SOP also leaves a cluster under 24 hours old out of every cohort, so replacing any
+  seeded cluster silences the finding for a day (`docs/designs/fleet-fixtures.yaml`). Either one
+  fails every repetition, which reds every open pull request until the fleet is repaired, and
+  nothing pages first: [#4015](https://github.com/gke-labs/kube-agents/issues/4015) adds the
+  peers' assertions to the scan.
   What it costs: it requests no pull request (the lane's install turns the audits' remediation
   sweep off, [The inject lane](#the-inject-lane)), so it runs in the first phase beside the other
   cases, its three repetitions one after another on its task lock, hinted at 600 s in
@@ -716,6 +721,12 @@ files — the files, not the Prow config, are deliberately the fast lever. It is
 erroring verifier, an empty record on a task that provisions nothing — a record whose
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
 case leaves the list.
+
+A collapse of consistency-drift-outlier on several unrelated pull requests at once is a fleet
+question before it is a case question. Check that seeded-a, -b and -d still carry their master
+authorized-networks block, and that no seeded cluster is under a day old. The hourly scan watches
+neither yet ([#4015](https://github.com/gke-labs/kube-agents/issues/4015)). If either holds,
+demote the case the same day and say why.
 
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
