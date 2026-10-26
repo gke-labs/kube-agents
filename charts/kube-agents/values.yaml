@@ -143,6 +143,16 @@ operator:
   # chart cannot see and the hint would fight it.
   topologySpread:
     enabled: true
+  # The manager's own metrics listener, port 8080, plain HTTP on the pod
+  # network: controller-runtime's series plus the operator's view of every
+  # PlatformAgent, status.usage and status.phase as three gauge families
+  # (kubeagents_platformagent_usage, kubeagents_platformagent_usage_time_seconds,
+  # kubeagents_platformagent_phase), so Managed Prometheus reads the numbers
+  # the poller wrote. podMonitoring is the same tri-state as
+  # platformAgent.podMonitoring: null follows the cluster.
+  metrics:
+    enabled: true
+    podMonitoring: null
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -1295,8 +1305,12 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github or gitlab; required when host is not github.com
-    #     host: ""                # empty is github.com; or a GitHub Enterprise Server hostname
+    #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
+    #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
+    #                             # Server hostname; required for gitea, which has none
+    #     scheme: https           # https (default); http only for gitea on an
+    #                             # in-cluster Service (*.svc or *.svc.cluster.local)
+    #     port: 3000              # gitea only, when not the scheme's default port
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
@@ -1304,12 +1318,13 @@ platformAgent:
     #     provider: gitlab
     #     host: ""                # gitlab.com, or a self-managed instance's hostname
     #     namespace: my-group     # group path; bounds which projects the agent may reach
-    #     credentialsRef:         # required for gitlab: a Secret holding an access
-    #       name: gitlab-token    # token under the key `token`, created out of band
-    #     caBundleRef:            # optional, self-managed GitLab or GitHub Enterprise Server only: a Secret holding
-    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate, created out of band;
-    #       key: ca.crt           # the broker trusts it for this host only. On a GitHub Enterprise Server
-    #                             # forge, the token minter also gets it and trusts it for all of its calls
+    #     credentialsRef:         # required for gitlab and gitea: a Secret holding an
+    #       name: gitlab-token    # access token under the key `token`, created out of band
+    #     caBundleRef:            # optional, self-managed GitLab, GitHub Enterprise Server, or https gitea:
+    #       name: gitlab-forge-ca # a Secret holding the PEM CA that signed the instance's certificate,
+    #       key: ca.crt           # created out of band; the broker trusts it for this host only. On a
+    #                             # GitHub Enterprise Server forge, the token minter also gets it and trusts
+    #                             # it for all of its calls
     forges: []
     # repositories:
     #   - forge: github
@@ -1374,6 +1389,10 @@ platformAgent:
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""
+      # "auto" (also empty) or "manual". Accepted and recorded in this release
+      # but with no effect yet: the A2A gateway does not learn a home channel,
+      # so homeChannel alone decides.
+      homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under

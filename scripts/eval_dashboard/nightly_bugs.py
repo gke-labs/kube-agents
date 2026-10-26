@@ -68,7 +68,7 @@ dropped before a night counts as failing.
 
 **A listing it cannot trust files nothing.** Both issue listings are
 cross-checked against the same issues read through GraphQL
-(``Filer.listing_doubt``); when GraphQL cannot be read, or names more issues
+(``listing_doubt``); when GraphQL cannot be read, or names more issues
 than the listing holds, the listings are read again (LISTING_ATTEMPTS),
 and when no read agrees the tick writes nothing and logs why; the next tick
 retries. Comments are read the same way: an issue whose listing counts
@@ -570,6 +570,59 @@ def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None) -> b
     return True
 
 
+def infra_issue_part(issue: dict) -> str:
+    """The part an open kept-case issue names: the part of the job its body
+    names (main-b or writers), else main."""
+    body = issue.get("body") or ""
+    return next((part for job, part in nightly.PART_JOBS.items() if f"`{job}`" in body), nightly.PART_MAIN)
+
+
+def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: str | None) -> str | None:
+    """Why the REST listings cannot be trusted, or None when GraphQL
+    agrees with them (LISTING_QUERY). A dedupe that reads an empty list
+    files every case again."""
+    owner, _, name = gh.repo.partition("/")
+    variables = {"owner": owner, "name": name, "label": LABEL, "since": since, "closed": bool(since)}
+    found = gh.call("POST", GRAPHQL_PATH, {"query": LISTING_QUERY, "variables": variables}, read=True)
+    repo = ((found or {}).get("data") or {}).get("repository") if isinstance(found, dict) else None
+    if not isinstance(repo, dict) or (found or {}).get("errors"):
+        return "the GraphQL cross-check could not be read"
+    for state, listed in (("open", open_issues), ("closed", closed_issues)):
+        if state == "closed" and not since:
+            continue
+        conn = repo.get(state)
+        if not isinstance(conn, dict) or not isinstance(conn.get("totalCount"), int) or not isinstance(conn.get("nodes"), list):
+            return f"the GraphQL cross-check of the {state} issues could not be read"
+        numbers = {i.get("number") for i in listed if isinstance(i, dict) and not i.get("pull_request")}
+        missing = sorted(n.get("number") for n in conn["nodes"] if isinstance(n, dict) and isinstance(n.get("number"), int) and n.get("number") not in numbers)
+        if missing or len(numbers) < conn["totalCount"]:
+            return (f"the {state} listing holds {len(numbers)} issues, GraphQL {conn['totalCount']}"
+                    + (f" (missing {', '.join(f'#{n}' for n in missing)})" if missing else ""))
+    return None
+
+
+def read_listings(gh: ghcli.Gh, since: str | None) -> tuple[list | None, list | None, str | None]:
+    """``(open, closed, doubt)``: the two REST listings (closed ones updated
+    since ``since``; none without it), read up to LISTING_ATTEMPTS times
+    until GraphQL agrees with them (``listing_doubt``). ``open`` or
+    ``closed`` is None when a read failed; ``doubt`` is why the last read is
+    not trusted, None when it is. The filer and the digest's nightly section
+    both read the issues through this."""
+    doubt = None
+    for attempt in range(1, LISTING_ATTEMPTS + 1):
+        open_issues = gh.call("GET", gh.path(OPEN_ISSUES_PATH), paginate=True)
+        closed_issues = gh.call("GET", gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True) if since else []
+        if open_issues is None or closed_issues is None:
+            return open_issues, closed_issues, None
+        doubt = listing_doubt(gh, open_issues, closed_issues, since)
+        if not doubt:
+            break
+        log(f"warning: the nightly-red issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
+        if attempt < LISTING_ATTEMPTS:
+            time.sleep(LISTING_RETRY_DELAY_S)
+    return open_issues, closed_issues, doubt
+
+
 class Filer:
     def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT):
         self.gh = gh
@@ -582,35 +635,6 @@ class Filer:
             log(f"warning: could not read domains.yaml: {exc}")
             self.domain_owners = {}
         self.infra_owner, self.infra_backup = gate_issue.infra_addressees(repo_root / case_owner.DOMAINS_PATH)
-
-    def open_issues(self) -> list[dict] | None:
-        return self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
-
-    def closed_issues(self, since: str) -> list[dict] | None:
-        return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True)
-
-    def listing_doubt(self, open_issues: list, closed_issues: list, since: str | None) -> str | None:
-        """Why the REST listings cannot be trusted, or None when GraphQL
-        agrees with them (LISTING_QUERY). A dedupe that reads an empty list
-        files every case again."""
-        owner, _, name = self.gh.repo.partition("/")
-        variables = {"owner": owner, "name": name, "label": LABEL, "since": since, "closed": bool(since)}
-        found = self.gh.call("POST", GRAPHQL_PATH, {"query": LISTING_QUERY, "variables": variables}, read=True)
-        repo = ((found or {}).get("data") or {}).get("repository") if isinstance(found, dict) else None
-        if not isinstance(repo, dict) or (found or {}).get("errors"):
-            return "the GraphQL cross-check could not be read"
-        for state, listed in (("open", open_issues), ("closed", closed_issues)):
-            if state == "closed" and not since:
-                continue
-            conn = repo.get(state)
-            if not isinstance(conn, dict) or not isinstance(conn.get("totalCount"), int) or not isinstance(conn.get("nodes"), list):
-                return f"the GraphQL cross-check of the {state} issues could not be read"
-            numbers = {i.get("number") for i in listed if isinstance(i, dict) and not i.get("pull_request")}
-            missing = sorted(n.get("number") for n in conn["nodes"] if isinstance(n, dict) and isinstance(n.get("number"), int) and n.get("number") not in numbers)
-            if missing or len(numbers) < conn["totalCount"]:
-                return (f"the {state} listing holds {len(numbers)} issues, GraphQL {conn['totalCount']}"
-                        + (f" (missing {', '.join(f'#{n}' for n in missing)})" if missing else ""))
-        return None
 
     def commented(self, issue: dict, marker: str) -> bool | None:
         """Whether a comment on ``issue`` carries ``marker``; None when the
@@ -637,19 +661,11 @@ class Filer:
         starts = [nightly.parse_iso(n.get("started")) for ns in parts.values() for n in ns]
         self.horizon = min((t for t in starts if t), default=None)
         since = self.horizon.strftime(GITHUB_TIME_FORMAT) if self.horizon else None
-        for attempt in range(1, LISTING_ATTEMPTS + 1):
-            open_issues = self.open_issues()
-            closed_issues = self.closed_issues(since) if since else []
-            if open_issues is None or closed_issues is None:
-                log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
-                return result
-            doubt = self.listing_doubt(open_issues, closed_issues, since)
-            if not doubt:
-                break
-            log(f"warning: the nightly-red issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
-            if attempt < LISTING_ATTEMPTS:
-                time.sleep(LISTING_RETRY_DELAY_S)
-        else:
+        open_issues, closed_issues, doubt = read_listings(self.gh, since)
+        if open_issues is None or closed_issues is None:
+            log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
+            return result
+        if doubt:
             log("warning: no trusted nightly-red issue listing this pass; nothing filed or commented, retried next tick")
             return result
         active = set(nightly.expected_cases(data))
@@ -719,8 +735,7 @@ class Filer:
         for case in candidates:
             open_issue = tracking_issue(open_issues, case, KIND_INFRA)
             if open_issue:
-                body_text = open_issue.get("body") or ""
-                tracked[case] = nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in body_text else nightly.PART_MAIN
+                tracked[case] = infra_issue_part(open_issue)
         for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates, tracked).items()):
             fields = task_fields(case, self.repo_root)
             if fields is None:

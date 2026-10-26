@@ -58,7 +58,13 @@ A first line of `[bench:card-failure-wake]` or `[bench:slack-question-wake]` mak
 replay of a card's wake rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
-needs an entry in `hack/eval/inject-lane-exclusions.txt`.
+needs an entry in `hack/eval/inject-lane-exclusions.txt`. A first line of
+`[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
+prompt an ask the harness stops once it has filed a card
+([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
+only over the inject transport, so the case needs an entry in
+`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
+`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -284,7 +290,7 @@ is not checked, and a missing command is
 `status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
 trajectory holds no worker terminal call).
 
-Eleven read the install under test, nine of them from that file. `bootstrap_fanout` compares the
+Thirteen read the install under test, nine of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -348,7 +354,13 @@ the `audit-chat-report` stack's state file, what the Session KV server stored fo
 job's threads since the fire, and the chat report the run's `finish` left on the shell sandbox, and
 passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
-silent run or one that never ended is an error.
+silent run or one that never ended is an error. `triage_starts`, in its own module
+(`bench/kube_agents_bench/triage_starts.py`), lists the pods in its `namespace` on the agent's cluster,
+joins the Session KV server's admitted `intercepted_events` rows for them (by pod UID) to the default
+profile's Hermes `state.db`, and passes when at least `min_alerts` pods have an admitted alert and every
+one of those alerts has a session with a message, a started triage turn; a session with no message is a
+lost start, because a create the daemon gave up on still commits, and fewer than `min_alerts` admitted
+alerts (the plant failed, or the daily Warning alert limit refused part of the burst) is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
@@ -485,7 +497,9 @@ test checks both, so two case pull requests don't edit the same lines). It lands
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
-the night it merges, its record accrues in the evidence store, and a presubmit seat is a
+the night it merges, its record accrues in the evidence store (for a case in
+`hack/eval/api-lane-exclusions.txt`, which runs only over the inject transport, under the
+version key's `next` mode), and a presubmit seat is a
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as

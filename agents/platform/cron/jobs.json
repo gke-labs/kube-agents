@@ -8,7 +8,7 @@
         "expr": "20 6 * * *",
         "display": "20 6 * * *"
       },
-      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at '/opt/data/profiles/platform/governance/compliance_audit_sop.md' — all 444 lines of it, before you run anything. Its sixteen checks are section 2, lines 90-372, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit`) in the foreground with the terminal tool's timeout: 600 (the foreground maximum), --workspace set to the workspace start returned and --out /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file (if the collector wrote none, section 2 says what to pass instead). Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at '/opt/data/profiles/platform/governance/compliance_audit_sop.md' — all 461 lines of it, before you run anything. Its seventeen checks are section 2, lines 90-389, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py compliance-audit`) in the foreground with the terminal tool's timeout: 600 (the foreground maximum), --workspace set to the workspace start returned and --out /opt/data/scratch/manifest_compliance-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file (if the collector wrote none, section 2 says what to pass instead). Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "max_turns": 250,
       "risk": "low",
@@ -129,6 +129,21 @@
         "display": "45 7 * * *"
       },
       "prompt": "Run the daily GCE Compute Engine and MIG fleet audit. Read the SOP at '/opt/data/profiles/platform/governance/gce_compute_fleet_sop.md' — all 186 lines of it, before you run anything. Its four checks are section 2, lines 33-96, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 opens by running the collector (`/opt/data/profiles/platform/skills/gce-compute-fleet-audit/scripts/compute_fleet_audit.py`), redirecting its stdout to /opt/data/scratch/manifest_gce-compute-fleet-audit.json: run it before evaluating any check by hand, read the manifest the way section 2 says, and pass the same file to finish as --manifest-file. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "max_turns": 250,
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
+      "id": "upgrade-retrospective",
+      "name": "Upgrade Retrospective",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 18 * * 0",
+        "display": "0 18 * * 0"
+      },
+      "prompt": "Run the weekly upgrade retrospective. Read the SOP at '/opt/data/profiles/platform/governance/upgrade_retrospective_sop.md' — all 256 lines of it, before you run anything. Its seven checks are section 3, lines 104-189, so a read that stops early skips the grading and reports a clean fleet it never looked at. Section 1 resolves the scope with the platform_control fleet_scope tool; section 0 probes the collector's lock (`--probe-lock`), then opens the audit run with the fleet-audit skill where a repository is linked, and says when a run has none and reports in chat alone. Section 2 runs the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full`) with the tool's collector_args verbatim and --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json, in the foreground with the terminal tool's timeout: 600 and never in the background: run it before grading anything by hand, draft the findings document from the manifest the way section 2 says, copy every candidate's grade by section 3, and pass the same manifest to finish as --manifest-file; a collector exit without a manifest after start takes section 0's recovery finish. Then execute the SOP exactly. This review is read-only: never upgrade, roll back, cordon, delete or patch anything.",
       "skills": ["fleet-audit"],
       "max_turns": 250,
       "risk": "low",

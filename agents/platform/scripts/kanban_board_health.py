@@ -215,6 +215,34 @@ BLOCKED_EVENTS_SQL = """
      WHERE kind = 'blocked'
      ORDER BY created_at, id
 """
+BLOCKED_CHILDREN_SQL = """
+    SELECT l.parent_id, c.id, c.title, c.assignee
+      FROM task_links l
+      JOIN tasks c ON c.id = l.child_id
+     WHERE c.status = 'todo'
+     ORDER BY c.id
+"""
+# The words `session_kv_server._triage_authorize_clauses(True)` puts in a
+# triage report's `To authorize:` bullet when the install opens the Pull
+# Request itself (`TRIAGE_OPEN_PR_MARKER` there). The Slack notifier
+# (`slack_ux_incident.OPENING_PULL_REQUEST`) and the bench case key on the same
+# words, so all three readers agree on which reports made the promise.
+TRIAGE_OPEN_PR_MARKER = "is being opened automatically"
+# A completed triage card whose report made that promise must have its linked
+# child card in `task_links`. If the front-door turn ended between Call 1 and
+# Call 2, the reader sees a report telling them not to reply `apply` while no
+# follow-up card exists to open the Pull Request.
+MISSING_PR_CHILD_SQL = f"""
+    SELECT t.id, t.title
+      FROM tasks t
+     WHERE t.status = 'done'
+       AND t.title LIKE 'Triage %'
+       AND t.result LIKE '%{TRIAGE_OPEN_PR_MARKER}%'
+       AND NOT EXISTS (
+           SELECT 1 FROM task_links l WHERE l.parent_id = t.id
+       )
+     ORDER BY t.id
+"""
 
 
 def agent_home() -> Path:
@@ -271,7 +299,7 @@ def read_only_connection(db: Path) -> sqlite3.Connection:
 
 
 def blocked_context(conn: sqlite3.Connection) -> dict:
-    """kind, reason, title and assignee per blocked card, or {} on an unmigrated board."""
+    """kind, reason, title, assignee and waiting todo children per blocked card, or {} on an unmigrated board."""
     try:
         tasks = {
             row["id"]: {"title": row["title"] or "", "assignee": row["assignee"] or "", "kind": row["block_kind"], "reason": ""}
@@ -289,6 +317,17 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
                 tasks[row["task_id"]]["reason"] = str(payload.get("reason") or tasks[row["task_id"]]["reason"])
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
+        try:
+            for row in conn.execute(BLOCKED_CHILDREN_SQL):
+                if row["parent_id"] not in tasks:
+                    continue
+                tasks[row["parent_id"]].setdefault("waiting_children", []).append({
+                    "id": row["id"],
+                    "title": row["title"] or "",
+                    "assignee": row["assignee"] or "?",
+                })
+        except sqlite3.OperationalError:
+            pass
     except sqlite3.OperationalError:
         return {}
     return tasks
@@ -326,6 +365,24 @@ def stuck_card_line(task_id: str, diag: dict, context: dict, entry: dict) -> str
     if reason:
         head += f' — "{reason}"'
     return head
+
+
+def waiting_child_lines(task_id: str, context: dict, indent: str = "    ") -> list:
+    """One line per todo child the blocked card holds back (`task_links`).
+
+    A child waits until every parent is done, so a blocked parent also parks
+    its children; without this line the board shows the parent and nothing
+    says the follow-up card (for instance an incident triage's pull-request
+    card) is stuck behind it.
+    """
+    info = (context or {}).get(task_id) or {}
+    lines = []
+    for child in info.get("waiting_children") or ():
+        line = f"{indent}holding todo child: {child['id']} ({child.get('assignee') or '?'})"
+        if child.get("title"):
+            line += f": {' '.join(str(child['title']).split())[:TITLE_MAX_CHARS]}"
+        lines.append(line)
+    return lines
 
 
 def _card_age_hours(diag: dict) -> float:
@@ -507,7 +564,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             renderable_items.append({
                 "age_hours": card["age_hours"],
                 "key": card["task_id"],
-                "lines": [line],
+                "lines": [line, *waiting_child_lines(card["task_id"], context)],
                 "card_count": 1,
                 "cards": [card],
                 "dropped_ids": [],
@@ -529,6 +586,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                     if card["reason"]:
                         card_sub += f' — "{card["reason"]}"'
                     lines_for_group.append(card_sub)
+                    lines_for_group.extend(waiting_child_lines(card["task_id"], context, indent="      "))
                 renderable_items.append({
                     "age_hours": newest_age,
                     "key": title[:TITLE_MAX_CHARS],
@@ -562,7 +620,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
         renderable_items.append({
             "age_hours": card["age_hours"],
             "key": card["task_id"],
-            "lines": [line],
+            "lines": [line, *waiting_child_lines(card["task_id"], context)],
             "card_count": 1,
             "cards": [card],
             "dropped_ids": [],
@@ -667,6 +725,14 @@ def invariant_violations(conn: sqlite3.Connection) -> list:
             f"  ghost claim: task {row['id']} is '{row['status']}' but still holds "
             f"claim_lock={row['claim_lock']!r}"
         )
+    try:
+        for row in conn.execute(MISSING_PR_CHILD_SQL):
+            lines.append(
+                f"  missing follow-up child: task {row['id']} ({row['title']!r}) promised "
+                "an automatic Pull Request but has no linked child in task_links"
+            )
+    except sqlite3.OperationalError:
+        pass
     return lines
 
 

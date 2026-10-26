@@ -136,21 +136,9 @@ type UsageCounterPoller struct {
 	// line.
 	mu      sync.Mutex
 	streaks map[usageStreakKey]*usageScrapeStreak
-	// prunedNewerFields records, per CR and per newer field -- the cluster
-	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal,
-	// toolExecutionsBlockedTotal brokerFailuresTotal, chatTurnsErroredTotal backgroundTasksGaveUpTotal negativeFeedbackTotal and remediationsClosedUnmergedTotal -- the last poll in which that
-	// field was written and came back absent: a served CRD at a previous
-	// schema, which has the first-schema counters (every CRD with status.usage
-	// has carried remediationsProposedTotal and sessionsTotal) and not every
-	// later field. A
-	// record per field rather than the counters' shared one, or one for all
-	// the newer fields, because each record suppresses the writes it covers
-	// for the interval and the fields such a CRD does serve should keep
-	// landing: a CRD from between the gauges and the merged counter serves
-	// the gauges and prunes the counter. Fresh for usageStatusReprobeInterval,
-	// then that field is probed again. In memory only, like streaks; keyed
-	// like the cursor, then by field.
-	prunedNewerFields map[string]map[string]time.Time
+	// The per-field pruning records are the reconciler's (prunedNewerFields
+	// there): the poller writes and reads them, and the usage gauges' publish
+	// reads them on every reconcile.
 	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
 	// replica's body was read while the watcher is on: listeners failing, pods
 	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
@@ -236,20 +224,16 @@ func (p *UsageCounterPoller) Start(ctx context.Context) error {
 }
 
 // newerFieldPruned reports whether the CR's pruning record for field is
-// fresh, dropping it once it has expired.
+// fresh. An expired record stays, for the usage gauges, until an echo
+// carries the field.
 func (p *UsageCounterPoller) newerFieldPruned(agent *agentv1alpha1.PlatformAgent, field string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	key := usagePollKey(agent)
-	recorded, ok := p.prunedNewerFields[key][field]
-	if !ok {
-		return false
-	}
-	if p.now().Sub(recorded) >= usageStatusReprobeInterval {
-		delete(p.prunedNewerFields[key], field)
-		return false
-	}
-	return true
+	p.r.prunedNewerFieldsMu.Lock()
+	defer p.r.prunedNewerFieldsMu.Unlock()
+	recorded, ok := p.r.prunedNewerFields[usagePollKey(agent)][field]
+	// A stale record reads false, which is what makes this poll probe the
+	// field; the record itself stays until an echo carries the field, so the
+	// usage gauges hold the field's sample back across the probe.
+	return ok && p.now().Sub(recorded) < usageStatusReprobeInterval
 }
 
 // noteNewerFieldEcho is one newer field's own echo record: echoed false is a
@@ -257,20 +241,23 @@ func (p *UsageCounterPoller) newerFieldPruned(agent *agentv1alpha1.PlatformAgent
 // logged once per record, naming the field; echoed true clears it.
 func (p *UsageCounterPoller) noteNewerFieldEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, field string, echoed bool) {
 	key := usagePollKey(agent)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.prunedNewerFields == nil {
-		p.prunedNewerFields = map[string]map[string]time.Time{}
+	p.r.prunedNewerFieldsMu.Lock()
+	defer p.r.prunedNewerFieldsMu.Unlock()
+	if p.r.prunedNewerFields == nil {
+		p.r.prunedNewerFields = map[string]map[string]time.Time{}
 	}
 	if echoed {
-		delete(p.prunedNewerFields[key], field)
+		delete(p.r.prunedNewerFields[key], field)
 		return
 	}
-	if p.prunedNewerFields[key] == nil {
-		p.prunedNewerFields[key] = map[string]time.Time{}
+	if p.r.prunedNewerFields[key] == nil {
+		p.r.prunedNewerFields[key] = map[string]time.Time{}
 	}
-	_, fresh := p.prunedNewerFields[key][field]
-	p.prunedNewerFields[key][field] = p.now()
+	// Said once per record, as the shared record's line is: a record that
+	// expired and is re-recorded says it again, once per interval.
+	recorded, held := p.r.prunedNewerFields[key][field]
+	fresh := held && p.now().Sub(recorded) < usageStatusReprobeInterval
+	p.r.prunedNewerFields[key][field] = p.now()
 	if !fresh {
 		logf.FromContext(ctx).Info("the served CRD does not serve a status.usage field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
 			"platformagent", key, "field", field, "reprobeAfter", usageStatusReprobeInterval.String())
@@ -300,13 +287,15 @@ func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAge
 // counts of CRs outside swept, the CRs a completed sweep reached, so the maps do not keep
 // an entry per deleted CR for the life of the process.
 func (p *UsageCounterPoller) forgetDepartedNewerFieldRecords(swept map[string]bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for key := range p.prunedNewerFields {
+	p.r.prunedNewerFieldsMu.Lock()
+	for key := range p.r.prunedNewerFields {
 		if !swept[key] {
-			delete(p.prunedNewerFields, key)
+			delete(p.r.prunedNewerFields, key)
 		}
 	}
+	p.r.prunedNewerFieldsMu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for key := range p.gatewayMisses {
 		if !swept[key] {
 			delete(p.gatewayMisses, key)

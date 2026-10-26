@@ -12,8 +12,8 @@
 # roster and, as the one documented exception, the held-out seats a coverage
 # tracker puts in presubmit-cases.txt without a name here (its last section;
 # #2013 seated the compliance canary 2026-09-29; #2016 seated pdb-remediation-pr
-# 2026-09-28, its roster line landed 2026-10-14, and it was demoted to the
-# nightly 2026-10-17, #3120): such a case runs on every
+# 2026-09-28 and its roster line landed 2026-10-14; nightly-only 2026-10-17
+# to 2026-10-26, #3120): such a case runs on every
 # pull request and, under the default EVAL_ADMISSION_MODE=roster, cannot red
 # one on a graded failure. Every other held-out case is a nightly case
 # (nightly-cases.txt carries each with its hold-out reason). The script
@@ -49,10 +49,13 @@
 reliability-pdb-probe
 capacity-pinned-pool-probe
 security-overgrant-probe
+upgrades-lagging-master-probe
 cost-idle-pool-probe
 obtainability-remediation-proposal
+pdb-remediation-pr
 cluster-agent-crashloop-debug
 cluster-agent-crashloop-misleading-symptom
 cluster-agent-crashloop-evidence-chain
 incident-triage-oom-event-probe
 agent-kanban-smoke
+vcs-spent-branch-reuse

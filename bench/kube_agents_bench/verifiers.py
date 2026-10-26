@@ -1956,6 +1956,7 @@ LEDGER_AUDIT_IDS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -1971,6 +1972,7 @@ AuditId = Literal[
     "obtainability-audit",
     "security-patch-orchestrator",
     "stockout-prevention",
+    "upgrade-retrospective",
 ]
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
@@ -1982,7 +1984,9 @@ AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE", "STORE_L
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
 # tests/test_gitlab_checks.py): `scripts/verify_ci_pool_project.py` parses
 # this tuple out of the file, without importing bench, to check that CI mints
-# into the name bench reads first.
+# into the name bench reads first. A non-empty file named by
+# forges.GITHUB_TOKEN_FILE_ENV_VAR outranks both: CI seeds it from the same
+# mint and renews it while the unit runs (forges.read_token).
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # When the first unit on the case's audit stream began, in epoch seconds, and
@@ -2146,20 +2150,17 @@ def _no_pr_url_reason(host: str) -> str:
         f"({forges.GITHUB_HOST_ENV_VAR})"
     )
 
-_NO_TOKEN_REASON = (
-    "no GitHub read credential in the environment: set one of "
-    f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
-    "the eval GitOps repository, or this check cannot be evaluated"
-)
-
-
 def _no_token_reason(forge: str) -> str:
-    """The reason for an absent grading credential, naming the forge's variables."""
+    """The reason for an absent grading credential, naming what was read."""
     if forge == forges.FORGE_GITHUB:
-        return _NO_TOKEN_REASON
+        return (
+            "no GitHub read credential in the environment: "
+            f"{forges.missing_token_hint(forge)} to a token that can read issues on "
+            "the eval GitOps repository, or this check cannot be evaluated"
+        )
     return (
-        f"no {forge} read credential in the environment: set one of "
-        f"{', '.join(forges.token_env_vars(forge))} to a token that can read the eval "
+        f"no {forge} read credential in the environment: "
+        f"{forges.missing_token_hint(forge)} to a token that can read the eval "
         "GitOps repository, or this check cannot be evaluated"
     )
 
@@ -4104,8 +4105,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     the noun does not pass. Exactly one of the reported URLs may satisfy them;
     two would mean the report named two ledgers for a stream that owns one.
 
-    AUTHENTICATION. A GitHub token from ``BENCH_GITHUB_TOKEN`` (preferred) or
-    ``GITHUB_TOKEN``, read by the verifier process — the Prow runner, not the
+    AUTHENTICATION. A GitHub token from the file ``BENCH_GITHUB_TOKEN_FILE``
+    names when it holds one, else ``BENCH_GITHUB_TOKEN`` (preferred) or
+    ``GITHUB_TOKEN`` (:func:`forges.read_token`), read by the verifier process — the Prow runner, not the
     agent. It needs one permission, ``issues: read``, on the eval GitOps
     repositories, which are private and ours (``gke-agentic/
     kube-agents-evals-infra`` and ``…-evals-2-infra``); that they are
@@ -5311,8 +5313,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # token lasts an hour, and telling the reader to widen a permission
             # sends them to the App's settings for a fault that is in the mint.
             return None, (
-                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
-                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                f"GitHub answered 401 for {owner}/{repo}#{number}: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} is not valid — an installation token "
                 "expires an hour after it is minted — so this check could not be "
                 "evaluated"
             )
@@ -5320,8 +5322,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return payload, None
         if first == 403 and status_code == 403:
             return None, (
-                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
-                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} can reach that repository but "
                 "read neither its issues nor its pull requests — add "
                 "`pull_requests: read` to the installation — so this check could "
                 "not be evaluated"
@@ -5382,7 +5384,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
-                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    f"endpoint: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                     "an installation token expires an hour after it is minted — so "
                     "this check could not be evaluated",
                 )
@@ -5393,7 +5395,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
-                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
                     "check could not be evaluated",
                 )
@@ -5429,7 +5431,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
-                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                f"page: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                 "an installation token expires an hour after it is minted — so "
                 "this check could not be evaluated",
             )
@@ -5440,7 +5442,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
-                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "
                 "check could not be evaluated",
             )
@@ -6188,13 +6190,12 @@ class GitHubWritesVerifier(BaseVerifier):
             forge = github_writes.forge_name()
         except github_writes.UnknownForge as exc:
             return done(False, str(exc), status="error")
-        token_vars = github_writes.token_env_vars(forge)
-        token = next((v for v in (os.environ.get(n) for n in token_vars) if v), None)
+        token = forges.read_token(forge)
         if not token:
             return done(
                 False,
-                f"no {forge} read credential in the environment: set one of "
-                f"{', '.join(token_vars)} to a token that can read the GitOps repository, "
+                f"no {forge} read credential in the environment: "
+                f"{forges.missing_token_hint(forge)} to a token that can read the GitOps repository, "
                 "or this check cannot be evaluated",
                 status="error",
             )
@@ -7056,10 +7057,16 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
         return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
-# The check rosters of the four audits the oobe stage runs after the scan
+# The check rosters of the five audits the oobe stage runs after the scan
 # (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
 # agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
 # leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+
+# The check rosters of the audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS, in its order; each roster is `AUDITS[<id>].checks`
+# in agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves the four fleet audits' checks to those audits; the upgrade retrospective's are the
+# collector's six, which no scan reports. tests/test_bootstrap_handoff.py re-derives this
 # copy from both files.
 FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
     "fleet-wide-cost-analysis": (
@@ -7071,7 +7078,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "privileged-container", "host-namespace", "hostpath-mount", "cluster-admin-binding", "wildcard-rbac",
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
-        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding",
+        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",
@@ -7086,6 +7093,11 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
         "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+    "upgrade-retrospective": (
+        "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
+        "upgrade-symptom-tentative", "upgrade-symptom-unclassified", "symptom-predates-upgrade",
+        "upgrade-log-volume-rose",
     ),
 }
 

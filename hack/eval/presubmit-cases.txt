@@ -54,14 +54,18 @@
 # ("presubmit cases", "presubmit units"); no count is written here, so a seat
 # change edits only its own entry. The mix: domain probes, a reliability
 # prompt variation, cluster-debugging cases, the incident-triage probe, the
-# kanban smoke, and the held-out seats (the compliance canary among them since 2026-09-29, ~1000-2000s a repetition; its
-# three repetitions serialize on the task lock). upgrades-lagging-master-probe
-# left for the nightly 2026-10-16 (#3269), putting upgrades on the
-# docs/designs/domains.yaml allowlist, and consistency-authorized-networks-probe
-# left 2026-10-21 (#3598), putting consistency there too. The remediation writer
-# pdb-remediation-pr (420-1929s measured, hinted at 1250) took its roster
-# line 2026-10-14 (#2016), which took remediation off that allowlist, and was
-# demoted to the nightly 2026-10-17 (#3120), which put it back on;
+# kanban smoke, the two cases here that request a pull request (the
+# remediation writer pdb-remediation-pr and the source-control branch-reuse
+# writer), and the held-out seats (the compliance canary among them since
+# 2026-09-29, ~1000-2000s a repetition; its three repetitions serialize on
+# the task lock). upgrades-lagging-master-probe
+# left for the nightly 2026-10-16 (#3269) and came back 2026-10-23 on three
+# clean nightlies after its prompt fix (#3338); consistency-authorized-networks-probe
+# left 2026-10-21 (#3598), putting consistency on the docs/designs/domains.yaml
+# allowlist. The remediation writer
+# pdb-remediation-pr took its roster line 2026-10-14 (#2016), which took
+# remediation off that allowlist, was demoted to the nightly 2026-10-17
+# (#3120), which put it back on, and returned 2026-10-26 after #3145;
 # rca-remediation-pr stays demoted (#1189). The 2026-08-26
 # smoke run (build 2092638061140643840, kube-agents-evals-3) measured what
 # six full audits cost: obtainability-planted-pdb PASSED in 962s and
@@ -83,6 +87,7 @@
 ./tasks/reliability-pdb-probe/task.yaml
 ./tasks/capacity-pinned-pool-probe/task.yaml
 ./tasks/security-overgrant-probe/task.yaml
+./tasks/upgrades-lagging-master-probe/task.yaml
 ./tasks/cost-idle-pool-probe/task.yaml
 
 # The reliability prompt variation that grades what the probe does not ask
@@ -97,6 +102,22 @@
 # since 2026-09-22 #1049's three (pdb-semantics, fleet-exposure-sweep,
 # healthy-namespace-silence) -- run in the nightly.
 ./tasks/obtainability-remediation-proposal/task.yaml
+# The remediation domain's writer: submit-suggestion's pull request on the
+# leased *-infra repository, graded by pull_request_opened. Seated held out
+# 2026-09-28 (#2016 step 2); roster line 2026-10-14 (#2016 step 4); demoted
+# to the nightly 2026-10-17 (#3120: the worker declined a pull request into
+# an *-infra repository with no manifest for checkout-gateway). Back
+# 2026-10-26 after #3145 (merged 2026-10-23) seeded that manifest into every
+# pool repository, on the writers nightly record: 21/21 since the agent model
+# became claude-opus-5-5 on 2026-10-19, 9/9 on the three nights since #3145,
+# all three under spec.mode next (#3783); median repetition 172s on those
+# nine. The evidence store reads `collecting` (9/9 at the next-mode key).
+# It requests a pull request, so its three repetitions run in the fan-out's
+# second phase with vcs-spent-branch-reuse's, one at a time, each after the
+# repository reset and, on the inject lane, the GitHub-write settle. Hinted
+# at 1250s in unit_cost_hint. This line takes remediation off the
+# docs/designs/domains.yaml allowlist.
+./tasks/pdb-remediation-pr/task.yaml
 
 # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
 # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
@@ -149,10 +170,31 @@
 # cluster names).
 ./tasks/agent-kanban-smoke/task.yaml
 
+# The source-control domain's first roster seat (#1918 authored the case),
+# moved in from nightly-cases.txt on 2026-10-23 on the record it built
+# there: 42/42 graded repetitions over the fourteen writers nightlies
+# 2026-10-09 to 10-22, every night 3/3 (12/12 on the four since the agent
+# model became claude-opus-5-5 on 2026-10-19), median repetition 173s;
+# 18/18 under spec.mode next on ci-kube-agents-eval-nightly-next-claude
+# 2026-10-16 to 10-21; 15/15 on the five GitLab nightlies that graded,
+# 2026-10-17 to 10-22.
+# The evidence store reads `collecting` (12/12 at the claude key, 8 short
+# of a window) because the model change reset the key. deployer: noop; it
+# seeds its own spent branch, so no fixture and no seeded cluster. It opens
+# two pull requests a repetition on the leased *-infra repository through
+# submit-suggestion, so it requests a pull request (the presubmit's one such
+# case until pdb-remediation-pr returned on 2026-10-26): its three
+# repetitions run in the fan-out's second phase, one at a time after every
+# other unit, each after the repository reset and, on
+# the inject lane, the GitHub-write settle. Priced at 1000s in
+# unit_cost_hint. This line took source-control off the
+# docs/designs/domains.yaml allowlist.
+./tasks/vcs-spent-branch-reuse/task.yaml
+
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
 # coverage tracker (today #2013, fleet-audits; #2016's seat became a
-# roster line 2026-10-14, demoted to the nightly 2026-10-17, #3120). A case
+# roster line 2026-10-14). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
 # in blocking-roster.txt, so rung 4 (collapse) and rung 6 (judged
@@ -174,10 +216,10 @@
 
 # The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
 # Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
-# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. The one
-# presubmit case that writes to GitHub (pdb-remediation-pr was the second,
-# on the roster 2026-10-14 to 2026-10-17, then demoted to the nightly,
-# #3120): the minted token, the cloned *-infra workspace, the ledger write.
+# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. One of the
+# presubmit cases that write to GitHub, with pdb-remediation-pr and
+# vcs-spent-branch-reuse above, and the one that writes a ledger: the
+# minted token, the cloned *-infra workspace, the ledger write.
 # 1002s median / 2074s p90 over 903 presubmit
 # repetitions 2026-09-04 to 09-15, the 3000s delegation ceiling, priced in
 # unit_cost_hint. Roster line when #2013 step 3's three clean days hold;
@@ -199,8 +241,9 @@
 #   core kube-agents journey); the four full audits recast on 2026-08-26
 #   (obtainability-planted-pdb, stockout-pinned-pool,
 #   upgrade-readiness-lagging-cluster, consistency-drift-outlier), each
-#   domain covered by its probe above (the upgrades and consistency probes
-#   left for the nightly 2026-10-16, #3269, and 2026-10-21, #3598);
+#   domain covered by its probe above (the consistency probe left for the
+#   nightly 2026-10-21, #3598; the upgrades probe was nightly-only 2026-10-16
+#   to 2026-10-23, #3269);
 #   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.

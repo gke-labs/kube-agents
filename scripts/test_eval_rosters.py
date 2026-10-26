@@ -92,7 +92,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120), back 2026-10-26
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -231,7 +231,10 @@ ADMITTED_AFTER_THE_SPLIT = [
     # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
     # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
+    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the claude-opus-5-5 key of 10-19, 9/9 since #3145, the store at collecting.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
+    # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
+    ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -239,7 +242,8 @@ ADMITTED_AFTER_THE_SPLIT = [
 # it), since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
-    ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
+    ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -269,7 +273,7 @@ HELD_OUT_TO_NIGHTLY = [
 # blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
 # less exactly this list.
 HELD_OUT_IN_PRESUBMIT = [
-    ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2, seated 2026-09-29 after agent-kanban-smoke; the roster line is step 4
 ]
 
 
@@ -281,18 +285,19 @@ HELD_OUT_IN_PRESUBMIT = [
 # when its line went in the nightly file's sorted section (#3495), which is
 # where a demotion lands from now on.
 DEMOTED_AFTER_THE_SPLIT = [
-    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
-    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    # upgrades-lagging-master-probe sat here 2026-10-16 to 2026-10-23 (#3269; its line followed
+    # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
+    # pdb-remediation-pr sat here 2026-10-17 to 2026-10-26 (#3120; its line followed
+    # fleet-cost-idle-pool) and took its roster line back after #3145 seeded the manifest it needs.
     ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the
 # frozen part after a named predecessor. Written out and not to grow: every
 # later demotion goes in the sorted section, recorded with None.
-DEMOTED_INTO_THE_FROZEN_PART = frozenset({
-    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),
-    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),
-})
+# Empty since pdb-remediation-pr, the last of them, returned to the roster on
+# 2026-10-26.
+DEMOTED_INTO_THE_FROZEN_PART: frozenset[tuple[str, str]] = frozenset()
 # Held-out seats withdrawn since #3495: a withdrawal moves the line to the
 # nightly file's sorted section and records the case here, in the same edit
 # that deletes its HELD_OUT_IN_PRESUBMIT entry.
@@ -794,6 +799,57 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, eval_rosters.blocking_roster())
                 else:
                     self.assertIn(case, eval_rosters.nightly_cases())
+
+
+# The api lane's exclusions at their introduction (#3263): the cases only the
+# inject door can carry. An edit to the file edits this set.
+API_LANE_EXCLUDED = [
+    "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+]
+
+
+class ApiLaneExclusionsTest(unittest.TestCase):
+    """hack/eval/api-lane-exclusions.txt: the inject lane's mirror, checked the same way."""
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(list(eval_rosters.api_lane_exclusions()), API_LANE_EXCLUDED)
+
+    def test_every_exclusion_names_a_registered_nightly_case(self):
+        # Not a presubmit case: the presubmit matrix also runs on the today
+        # lane over api, where a case excluded here would hold a seat it
+        # never fills, and a case new to the inject door earns its record in
+        # the nightly first.
+        for case in eval_rosters.api_lane_exclusions():
+            with self.subTest(case=case):
+                self.assertTrue((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").is_file(), f"{case} has no task.yaml")
+                self.assertIn(case, eval_rosters.nightly_cases())
+                self.assertNotIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
+
+    def test_every_exclusion_carries_a_reason_that_names_an_issue(self):
+        for case, reason in eval_rosters.api_lane_exclusions().items():
+            with self.subTest(case=case):
+                self.assertTrue(reason, f"{case}: no reason in the comment block above it")
+                self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
+
+    def test_no_case_is_excluded_on_both_lanes(self):
+        self.assertFalse(set(eval_rosters.api_lane_exclusions()) & set(eval_rosters.inject_lane_exclusions()))
+
+    def test_every_registered_stopped_ask_is_excluded(self):
+        # A stopped ask errors on the api transport, so an unlisted one would
+        # error there every repetition. The directive is read from the module
+        # the harness reads it from, so the two cannot disagree.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.stop_hook import is_stopped_ask
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_stopped_ask(str(doc.get("prompt") or "")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the

@@ -51,6 +51,9 @@ readonly NIGHTLY_HALF_CKSUM_BIT=2
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# Its mirror (#3263): the cases every other lane does not run, because their
+# premise needs the inject door (a second message on the same conversation).
+readonly EVAL_API_LANE_EXCLUSIONS_FILE="eval/api-lane-exclusions.txt"
 # A sixth, applied on the same lane (#2079): the safeguards every case the
 # lane runs carries beside its own -- today the one that fails a repetition
 # on a GitHub write the case did not request. Appended to a copy of each
@@ -1007,6 +1010,16 @@ LEDGER_MINT_ATTEMPTS=3
 # mint is reported and skipped rather than retried into the unit's budget.
 LEDGER_RESET_MINT_ATTEMPTS=2
 LEDGER_RESET_MINT_RETRY_DELAY=2
+# A unit's grading token is renewed this often while devops-bench runs
+# (start_ledger_token_renewal): well inside the hour an installation token
+# lasts, with room for the mint's own retry ladder.
+LEDGER_TOKEN_RENEW_SECONDS=2400
+# The renewer's sleep step. Short, so the sleep a stopped renewer leaves
+# behind ends within seconds rather than holding the unit's output open.
+LEDGER_TOKEN_RENEW_TICK_SECONDS=10
+# After a renewal that failed, the next attempt comes this soon rather than a
+# whole period later, when the token in the file would already be dead.
+LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
 # What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
 # documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
 # mint rather than inherited from the installation's whole grant -- which,
@@ -1098,6 +1111,76 @@ mint_ledger_token() { # <label>
   rm -f "${diagnostics}"
   export BENCH_GITHUB_TOKEN="${minted%% *}"
   echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
+}
+
+# Keeps a unit's grading token alive for as long as its devops-bench runs.
+# The token is minted just before launch and lasts an hour, but a unit can
+# outlast it before its checks read GitHub: oobe-first-run-audits' first
+# repetition waits out a fresh install's own first-run stage inside its stack
+# (1h18m on 2026-10-17), and its github_writes safeguard then errored on a 401,
+# a rung-2 red on a run that wrote nothing. So the token goes to <file>, which
+# the checks read in preference to BENCH_GITHUB_TOKEN at verify time
+# (bench/kube_agents_bench/forges.py, GITHUB_TOKEN_FILE_ENV_VAR), and a
+# background loop re-mints into it every LEDGER_TOKEN_RENEW_SECONDS. A failed
+# renewal leaves the previous token in place and is tried again after
+# LEDGER_TOKEN_RENEW_RETRY_SECONDS. A renewal's mint runs with its stderr
+# discarded: mint_ledger_token's ERROR block says grading cannot proceed, which
+# is not yet true while the file holds a live token, and a retry every
+# LEDGER_TOKEN_RENEW_RETRY_SECONDS would repeat it for the rest of the unit. The
+# loop prints one WARNING per failure streak instead, carrying the mint's last
+# diagnostic, and a line when renewal recovers. Nothing to renew under gitlab or on the
+# mounted PAT, as in mint_ledger_token. stop_ledger_token_renewal ends it, and
+# the loop ends itself once the unit that started it is gone, so a unit killed
+# before its stop leaves no renewer holding the job's output open.
+start_ledger_token_renewal() { # <label> <file>
+  LEDGER_TOKEN_RENEWER=""
+  unset BENCH_GITHUB_TOKEN_FILE
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
+    || [ -z "${BENCH_GITHUB_TOKEN:-}" ]; then
+    return 0
+  fi
+  local label="$1" file="$2" owner="${BASHPID:-$$}"
+  (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}") || return 0
+  export BENCH_GITHUB_TOKEN_FILE="${file}"
+  (
+    waited=0
+    failures=0
+    while :; do
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      kill -0 "${owner}" 2>/dev/null || exit 0
+      waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
+      [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
+      if mint_ledger_token "${label} renewal" 2>/dev/null \
+        && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
+        && mv -f "${file}.next" "${file}"; then
+        if [ "${failures}" -gt 0 ]; then
+          echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+        fi
+        failures=0
+        waited=0
+      else
+        failures=$((failures + 1))
+        if [ "${failures}" -eq 1 ]; then
+          echo "WARNING: ${label}: could not renew the ledger read token" \
+               "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
+               "stays in ${file} until it expires, and renewal is retried every" \
+               "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+        fi
+        waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
+      fi
+    done
+  ) &
+  LEDGER_TOKEN_RENEWER=$!
+}
+
+stop_ledger_token_renewal() { # <file>
+  if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
+    kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
+    wait "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
+  fi
+  LEDGER_TOKEN_RENEWER=""
+  rm -f "$1" "$1.next"
+  unset BENCH_GITHUB_TOKEN_FILE
 }
 
 # Once here as well as once per unit: a key that cannot mint at all is a
@@ -1299,7 +1382,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts four), read with the YAML parser by
+# runs; oobe-first-run-audits starts five), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -2061,8 +2144,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14, demoted back here 2026-10-17, #3120; the
-# presubmit file's last section).
+# its roster line 2026-10-14, was demoted back here 2026-10-17, #3120, and
+# returned to the roster 2026-10-26; the presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2157,7 +2240,7 @@ esac
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
 # those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two more leased projects:
+# "main" again, so it can run as two periodics on two leased projects:
 # its length is set by the stack-bearing units, which run one at a time under
 # lock-infra, and each project has a lock of its own (#3384). The split is
 # applied after the lane step, which is what names the writers. A part
@@ -2238,6 +2321,37 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
     exit 1
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
+fi
+# The mirror (#3263): hack/eval/api-lane-exclusions.txt names the cases only
+# the inject door can carry (a stop sent as the conversation's next message,
+# bench/kube_agents_bench/stop_hook.py). Read and checked on every lane like
+# the list above; applied on every transport but inject. None of them is on
+# the blocking roster (scripts/test_eval_rosters.py), so BOOTSTRAP_ADMITTED
+# needs no drop list for them.
+API_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_API_LANE_EXCLUSIONS_FILE}"
+API_LANE_EXCLUDED="$(roster_entries "${API_LANE_EXCLUSIONS_FILE}")"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${API_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the api lane." >&2
+    exit 1
+  fi
+done <<< "${API_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_EXCLUDED}" ]; then
+  API_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: ${NAME} leaves the matrix -- it runs on the inject lane only; the reason is in ${EVAL_API_LANE_EXCLUSIONS_FILE}"
+    else
+      API_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${API_LANE_KEPT[@]+"${API_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the api lane (${EVAL_API_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
 fi
 
 # ─── The inject lane's safeguards (#2079) ────────────────────────────────────
@@ -2328,6 +2442,26 @@ else
     exit 1
   fi
   echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
+fi
+# The stopped asks in the matrix (a prompt opening with the harness's stop
+# directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
+# carries one) run in the same second phase although they request no pull
+# request: a stop that fails leaves its card to open a pull request mid-run,
+# which the lane's write safeguard would charge to every case whose window
+# it overlaps. Alone in the second phase, a failed stop reds only itself.
+# Read from the prompt, as the harness reads it, not from
+# api-lane-exclusions.txt, which may come to list door-only cases of other
+# kinds.
+STOPPED_ASK_CASES=""
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+    exit 1
+  fi
+fi
+if [ -n "${STOPPED_ASK_CASES}" ]; then
+  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -2425,7 +2559,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -2629,7 +2763,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # launches early and was never the last unit in 385 recorded runs). Only a
 # repetition at its 1929s maximum could be the last unit, by minutes. The
 # first runs of the fourteen-case matrix measure it, and until they have,
-# this is the projection. No Prow deadline change.
+# this is the projection. No Prow deadline change. (That was before #2260
+# moved the cases that request a pull request into a serial second phase;
+# since its return to the roster on 2026-10-26 it runs there, after every
+# other unit: unit_cost_hint has the cost.)
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -2799,8 +2936,10 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (all three of its seats are
-# held out since pdb-remediation-pr's demotion of 2026-10-17, #3120), which empties the export by design, like a nightly part: said
+# The GitLab lane's list may hold no roster case (it held none from
+# pdb-remediation-pr's demotion of 2026-10-17, #3120, until
+# vcs-spent-branch-reuse's roster line of 2026-10-23; pdb-remediation-pr's
+# returned 2026-10-26), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3030,22 +3169,25 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Nightly-only since 2026-10-17 (demoted on #3120); on the roster 2026-10-14
-    # to then (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
+    # On the roster again since 2026-10-26, after #3145; nightly-only
+    # 2026-10-17 to then (demoted on #3120); on the roster 2026-10-14 to
+    # 2026-10-17 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
     # to 2026-09-28. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
     # August); median of the September run, kept although the four graded
     # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
-    # under pull_request_opened says otherwise. While in the presubmit it was
-    # the largest hint, so it launched first in each repetition round; its
-    # three repetitions serialize on the task lock, ~62min at the hint and
-    # ~96min at the measured maximum.
+    # under pull_request_opened says otherwise. It requests a pull request, so
+    # since #2260 it runs in the second phase (unit_phase), one unit at a time
+    # after every other unit, and the hint orders it only among that phase's
+    # units (ahead of vcs-spent-branch-reuse's 1000 in each repetition round,
+    # which changes no total: the phase is serial). The writers nightlies
+    # since #3145 measured 142-265s a repetition.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
     # incumbent autoops hint (same watcher and card waits) until it passes.
-    ai-security-planted-model-audit) echo 1450 ;;
+    ai-security-planted-model-audit | ai-security-manual-names-reconciler) echo 1450 ;;
     # Not measured yet: the same stream and stack shape as the case above, so
     # it takes that case's hint until its nightly record says otherwise.
     fleet-audit-clean-close-reads-clean) echo 1450 ;;
@@ -3059,6 +3201,9 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
+    # Measured 1380-1640s a repetition on gkedemos2 (2026-10-22, ten runs back
+    # to back): a 20-minute settle after the plant, then a board read.
+    triage-start-burst) echo 1500 ;;
     # Presubmit since 2026-09-22 (#1023), nightly-only from 2026-09-15 before
     # that. Median of its three measured presubmit repetitions (737/599/1357s,
     # build 2099969322708373504); the 200s default under-packs it by 3x. The
@@ -3087,6 +3232,12 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Next-lane nightly only (api-lane-exclusions.txt). The opening turn files
+    # a card, then the harness sends `stop` and waits out the prompt's
+    # observe=900 window (stop_hook.py), so a repetition is never under 900s;
+    # priced in that band so a deadline cut does not take it first.
+    # Unmeasured until its first nights.
+    chat-stop-halts-delegated-remediation) echo 1100 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -3138,6 +3289,12 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # The upgrade retrospective's cases: each holds the stream, and a
+    # fleet-wide question with a stale report is a full collector run over the
+    # seeded fleet. 540s and 360s a red repetition on a dev install
+    # (2026-10-15); priced at the audit band's floor. The six after-upgrade
+    # cases ask the same fleet-wide question and take the same price.
+    upgrades-retrospective-on-demand | upgrades-retrospective-drained-budget) echo 600 ;;
     # Nightly-only since #3524. One of the five readiness-line cases of that
     # change, each the same read-only run (three project list reads, the
     # server config per location, the per-member kubectl reads); unmeasured.
@@ -3146,6 +3303,10 @@ unit_cost_hint() {
     # the default is cut from this tier rather than from all five; the four
     # siblings pack at the default until the nightly record prices them.
     upgrades-audit-control-plane-capacity) echo 600 ;;
+    upgrades-retrospective-cgroup-blind-runtime | upgrades-retrospective-cuda-pinned-gpu-job) echo 600 ;;
+    upgrades-retrospective-failclosed-webhook | upgrades-retrospective-multi-process-container) echo 600 ;;
+    upgrades-retrospective-network-policy-enforcement | upgrades-retrospective-stale-client-skew) echo 600 ;;
+    upgrades-retrospective-log-volume-gate | upgrades-rollout-family-held-by-canary-gate) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -3293,7 +3454,7 @@ STATE_DIR="$(mktemp -d)"
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds four).
+#                 (audit_streams; oobe-first-run-audits holds five).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count), as the infra
@@ -3732,7 +3893,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
@@ -3808,9 +3969,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # lease is never copied in for this repetition.
   local timing="${STATE_DIR}/${name}.rep${rep}.${EVAL_TIMING_FILE}"
   rm -f "${timing}"
+  local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
+  start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
+  stop_ledger_token_renewal "${token_file}"
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
   # run someone will need the log for.
@@ -3885,8 +4049,8 @@ scheduled_audits pause "fan-out"
 # the first phase's last unit -- must be older than that before the next
 # window can open. The cost is one drain of the lanes at the phase boundary
 # and the settle plus the serial run of the requesting units (on the
-# presubmit tier, one case's repetitions, which the task lock already ran one
-# at a time, so three settles); the order inside each phase is unchanged.
+# presubmit tier, the requesting cases' repetitions, which launch_units runs
+# one at a time, one settle each); the order inside each phase is unchanged.
 # The ordering assumes a unit's writes land before the unit ends. Under the
 # bridge's api executor the harness's delegation wait holds the unit until
 # the cards the case filed are terminal, so their workers' pull requests
@@ -3895,8 +4059,8 @@ scheduled_audits pause "fan-out"
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"; per-case attribution is #2611).
-unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
-  case ",${INJECT_LANE_REQUESTING:-}," in
+unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -3953,7 +4117,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=$
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
@@ -4064,8 +4228,8 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly and its -writers part, EVAL_MODE_NEXT=1) is a
-# periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
+# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
 # run at the same agent model (setupId) is compared with. Today's window is

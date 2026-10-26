@@ -27,6 +27,7 @@ from eval_dashboard import nightly_bugs
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 JOB = "ci-kube-agents-eval-nightly"
 WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
+MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 REPO = "gke-labs/kube-agents"
 ISSUES = f"repos/{REPO}/issues"
 FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: required phrases absent"
@@ -409,14 +410,14 @@ class DedupeTest(Harness):
         pr = {"number": 3990, "title": "t", "body": "", "pull_request": {"url": "https://api.github.com/pulls/3990"}}
         hidden = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
         filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, FakeGh(open_issues=[pr, hidden])), self.root)
-        self.assertEqual(filer.listing_doubt([pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
-        self.assertIsNone(filer.listing_doubt([pr, hidden], [], None))
+        self.assertEqual(nightly_bugs.listing_doubt(filer.gh, [pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
+        self.assertIsNone(nightly_bugs.listing_doubt(filer.gh, [pr, hidden], [], None))
 
     def test_a_listing_short_of_graphqls_total_beyond_its_first_page_is_untrusted(self):
         listed = [{"number": n, "title": "t", "body": ""} for n in range(1, 101)]
         fake = FakeGh(open_issues=listed + [{"number": 101, "title": "t", "body": ""}])
         filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, fake), self.root)
-        self.assertIsNotNone(filer.listing_doubt(listed, [], None))
+        self.assertIsNotNone(nightly_bugs.listing_doubt(filer.gh, listed, [], None))
 
     def test_a_bug_closed_after_the_newest_red_night_is_not_filed_again(self):
         marker = nightly_bugs.MARKER.format(case="case-red")
@@ -1021,6 +1022,17 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*runs, night(18, [green("case-red")])), FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
         self.assertIn("`case-red` was graded on the 2026-10-18 nightly", comment)
+
+    def test_an_open_issue_naming_the_main_b_job_is_read_on_the_main_b_part(self):
+        # As above, but main-b ran the case: the note cites main-b's build.
+        issue = {"number": 3976, "title": "t", "body": f"<!-- kube-agents-bot:nightly-infra case=case-red --> (`{MAIN_B_JOB}`)", "created_at": "2026-10-04T12:00:00Z"}
+        main = [night(d, []) for d in range(1, 18)]
+        main_b = [night(1, [green("case-red")], job=MAIN_B_JOB, hour="09")] + [night(d, [], job=MAIN_B_JOB, hour="09") for d in range(2, 18)]
+        gh, _, _ = self.run_once(data(*sorted(main + main_b, key=lambda r: r["build_id"])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly", comment)
+        self.assertIn("the main-b part ran to its verdict", comment)
+        self.assertIn(f"/logs/{MAIN_B_JOB}/30000000000000170902)", comment)
 
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the

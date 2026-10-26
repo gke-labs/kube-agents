@@ -12268,6 +12268,450 @@ class BuildAuthenticatorTest(unittest.TestCase):
         self.assertTrue(any("CREDENTIAL_PROXY_SESSION_CALLERS" in line for line in logs.output))
 
 
+class MCPCallerBindingTest(unittest.TestCase):
+    """The mcp role is bound to the MCP pod's ServiceAccount in both directions.
+
+    The session binding's shape (SessionCallerBindingTest), with one
+    difference: no mcp callers named means the mcp audience confers nothing,
+    rather than the audience alone deciding.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    WATCHER = "kubeagents-credential-proxy-watcher"
+    MCP = "kubeagents-credential-proxy-mcp"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    MCP_SA = "system:serviceaccount:kubeagents-system:agent-a2a-mcp"
+
+    def _authenticator(self, mcp_callers=frozenset({MCP_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.WATCHER: credential_proxy.CALLER_ROLE_WATCHER,
+                self.MCP: credential_proxy.CALLER_ROLE_MCP,
+            },
+            allowed_callers=frozenset({self.AGENT, self.MCP_SA}),
+            mcp_callers=mcp_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_an_mcp_caller_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT, self.WATCHER):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only the mcp audience"
+                ):
+                    self._authenticator()._principal_from(self._review(self.MCP_SA, audience))
+
+    def test_an_mcp_caller_presenting_the_mcp_audience_is_the_mcp_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.MCP_SA, self.MCP))
+        self.assertEqual(credential_proxy.CALLER_ROLE_MCP, principal.role)
+
+    def test_another_caller_presenting_the_mcp_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for mcp callers"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.MCP))
+
+    def test_the_shell_caller_keeps_the_shell_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.AGENT, self.SHELL))
+        self.assertEqual(credential_proxy.CALLER_ROLE_SHELL, principal.role)
+
+    def test_with_no_mcp_callers_named_the_mcp_audience_confers_nothing(self):
+        # Not the session binding's upgrade case: no operator renders the mcp
+        # audience without its callers, so unset is "never conferred".
+        for caller in (self.AGENT, self.MCP_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for mcp callers"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.MCP))
+
+    def test_the_mcp_callers_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.MCP_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+            "CREDENTIAL_PROXY_MCP_CALLERS": f" {self.MCP_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.MCP_SA}), authenticator.mcp_callers)
+        # And the binding holds end to end through the built authenticator.
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.MCP_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-mcp"))
+
+    def test_an_mcp_audience_without_mcp_callers_warns(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.mcp_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_MCP_CALLERS" in line for line in logs.output))
+
+
+class MCPAudienceTest(unittest.TestCase):
+    """The A2A MCP server's audience, and the role it alone confers.
+
+    Same shape as the a2a-chat, session and watcher audiences: read raw, only
+    meaningful once the chat split exists, and refused (with a warning naming
+    the env) when it collides with any audience a role already holds.
+    """
+
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+    }
+
+    def _build(self, **env):
+        with mock.patch.dict(os.environ, {**self.BASE, **env}, clear=True):
+            return credential_proxy.build_authenticator()
+
+    def test_the_mcp_audience_confers_its_own_role(self):
+        authenticator = self._build(
+            CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat",
+            CREDENTIAL_PROXY_MCP_AUDIENCE=credential_proxy.DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE,
+        )
+        self.assertEqual(
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE: credential_proxy.CALLER_ROLE_MCP,
+            },
+            authenticator.audience_roles,
+        )
+
+    def test_a_token_validated_for_the_mcp_audience_is_the_mcp_role(self):
+        mcp = "system:serviceaccount:ns:agent-a2a-mcp"
+        with mock.patch.dict(
+            os.environ,
+            {
+                **self.BASE,
+                "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"system:serviceaccount:ns:agent,{mcp}",
+                "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+                "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+                "CREDENTIAL_PROXY_MCP_CALLERS": mcp,
+            },
+            clear=True,
+        ):
+            authenticator = credential_proxy.build_authenticator()
+        status = {
+            "authenticated": True,
+            "audiences": ["aud-mcp"],
+            "user": {"username": mcp, "uid": "u", "groups": []},
+        }
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_MCP, authenticator._principal_from({"status": status}).role
+        )
+        # And one naming the mcp audience beside another of ours is refused:
+        # one caller holding two roles is the separation gone.
+        status["audiences"] = ["aud-mcp", "aud-chat"]
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from({"status": status})
+
+    def test_unset_means_the_role_is_never_conferred(self):
+        authenticator = self._build(CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat")
+        self.assertNotIn(credential_proxy.CALLER_ROLE_MCP, authenticator.audience_roles.values())
+        self.assertNotIn(
+            credential_proxy.DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE, authenticator.audience_roles
+        )
+
+    def test_the_mcp_audience_means_nothing_without_the_chat_split(self):
+        with mock.patch.dict(
+            os.environ, {**self.BASE, "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp"}, clear=True
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}, authenticator.audience_roles
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_MCP_AUDIENCE" in line for line in logs.output))
+
+    def test_an_mcp_audience_equal_to_another_roles_is_refused_with_a_warning(self):
+        others = {
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+            "CREDENTIAL_PROXY_SESSION_CALLERS": "system:serviceaccount:ns:session",
+            "CREDENTIAL_PROXY_WATCHER_AUDIENCE": "aud-watcher",
+        }
+        for clash, role in (
+            (credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE, credential_proxy.CALLER_ROLE_SHELL),
+            ("aud-chat", credential_proxy.CALLER_ROLE_CHAT),
+            ("aud-a2a", credential_proxy.CALLER_ROLE_A2A_CHAT),
+            ("aud-session", credential_proxy.CALLER_ROLE_SESSION),
+            ("aud-watcher", credential_proxy.CALLER_ROLE_WATCHER),
+        ):
+            with self.subTest(clash=clash):
+                with mock.patch.dict(
+                    os.environ,
+                    {**self.BASE, **others, "CREDENTIAL_PROXY_MCP_AUDIENCE": clash},
+                    clear=True,
+                ):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                        authenticator = credential_proxy.build_authenticator()
+                self.assertNotIn(credential_proxy.CALLER_ROLE_MCP, authenticator.audience_roles.values())
+                # The other role keeps its audience: the collision is refused,
+                # not resolved in the newcomer's favour.
+                self.assertEqual(role, authenticator.audience_roles[clash])
+                self.assertTrue(any("CREDENTIAL_PROXY_MCP_AUDIENCE" in line for line in logs.output))
+
+    def test_the_default_mcp_audience_is_no_other_roles_default(self):
+        self.assertNotIn(
+            credential_proxy.DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE,
+                "kubeagents-credential-proxy-a2a-chat",
+                "kubeagents-credential-proxy-watcher",
+            },
+        )
+        self.assertIn(credential_proxy.CALLER_ROLE_MCP, credential_proxy.CALLER_ROLES)
+
+
+class MCPRouteAdmissionTest(unittest.TestCase):
+    """The mcp role reaches /v1/vcs/ and no other route family."""
+
+    def _permits(self, path, role):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:a2a-mcp", uid="u", groups=(), role=role
+        )
+        return handler._role_permits(principal), handler.replies
+
+    def test_the_vcs_family_admits_the_mcp_role(self):
+        permitted, replies = self._permits("/v1/vcs/proposal-view", credential_proxy.CALLER_ROLE_MCP)
+        self.assertTrue(permitted)
+        self.assertEqual([], replies)
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_MCP),
+            credential_proxy.required_roles("/v1/vcs/proposal-view"),
+        )
+
+    def test_every_other_route_family_refuses_the_mcp_role(self):
+        for path in (
+            "/v1/exec",
+            "/v1/github/refresh",
+            "/v1/forge/refresh",
+            "/v1/workspace/open",
+            credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x",
+            credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "server/x",
+            credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x",
+            credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "api/v1/pods",
+            feedback_broker.ROUTE,
+            "/v1/chat/slack/api",
+            "/v1/chat/api",
+            "/v1/chat/a2a/events",
+            "/v1/chat/events",
+        ):
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    permitted, replies = self._permits(path, credential_proxy.CALLER_ROLE_MCP)
+                self.assertFalse(permitted)
+                status, payload = replies[0]
+                self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+
+    def test_every_route_family_the_dispatcher_serves_names_its_roles(self):
+        # A POST path ROUTE_ROLES misses admits every role, the mcp role with
+        # it; each family do_POST dispatches must be in the table.
+        for path in (
+            "/v1/exec", "/v1/github/refresh", "/v1/forge/refresh", "/v1/workspace/open",
+            "/v1/vcs/x", feedback_broker.ROUTE, "/v1/chat/x",
+            credential_proxy.API_RELAY_PREFIX, credential_proxy.mcp_policy.MCP_RELAY_PREFIX,
+            credential_proxy.watcher_policy.WATCHER_GCP_PREFIX,
+            credential_proxy.watcher_policy.WATCHER_K8S_PREFIX,
+        ):
+            with self.subTest(path=path):
+                self.assertNotEqual((), credential_proxy.required_roles(path))
+
+
+class MCPVcsVerbGateTest(unittest.TestCase):
+    """The per-verb half of the mcp role: reads only, refused before anything is spent."""
+
+    PAYLOAD = {"repository": "https://github.com/acme/infra", "number": 7, "diff": True, "comments": True}
+
+    def _handler(self, verb_path, role, body=None):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/" + verb_path
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:a2a-mcp", uid="u", groups=(), role=role
+        )
+        handler.metrics = credential_proxy.ProxyMetrics()
+        handler.max_request_bytes = 1 << 20
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        encoded = json.dumps(self.PAYLOAD if body is None else body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.vcs = mock.Mock()
+        handler.vcs.registry.resolve.return_value = (mock.Mock(), "acme/infra")
+        return handler
+
+    def _refused_without_touching_anything(self, verb_path):
+        handler = self._handler(verb_path, credential_proxy.CALLER_ROLE_MCP)
+        handler.rfile = mock.Mock(read=mock.Mock(side_effect=AssertionError("body read")))
+        handler._request_slot = mock.Mock(side_effect=AssertionError("slot taken"))
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", side_effect=AssertionError("route table read")
+        ), mock.patch.object(
+            credential_proxy, "repository_is_managed", side_effect=AssertionError("managed list read")
+        ), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            handler._handle_vcs_post()
+        self.assertEqual(1, len(handler.replies), handler.replies)
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("CALLER_VERB_FORBIDDEN", payload["code"])
+        self.assertEqual("blocked", payload["status"])
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_VERB, payload["rule"])
+        handler.vcs.registry.resolve.assert_not_called()
+        self.assertTrue(any(credential_proxy.RULE_CALLER_VCS_VERB in line for line in logs.output))
+        return handler
+
+    def test_every_write_verb_and_every_unlisted_verb_is_refused_for_mcp(self):
+        verbs = (
+            set(vcs_broker.WRITE_VERBS)
+            | {"clone", "identity", "branch-view", "branch-delete"}
+            | (set(vcs_broker.VCS_VERBS) - credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_MCP])
+        )
+        self.assertTrue(vcs_broker.WRITE_VERBS <= verbs)
+        for verb in sorted(verbs):
+            with self.subTest(verb=verb):
+                handler = self._refused_without_touching_anything(verb)
+                # Counted as a refusal under the verb's own label.
+                self.assertEqual({(verb, credential_proxy.TOOL_STATUS_BLOCKED): 1}, handler.metrics._vcs)
+
+    def test_spellings_that_normalise_to_a_write_or_no_verb_are_refused_for_mcp(self):
+        for spelling in (
+            "proposal_create", "proposal_comment", "issue_create", "branch_delete", "label_ensure",
+            "proposal_acknowledge", "Proposal-Create", "PROPOSAL-VIEW", "proposal-view/",
+            "proposal-view/../proposal-create", "proposal-create?x=1", "proposal-view?x=1",
+            "proposal-view%2F..", "proposal-view ", "", "proposal--view", "proposal_view_",
+        ):
+            with self.subTest(spelling=spelling):
+                self._refused_without_touching_anything(spelling)
+
+    def test_proposal_view_is_admitted_for_mcp_on_a_managed_repository(self):
+        seen = []
+
+        def view(payload):
+            seen.append(payload)
+            return {"proposal": {"number": payload["number"]}, "diff": "", "comments": []}
+
+        for spelling in ("proposal-view", "proposal_view"):
+            with self.subTest(spelling=spelling):
+                seen.clear()
+                handler = self._handler(spelling, credential_proxy.CALLER_ROLE_MCP)
+                with mock.patch.object(
+                    credential_proxy.vcs_broker, "route_table", return_value={"proposal-view": view}
+                ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+                    handler._handle_vcs_post()
+                self.assertEqual(HTTPStatus.OK, handler.replies[0][0])
+                self.assertEqual([self.PAYLOAD], seen)
+                self.assertEqual(
+                    {("proposal-view", credential_proxy.TOOL_STATUS_SUCCESS): 1}, handler.metrics._vcs
+                )
+
+    def test_proposal_view_for_mcp_still_meets_the_managed_repository_check(self):
+        handler = self._handler("proposal-view", credential_proxy.CALLER_ROLE_MCP)
+        route = mock.Mock()
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"proposal-view": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=False), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            handler._handle_vcs_post()
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
+        route.assert_not_called()
+
+    def test_the_shell_and_the_roleless_principal_still_reach_every_verb(self):
+        for role in (credential_proxy.CALLER_ROLE_SHELL, ""):
+            for verb in sorted(vcs_broker.VCS_VERBS):
+                with self.subTest(role=role, verb=verb):
+                    self.assertTrue(credential_proxy.vcs_verb_permitted(role, verb))
+                    handler = self._handler(verb, role)
+                    route = mock.Mock(return_value={})
+                    with mock.patch.object(
+                        credential_proxy.vcs_broker, "route_table", return_value={verb: route}
+                    ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+                        handler._handle_vcs_post()
+                    self.assertEqual(HTTPStatus.OK, handler.replies[0][0], handler.replies)
+                    route.assert_called_once()
+
+
+class RoleVcsVerbsTableTest(unittest.TestCase):
+    """ROLE_VCS_VERBS: the mcp entry exists, is reads only, and the import check holds."""
+
+    def test_the_mcp_entry_exists_and_is_narrow(self):
+        # Absent means every verb, so the entry's existence is the control:
+        # deleting it would hand the MCP pod publish and proposal-create.
+        self.assertIn(credential_proxy.CALLER_ROLE_MCP, credential_proxy.ROLE_VCS_VERBS)
+        narrowed = credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_MCP]
+        self.assertIn("proposal-view", narrowed)
+        self.assertLess(narrowed, vcs_broker.VCS_VERBS)
+        self.assertFalse(credential_proxy.vcs_verb_permitted(credential_proxy.CALLER_ROLE_MCP, "publish"))
+
+    def test_every_mcp_verb_is_a_served_read(self):
+        narrowed = credential_proxy.ROLE_VCS_VERBS[credential_proxy.CALLER_ROLE_MCP]
+        self.assertLessEqual(narrowed, vcs_broker.VCS_VERBS)
+        self.assertEqual(frozenset(), narrowed & vcs_broker.WRITE_VERBS)
+        # Nor the verbs that are not forge writes but are not reads of a
+        # proposal either: a clone into the broker, the credential's identity.
+        self.assertEqual(frozenset(), narrowed & {"clone", "identity", "branch-delete"})
+
+    def test_the_shipped_table_is_valid(self):
+        credential_proxy._validate_role_vcs_verbs(credential_proxy.ROLE_VCS_VERBS)
+
+    def test_a_write_verb_in_the_mcp_entry_is_refused(self):
+        for verb in sorted(vcs_broker.WRITE_VERBS):
+            with self.subTest(verb=verb):
+                with self.assertRaises(ValueError):
+                    credential_proxy._validate_role_vcs_verbs(
+                        {credential_proxy.CALLER_ROLE_MCP: frozenset({"proposal-view", verb})}
+                    )
+
+    def test_a_bare_string_unknown_verb_or_unknown_role_is_refused(self):
+        with self.assertRaises(TypeError):
+            credential_proxy._validate_role_vcs_verbs({credential_proxy.CALLER_ROLE_MCP: "proposal-view"})
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_role_vcs_verbs(
+                {credential_proxy.CALLER_ROLE_MCP: frozenset({"proposal_view"})}
+            )
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_role_vcs_verbs({"mcp-server": frozenset({"proposal-view"})})
+
+
 class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
     """The listener that would hand the credentials to whoever reaches the port.
 
@@ -14767,6 +15211,225 @@ class FeedbackRouteTest(_ExecRouteServer):
         self.assertEqual(status, 400)
         self.assertIn("error", body)
 
+
+class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
+    """`_execute` widens `GIT_ALLOW_PROTOCOL` to `https:http` for an `http` forge across both `execute_vcs_git` and `execute_workspace_git`."""
+
+    def test_git_allow_protocol_widens_for_allow_http_or_http_credential_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+                executor = CommandExecutor(
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                    state_dir=root / "state",
+                )
+            executor.vcs_root.mkdir(parents=True, exist_ok=True)
+            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+            captured_envs = []
+
+            class FakeProcess:
+                returncode = 0
+
+            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
+                captured_envs.append(dict(env or {}))
+                return FakeProcess()
+
+            fake_captured = credential_proxy._CapturedOutput(
+                stdout=b"", stderr=b"", truncated=False, timed_out=False, abandoned=False
+            )
+            with (
+                mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(credential_proxy, "_capture_output", return_value=fake_captured),
+            ):
+                executor.execute_vcs_git(
+                    ["git", "init"],
+                    executor.vcs_root,
+                    config=(
+                        ("credential.helper", ""),
+                        ("credential.https://gitea.example.test.helper", "/bin/true"),
+                    ),
+                )
+                executor.execute_vcs_git(
+                    ["git", "init"],
+                    executor.vcs_root,
+                    config=(("credential.helper", ""),),
+                    allow_http=True,
+                )
+                executor.execute_workspace_git(
+                    [
+                        "git",
+                        "clone",
+                        "--quiet",
+                        "http://gitea.gitea.svc.cluster.local:3000/acme/infra.git",
+                        str(executor.content_workspace_root / "repo"),
+                    ],
+                    executor.content_workspace_root,
+                    config=(),
+                    allow_http=True,
+                )
+            self.assertEqual("https", captured_envs[0]["GIT_ALLOW_PROTOCOL"])
+            self.assertEqual("https:http", captured_envs[1]["GIT_ALLOW_PROTOCOL"])
+            self.assertEqual("https:http", captured_envs[2]["GIT_ALLOW_PROTOCOL"])
+
+    def test_content_workspace_store_open_on_http_gitea_forge_widens_git_allow_protocol(self):
+        import content_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token_file = root / "gitea-token"
+            token_file.write_text("gitea-pat-token\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+                executor = CommandExecutor(
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                    state_dir=root / "state",
+                )
+            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+            agent_dir = root / "agent"
+            agent_dir.mkdir(parents=True, exist_ok=True)
+
+            gitea_forge = providers.build_forges({
+                "forges": [
+                    {
+                        "provider": "gitea",
+                        "name": "gitea",
+                        "host": "gitea.gitea.svc.cluster.local",
+                        "scheme": "http",
+                        "port": 3000,
+                        "token_path": str(token_file),
+                        "allowed_paths": ["acme"],
+                    }
+                ]
+            })[-1]
+
+            captured_clone_envs = []
+
+            class FakeProcess:
+                returncode = 0
+
+            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
+                if "clone" in argv:
+                    captured_clone_envs.append(dict(env or {}))
+                    Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+                return FakeProcess()
+
+            def fake_capture(_proc, *_args, **_kwargs):
+                return credential_proxy._CapturedOutput(
+                    stdout=b"refs/remotes/origin/main\n" + (b"a" * 40) + b"\n",
+                    stderr=b"",
+                    truncated=False,
+                    timed_out=False,
+                    abandoned=False,
+                )
+
+            for label, cred_fn in (
+                ("managed stored credential", lambda _repo: gitea_forge.credential),
+                ("context or unregistered NoCredential", lambda _repo: providers.NoCredential()),
+            ):
+                with self.subTest(case=label):
+                    captured_clone_envs.clear()
+                    store = content_workspace.ContentWorkspaceStore(
+                        executor.content_workspace_root,
+                        agent_dir,
+                        executor.execute_workspace_git,
+                        credential_for=cred_fn,
+                        locate=lambda _repo: (
+                            "gitea.gitea.svc.cluster.local/acme/infra",
+                            gitea_forge.clone_url("acme/infra"),
+                        ),
+                    )
+                    with (
+                        mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
+                        mock.patch.object(credential_proxy, "_capture_output", side_effect=fake_capture),
+                    ):
+                        ws = store.open("gitea.gitea.svc.cluster.local/acme/infra")
+                    self.assertEqual("gitea.gitea.svc.cluster.local/acme/infra", ws.repo)
+                    self.assertEqual(1, len(captured_clone_envs))
+                    self.assertEqual("https:http", captured_clone_envs[0]["GIT_ALLOW_PROTOCOL"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_every_remote_verb_of_an_http_workspace_asks_for_http(self):
+        """`ls-remote`, `clone`, `fetch` and `push` all hand the runner `allow_http`.
+
+        The workspace's remote is the `http` Gitea URL, rewritten by
+        `url.insteadOf` to a local bare repository so real git answers. The
+        runner records which verbs asked for `allow_http`: the pinned-base probe
+        and the clone from `open`, then `fetch` from `commit` and `push` from
+        `push`, the last two reading `Workspace.allow_http`. The executor's
+        mapping from `allow_http` to `GIT_ALLOW_PROTOCOL=https:http` is pinned by
+        the first test in this class.
+        """
+        import content_workspace
+
+        host = "gitea.gitea.svc.cluster.local"
+        remote_prefix = f"http://{host}:3000/"
+        url = f"{remote_prefix}acme/infra.git"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plain_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(root),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            }
+
+            def plain_git(*argv, cwd):
+                subprocess.run(["git", *argv], cwd=str(cwd), env=plain_env, check=True, capture_output=True)
+
+            bare = root / "remotes" / "acme" / "infra.git"
+            bare.parent.mkdir(parents=True)
+            plain_git("init", "--quiet", "--bare", "--initial-branch=main", str(bare), cwd=root)
+            seed = root / "seed"
+            plain_git("init", "--quiet", "--initial-branch=main", str(seed), cwd=root)
+            (seed / "README.md").write_text("seed\n", encoding="utf-8")
+            plain_git("add", "README.md", cwd=seed)
+            plain_git("commit", "--quiet", "-m", "seed", cwd=seed)
+            plain_git("push", "--quiet", str(bare), "main", "main:release", cwd=seed)
+
+            asked: list[tuple[str, bool]] = []
+
+            def runner(argv, cwd, config=(), allow_http=False):
+                asked.append((argv[1], allow_http))
+                rewritten = [
+                    "git",
+                    "-c",
+                    f"url.{(root / 'remotes').as_uri()}/.insteadOf={remote_prefix}",
+                    *argv[1:],
+                ]
+                done = subprocess.run(rewritten, cwd=str(cwd), env=plain_env, capture_output=True, text=True)
+                return types.SimpleNamespace(exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+            agent_dir = root / "agent"
+            agent_dir.mkdir()
+            store = content_workspace.ContentWorkspaceStore(
+                root / "trees",
+                agent_dir,
+                runner,
+                credential_for=lambda _repo: providers.NoCredential(),
+                locate=lambda _repo: (f"{host}/acme/infra", url),
+                pinned_bases={(host, "acme/infra"): "release"},
+            )
+            ws = store.open(f"{host}/acme/infra")
+            self.assertTrue(ws.allow_http)
+            store.commit(
+                ws.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [content_workspace.Change(content_workspace.repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+            )
+            store.push(ws.handle, "platform-agent/change")
+
+            remote_verbs = {"ls-remote", "clone", "fetch", "push"}
+            seen = {verb for verb, _ in asked if verb in remote_verbs}
+            self.assertEqual(remote_verbs, seen)
+            for verb, allow_http in asked:
+                if verb in remote_verbs:
+                    self.assertTrue(allow_http, f"git {verb} did not ask for allow_http")
 
 
 if __name__ == "__main__":

@@ -124,6 +124,18 @@
         },
         "resources": {
           "type": "object"
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "podMonitoring": {
+              "type": ["boolean", "null"]
+            }
+          }
         }
       }
     },
@@ -1018,6 +1030,15 @@
                   "host": {
                     "type": "string"
                   },
+                  "scheme": {
+                    "type": "string",
+                    "enum": ["https", "http"]
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
                   "namespace": {
                     "type": "string"
                   },
@@ -1171,6 +1192,10 @@
                 },
                 "homeChannelName": {
                   "type": "string"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },

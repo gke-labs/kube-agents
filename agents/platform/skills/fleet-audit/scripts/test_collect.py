@@ -162,7 +162,7 @@ class TestReconcilerOf(unittest.TestCase):
     All three markers are written at apply time and sit in the dump every check
     already runs on, so naming the reconciler costs no extra call. The phrase
     ends up in the remediation note of any `manual` finding on the object --
-    `audit_report.disclose_reconciled_manual_remediations` -- which is why each
+    `audit_report.disclose_manual_remediation_routes` -- which is why each
     one names the release or Application rather than saying "something".
     """
 
@@ -4745,6 +4745,11 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # inapplicable, and the full roster this test asserts against
                 # would then rightly be rejected for naming a check nothing ran.
                 return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.1)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in collect.CONFIGSYNC_SYNC_KINDS:
+                # One healthy RootSync, for the reason the `gcp` read above
+                # answers with one healthy object: served and empty would
+                # declare `configsync-reconciler-stalled` inapplicable.
+                return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.1)
             if argv[:2] == ["kubectl", "get"]:
                 return Run(argv, 0, json.dumps(dump_of()), "", 0.1)
             if argv[:3] == ["gcloud", "container", "clusters"]:
@@ -4847,6 +4852,31 @@ def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDat
         if message is not None:
             condition["message"] = message
         doc["status"]["conditions"] = [condition]
+    return doc
+
+
+def configsync_object(kind, name, ns="config-management-system", stalled="False", syncing_refs=(), syncing_message="Sync Completed",
+                      reconciling="False", stage_errors=None):
+    """A Config Sync RootSync or RepoSync as `kubectl get <kind> -A -o json` returns it.
+
+    `stalled=None` omits every condition, which is what a just-applied object
+    carries. `syncing_refs` are the `errorSourceRefs` of the `Syncing`
+    condition; `stage_errors` is `{"source": [{"code": ..., "errorMessage": ...}]}`
+    and lands under `status.<stage>.errors`.
+    """
+    doc = {"kind": kind, "metadata": {"namespace": ns, "name": name}, "status": {}}
+    if stalled is None:
+        return doc
+    syncing = {"type": "Syncing", "status": "False", "reason": "Sync", "message": syncing_message}
+    if syncing_refs:
+        syncing["errorSourceRefs"] = list(syncing_refs)
+    doc["status"]["conditions"] = [
+        {"type": "Reconciling", "status": reconciling, "reason": "Deployment", "message": "Reconciler deployment was created"},
+        {"type": "Stalled", "status": stalled, "reason": "Deployment" if stalled == "True" else "", "message": "Reconciler deployment failed" if stalled == "True" else ""},
+        syncing,
+    ]
+    for stage, errors in (stage_errors or {}).items():
+        doc["status"][stage] = {"errors": errors, "errorSummary": {"totalCount": len(errors)}}
     return doc
 
 
@@ -7500,6 +7530,111 @@ def lb_service(
     return svc
 
 
+
+class TestConfigSyncReconcilerStalled(unittest.TestCase):
+    """§2.17. The twin of §2.12 for the controller that writes cluster state."""
+
+    SOURCE_ERROR = (
+        "KNV2004: error in the git-sync container: {\"Msg\":\"error running command\","
+        "\"Err\":\"fatal: could not read Username for 'https://github.com': terminal prompts disabled\"}"
+    )
+
+    def run_on(self, *objects):
+        return collect.check_configsync_reconciler_stalled({"configsync_objects": list(objects)})
+
+    def test_healthy_objects_report_nothing(self):
+        self.assertEqual(
+            self.run_on(configsync_object("RootSync", "root-sync"), configsync_object("RepoSync", "team-a", ns="team-a")),
+            [],
+        )
+
+    def test_no_conditions_yet_is_not_a_finding(self):
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", stalled=None)), [])
+
+    def test_reconciling_alone_is_not_a_finding(self):
+        """The state of every first sync; a large repository holds it for a
+        long time, and no threshold this check could pick is defensible."""
+        self.assertEqual(self.run_on(configsync_object("RootSync", "root-sync", reconciling="True")), [])
+
+    def test_stalled_is_one_critical_naming_the_object(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", stalled="True"))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "RootSync/root-sync")
+        self.assertEqual(hits[0]["namespace"], "config-management-system")
+        self.assertIn("Deployment: Reconciler deployment failed", hits[0]["excerpt"])
+        self.assertNotIn("severity", hits[0])  # the CheckSpec's `critical` stands
+
+    def test_syncing_errors_name_the_stage_and_its_first_error(self):
+        hits = self.run_on(
+            configsync_object(
+                "RepoSync", "team-a", ns="team-a",
+                syncing_refs=["status.source.errors"], syncing_message="Source error",
+                stage_errors={"source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}]},
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["object"], "RepoSync/team-a")
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertIn("errors in status.source.errors", hits[0]["excerpt"])
+
+    def test_a_stale_stage_counter_without_a_syncing_ref_is_not_a_finding(self):
+        """The stage summaries keep the previous commit's errors until the next
+        stage overwrites them. The `Syncing` condition is scoped to the current
+        commit, and it is the one that decides."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                stage_errors={"sync": [{"code": "2009", "errorMessage": "failed to apply"}]},
+            )
+        )
+        self.assertEqual(hits, [])
+
+    def test_a_render_in_progress_is_not_a_finding(self):
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors"], syncing_message="Rendering in progress",
+                stage_errors={"rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}]},
+            )
+        )
+        self.assertEqual(hits, [])
+
+    def test_a_mixed_stage_quotes_the_real_error_not_the_transient_one(self):
+        """A render in flight writes KNV2016 beside a real error. The check
+        fires on the real one, and the excerpt must quote it, not the
+        transient line that clears by itself."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors", "status.source.errors"], syncing_message="Source error",
+                stage_errors={
+                    "rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}],
+                    "source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}],
+                },
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertNotIn("still in progress", hits[0]["excerpt"])
+
+    def test_an_empty_error_source_ref_falls_back_to_the_condition_without_a_stage_list(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=[""], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+        self.assertNotIn("errors in", hits[0]["excerpt"])
+
+    def test_a_syncing_ref_with_no_readable_error_still_counts_and_quotes_the_condition(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=["status.sync.errors"], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+
+    def test_hits_are_sorted_and_the_message_is_cut(self):
+        long = configsync_object("RootSync", "root-sync", syncing_refs=["status.source.errors"],
+                                 stage_errors={"source": [{"code": "2004", "errorMessage": "x" * 1000}]})
+        hits = self.run_on(long, configsync_object("RepoSync", "b", ns="b", stalled="True"), configsync_object("RepoSync", "a", ns="a", stalled="True"))
+        self.assertEqual([h["object"] for h in hits], ["RepoSync/a", "RepoSync/b", "RootSync/root-sync"])
+        self.assertLess(len(hits[2]["excerpt"]), collect.MAX_CONFIGSYNC_MESSAGE_CHARS + 120)
+
 class TestLbWorldOpen(unittest.TestCase):
     def run_on(self, *services):
         return collect.check_lb_world_open({"services": list(services)})
@@ -7631,7 +7766,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=()):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None):
         workload_items = [self.benign_pod()] if workload_items is None else workload_items
         describe = describe if describe is not None else {}
         target = cluster or self.CLUSTER
@@ -7671,6 +7806,17 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     if callable(kcc_items):
                         return kcc_items(argv, **kwargs)
                     return Run(argv, 0, json.dumps(dump_of(*kcc_items)), "", 0.05)
+                if kinds in collect.CONFIGSYNC_SYNC_KINDS:
+                    if callable(configsync_items):
+                        return configsync_items(argv, **kwargs)
+                    if configsync_items is None or kinds != collect.CONFIGSYNC_SYNC_KINDS[0]:
+                        # A cluster without Config Sync, which is most of a
+                        # fleet and the default here. A list answers the
+                        # RootSync read alone: a cluster can serve RootSync
+                        # without RepoSync, and the mix is the shape §2.17's
+                        # "one served, one unserved" arm has to accept.
+                        return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds.split(".")[0]}" in group "configsync.gke.io"', 0.05)
+                    return Run(argv, 0, json.dumps(dump_of(*configsync_items)), "", 0.05)
                 if kinds in collect.AUTOPILOT_ALLOWLIST_KINDS:
                     if callable(allowlist_items):
                         return allowlist_items(argv, **kwargs)
@@ -7809,13 +7955,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # Config Connector does. It is declared by the collector rather
             # than by the Autopilot table, so it is not part of what this test
             # is about -- see `test_a_cluster_without_config_connector_...`.
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertFalse(not_applicable_slugs & command_slugs)
         # Every reason is the SOP's own canonical text, not a placeholder.
         for entry in result["checks_not_applicable"]:
-            if entry["check"] == "kcc-object-wedged":
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
                 continue
             self.assertIn("Autopilot", entry["reason"])
 
@@ -7833,7 +7979,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             # wrote it: an unfalsifiable claim is the defect, not Autopilot's
             # phrasing of one.
             self.assertNotIn("cannot exist", entry["reason"])
-            if entry["check"] == "kcc-object-wedged":
+            if entry["check"] in ("kcc-object-wedged", "configsync-reconciler-stalled"):
                 continue
             # Scoped to the workloads the audit can see, and to the admission
             # policy holding -- both halves, on every Autopilot reason.
@@ -7851,7 +7997,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             allowlist_items=[{"kind": "WorkloadAllowlist", "metadata": {"name": "vendor-agent"}}],
         )
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
         )
         # And they report as what they are: checks that ran and found nothing.
         command_slugs = {c["check"] for c in result["commands"]}
@@ -7870,7 +8016,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
 
     def test_a_standard_cluster_never_reads_for_allowlists(self):
@@ -7891,7 +8037,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(result["outcome"], "collected")
-        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"})
+        self.assertEqual({e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"})
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"},
             {c["check"] for c in result["commands"]},
@@ -7909,7 +8055,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True}, allowlist_items=answer)
         self.assertEqual(
             {e["check"] for e in result["checks_not_applicable"]},
-            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged"},
+            {"privileged-container", "host-namespace", "hostpath-mount", "kcc-object-wedged", "configsync-reconciler-stalled"},
         )
 
     def test_standard_cluster_declares_only_the_config_connector_check(self):
@@ -7923,7 +8069,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         and just as good at teaching a reader to ignore the column."""
         result = self.run_with()
         self.assertEqual(
-            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged"}
+            {e["check"] for e in result["checks_not_applicable"]}, {"kcc-object-wedged", "configsync-reconciler-stalled"}
         )
 
     def kcc_reason(self, result):
@@ -8065,7 +8211,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # Nor are the other two, though they found nothing: all three rest on
         # one admission rule, and a privileged pod says it is not holding on
         # this cluster, so a hostPath or host-namespace pod could be there too.
-        self.assertEqual(not_applicable, {"kcc-object-wedged"})
+        self.assertEqual(not_applicable, {"kcc-object-wedged", "configsync-reconciler-stalled"})
         self.assertLessEqual({"host-namespace", "hostpath-mount"}, {c["check"] for c in result["commands"]})
 
     def test_autopilot_collects_rather_than_gate_failing_on_a_read_the_api_refuses(self):
@@ -8113,15 +8259,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Sixteen checks minus the three Autopilot rules out and the one no
-        cluster without Config Connector can run is twelve, each with a command
-        behind it, and the four dispositioned rather than silently absent --
+        Seventeen checks minus the three Autopilot rules out and the two no
+        cluster without Config Connector or Config Sync can run is twelve, each
+        with a command behind it, and the five dispositioned rather than silently absent --
         absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
         self.assertEqual(len(command_slugs), 12)
-        self.assertEqual(len(na_slugs), 4)
+        self.assertEqual(len(na_slugs), 5)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
 
@@ -9350,6 +9496,53 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
                 return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
 
+    def test_the_reconciled_model_plant_files_one_manual_candidate_with_its_reconciler(self):
+        """The object `bench/tf/prebuilt/ai-reconciled-model` plants, as the
+        dump reads it: a zero-replica model server on a floating tag with the
+        two Helm release annotations. It must give exactly one candidate,
+        `model-image-floating-tag`, carrying the reconciler that
+        `audit_report.disclose_manual_remediation_routes` names. Change the
+        stack and change this test."""
+        planted = {
+            "kind": "Deployment",
+            "metadata": {
+                "name": "eval-reconciled-model",
+                "namespace": "eval-ai-reconciled",
+                "labels": {"app": "eval-reconciled-model"},
+                "annotations": {
+                    "meta.helm.sh/release-name": "eval-model-release",
+                    "meta.helm.sh/release-namespace": "eval-ai-reconciled",
+                },
+            },
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {"app": "eval-reconciled-model"}},
+                "template": {
+                    "metadata": {"labels": {"app": "eval-reconciled-model"}},
+                    "spec": {
+                        "automountServiceAccountToken": False,
+                        "containers": [
+                            {
+                                "name": "server",
+                                "image": "registry.invalid/vllm/vllm-openai:latest",
+                                "resources": {
+                                    "requests": {"cpu": "10m", "memory": "16Mi"},
+                                    "limits": {"memory": "32Mi"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        }
+        result = self.run_with(workload_items=[planted])
+        self.assertEqual(result["outcome"], "collected")
+        self.assertEqual([c["check"] for c in result["candidates"]], ["model-image-floating-tag"])
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["object"], "Deployment/eval-reconciled-model")
+        self.assertEqual(candidate["reconciler"], "the Helm release `eval-model-release` in eval-ai-reconciled")
+        self.assertNotIn("declaration", candidate)
+
     def test_a_cluster_with_no_ai_workloads_still_runs_every_check(self):
         """The one stream where an empty scope is *not* declared inapplicable.
 
@@ -9383,7 +9576,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertEqual(endpoint[0]["reconciler"], ARGO_PHRASE)
 
     def test_an_unreconciled_endpoint_omits_the_key_rather_than_carrying_none(self):
-        """`disclose_reconciled_manual_remediations` reads the field with a
+        """`disclose_manual_remediation_routes` reads the field with a
         truth test, but the candidate is also what `derive_finding_id` and the
         ledger diff hash over: a `reconciler: null` key on every unmanaged
         object is churn in the stored manifest for no reader's benefit."""
@@ -12287,6 +12480,74 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         result = self.compliance()
         self.assertIn("kcc-object-wedged", {e["check"] for e in result["checks_not_applicable"]})
         self.assertNotIn("checks_unevaluated", result)
+
+    # §2.17's two reads, folded into one disposition.
+    def configsync_reason(self, result):
+        for entry in (result.get("checks_not_applicable") or []) + (result.get("checks_unevaluated") or []):
+            if entry["check"] == "configsync-reconciler-stalled":
+                return entry["reason"]
+        return None
+
+    def test_a_cluster_without_config_sync_is_inapplicable_and_records_no_command(self):
+        """The no-op: both kinds unserved on most of a fleet, with no
+        exception, no command and no `checks_unevaluated`."""
+        result = self.compliance()
+        self.assertIn("not installed", self.configsync_reason(result))
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_rootsync_served_without_reposync_counts_as_run_over_the_served_kind(self):
+        result = self.compliance(configsync_items=[configsync_object("RootSync", "root-sync", stalled="True")])
+        self.assertIsNone(self.configsync_reason(result))
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertIn("rootsyncs.configsync.gke.io", command["command"])
+        self.assertNotIn("reposyncs", command["command"])
+        self.assertEqual(command["rc"], 0)
+        candidate = next(c for c in result["candidates"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertEqual(candidate["object"], "RootSync/root-sync")
+        self.assertEqual(candidate["severity"], "critical")
+        self.assertEqual(candidate["namespace"], "config-management-system")
+
+    def test_both_kinds_served_record_one_pasteable_command(self):
+        def both(argv, **kw):
+            return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync"))), "", 0.05)
+        result = self.compliance(configsync_items=both)
+        command = next(c for c in result["commands"] if c["check"] == "configsync-reconciler-stalled")
+        self.assertIn("rootsyncs.configsync.gke.io -A -o json; KUBECONFIG=", command["command"])
+        self.assertIn("reposyncs.configsync.gke.io", command["command"])
+
+    def test_served_but_empty_is_inapplicable_not_clean(self):
+        result = self.compliance(configsync_items=[])
+        self.assertIn("declares no RootSync or RepoSync", self.configsync_reason(result))
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+
+    def test_a_forbidden_config_sync_read_is_undetermined_not_absence(self):
+        result = self.compliance(
+            configsync_items=lambda argv, **kw: Run(argv, 1, "", "Error from server (Forbidden): rootsyncs.configsync.gke.io is forbidden", 0.1)
+        )
+        reason = self.configsync_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("Forbidden", reason)
+        self.assertNotIn("not installed", reason)
+        self.assertIn("configsync-reconciler-stalled", {e["check"] for e in result["checks_unevaluated"]})
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["commands"]})
+
+    def test_a_timed_out_config_sync_read_is_undetermined_even_when_the_other_kind_answered(self):
+        def one_slow(argv, **kw):
+            if argv[2] == collect.CONFIGSYNC_SYNC_KINDS[0]:
+                return Run(argv, 0, json.dumps(dump_of(configsync_object("RootSync", "root-sync", stalled="True"))), "", 0.05)
+            return Run(argv, collect.TIMEOUT_RC, "", "", 60.0)
+        result = self.compliance(configsync_items=one_slow)
+        reason = self.configsync_reason(result)
+        self.assertIn("Undetermined", reason)
+        self.assertIn("did not finish", reason)
+        # Its candidate rests on a read that did not finish; it is dropped with the check.
+        self.assertNotIn("configsync-reconciler-stalled", {c["check"] for c in result["candidates"]})
+        self.assertNotIn("configsync-reconciler-stalled", {e["check"] for e in result.get("checks_not_applicable") or []})
+
+    def test_an_unparseable_config_sync_read_is_undetermined(self):
+        result = self.compliance(configsync_items=lambda argv, **kw: Run(argv, 0, "{not json", "", 0.1))
+        self.assertIn("could not read", self.configsync_reason(result))
 
     # Any ccnp failure read as "no cluster-wide policies".
     def test_a_forbidden_ccnp_read_leaves_netpol_missing_unevaluated(self):

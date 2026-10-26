@@ -7,7 +7,8 @@ description: "Eval-driven development workflow: running the red-to-green devops-
 # Eval-driven development
 
 [`AGENTS.md`](../../AGENTS.md) owns the rule: a change to what an agent does starts from a
-failing eval case and ends with that case passing and registered. This file holds the mechanics.
+failing eval case and ends with that case passing and registered, unless an exemption below
+applies. This file holds the mechanics.
 Change the rule in `AGENTS.md`; change how it is done here.
 
 ## When it applies
@@ -18,6 +19,26 @@ configuration change that alters agent behaviour counts; "infrastructure" here m
 projects, the seeded fleet, Prow and the workflows. Exempt: docs, CI, that infrastructure, and the
 bench harness itself (`bench/kube_agents_bench/`, `hack/ci-eval-pr.sh`). An exempt change says so
 in one line under **Live validation** in the pull request body.
+
+Two kinds of agent-behaviour change are also exempt, because no case can test them:
+
+- a **deterministic guard**: code that holds, drops or rewrites an output by a fixed rule, with
+  no model call in its path and no text that reaches the model (no re-prompt, no retry
+  instruction, no tool or skill text). Its unit tests cover every input class it acts on, plus
+  pass-through. The fixed text a guard emits is part of the guard;
+- a fix for a failure that **didn't turn red on demand**: a case written for it ran at least
+  three times against `main` without failing (a replay of the captured failing request can stand
+  in for those runs), and the nightly and prow records were checked first. Three runs miss a rare
+  failure, so a failure those records show on `main` is red on demand through them and takes the
+  loop against that lane instead. Either way the case is registered in
+  `hack/eval/nightly-cases.txt`, so the nightly keeps measuring it after the fix.
+
+Neither exemption covers wording the model reads (a prompt, an SOP, a skill, or reply or
+refusal guidance in any of them); that still needs a case. A change exempt under these two
+records, under **Live validation**: its unit tests; a live or replay check against an install
+(for a replay, what was replayed and against which build); and, for the second, the case,
+where it is registered, the runs (or the replay), and the nightly or prow record checked. That's
+more than the one line the exemptions above take.
 
 The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)),
 refreshed to the commit under test: build the images with `deploy/docker/cloudbuild-ci.yaml`
@@ -36,10 +57,10 @@ against GitHub also need the runner's read token
 ([`bench/CUSTOM-TASKS.md`](../../bench/CUSTOM-TASKS.md#grading-a-fleet-audit)). Without any of
 them the run cannot clone, mint or read, which is broken, not red. A stock install sandboxes the
 agent, which the harness's `kubectl port-forward` cannot reach;
-[`bench/README.md`](../../bench/README.md#sandboxed-installs) has the ways round that. There is no
-path around the loop: a pull request that changes agent
-behaviour without eval evidence is not ready for review; being one change in a stack is not an
-exception, and "What does not count" says why.
+[`bench/README.md`](../../bench/README.md#sandboxed-installs) has the ways round that. Outside the
+two agent-behaviour exemptions above there is no path around the loop: a pull request that changes
+agent behaviour without eval evidence or an exemption record is not ready for review; being one
+change in a stack is not an exception, and "What does not count" says why.
 
 ## The loop
 
@@ -70,7 +91,8 @@ so that is the lane a case on its matrix goes red or green on. Against a next in
 two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
 from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
 `hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
-the nightlies); run it without them. The lane also appends the GitHub-write safeguard in
+the nightlies); run it without them. A case on `hack/eval/api-lane-exclusions.txt` is the
+reverse: it runs only with them, and without them its run errors rather than going red. The lane also appends the GitHub-write safeguard in
 `hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
 it in CI.
 
@@ -142,15 +164,18 @@ you are about to close.
 ## What the pull request records
 
 Under **Testing → Live validation** in the template, which for a change to agent behaviour
-is this loop and nothing less:
+is this loop and nothing less, unless one of the two agent-behaviour exemptions applies:
 
 - the case id, and whether it is new or existing;
 - red: the install and the `main` commit it ran against, the failing check and its reason, one
   line of the agent's report;
 - green: the three runs (directories or a one-line summary each) against the branch's build;
-- where the case is registered, or the one-line exemption.
+- where the case is registered, or the exemption (one line, or the fuller record the two
+  agent-behaviour exemptions take).
 
 ## What does not count
+
+Outside the two agent-behaviour exemptions in "When it applies":
 
 - A unit test with a mocked model. That is a test; it goes where
   [`AGENTS.md`](../../AGENTS.md) "Where Tests Go" says, and it does not replace the case.

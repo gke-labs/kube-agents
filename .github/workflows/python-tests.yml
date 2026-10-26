@@ -65,7 +65,12 @@ jobs:
   # coverage.py writing its own data, which are the two things that should.
   test:
     name: Run Python Unit Tests
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: on 2026-10-26 ubuntu-latest moved to 26.04,
+    # where hack/ci-env.sh's `tail -c` byte caps let more than the cap
+    # through and bash names a piped script's frame "bash" rather than
+    # install.sh, so the four tests that hold those behaviours fail. Move off the pin once they pass
+    # there (#3952).
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     # No pull-requests: write here, deliberately. This job runs the pull
@@ -249,7 +254,7 @@ jobs:
   # runs every directory in PYTHON_TEST_DIRS on it.
   test-agent-python:
     name: Run Python Unit Tests on the agent image's Python
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, as the test job above says
     timeout-minutes: 35
     permissions:
       contents: read
@@ -304,7 +309,7 @@ jobs:
   # git SHA pinned in bench/pyproject.toml.
   bench-tests:
     name: Run Bench Harness Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, as the test job above says
     timeout-minutes: 15
 
     steps:
