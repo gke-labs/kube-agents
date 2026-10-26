@@ -18,8 +18,8 @@ The set has two values by design: controller output rendered under `mode: next`,
 install runs, carries `part-of: a2a-next` instead of `kube-agents`, plus a
 `kubeagents.x-k8s.io/a2a-component` label, so the A2A stack is one query of its own
 (`-l app.kubernetes.io/part-of=a2a-next`) and `-l app.kubernetes.io/part-of=kube-agents` keeps
-meaning the components every mode shares. On a default install the second selector alone misses
-the bus, the callout, the verifier, the console and the gateway.
+meaning the components every mode shares. On an install `install.sh` created, the second
+selector alone misses the bus, the callout, the verifier, the console and the gateway.
 
 ## The label contract
 
@@ -117,9 +117,9 @@ install:
 
 PersistentVolumeClaims are created once; afterwards the controller only grows the two data
 claims' size and never rewrites their labels, so claims that existed before the upgrade stay
-unlabelled until they are recreated. They will not appear in the
-`-l app.kubernetes.io/part-of=kube-agents` query above. The constraint above means Hindsight's
-claim stays unlabelled permanently, not just until recreation.
+unlabelled until they are recreated. They will not appear in the `kube-agents` half of the
+footprint query above. The constraint above means Hindsight's claim stays unlabelled permanently,
+not just until recreation.
 
 Claims backed by a `volumeClaimTemplates` entry carry only what the template sets, wherever they
 come from, not only under Kustomize: the shell sandbox's data claim template sets a name and
@@ -151,10 +151,12 @@ kubectl get all -A \
 ```
 
 Cluster-scoped RBAC the project owns — the objects most easily orphaned, since a namespaced
-PlatformAgent cannot own a cluster-scoped resource through an owner reference:
+PlatformAgent cannot own a cluster-scoped resource through an owner reference. Both `part-of`
+values again: under `mode: next` the auth callout's ClusterRoleBinding to `system:auth-delegator`
+carries `a2a-next`.
 
 ```bash
-kubectl get clusterrole,clusterrolebinding -l app.kubernetes.io/part-of=kube-agents
+kubectl get clusterrole,clusterrolebinding -l 'app.kubernetes.io/part-of in (kube-agents,a2a-next)'
 ```
 
 ## Where to go next
