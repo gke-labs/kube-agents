@@ -151,13 +151,18 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-terminology` — `hack/check-docs-terminology.sh`; identifiers in
   prose must match their source (service-account names, versions, the
   fleet-audit finding-id pattern and rendering caps, …). Then
-  `scripts/check_docs_contracts.py`: on the site, `INSTALL.md` and `README.md`,
-  a flag cited on `install.sh`, `upgrade.sh` or `uninstall.sh` must be one its
-  `case` arms accept, every `json` field of the three CRDs must appear on its
-  CRD page, and a number directly before `fleet audits`, `A2A … images`,
-  `release images` or `<persona> skills` must equal the source's. Known
-  mismatches are listed in `scripts/docs_contracts_allowlist.txt`, which only
-  shrinks: an entry with no finding fails the check until it is dropped.
+  `scripts/check_docs_contracts.py`, on the site, `INSTALL.md` and `README.md`:
+  a flag passed to `install.sh`, `upgrade.sh` or `uninstall.sh` in a command
+  must be one that script's `case` arms accept, and a flag standing alone in a
+  code span, in a paragraph naming one of the three, must be one some installer
+  script accepts; every `json` field declared on the API package's own structs
+  and reachable from a CRD's `Spec` or `Status` must appear on that CRD's page
+  (fields inside `corev1`/`metav1` types are not required); and a number
+  directly before `fleet audits` (also `governance watchdogs`, `audit crons`),
+  `A2A … images`, `release images` or `<persona> skills` must equal the
+  source's. Known mismatches are listed in
+  `scripts/docs_contracts_allowlist.txt`, which only shrinks: an entry with no
+  finding fails the check until it is dropped.
 - `docs-check-audience` — `scripts/check_docs_audience.py`; no page under
   `docs/site/src/content/docs/` may match a shape in
   `scripts/docs_audience_denylist.txt` (workflow secret and variable names, App
@@ -257,6 +262,8 @@ identifier appears, add its source here.
 | Image inventory: every image an install pulls, and its upstream pin | `images.json` |
 | Registry prefix defaults (`REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`) | `install.defaults.env` |
 | GKE host-discovery label | `scripts/installer/common.sh` |
+| Installer long options (`--flag`) a document may cite on `install.sh`, `upgrade.sh` or `uninstall.sh` | the `case` arms of each script; `scripts/check_docs_contracts.py` reads them |
+| CRD field names of `PlatformAgent`, `AgentProfile` and `AgentPlugin` | the `json` tags reachable from each kind's `Spec` and `Status` in `k8s-operator/api/v1alpha1/*_types.go` and `common_types.go`; each kind's site page must name every field |
 | GitOps clone layout (`/opt/data/gitops/...`) and leases | `agents/platform/scripts/gitops_workspace.py` |
 | Repository-identity rules: accepted GitHub hostnames, path depth, segment grammar, length bound, and the `GIT_REPO_UNPARSEABLE` reason | `agents/platform/scripts/repo_ref.py` |
 | The gitops-state ConfigMap's keys (`managed_repos`, `context_repos`) and which one each consumer reads | `agents/platform/scripts/gitops_workspace.py` (readers), `repository_role` in `agents/platform/scripts/credential_proxy.py` (reads `context_repos` for the clone credential), and `reconcileGitopsStateConfigMap` / `syncGithubTokenMinterConfigMap` in `k8s-operator/internal/controller/platformagent_controller.go` (the `managed_repos` seed; both keys for the minter policy) |

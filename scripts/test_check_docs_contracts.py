@@ -244,7 +244,10 @@ class RepoFixture(unittest.TestCase):
         return [(f.check, f.token, f.line) for f in contracts.scan(self.repo)]
 
     def flag_findings(self, body):
-        return [(token, line) for check, token, line in self.findings(body) if check == contracts.CHECK_FLAG]
+        return self.flag_findings_in(body, PAGE_NAME)
+
+    def flag_findings_in(self, body, name):
+        return [(token, line) for check, token, line in self.findings(body, name) if check == contracts.CHECK_FLAG]
 
     def count_findings(self, body):
         return [token for check, token, _ in self.findings(body) if check == contracts.CHECK_COUNT]
@@ -291,6 +294,45 @@ class FlagTest(RepoFixture):
                 "```bash\ncurl -fsSL https://example/upgrade.sh | KUBE_AGENTS_INSTALL_ENV=x bash -s -- --plan\n```\n"
             ),
             [],
+        )
+
+    def test_script_as_another_commands_argument_cites_nothing(self):
+        body = (
+            "```bash\n"
+            "curl -o install.sh https://example/install.sh --retry 3\n"
+            "diff install.sh --brief other.sh\n"
+            "```\n"
+        )
+        self.assertEqual(self.flag_findings(body), [])
+
+    def test_runner_and_prefix_forms_are_the_scripts_command(self):
+        body = (
+            "```bash\n"
+            "$ sudo -E ./install.sh --bogus-one\n"
+            "KUBE_AGENTS_INSTALL_ENV=x bash install.sh --bogus-two\n"
+            "bash <(curl -fsSL https://example/install.sh) --bogus-three\n"
+            "curl -fsSL https://example/install.sh | sudo -E bash -s -- --bogus-four\n"
+            "```\n"
+        )
+        self.assertEqual(
+            self.flag_findings(body),
+            [("--bogus-one", 2), ("--bogus-two", 3), ("--bogus-three", 4), ("--bogus-four", 5)],
+        )
+
+    def test_pipe_inside_a_process_substitution_does_not_split_the_command(self):
+        body = "```bash\nTOKEN_FILE=<(pass show x | head -n1) ./install.sh -y --bogus\n```\n"
+        self.assertEqual(self.flag_findings(body), [("--bogus", 2)])
+
+    def test_removal_script_is_not_a_mention_of_the_install_script(self):
+        """`--source-ref` is the removal script's own flag; neither rule attributes it to install.sh."""
+        body = "```bash\n./uninstall.sh --source-ref=v1.2.3 --dry-run\n```\n\nRun `uninstall.sh` with `--source-ref`.\n"
+        self.assertEqual(self.flag_findings(body), [])
+        self.assertEqual(self.flag_findings("```bash\n./uninstall.sh --bogus\n```\n"), [("--bogus", 2)])
+
+    def test_mdx_pages_are_scanned(self):
+        self.assertEqual(
+            self.flag_findings_in("```bash\n./install.sh --gvisor=false\n```\n", "page.mdx"),
+            [("--gvisor", 2)],
         )
 
     def test_continuation_lines_are_one_command(self):
@@ -395,6 +437,10 @@ class CountTest(RepoFixture):
 
     def test_partitive_is_not_a_count(self):
         self.assertEqual(self.count_findings("four of the fleet audits write a ledger.\n"), [])
+
+    def test_singular_noun_is_not_a_count(self):
+        body = "Run one fleet audit at a time; the one A2A console image; 1 release image; one platform skill.\n"
+        self.assertEqual(self.count_findings(body), [])
 
     def test_hyphenated_number_is_not_its_last_word(self):
         self.assertEqual(self.count_findings("twenty-one fleet audits\n"), [])

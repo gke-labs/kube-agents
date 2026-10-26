@@ -11,20 +11,24 @@ time and compared with what the documents say:
 * **Flags** -- the long options a script accepts are the ``--name`` alternatives
   of its ``case`` arms. A document cites a flag on a script when the flag follows
   the script's name in one shell command (a fenced block line, continuations
-  joined, or an inline code span), including the ``curl … | bash -s -- --flag``
-  form; or when the flag stands alone in a code span inside a paragraph that
-  names exactly one of the three scripts. A command's flag must be one the
+  joined, or an inline code span) whose command word is the script, run
+  directly, through ``bash``, or as ``bash <(curl …)``; through the
+  ``curl … | bash -s -- --flag`` form; or when the flag stands alone in a code
+  span inside a paragraph that names exactly one of the three scripts. A script
+  named as another command's argument (``curl -o install.sh …``) cites nothing. A command's flag must be one the
   named script accepts; a standalone span's flag must be one some installer
   script accepts, since a paragraph about one script often quotes another's.
 * **CRD fields** -- every ``json`` field name reachable from a kind's ``Spec``
   and ``Status`` structs, inline embeds followed, must appear as a word on the
-  kind's CRD page.
+  kind's CRD page. Only structs of the API package are walked: the fields
+  inside a ``corev1`` or ``metav1`` type are Kubernetes' own and not required.
 * **Counts** -- a number, as digits or a word, directly before ``fleet audits``,
   ``governance watchdogs``, ``audit crons``, ``A2A … images``, ``release
   images`` or ``<persona> skills`` must equal the count the source gives:
   enabled ``jobs.json`` entries carrying the ``fleet-audit`` skill, ``SKILL.md``
   directories under each persona, ``a2a-*`` entries in ``images.json``, and the
-  ``REQUIRED_RELEASE_IMAGES`` array. "four of the fleet audits" is not a count.
+  ``REQUIRED_RELEASE_IMAGES`` array. The noun is plural: "four of the fleet
+  audits" and "one fleet audit" are not counts.
 
 The documents scanned are the published site, ``INSTALL.md`` and ``README.md``.
 
@@ -91,7 +95,23 @@ SCRIPT_NAME_SUFFIX = ".sh"
 COMMAND_SEPARATOR_RE = re.compile(r"\|\||&&|;|\|")
 # The segment after `curl … script.sh |` that runs what curl fetched: optional
 # environment assignments, optional sudo, then bash or sh.
-PIPED_RUNNER_RE = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:sudo\s+)?(?:bash|sh)\b")
+# An environment assignment before a command; its value may be a `<(…)`
+# process substitution, which carries spaces and pipes of its own.
+ASSIGNMENT_RE_FRAGMENT = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:<\([^)]*\)|\S)*\s+)*"
+PIPED_RUNNER_RE = re.compile(r"^\s*" + ASSIGNMENT_RE_FRAGMENT + r"(?:sudo(?:\s+-\S+)*\s+)?(?:bash|sh)\b")
+# What may stand before a script's name when the script is the segment's
+# command: a prompt, environment assignments, sudo or time with options, a
+# bash/sh runner with options, a `<(curl …` process substitution feeding it,
+# and the path the name hangs off. Anything else (`curl -o`, `diff`) makes the
+# script an argument, and the options that follow are that command's.
+SCRIPT_COMMAND_PREFIX_RE = re.compile(
+    r"^\s*(?:\$\s+)?" + ASSIGNMENT_RE_FRAGMENT + r"(?:(?:sudo|time)(?:\s+-\S+)*\s+)?"
+    r"(?:(?:bash|sh)(?:\s+-\S+)*\s+(?:<\(\s*\S+(?:\s+\S+)*?\s+)?)?\S*$"
+)
+# Separators are read outside parentheses only, so `X=<(a | b) ./install.sh`
+# stays one command.
+GROUP_OPEN = "("
+GROUP_CLOSE = ")"
 # A shell comment: `#` at the start of a line or after whitespace, so a URL
 # fragment is kept.
 SHELL_COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
@@ -172,12 +192,14 @@ NUMBER_WINDOW = 24
 # The subject phrases, keyed by the count they state. `A2A` may carry up to
 # two words before `images` (`A2A next-stack images`); the persona list is
 # filled in at run time from the directories under agents/.
+# The nouns are plural: a count is a total, and "one fleet audit" names an
+# item, not a total of one.
 COUNT_PHRASES = {
-    COUNT_FLEET_AUDITS: r"(?:fleet audits?|governance watchdogs?|audit crons?)",
-    COUNT_A2A_IMAGES: r"A2A(?:\s+[\w`-]+){0,2}\s+images?",
-    COUNT_RELEASE_IMAGES: r"(?:required\s+)?release images?",
+    COUNT_FLEET_AUDITS: r"(?:fleet audits|governance watchdogs|audit crons)",
+    COUNT_A2A_IMAGES: r"A2A(?:\s+[\w`-]+){0,2}\s+images",
+    COUNT_RELEASE_IMAGES: r"(?:required\s+)?release images",
 }
-PERSONA_SKILLS_RE_TEMPLATE = r"(?P<persona>{personas})(?:[ -]agent)?(?:'s)?[ -]skills?"
+PERSONA_SKILLS_RE_TEMPLATE = r"(?P<persona>{personas})(?:[ -]agent)?(?:'s)?[ -]skills"
 # Characters stripped from a matched phrase before it is reported or compared
 # with the allowlist.
 TOKEN_MARKUP_RE = re.compile(r"[*_`]")
@@ -353,15 +375,45 @@ def installer_flags(repo: Path) -> dict[str, set[str]]:
     return accepted
 
 
+def split_commands(command: str) -> list[str]:
+    """The simple commands of a command line, split at `|`, `||`, `&&` and `;` outside parentheses."""
+    segments: list[str] = []
+    depth = 0
+    start = 0
+    position = 0
+    while position < len(command):
+        char = command[position]
+        if char == GROUP_OPEN:
+            depth += 1
+        elif char == GROUP_CLOSE and depth:
+            depth -= 1
+        separator = COMMAND_SEPARATOR_RE.match(command, position) if not depth else None
+        if separator:
+            segments.append(command[start:position])
+            position = separator.end()
+            start = position
+            continue
+        position += 1
+    segments.append(command[start:])
+    return segments
+
+
 def command_flag_citations(command: str) -> list[tuple[str, str]]:
-    """(script file name, flag) for every long option a command passes to an installer script."""
-    segments = COMMAND_SEPARATOR_RE.split(command)
+    """(script file name, flag) for every long option a command passes to an installer script.
+
+    The options after the script's name count when the script is the segment's
+    command (``SCRIPT_COMMAND_PREFIX_RE``); the next segment's options count when
+    it is a ``bash``/``sh`` runner fed by this one (``curl … | bash -s -- …``).
+    """
+    segments = split_commands(command)
     citations: list[tuple[str, str]] = []
     for index, segment in enumerate(segments):
         for script in SCRIPT_NAME_RE.finditer(segment):
             name = script.group(1) + SCRIPT_NAME_SUFFIX
-            tail = segment[script.end() :]
-            flags = [LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(tail)]
+            flags: list[str] = []
+            if SCRIPT_COMMAND_PREFIX_RE.match(segment[: script.start()]):
+                tail = segment[script.end() :]
+                flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(tail))
             if index + 1 < len(segments) and PIPED_RUNNER_RE.match(segments[index + 1]):
                 flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(segments[index + 1]))
             citations.extend((name, flag) for flag in flags)
