@@ -24,8 +24,8 @@
 # WHY THIS SCENARIO. The detector forwards every successful human write to
 # declarative state and never consults git, so an object git does not declare
 # reaches the same card as one it does. docs/designs/drift-detection.md says
-# what is different about it: "There is no desired state to revert to, so the
-# only sound proposals are codify or delete -- never revert." The sibling stacks
+# what is different about it ("Resources not in Git at all"): there is no
+# desired state to revert to, so the triage never proposes one. The sibling stacks
 # (../gitops-drift, ../gitops-drift-deleted-policy, ../gitops-drift-load-bearing)
 # all apply their objects under a GitOps field manager, so none of them asks
 # the agent to notice that git declares nothing.

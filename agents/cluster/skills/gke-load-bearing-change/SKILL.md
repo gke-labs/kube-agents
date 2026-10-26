@@ -40,7 +40,7 @@ kubectl get <kind> <name> [-n <namespace>] -o jsonpath='{range .metadata.managed
 ```
 
 - **Any of them present:** a tool syncs it from git. Go on to the method.
-- **Only an ambiguous one:** `kubectl-client-side-apply` as a manager, or the labels `app.kubernetes.io/instance` and `app.kubernetes.io/managed-by: Helm`. A person's `kubectl apply -f` and `helm install` leave these too, as does Argo CD on older installs or under label tracking. Say the object was applied from a manifest or a chart whose source the cluster does not show, and keep both the revert and the options below, saying which depends on where that manifest lives.
+- **Only an ambiguous one:** `kubectl-client-side-apply` as a manager, or the labels `app.kubernetes.io/instance` and `app.kubernetes.io/managed-by: Helm`. A person's `kubectl apply -f` and `helm install` leave these too, and so can Argo CD under client-side sync or label tracking. Say the object was applied from a manifest or a chart whose source the cluster does not show, and keep both the revert and the options below, saying which depends on where that manifest lives.
 - **None present:** say the object is probably not declared in git, and list what you checked. Probably, not certainly: a pipeline that applies a repository under a field manager of its own leaves nothing this table names, so name any manager you do not recognise and say it may be one. `kubectl-create`, `kubectl-edit`, `kubectl-label` and `kubectl-patch` are a person at a terminal.
 
 An object git does not declare has no declared state, so there is nothing to revert to, and the method below does not apply. Do not offer "revert to the declared state". The choices are:

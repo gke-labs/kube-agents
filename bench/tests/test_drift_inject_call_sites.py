@@ -21,8 +21,8 @@ or that grew an `owners` argument where its case requires none would still
 produce a payload the builder accepts and the daemon files. The case would
 then fail on a judged objective as though the agent were wrong.
 
-That is worth a test rather than a comment because of when these run: all
-three are nightly-only, so a swapped argument is seen once a night at best,
+That is worth a test rather than a comment because of when these run: every
+one is nightly-only, so a swapped argument is seen once a night at best,
 and the nightly truncated three times in the week before the two CUJ 1 halves
 were registered into it. A test sees it on the pull request instead.
 
