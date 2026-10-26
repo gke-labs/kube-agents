@@ -81,6 +81,11 @@ class SiteFixture(unittest.TestCase):
     def citations_for(self, body: str, name: str = "page.md") -> list[tuple[int, str]]:
         return [(f.line, f.text) for f in self.findings_for(body, name) if f.shape == CITATION]
 
+    def mdx_citations_for(self, body: str) -> list[tuple[int, str]]:
+        """The same body as the one `.mdx` page of the site, the default `.md` page removed first."""
+        (self.site / "page.md").unlink(missing_ok=True)
+        return self.citations_for(body, name="page.mdx")
+
 
 class DenylistShapesTest(SiteFixture):
     def test_workflow_secret_reference_fails(self):
@@ -359,8 +364,25 @@ class CitationShapeTest(SiteFixture):
         self.assertEqual(self.citations_for(body), [])
 
     def test_punctuation_after_a_number_still_counts(self):
-        body = "#2801. #2802, #2803: (#2804) #2805\n"
-        self.assertEqual([t for _, t in self.citations_for(body)], ["#2801", "#2802", "#2803", "#2804", "#2805"])
+        body = "#2801. #2802, #2803: (#2804) #2805; #2806-ish\n"
+        self.assertEqual([t for _, t in self.citations_for(body)], ["#2801", "#2802", "#2803", "#2804", "#2805", "#2806"])
+
+    def test_digits_only_anchor_targets_pass(self):
+        """The slug of a version or year heading is digits only; a link to it is not a citation."""
+        self.assertEqual(self.citations_for("[0.14.0](#0140) and [2026](#2026) and [#1](#2026)\n"), [])
+
+    def test_link_forms_the_link_branch_cannot_see_count_once(self):
+        """A wrapped link, an angle-bracket destination and an HTML or MDX attribute cite one number once."""
+        self.assertEqual(self.citations_for(f"see [pull request\n#2801]({PULL_URL}) for why\n"), [(2, "#2801")])
+        for body in (
+            f"[#2801](<{PULL_URL}>)",
+            f'<a href="{PULL_URL}">#2801</a>',
+            f'<LinkCard href="{PULL_URL}" title="#2801" />',
+            "#2801 and #2801 again",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(len(self.citations_for(body + "\n")), 1)
+        self.assertEqual(len(self.citations_for(f'<a href="{PULL_URL}">#2802</a>\n')), 2)
 
     def test_fewer_than_three_digits_pass(self):
         self.assertEqual(self.citations_for("item #12 and #99\n"), [])
@@ -389,6 +411,19 @@ class CitationShapeTest(SiteFixture):
         body = "````md\n```\n#1234\n```\n#5678\n````\n#2801\n"
         self.assertEqual(self.citations_for(body), [(7, "#2801")])
 
+    def test_fence_on_a_list_marker_or_quote_marker_line_is_a_fence(self):
+        """CommonMark opens a fence on the marker line too; a list item's closer is indented, a quote's keeps its marker."""
+        body = (
+            "- ```bash\n  # see #1234\n  ```\n- then #2801\n\n"
+            "> ```yaml\n> # #5678\n> ```\n\n"
+            "after #2802\n```yaml\n#9999\n```\n#2803\n"
+        )
+        self.assertEqual(self.citations_for(body), [(4, "#2801"), (10, "#2802"), (14, "#2803")])
+
+    def test_a_fence_closes_at_its_own_blockquote_depth(self):
+        """A quoted fence line inside an unquoted block is content, not the block's closer."""
+        self.assertEqual(self.citations_for("```md\n> ```\n```\n#2801\n"), [(4, "#2801")])
+
     def test_backtick_fence_info_string_with_a_backtick_is_a_code_span_not_a_fence(self):
         """CommonMark: a backtick fence's info string may not hold a backtick; a tilde fence's may."""
         body = "```yaml``` is the fence you want, see #2801\n```bash\n# see #1234\n```\n#5678\n~~~a`b\n#4321\n~~~\n#3333\n"
@@ -398,19 +433,38 @@ class CitationShapeTest(SiteFixture):
         body = "a <!-- #1234 --> b\n<!--\n#5678\n-->\n#2801 <!-- open #4321\nstill #8765 --> #3333\n"
         self.assertEqual(self.citations_for(body), [(5, "#2801"), (6, "#3333")])
 
-    def test_code_span_after_a_multiline_comment_closes_is_blanked(self):
-        """The prose after a mid-line closer gets the same code-span blanking as any other prose."""
-        body = "<!-- reviewer note\n--> the proxy listens on `#8080`; the `<!--` marker opens a comment\nlater #2801\n"
+    def test_the_line_after_a_comment_closes_is_read_as_a_renderer_shows_it(self):
+        """An HTML block runs to the end of its closer's line (raw HTML, the links checker's rule); an MDX comment ends at its closer."""
+        body = "<!-- reviewer note\n--> the proxy listens on `#8080`; see #2803\nlater #2801\n"
         self.assertEqual(self.citations_for(body), [(3, "#2801")])
-        body = "{/* note\n*/} port `#8080` and `{/*` quoted\nlater #2801\n"
-        self.assertEqual(self.citations_for(body), [(3, "#2801")])
+        body = "{/* note\n*/} port `#8080` and `{/*` quoted, see #2803\nlater #2801\n"
+        self.assertEqual(self.mdx_citations_for(body), [(2, "#2803"), (3, "#2801")])
 
     def test_an_opener_nothing_closes_is_text(self):
         """A stray `<!--` or `{/*` hides nothing after it, as the links checker reads the same page."""
         self.assertEqual(self.citations_for("a <!-- b\n#2801\n"), [(2, "#2801")])
-        self.assertEqual(self.citations_for("a {/* b #2801\n#2802\n"), [(1, "#2801"), (2, "#2802")])
         body = "a <!-- b #1234\n#5678 --> #2801\nc <!-- d\n#2802\n"
         self.assertEqual(self.citations_for(body), [(2, "#2801"), (4, "#2802")])
+        self.assertEqual(self.mdx_citations_for("a {/* b #2801\n#2802\n"), [(1, "#2801"), (2, "#2802")])
+
+    def test_a_mid_line_opener_is_believed_only_within_its_paragraph(self):
+        """A `-->` in a later paragraph, another comment's or one in a code span, is not a stray opener's closer."""
+        self.assertEqual(self.citations_for("a <!-- b\n#2801\n\n<!-- note -->\n#2802\n"), [(2, "#2801"), (5, "#2802")])
+        self.assertEqual(self.citations_for("a <!-- b\n#2801\n\nthe `-->` closer\n#2802\n"), [(2, "#2801"), (5, "#2802")])
+        self.assertEqual(self.citations_for("<!--\n#2801\n\n#2802 -->\n#2803\n"), [(5, "#2803")])
+
+    def test_a_code_span_that_wraps_is_still_a_span(self):
+        """A span may wrap onto the next line; its contents are code and the pairing after it is unchanged."""
+        body = "the `platform-agent\n#2801` pod and `x` then #2802\n"
+        self.assertEqual(self.citations_for(body), [(2, "#2802")])
+        body = "wrap the `<!--\nmarker` in code, see #2801\n\n<!-- prettier-ignore -->\n"
+        self.assertEqual(self.citations_for(body), [(2, "#2801")])
+
+    def test_mdx_comment_delimiters_are_text_in_a_markdown_page(self):
+        """A `.md` page renders `{/* */}` as text, so a number inside counts there and not in `.mdx`."""
+        body = "{/* see #2801 */}\n{/*\n#2802\n*/}\n"
+        self.assertEqual(self.citations_for(body), [(1, "#2801"), (3, "#2802")])
+        self.assertEqual(self.mdx_citations_for(body), [])
 
     def test_a_closer_inside_a_fence_does_not_close_a_comment(self):
         """Fences are read first, so a closer in code is not the one an opener waits for."""

@@ -26,17 +26,20 @@ review-time hope. Four sources feed it:
   whose text carries the number and whose target starts with that URL (any
   path, query, fragment or title after it is part of the link), counted once
   each; a reference-style link counts its text and its definition
-  separately. This shape reads prose only: fenced code blocks, inline code
-  spans and HTML or MDX comments are blanked first, line by line so the
-  reported line numbers stay true, which is what keeps a shell comment inside
-  a fence from matching. A comment opener nothing later in the page closes is
-  text, as ``scripts/check_docs_links.py`` reads it, so a stray ``<!--`` does
-  not hide the rest of the page. A ``#NNN`` glued to a word or a ``/``
-  (``kubernetes/kubernetes#68078``) is a cross-repository reference, one
-  followed by a word character, ``-`` or ``;`` (``#404-errors``, ``&#160;``)
-  is an anchor or an entity, and both are excused. ``contributing.md`` is
-  exempt from this shape alone: it is the one site page written for
-  contributors.
+  separately, and a number cited twice on one line, as a wrapped link's text
+  and target are, counts once. This shape reads prose only: fenced code
+  blocks are dropped, then inline code spans and comments are blanked by the
+  reader ``scripts/check_docs_links.py`` applies to the same pages, a
+  paragraph at a time, so a span that wraps is still a span, a comment opener
+  is believed only where a renderer would close it (a stray ``<!--`` hides
+  nothing past its paragraph), and ``{/* */}`` is a comment in ``.mdx`` pages
+  only. Reported line numbers stay true throughout, which is what keeps a
+  shell comment inside a fence from matching. A ``#NNN`` glued to a word or a
+  ``/`` (``kubernetes/kubernetes#68078``) is a cross-repository reference, one
+  that runs on into a word (``#2801v2``), a numeric entity (``&#160;``) and a
+  link target (``[0.14.0](#0140)``) are not citations, and all are excused.
+  ``contributing.md`` is exempt from this shape alone: it is the one site
+  page written for contributors.
 
 The pages that carried findings when a shape arrived are pinned in
 ``scripts/docs_audience_allowlist.txt``: one line per page and shape, with
@@ -70,6 +73,8 @@ import re
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+
+from check_docs_links import BLOCK_PREFIX_RE, HTML_COMMENT, MDX_COMMENT, MDX_SUFFIX, strip_specimens
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -117,43 +122,54 @@ SERVICE_ACCOUNT_SHAPE = "service-account email in a non-placeholder project"
 # tried first and consumes the number in its text, the URL it points at and
 # whatever follows the URL up to the closing parenthesis (a `/files` path, a
 # `?diff=` query, a `#issuecomment` fragment, a quoted title), so no form of
-# the target falls through to the other two branches; a reference-style link
+# the target falls through to the other two branches. The forms Markdown
+# admits that the link branch cannot see as one (a link whose text wraps onto
+# the target's line, an angle-bracket destination, an `<a href>` or a
+# `<LinkCard>` attribute) match twice, as a bare number and a URL, so each
+# match's number is read out (`CITATION_NUMBER_RE`, the first `#N` or
+# `/pull/N`) and a number is reported once per line; a reference-style link
 # keeps its text and its definition on separate lines and counts twice, a
-# limit this grammar accepts. The bare `#NNN` branch asks for three or more digits so a
-# `#2` list marker does not match, its lookbehind excuses a number glued to a
-# word or a `/` (a cross-repository reference, `kubernetes/kubernetes#68078`),
-# and its lookahead excuses a number that runs on into a word, a `-` or a `;`
-# (a heading anchor such as `#404-errors`, a numeric entity such as `&#160;`).
+# limit this grammar accepts. The bare `#NNN` branch asks for three or more
+# digits so a `#2` list marker does not match, and its lookarounds excuse by
+# construct rather than by the next character: a number glued to a word or a
+# `/` is a cross-repository reference (`kubernetes/kubernetes#68078`), one
+# after `&` is a numeric entity (`&#160;`), one after `](` is a link target
+# (`[0.14.0](#0140)`, the slug of a version heading), and one that runs on
+# into a word is neither (`#2801v2`); `#2801;` and `#2801-` are citations.
 REPO_ISSUE_URL_RE = r"(?:https?://)?github\.com/gke-labs/kube-agents/(?:pull|issues)/[0-9]+"
 CITATION_RE = re.compile(
     rf"\[[^\]]*#[0-9]{{3,}}[^\]]*\]\({REPO_ISSUE_URL_RE}[^)]*\)"
-    rf"|(?<![\w/])#[0-9]{{3,}}(?![-;\w])"
+    rf"|(?<![\w/&])(?<!\]\()#[0-9]{{3,}}(?!\w)"
     rf"|{REPO_ISSUE_URL_RE}"
 )
+CITATION_NUMBER_RE = re.compile(r"(?:#|/(?:pull|issues)/)(?P<number>[0-9]+)")
 CITATION_SHAPE = "pull-request or issue citation"
 # The one site page written for contributors (.agents/rules/documentation.md,
 # "Who the site is for"); relative to the site root.
 CITATION_EXEMPT_PAGES = (Path("contributing.md"),)
 
 # What the citation shape does not read. A fenced code block: a backtick or
-# tilde fence at any indentation (a fence inside a list item sits at the item's
-# content column), closed by a fence of the same character at least as long
-# with nothing after it; a backtick fence's info string may not contain a
-# backtick (CommonMark), which is what keeps a line opening with a
-# triple-backtick code span from opening a fence, while a tilde fence's may.
-# An inline code span: a backtick run closed by a run of the same length on
-# the same line. A comment, HTML or MDX, which may span lines, believed only
-# when its closer follows somewhere in the page. All are blanked in place so
-# line numbers stay true, and code spans go first so a comment opener quoted
-# in one does not open a comment; the text after a comment closes gets the
-# same treatment.
-FENCE_RE = re.compile(r"^\s*(?P<fence>(?P<backtick>`{3,})|~{3,})(?P<info>(?(backtick)[^`]*|.*))$")
-CODE_SPAN_RE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)")
-COMMENT_DELIMITERS = (("<!--", "-->"), ("{/*", "*/}"))
-COMMENT_CLOSERS = dict(COMMENT_DELIMITERS)
-# A blanked span or comment leaves one space, so the text either side of it
-# does not fuse into a token neither side wrote.
-BLANK = " "
+# tilde fence with nothing but indentation and container markers before it (a
+# fence inside a list item sits at the item's content column, and CommonMark
+# opens one on the marker line too, `- ```bash` or `> ```yaml`; the markers
+# are the links checker's `BLOCK_PREFIX_RE`), closed by a fence of the same
+# character at least as long with nothing after it, at the same blockquote
+# depth; a backtick fence's info string may not contain a backtick
+# (CommonMark), which is what keeps a line opening with a triple-backtick code
+# span from opening a fence, while a tilde fence's may. The lines outside
+# fences are then read by `scripts/check_docs_links.py`'s `strip_specimens`,
+# the reader that checker applies to the same pages, which blanks inline code
+# spans and comments a paragraph at a time: a span that wraps onto the next
+# line is still a span, a `<!--` quoted in one opens nothing, a comment opener
+# is believed only where a renderer would close it (a block opener in any
+# later paragraph, a mid-line opener in its own), and `{/* */}` is a comment
+# in `.mdx` pages only, since a `.md` page renders those characters as text.
+# Fences are read first, so a closer inside code is not the one an opener
+# waits for, and a dropped or blanked line keeps its number.
+FENCE_RE = re.compile(r"(?P<fence>(?P<backtick>`{3,})|~{3,})(?P<info>(?(backtick)[^`]*|.*))$")
+QUOTE_MARKER = ">"
+MARKDOWN_COMMENTS = (HTML_COMMENT,)
+MDX_COMMENTS = (HTML_COMMENT, MDX_COMMENT)
 
 # The shrinking allowlist: `<page> <count> <shape>` per line, the page relative
 # to the site root, the shape exactly as this check reports it. `#` lines and
@@ -272,88 +288,53 @@ def pattern_findings(path: Path, text: str, shapes: Iterable[tuple[str, re.Patte
     return findings
 
 
-def blank_comments(line: str, open_delimiter: str | None, later_closers: set[str]) -> tuple[str, str | None]:
-    """The line with every comment segment blanked, and the delimiter of a comment left open at its end.
-
-    Code spans are blanked before the comment scan on every prose segment,
-    including the text after a comment closes, so an opener quoted in one
-    never opens a comment. An opener whose closer is neither on this line nor
-    among ``later_closers``, the closers that appear on a later line, is text.
-    """
-    kept: list[str] = []
-    pos = 0
-    while pos < len(line):
-        if open_delimiter is not None:
-            close = COMMENT_CLOSERS[open_delimiter]
-            end = line.find(close, pos)
-            if end == -1:
-                return "".join(kept), open_delimiter
-            open_delimiter = None
-            pos = end + len(close)
-            line = line[:pos] + CODE_SPAN_RE.sub(BLANK, line[pos:])
-            continue
-        starts = [(line.find(opener, pos), opener) for opener, _ in COMMENT_DELIMITERS]
-        starts = [(at, opener) for at, opener in starts if at != -1]
-        if not starts:
-            kept.append(line[pos:])
-            break
-        at, opener = min(starts)
-        after = at + len(opener)
-        close = COMMENT_CLOSERS[opener]
-        if line.find(close, after) == -1 and close not in later_closers:
-            kept.append(line[pos:after])
-            pos = after
-            continue
-        open_delimiter = opener
-        kept.append(line[pos:at])
-        kept.append(BLANK)
-        pos = after
-    return "".join(kept), open_delimiter
+def fence_on(line: str) -> re.Match[str] | None:
+    """The fence a line opens or closes: a run with nothing but indentation and container markers before it."""
+    match = FENCE_RE.search(line)
+    if match is not None and BLOCK_PREFIX_RE.match(line[: match.start()]):
+        return match
+    return None
 
 
-def unfenced_lines(text: str) -> list[str]:
-    """The page's lines with every fenced code block, fences included, replaced by an empty line."""
-    lines: list[str] = []
+def unfenced_lines(text: str) -> list[tuple[int, str]]:
+    """(line number, line) for every line outside a fenced code block, the fences themselves excluded."""
+    kept: list[tuple[int, str]] = []
     fence: str | None = None
-    for raw in text.splitlines():
-        match = FENCE_RE.match(raw)
+    depth = 0
+    for number, raw in enumerate(text.splitlines(), start=1):
+        match = fence_on(raw)
         if fence is None and match:
             fence = match.group("fence")
-            lines.append("")
+            depth = raw[: match.start()].count(QUOTE_MARKER)
         elif fence is not None:
-            if match and match.group("fence").startswith(fence) and not match.group("info").strip():
+            if (
+                match
+                and match.group("fence").startswith(fence)
+                and not match.group("info").strip()
+                and raw[: match.start()].count(QUOTE_MARKER) == depth
+            ):
                 fence = None
-            lines.append("")
         else:
-            lines.append(raw)
-    return lines
+            kept.append((number, raw))
+    return kept
 
 
-def prose_lines(text: str) -> list[str]:
-    """The page's lines with fenced code, inline code spans and comments blanked, one entry per source line."""
-    unfenced = unfenced_lines(text)
-    # The last unfenced line each closer appears on, so an opener is believed
-    # only when its closer follows it somewhere in the page.
-    last_closer_line = {
-        close: max((index for index, line in enumerate(unfenced) if close in line), default=-1)
-        for _, close in COMMENT_DELIMITERS
-    }
-    lines: list[str] = []
-    open_delimiter: str | None = None
-    for index, raw in enumerate(unfenced):
-        later_closers = {close for close, last in last_closer_line.items() if last > index}
-        line = raw if open_delimiter is not None else CODE_SPAN_RE.sub(BLANK, raw)
-        line, open_delimiter = blank_comments(line, open_delimiter, later_closers)
-        lines.append(line)
-    return lines
+def prose_lines(path: Path, text: str) -> Iterator[tuple[int, str]]:
+    """(line number, line) for the page's prose: fenced code dropped, inline code spans and comments blanked."""
+    comments = MDX_COMMENTS if path.suffix == MDX_SUFFIX else MARKDOWN_COMMENTS
+    return strip_specimens(unfenced_lines(text), comments)
 
 
 def citation_findings(path: Path, text: str) -> list[Finding]:
-    """Every pull-request or issue citation in the page's prose, one Finding per occurrence."""
+    """Every pull-request or issue citation in the page's prose, each number once per line."""
     findings = []
-    for number, line in enumerate(prose_lines(text), start=1):
+    for number, line in prose_lines(path, text):
+        cited: set[str] = set()
         for match in CITATION_RE.finditer(line):
-            findings.append(Finding(path, number, CITATION_SHAPE, match.group(0)))
+            cited_number = CITATION_NUMBER_RE.search(match.group(0)).group("number")
+            if cited_number not in cited:
+                cited.add(cited_number)
+                findings.append(Finding(path, number, CITATION_SHAPE, match.group(0)))
     return findings
 
 
