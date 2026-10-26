@@ -1034,6 +1034,7 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
 SEAT_BAR_EXEMPT = [
     ("agent-kanban-smoke", "c", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
     ("vcs-spent-branch-reuse", "c", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
+    ("pdb-remediation-pr", "c", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
 ]
 FLEET_FIXTURE_STATE_SCRIPT = REPO_ROOT / "hack" / "fleet-fixture-state.py"
 FLEET_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
