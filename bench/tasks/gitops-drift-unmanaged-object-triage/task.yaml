@@ -153,11 +153,14 @@ verification_spec:
       # "git declares nothing"), so a report that echoed them without deciding
       # anything would pass here. On main's card none of them appear, which
       # is what keeps the red honest; on the fix, the conclusion is graded by
-      # triage-offers-no-revert below and by the judge.
+      # triage-offers-no-revert below and by the judge. "Declares no" is held
+      # to the object itself: main's report wrote "git declares no privileged
+      # Pod Security Standard enforcement", which asserts a declared state
+      # without that label, the opposite claim.
       any_of_patterns:
         - "\\bnot (?:declared|defined|tracked|stored|present|found|kept|committed|managed|represented) (?:in|by|through) (?:git|gitops|the gitops repo(?:sitory)?)\\b"
         - "\\b(?:git|gitops|the gitops repo(?:sitory)?) (?:does not|doesn't|did not|didn't) (?:declare|define|track|contain|manage|hold|have)\\b"
-        - "\\b(?:git|gitops) declares (?:no|nothing)\\b"
+        - "\\b(?:git|gitops) declares (?:nothing|no (?:copy|manifest|object|state|definition|declaration)s?)\\b"
         - "\\bno (?:declared|desired) state\\b"
         - "\\bnot (?:git|gitops)[- ]managed\\b"
         - "\\bno (?:git|gitops) (?:manifest|source|definition|declaration)\\b"

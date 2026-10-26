@@ -123,6 +123,11 @@ def test_a_delete_offered_as_a_manual_step_passes():
 
 def test_the_red_does_not_say_git_lacks_the_object_and_the_green_does():
     assert not _says_git_does_not_declare(RED)
+    # The clean red on main (2026-10-26, run_20261026_215212_254219): a
+    # claim that git declares the namespace without the label.
+    assert not _says_git_does_not_declare(
+        "no GitOps controller in `managedFields`, whereas git declares no privileged Pod Security Standard enforcement."
+    )
     assert _says_git_does_not_declare(
         "contains no GitOps management markers, confirming git declares nothing for this object."
     )
