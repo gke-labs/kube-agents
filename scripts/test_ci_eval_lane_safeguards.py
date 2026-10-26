@@ -380,7 +380,8 @@ class TwoPhaseFanOutTest(unittest.TestCase):
 
     def test_a_stopped_ask_runs_in_the_second_phase_without_requesting(self):
         """A failed stop lets its card open a pull request; in the first
-        phase it would land in the window of every case beside it."""
+        phase the write safeguard would charge it only if named, and alone in
+        the second, whose window is exclusive, it reds the stopped ask."""
         lines = self.run_fanout("", stopped="v")
         self.assertIn("TOTAL=8", lines)
         v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]

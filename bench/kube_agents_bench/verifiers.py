@@ -5858,7 +5858,8 @@ class GitHubWritesVerifier(BaseVerifier):
     listed under ``unattributed`` in ``raw`` and in the reason, so one late
     write fails the repetition that named it rather than every repetition
     running at the time. With ``exclusive_window`` -- set by the lane on a
-    case that requests a pull request, which runs alone -- a write nothing
+    case that requests a pull request or a stopped ask, either of which runs
+    alone -- a write nothing
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,

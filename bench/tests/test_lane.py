@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 import yaml
 from devops_bench.verification.spec import parse_entries
-from kube_agents_bench import lane
+from kube_agents_bench import lane, stop_hook
 from kube_agents_bench.cases import load_case
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +36,9 @@ TASKS = REPO_ROOT / "bench" / "tasks"
 # zero-allowance safeguard exists to watch.
 READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
+# A stopped ask (stop_hook.py): it requests no pull request, and runs alone
+# in the second phase on the inject lane, the only lane that carries it.
+STOPPED_ASK_CASE = "chat-stop-halts-delegated-remediation"
 # The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,
 # so the listed path is tested without pinning the real file's entries,
 # whose contents scripts/test_eval_rosters.py owns.
@@ -96,6 +99,21 @@ def test_a_case_that_requests_a_pull_request_gets_that_allowance(tmp_path):
     again_leaf = lane._leaves(load(again)["verification_spec"][-1]["check"])[0]
     assert lane.REQUESTED_FIELD not in again_leaf
     assert lane.EXCLUSIVE_WINDOW_FIELD not in again_leaf
+
+
+def test_a_stopped_ask_gets_an_exclusive_window_and_no_allowance(tmp_path):
+    # It runs alone in the second phase with the requesting cases, so a write
+    # its failed stop lets the card make reds it whether named or not.
+    source = TASKS / STOPPED_ASK_CASE / "task.yaml"
+    assert stop_hook.is_stopped_ask(load(source)["prompt"])
+    assert lane.requested_pull_requests(load(source)["verification_spec"]) == 0
+    copy, requested = lane.copy_task(source, lane.load_lane_safeguards(LANE_FILE), tmp_path)
+    assert requested == 0
+    leaf = lane._leaves(load(copy)["verification_spec"][-1]["check"])[0]
+    assert leaf[lane.EXCLUSIVE_WINDOW_FIELD] is True
+    assert lane.REQUESTED_FIELD not in leaf
+    _parsed, errors = parse_entries(load(copy)["verification_spec"])
+    assert errors == []
 
 
 def test_requested_counts_nested_leaves_of_both_requesting_types():

@@ -2449,9 +2449,11 @@ echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries 
 # directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
 # carries one) run in the same second phase although they request no pull
 # request: a stop that fails leaves its card to open a pull request mid-run,
-# which would land in the write safeguard's window of every case running
-# beside it. Alone in the second phase, a failed stop's write lands in no
-# other case's window.
+# which in the first phase lands in the window of every case beside it,
+# where the write safeguard charges it only if the stopped ask names it.
+# Alone in the second phase, whose window the lane marks exclusive
+# (bench/kube_agents_bench/lane.py), a failed stop reds itself whether or
+# not it names the write, and reds only itself.
 # Read from the prompt, as the harness reads it, not from
 # api-lane-exclusions.txt, which may come to list door-only cases of other
 # kinds.
@@ -4057,7 +4059,8 @@ scheduled_audits pause "fan-out"
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"): unattributed there in the first phase, and charged to the unit
-# in the second, whose window is exclusive.
+# in the second, whose window is exclusive (a requesting case's and a stopped
+# ask's alike).
 unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
   case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;

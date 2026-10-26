@@ -581,8 +581,9 @@ today the stopped asks (a `stop` sent on the conversation after the opening turn
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and
 `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
-the cases that request a pull request, so a stop that fails and lets its card write lands in
-no other case's window.
+the cases that request a pull request, with its window marked exclusive like theirs, so a stop
+that fails and lets its card write reds that case whether or not it names the write, and only
+that case.
 
 A safeguard every case needs and no case declares is in the lane safeguards list,
 `hack/eval/inject-lane-safeguards.yaml`, which applies on both lanes despite its name, so the

@@ -47,8 +47,9 @@
 # `unattributed` in the record, so one late write fails the case that named
 # it and not every case running at the time (GitHubWritesVerifier in
 # bench/kube_agents_bench/verifiers.py). A case that requests a pull request
-# runs alone (below), so the lane marks its window `exclusive_window` and a
-# write in it is charged whether named or not.
+# runs alone (below), and so does a stopped ask (a prompt opening with
+# bench/kube_agents_bench/stop_hook.py's directive), so the lane marks its
+# window `exclusive_window` and a write in it is charged whether named or not.
 #
 # How a case that writes by design is kept away from the others.
 # hack/ci-eval-pr.sh runs the cases that request a pull request (the same

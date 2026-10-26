@@ -43,7 +43,11 @@ has that many requested writes: every ``github_writes`` leaf appended to it
 gets ``requested_pull_requests`` set to that count, so the lane's safeguard
 leaves the case's own pull request out and fails the repetition on anything
 beyond it, and ``exclusive_window``, since such a case runs alone and a
-write in its window is its own whether or not it names it. The command line also reports that count per case, which the
+write in its window is its own whether or not it names it. A stopped ask
+(a prompt opening with :data:`kube_agents_bench.stop_hook.STOP_DIRECTIVE`)
+gets ``exclusive_window`` too, with no allowance: the script runs it alone
+in the same second phase, and a stop that fails lets its card write, which
+has to fail the case whether or not anything of it names the write. The command line also reports that count per case, which the
 script uses to run the requesting cases in a second phase after every other
 unit has finished, so a repetition that requests nothing never shares the
 repository with a case that writes by design.
@@ -60,7 +64,7 @@ from typing import Any
 
 import yaml
 
-from kube_agents_bench import forges
+from kube_agents_bench import forges, stop_hook
 
 __all__ = [
     "LaneSafeguardsError",
@@ -284,6 +288,9 @@ def copy_task(
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
     requested = requested_for(existing, listed_allowance)
+    # A stopped ask runs alone in the second phase as well (hack/ci-eval-pr.sh
+    # reads the same prompt test), so its window is exclusive with no allowance.
+    exclusive = bool(requested) or stop_hook.is_stopped_ask(str(doc.get("prompt") or ""))
     appended = []
     for entry in safeguards:
         if entry["name"] in taken:
@@ -294,10 +301,14 @@ def copy_task(
             )
         clone = copy.deepcopy(entry)
         for leaf in _leaves(clone.get("check")):
-            if leaf.get("type") == WRITES_CHECK_TYPE and requested:
+            if leaf.get("type") != WRITES_CHECK_TYPE:
+                continue
+            if requested:
                 leaf[REQUESTED_FIELD] = requested
-                # A requesting case runs alone in the second phase, so a
-                # write in its window that it does not name is still its own.
+            if exclusive:
+                # A requesting case or a stopped ask runs alone in the second
+                # phase, so a write in its window that it does not name is
+                # still its own.
                 leaf[EXCLUSIVE_WINDOW_FIELD] = True
         appended.append(clone)
     doc[SPEC_KEY] = existing + appended
