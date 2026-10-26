@@ -124,6 +124,13 @@ class ExtractionTest(SiteFixture):
         body = '<LinkCard title="Seamless" description="A robust card, simply put." href="/x/" />\n'
         self.assertEqual(self.kinds(body), [])
 
+    def test_wrapped_opening_tag_closed_by_a_bare_bracket_keeps_its_body(self):
+        """prettier's JSX layout puts the `>` on its own line; the body after it is prose."""
+        body = '<Aside\n  type="caution"\n  title="Robust"\n>\n  This is simply text.\n</Aside>\n'
+        findings = self.findings(body)
+        self.assertEqual([f.kind for f in findings], [prose.KIND_BANNED_WORD])
+        self.assertEqual(findings[0].line, FRONTMATTER.count("\n") + 5)
+
     def test_blockquote_separator_ends_a_paragraph(self):
         """Two quoted paragraphs are two, and a sentence does not run across the `>` line."""
         half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)
@@ -149,6 +156,19 @@ class ExtractionTest(SiteFixture):
         ):
             with self.subTest(body=body[:50]):
                 self.assertEqual(self.kinds(body), [])
+
+    def test_comment_and_span_continuation_lines_do_not_split_a_paragraph(self):
+        """A line a comment or a wrapped span emptied is the same paragraph, not a break."""
+        half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)
+        for body in (
+            f"{half} <!-- TODO: note\nsomething -->\n{half}\n",
+            f"{half} {{/* TODO: note\nsomething */}}\n{half}\n",
+            f"{half} `a\nb\nc` {half}\n",
+        ):
+            with self.subTest(body=body[-40:]):
+                self.assertEqual(self.kinds(body), [prose.KIND_PARAGRAPH])
+        straddling = f"{one_sentence(prose.SENTENCE_WORD_LIMIT // 2)} <!-- a\nb -->\n{one_sentence(prose.SENTENCE_WORD_LIMIT // 2 + 1)}.\n"
+        self.assertEqual(self.kinds(straddling), [prose.KIND_SENTENCE])
 
     def test_comment_opener_in_a_code_span_is_not_an_opener(self):
         body = "The `<!--` opener is documented here.\nThis is simply text.\n"
@@ -262,6 +282,20 @@ class StructuralCeilingTest(SiteFixture):
         ):
             with self.subTest(body=body[:40]):
                 self.assertEqual(self.kinds(body), [])
+
+    def test_directive_line_ends_a_paragraph_and_adds_no_words_to_the_aside(self):
+        """A Starlight `:::note[Title]` line and its `:::` closer bound the aside like a heading."""
+        half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)
+        at_limit = one_sentence(prose.SENTENCE_WORD_LIMIT)
+        for body in (
+            f":::note\n{at_limit}.\n:::\n",
+            f":::caution[Grants nothing today]\n{at_limit}.\n:::\n",
+            f"{half}\n:::note\n{half}\n:::\n{half}\n",
+            f"- item\n  :::note[Upgrade note: a title]\n  {at_limit}.\n  :::\n",
+        ):
+            with self.subTest(body=body[:40]):
+                self.assertEqual(self.kinds(body), [])
+        self.assertEqual(self.kinds(":::note[Simply put]\nText.\n:::\n"), [prose.KIND_BANNED_WORD])
 
     def test_wrapped_lines_are_one_paragraph(self):
         half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)

@@ -17,7 +17,8 @@ a time. This check counts five kinds of finding per page under
   ``not (merely|just|simply) X, but Y``. A plain ``is a X, not a Y`` contrast
   ("a namespaced resource, not cluster-scoped") is a fact and is not flagged;
 * **paragraph over ``PARAGRAPH_WORD_LIMIT`` words** -- a paragraph ends at a
-  blank line, a heading, a list item or a table row;
+  blank line, a heading, a list item, a table row or a ``:::`` directive line
+  (a Starlight aside's label or closer);
 * **table cell over ``CELL_WORD_LIMIT`` words**;
 * **sentence over ``SENTENCE_WORD_LIMIT`` words**.
 
@@ -161,6 +162,10 @@ ANTITHESIS_RES = (
 FRONTMATTER_DELIMITER = "---"
 FENCE_RE = re.compile(r"^\s*(?P<fence>```+|~~~+)")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+# A remark directive container line: a Starlight aside's `:::note[Title]`
+# label or its `:::` closer. It bounds the aside's paragraphs like a heading
+# and is not a paragraph itself; the label's words stay for the word check.
+DIRECTIVE_RE = re.compile(r"^\s*:{3,}")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 # A blockquote's `>` prefix (one per nesting level). Dropped before the line
 # is classified, so a `>`-only separator is a blank line, a quoted `| … |` row
@@ -227,6 +232,11 @@ LENGTH_DETAIL = "{words} words (limit {limit}): {opening}..."
 # Wrapped lines of one paragraph are joined with this, so a sentence's offset
 # maps back to its source line.
 PARAGRAPH_JOIN = "\n"
+# A line the replacement pass emptied: a comment's closing line, or the middle
+# of a code span wrapped over three lines. It stands for text the page still
+# carries, so it continues the paragraph; the empty string is a source blank
+# and ends it.
+REPLACED_LINE = " "
 
 # Report wording.
 ABOVE_MESSAGE = (
@@ -281,6 +291,13 @@ def prose_lines(text: str) -> list[str]:
     in_generated = False
     in_tag = False
     for index, raw in enumerate(lines):
+        if in_tag:
+            # Read before the blockquote strip: inside an opening tag a `>` on
+            # its own line is the tag's close, never a quote marker.
+            if TAG_CLOSE_RE.search(raw):
+                in_tag = False
+            kept.append("")
+            continue
         raw = BLOCKQUOTE_RE.sub("", raw, count=1)
         stripped = raw.strip()
         if index == 0 and stripped == FRONTMATTER_DELIMITER:
@@ -328,11 +345,6 @@ def prose_lines(text: str) -> list[str]:
         if not raw:
             kept.append("")
             continue
-        if in_tag:
-            if TAG_CLOSE_RE.search(raw):
-                in_tag = False
-            kept.append("")
-            continue
         if TAG_OPEN_RE.match(raw):
             in_tag = True
             kept.append("")
@@ -350,7 +362,9 @@ def prose_runs(kept: list[str]) -> list[list[str]]:
     A run is one paragraph's worth of consecutive lines. Code spans and inline
     comments are replaced over the run joined with ``PARAGRAPH_JOIN``, with
     their line breaks kept, so a span wrapped across two lines is one ``Code``
-    and the prose after it stays on its own line; the rest is per line.
+    and the prose after it stays on its own line; the rest is per line. A line
+    the replacement leaves empty comes back as ``REPLACED_LINE``, so the
+    paragraph it sits in is not read as two.
     """
     runs: list[list[str]] = []
     run: list[str] = []
@@ -362,7 +376,9 @@ def prose_runs(kept: list[str]) -> list[list[str]]:
             joined = PARAGRAPH_JOIN.join(run)
             joined = CODE_SPAN_RE.sub(keeping_newlines(CODE_SPAN_PLACEHOLDER), joined)
             joined = INLINE_COMMENT_RE.sub(keeping_newlines(""), joined)
-            runs.append([prose_line(part) for part in joined.split(PARAGRAPH_JOIN)])
+            runs.append(
+                [prose_line(part) if part.strip() else REPLACED_LINE for part in joined.split(PARAGRAPH_JOIN)]
+            )
             run = []
         runs.append([""])
     runs.pop()  # the sentinel's own blank
@@ -386,12 +402,17 @@ def word_count(text: str) -> int:
     return len(WORD_RE.findall(text))
 
 
+def is_blank(line: str) -> bool:
+    """A source blank line, as opposed to one the replacement pass emptied."""
+    return not line.strip() and line != REPLACED_LINE
+
+
 def paragraphs(lines: list[str]) -> list[tuple[int, str]]:
     """(1-based start line, text) for every prose block.
 
-    A blank line, a heading, a list item or a table row ends the block before
-    it; a heading or table row is not a paragraph itself, and each list item is
-    a paragraph of its own.
+    A blank line, a heading, a directive line, a list item or a table row ends
+    the block before it; a heading, directive line or table row is not a
+    paragraph itself, and each list item is a paragraph of its own.
     """
     blocks: list[tuple[int, str]] = []
     start = 0
@@ -403,7 +424,7 @@ def paragraphs(lines: list[str]) -> list[tuple[int, str]]:
             buffer.clear()
 
     for index, line in enumerate(lines, start=1):
-        if not line.strip() or HEADING_RE.match(line) or TABLE_ROW_RE.match(line):
+        if is_blank(line) or HEADING_RE.match(line) or DIRECTIVE_RE.match(line) or TABLE_ROW_RE.match(line):
             flush()
             continue
         if LIST_ITEM_RE.match(line):
@@ -475,7 +496,7 @@ def line_runs(lines: list[str]) -> list[tuple[int, str]]:
     start = 0
     buffer: list[str] = []
     for index, line in enumerate(lines + [""], start=1):
-        if line.strip():
+        if not is_blank(line):
             if not buffer:
                 start = index
             buffer.append(line)
