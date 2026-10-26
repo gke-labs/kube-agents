@@ -159,6 +159,16 @@ CI enforcement: `make docs-check` runs the same checks as
   service-account email in a non-placeholder project; it also fails when it
   finds no site page or derives no project ID. The rule is
   `.agents/rules/documentation.md`.
+- `docs-check-prose` — `scripts/check_docs_prose.py`; the prose on each page
+  under `docs/site/src/content/docs/` (frontmatter, fences, comments, generated
+  regions, code spans and link URLs set aside) may not carry more banned words
+  (`simply`, `robust`, `seamless`, the verb `leverage`, …), "is not a X, it is
+  Y" epigrams, paragraphs over 120 words, table cells over 120 words or
+  sentences over 40 words than `scripts/docs_prose_ratchet.json` records for
+  it, per kind. A page with no entry must be clean, and a count below its
+  entry fails until the entry is lowered (`--write-ratchet` lowers or drops
+  entries and never raises or adds one). The rule is
+  `.agents/rules/documentation.md`, "Write it straight".
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
   and their combined size must stay inside the `BUDGET` that file sets.

@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Unit tests for the site prose ratchet.
+
+Run: cd scripts && python3 -m unittest test_check_docs_prose
+
+The check fails green: a shape that stops matching lets the next `simply`
+onto the site with no signal, an extraction that stops blanking fences turns
+every page with a code block red, and a ratchet that accepts an unrecorded
+improvement stops being a record. Each direction is pinned here on a
+throwaway site root and ratchet file; two tests run against the real tree to
+pin the committed ratchet to today's counts and the run to the issue's time
+bound.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+import check_docs_prose as prose
+
+# Literals below are the shapes under test, not values the site may carry.
+FRONTMATTER = "---\ntitle: Page\ndescription: simply a test\n---\n\n"
+SITE_TIME_BUDGET_SECONDS = 2.0
+SHORT_SENTENCE_WORDS = 10
+
+
+def one_sentence(n: int) -> str:
+    """``n`` words with no sentence end inside them."""
+    return " ".join(["word"] * n)
+
+
+def words(n: int) -> str:
+    """``n`` words in short sentences, so only the count under test can trip a ceiling."""
+    out = []
+    while n > 0:
+        take = min(n, SHORT_SENTENCE_WORDS)
+        out.append(" ".join(["Word"] + ["word"] * (take - 1)) + ".")
+        n -= take
+    return " ".join(out)
+
+
+class SiteFixture(unittest.TestCase):
+    """A throwaway site root and ratchet file per test."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.site = root / "site"
+        self.site.mkdir()
+        self.ratchet = root / "ratchet.json"
+
+    def write_page(self, body: str, name: str = "page.md") -> Path:
+        page = self.site / name
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(FRONTMATTER + body, encoding="utf-8")
+        return page
+
+    def findings(self, body: str, name: str = "page.md") -> list[prose.Finding]:
+        page = self.write_page(body, name)
+        return prose.page_findings(page, page.read_text(encoding="utf-8"))
+
+    def kinds(self, body: str) -> list[str]:
+        return [f.kind for f in self.findings(body)]
+
+    def run_main(self, *argv: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = prose.main(list(argv), self.site, self.ratchet)
+        return code, out.getvalue()
+
+
+class ExtractionTest(SiteFixture):
+    def test_frontmatter_is_not_prose(self):
+        self.assertEqual(self.kinds("A plain sentence.\n"), [])
+
+    def test_backticked_identifier_is_not_a_banned_word(self):
+        self.assertEqual(self.kinds("Run `simply` and `--robust` here.\n"), [])
+
+    def test_link_url_is_not_prose(self):
+        self.assertEqual(self.kinds("See [the page](https://example.com/simply/robust.html).\n"), [])
+
+    def test_backtick_fence_is_not_prose(self):
+        self.assertEqual(self.kinds("```sh\nsimply robust\n```\n"), [])
+
+    def test_tilde_fence_is_not_prose(self):
+        self.assertEqual(self.kinds("~~~\nsimply robust\n~~~\n"), [])
+
+    def test_html_comment_is_not_prose(self):
+        self.assertEqual(self.kinds("<!-- simply -->\n<!--\nrobust\n-->\n"), [])
+
+    def test_generated_region_is_not_prose(self):
+        body = "<!-- BEGIN GENERATED: x -->\nsimply robust\n<!-- END GENERATED: x -->\n"
+        self.assertEqual(self.kinds(body), [])
+
+    def test_mdx_import_and_tag_lines_are_not_prose(self):
+        body = 'import { Aside } from "@astrojs/starlight/components";\n\n<Aside type="note">\n  Fine text.\n</Aside>\n'
+        self.assertEqual(self.kinds(body), [])
+
+    def test_prose_inside_a_component_is_still_read(self):
+        body = '<Aside type="note">\n  This is simply text.\n</Aside>\n'
+        self.assertEqual(self.kinds(body), [prose.KIND_BANNED_WORD])
+
+    def test_line_numbers_are_one_based_source_lines(self):
+        body = "First line.\n\n```\ncode\n```\n\nThis is simply text.\n"
+        finding = self.findings(body)[0]
+        frontmatter_lines = FRONTMATTER.count("\n")
+        self.assertEqual(finding.line, frontmatter_lines + 7)
+
+
+class BannedWordTest(SiteFixture):
+    def test_every_banned_word_hits(self):
+        for word in prose.BANNED_WORDS:
+            with self.subTest(word=word):
+                self.assertEqual(self.kinds(f"This is {word} text.\n"), [prose.KIND_BANNED_WORD])
+
+    def test_every_banned_phrase_hits(self):
+        for phrase in prose.BANNED_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(self.kinds(f"And {phrase} the rest.\n"), [prose.KIND_BANNED_WORD])
+
+    def test_match_is_case_insensitive(self):
+        self.assertEqual(self.kinds("Simply put.\n"), [prose.KIND_BANNED_WORD])
+
+    def test_match_is_whole_word(self):
+        self.assertEqual(self.kinds("A robustness test with delvers and synergistic facet.\n"), [])
+
+    def test_leverage_as_a_verb_hits(self):
+        for text in ("It leverages the cache.", "Leverage the cache.", "We are leveraging it."):
+            with self.subTest(text=text):
+                self.assertEqual(self.kinds(text + "\n"), [prose.KIND_BANNED_WORD])
+
+    def test_leverage_as_a_noun_does_not(self):
+        self.assertEqual(self.kinds("The lease gives the operator leverage.\n"), [])
+
+    def test_finding_carries_the_matched_text(self):
+        finding = self.findings("A seamless install.\n")[0]
+        self.assertEqual(finding.detail, "seamless")
+
+
+class AntithesisTest(SiteFixture):
+    def test_is_not_a_x_it_is_y_hits(self):
+        for sep in (",", ":", ";", " —", " -"):
+            with self.subTest(sep=sep):
+                body = f"The lease is not a lock{sep} it is a note.\n"
+                self.assertEqual(self.kinds(body), [prose.KIND_ANTITHESIS])
+
+    def test_not_merely_x_but_y_hits(self):
+        for qualifier in ("merely", "just", "simply"):
+            with self.subTest(qualifier=qualifier):
+                body = f"It is not {qualifier} a cache but a record.\n"
+                self.assertIn(prose.KIND_ANTITHESIS, self.kinds(body))
+
+    def test_plain_technical_contrast_does_not(self):
+        body = "AgentProfile is a namespaced resource, not cluster-scoped.\n"
+        self.assertEqual(self.kinds(body), [])
+
+    def test_plain_is_not_does_not(self):
+        body = "The flag is not required. It is read once.\n"
+        self.assertEqual(self.kinds(body), [])
+
+    def test_antithesis_in_a_table_cell_hits(self):
+        body = "| a | b |\n| --- | --- |\n| x | The lease is not a lock, it is a note. |\n"
+        self.assertEqual(self.kinds(body), [prose.KIND_ANTITHESIS])
+
+
+class StructuralCeilingTest(SiteFixture):
+    def test_paragraph_at_the_ceiling_passes(self):
+        self.assertEqual(self.kinds(words(prose.PARAGRAPH_WORD_LIMIT) + "\n"), [])
+
+    def test_paragraph_over_the_ceiling_fails(self):
+        self.assertEqual(self.kinds(words(prose.PARAGRAPH_WORD_LIMIT + 1) + "\n"), [prose.KIND_PARAGRAPH])
+
+    def test_blank_line_heading_list_item_and_table_row_end_a_paragraph(self):
+        half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)
+        for body in (
+            f"{half}\n\n{half}\n",
+            f"{half}\n## Heading\n{half}\n",
+            f"{half}\n- {half}\n",
+            f"{half}\n| a |\n| --- |\n{half}\n",
+        ):
+            with self.subTest(body=body[:40]):
+                self.assertEqual(self.kinds(body), [])
+
+    def test_wrapped_lines_are_one_paragraph(self):
+        half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)
+        self.assertEqual(self.kinds(f"{half}\n{half}\n"), [prose.KIND_PARAGRAPH])
+
+    def test_table_cell_at_the_ceiling_passes(self):
+        body = f"| a | b |\n| --- | --- |\n| x | {words(prose.CELL_WORD_LIMIT)} |\n"
+        self.assertEqual(self.kinds(body), [])
+
+    def test_table_cell_over_the_ceiling_fails(self):
+        body = f"| a | b |\n| --- | --- |\n| x | {words(prose.CELL_WORD_LIMIT + 1)} |\n"
+        self.assertEqual(self.kinds(body), [prose.KIND_CELL])
+
+    def test_sentence_at_the_ceiling_passes(self):
+        self.assertEqual(self.kinds(one_sentence(prose.SENTENCE_WORD_LIMIT) + ". Short.\n"), [])
+
+    def test_sentence_over_the_ceiling_fails(self):
+        body = one_sentence(prose.SENTENCE_WORD_LIMIT + 1) + ". Short.\n"
+        self.assertEqual(self.kinds(body), [prose.KIND_SENTENCE])
+
+    def test_abbreviation_and_version_do_not_split_a_sentence(self):
+        text = "Use e.g. `flag` and v1.2 (i.e. `two`). " + one_sentence(prose.SENTENCE_WORD_LIMIT - 5) + "."
+        self.assertEqual(self.kinds(text + "\n"), [prose.KIND_SENTENCE])
+
+    def test_code_span_counts_as_one_word(self):
+        spans = " ".join(["`a.very.long.identifier/with-parts`"] * prose.SENTENCE_WORD_LIMIT)
+        self.assertEqual(self.kinds(spans + ".\n"), [])
+
+    def test_counts_are_per_kind(self):
+        body = words(prose.PARAGRAPH_WORD_LIMIT) + " " + one_sentence(prose.SENTENCE_WORD_LIMIT + 1) + ".\n"
+        counts = prose.counts_of(self.findings(body))
+        self.assertEqual(counts, {prose.KIND_PARAGRAPH: 1, prose.KIND_SENTENCE: 1})
+
+
+class RatchetTest(SiteFixture):
+    def test_clean_site_with_no_ratchet_file_passes(self):
+        self.write_page("Fine.\n")
+        code, out = self.run_main()
+        self.assertEqual(code, 0, out)
+
+    def test_page_without_an_entry_must_be_clean(self):
+        self.write_page("This is simply text.\n", "new.md")
+        self.ratchet.write_text("{}\n", encoding="utf-8")
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("new.md: banned-word 1 > ceiling 0", out)
+        self.assertIn("fix the prose", out)
+        self.assertIn("'simply'", out.replace("simply", "'simply'"))
+
+    def test_recorded_count_passes(self):
+        self.write_page("This is simply text.\n")
+        self.ratchet.write_text(json.dumps({"page.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        code, out = self.run_main()
+        self.assertEqual(code, 0, out)
+
+    def test_regression_above_the_ceiling_fails_and_lists_the_findings(self):
+        self.write_page("This is simply text.\nA robust one.\n")
+        self.ratchet.write_text(json.dumps({"page.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("banned-word 2 > ceiling 1", out)
+        self.assertIn("simply", out)
+        self.assertIn("robust", out)
+
+    def test_unrecorded_improvement_fails(self):
+        self.write_page("Fine.\n")
+        self.ratchet.write_text(json.dumps({"page.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("banned-word 0 < ceiling 1", out)
+        self.assertIn("lower the entry", out)
+
+    def test_ceiling_is_per_kind_not_per_page(self):
+        """A banned word traded for an over-long sentence is a regression and an improvement."""
+        self.write_page(one_sentence(prose.SENTENCE_WORD_LIMIT + 1) + ".\n")
+        self.ratchet.write_text(json.dumps({"page.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("banned-word 0 < ceiling 1", out)
+        self.assertIn("long-sentence 1 > ceiling 0", out)
+
+    def test_entry_for_a_deleted_page_fails(self):
+        self.write_page("Fine.\n")
+        self.ratchet.write_text(json.dumps({"gone.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("gone.md", out)
+        self.assertIn("no such page", out)
+
+    def test_malformed_ratchet_fails(self):
+        self.write_page("Fine.\n")
+        for text in ("[]", '{"page.md": {"no-such-kind": 1}}', '{"page.md": {"banned-word": "1"}}'):
+            with self.subTest(text=text):
+                self.ratchet.write_text(text, encoding="utf-8")
+                code, out = self.run_main()
+                self.assertEqual(code, 1)
+                self.assertIn("ERROR", out)
+
+    def test_write_ratchet_lowers_and_drops(self):
+        self.write_page("This is simply text.\n")
+        self.write_page("Fine.\n", "clean.md")
+        self.ratchet.write_text(
+            json.dumps({"page.md": {prose.KIND_BANNED_WORD: 3, prose.KIND_SENTENCE: 2}, "clean.md": {prose.KIND_BANNED_WORD: 1}}),
+            encoding="utf-8",
+        )
+        code, _ = self.run_main(prose.WRITE_RATCHET_FLAG)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.ratchet.read_text(encoding="utf-8")), {"page.md": {prose.KIND_BANNED_WORD: 1}})
+        code, out = self.run_main()
+        self.assertEqual(code, 0, out)
+
+    def test_write_ratchet_never_raises_or_adds(self):
+        self.write_page("This is simply text. A robust one.\n")
+        self.write_page("Also simply.\n", "new.md")
+        self.ratchet.write_text(json.dumps({"page.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        code, _ = self.run_main(prose.WRITE_RATCHET_FLAG)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.ratchet.read_text(encoding="utf-8")), {"page.md": {prose.KIND_BANNED_WORD: 1}})
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("page.md: banned-word 2 > ceiling 1", out)
+        self.assertIn("new.md: banned-word 1 > ceiling 0", out)
+
+    def test_write_ratchet_drops_a_deleted_page(self):
+        self.write_page("Fine.\n")
+        self.ratchet.write_text(json.dumps({"gone.md": {prose.KIND_BANNED_WORD: 1}}), encoding="utf-8")
+        self.run_main(prose.WRITE_RATCHET_FLAG)
+        self.assertEqual(json.loads(self.ratchet.read_text(encoding="utf-8")), {})
+
+    def test_no_pages_is_an_error_not_a_pass(self):
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR", out)
+        self.assertIn("no .md/.mdx page", out)
+
+    def test_page_key_is_site_relative_posix(self):
+        self.write_page("Fine.\n", "deep/dir/page.mdx")
+        self.assertEqual(list(prose.scan(self.site)), ["deep/dir/page.mdx"])
+
+
+class RealSiteTest(unittest.TestCase):
+    """The committed ratchet against the tree, and the run's time bound."""
+
+    def test_committed_ratchet_matches_the_site(self):
+        """What the check in CI sees: every page at its ceiling, none above or below."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = prose.main([])
+        self.assertEqual(code, 0, out.getvalue())
+
+    def test_ratchet_file_is_in_canonical_form(self):
+        """Sorted pages, kinds in report order, zero entries omitted, so a rewrite is a clean diff."""
+        text = prose.RATCHET.read_text(encoding="utf-8")
+        self.assertEqual(text, prose.dump_ratchet(json.loads(text)))
+        for page, kinds in json.loads(text).items():
+            self.assertTrue(kinds, page)
+            self.assertNotIn(0, kinds.values(), page)
+
+    def test_site_scan_runs_inside_the_time_budget(self):
+        start = time.monotonic()
+        prose.scan()
+        self.assertLess(time.monotonic() - start, SITE_TIME_BUDGET_SECONDS)
+
+
+if __name__ == "__main__":
+    unittest.main()
