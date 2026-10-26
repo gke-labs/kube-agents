@@ -2906,6 +2906,19 @@ class KubeAgentsHarness(AgentHarness):
                 f"{len(read.card_ids)}"
             )
 
+        triage_initial = [
+            t
+            for t in read.card_ids
+            if str(read.cards.get(t, {}).get("status") or "") == "triage"
+            and not read.cards.get(t, {}).get("summary")
+        ]
+        if triage_initial:
+            fresh_triage = _read(triage_initial)
+            if fresh_triage is not None:
+                read.cards.update(
+                    {t: c for t, c in fresh_triage.cards.items() if t in triage_initial}
+                )
+
         def _status(task_id: str) -> str:
             return str(read.cards.get(task_id, {}).get("status") or "unknown")
 
@@ -2915,11 +2928,12 @@ class KubeAgentsHarness(AgentHarness):
                 return True
             if st == "triage":
                 card = read.cards.get(task_id, {}) if read is not None else {}
-                runs = card.get("runs") or []
-                newest = runs[-1] if runs and isinstance(runs[-1], dict) else {}
-                summary = str(newest.get("summary") or "")
-                error = str(newest.get("error") or "")
-                return bool(_extract_infra_failure_reason(summary) or _extract_infra_failure_reason(error))
+                summary = str(card.get("summary") or "")
+                result_val = str(card.get("result") or "")
+                return bool(
+                    _extract_infra_failure_reason(summary)
+                    or _extract_infra_failure_reason(result_val)
+                )
             return False
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
@@ -2965,7 +2979,7 @@ class KubeAgentsHarness(AgentHarness):
                 break
             _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
             time.sleep(max(0.0, min(poll_interval, remaining)))
-            fresh = _read()
+            fresh = _read(outstanding)
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
