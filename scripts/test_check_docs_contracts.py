@@ -9,16 +9,18 @@ skill directories, an image inventory, the release image list, an allowlist --
 and asserts the verdict. The directions pinned: an unknown flag fails and a
 known one passes, with another command's flags not attributed to the installer;
 a field reached through an inline embed is required and an absent one fails
-unless allowlisted; a stale count fails in digit and word form while "four of
-the" is not a count; an allowlist entry with no finding fails; and every source
-file that goes missing fails the run instead of thinning it.
+unless allowlisted; a stale count fails in digit, word and compound-word form
+while "four of the" and a dotted version are not counts; an allowlist entry
+with no finding fails; and every source file that goes missing fails the run
+instead of thinning it.
 """
 
 import contextlib
 import io
 import json
+import subprocess
+import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -351,6 +353,19 @@ class FlagTest(RepoFixture):
         body = "```bash\nTOKEN_FILE=<(pass show x | head -n1) ./install.sh -y --bogus\n```\n"
         self.assertEqual(self.flag_findings(body), [("--bogus", 2)])
 
+    def test_options_inside_substitutions_and_quoted_values_are_not_the_scripts(self):
+        """`jq --raw-output` in `$(…)`, `head --lines` in `<(…)` and a quoted `--inner` are theirs, not the script's."""
+        body = (
+            "```bash\n"
+            "curl -fsSL https://example/upgrade.sh | KUBE_AGENTS_INSTALL_ENV=\"x\" bash -s -- \\\n"
+            "  --plan --upgrade-mode=\"$(cat state | jq --raw-output '.mode')\"\n"
+            "./install.sh --gcp-project-id=$(git rev-parse --short HEAD) --bogus-one\n"
+            "./install.sh --enable-gvisor=<(pass show x | head --lines=1) --dry-run >(tee --append log)\n"
+            "./install.sh --bogus-two \"--inner\" '--inner' --yes=a\\;b --bogus-three\n"
+            "```\n"
+        )
+        self.assertEqual(self.flag_findings(body), [("--bogus-one", 4), ("--bogus-three", 6), ("--bogus-two", 6)])
+
     def test_removal_script_is_not_a_mention_of_the_install_script(self):
         """`--source-ref` is the removal script's own flag; neither rule attributes it to install.sh."""
         body = "```bash\n./uninstall.sh --source-ref=v1.2.3 --dry-run\n```\n\nRun `uninstall.sh` with `--source-ref`.\n"
@@ -493,8 +508,21 @@ class CountTest(RepoFixture):
         body = "Run one fleet audit at a time; the one A2A console image; 1 release image; one platform skill.\n"
         self.assertEqual(self.count_findings(body), [])
 
-    def test_hyphenated_number_is_not_its_last_word(self):
-        self.assertEqual(self.count_findings("twenty-one fleet audits\n"), [])
+    def test_compound_number_word_is_read_whole(self):
+        """`twenty-one` is 21, never the `one` the hyphen refuses; the tens run to ninety."""
+        self.assertEqual(self.count_findings("twenty-one fleet audits\n"), ["twenty-one fleet audits"])
+        self.assertEqual(self.count_findings("the **Fifty-one** platform skills and ninety cluster skills\n"),
+                         ["**Fifty-one** platform skills", "ninety cluster skills"])
+        words = ("twenty-one", "Fifty-one", "ninety", "twenty")
+        self.assertEqual([contracts.number_value(word) for word in words], [21, 51, 90, 20])
+        self.write(SITE / PAGE_NAME, "# Title\n\ntwenty-one fleet audits\n")
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("says 21 fleet audits", out)
+
+    def test_dotted_version_before_a_count_noun_is_not_a_count(self):
+        body = "The 0.5.0 release images; roll back to the v1.2 release images; the 1.30 cluster skills.\n"
+        self.assertEqual(self.count_findings(body), [])
 
     def test_a2a_and_release_and_persona_counts(self):
         self.assertEqual(self.count_findings("the four A2A `next`-stack images\n"), ["four A2A `next`-stack images"])
@@ -597,24 +625,43 @@ class SourceFileTest(RepoFixture):
 
 
 class PatternBacktrackingTest(unittest.TestCase):
-    """Each shell pattern has one parse per input, so a crafted line cannot stall the check."""
+    """Each shell pattern has one parse per input, so a crafted line cannot stall the check.
+
+    The match runs in a subprocess under a timeout. A pattern that backtracks
+    exponentially never returns at this repetition count, and CPython's `re`
+    checks no signal while matching, so an in-process clock could only hang
+    the test sweep; the timeout turns the hang into a failed test.
+    """
 
     REPETITIONS = 60
-    TIME_BOUND_SECONDS = 1.0
+    # Interpreter start included. A regressed pattern never returns at
+    # REPETITIONS, so the bound sets how soon the test goes red, not how fast
+    # a sound pattern must be (those match in under a millisecond).
+    TIME_BOUND_SECONDS = 5.0
+    MATCH_SNIPPET = "import sys, check_docs_contracts; getattr(check_docs_contracts, sys.argv[1]).match(sys.argv[2])"
 
-    def assert_fast(self, pattern, text):
-        started = time.monotonic()
-        pattern.match(text)
-        self.assertLess(time.monotonic() - started, self.TIME_BOUND_SECONDS)
+    def assert_fast(self, pattern_name, text):
+        timed_out = False
+        try:
+            subprocess.run(
+                [sys.executable, "-c", self.MATCH_SNIPPET, pattern_name, text],
+                cwd=Path(__file__).resolve().parent,
+                check=True,
+                capture_output=True,
+                timeout=self.TIME_BOUND_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        self.assertFalse(timed_out, f"{pattern_name} did not finish on {len(text)} characters in {self.TIME_BOUND_SECONDS}s")
 
     def test_case_arm_with_many_bare_separators(self):
-        self.assert_fast(contracts.CASE_ARM_RE, "--0|" + "!|" * self.REPETITIONS)
+        self.assert_fast("CASE_ARM_RE", "--0|" + "!|" * self.REPETITIONS)
 
     def test_assignment_with_many_process_substitutions(self):
         """The match fails as a whole (`y ./` is no script), so every tiling of the value would be tried."""
         value = "X=" + "<(a)" * self.REPETITIONS + " y ./"
-        self.assert_fast(contracts.PIPED_RUNNER_RE, value)
-        self.assert_fast(contracts.SCRIPT_COMMAND_PREFIX_RE, value)
+        self.assert_fast("PIPED_RUNNER_RE", value)
+        self.assert_fast("SCRIPT_COMMAND_PREFIX_RE", value)
 
     def test_unclosed_substitution_is_a_value_character(self):
         self.assertIsNotNone(contracts.SCRIPT_COMMAND_PREFIX_RE.match("X=<(a ./"))

@@ -18,20 +18,23 @@ time and compared with what the documents say:
   paragraph that names exactly one of the three scripts. A script named as
   another command's argument (``curl -o install.sh …``) cites nothing, and so
   does a path to another script in the tree with the same file name (a
-  plugin's ``agentplugins/<plugin>/install.sh``). A command's flag must be one
-  the named script accepts; a standalone span's flag must be one some installer
-  script accepts, since a paragraph about one script often quotes another's.
+  plugin's ``agentplugins/<plugin>/install.sh``), and an option inside a
+  ``$(…)``, ``<(…)`` or quoted argument belongs to the command in there, not
+  to the script. A command's flag must be one the named script accepts; a
+  standalone span's flag must be one some installer script accepts, since a
+  paragraph about one script often quotes another's.
 * **CRD fields** -- every ``json`` field name reachable from a kind's ``Spec``
   and ``Status`` structs, inline embeds followed, must appear as a word on the
   kind's CRD page. Only structs of the API package are walked: the fields
   inside a ``corev1`` or ``metav1`` type are Kubernetes' own and not required.
-* **Counts** -- a number, as digits or a word, directly before ``fleet audits``,
+* **Counts** -- a number, as digits or a word up to ``ninety-nine``, directly before ``fleet audits``,
   ``governance watchdogs``, ``audit crons``, ``A2A … images``, ``release
   images`` or ``<persona> skills`` must equal the count the source gives:
   enabled ``jobs.json`` entries carrying the ``fleet-audit`` skill, ``SKILL.md``
   directories under each persona, ``a2a-*`` entries in ``images.json``, and the
   ``REQUIRED_RELEASE_IMAGES`` array. The noun is plural: "four of the fleet
-  audits" and "one fleet audit" are not counts.
+  audits" and "one fleet audit" are not counts, and neither is a dotted
+  version ("the 0.5.0 release images").
 
 The documents scanned are the published site, ``INSTALL.md`` and ``README.md``.
 
@@ -131,10 +134,18 @@ SCRIPT_COMMAND_PREFIX_RE = re.compile(
     r"^\s*(?:\$\s+)?" + ASSIGNMENT_RE_FRAGMENT + r"(?:(?:sudo|time)(?:\s+-\S+)*\s+)?"
     r"(?:(?:bash|sh)(?:\s+-\S+)*\s+(?:<\(\s*\S+(?:\s+\S+)*?\s+)?)?\S*$"
 )
-# Separators are read outside parentheses only, so `X=<(a | b) ./install.sh`
-# stays one command.
+# Separators and the options after a script are read at depth zero outside
+# quotes: one walk blanks every parenthesised group (`$(…)`, `<(…)`, `>(…)`)
+# and quoted value to spaces, so `X=<(a | b) ./install.sh` stays one command
+# and `--image-tag="$(cat tag | jq --raw-output .)"` cites `--image-tag` and
+# not `--raw-output`. A backslash outside single quotes escapes the next
+# character.
 GROUP_OPEN = "("
 GROUP_CLOSE = ")"
+QUOTES = ("'", '"')
+SINGLE_QUOTE = "'"
+SHELL_ESCAPE = "\\"
+MASK_CHAR = " "
 # A shell comment: `#` at the start of a line or after whitespace, so a URL
 # fragment is kept.
 SHELL_COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
@@ -198,22 +209,35 @@ COUNT_FLEET_AUDITS = "fleet audits"
 COUNT_A2A_IMAGES = "A2A images"
 COUNT_RELEASE_IMAGES = "release images"
 COUNT_PERSONA_SKILLS = "{persona} skills"
+# The number words: zero to twenty by index, then the tens, which a unit word
+# may follow after a hyphen (`twenty-one`, `fifty-one`).
 NUMBER_WORDS = (
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
     "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
     "nineteen", "twenty",
 )
-# Not a suffix of a longer word or a hyphenated number: `twenty-one` is not `one`.
+TENS_WORDS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+UNIT_WORDS = NUMBER_WORDS[1:10]
+COMPOUND_SEPARATOR = "-"
+NUMBER_WORD_RE_FRAGMENT = (
+    r"(?:" + "|".join(TENS_WORDS) + r")(?:" + COMPOUND_SEPARATOR + r"(?:" + "|".join(UNIT_WORDS) + r"))?|"
+    + "|".join(NUMBER_WORDS)
+)
+# Not a suffix of a longer word or of a dotted version: `someone` is not `one`
+# and `0.5.0` is not `0`; a hyphenated compound is read whole, so `twenty-one`
+# is 21 and never `one`.
 # Emphasis or a code span may sit between the number and its noun: `**ten** fleet audits`.
 # The number is read off the text before a phrase match, anchored at its end, so
 # the phrase is what the document is searched for and the number is checked only
 # where a phrase stands: searching for the number first ran over the two-second
 # budget.
 NUMBER_BEFORE_RE = re.compile(
-    r"(?<![\w-])[*_`]*(?P<number>\d+|" + "|".join(NUMBER_WORDS) + r")[*_`]*\s+[*_`]*$", re.IGNORECASE
+    r"(?<![\w.-])[*_`]*(?P<number>\d+|" + NUMBER_WORD_RE_FRAGMENT + r")[*_`]*\s+[*_`]*$", re.IGNORECASE
 )
-# How far before a phrase the number may start: the longest number word, its
-# markup and the whitespace between.
+# How far before a phrase the number may start: the longest compound number
+# word, its markup and the whitespace between.
 NUMBER_WINDOW = 24
 # The subject phrases, keyed by the count they state. `A2A` may carry up to
 # two words before `images` (`A2A next-stack images`); the persona list is
@@ -433,25 +457,46 @@ def script_mentions(text: str, namesakes: dict[str, tuple[str, ...]]) -> list[tu
     return mentions
 
 
-def split_commands(command: str) -> list[str]:
-    """The simple commands of a command line, split at `|`, `||`, `&&` and `;` outside parentheses."""
-    segments: list[str] = []
+def outer_text(command: str) -> str:
+    """The command with every parenthesised group and quoted span blanked to spaces, the same length.
+
+    Offsets into the result are offsets into the command, so a match found on
+    the raw text (the script's name, the runner) selects a tail of the blanked
+    one, and what a substitution or a quoted value contains is neither a
+    separator nor an option of the script.
+    """
+    outer: list[str] = []
     depth = 0
-    start = 0
-    position = 0
-    while position < len(command):
-        char = command[position]
-        if char == GROUP_OPEN:
+    quote = ""
+    escaped = False
+    for char in command:
+        hidden = True
+        if escaped:
+            escaped = False
+        elif char == SHELL_ESCAPE and quote != SINGLE_QUOTE:
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in QUOTES:
+            quote = char
+        elif char == GROUP_OPEN:
             depth += 1
         elif char == GROUP_CLOSE and depth:
             depth -= 1
-        separator = COMMAND_SEPARATOR_RE.match(command, position) if not depth else None
-        if separator:
-            segments.append(command[start:position])
-            position = separator.end()
-            start = position
-            continue
-        position += 1
+        else:
+            hidden = depth > 0
+        outer.append(MASK_CHAR if hidden else char)
+    return "".join(outer)
+
+
+def split_commands(command: str) -> list[str]:
+    """The simple commands of a command line, split at `|`, `||`, `&&` and `;` outside parentheses and quotes."""
+    segments: list[str] = []
+    start = 0
+    for separator in COMMAND_SEPARATOR_RE.finditer(outer_text(command)):
+        segments.append(command[start : separator.start()])
+        start = separator.end()
     segments.append(command[start:])
     return segments
 
@@ -462,7 +507,9 @@ def command_flag_citations(command: str, namesakes: dict[str, tuple[str, ...]] |
     The options after the script's name count when the script is the segment's
     command (``SCRIPT_COMMAND_PREFIX_RE``); the next segment's options after
     the runner's own count when it is a ``bash``/``sh`` runner fed by this one
-    (``curl … | bash -s -- …``, ``PIPED_RUNNER_RE``).
+    (``curl … | bash -s -- …``, ``PIPED_RUNNER_RE``). Either tail is read
+    with its substitutions and quoted values blanked (``outer_text``), so an
+    option of a command inside an argument is not the script's.
     """
     segments = split_commands(command)
     citations: list[tuple[str, str]] = []
@@ -470,11 +517,11 @@ def command_flag_citations(command: str, namesakes: dict[str, tuple[str, ...]] |
         for name, script in script_mentions(segment, namesakes or {}):
             flags: list[str] = []
             if SCRIPT_COMMAND_PREFIX_RE.match(segment[: script.start()]):
-                tail = segment[script.end() :]
+                tail = outer_text(segment)[script.end() :]
                 flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(tail))
             runner = PIPED_RUNNER_RE.match(segments[index + 1]) if index + 1 < len(segments) else None
             if runner:
-                tail = segments[index + 1][runner.end() :]
+                tail = outer_text(segments[index + 1])[runner.end() :]
                 flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(tail))
             citations.extend((name, flag) for flag in flags)
     return citations
@@ -745,9 +792,13 @@ def count_rules(repo: Path) -> list[CountRule]:
 
 
 def number_value(text: str) -> int:
+    """The integer a matched number spells: digits, a number word, or a tens word with a hyphenated unit."""
     lowered = text.lower()
     if lowered.isdigit():
         return int(lowered)
+    tens, _, unit = lowered.partition(COMPOUND_SEPARATOR)
+    if tens in TENS_WORDS:
+        return TENS_WORDS[tens] + (NUMBER_WORDS.index(unit) if unit else 0)
     return NUMBER_WORDS.index(lowered)
 
 
