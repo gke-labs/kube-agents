@@ -51,9 +51,9 @@ domain: chat-and-routing
 verification_spec:
   # The answer the user receives is the fleet as read, not a guess: the
   # three seeded clusters (agent-kanban-smoke's rendering contract: slots
-  # a/b/c under the fleet prefix's default) and a Kubernetes minor version:
-  # 1.NN, v-prefixed or not, but not a quantity (1.25Gi, 1.50 vCPU, $1.20)
-  # or an address that opens with 1.
+  # a/b/c under the fleet prefix's default) and a Kubernetes version in the
+  # shape gcloud and kubectl report it, with its patch component (1.33.5,
+  # v1.33.5, 1.33.5-gke.1080000): a bare 1.NN is too often a quantity.
   - name: the-answer-names-the-fleet-and-a-version
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -62,7 +62,7 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["seeded-a", "seeded-b", "seeded-c"]
-      required_patterns: ['(?<![\w.$])v?1\.\d{2}(?!\d)(?!\.\d+\.\d)(?![a-z]|\s*(?:[kmgtp]i?b?|vcpu|cpus?|cores?|%)(?![a-z]))']
+      required_patterns: ['(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d)']
   # The same inside a delivered card result, the report the notifier posts
   # into the conversation on next: a front door that answered from memory,
   # with no specialist reading the fleet, does not pass.
@@ -72,4 +72,4 @@ verification_spec:
     check:
       type: report_contains
       required_patterns:
-        - 'result of delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-a)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-b)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-c)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?<![\w.$])v?1\.\d{2}(?!\d)(?!\.\d+\.\d)(?![a-z]|\s*(?:[kmgtp]i?b?|vcpu|cpus?|cores?|%)(?![a-z])))'
+        - 'result of delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-a)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-b)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-c)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d))'

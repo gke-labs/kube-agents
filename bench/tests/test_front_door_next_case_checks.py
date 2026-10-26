@@ -142,9 +142,14 @@ ROUTING = "chat-routing-fleet-question"
             False,
             id="a vCPU count and a price",
         ),
-        pytest.param(RESULT + "seeded-a, seeded-b and seeded-c run 1.33.", True, id="a bare minor version"),
+        pytest.param(RESULT + "seeded-a, seeded-b and seeded-c run 1.33.", False, id="a bare minor version"),
         pytest.param(
-            "seeded-a, seeded-b and seeded-c, all on 1.33.", False, id="the front door answered with no card result"
+            RESULT + "seeded-a, seeded-b and seeded-c: p50 1.20 ms, load 1.25, 1.50 GHz.",
+            False,
+            id="a latency, a load average and a clock speed",
+        ),
+        pytest.param(
+            "seeded-a, seeded-b and seeded-c, all on 1.33.5.", False, id="the front door answered with no card result"
         ),
     ],
 )
@@ -191,3 +196,40 @@ def test_a_question_section_ends_the_front_doors_own_text() -> None:
     answer = RESULT + "checkout-gateway is healthy."
     question = QUESTION.replace("t_1a2b3c4d", "t_2") + "Which cluster should I check? Let me know."
     assert _ack_passes(f"checking checkout-gateway.\n\n{answer}\n\n{question}")
+
+
+def test_a_paused_specialist_also_follows_the_ack() -> None:
+    question = QUESTION + "checkout-gateway runs on two clusters. Which should I check?\n- seeded-a\n- seeded-b"
+    assert _ack_passes("checking checkout-gateway.\n\n" + question)
+
+
+NEXT_STEP = "chat-answer-declares-next-step"
+
+
+@pytest.mark.parametrize(
+    ("delivered", "passes"),
+    [
+        pytest.param(
+            RESULT + "payments-api is OOMKilled against its 64Mi limit.\n[next: raise the memory limit]",
+            True,
+            id="one step at the end",
+        ),
+        pytest.param(
+            RESULT + "payments-api is OOMKilled against its 64Mi limit.\n[next: raise the memory limit]\n\n"
+            + QUESTION.replace("t_1a2b3c4d", "t_2")
+            + "Which cluster?\n- seeded-a\n- seeded-b",
+            True,
+            id="one step, then another card's question",
+        ),
+        pytest.param(
+            RESULT + "payments-api is OOMKilled.\n[next: raise the limit]\n[next: lower usage]",
+            False,
+            id="two steps",
+        ),
+        pytest.param(RESULT + "payments-api is OOMKilled. Want me to raise the limit?", False, id="an offer in prose"),
+    ],
+)
+def test_the_next_step_ends_the_answer_before_any_question_section(delivered: str, passes: bool) -> None:
+    transcript.set(ACK, [], final_message=f"{ACK}\n\n{delivered}")
+    checks = _report_checks(NEXT_STEP)
+    assert all(ReportContainsVerifier(**c).verify(timeout_sec=1.0).success for c in checks) is passes
