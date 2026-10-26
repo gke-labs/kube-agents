@@ -44,12 +44,16 @@ MONITORING_DELAY_SECONDS = 240
 REGISTRATION_POLL_SECONDS = 60
 # Time for a restarted watcher to list and sync every cluster before it is asked what it watches.
 WATCHER_START_SECONDS = 180
+WATCHER_POLL_SECONDS = 30
 RESPONSE_FITS = ["response_seconds"]
 LEVEL_LABEL = "harness-scale/level"
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 DEFAULT_DATA_FILE = "harness-limits.json"
 SECONDS_PER_MINUTE = 60
 FIXTURES = ("objects", "listing", "warning", "churn")
+# The values that shape the fleet; a level that changes none of them needs no settle time.
+FLEET_VALUES = ("clusters", "nodes", "objects", "churn_per_minute", "failing_pods", "listing_pods")
+FIXTURE_PARALLELISM = 8
 # The tag of an image pinned by commit is the commit; anything else is recorded as the image only.
 COMMIT_LENGTH = 40
 HEX_DIGITS = set("0123456789abcdef")
@@ -67,6 +71,9 @@ KUBECONFIG_SUFFIX = ".kubeconfig"
 # cancelled (they need a GitOps repository; they honour the scope's exclusions).
 NEEDS_ANSWER_CHECK = ("fleet_audit", "upgrade_readiness")
 UNFINISHED_METRIC = "unfinished_prompts"
+PROXY_CONCURRENCY = "proxy_concurrency"
+# A Cluster Agent profile's kubeconfig in the sandbox shell, which proxy_load points its commands at.
+PROFILE_KUBECONFIG_GLOB = "/opt/data/profiles/cluster-{project}-{cluster}-*/kubeconfig.yaml"
 PROFILES_METRIC = "profiles"
 CLUSTERS_TOTAL = "clusters"
 STALE_PROFILES_NOTE = "profiles of deleted test clusters still present"
@@ -122,6 +129,8 @@ class Runner:
         # What the latest watcher check found; replaced at each check, so a record carries only its own.
         self.watch_errors: list[str] = []
         self.relay_port = 0
+        # The fleet values of the level applied last, so a level that keeps them skips the settle.
+        self.applied_fleet: dict[str, float] | None = None
 
     # --- the fleet ----------------------------------------------------------------------------
 
@@ -144,7 +153,9 @@ class Runner:
         missing = [name for name in wanted if name not in existing]
         extra = [name for name in existing if name not in wanted]
         if missing or extra:
-            with ThreadPoolExecutor(max_workers=len(missing) + len(extra)) as pool:
+            # A bound keeps a large level from opening dozens of GKE operations at once.
+            parallel = int(self.settings.get("cluster_create_parallelism", 0)) or len(missing) + len(extra)
+            with ThreadPoolExecutor(max_workers=min(parallel, len(missing) + len(extra))) as pool:
                 jobs = [pool.submit(self._create_cluster, name) for name in missing]
                 jobs += [pool.submit(kube.delete_cluster, self.project, self.zone, name) for name in extra]
                 for job in jobs:
@@ -179,12 +190,22 @@ class Runner:
         profiles match, a watch set that differs from the test fleet is fixed by
         restarting the gateway pod, which is what an operator would have to do.
         Whatever is still wrong after that is recorded on every run of the level.
+        With ``trigger_reconcile`` set, a profile set that differs from the fleet
+        runs the reconcile at once instead of waiting for its hourly tick.
         """
         names = set(self.cluster_names(count))
         self.watch_errors = []
         timeout = float(self.settings.get("cluster_registration_timeout_seconds", 0))
         deadline = time.monotonic() + timeout
         profiles = self.install.profile_clusters()
+        if self.settings.get("trigger_reconcile") and self.test_clusters(profiles) != names:
+            LOG.info("profiles for %s of %s test clusters; running the Cluster Agent reconcile",
+                     len(profiles & names), count)
+            try:
+                operations.reconcile_profiles(self.install.context, self.install.namespace)
+            except kube.CommandError as exc:
+                LOG.warning("the reconcile failed; waiting for its hourly run instead: %s", exc)
+            profiles = self.install.profile_clusters()
         stale = self.test_clusters(profiles) - names
         if stale:
             # A deleted test cluster's profile stays until the reconcile prunes it; the run says so.
@@ -202,9 +223,19 @@ class Runner:
                         sorted(test_watched), sorted(names))
             operations.restart(self.install.context, self.install.namespace)
             time.sleep(WATCHER_START_SECONDS)
-            test_watched = self.test_clusters(self.install.watched_clusters())
+            test_watched = self._wait_watched(names)
             if test_watched != names:
                 self.watch_errors.append(f"event watcher watches {sorted(test_watched)}, test fleet is {sorted(names)}")
+
+    def _wait_watched(self, names: set[str]) -> set[str]:
+        """The test clusters the watcher reports as up, polled until they are ``names`` or
+        ``watcher_wait_seconds`` (default 0: one look) runs out; a large fleet takes longer to sync."""
+        deadline = time.monotonic() + float(self.settings.get("watcher_wait_seconds", 0))
+        while True:
+            watched = self.test_clusters(self.install.watched_clusters())
+            if watched == names or time.monotonic() >= deadline:
+                return watched
+            time.sleep(WATCHER_POLL_SECONDS)
 
     def ensure_nodes(self, values: dict[str, float]) -> None:
         """Size each test cluster's fixture pool for the level's node count and the Pods it must hold."""
@@ -231,18 +262,22 @@ class Runner:
     def ensure_fixtures(self, values: dict[str, float]) -> None:
         contexts = self.contexts(int(values["clusters"]))
         objects = int(values["objects"])
-        for context in contexts:
-            if self._applied_level(context, "objects") not in (None, objects):
-                fixtures.delete_fixture(context, "objects")
-                self._wait_fixture_gone(context, "objects")
-            manifests = fixtures.objects_manifests(objects)
-            for manifest in manifests:
-                if manifest["kind"] == "Namespace":
-                    manifest["metadata"]["labels"][LEVEL_LABEL] = str(objects)
-            kube.apply(context, manifests)
+        with ThreadPoolExecutor(max_workers=min(FIXTURE_PARALLELISM, len(contexts))) as pool:
+            for job in [pool.submit(self._ensure_objects, context, objects) for context in contexts]:
+                job.result()
         first = contexts[0]
         kube.apply(first, fixtures.listing_manifests(int(values["listing_pods"])))
         kube.apply(first, fixtures.warning_manifests(int(values["failing_pods"])))
+
+    def _ensure_objects(self, context: str, objects: int) -> None:
+        if self._applied_level(context, "objects") not in (None, objects):
+            fixtures.delete_fixture(context, "objects")
+            self._wait_fixture_gone(context, "objects")
+        manifests = fixtures.objects_manifests(objects)
+        for manifest in manifests:
+            if manifest["kind"] == "Namespace":
+                manifest["metadata"]["labels"][LEVEL_LABEL] = str(objects)
+        kube.apply(context, manifests)
 
     def _applied_level(self, context: str, fixture: str) -> int | None:
         items = kube.kubectl_json(context, "get", "namespaces", "-l", f"{fixtures.FIXTURE_LABEL}={fixture}")["items"]
@@ -282,9 +317,12 @@ class Runner:
         self.churner = fixtures.Churner(self.contexts(int(values["clusters"])), values["churn_per_minute"],
                                         int(self.settings["churn_pod_lifetime_seconds"]))
         self.churner.start()
-        settle = int(self.settings.get("settle_seconds", 0))
-        LOG.info("settling for %ss", settle)
-        time.sleep(settle)
+        fleet = {key: values[key] for key in FLEET_VALUES if key in values}
+        if fleet != self.applied_fleet:
+            settle = int(self.settings.get("settle_seconds", 0))
+            LOG.info("settling for %ss", settle)
+            time.sleep(settle)
+        self.applied_fleet = fleet
         return values
 
     def scrub(self, text: str) -> str:
@@ -389,6 +427,10 @@ class Runner:
         elif op.kind == "restart_soak":
             operations.restart(self.install.context, self.install.namespace)
             outcome = operations.soak(op.window_seconds)
+        elif op.kind == "proxy_load":
+            concurrency = int(values.get(PROXY_CONCURRENCY, 1))
+            kubeconfig_glob = PROFILE_KUBECONFIG_GLOB.format(project=self.project, cluster=self.cluster_names(count)[0])
+            outcome = operations.proxy_load(self.install.context, self.install.namespace, op, concurrency, kubeconfig_glob)
         elif op.kind == "reset_soak":
             self.check_resettable()
             operations.reset(self.install.context, self.install.namespace)
@@ -416,6 +458,8 @@ class Runner:
             metrics.append(records.Metric("unfinished_prompts", float(outcome.unfinished_prompts)))
         if outcome.response_seconds:
             metrics.append(records.Metric("response_seconds", max(outcome.response_seconds)))
+        for name, value in outcome.metrics.items():
+            metrics.append(records.Metric(name, value))
         # tokens_* (from LiteLLM) count every model call in the window, background jobs included, and
         # their input counts the whole prompt; run_tokens_* (from the harness) count the sessions this
         # run's prompts opened, and their input is the non-cached part alone.

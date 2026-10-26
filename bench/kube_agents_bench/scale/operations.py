@@ -9,6 +9,7 @@ the harness keeps its port-forward state per process.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import multiprocessing
 import os
@@ -71,7 +72,46 @@ LOCALHOST = "127.0.0.1"
 RELAY_START_SECONDS = 15
 KUBECONFIG_MODE = 0o600
 RELAY_KUBECONFIG_PREFIX = "harness-scale-"
+SHELL_POD = "platform-agent-shell-0"
+SHELL_CONTAINER = "shell"
+# The sandbox's client for brokered commands: the path every agent kubectl and gcloud takes.
+PROXY_CLIENT = "credential-proxy-exec"
+PROXY_LOAD_GRACE_SECONDS = 600
+MIN_WALL_SECONDS = 1e-3
+# Runs inside the shell container: concurrency, seconds, argv (JSON, "{kubeconfig}" filled in), kubeconfig glob.
+PROXY_LOAD_SCRIPT = """
+import concurrent.futures, glob, json, subprocess, sys, time
+concurrency, seconds = int(sys.argv[1]), float(sys.argv[2])
+kubeconfig = sorted(glob.glob(sys.argv[4]))[0]
+argv = [a.replace("{kubeconfig}", kubeconfig) for a in json.loads(sys.argv[3])]
+deadline = time.time() + seconds
+def worker(_):
+    done, errors, first = [], 0, ""
+    while time.time() < deadline:
+        start = time.time()
+        p = subprocess.run(argv, capture_output=True, text=True)
+        if p.returncode == 0:
+            done.append(time.time() - start)
+        else:
+            errors += 1
+            first = first or (p.stderr or p.stdout).strip()[:200]
+    return done, errors, first
+began = time.time()
+with concurrent.futures.ThreadPoolExecutor(concurrency) as pool:
+    results = list(pool.map(worker, range(concurrency)))
+wall = time.time() - began
+latency = sorted(d for done, _, _ in results for d in done)
+pick = lambda q: latency[min(len(latency) - 1, int(q * len(latency)))] if latency else None
+print(json.dumps({"completed": len(latency), "errors": sum(e for _, e, _ in results), "wall": wall,
+                  "p50": pick(0.5), "p95": pick(0.95), "max": latency[-1] if latency else None,
+                  "first_error": next((f for _, _, f in results if f), "")}))
+"""
 KUBECONFIG_SUFFIX = ".kubeconfig"
+# The hourly Cluster Agent reconcile (agents/chat/defaults/cron/jobs.json), which the gateway's
+# agent container ticks; run at once, it scaffolds new clusters' profiles and prunes deleted ones'.
+RECONCILE_CONTAINER = "platform-agent"
+RECONCILE_COMMAND = ("python3", "/opt/data/scripts/cluster_agent_reconcile.py")
+RECONCILE_TIMEOUT_SECONDS = 1800
 # What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
 RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
 RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
@@ -90,6 +130,8 @@ class OperationResult:
     provider_429s: int = 0
     run_slot_refusals: int = 0
     errors: list[str] = field(default_factory=list)
+    # Operation-specific measurements (proxy_load's throughput and latency).
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 def agent_env(context: str, namespace: str, local_port: int) -> dict[str, str]:
@@ -257,6 +299,40 @@ def run_prompts(operation: Operation, env: dict[str, str], concurrent: int, firs
     return outcome
 
 
+def proxy_load(context: str, namespace: str, operation: Operation, concurrency: int,
+               kubeconfig_glob: str) -> OperationResult:
+    """Drive the credential proxy with brokered commands, as the agent's sandbox does, and time them.
+
+    ``concurrency`` workers in the sandbox shell each repeat ``operation.command``
+    through ``credential-proxy-exec`` for ``operation.window_seconds``; the run
+    records the commands completed per second and their latency. No model call
+    is involved, so the result is the broker's own capacity.
+    """
+    outcome = OperationResult()
+    argv = [PROXY_CLIENT, *operation.command]
+    try:
+        out = kube.kubectl(context, "exec", "-i", "-n", namespace, SHELL_POD, "-c", SHELL_CONTAINER, "--",
+                           "python3", "-", str(concurrency), str(operation.window_seconds), json.dumps(argv),
+                           kubeconfig_glob, stdin=PROXY_LOAD_SCRIPT,
+                           timeout=operation.window_seconds + PROXY_LOAD_GRACE_SECONDS)
+        result = json.loads(out.strip().splitlines()[-1])
+    except (kube.CommandError, ValueError, IndexError) as exc:
+        outcome.errors.append(f"proxy load failed: {exc}")
+        return outcome
+    wall = max(float(result["wall"]), MIN_WALL_SECONDS)
+    outcome.metrics = {
+        "proxy_load_completed": float(result["completed"]),
+        "proxy_load_errors": float(result["errors"]),
+        "proxy_load_per_second": float(result["completed"]) / wall,
+    }
+    for name in ("p50", "p95", "max"):
+        if result.get(name) is not None:
+            outcome.metrics[f"proxy_load_{name}_seconds"] = float(result[name])
+    if result.get("first_error"):
+        outcome.errors.append(f"proxy load command error: {result['first_error']}")
+    return outcome
+
+
 def soak(window_seconds: int) -> OperationResult:
     time.sleep(window_seconds)
     return OperationResult()
@@ -266,6 +342,20 @@ def _gateway_pod(context: str, namespace: str) -> str | None:
     pods = kube.kubectl_json(context, "get", "pods", "-n", namespace, "-l", GATEWAY_SELECTOR)["items"]
     live = [p for p in pods if not p["metadata"].get("deletionTimestamp")]
     return f"pod/{live[0]['metadata']['name']}" if live else None
+
+
+def reconcile_profiles(context: str, namespace: str) -> None:
+    """Run the Cluster Agent reconcile now rather than at its next hourly tick.
+
+    It does what that tick would: a profile for each cluster in scope that has
+    none, and no profile for a cluster that is gone. A reconcile already running
+    holds the lock, and this one returns at once.
+    """
+    pod = _gateway_pod(context, namespace)
+    if not pod:
+        raise kube.CommandError("no gateway pod to run the reconcile in")
+    kube.kubectl(context, "exec", "-n", namespace, pod, "-c", RECONCILE_CONTAINER, "--", *RECONCILE_COMMAND,
+                 timeout=RECONCILE_TIMEOUT_SECONDS)
 
 
 def wait_gateway_ready(context: str, namespace: str, timeout: float = RESET_TIMEOUT_SECONDS) -> None:

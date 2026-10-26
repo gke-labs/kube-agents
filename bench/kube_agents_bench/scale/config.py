@@ -19,6 +19,10 @@ import yaml
 from kube_agents_bench.scale import kube
 
 BASE_FACTOR = "base"
+# A factor whose levels are points that move several factors at once: level N is the plan's
+# Nth ``combined`` point (1-based). It is listed under ``factors`` like any other, so the
+# plan's order decides when it runs.
+COMBINED_FACTOR = "combined"
 ENV_PREFIX = "SCALE_"
 TARGET_KEYS = (
     "project_id",
@@ -48,6 +52,8 @@ class Operation:
     follow_up: str = ""
     window_seconds: int = 0
     timeout_seconds: int = 0
+    # proxy_load: the command each worker repeats, as an argv after the CLI name.
+    command: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,11 +72,15 @@ class Plan:
     factors: dict[str, list[float]]
     operations: list[Operation]
     settings: dict[str, Any] = field(default_factory=dict)
+    combined: list[dict[str, float]] = field(default_factory=list)
 
     def level_values(self, factor: str, level: float) -> dict[str, float]:
-        """Every factor's value at one point: the base, with ``factor`` set to ``level``."""
+        """Every factor's value at one point: the base, with ``factor`` set to ``level``,
+        or with the level's point applied when ``factor`` is the combined factor."""
         values = dict(self.base)
-        if factor != BASE_FACTOR:
+        if factor == COMBINED_FACTOR:
+            values.update(self.combined[int(level) - 1])
+        elif factor != BASE_FACTOR:
             values[factor] = level
         return values
 
@@ -123,6 +133,7 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
             follow_up=spec.get("follow_up", ""),
             window_seconds=int(spec.get("window_seconds", 0)),
             timeout_seconds=int(spec.get("timeout_seconds", 0)),
+            command=tuple(spec.get("command") or ()),
         )
         for name, spec in (raw.get("operations") or {}).items()
     ]
@@ -130,6 +141,14 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
     unknown = sorted({f for op in operations for f in op.factors} - set(factors))
     if unknown:
         raise ValueError(f"{path}: operations name unknown factors {unknown}")
+    combined = [{name: float(value) for name, value in point.items()} for point in raw.get("combined") or []]
+    points = range(1, len(combined) + 1)
+    bad = [level for level in factors.get(COMBINED_FACTOR, []) if level not in points]
+    if bad:
+        raise ValueError(f"{path}: combined levels {bad} name no point; the plan has {len(combined)}")
+    strays = sorted({name for point in combined for name in point} - set(raw["base"]))
+    if strays:
+        raise ValueError(f"{path}: combined points set factors the base does not have: {strays}")
     return Plan(
         phase=str(raw["phase"]),
         target=target,
@@ -137,4 +156,5 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
         factors=factors,
         operations=operations,
         settings=raw.get("settings") or {},
+        combined=combined,
     )

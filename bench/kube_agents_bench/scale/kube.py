@@ -13,6 +13,7 @@ import re
 import subprocess
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,8 @@ TRANSIENT_RE = re.compile(
 )
 STDERR_TAIL_CHARS = 2000
 FIXTURE_DISK_GB = 20
+# Clusters counted at once; a 32-cluster level is otherwise minutes of serial kubectl calls per run.
+TOTALS_PARALLELISM = 8
 RELEASE_CHANNEL = "regular"
 NODE_POOL_LABEL = "cloud.google.com/gke-nodepool"
 LABELS_FIELD = "resourceLabels"
@@ -159,9 +162,14 @@ def count(context: str, resource: str) -> int:
 def totals(contexts: list[str]) -> dict[str, int]:
     """Object counts by kind, summed over the test clusters, plus the cluster count."""
     result = {name: 0 for name in COUNTED_KINDS}
-    for context in contexts:
-        for name, resource in COUNTED_KINDS.items():
-            result[name] += count(context, resource)
+
+    def one(context: str) -> dict[str, int]:
+        return {name: count(context, resource) for name, resource in COUNTED_KINDS.items()}
+
+    with ThreadPoolExecutor(max_workers=max(1, min(TOTALS_PARALLELISM, len(contexts)))) as pool:
+        for counts in pool.map(one, contexts):
+            for name, value in counts.items():
+                result[name] += value
     result["clusters"] = len(contexts)
     return result
 

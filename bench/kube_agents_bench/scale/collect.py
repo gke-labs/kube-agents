@@ -86,6 +86,10 @@ WATCHER_COUNTERS = {
     "watcher_quota_suppressed": "k8s_event_watcher_events_quota_suppressed_total",
 }
 PROXY_REFUSALS = "kubeagents_credential_proxy_admission_refusals_total"
+# Every brokered command the proxy ran, and the seconds they ran for: the demand a fleet puts
+# on the broker, and how much of its slots that demand held.
+PROXY_COMMANDS = "kubeagents_tool_invocations_total"
+PROXY_COMMAND_SECONDS = "kubeagents_tool_execution_duration_seconds_sum"
 PROXY_WAIT = "kubeagents_credential_proxy_admission_wait_seconds"
 PROXY_WAIT_QUANTILES = (("proxy_wait_p50_seconds", 0.5), ("proxy_wait_max_seconds", 1.0))
 TOKEN_FAMILIES = {
@@ -482,6 +486,8 @@ def counter_metrics(before: Snapshot, after: Snapshot) -> list[Metric]:
             metrics.append(Metric(name, _growth(before, after, "watcher", family)))
     if after.scraped.get("proxy"):
         metrics.append(Metric("proxy_refusals", _growth(before, after, "proxy", PROXY_REFUSALS)))
+        metrics.append(Metric("proxy_commands", _growth(before, after, "proxy", PROXY_COMMANDS)))
+        metrics.append(Metric("proxy_command_seconds", _growth(before, after, "proxy", PROXY_COMMAND_SECONDS)))
         delta: dict[float, float] = {}
         for pod, samples in after.scraped["proxy"].items():
             earlier = histogram_buckets(before.scraped.get("proxy", {}).get(pod, []), PROXY_WAIT)

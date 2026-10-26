@@ -498,3 +498,121 @@ def test_a_plan_without_mode_is_refused_at_load(tmp_path):
     trimmed.write_text(text)
     with pytest.raises(ValueError, match="SCALE_MODE"):
         load_plan(trimmed, environ=ENV)
+
+
+PHASE2 = REPO_BENCH / "scale" / "phase2.yaml"
+
+
+def test_phase2_runs_levels_in_plan_order_and_reuses_the_phase1_base():
+    plan = load_plan(PHASE2, environ=ENV)
+    levels = list(dict.fromkeys((s.factor, s.level) for s in plan.matrix()))
+    assert levels[0] == ("base", 0)
+    assert [f for f, _ in levels[1:]] == ["proxy_concurrency"] * 4 + ["concurrent"] * 3 + ["failing_pods"] * 2 + [
+        "combined", "clusters", "clusters"]
+    assert plan.level_values("combined", 1) == {**plan.base, "clusters": 8, "objects": 4000}
+    phase1 = load_plan(PHASE1, environ=ENV)
+    shared = {s.operation.name for s in plan.matrix() if s.factor == "base"} & {o.name for o in phase1.operations}
+    assert shared == {"onboarding", "watcher_soak", "fan_out", "boot_burst"}
+    # Same base fleet, so the base keys the Phase 1 runs wrote stand for Phase 2's base too.
+    assert plan.level_values("base", 0).items() >= phase1.level_values("base", 0).items()
+
+
+def test_a_combined_level_must_name_a_point(tmp_path):
+    text = PHASE2.read_text().replace("combined: [1]", "combined: [1, 2]")
+    path = tmp_path / "plan.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="combined levels"):
+        load_plan(path, environ=ENV)
+
+
+def test_proxy_load_reads_the_workers_summary(monkeypatch):
+    calls = []
+    summary = {"completed": 90, "errors": 2, "wall": 180.0, "p50": 4.5, "p95": 9.0, "max": 12.0,
+               "first_error": "error: You must be logged in"}
+    monkeypatch.setattr(operations.kube, "kubectl",
+                        lambda *a, **k: calls.append((a, k)) or "noise\n" + json.dumps(summary) + "\n")
+    op = load_plan(PHASE2, environ=ENV).operations[-1]
+    outcome = operations.proxy_load("ctx", "ns", op, 8, "/opt/data/profiles/cluster-p-scale-01-*/kubeconfig.yaml")
+    assert outcome.metrics == {"proxy_load_completed": 90.0, "proxy_load_errors": 2.0, "proxy_load_per_second": 0.5,
+                               "proxy_load_p50_seconds": 4.5, "proxy_load_p95_seconds": 9.0,
+                               "proxy_load_max_seconds": 12.0}
+    assert outcome.errors == ["proxy load command error: error: You must be logged in"]
+    args, kwargs = calls[0]
+    assert args[-4:-1] == ("8", "180", json.dumps(["credential-proxy-exec", *op.command]))
+    assert kwargs["stdin"] == operations.PROXY_LOAD_SCRIPT
+
+
+def test_a_proxy_load_that_cannot_run_is_an_error(monkeypatch):
+    def fail(*a, **k):
+        raise kube.CommandError("kubectl exec... exited 1: IndexError: list index out of range")
+    monkeypatch.setattr(operations.kube, "kubectl", fail)
+    op = load_plan(PHASE2, environ=ENV).operations[-1]
+    outcome = operations.proxy_load("ctx", "ns", op, 1, "/nowhere/*")
+    assert outcome.metrics == {} and outcome.errors[0].startswith("proxy load failed")
+
+
+def test_counter_metrics_count_brokered_commands_and_their_seconds():
+    before = Snapshot(scraped={"proxy": {"uid": collect.parse_prometheus(
+        'kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 20\n'
+        'kubeagents_tool_execution_duration_seconds_sum{tool="kubectl"} 25.0\n')}})
+    after = Snapshot(scraped={"proxy": {"uid": collect.parse_prometheus(
+        'kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 50\n'
+        'kubeagents_tool_invocations_total{tool="gcloud",subcommand="container",status="success"} 4\n'
+        'kubeagents_tool_execution_duration_seconds_sum{tool="kubectl"} 61.0\n'
+        'kubeagents_tool_execution_duration_seconds_sum{tool="gcloud"} 8.0\n')}})
+    metrics = {m.name: m.value for m in collect.counter_metrics(before, after)}
+    assert metrics["proxy_commands"] == 34
+    assert metrics["proxy_command_seconds"] == 44.0
+
+
+def _registration_runner(monkeypatch, tmp_path, profiles: list[set[str]], watched: set[str]):
+    plan = load_plan(PHASE2, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    reads = iter(profiles)
+    last = {}
+
+    class Install:
+        context, namespace = "ctx", "ns"
+
+        def profile_clusters(self):
+            last["value"] = next(reads, last.get("value"))
+            return last["value"]
+
+        def watched_clusters(self):
+            return watched
+
+    run.install = Install()
+    reconciles = []
+    monkeypatch.setattr(runner.operations, "reconcile_profiles", lambda *a: reconciles.append(a))
+    monkeypatch.setattr(runner.operations, "restart", lambda *a: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    return run, reconciles
+
+
+def test_registration_runs_the_reconcile_when_the_profiles_differ(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02", "scale-03"}
+    run, reconciles = _registration_runner(monkeypatch, tmp_path, [{"scale-01", "scale-02", "scale-09"}, fleet], fleet)
+    run.wait_registered(3)
+    assert reconciles == [("ctx", "ns")]
+    assert run.watch_errors == []
+
+
+def test_registration_skips_the_reconcile_when_the_profiles_match(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02"}
+    run, reconciles = _registration_runner(monkeypatch, tmp_path, [fleet | {"host"}], fleet)
+    run.wait_registered(2)
+    assert reconciles == [] and run.watch_errors == []
+
+
+def test_a_level_that_keeps_the_fleet_skips_the_settle(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    sleeps = []
+    for name in ("preflight", "ensure_clusters", "ensure_nodes", "ensure_fixtures"):
+        monkeypatch.setattr(run, name, lambda *a: None)
+    monkeypatch.setattr(runner.fixtures.Churner, "start", lambda self: None)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    run.apply_level("proxy_concurrency", 4)
+    run.apply_level("proxy_concurrency", 8)
+    run.apply_level("concurrent", 8)
+    run.apply_level("failing_pods", 10)
+    assert sleeps == [300, 300]

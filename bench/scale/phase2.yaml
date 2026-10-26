@@ -1,0 +1,89 @@
+# Phase 2 of docs/designs/agent-harness-bottlenecks.md: the points Phase 1 pointed at, the
+# combined point, and the credential proxy's own capacity.
+#
+# The base is Phase 1's, so an install that runs the same build reuses the Phase 1 base runs.
+# Set the target as for phase1.yaml.
+phase: phase2
+
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-c
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+  # Workers that drive the credential proxy in proxy_load; no other operation reads it.
+  proxy_concurrency: 1
+
+# Levels run in this order: the 2-cluster points first, then the combined point and the cluster
+# counts in rising order, so each fleet change only adds clusters.
+factors:
+  proxy_concurrency: [1, 4, 8, 16, 32]
+  concurrent: [1, 8, 10, 12]
+  failing_pods: [1, 10, 30]
+  # Level N is the Nth point under combined.
+  combined: [1]
+  clusters: [2, 16, 32]
+
+# Points that move several factors at once. The first checks memory against total watched
+# objects (the design's first open question).
+combined:
+  - clusters: 8
+    objects: 4000
+
+settings:
+  settle_seconds: 300
+  pods_per_node: 90
+  fixture_machine_type: e2-small
+  fixture_pool: scale-pool
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  # Run the Cluster Agent reconcile when the profiles differ from the fleet, not at its hourly tick.
+  trigger_reconcile: true
+  cluster_create_parallelism: 8
+  # How long a restarted event watcher may take to report every test cluster up.
+  watcher_wait_seconds: 600
+
+operations:
+  onboarding:
+    kind: reset_soak
+    factors: [clusters, combined]
+    runs: 1
+    window_seconds: 7200
+  watcher_soak:
+    kind: soak
+    factors: [clusters, failing_pods, combined]
+    runs: 1
+    window_seconds: 3600
+  fan_out:
+    kind: prompt
+    factors: [clusters, concurrent, combined]
+    runs: 3
+    timeout_seconds: 2400
+    prompt: Which of my clusters, if any, are stressed right now? Check every cluster.
+    follow_up: Which clusters do you monitor?
+  boot_burst:
+    kind: restart_soak
+    factors: [failing_pods]
+    runs: 3
+    window_seconds: 900
+  # Brokered commands from the sandbox shell, as the agent sends them, with no model call: the
+  # broker's throughput and latency at each concurrency. {kubeconfig} is the first test cluster's
+  # Cluster Agent kubeconfig.
+  proxy_load:
+    kind: proxy_load
+    factors: [proxy_concurrency]
+    runs: 3
+    window_seconds: 180
+    command: [kubectl, --kubeconfig, "{kubeconfig}", get, pods, --all-namespaces, --no-headers]
