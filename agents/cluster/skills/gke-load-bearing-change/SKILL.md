@@ -45,11 +45,10 @@ kubectl get <kind> <name> [-n <namespace>] -o jsonpath='{range .metadata.managed
 
 An object git does not declare has no declared state, so there is nothing to revert to, and the method below does not apply. Do not offer "revert to the declared state". The choices are:
 
-- **Add it to git with the change undone.** This is how undoing the change is written for an object git never held; it also brings the object under management.
-- **Add it to git as it is now.**
-- **Leave it unmanaged**, with no pull request. A drift card's "reply 'apply'" opens a pull request, so this option is never one it names.
+- **Codify it.** Add a manifest for it to git. Say whether the manifest keeps the change or undoes it: weigh that the way "What you conclude" weighs a revert against a codify, so a loosening nothing depends on is codified with the change undone, and one something depends on is codified as it is now, with its durable fix named.
+- **Delete it.** Git declares nothing, so deleting it brings the cluster in line with git. No pull request can delete an object git never held, so this is a manual step a person runs: say so in the option, give the command, and never name it in the card's "reply 'apply'" line. Recommend it when nothing uses the object and nothing suggests it was meant to exist.
 
-Weigh them the way "What you conclude" weighs a revert against a codify: a loosening nothing depends on goes into git with the change undone; one something depends on goes in as it is now, with its durable fix named.
+Do not offer to undo the change by hand. Relabelling or patching it back leaves the object as unmanaged as before, which is the out-of-band fix the card rules out.
 
 ## The method
 

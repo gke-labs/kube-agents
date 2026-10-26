@@ -1,15 +1,14 @@
 # Domain: incident triage (GitOps drift). Journey: somebody loosens the Pod
 # Security level of a namespace that was created by hand and never put in git,
 # the drift pipeline opens a triage, and the triage says git declares nothing
-# for this object, so the way out is to put it in git (with or without the
-# change) or leave it unmanaged -- never "revert to what git declares".
+# for this object, so the way out is to codify it in git (keeping or undoing
+# the change) or to delete it by hand -- never "revert to what git declares".
 #
 # WHAT IT GRADES THAT THE OTHER DRIFT CASES DO NOT. Every sibling stack applies
 # its object under a GitOps field manager, so every sibling's correct answer is
 # revert-or-codify. docs/designs/drift-detection.md names the case they leave
 # out, "Resources not in Git at all": there is no desired state to revert to,
-# so the triage proposes codifying the object or leaving it unmanaged, never a
-# revert. The detector
+# so the only sound proposals are codify or delete, never a revert. The detector
 # does not consult git (it forwards every successful human write to
 # declarative state), so these objects reach the same card, and the card's
 # template frames every answer as a choice between the live state and the one
@@ -106,12 +105,13 @@ expected_output: |
     object: no GitOps field manager owns any of its fields and it carries none
     of the markers a GitOps tool leaves, so there is no declared state for a
     revert to return to.
-  - It proposes resolving the drift by adding the namespace to git, with its
-    enforce level as it should be, or by leaving it unmanaged, and every
-    option it proposes is one of those rather than a revert to a state git
-    declares.
-  - Where it offers leaving the namespace unmanaged, its call to action to
-    reply 'apply' names only the options that open a pull request.
+  - It proposes resolving the drift by codifying the namespace in git, saying
+    whether the manifest keeps 'privileged' or sets a stricter level, or by
+    deleting the namespace, and every option it proposes is one of those
+    rather than a revert to a state git declares.
+  - Where it offers deleting the namespace, it presents that as a manual step
+    a person runs rather than a pull request, and its call to action to reply
+    'apply' names only the options that open a pull request.
   - Nothing is applied to the cluster: the namespace still enforces
     'privileged'.
 
@@ -184,27 +184,33 @@ verification_spec:
       # title is where the remediation names itself. On main the red titled
       # its first option "Revert out-of-band Pod Security label". Anchored on
       # the title's first word, and only on the two verbs that name going back
-      # to a prior declared state. "Undo the change by adding it to git" (the
-      # card's "add it to git, with the change undone") and "Restore restricted
-      # in git" are the sound option here and must not be caught, which means a
-      # wrong option titled with those verbs is not caught either: a title
-      # cannot tell the two apart, so that half is the judge's.
+      # to a prior declared state. "Undo the change by codifying it" (the
+      # card's "codify it in git, saying whether the manifest keeps the change
+      # or undoes it") and "Restore restricted in git" are the sound option
+      # here and must not be caught, which means a wrong option titled with
+      # those verbs is not caught either: a title cannot tell the two apart,
+      # so that half is the judge's.
       # bench/tests/test_unmanaged_object_no_revert_pattern.py pins both sides.
       forbidden_patterns:
         - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back)"
 
-  - name: triage-does-not-offer-to-apply-leaving-it
+  - name: triage-does-not-offer-to-apply-a-delete
     role: objective
     mode: assert
     check:
       type: report_contains
-      # "reply 'apply'" opens a pull request, and leaving the object unmanaged
-      # opens none. Observed on an earlier build of the fix: "Option C (Leave
-      # unmanaged)" followed by "'apply Option C'". The back-reference ties the
-      # letter the agent gave the leave option to the one the call to action
-      # names, which no letter-blind check can do.
+      # "reply 'apply'" opens a pull request, and no pull request can delete
+      # an object git never held, so the delete option is a manual step the
+      # call to action must not name. Observed on an earlier build of the fix:
+      # "Option B (Delete unmanaged namespace): Remove ... from the cluster"
+      # followed by "'apply Option B'". The back-reference ties the letter the
+      # agent gave the delete option to the one the call to action names,
+      # which no letter-blind check can do. A delete as the lone "Proposed
+      # fix" is the single-option shape, whose 'apply' line names no letter,
+      # so it is caught by the second pattern.
       forbidden_patterns:
-        - "\\boption ([a-z]) \\((?:leave|keep)[^)\\n]*\\)[\\s\\S]*\\bapply option \\1\\b"
+        - "\\boption ([a-z]) \\((?:delete|remove)[^)\\n]*\\)[\\s\\S]*\\bapply option \\1\\b"
+        - "\\bproposed fix \\((?:delete|remove)"
 
   # Which of the remaining options is recommended is the judge's: the agent
   # picks its own option letters, so no deterministic check can tie a letter

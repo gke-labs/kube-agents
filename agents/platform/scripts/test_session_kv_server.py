@@ -6593,15 +6593,17 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn("no declared state to revert to", card)
         # A delete leaves no live object, so no markers proves nothing and the
         # revert has to survive: gitops-drift-deleted-policy-triage expects it.
-        # "reply 'apply'" opens a pull request, and leaving the object
-        # unmanaged opens none, so the call to action must not offer it
-        # (observed: "apply Option C" on a "Leave unmanaged" option).
+        # No pull request can delete an object git never held, so the delete
+        # option is a manual step the 'apply' line never names (observed:
+        # "apply Option B" on a "Delete unmanaged namespace" option).
+        self.assertIn("or to delete it", card)
+        self.assertIn("manual step a person runs", card)
         self.assertIn("never name it in the 'apply' line", card)
         self.assertIn("A deleted object carries nothing to read", card)
         self.assertIn("keep the revert", card)
         done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
         self.assertIn("for an object git does not declare", done_when)
-        self.assertIn("leaving it unmanaged", done_when)
+        self.assertIn("deleting it by hand", done_when)
 
         skill = (
             Path(__file__).resolve().parents[3]

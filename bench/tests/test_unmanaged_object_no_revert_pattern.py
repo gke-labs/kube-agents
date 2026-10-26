@@ -17,7 +17,7 @@
 The report_contains verifier ``re.search``es each pattern over
 ``_normalize_lines`` (lowercased, emphasis and backticks dropped). The
 object in that case is one git never declared, so no option may be a
-revert, while "add it to git with the change undone" is the sound option and
+revert, while codifying it "with the change undone" is a sound option and
 must pass in the wordings below. A title cannot tell a wrong "Undo ..." from a
 right one, so the pattern leaves both to the judge.
 """
@@ -83,37 +83,41 @@ def test_a_single_option_revert_is_caught():
         assert not _offers_no_revert(f"- **Proposed fix ({title}):** Remove it in GitOps."), title
 
 
-def _does_not_offer_to_apply_leaving(report: str) -> bool:
+def _does_not_offer_to_apply_a_delete(report: str) -> bool:
     text = _normalize_lines(report)
-    patterns = _check("triage-does-not-offer-to-apply-leaving-it")["forbidden_patterns"]
+    patterns = _check("triage-does-not-offer-to-apply-a-delete")["forbidden_patterns"]
     return not any(re.search(p, text) for p in patterns)
 
 
-# Observed on the d8836c11a build, verbatim but for the option bodies.
-OFFERS_TO_APPLY_LEAVING = (
-    "- **Option A (Codify namespace without privileged label):** Add it to GitOps.\n"
-    "- **Option C (Leave unmanaged):** Leave namespace eval-drift-unmanaged unmanaged.\n"
-    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one "
-    "directly with **'apply Option A'** / **'apply Option B'** / **'apply Option C'**."
-)
-NAMES_ONLY_PULL_REQUESTS = (
-    "- **Option A (Codify namespace in GitOps with change undone):** Add a manifest.\n"
-    "- **Option B (Codify namespace in GitOps as live):** Add a manifest.\n"
-    "- **Option C (Leave unmanaged):** Leave it with no GitOps manifest.\n"
+# Observed on the a65b68691 build, verbatim.
+OFFERS_TO_APPLY_A_DELETE = (
+    "- **Option A (Codify in GitOps):** Add a manifest for namespace eval-drift-unmanaged to the GitOps repository "
+    "with standard baseline Pod Security.\n"
+    "- **Option B (Delete unmanaged namespace):** Remove the unmanaged namespace eval-drift-unmanaged from the cluster.\n"
     "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one "
     "directly with **'apply Option A'** / **'apply Option B'**."
 )
+DELETE_AS_A_MANUAL_STEP = (
+    "- **Option A (Codify with a stricter level):** Add a Namespace manifest enforcing baseline.\n"
+    "- **Option B (Delete the namespace):** Git declares nothing and nothing runs here; no pull request can do this, "
+    "so a person runs `kubectl delete namespace eval-drift-unmanaged`.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request for Option A. Option B is a manual step."
+)
 
 
-def test_offering_to_apply_the_leave_option_is_caught():
-    assert not _does_not_offer_to_apply_leaving(OFFERS_TO_APPLY_LEAVING)
-    keep = OFFERS_TO_APPLY_LEAVING.replace("Leave unmanaged", "Keep it unmanaged")
-    assert not _does_not_offer_to_apply_leaving(keep)
+def test_offering_to_apply_the_delete_option_is_caught():
+    assert not _does_not_offer_to_apply_a_delete(OFFERS_TO_APPLY_A_DELETE)
+    remove = OFFERS_TO_APPLY_A_DELETE.replace("Delete unmanaged namespace", "Remove the namespace")
+    assert not _does_not_offer_to_apply_a_delete(remove)
+    assert not _does_not_offer_to_apply_a_delete(
+        "- **Proposed fix (Delete the namespace):** Remove it.\n- **To authorize:** reply **'apply'**."
+    )
 
 
-def test_naming_only_the_pull_request_options_passes():
-    assert _does_not_offer_to_apply_leaving(NAMES_ONLY_PULL_REQUESTS)
-    assert _does_not_offer_to_apply_leaving(RED)
+def test_a_delete_offered_as_a_manual_step_passes():
+    assert _does_not_offer_to_apply_a_delete(DELETE_AS_A_MANUAL_STEP)
+    assert _does_not_offer_to_apply_a_delete(RED)
+    assert _offers_no_revert(DELETE_AS_A_MANUAL_STEP)
 
 
 def test_the_red_does_not_say_git_lacks_the_object_and_the_green_does():

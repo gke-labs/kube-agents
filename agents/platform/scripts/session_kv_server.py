@@ -3280,8 +3280,9 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     (docs/designs/drift-detection.md, "Resources not in Git at all"). The
     worker has no repository to check, so the body tells it to read that off
     the live object's GitOps markers, which the skill lists, and widens the
-    options and the **Done when** line to adding it to git or leaving it
-    unmanaged. bench/tasks/gitops-drift-unmanaged-object-triage grades it.
+    options and the **Done when** line to codifying it or deleting it by hand
+    (no pull request can delete what git does not hold, so the delete option
+    is a manual step the 'apply' line never names). bench/tasks/gitops-drift-unmanaged-object-triage grades it.
 
     On an install with no usable GitOps repository the card is
     :func:`_drift_task_body_without_gitops` instead: an explanation with no
@@ -3308,9 +3309,11 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"repository; the live object tells you. A GitOps tool marks what it applies — its field manager, or its "
         f"tracking label or annotation — and the skill lists them. If the object still exists and carries none, "
         f"say it is probably not in git and what you checked. There is then no declared state to revert to, so do "
-        f"not offer one: the options are to add it to git, with the change undone or as it is now, or to leave it "
-        f"unmanaged. Leaving it unmanaged opens no pull request, so never name it in the 'apply' line or recommend "
-        f"it as the fix to apply. If its only markers are ones the skill calls ambiguous, which a person's `kubectl apply` or "
+        f"not offer one: the options are to codify it in git, saying whether the manifest keeps the change or "
+        f"undoes it, or to delete it. Deleting brings the cluster in line with git, which declares nothing, but no "
+        f"pull request can do it: say in that option that it is a manual step a person runs, give the command, and "
+        f"never name it in the 'apply' line. If deleting is the only option, it gets no 'apply' line at all. "
+        f"If its only markers are ones the skill calls ambiguous, which a person's `kubectl apply` or "
         f"`helm install` leaves too, keep the revert beside those options and say what would decide between them. "
         f"A deleted object carries nothing to read, so its absence of markers is no evidence: say whether git "
         f"declares it could not be read off the cluster, and keep the revert.\n\n"
@@ -3322,8 +3325,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
         f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
         f"revert's consequence being whether the state git declares would still run, read off this cluster or "
-        f"reported as not established — or, for an object git does not declare, proposes adding it to git or "
-        f"leaving it unmanaged. "
+        f"reported as not established — or, for an object git does not declare, proposes codifying it or "
+        f"deleting it by hand. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
