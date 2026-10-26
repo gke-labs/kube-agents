@@ -21,6 +21,10 @@ _log = logging.getLogger("kube_agents_bench.parsing")
 
 DELEGATION_TOOL = "kanban_create"
 STATUS_TOOL = "kanban_show"
+# A card paused on a question for the user: the board's status, and the block
+# kind ``kanban_block`` records for it.
+BLOCKED_STATUS = "blocked"
+NEEDS_INPUT_KIND = "needs_input"
 
 _TOOL_ERROR_PREFIX = "Error executing tool"
 
@@ -327,6 +331,29 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
             if isinstance(summary, str) and summary.strip():
                 delivered[task_id] = summary
     return delivered
+
+
+def paused_questions(trajectory: list[dict[str, Any]], task_ids: list[str]) -> dict[str, str]:
+    """The question each awaited card paused on, keyed by card id.
+
+    A card a worker blocked with ``kind: needs_input`` delivers no result: what
+    reaches the conversation is the block's reason, posted as the needs-you
+    question (``deploy/docker/patches/slack_ux_moments.py``, ``needs_you``).
+    Only the board read carries it (``board.SessionCards.as_shown``'s
+    ``task.block``), and only for a card the board still shows blocked.
+    """
+    questions: dict[str, str] = {}
+    for entry in trajectory:
+        shown = _json_object(entry.get("result")).get("task")
+        if not isinstance(shown, dict) or shown.get("id") not in task_ids:
+            continue
+        block = shown.get("block")
+        if shown.get("status") != BLOCKED_STATUS or not isinstance(block, dict):
+            continue
+        reason = block.get("reason")
+        if block.get("kind") == NEEDS_INPUT_KIND and isinstance(reason, str) and reason.strip():
+            questions[str(shown["id"])] = reason
+    return questions
 
 
 def merge_new(base: list[dict[str, Any]], turn: list[dict[str, Any]]) -> list[dict[str, Any]]:

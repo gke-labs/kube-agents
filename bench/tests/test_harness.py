@@ -3828,17 +3828,56 @@ def test_a_failure_wake_whose_script_reports_an_error_is_an_errored_run_not_infr
     assert stub_agent.requests == []
 
 
-def test_a_failure_wake_needs_the_api_transport(
+def test_a_failure_wake_on_the_inject_transport_goes_to_the_api_server(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """Under spec.mode next a card's wake reaches the front door through the
+    in-pod API server, not the gateway, so the inject lane sends it there too:
+    no inject token is needed and no door is called."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+    monkeypatch.delenv("AGENT_INJECT_TOKEN", raising=False)
+    stub_agent.turns = [_turn(_text("I couldn't restart checkout-gateway on seeded-a."))]
+
+    result = KubeAgentsHarness().run(_FAILURE_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE]
+    assert result.output == "I couldn't restart checkout-gateway on seeded-a."
+    assert _archived(scripts)
+
+
+def test_a_question_wake_on_the_inject_transport_sends_both_turns_to_the_api_server(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
     scripts: list[str] = []
     monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
     monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+    monkeypatch.delenv("AGENT_INJECT_TOKEN", raising=False)
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE, "seeded-b"]
+    assert stub_agent.requests[0]["conversation"] == stub_agent.requests[1]["conversation"]
+    assert result.trajectory[-1]["result"] == _REPLAY_SETTLED
+    assert _archived(scripts)
+
+
+def test_a_card_wake_refuses_an_unknown_transport(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "smoke-signal")
 
     result = KubeAgentsHarness().run(_FAILURE_PROMPT)
 
-    assert result.errors == [f"{card_wake.FAILURE_DIRECTIVE} needs AGENT_TRANSPORT=api, got 'inject'"]
+    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject'], got 'smoke-signal'"]
     assert scripts == []
+    assert stub_agent.requests == []
 
 
 # --- The fresh-session question replay (session: fresh) ----------------------

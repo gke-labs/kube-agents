@@ -556,7 +556,8 @@ default `api` executor the default profile answers the door's task and can file 
 card's completion never reaches the A2A thread. The lane's delegation wait reads the card's
 result from the pod and appends it to the graded answer, but that is the harness's view, not the
 thread's, so grading it would pass a premise the case does not have there. The card-wake
-cases replay a wake the harness sends on the api transport only, and error on this lane. A case
+cases replay a wake whose reply under `next` is posted nowhere, so they stay listed until each is
+ported to grade what a next-mode user sees. A case
 excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
 listed until a run on `api` grades it.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
