@@ -3011,7 +3011,8 @@ class KubeAgentsHarness(AgentHarness):
         transport_failures = 0
         had_answered_failure = False
         timed_out = True
-        board_messages: list[str] = []
+        last_board_summaries: dict[str, str] = {}
+        last_board_errors: dict[str, str] = {}
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
         # ``statuses`` stays the agent's own readings, which are what settle a
@@ -3047,8 +3048,15 @@ class KubeAgentsHarness(AgentHarness):
             bstate = board.read_board_state(_agent_shell, outstanding, _EXEC_TIMEOUT)
             if bstate is not None:
                 on_board, bsummaries, berrors = bstate
-                board_messages.extend(bsummaries.values())
-                board_messages.extend(berrors.values())
+                for t in on_board:
+                    if t in bsummaries:
+                        last_board_summaries[t] = bsummaries[t]
+                    else:
+                        last_board_summaries.pop(t, None)
+                    if t in berrors:
+                        last_board_errors[t] = berrors[t]
+                    else:
+                        last_board_errors.pop(t, None)
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
@@ -3174,6 +3182,18 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
+        # Final board messages for cards whose terminal status is blocked
+        # (matching the guardrail's transient block); cards that completed or
+        # unblocked retries that failed on other grounds are not infra.
+        board_messages = [
+            last_board_summaries[t]
+            for t in awaited
+            if latest.get(t) == "blocked" and t in last_board_summaries
+        ] + [
+            last_board_errors[t]
+            for t in awaited
+            if latest.get(t) == "blocked" and t in last_board_errors
+        ]
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
@@ -3244,7 +3264,18 @@ class KubeAgentsHarness(AgentHarness):
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
-        worker_acted = bool(captured and captured.entries) or bool(result.metadata.get("worker_commands"))
+        worker_non_action = {
+            "kanban_show",
+            "kanban_heartbeat",
+        }
+        worker_acted = (
+            any(
+                isinstance(e, dict)
+                and e.get("name") not in worker_non_action
+                for e in (captured.entries if captured else [])
+            )
+            or bool(result.metadata.get("worker_commands"))
+        )
         # Sanctioned front-door capabilities on the chat / delegation profile
         # (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
         # substantive worker action or final answer generation: board management,
@@ -3253,6 +3284,7 @@ class KubeAgentsHarness(AgentHarness):
             DELEGATION_TOOL,
             STATUS_TOOL,
             "kanban_list",
+            "kanban_show",
             "kanban_comment",
             "kanban_unblock",
             "list_agents",
@@ -3287,8 +3319,13 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
+        obs_statuses = reported_statuses(observed)
         all_messages: list[str] = list(board_messages)
-        all_messages.extend(delivered_results(observed, awaited).values())
+        all_messages.extend(
+            text
+            for tid, text in delivered_results(observed, awaited).items()
+            if obs_statuses.get(tid) == "blocked" or not obs_statuses
+        )
 
         if not infra_reason and all_messages:
             for text in all_messages:

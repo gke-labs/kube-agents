@@ -2160,7 +2160,7 @@ def test_delegated_worker_board_rate_limit_marks_run_infra(
         if board.BOARD_PRESENT in script:
             reads.append(script)
             payload = {
-                "statuses": {_TASK_ID: "failed"},
+                "statuses": {_TASK_ID: "blocked"},
                 "summaries": {_TASK_ID: rate_limit_msg},
                 "errors": {},
             }
@@ -2171,7 +2171,7 @@ def test_delegated_worker_board_rate_limit_marks_run_infra(
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell)
-    stub_agent.turns = [_create_turn(), _show_turn("failed")]
+    stub_agent.turns = [_create_turn(), _show_turn("blocked")]
 
     result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
 
@@ -4270,3 +4270,113 @@ def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_after_kanban_show_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker whose only tool call was the mandated kanban_show before hitting 429 is marked infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[{
+            "name": "kanban_show",
+            "agent": "platform",
+            "task": "t_1",
+            "session": "sess_1",
+            "args": {"task_id": "t_1"},
+            "result": None,
+            "failed": None,
+            "at": "2026-10-26T12:00:00Z",
+            "_id": "call_1",
+        }],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "worker transcript for t_1 logged rate_limit" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_tool_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that executed a substantive tool (e.g. bash/kubectl) after kanban_show remains graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[
+            {
+                "name": "kanban_show",
+                "agent": "platform",
+                "task": "t_1",
+                "session": "sess_1",
+                "args": {"task_id": "t_1"},
+                "result": None,
+                "failed": None,
+                "at": "2026-10-26T12:00:00Z",
+                "_id": "call_1",
+            },
+            {
+                "name": "bash",
+                "agent": "platform",
+                "task": "t_1",
+                "session": "sess_1",
+                "args": {"command": "kubectl get pods"},
+                "result": "pod-1",
+                "failed": False,
+                "at": "2026-10-26T12:00:05Z",
+                "_id": "call_2",
+            },
+        ],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_unblocked_retry_failed_on_own_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unblocked card that failed on its retry without a rate limit is graded, not excused as infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    observed = [{
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "failed", "result": None},
+            "runs": [{"summary": ""}],
+        }),
+    }]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)

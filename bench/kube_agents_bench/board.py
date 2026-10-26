@@ -108,20 +108,20 @@ try:
         if "summary" in run_cols:
             for tid in ids:
                 r = conn.execute(
-                    "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
-                    "AND summary != '' ORDER BY id DESC LIMIT 1",
+                    "SELECT summary FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
                     (tid,),
                 ).fetchone()
-                if r:
+                if r and r[0]:
                     out["summaries"][str(tid)] = str(r[0])
         if "error" in run_cols:
             for tid in ids:
                 r = conn.execute(
-                    "SELECT error FROM task_runs WHERE task_id = ? AND error IS NOT NULL "
-                    "AND error != '' ORDER BY id DESC LIMIT 1",
+                    "SELECT error FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
                     (tid,),
                 ).fetchone()
-                if r and str(tid) not in out["errors"]:
+                if r and str(tid) not in out["errors"] and r[0]:
                     out["errors"][str(tid)] = str(r[0])
     conn.close()
 except sqlite3.Error as exc:
@@ -334,9 +334,9 @@ if out["error"] is None:
             if has_table(board, "task_runs") and "summary" in columns(board, "task_runs"):
                 for tid in wanted:
                     row = board.execute(
-                        "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
-                        "AND summary != '' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    if row:
+                        "SELECT summary FROM task_runs WHERE task_id = ? "
+                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                    if row and row[0]:
                         out["cards"][tid]["summary"] = row[0]
         board.close()
     except sqlite3.Error as exc:
