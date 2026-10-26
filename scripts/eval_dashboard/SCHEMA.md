@@ -61,7 +61,7 @@ only — anything that renames, removes or re-types a field bumps
 
 Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
-Every job below is a source with a watermark of its own: the
+Three jobs feed it, each a source with a watermark of its own: the
 presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request
 push), the nightly periodic (`ci-kube-agents-eval-nightly`,
 `EVAL_TIER=nightly` in the same `hack/ci-eval-pr.sh`, against `main` on
@@ -69,25 +69,19 @@ push), the nightly periodic (`ci-kube-agents-eval-nightly`,
 writers periodic, `ci-kube-agents-eval-nightly-writers`, the cases that
 request a pull request, and, when the main part runs as two halves, the
 main-b periodic, `ci-kube-agents-eval-nightly-main-b`, whose runs are
-`nightly` runs too, told apart by `job`), the today-mode nightly kept as the rollback check
-(`ci-kube-agents-eval-nightly-today`, the whole catalogue on a `spec.mode: today`
-install, a night of its own) and the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
+`nightly` runs too, told apart by `job`) and the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
 pull-request build against a GitLab repository). All archive the same
 layout and are collected from the moment they start running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
   overflow 53-bit JSON-consumer integers).
-- `tier` — **optional, additive**: `"presubmit"`, `"nightly"`, `"nightly-today"` or `"gitlab"`, from the
+- `tier` — **optional, additive**: `"presubmit"`, `"nightly"` or `"gitlab"`, from the
   source the build was discovered through, never from the build's own
   metadata. **Absent means `presubmit`** — every run written before the
   field existed was one — and consumers read it through `tiers.py`'s
-  `run_tier` / `presubmit_runs` / `nightly_runs` / `gitlab_runs` /
-  `nightly_today_runs`. A value
-  outside the four is no tier and counts nowhere: a run tagged some new
-  way is never the gate's by default. A `nightly-today` run is the
-  today-mode nightly's (`--nightly-today-prefix`): read only by the
-  digest's rollback line (`nightly.today_view`), in no case history, no
-  Nightly page, no Trend latency and no gate number. A `gitlab` run is the GitLab lane's
+  `run_tier` / `presubmit_runs` / `nightly_runs` / `gitlab_runs`. A value
+  outside the three is no tier and counts nowhere: a run tagged some new
+  way is never the gate's by default. A `gitlab` run is the GitLab lane's
   (`pull-kube-agents-smoke-test-gitlab`, `--gitlab-pr-glob`): listed in
   `brief.json`'s `gitlab` block and the Brief's "GitLab lane" section,
   in no case history and no gate number. Every gate verdict — the
@@ -399,8 +393,7 @@ Additive, optional, and safe to omit — consumers must default them.
   `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
   and `"log_url"` (Spyglass's page for the build directory, as for
   `runs[].log_url`) when a nightly periodic's listing (the main, writers
-  or main-b job) named the build, the same with `"tier": "nightly-today"`
-  when the today-mode nightly's did, or `"tier": "gitlab"` when the GitLab
+  or main-b job) named the build, or `"tier": "gitlab"` when the GitLab
   lane's did (absent: the presubmit's, as for `runs[].tier`; all are kept
   across scans, and each source retries its own). `nightly.py` reads a
   running nightly build's part from the job segment of its `log_url`; an
@@ -651,13 +644,6 @@ what the renderer does with them.
   call is.
 - `--nightly-job <name>` — the `job` recorded on nightly runs; default
   derived from the prefix.
-- `--nightly-today-prefix [<gs prefix>]` — the today-mode nightly kept as
-  the rollback check (`ci-kube-agents-eval-nightly-today`), read as
-  `--nightly-prefix` is (the prefix is its index, `pr` null, `log_url`
-  set, the nightly's rule on a listing that fails) but tagged
-  `tier: "nightly-today"`, above a watermark of its own, and its unfinished
-  builds the same on `pending_builds`. Given without a value it is
-  `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-today/`.
 - `--nightly-writers-prefix [<gs prefix>]` — the same for the nightly's
   writers periodic; given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/`.

@@ -12,9 +12,7 @@ sends a message only when:
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
                                                plus a section on last night's
                                                nightly run when --data is given
-                                               (nightly_digest.py);
-                                               plus one line on the today-mode
-                                               rollback nightly's
+                                               (nightly_digest.py)
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only
@@ -1559,9 +1557,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     is newly failing against the night before, the opening chat turn's p50
     and p95 when the reps carried it, and the wall clock, or that the night
     was truncated or missing -- and a reason adds a line saying why the
-    section is missing. Then, whatever the section did, one line on the
-    today-mode nightly kept as the rollback check, linked to its Prow
-    history."""
+    section is missing."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1605,11 +1601,6 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
         lines.append(NIGHTLY_URL)
         if isinstance(section, str):
             lines.append(NIGHTLY_SKIPPED.format(reason=section))
-    if data is not None:
-        # Outside the section's if/elif: the rollback nightly has no section,
-        # and its line goes out whichever way the main nightly is reported.
-        lines.append(nightly.digest_line(nightly.today_view(data), now, clock=lambda value: clock(value, weekday=True), label=nightly.DIGEST_LABEL_TODAY, todays_build_is_tonight=True))
-        lines.append(nightly.NIGHTLY_TODAY_HISTORY_URL)
     fleet = fixture_digest_line(health)
     if fleet:
         lines.append(fleet)

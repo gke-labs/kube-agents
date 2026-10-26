@@ -2120,8 +2120,7 @@ class KubeAgentsHarness(AgentHarness):
         # dropped poll) rejoins it rather than restarting it. An opening POST
         # whose reply was lost may have started the task already, and the
         # door's dedupe hands the retry the same task, so its start is
-        # unknown: such a turn is not timed (opening_post_lost), as the api
-        # path times no retried attempt.
+        # unknown: such a turn is not timed (opening_post_lost).
         opening_accepted: list[float] = []
         opening_post_lost: list[bool] = []
 

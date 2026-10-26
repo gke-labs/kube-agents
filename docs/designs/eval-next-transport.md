@@ -725,8 +725,8 @@ catalogue on a fresh `today` install over the agent API once a night and records
 which is what the rollback to `today` is measured against. The today lane stays out of the
 recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`, but it grades
 a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; its
-Nightly page reads the main nightly's runs, so it shows `next`; the today-mode nightly's runs are
-collected under a tier of their own that only the CI health digest's rollback line reads.
+Nightly page reads the main nightly's runs, so it shows `next`, and the today-mode nightly's Prow
+runs are not collected onto the run pages.
 
 ## Open questions
 

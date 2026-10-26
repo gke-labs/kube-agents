@@ -44,10 +44,6 @@ writers job), reported as one night: the line names a part that is missing,
 still running or cut short, and the night counts as cut short when its main or
 main-b part is. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs.
-Whether or not the section was built, a further line says the same of the
-today-mode nightly kept as the rollback check (`ci-kube-agents-eval-nightly-today`, tier
-`nightly-today` in `data.json`), compared with its own night before and linked to its Prow job
-history, since the dashboard has no page for it.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -215,8 +211,7 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line. The today-mode nightly's runs (`tier: nightly-today`) reach only the
-digest's rollback line.
+history or digest line.
 
 ## Hysteresis
 

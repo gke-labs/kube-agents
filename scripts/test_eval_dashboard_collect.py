@@ -1026,7 +1026,6 @@ FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
 FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
 # The periodic that runs the main part's second half, under its live job name.
 FAKE_MAIN_B_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
-FAKE_TODAY_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_TODAY_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
@@ -1446,69 +1445,6 @@ class TestNightlySource(_MergeBase):
         data, _ = self.quiet_collect(nightly_writers_prefix=FAKE_WRITERS_PREFIX, gsutil=gsutil, now=now)
         url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers/{BUILD_998_FULL}"
         self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
-
-    def test_the_today_nightly_is_its_own_tier_on_its_own_watermark(self):
-        """The rollback check runs the whole catalogue under spec.mode today
-        beside the main nightly's next-mode night: tier nightly-today, so no
-        reader of the main nightly counts it, and a watermark of its own, so
-        neither job's newer build hides the other's."""
-        gsutil, _ = self.fake_gsutil([])
-        self.place_nightly_build(BUILD_956_TRUNCATED, periodic=FAKE_TODAY_PREFIX)  # the lower id
-        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
-        prior_data["runs"].append(dict(prior_data["runs"][0], build_id=BUILD_998_INFRA, tier="nightly", pr=None))
-        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly-today", pr=None, job=collect.DEFAULT_NIGHTLY_TODAY_JOB))
-        merged, stderr = self.quiet_collect(
-            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_today_prefix=FAKE_TODAY_PREFIX,
-            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
-        )
-        run = next(r for r in merged["runs"] if r["build_id"] == BUILD_956_TRUNCATED)
-        self.assertEqual((run["tier"], run["job"], run["pr"]), ("nightly-today", collect.DEFAULT_NIGHTLY_TODAY_JOB, None))
-        self.assertIn("today nightly resumed above build 1, 1 new", stderr)
-        self.assertIn(f"nightly scan resumed above build {BUILD_998_INFRA}, 0 new", stderr, "the main nightly's watermark ignores the today job's ids")
-        self.assertEqual(tiers.nightly_runs(merged["runs"]), [r for r in merged["runs"] if r["build_id"] == BUILD_998_INFRA])
-        self.assertEqual({r["build_id"] for r in tiers.nightly_today_runs(merged["runs"])}, {"1", BUILD_956_TRUNCATED})
-        self.assertNotIn(BUILD_956_TRUNCATED, {r["build_id"] for r in tiers.presubmit_runs(merged["runs"])})
-        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
-
-    def test_an_unfinished_today_build_rides_pending_with_its_tier_and_link(self):
-        gsutil, _ = self.fake_gsutil([])
-        built = self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_TODAY_PREFIX)
-        (built / "finished.json").unlink()
-        now = datetime(2026, 9, 10, 6, 5, tzinfo=timezone.utc)
-        data, _ = self.quiet_collect(nightly_today_prefix=FAKE_TODAY_PREFIX, gsutil=gsutil, now=now)
-        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/{collect.DEFAULT_NIGHTLY_TODAY_JOB}/{BUILD_998_FULL}"
-        pending = [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly-today", "log_url": url}]
-        self.assertEqual(data["pending_builds"], pending)
-        # The tag survives a scan that lists nothing new, and the presubmit
-        # source never retries it.
-        gsutil, _ = self.fake_gsutil([])
-        merged, _ = self.quiet_collect(
-            pr_globs=[FAKE_GLOB], nightly_today_prefix=FAKE_TODAY_PREFIX, merge_with=self.write_prior(data),
-            gsutil=gsutil, now=now + timedelta(minutes=15), index_prefix="",
-        )
-        self.assertEqual(merged["pending_builds"], pending)
-
-    def test_a_today_prefix_that_has_never_run_is_a_note(self):
-        gsutil, _ = self.fake_gsutil([])
-        data, stderr = self.quiet_collect(nightly_today_prefix=FAKE_TODAY_PREFIX, gsutil=gsutil)
-        self.assertEqual(data["runs"], [])
-        self.assertIn(f"note: nightly prefix {FAKE_TODAY_PREFIX} did not list", stderr)
-        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
-
-    def test_the_cli_takes_the_today_prefix_and_counts_it(self):
-        gsutil, log = self.fake_gsutil([])
-        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_TODAY_PREFIX)
-        out = self.tmp / "out.json"
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
-            self.assertEqual(collect.main(["--nightly-today-prefix", FAKE_TODAY_PREFIX, "--gsutil", gsutil, "--gh", "", "--out", str(out), "--since-days", "100000"]), 0)
-        self.assertIn("0 presubmit, 0 nightly, 0 gitlab, 1 nightly-today", stderr.getvalue())
-        # Bare, it is the live job's prefix.
-        log.write_text("")
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(collect.main(["--nightly-today-prefix", "--gsutil", gsutil, "--gh", "", "--out", str(out)]), 0)
-        self.assertEqual([c for c in log.read_text().splitlines() if c.startswith("ls ")], [f"ls {collect.DEFAULT_NIGHTLY_TODAY_PREFIX}"])
-        self.assertEqual(collect.DEFAULT_NIGHTLY_TODAY_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-today/")
 
     def test_nightly_active_is_the_superset_matrix(self):
         data = collect.collect(from_dir=TESTDATA)

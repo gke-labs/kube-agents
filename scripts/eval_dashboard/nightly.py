@@ -142,11 +142,6 @@ PART_WORDS = {PART_MAIN: "main part", PART_MAIN_B: "main-b part", PART_WRITERS: 
 # short, and either one still running holds back the digest's numbers. The
 # writers part, a few cases, does neither.
 MAIN_PARTS = (PART_MAIN, PART_MAIN_B)
-# The today-mode nightly kept as the rollback check (``today_view``), and
-# Prow's history page for it, which the digest links under its line: the
-# dashboard has no page for it.
-NIGHTLY_TODAY_JOB = "ci-kube-agents-eval-nightly-today"
-NIGHTLY_TODAY_HISTORY_URL = f"https://oss.gprow.dev/job-history/gs/kube-agents-evals-nightly-logs/logs/{NIGHTLY_TODAY_JOB}"
 # The job segment of a Spyglass build link (.../logs/<job>/<build>), which
 # is how a pending build's part is read: its entry carries no job.
 JOB_IN_LOG_URL = re.compile(r"/(?P<job>[^/]+)/\d+/?$")
@@ -159,10 +154,6 @@ REASON_MAX_CHARS = 300
 DOMAIN_UNKNOWN = "unknown"
 # The digest line's glyph and the separator the other digest lines use.
 DIGEST_GLYPH = "🌙"
-# What the digest calls each nightly: the main one (next), and the
-# today-mode one kept as the rollback check (``today_view``).
-DIGEST_LABEL = "Nightly"
-DIGEST_LABEL_TODAY = "Rollback nightly (today)"
 SEP = " · "
 # How the digest words a part's wall clock when its run recorded none.
 UNKNOWN_CLOCK = "an unknown wall clock"
@@ -872,38 +863,7 @@ def turn1_note(night: dict) -> str | None:
     return f"chat turn 1 p50 {p50:.1f} s, p95 {p95:.1f} s (advisory: target p95 < {TURN1_P95_TARGET_S} s)"
 
 
-def today_view(data: dict) -> dict:
-    """``data`` as the today-mode nightly alone, for the functions above.
-
-    The collector tags that job's runs, and its builds still in flight,
-    tier ``nightly-today`` (SCHEMA.md: ``runs[].tier``), so no reader of the
-    main nightly counts them. This returns a copy whose runs and pending
-    builds are those alone, retagged ``nightly``, so ``digest_line`` reads
-    the rollback check as one job running the whole matrix: its own nights,
-    each compared with its own night before, expected to record every case
-    ``nightly_active`` (it runs the inject lane's exclusions too).
-    RUNNING_MAX_AGE and LAST_NIGHT_MAX_AGE are the main nightly's (00:00 UTC,
-    8 h): this job starts at 06:00 UTC and runs up to 15 h, so at the 9 AM
-    digest its last finished night is 31-32 h old, inside the 36 h, and
-    tonight's build is 7-8 h into its run, inside the 9 h. A digest sent
-    much later in the day can read a night still running past 9 h as
-    missing."""
-    if not data:
-        return data
-
-    def retag(entries) -> list[dict]:
-        return [{**e, tiers.TIER_KEY: tiers.TIER_NIGHTLY} for e in entries]
-
-    pending = data.get("pending_builds")
-    view = {**data, "runs": retag(tiers.nightly_today_runs([r for r in data.get("runs") or [] if isinstance(r, dict)]))}
-    if isinstance(pending, list):
-        view["pending_builds"] = retag(e for e in pending if isinstance(e, dict) and tiers.is_nightly_today(e))
-    return view
-
-
-def digest_line(
-    data: dict | None, now: datetime.datetime, clock=None, label: str = DIGEST_LABEL, todays_build_is_tonight: bool = False
-) -> str:
+def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     """One line for the 9 AM digest. ``clock`` renders a datetime the way
     the rest of the digest does (post_health.clock); without one the ISO
     form is used. A truncated or missing night says so instead of numbers,
@@ -912,37 +872,26 @@ def digest_line(
     has its numbers and says which part, without a newly-failing verdict
     when the main part is missing. A night with numbers whose reps carried the
     opening chat turn's time gives its p50 and p95, as advice
-    (``turn1_note``). ``label`` names the nightly the line is about
-    (``DIGEST_LABEL_TODAY`` for ``today_view``). ``todays_build_is_tonight``
-    is for a job still running at the digest hour on an ordinary day (the
-    today-mode nightly starts 06:00 UTC): a build first seen on ``now``'s
-    night date is tonight's, not a late last night, so it never stands in
-    for a missing last night; the line says last night is missing and that
-    tonight's build is running."""
+    (``turn1_note``)."""
     when = clock or (lambda value: value.isoformat(timespec="minutes"))
     if not data:
-        return f"{DIGEST_GLYPH} {label}: no data.json to read a night from"
+        return f"{DIGEST_GLYPH} Nightly: no data.json to read a night from"
     night, newest = last_night(data, now)
 
     def still_running(entry: dict) -> str:
-        return f"{DIGEST_GLYPH} {label}: still running (first seen {when(parse_iso(entry['first_seen']))}){SEP}the report follows when it finishes"
+        return f"{DIGEST_GLYPH} Nightly: still running (first seen {when(parse_iso(entry['first_seen']))}){SEP}the report follows when it finishes"
 
     if night is None:
         running = running_nights(data, now)
-        tonight = []
-        if todays_build_is_tonight:
-            tonight = [e for e in running if night_day(parse_iso(e["first_seen"])) == night_day(now)]
-            running = [e for e in running if e not in tonight]
         if running:
             # Still in flight at digest time -- a late start, or a night at
             # its budget -- so there are no numbers yet, and the report
             # carries them once the collector records the build.
             return still_running(running[-1])
-        also = f"{SEP}tonight's build running since {when(parse_iso(tonight[-1]['first_seen']))}" if tonight else ""
         if newest is None:
-            return f"{DIGEST_GLYPH} {label}: no run on record yet{also}"
+            return f"{DIGEST_GLYPH} Nightly: no run on record yet"
         started = parse_iso(newest.get("started"))
-        return f"{DIGEST_GLYPH} {label}: no run last night (the newest on record started {when(started) if started else 'at an unknown time'}){also}"
+        return f"{DIGEST_GLYPH} Nightly: no run last night (the newest on record started {when(started) if started else 'at an unknown time'})"
     held_back = [p for p in MAIN_PARTS if p in night.get("running_parts", [])]
     if held_back:
         # A part that holds the main matrix is still in flight: the parts
@@ -963,7 +912,7 @@ def digest_line(
         if any(p.get("part") == PART_MAIN_B for p in on_record):
             head = SEP.join(cut_notes(night, MAIN_PARTS))
         notes = "".join(f"{SEP}{note}" for note in part_notes(night, cut=False))
-        return f"{DIGEST_GLYPH} {label}: {head}{SEP}{recorded}{notes}{SEP}the night's numbers are not comparable"
+        return f"{DIGEST_GLYPH} Nightly: {head}{SEP}{recorded}{notes}{SEP}the night's numbers are not comparable"
     parts = [f"{counts['recorded']} cases", f"{counts['passed']} passed all reps", f"{counts['partial']} partial", f"{counts['failed']} failed"]
     if counts["infra"]:
         parts.append(f"{counts['infra']} infra")
@@ -986,4 +935,4 @@ def digest_line(
     if note:
         parts.append(note)
     parts.append(took)
-    return f"{DIGEST_GLYPH} {label}: {SEP.join(parts)}"
+    return f"{DIGEST_GLYPH} Nightly: {SEP.join(parts)}"
