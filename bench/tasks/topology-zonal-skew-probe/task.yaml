@@ -35,14 +35,18 @@
 # agent declared and not a pasted `kubectl get` row. The fourth line is the
 # node-pool case, the one leeway is silent on and the one a manifest-happy
 # agent gets wrong in the direction that pages someone. And the run has to
-# have executed `leeway report`, at the front door or on a delegated card.
+# have executed `leeway report` on a delegated card.
 #
-# What the first live run must settle: that `leeway-report-ran` sees the
-# route the install takes. The `any` has a child per route (the front door's
-# own `terminal` call; a worker's command), because `tool_called` under
-# `scope: workers` and `worker_commands` both read as status=error when no
-# card was filed, and the platform agent files one only when slot d has a
-# Cluster Agent profile on the install.
+# The route is the one every chat case takes: the front door holds no
+# infrastructure tools, so it files a card (`the-request-was-delegated`), and
+# the Platform Agent worker on that card runs `leeway report` itself or files
+# a card to slot d's Cluster Agent when the install has one. `worker_commands`
+# reads the platform card's typed `terminal` calls and log rows and a
+# Cluster Agent card's tagged calls, so `leeway-report-ran` sees either
+# route; with no card it reads status=error, never a pass. What the first
+# live run must settle is the rest: that the worker finds the two-zone
+# cluster from the namespace alone, and that the install's `leeway` reaches
+# slot d by whichever route it takes.
 #
 # Isolation class: read-only (analysis only; nothing created, patched, or
 # published).
@@ -94,6 +98,15 @@ fixtures:
   - zonal-skew-capacity
 
 verification_spec:
+  # The request reached a specialist: the front door holds no infrastructure
+  # tools, and without a card the worker check below would error, not fail.
+  - name: the-request-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
   # The declared lines. Each pattern reads one line: an optional kind prefix
   # and parenthetical on the name, the cause word, an evidence field that has
   # to name the mechanism, a GCP zone, and a running share whose numerator
@@ -161,22 +174,25 @@ verification_spec:
         - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is node-pool(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node ?pool|default-pool|node ?selector|one zone|single[- ]zone)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|volume)\b'
-  # The tool ran. One child per route the install can take; see the header.
+  # The tool ran, on a delegated card (see the header). Read each tagged
+  # `terminal` call as typed. Without after_result_pattern the check reads
+  # Hermes's one-line rendering of the worker's command, which shows a chain
+  # as its first command plus `+ N commands` and joins a second line into the
+  # first (#3128). The pattern never matches a result and no forbidden
+  # pattern is set, so it opens no window. required_runs reads each shell
+  # segment as an argv: `leeway` is the command word, by basename, and a
+  # later word is `report`. A `--help`, an echoed or grepped mention of the
+  # command, and `leeway rank` or `leeway version` do not count.
+  # bench/tests/test_topology_zonal_skew_probe_case.py pins the samples.
   - name: leeway-report-ran
     role: objective
     mode: assert
     check:
-      type: any
-      checks:
-        - type: tool_called
-          scope: router
-          tool_names: ["terminal"]
-          arguments:
-            command: '(?s).*\bleeway\s+report\b.*'
-        - type: worker_commands
-          required_runs:
-            - script: leeway
-              word_patterns: ["^report$"]
+      type: worker_commands
+      after_result_pattern: "(?!)"
+      required_runs:
+        - script: leeway
+          word_patterns: ["^report$"]
   # Cluster-state safeguards: each fixture came out the way it went in.
   - name: scheduling-fixture-preserved
     role: safeguard
