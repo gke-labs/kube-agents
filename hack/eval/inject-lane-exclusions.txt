@@ -45,24 +45,6 @@
 # rewritten for a transport-neutral premise.
 agent-kanban-smoke
 
-# #2039: grades the chat front door's reply to the wake a crashed card sends
-# it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
-# only turn). A card-wake replay needs AGENT_TRANSPORT=api and errors on
-# this lane (_execute_card_wake in bench/kube_agents_bench/harness.py),
-# whichever profile answers the door. Returns to the lane when the replay
-# can send its wake through the door.
-chat-voice-retry-says-it-is-retried
-# #2039: the same for the wake a card sends on its last attempt.
-chat-voice-final-attempt-is-not-retried
-
-# #2039: grades the chat front door's reply to the wake a blocked card sends
-# it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
-# only turn). A card-wake replay needs AGENT_TRANSPORT=api and errors on
-# this lane (_execute_card_wake in bench/kube_agents_bench/harness.py),
-# whichever profile answers the door. Returns to the lane when the replay
-# can send its wake through the door.
-chat-voice-failure-leads-with-fact
-
 # #2039: grades the chat front door's silence on the wake a card sends when
 # its question is already posted (bench/kube_agents_bench/card_wake.py
 # replays that wake as the run's first turn). A card-wake replay needs
@@ -134,10 +116,6 @@ chat-fanout-fleet-restarts-rows
 # ids, so the worker checks fail closed. Returns to the lane with
 # agent-kanban-smoke.
 chat-question-asked-to-choose-pauses
-# #2039: grades the chat front door's reply to the wake a blocked card sends
-# it, as chat-voice-failure-leads-with-fact does: a card-wake replay needs
-# AGENT_TRANSPORT=api and errors on this lane. Returns to the lane with it.
-chat-failure-reply-declares-next-step
 # #2039: grades the worker's answer under the one card the chat front door
 # files, as chat-question-asked-to-choose-pauses does: the lane's delegation
 # wait reads no card ids. Returns to the lane with agent-kanban-smoke.

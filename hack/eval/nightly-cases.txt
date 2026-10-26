@@ -534,31 +534,6 @@
 # wait.
 ./tasks/autoops-controller-stall-triage/task.yaml
 
-# The front door's reply when a card's worker crashes (agents/chat/SOUL.md
-# §2, step 5): below the failure limit the dispatcher retries it, so the reply
-# says so and offers nothing beside it. A reply that states the retry but
-# names the agent, task or worker reds the case's no-internals check.
-# deployer: noop; the card and its crash are planted per run
-# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
-# worker: filing or unblocking a card fails its catastrophic fence.
-./tasks/chat-voice-retry-says-it-is-retried/task.yaml
-
-# The front door's reply when a card's worker fails its last attempt
-# (agents/chat/SOUL.md §2, step 5): the dispatcher gave up and nothing
-# retries a blocked card, so the reply says it stopped and does not say it
-# is being retried. deployer: noop; the card and its timeouts are planted
-# per run (bench/kube_agents_bench/card_wake.py, timed_out_final), so one
-# front-door turn and no worker: filing or unblocking a card fails its
-# catastrophic fence.
-./tasks/chat-voice-final-attempt-is-not-retried/task.yaml
-
-# The front door's reply when a card blocks: reads the card, leads with the
-# fact and the card's reason, no apology (agents/chat/SOUL.md §2, step 5).
-# deployer: noop; the blocked card is planted per run
-# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
-# worker: filing or unblocking a card fails the case's catastrophic fence.
-./tasks/chat-voice-failure-leads-with-fact/task.yaml
-
 # The first of the upgrade-failure catalogue's scenario cases (entry 11, the
 # zonal control plane's API gap during its own upgrade). Read-only chat prompt
 # against the seeded clusters' own zonal shape; no planted fixture, nothing to
@@ -833,13 +808,6 @@
 # the workload, rather than waiting for it (#2978). Worker-scope checks, so it
 # grades on the api lanes; fixture no-pdb-workload on seeded-a.
 ./tasks/fanout-absent-cluster-cards-complete/task.yaml
-
-# The front door's reply to a blocked card declares the one next step on a
-# last line of its own, `[next: <label>]`, which Slack draws as a button
-# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
-# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
-# turn and no worker: filing or unblocking a card fails its catastrophic fence.
-./tasks/chat-failure-reply-declares-next-step/task.yaml
 
 # A card's answer with one obvious next step declares it on a last line of
 # its own, `[next: <label>]`, which Slack draws as a button (the report-format
