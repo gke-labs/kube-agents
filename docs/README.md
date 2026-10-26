@@ -177,9 +177,7 @@ CI enforcement: `make docs-check` runs the same checks as
   page with no entry must be clean, and a count below its entry fails until the
   entry is lowered (`--write-ratchet` lowers or drops entries and never raises
   or adds one). The rule is `.agents/rules/documentation.md`, "Write it
-  straight". The workflow has no step for this target yet; until it gains one,
-  CI holds the ratchet through `scripts/test_check_docs_prose.py` in the Python
-  unit-test job.
+  straight".
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
   and their combined size must stay inside the `BUDGET` that file sets.
