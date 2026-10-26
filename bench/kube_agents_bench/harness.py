@@ -158,6 +158,7 @@ from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import board, card_wake, gitops, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
+    DELEGATION_TOOL,
     STATUS_TOOL,
     delegated_task_ids,
     delivered_results,
@@ -659,7 +660,6 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.output = ""
-    del result.trajectory[:]
     result.errors.insert(0, f"{INFRA_FAILURE_MARKER}: {detail}")
     result.metadata["infra_failure"] = detail
 
@@ -3252,6 +3252,13 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         worker_acted = bool(captured and captured.entries) or bool(result.metadata.get("worker_commands"))
+        front_door_acted = any(
+            isinstance(e, dict)
+            and not e.get("agent")
+            and e.get("name") not in {DELEGATION_TOOL, STATUS_TOOL, "kanban_list", "delegate"}
+            for e in result.trajectory
+        )
+        agent_acted = worker_acted or front_door_acted
         infra_reason: str | None = None
         infra_detail: str = ""
         for tid, wlog in (logs or {}).items():
@@ -3280,7 +3287,7 @@ class KubeAgentsHarness(AgentHarness):
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
-        if infra_reason and trajectory_clean and not worker_acted:
+        if infra_reason and trajectory_clean and not agent_acted:
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",

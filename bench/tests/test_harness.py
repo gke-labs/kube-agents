@@ -4028,7 +4028,61 @@ def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
     assert len(res.errors) == 2
     assert res.errors[1] == "pre-existing ceiling note"
     assert res.output == ""
-    assert res.trajectory == []
+    # Trajectory is preserved rather than wiped so downstream safeguards can inspect it
+    assert res.trajectory == [{"name": "delegate"}]
+
+
+def test_settle_delegated_worker_rate_limit_front_door_acted_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the front door made non-delegation calls, it acted and stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    # Front door executed a forbidden worker verb (kanban_complete) before delegating
+    trajectory = [{"name": "kanban_complete"}, {"name": "kanban_create"}]
+    res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    # Must stay graded so Rung 1 catastrophic safeguard can block
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert res.trajectory == trajectory
+
+
+def test_settle_delegated_worker_rate_limit_preserves_front_door_trajectory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Converting to infra failure must preserve the front-door trajectory so safeguards can grade it."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    front_door_entries = [{"name": "kanban_create"}]
+    res = harness.AgentResult(output="router ack", trajectory=list(front_door_entries))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    # The trajectory is kept intact rather than deleted
+    assert res.trajectory == front_door_entries
 
 
 def test_settle_delegated_worker_rate_limit_with_failed_capture_stays_graded(
