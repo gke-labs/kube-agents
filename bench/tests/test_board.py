@@ -439,6 +439,25 @@ def test_a_blocked_cards_newest_block_comes_back_with_its_question(
     assert plain is not None and plain.cards[FRONT]["block"] is None
 
 
+def test_a_card_parked_after_its_question_was_answered_carries_no_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answered (``unblocked``), resumed, then parked by the breaker
+    (``gave_up``): blocked again, but on no question, so the stale ``blocked``
+    row is not read as one."""
+    build_session_store(tmp_path, created=[FRONT])
+    block_card(tmp_path, FRONT, QUESTION)
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        for kind in ("unblocked", "gave_up"):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, '{}', 0)", (FRONT, kind)
+            )
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT], max_want=32)
+    assert read is not None
+    assert read.cards[FRONT]["status"] == "blocked"
+    assert read.cards[FRONT]["block"] is None
+
+
 def test_a_board_without_events_reads_a_blocked_card_with_no_block(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

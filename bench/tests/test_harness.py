@@ -3866,6 +3866,25 @@ def test_a_question_wake_on_the_inject_transport_sends_both_turns_to_the_api_ser
     assert _archived(scripts)
 
 
+def test_a_fresh_session_answer_on_the_inject_transport_goes_to_the_api_server(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _fresh_shell(scripts))
+    monkeypatch.setenv("AGENT_TRANSPORT", "inject")
+    monkeypatch.delenv("AGENT_INJECT_TOKEN", raising=False)
+    stub_agent.turns = [_turn(_text("[SILENT]")), _answer_turn()]
+
+    result = KubeAgentsHarness().run(_FRESH_PROMPT)
+
+    assert not result.has_errors()
+    wake, answer = stub_agent.requests
+    assert wake["input"] == _REPLAY_WAKE
+    assert answer["input"].endswith("seeded-b")
+    assert wake["conversation"] != answer["conversation"]
+    assert _archived(scripts)
+
+
 def test_a_card_wake_refuses_an_unknown_transport(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
