@@ -42,15 +42,21 @@ change to what decides drift (the catalog, the scan, the runner that
 addresses the clusters, this module) excuses nothing, and a case whose own
 directory the change edits is never excused.
 
-Only positive evidence counts. A role the scan READ and found out of shape
-is ``drifted``; ``unchecked`` (the read failed), ``unpublished`` (the
+Only positive, sustained evidence counts. A role is excused only when the
+lease-time scan READ it out of shape after waiting for it to converge AND the
+published hourly scan (``fixture-state.json``, ``--published``) holds it
+drifted on the same project in its last two scans, the rule ``health.py``'s
+``fixture_drift`` condition uses: a pod rescheduling, or the crashloop's
+restart lag after a node repair, reads drifted once and is not excused. A
+published document that cannot be read excuses nothing. ``drifted`` is the
+only lease-time verdict that can excuse; ``unchecked`` (the read failed), ``unpublished`` (the
 runner wrote no kubeconfig for it) and ``no_state`` say nothing about the
 fixture, and the case is graded as usual. A report that is missing, will
 not parse, or is of another schema version is the same: every case is graded
 as usual and the run says why. A task file that will not read leaves that
 case graded as usual too. The only exit other than 0 is argparse's.
 
-Run:  python -m kube_agents_bench.fixture_drift --report R --out-dir D [--changed-files F] TASK...
+Run:  python -m kube_agents_bench.fixture_drift --report R --published P --out-dir D [--changed-files F] TASK...
 """
 
 from __future__ import annotations
@@ -149,6 +155,18 @@ def load_scan(path: Path) -> LeaseScan:
     return LeaseScan(project=str(doc.get("project") or "the leased project"), drifted=drifted)
 
 
+def sustained_roles(path: Path, project: str) -> set[str]:
+    """The roles the published hourly scan holds drifted on ``project`` in
+    both its latest scan and the one before (``previous.drifted``)."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        roles = doc["projects"][project]["roles"]
+        before = set(doc["previous"]["drifted"].get(project) or [])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ScanUnusable(f"the published hourly scan {path} does not say whether a drift on {project} is sustained ({exc!r})") from exc
+    return {r for r, v in roles.items() if isinstance(v, dict) and v.get("state") == VERDICT_DRIFTED and r in before}
+
+
 def _check_roles(node: Any, found: set[str]) -> None:
     """Every singular ``fixture_role:`` in one check subtree."""
     if not isinstance(node, dict):
@@ -220,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--report", required=True, help="hack/fleet-fixture-state.py --report output for the leased project")
     parser.add_argument("--out-dir", required=True, help="where to write one reason file per drifted case")
+    parser.add_argument("--published", required=True, help="the hourly scan's published fixture-state.json")
     parser.add_argument("--changed-files", help="the paths the change under test edits, one per line, from the repository root")
     parser.add_argument("tasks", nargs="*", help="the matrix's task.yaml paths")
     args = parser.parse_args(argv)
@@ -247,6 +266,15 @@ def main(argv: list[str] | None = None) -> int:
     if not scan.drifted:
         print(f"Fixture drift: the lease-time scan of {scan.project} saw no drifted role; every case is graded as usual.", file=sys.stderr)
         return 0
+    try:
+        sustained = sustained_roles(Path(args.published), scan.project)
+    except ScanUnusable as exc:
+        print(f"Fixture drift: {exc}; every case is graded as usual.", file=sys.stderr)
+        return 0
+    passing = sorted(set(scan.drifted) - sustained)
+    if passing:
+        print(f"Fixture drift: {', '.join(passing)} read drifted at lease time but not on the last two hourly scans of {scan.project}; not excused.", file=sys.stderr)
+    scan = LeaseScan(project=scan.project, drifted={r: d for r, d in scan.drifted.items() if r in sustained})
     marked = mark([Path(t) for t in args.tasks], scan, Path(args.out_dir), edited_cases)
     print(
         f"Fixture drift: the lease-time scan of {scan.project} saw {', '.join(sorted(scan.drifted))} drifted; "

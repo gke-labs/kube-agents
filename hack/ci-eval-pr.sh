@@ -95,9 +95,15 @@ readonly EVAL_NOT_RUN_DIR="not-run"
 # under STATE_DIR, where kube_agents_bench.fixture_drift writes one reason
 # file per case that needs a drifted fixture, which run_one_unit records as
 # infrastructure instead of running; and, under STATE_DIR, the list of files
-# a pull request changes, which that module reads.
+# a pull request changes, which that module reads. The hourly scan's
+# published document is copied beside the report: a role is excused only when
+# it also says the drift held on its last two scans. The lease-time scan waits
+# for a drifted role to converge as long as the pool verifier does
+# (FLEET_STATE_WAIT_SECONDS, read out of that file), on top of the bound.
 readonly EVAL_LEASE_FIXTURE_REPORT="fixture-state-lease.json"
 readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=300
+readonly EVAL_FIXTURE_STATE_PUBLISHED="gs://kube-agents-dashboards/evals/fixture-state.json"
+readonly EVAL_FIXTURE_STATE_PUBLISHED_COPY="fixture-state-published.json"
 readonly EVAL_FIXTURE_DRIFT_DIR="fixture-drift"
 readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
@@ -900,8 +906,8 @@ write_fleet_kubeconfigs || {
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
 # ─── The leased project's fixtures, in their designed state? ─────────────────
-# hack/fleet-fixture-state.py over the kubeconfigs just written, one pass
-# (--wait 0), the same check the CI health bot's hourly scan runs against every
+# hack/fleet-fixture-state.py over the kubeconfigs just written, waiting for a
+# drifted role to converge as the pool verifier does, the same check the CI health bot's hourly scan runs against every
 # pool project (docs/ci-health.md, "The seeded-fleet scan"). Run here, per
 # lease, rather than read from the published fixture-state.json: that file is
 # up to an hour old in both directions, so a fixture that drifted since would
@@ -913,36 +919,40 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # own credential, which already lists the same clusters above.
 #
 # What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
-# case whose grade depends on a role the scan positively saw drifted (a role a
+# case whose grade depends on a role the scan positively saw drifted, and the
+# hourly scan saw drifted on its last two scans (a role a
 # check reads, or the case's single `fixtures:` role), and
 # run_one_unit records that case's repetitions as infrastructure under
 # `fixture-drift:<role>` instead of running them. A role the scan could not read
 # is not drift, and a scan that fails or times out leaves no report: either way
 # every case is graded as usual and the log says why. Never fatal.
-scan_lease_fixtures() { # <report path>
-  local report="$1" status=0
+scan_lease_fixtures() { # <report path> <published copy path>
+  local report="$1" published="$2" status=0 wait
   local -a bound=()
-  rm -f "${report}"
-  if [ -z "${BENCH_FLEET_KUBECONFIG_DIR:-}" ]; then
-    echo "WARNING: no fleet kubeconfig directory, so the leased project's fixtures were not checked; every case is graded as usual." >&2
+  rm -f "${report}" "${published}"
+  wait="$(sed -n 's/^FLEET_STATE_WAIT_SECONDS = \([0-9][0-9]*\)$/\1/p' "${SCRIPT_DIR}/../scripts/verify_ci_pool_project.py" 2>/dev/null || true)"
+  if [ -z "${BENCH_FLEET_KUBECONFIG_DIR:-}" ] || [ -z "${wait}" ]; then
+    echo "WARNING: no fleet kubeconfig directory, or no FLEET_STATE_WAIT_SECONDS to wait by, so the leased project's fixtures were not checked; every case is graded as usual." >&2
     return 0
   fi
   if command -v timeout >/dev/null 2>&1; then
-    bound=(timeout "${EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS}")
+    bound=(timeout "$(( wait + EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS ))")
   fi
+  gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
   ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
     --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
-    --wait 0 --report "${report}" || status=$?
+    --wait "${wait}" --report "${report}" || status=$?
   if [ "${status}" -ne 0 ]; then
     rm -f "${report}"
-    echo "WARNING: the lease-time fixture scan failed (exit ${status}; 124 is the ${EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS}s bound), so nothing is known about the leased project's fixtures; every case is graded as usual." >&2
+    echo "WARNING: the lease-time fixture scan failed (exit ${status}; 124 is the bound), so nothing is known about the leased project's fixtures; every case is graded as usual." >&2
   fi
 }
 profile_begin "fleet-fixture-state: the leased project's fixtures"
 STEP_START=$SECONDS
 mkdir -p "${ARTIFACTS:-/tmp/artifacts}"
 EVAL_LEASE_FIXTURE_REPORT_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_LEASE_FIXTURE_REPORT}"
-scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}"
+EVAL_FIXTURE_STATE_PUBLISHED_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_FIXTURE_STATE_PUBLISHED_COPY}"
+scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}" "${EVAL_FIXTURE_STATE_PUBLISHED_PATH}"
 echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
@@ -3439,7 +3449,7 @@ if [ -n "${PULL_NUMBER:-}" ] || [ -n "${PULL_BASE_SHA:-}" ] || [ "${JOB_TYPE:-}"
   fi
 fi
 if [ -n "${FIXTURE_DRIFT_MATCH}" ] && ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.fixture_drift \
-    --report "${EVAL_LEASE_FIXTURE_REPORT_PATH:-}" --out-dir "${FIXTURE_DRIFT_DIR}" \
+    --report "${EVAL_LEASE_FIXTURE_REPORT_PATH:-}" --published "${EVAL_FIXTURE_STATE_PUBLISHED_PATH:-}" --out-dir "${FIXTURE_DRIFT_DIR}" \
     ${FIXTURE_DRIFT_ARGS[@]+"${FIXTURE_DRIFT_ARGS[@]}"} "${TASKS[@]}"); then
   rm -f "${FIXTURE_DRIFT_DIR:?}"/*
   echo "WARNING: could not match the lease-time fixture scan to the matrix (kube_agents_bench.fixture_drift, above); every case is graded as usual." >&2

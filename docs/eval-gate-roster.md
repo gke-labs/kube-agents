@@ -651,7 +651,8 @@ case leaves the list.
 
 A broken seeded-fleet fixture is not a reason to demote. After it writes the fleet kubeconfigs,
 `hack/ci-eval-pr.sh` runs `hack/fleet-fixture-state.py` against the leased project. A case
-whose grade depends on a role that scan read and found out of its designed state (a role a
+whose grade depends on a role that scan read and found out of its designed state, after the pool
+verifier's convergence wait and on the hourly scan's last two passes too (a role a
 `fixture_role:` check reads, or the case's only `fixtures:` role) is not run. Each of its repetitions is recorded as infrastructure under `fixture-drift:<role>` and
 the scan's own words, and the suite leaves the case out of its coverage floor, so it cannot
 red or hold a pull request ([the scorer](designs/eval-scorer.md#the-verdict-ladder)). The

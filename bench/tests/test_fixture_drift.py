@@ -78,6 +78,15 @@ def laggard_drifted(tmp_path) -> Path:
     )
 
 
+def published(tmp_path: Path, now=("version-laggard",), before=("version-laggard",), project=PROJECT) -> Path:
+    """The hourly scan's fixture-state.json: ``now`` drifted on ``project``
+    in its latest scan, ``before`` in the one before."""
+    path = tmp_path / "fixture-state-published.json"
+    roles = {r: {"state": "drifted", "detail": ["x"]} for r in now} | {"no-pdb-workload": {"state": "healthy", "detail": []}}
+    path.write_text(json.dumps({"schema_version": 1, "projects": {project: {"roles": roles}}, "previous": {"drifted": {project: list(before)}}}), encoding="utf-8")
+    return path
+
+
 UPGRADES = TASKS / "upgrades-lagging-master-probe" / "task.yaml"
 RELIABILITY = TASKS / "reliability-pdb-probe" / "task.yaml"
 CRASHLOOP = TASKS / "cluster-agent-crashloop-debug" / "task.yaml"
@@ -171,14 +180,14 @@ def test_the_reason_leads_with_the_label_and_carries_the_scans_words():
 
 def test_main_marks_the_case_that_needs_the_drifted_role_and_no_other(laggard_drifted, tmp_path):
     out = tmp_path / "marks"
-    assert fixture_drift.main(["--report", str(laggard_drifted), "--out-dir", str(out), str(UPGRADES), str(RELIABILITY), str(CRASHLOOP)]) == 0
+    assert fixture_drift.main(["--report", str(laggard_drifted), "--published", str(published(tmp_path)), "--out-dir", str(out), str(UPGRADES), str(RELIABILITY), str(CRASHLOOP)]) == 0
     assert sorted(p.name for p in out.iterdir()) == ["upgrades-lagging-master-probe"]
     assert (out / "upgrades-lagging-master-probe").read_text(encoding="utf-8").startswith("fixture-drift:version-laggard: ")
 
 
 def test_main_on_an_unusable_report_marks_nothing_and_says_why(tmp_path, capsys):
     out = tmp_path / "marks"
-    assert fixture_drift.main(["--report", str(tmp_path / "absent.json"), "--out-dir", str(out), str(UPGRADES)]) == 0
+    assert fixture_drift.main(["--report", str(tmp_path / "absent.json"), "--published", str(published(tmp_path)), "--out-dir", str(out), str(UPGRADES)]) == 0
     assert not out.exists() or not any(out.iterdir())
     assert "graded as usual" in capsys.readouterr().err
 
@@ -188,7 +197,7 @@ def test_main_skips_a_task_that_will_not_read(laggard_drifted, tmp_path, capsys)
     broken.parent.mkdir()
     broken.write_text("fixtures: [version-laggard\n", encoding="utf-8")
     out = tmp_path / "marks"
-    assert fixture_drift.main(["--report", str(laggard_drifted), "--out-dir", str(out), str(broken), str(UPGRADES)]) == 0
+    assert fixture_drift.main(["--report", str(laggard_drifted), "--published", str(published(tmp_path)), "--out-dir", str(out), str(broken), str(UPGRADES)]) == 0
     assert sorted(p.name for p in out.iterdir()) == ["upgrades-lagging-master-probe"]
     assert "broken is graded as usual" in capsys.readouterr().err
 
@@ -197,7 +206,7 @@ def test_a_change_to_what_decides_drift_excuses_nothing(laggard_drifted, tmp_pat
     changed = tmp_path / "changed.txt"
     changed.write_text("docs/x.md\nbench/tf/fleet/fixtures.json\n", encoding="utf-8")
     out = tmp_path / "marks"
-    argv = ["--report", str(laggard_drifted), "--out-dir", str(out), "--changed-files", str(changed), str(UPGRADES)]
+    argv = ["--report", str(laggard_drifted), "--published", str(published(tmp_path)), "--out-dir", str(out), "--changed-files", str(changed), str(UPGRADES)]
     assert fixture_drift.main(argv) == 0
     assert not out.exists() or not any(out.iterdir())
     assert "bench/tf/fleet/fixtures.json" in capsys.readouterr().err
@@ -208,7 +217,7 @@ def test_a_case_the_change_edits_is_never_excused(laggard_drifted, tmp_path, cap
     changed = tmp_path / "changed.txt"
     changed.write_text("bench/tasks/upgrades-lagging-master-probe/task.yaml\n", encoding="utf-8")
     out = tmp_path / "marks"
-    argv = ["--report", str(laggard_drifted), "--out-dir", str(out), "--changed-files", str(changed), str(UPGRADES), str(other)]
+    argv = ["--report", str(laggard_drifted), "--published", str(published(tmp_path)), "--out-dir", str(out), "--changed-files", str(changed), str(UPGRADES), str(other)]
     assert fixture_drift.main(argv) == 0
     assert sorted(p.name for p in out.iterdir()) == ["other-laggard-case"]
     assert "upgrades-lagging-master-probe needs a drifted fixture, but this change edits the case" in capsys.readouterr().err
@@ -216,9 +225,37 @@ def test_a_case_the_change_edits_is_never_excused(laggard_drifted, tmp_path, cap
 
 def test_an_unreadable_change_list_excuses_nothing(laggard_drifted, tmp_path):
     out = tmp_path / "marks"
-    argv = ["--report", str(laggard_drifted), "--out-dir", str(out), "--changed-files", str(tmp_path / "absent.txt"), str(UPGRADES)]
+    argv = ["--report", str(laggard_drifted), "--published", str(published(tmp_path)), "--out-dir", str(out), "--changed-files", str(tmp_path / "absent.txt"), str(UPGRADES)]
     assert fixture_drift.main(argv) == 0
     assert not out.exists() or not any(out.iterdir())
+
+
+def marks_for(laggard_drifted: Path, tmp_path: Path, published_path: Path) -> list[str]:
+    out = tmp_path / "marks"
+    assert fixture_drift.main(["--report", str(laggard_drifted), "--published", str(published_path), "--out-dir", str(out), str(UPGRADES)]) == 0
+    return sorted(p.name for p in out.iterdir()) if out.exists() else []
+
+
+def test_a_drift_the_hourly_scan_held_twice_and_the_lease_confirms_is_excused(laggard_drifted, tmp_path):
+    assert marks_for(laggard_drifted, tmp_path, published(tmp_path)) == ["upgrades-lagging-master-probe"]
+
+
+def test_a_transient_lease_time_drift_the_hourly_scan_has_not_held_is_not_excused(laggard_drifted, tmp_path, capsys):
+    # A pod rescheduling, or the crashloop's restart lag: the hourly scan saw
+    # it on its latest pass only, or not at all.
+    assert marks_for(laggard_drifted, tmp_path, published(tmp_path, before=())) == []
+    assert marks_for(laggard_drifted, tmp_path, published(tmp_path, now=(), before=())) == []
+    assert "not excused" in capsys.readouterr().err
+    # Sustained on another project says nothing about this one.
+    assert marks_for(laggard_drifted, tmp_path, published(tmp_path, project="kube-agents-evals-9")) == []
+
+
+def test_an_unreadable_hourly_result_excuses_nothing(laggard_drifted, tmp_path, capsys):
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert marks_for(laggard_drifted, tmp_path, broken) == []
+    assert marks_for(laggard_drifted, tmp_path, tmp_path / "absent.json") == []
+    assert "graded as usual" in capsys.readouterr().err
 
 
 # --- What the gate makes of it ---------------------------------------------

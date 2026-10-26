@@ -243,8 +243,9 @@ its own key, `not_graded`, and named in a note; a run whose every case was not g
 A case not run because the lease-time seeded-fleet scan saw a fixture it needs drifted
 (`hack/ci-eval-pr.sh` records every repetition under `fixture-drift:<role>`;
 `kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
-not a wiped case for the floor either: a rerun lands on the same fixture, and nothing in the
-change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+not a wiped case for the floor either: a role is excused only when the lease-time read, after
+the pool verifier's convergence wait, and the hourly scan's last two passes all show it drifted,
+so it is not weather a rerun clears, and nothing in the change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
 named in a note. It still counts toward the all-cases guard, and a case with even one repetition
 lost some other way is weather as before.
 A blocking case outranks the

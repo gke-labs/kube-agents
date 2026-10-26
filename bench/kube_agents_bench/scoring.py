@@ -382,8 +382,9 @@ SUITE_OUTCOME_NOT_EVALUATED = "not_evaluated"
 #: (:mod:`kube_agents_bench.fixture_drift`). Such a repetition is
 #: infrastructure like any other not-run record; a case whose every
 #: repetition carries the label is also kept out of the suite's coverage
-#: floor, because a rerun lands on the same drifted fixture and the pull
-#: request cannot fix it.
+#: floor: the drift was read at lease time after a convergence wait and had
+#: held on the hourly scan's last two passes, so it is not weather a rerun
+#: clears, and the pull request cannot fix it.
 #: Matched only where :func:`classify_rep` puts a not-run record's reason:
 #: in parentheses after "nothing to grade", so a reason that merely quotes
 #: the label elsewhere excuses nothing.
@@ -1860,9 +1861,10 @@ def grade_suite(
     the answer is a rerun when the environment is healthy. The all-cases
     guard below is the same rule at the limit and reports the same outcome.
     One kind of lost case is outside the floor: a case not run because the
-    lease-time scan saw a fixture it needs drifted (``fixture_drift``). A
-    rerun finds the same fixture, so holding the floor on it would hold
-    every pull request until the fleet is repaired.
+    lease-time scan saw a fixture it needs drifted (``fixture_drift``), a
+    drift the hourly scan had also held on its last two passes. A sustained
+    drift is not weather a rerun clears, so holding the floor on it would
+    hold every pull request until the fleet is repaired.
 
     Precedence: a blocking case or an armed aggregate below the margin is a
     finding against the change, and it outranks the weather -- the outcome is
@@ -1945,9 +1947,9 @@ def grade_suite(
     # reason above; it is not weather, so it is not listed here. Neither is
     # a case the lane could not grade: its run happened.
     # The cases not run because a fixture they need drifted on the leased
-    # project. Infrastructure, but not weather a rerun clears: the next lease
-    # of the same project finds the same fixture, and nothing in the pull
-    # request can fix it. So they are kept out of the floor below rather than
+    # project, confirmed after a convergence wait and already held by the
+    # hourly scan's last two passes. Infrastructure, but not weather a rerun
+    # clears, and nothing in the pull request can fix it. So they are kept out of the floor below rather than
     # holding every pull request at not-evaluated until the fleet is
     # repaired; the all-cases guard still counts them, since a run where
     # nothing else graded evaluated nothing.

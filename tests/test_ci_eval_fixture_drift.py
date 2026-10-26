@@ -58,16 +58,23 @@ class ScanLeaseFixturesTest(unittest.TestCase):
         self.report = self.tmp / "artifacts" / "fixture-state-lease.json"
         self.report.parent.mkdir()
         self.args = self.tmp / "args"
+        self.published = self.tmp / "artifacts" / "fixture-state-published.json"
+        scripts = self.tmp / "scripts"
+        scripts.mkdir()
+        # The pool verifier's wait, which the scan reads rather than copies.
+        (scripts / "verify_ci_pool_project.py").write_text("FLEET_STATE_WAIT_SECONDS = 271\n")
 
-    def _scan(self, rc="0", fleet_dir="set", stale=False):
+    def _scan(self, rc="0", fleet_dir="set", stale=False, gcloud_ok=True):
         if stale:
             self.report.write_text('{"stale": true}')
         script = "\n".join(
             [
                 "set -euo pipefail",
                 _lift(r"^readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=.*$", "EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS"),
+                _lift(r"^readonly EVAL_FIXTURE_STATE_PUBLISHED=.*$", "EVAL_FIXTURE_STATE_PUBLISHED"),
+                f'gcloud() {{ {"echo published-doc" if gcloud_ok else "return 1"}; }}',
                 _lift(r"^scan_lease_fixtures\(\) \{.*?^\}", "scan_lease_fixtures", re.DOTALL | re.MULTILINE),
-                'scan_lease_fixtures "${REPORT}"',
+                'scan_lease_fixtures "${REPORT}" "${PUBLISHED}"',
                 'echo "survived"',
             ]
         )
@@ -76,6 +83,7 @@ class ScanLeaseFixturesTest(unittest.TestCase):
                 "SCRIPT_DIR": str(self.tmp / "hack"),
                 "PROJECT_ID": "kube-agents-evals-7",
                 "REPORT": str(self.report),
+                "PUBLISHED": str(self.published),
                 "SCAN_ARGS": str(self.args),
                 "SCAN_RC": rc,
                 "BENCH_FLEET_KUBECONFIG_DIR": str(self.tmp / "fleet") if fleet_dir == "set" else "",
@@ -90,9 +98,21 @@ class ScanLeaseFixturesTest(unittest.TestCase):
         self._scan()
         self.assertEqual(1, json.loads(self.report.read_text())["schema_version"])
         args = self.args.read_text()
-        self.assertIn("--wait 0", args)
+        self.assertIn("--wait 271", args, "the verifier's convergence wait, read out of its file")
+        self.assertEqual("published-doc\n", self.published.read_text())
         self.assertIn(f"--dir {self.tmp / 'fleet'}", args)
         self.assertIn("--project kube-agents-evals-7", args)
+
+    def test_an_unreadable_published_scan_leaves_no_copy(self):
+        self._scan(gcloud_ok=False)
+        self.assertFalse(self.published.exists(), "no copy means the mapping excuses nothing")
+
+    def test_no_wait_to_read_skips_the_scan(self):
+        (self.tmp / "scripts" / "verify_ci_pool_project.py").write_text("# moved\n")
+        proc = self._scan()
+        self.assertFalse(self.args.exists())
+        self.assertFalse(self.report.exists())
+        self.assertIn("every case is graded as usual", proc.stderr)
 
     def test_a_failed_scan_leaves_no_report_and_says_cases_grade_as_usual(self):
         proc = self._scan(rc="1")
@@ -208,6 +228,10 @@ class OrderTest(unittest.TestCase):
         self.assertLess(scan, state)
         self.assertLess(state, mapping)
         self.assertLess(mapping, fan_out)
+
+    def test_the_verifiers_wait_is_still_where_the_scan_reads_it(self):
+        verifier = _CI_EVAL_PR.parents[1] / "scripts" / "verify_ci_pool_project.py"
+        self.assertRegex(verifier.read_text(encoding="utf-8"), re.compile(r"^FLEET_STATE_WAIT_SECONDS = [0-9]+$", re.M))
 
     def test_run_one_unit_reads_the_mark_before_the_stream_locks_and_the_launch(self):
         unit = _lift(r"^run_one_unit\(\) \{.*?^\}", "run_one_unit", re.DOTALL | re.MULTILINE)
