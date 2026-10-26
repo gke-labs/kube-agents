@@ -65,10 +65,9 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 #: The label every reason this module writes leads with, followed by the
 #: role. ``scoring.py`` and the dashboard (``scripts/eval_dashboard/classify.py``,
@@ -95,6 +94,11 @@ NO_DETAIL = "no detail recorded"
 #: ``hack/ci-eval-pr.sh`` keeps under PIPE_BUF; the whole detail is in the
 #: report, which the job keeps as an artifact.
 DETAIL_MAX_CHARS = 200
+# How old the published hourly scan may be and still count: the same three
+# missed scans health.py's FIXTURE_STATE_MAX_AGE refuses past (a test pins the
+# two together). An older document means the scan job is down, and its last
+# verdicts say nothing about the fixtures now.
+PUBLISHED_MAX_AGE = timedelta(hours=3)
 ELLIPSIS = "..."
 
 #: Repository paths that decide what the scan calls drift. A pull request
@@ -155,15 +159,19 @@ def load_scan(path: Path) -> LeaseScan:
     return LeaseScan(project=str(doc.get("project") or "the leased project"), drifted=drifted)
 
 
-def sustained_roles(path: Path, project: str) -> set[str]:
+def sustained_roles(path: Path, project: str, now: datetime | None = None) -> set[str]:
     """The roles the published hourly scan holds drifted on ``project`` in
-    both its latest scan and the one before (``previous.drifted``)."""
+    both its latest scan and the one before (``previous.drifted``). A document
+    older than PUBLISHED_MAX_AGE is unusable, as health.py treats it."""
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
+        scanned_at = datetime.fromisoformat(doc["scanned_at"].replace("Z", "+00:00"))
         roles = doc["projects"][project]["roles"]
         before = set(doc["previous"]["drifted"].get(project) or [])
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise ScanUnusable(f"the published hourly scan {path} does not say whether a drift on {project} is sustained ({exc!r})") from exc
+    if scanned_at.tzinfo is None or (now or datetime.now(timezone.utc)) - scanned_at > PUBLISHED_MAX_AGE:
+        raise ScanUnusable(f"the published hourly scan {path} is from {doc['scanned_at']}, older than {PUBLISHED_MAX_AGE}: the scan job is not publishing")
     return {r for r, v in roles.items() if isinstance(v, dict) and v.get("state") == VERDICT_DRIFTED and r in before}
 
 
@@ -187,6 +195,8 @@ def _first_line(detail: list[str]) -> str:
 def case_roles(task_yaml: Path) -> set[str]:
     """The fixture roles one case's grade depends on (module docstring).
     Raises ``OSError`` or ``yaml.YAMLError`` on a file that will not read."""
+    import yaml  # here, so sustained_roles imports with the stdlib alone (hack/ci-eval-pr.sh)
+
     doc = yaml.safe_load(task_yaml.read_text(encoding="utf-8"))
     if not isinstance(doc, dict):
         return set()
@@ -216,6 +226,8 @@ def drift_reason(roles: set[str], scan: LeaseScan) -> str | None:
 
 def mark(tasks: list[Path], scan: LeaseScan, out_dir: Path, edited_cases: frozenset[str] = frozenset()) -> dict[str, str]:
     """Write ``<out_dir>/<case>`` for each drifted case; return ``{case: reason}``."""
+    import yaml  # lazy: see case_roles
+
     out_dir.mkdir(parents=True, exist_ok=True)
     marked: dict[str, str] = {}
     for task in tasks:

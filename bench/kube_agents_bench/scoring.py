@@ -1804,20 +1804,20 @@ class SuiteVerdict:
         return self.outcome == SUITE_OUTCOME_GREEN
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "green": self.green,
             "outcome": self.outcome,
             "reasons": self.reasons,
             "notes": self.notes,
             "not_evaluated": self.not_evaluated,
             "not_graded": self.not_graded,
-            "fixture_drift": self.fixture_drift,
-            "pass_rate": self.pass_rate,
-            "baseline_rate": self.baseline_rate,
-            "margin": self.margin,
-            "scored": self.scored,
-            "cases": self.cases,
         }
+        # Only when a case was excused, so a run with no drift writes the
+        # verdict shape it always has.
+        if self.fixture_drift:
+            out["fixture_drift"] = self.fixture_drift
+        out.update(pass_rate=self.pass_rate, baseline_rate=self.baseline_rate, margin=self.margin, scored=self.scored, cases=self.cases)
+        return out
 
 
 def grade_suite(

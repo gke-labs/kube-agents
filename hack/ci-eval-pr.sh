@@ -939,6 +939,11 @@ scan_lease_fixtures() { # <report path> <published copy path>
     bound=(timeout "$(( wait + EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS ))")
   fi
   gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
+  # Only a role the fresh hourly scan already holds drifted twice can be
+  # excused, so wait for convergence only then; otherwise one pass is enough.
+  if ! PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
+    wait=0
+  fi
   ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
     --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
     --wait "${wait}" --report "${report}" || status=$?

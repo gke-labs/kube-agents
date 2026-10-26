@@ -11,9 +11,11 @@ job and never leaves a stale or partial report behind, and the steps run in
 the order that makes the mark mean something.
 """
 
+import datetime
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -63,8 +65,10 @@ class ScanLeaseFixturesTest(unittest.TestCase):
         scripts.mkdir()
         # The pool verifier's wait, which the scan reads rather than copies.
         (scripts / "verify_ci_pool_project.py").write_text("FLEET_STATE_WAIT_SECONDS = 271\n")
+        # The scan asks kube_agents_bench whether a drift is sustained.
+        (self.tmp / "bench").symlink_to(_CI_EVAL_PR.parents[1] / "bench", target_is_directory=True)
 
-    def _scan(self, rc="0", fleet_dir="set", stale=False, gcloud_ok=True):
+    def _scan(self, rc="0", fleet_dir="set", stale=False, gcloud_ok=True, published_doc="published-doc"):
         if stale:
             self.report.write_text('{"stale": true}')
         script = "\n".join(
@@ -72,7 +76,7 @@ class ScanLeaseFixturesTest(unittest.TestCase):
                 "set -euo pipefail",
                 _lift(r"^readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=.*$", "EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS"),
                 _lift(r"^readonly EVAL_FIXTURE_STATE_PUBLISHED=.*$", "EVAL_FIXTURE_STATE_PUBLISHED"),
-                f'gcloud() {{ {"echo published-doc" if gcloud_ok else "return 1"}; }}',
+                f"gcloud() {{ {'printf %s ' + shlex.quote(published_doc) if gcloud_ok else 'return 1'}; }}",
                 _lift(r"^scan_lease_fixtures\(\) \{.*?^\}", "scan_lease_fixtures", re.DOTALL | re.MULTILINE),
                 'scan_lease_fixtures "${REPORT}" "${PUBLISHED}"',
                 'echo "survived"',
@@ -94,14 +98,25 @@ class ScanLeaseFixturesTest(unittest.TestCase):
         self.assertIn("survived", proc.stdout, "the scan never stops the job")
         return proc
 
+    def _sustained_doc(self):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        return json.dumps({"scanned_at": now, "projects": {"kube-agents-evals-7": {"roles": {"version-laggard": {"state": "drifted"}}}},
+                           "previous": {"drifted": {"kube-agents-evals-7": ["version-laggard"]}}})
+
     def test_a_scan_that_ran_keeps_its_report(self):
-        self._scan()
+        doc = self._sustained_doc()
+        self._scan(published_doc=doc)
         self.assertEqual(1, json.loads(self.report.read_text())["schema_version"])
         args = self.args.read_text()
-        self.assertIn("--wait 271", args, "the verifier's convergence wait, read out of its file")
-        self.assertEqual("published-doc\n", self.published.read_text())
+        self.assertIn("--wait 271", args, "a sustained drift waits the verifier's convergence wait, read out of its file")
+        self.assertEqual(doc, self.published.read_text())
         self.assertIn(f"--dir {self.tmp / 'fleet'}", args)
         self.assertIn("--project kube-agents-evals-7", args)
+
+    def test_no_sustained_drift_reads_once_without_waiting(self):
+        # Nothing can be excused, so the five-minute wait would buy nothing.
+        self._scan()
+        self.assertIn("--wait 0", self.args.read_text())
 
     def test_an_unreadable_published_scan_leaves_no_copy(self):
         self._scan(gcloud_ok=False)
@@ -232,6 +247,15 @@ class OrderTest(unittest.TestCase):
     def test_the_verifiers_wait_is_still_where_the_scan_reads_it(self):
         verifier = _CI_EVAL_PR.parents[1] / "scripts" / "verify_ci_pool_project.py"
         self.assertRegex(verifier.read_text(encoding="utf-8"), re.compile(r"^FLEET_STATE_WAIT_SECONDS = [0-9]+$", re.M))
+
+    def test_the_published_scans_max_age_matches_health_pys(self):
+        # fixture_drift.PUBLISHED_MAX_AGE mirrors health.FIXTURE_STATE_MAX_AGE
+        # (the bench module cannot import the health bot); keep them together.
+        root = _CI_EVAL_PR.parents[1]
+        health = (root / "scripts" / "eval_dashboard" / "health.py").read_text(encoding="utf-8")
+        bench = (root / "bench" / "kube_agents_bench" / "fixture_drift.py").read_text(encoding="utf-8")
+        hours = re.compile(r"= timedelta\(hours=([0-9]+)\)")
+        self.assertEqual(hours.search(health[health.index("FIXTURE_STATE_MAX_AGE = "):]).group(1), hours.search(bench[bench.index("PUBLISHED_MAX_AGE = "):]).group(1))
 
     def test_run_one_unit_reads_the_mark_before_the_stream_locks_and_the_launch(self):
         unit = _lift(r"^run_one_unit\(\) \{.*?^\}", "run_one_unit", re.DOTALL | re.MULTILINE)

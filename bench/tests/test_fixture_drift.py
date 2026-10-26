@@ -28,6 +28,7 @@ changes nothing.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -78,12 +79,16 @@ def laggard_drifted(tmp_path) -> Path:
     )
 
 
-def published(tmp_path: Path, now=("version-laggard",), before=("version-laggard",), project=PROJECT) -> Path:
+def published(tmp_path: Path, now=("version-laggard",), before=("version-laggard",), project=PROJECT, age=timedelta(minutes=20)) -> Path:
     """The hourly scan's fixture-state.json: ``now`` drifted on ``project``
-    in its latest scan, ``before`` in the one before."""
+    in its latest scan, ``before`` in the one before, scanned ``age`` ago
+    (None: no ``scanned_at``)."""
     path = tmp_path / "fixture-state-published.json"
     roles = {r: {"state": "drifted", "detail": ["x"]} for r in now} | {"no-pdb-workload": {"state": "healthy", "detail": []}}
-    path.write_text(json.dumps({"schema_version": 1, "projects": {project: {"roles": roles}}, "previous": {"drifted": {project: list(before)}}}), encoding="utf-8")
+    doc = {"schema_version": 1, "projects": {project: {"roles": roles}}, "previous": {"drifted": {project: list(before)}}}
+    if age is not None:
+        doc["scanned_at"] = (datetime.now(timezone.utc) - age).isoformat().replace("+00:00", "Z")
+    path.write_text(json.dumps(doc), encoding="utf-8")
     return path
 
 
@@ -250,6 +255,14 @@ def test_a_transient_lease_time_drift_the_hourly_scan_has_not_held_is_not_excuse
     assert marks_for(laggard_drifted, tmp_path, published(tmp_path, project="kube-agents-evals-9")) == []
 
 
+def test_a_stale_or_undated_published_scan_excuses_nothing(laggard_drifted, tmp_path):
+    # The scan job stopped: its last verdicts may be an incident since repaired.
+    assert marks_for(laggard_drifted, tmp_path, published(tmp_path, age=timedelta(hours=4))) == []
+    assert marks_for(laggard_drifted, tmp_path, published(tmp_path, age=None)) == []
+    with pytest.raises(ScanUnusable):
+        fixture_drift.sustained_roles(published(tmp_path, age=timedelta(hours=4)), PROJECT)
+
+
 def test_an_unreadable_hourly_result_excuses_nothing(laggard_drifted, tmp_path, capsys):
     broken = tmp_path / "broken.json"
     broken.write_text("{not json", encoding="utf-8")
@@ -319,7 +332,7 @@ def test_weather_on_the_same_admitted_case_is_still_not_evaluated(kanban_task, t
     rc, doc = suite(tmp_path, tmp_path / "case-a.json", tmp_path / "case-b.json")
     assert rc == 2 and doc["outcome"] == "not_evaluated"
     assert doc["not_evaluated"] == ["upgrades-lagging-master-probe"]
-    assert doc["fixture_drift"] == {}
+    assert "fixture_drift" not in doc  # no drift, no key: the verdict keeps its usual shape
 
 
 def test_every_case_on_a_drifted_fixture_is_still_not_evaluated(tmp_path):
