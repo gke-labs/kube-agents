@@ -1747,6 +1747,9 @@ stop armed the button cancels the turn without the `🛑` lines and sends the sa
 gateway words the result as the Slack Stop's one reply (`slack_stop.go`); unarmed, it is a typed
 `stop`.
 
+The steps after it, a reply that says what changed and a Stop that also ends the turn still
+running in Hermes, are designed in [`slack-stop.md`](slack-stop.md).
+
 The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
 is keyed that way. It is the form a DM record from before DMs threaded carries, so such
 a record relays its task's terminal into the DM where the ask was, and a message sent
