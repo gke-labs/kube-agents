@@ -596,6 +596,16 @@ def test_an_unreadable_pull_listing_is_an_error(env, github, status, needle):
     assert VerifierAgent().run_entry(lane_entry(), timeout_sec=10.0).status == "error"
 
 
+def test_a_401_names_the_credential_the_request_carried(env, github):
+    """Since #3424 the token is the renewed file's or the variable's, so a 401
+    says which one GitHub refused (#3823)."""
+    stash()
+    github.routes[WINDOWED_LISTING] = (401, {"message": "Bad credentials"})
+    res = check().verify(5.0)
+    assert res.status == "error"
+    assert "the token in BENCH_GITHUB_TOKEN is not valid" in res.reason
+
+
 def test_an_unreachable_api_is_an_error(env, github):
     stash()
 

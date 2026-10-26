@@ -35,6 +35,7 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -4345,8 +4346,8 @@ def test_assert_mode_timeout_is_floored_before_the_http_call(token, monkeypatch)
 
 def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
     """One slow forge read must not red a run on rung 2: a timeout or a reset
-    is retried, an HTTP answer is not, and the retries give up after the
-    configured count with the last failure."""
+    is retried, an HTTP answer short of a 5xx is not, and the retries give up
+    after the configured count with the last failure."""
     calls = {"n": 0}
     pauses = []
     monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
@@ -4394,7 +4395,68 @@ def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
     calls["n"] = 0
     monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _AnsweringOpener())
     assert verifiers._http_get_json(_api(), "tok", 30.0)[0] == 404
-    assert calls["n"] == 1, "an HTTP answer is an observation and is not retried"
+    assert calls["n"] == 1, "an HTTP answer short of a 5xx is an observation and is not retried"
+
+
+def test_a_5xx_answer_is_retried_before_it_is_returned(monkeypatch):
+    """A 5xx is the forge's fault, not an observation: one 502 on the branch
+    listing redded a merge gate (#3823). It is retried like a transport
+    failure, the last answer is returned unchanged when the tries run out, and
+    a 4xx is still answered on the first call."""
+    calls = {"n": 0}
+    pauses = []
+    monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b'{"number": 7}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _http_error(code: int, body: bytes):
+        return verifiers.urllib.error.HTTPError(_api(), code, "x", {}, io.BytesIO(body))
+
+    class _RecoveringOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise _http_error(502, b'{"message": "Bad Gateway"}')
+            return _Response()
+
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _RecoveringOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (200, {"number": 7})
+    assert calls["n"] == 3
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * 2
+
+    class _DownOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise _http_error(503, b'{"message": "down"}')
+
+    calls["n"] = 0
+    pauses.clear()
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _DownOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (503, {"message": "down"})
+    assert calls["n"] == verifiers._FORGE_READ_ATTEMPTS
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * (verifiers._FORGE_READ_ATTEMPTS - 1)
+
+    class _RefusingOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise _http_error(401, b'{"message": "Bad credentials"}')
+
+    calls["n"] = 0
+    pauses.clear()
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _RefusingOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (401, {"message": "Bad credentials"})
+    assert calls["n"] == 1
+    assert pauses == []
 
 
 def test_the_ledger_verifier_is_published_as_an_entry_point():

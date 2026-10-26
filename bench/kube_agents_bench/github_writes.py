@@ -75,6 +75,7 @@ from typing import Any
 
 from kube_agents_bench.forges import (
     FORGE_ENV_VAR,
+    FORGE_GITHUB,
     FORGE_GITLAB,
     FORGES,
     GITHUB_API_ROOT,
@@ -92,6 +93,7 @@ from kube_agents_bench.forges import (
     proposal_refs,
     read_token,
     token_env_vars,
+    token_source,
 )
 
 __all__ = [
@@ -428,9 +430,9 @@ class GitHubClient:
     def _refuse(status: int, repo: str, what: str, permission: str) -> None:
         if status == STATUS_UNAUTHORIZED:
             raise GitHubUnreadable(
-                f"GitHub answered 401 for {what} on {repo}: the token is not valid -- an "
-                "installation token expires an hour after it is minted -- so this check "
-                "could not be evaluated"
+                f"GitHub answered 401 for {what} on {repo}: {token_source(FORGE_GITHUB)} is "
+                "not valid -- an installation token expires an hour after it is minted -- "
+                "so this check could not be evaluated"
             )
         if status == STATUS_FORBIDDEN:
             raise GitHubUnreadable(

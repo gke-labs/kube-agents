@@ -186,13 +186,16 @@ _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
-# connection) is tried this many times, with this pause between tries, before
-# the check reports the API unreachable. One slow read must not red a run on
-# rung 2: gitlab.com's API times out a read now and then where GitHub's does
-# not, and the in-job GitLab helper retries its reads for the same reason. An
-# HTTP answer, whatever its status, is not retried: it is an observation.
+# connection) or is answered 5xx is tried this many times, with this pause
+# between tries, before the check reports the API unreachable or returns the
+# last 5xx. One slow read must not red a run on rung 2: gitlab.com's API times
+# out a read now and then where GitHub's does not, and the in-job GitLab helper
+# retries its reads for the same reason; a GitHub 502 on one branch listing
+# redded a merge gate (#3823). Any other HTTP answer is not retried: it is an
+# observation.
 _FORGE_READ_ATTEMPTS = 3
 _FORGE_READ_RETRY_PAUSE_SEC = 2.0
+_HTTP_SERVER_ERROR_FLOOR = 500
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -3920,10 +3923,10 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     Returns ``(status, decoded_json_or_None)``. Raises :class:`OSError`-family
     exceptions for transport failures, which the caller turns into
     ``status="error"`` rather than a fail — an unreachable API is the absence
-    of an observation, not a violation. A transport failure is retried
-    ``_FORGE_READ_ATTEMPTS`` times first, so one slow read does not become
-    that error; an HTTP answer is returned on the first try, whatever its
-    status.
+    of an observation, not a violation. A transport failure or a 5xx answer is
+    retried ``_FORGE_READ_ATTEMPTS`` times first, so one slow read or one
+    forge fault does not become that error; any other HTTP answer is returned
+    on the first try.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -3962,6 +3965,9 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
                 payload = json.loads(exc.read().decode("utf-8", errors="replace"))
             except (ValueError, OSError):
                 payload = None
+            if exc.code >= _HTTP_SERVER_ERROR_FLOOR and attempt < _FORGE_READ_ATTEMPTS:
+                time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
+                continue
             return exc.code, payload
         except json.JSONDecodeError as exc:
             raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc
