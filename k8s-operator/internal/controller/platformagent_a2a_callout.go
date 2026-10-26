@@ -535,8 +535,8 @@ const a2aAuthDelegatorRole = "system:auth-delegator"
 // Each would rewrite the other's Subjects on every reconcile, so one namespace's
 // callout silently loses TokenReview and refuses every connection with an error
 // indistinguishable from a bad token; and teardown then fails the ownership
-// check and returns "refusing to delete unowned" forever. The controller
-// already spells cluster-scoped names this way elsewhere.
+// check and leaves the binding to the other agent. The controller already
+// spells cluster-scoped names this way elsewhere.
 func a2aCalloutClusterRoleBindingName(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("kubeagents:a2a-callout-tokenreview:%s:%s", agent.Namespace, agent.Name)
 }

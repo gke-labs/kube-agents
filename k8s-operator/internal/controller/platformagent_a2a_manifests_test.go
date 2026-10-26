@@ -2614,6 +2614,56 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	}
 }
 
+// TestAFlipToTodayCompletesAroundAnUnownedDoorObject (#3871): the walk lists
+// both doors' objects whatever the flags say, and one under a door's name that
+// this CR does not own is somebody else's. The flip removes everything that is
+// ours, the sentinel StatefulSet included, and leaves that object as found,
+// instead of halting at it with the rest of the stack still standing.
+func TestAFlipToTodayCompletesAroundAnUnownedDoorObject(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+	doorKey := types.NamespacedName{Name: a2aDoorName(next), Namespace: next.Namespace}
+	squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: doorKey.Name, Namespace: doorKey.Namespace},
+		Data: map[string][]byte{"token": []byte("theirs")}}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy(), squatter).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, next)
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	stsKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
+	if err := cl.Get(ctx, stsKey, &appsv1.StatefulSet{}); err != nil {
+		t.Fatalf("precondition: the NATS StatefulSet was not rendered: %v", err)
+	}
+
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("an unowned object under a door's name stopped the flip to today: %v", err)
+	}
+	if err := cl.Get(ctx, stsKey, &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
+		t.Errorf("the NATS StatefulSet survived the flip: %v", err)
+	}
+	got := &corev1.Secret{}
+	if err := cl.Get(ctx, doorKey, got); err != nil {
+		t.Fatalf("the unowned Secret is gone: %v", err)
+	}
+	if string(got.Data["token"]) != "theirs" || len(got.OwnerReferences) != 0 {
+		t.Errorf("the unowned Secret was touched: data=%q owners=%+v", got.Data["token"], got.OwnerReferences)
+	}
+}
+
 // TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding pins the invariant
 // that on CR deletion (handleDeletion), an unowned or squatted callout
 // ClusterRoleBinding is logged and skipped rather than wedging finalizer removal,
@@ -6631,10 +6681,8 @@ func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
 // TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret: a Secret under the
 // rendered name that this agent did not create is not the door's key. The
 // token is the door's only access control, so adopting one would arm the door
-// with a credential its planter holds; and the flag-off removal refuses to
-// delete an unowned object, so a render built on it would wedge every later
-// reconcile. The reconcile fails before the Service is rendered, and the
-// planted Secret is left exactly as it was.
+// with a credential its planter holds. The reconcile fails before the Service
+// is rendered, and the planted Secret is left exactly as it was.
 func TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	scheme := setupScheme()
