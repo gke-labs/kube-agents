@@ -2181,6 +2181,35 @@ def test_delegated_worker_board_rate_limit_marks_run_infra(
     assert reads
 
 
+def test_delegated_worker_board_rate_limit_in_errors_marks_run_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delegated card whose board state records Hermes rate limit in errors is marked infra."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "blocked"},
+                "summaries": {},
+                "errors": {_TASK_ID: rate_limit_msg},
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+
+
 def test_delegated_worker_board_rate_limit_cleared_on_retry_stays_graded(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2200,7 +2229,7 @@ def test_delegated_worker_board_rate_limit_cleared_on_retry_stays_graded(
                 }
             else:
                 payload = {
-                    "statuses": {_TASK_ID: "done"},
+                    "statuses": {_TASK_ID: "blocked"},
                     "summaries": {},
                     "errors": {},
                 }
@@ -2211,12 +2240,12 @@ def test_delegated_worker_board_rate_limit_cleared_on_retry_stays_graded(
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell)
-    # Turn 1: create card; Turn 2: status turn reporting running (allows retry/poll 2); Turn 3: status turn reporting done
-    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("done")]
+    # Turn 1: create card; Turn 2: status turn reporting running (allows retry/poll 2); Turn 3: status turn reporting blocked (retry failed without summary)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked")]
 
     result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
 
-    assert not result.has_errors()
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
     assert read_count >= 2
 
 
