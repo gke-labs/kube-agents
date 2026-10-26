@@ -297,6 +297,33 @@ class FlagTest(RepoFixture):
             [],
         )
 
+    def test_runner_options_before_the_bare_separator_are_not_the_scripts(self):
+        """`sudo --preserve-env` and `bash --noprofile` are the runner's; the script's start after `--`."""
+        body = (
+            "```bash\n"
+            "curl -fsSL https://example/install.sh | sudo --preserve-env=PATH bash -s -- --dry-run\n"
+            "curl -fsSL https://example/install.sh | bash --noprofile -s -- --bogus\n"
+            "curl -fsSL https://example/install.sh | bash --norc\n"
+            "```\n"
+        )
+        self.assertEqual(self.flag_findings(body), [("--bogus", 3)])
+
+    def test_namesake_script_in_the_tree_is_not_the_installer(self):
+        """A path ending in another install.sh's directory cites nothing on the root one; other paths are the root one."""
+        self.write("plugins/pubsub/install.sh", 'case "$1" in\n  --context) CONTEXT="$2"; shift 2 ;;\nesac\n')
+        body = (
+            "```bash\n"
+            "bash plugins/pubsub/install.sh --context kind-dev --namespace agents\n"
+            "plugins/pubsub/install.sh --namespace agents\n"
+            "https://example/kube-agents/main/plugins/pubsub/install.sh --namespace agents\n"
+            "$HOME/kube-agents/install.sh --bogus-root\n"
+            "~/Downloads/install.sh --bogus-download\n"
+            "```\n"
+            "\n"
+            "Run `plugins/pubsub/install.sh` with `--context`.\n"
+        )
+        self.assertEqual(self.flag_findings(body), [("--bogus-root", 5), ("--bogus-download", 6)])
+
     def test_script_as_another_commands_argument_cites_nothing(self):
         body = (
             "```bash\n"
@@ -366,6 +393,29 @@ class FlagTest(RepoFixture):
 
     def test_fenced_code_is_not_a_paragraph(self):
         self.assertEqual(self.flag_findings("`install.sh` is below.\n```\n`--bogus`\n```\n"), [])
+
+    def test_fence_closes_on_a_run_at_least_as_long_with_nothing_after(self):
+        """A four-backtick block showing a three-backtick one stays code; a closer carries no info string."""
+        body = (
+            "````markdown\n"
+            "```bash\n"
+            "./install.sh --inner-bogus\n"
+            "```\n"
+            "Prose inside the outer block: `--not-a-span`.\n"
+            "````\n"
+            "\n"
+            "After the block, `install.sh` takes `--outer-bogus`.\n"
+            "\n"
+            "```\n"
+            "./install.sh --first\n"
+            "```bash\n"
+            "./install.sh --second\n"
+            "```\n"
+        )
+        self.assertEqual(
+            self.flag_findings(body),
+            [("--inner-bogus", 3), ("--outer-bogus", 8), ("--first", 11), ("--second", 13)],
+        )
 
     def test_allowlisted_flag_passes(self):
         self.write(SITE / PAGE_NAME, "```bash\n./install.sh --gvisor=false\n```\n")
@@ -561,7 +611,8 @@ class PatternBacktrackingTest(unittest.TestCase):
         self.assert_fast(contracts.CASE_ARM_RE, "--0|" + "!|" * self.REPETITIONS)
 
     def test_assignment_with_many_process_substitutions(self):
-        value = "X=" + "<(a)" * self.REPETITIONS
+        """The match fails as a whole (`y ./` is no script), so every tiling of the value would be tried."""
+        value = "X=" + "<(a)" * self.REPETITIONS + " y ./"
         self.assert_fast(contracts.PIPED_RUNNER_RE, value)
         self.assert_fast(contracts.SCRIPT_COMMAND_PREFIX_RE, value)
 

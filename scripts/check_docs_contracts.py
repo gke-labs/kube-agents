@@ -13,10 +13,13 @@ time and compared with what the documents say:
   the script's name in one shell command (a fenced block line, continuations
   joined, or an inline code span) whose command word is the script, run
   directly, through ``bash``, or as ``bash <(curl …)``; through the
-  ``curl … | bash -s -- --flag`` form; or when the flag stands alone in a code
-  span inside a paragraph that names exactly one of the three scripts. A script
-  named as another command's argument (``curl -o install.sh …``) cites nothing. A command's flag must be one the
-  named script accepts; a standalone span's flag must be one some installer
+  ``curl … | bash -s -- --flag`` form, where the runner's own options end at
+  the bare ``--``; or when the flag stands alone in a code span inside a
+  paragraph that names exactly one of the three scripts. A script named as
+  another command's argument (``curl -o install.sh …``) cites nothing, and so
+  does a path to another script in the tree with the same file name (a
+  plugin's ``agentplugins/<plugin>/install.sh``). A command's flag must be one
+  the named script accepts; a standalone span's flag must be one some installer
   script accepts, since a paragraph about one script often quotes another's.
 * **CRD fields** -- every ``json`` field name reachable from a kind's ``Spec``
   and ``Status`` structs, inline embeds followed, must appear as a word on the
@@ -49,6 +52,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -93,16 +97,31 @@ LONG_OPTION_RE = re.compile(r"(?<![\w-])--([a-z0-9][a-z0-9-]*)")
 # is not a mention of `install.sh`.
 SCRIPT_NAME_RE = re.compile(r"(?<![\w-])(install|upgrade|uninstall)\.sh\b")
 SCRIPT_NAME_SUFFIX = ".sh"
+# The word a script's name hangs off: `./`, `$HOME/kube-agents/`, a URL, or
+# nothing. When it ends in the directory of another script in the tree with
+# the same file name (a plugin's `agentplugins/<plugin>/install.sh`), the
+# mention is that script's, not the root installer's. Hidden directories and
+# `node_modules` are not searched for such scripts.
+WORD_BEFORE_RE = re.compile(r"\S*$")
+NAMESAKE_SKIP_PREFIX = "."
+NAMESAKE_SKIP_DIRS = ("node_modules",)
+DIRECTORY_SEPARATOR = "/"
 # Where one shell command ends and the next begins.
 COMMAND_SEPARATOR_RE = re.compile(r"\|\||&&|;|\|")
 # The segment after `curl … script.sh |` that runs what curl fetched: optional
-# environment assignments, optional sudo, then bash or sh.
+# environment assignments, optional sudo with options, then bash or sh with its
+# own options (`-s`, `--noprofile`) up to and including a bare `--`; what
+# follows the match is the script's. Without a bare `--` every option in the
+# segment is the runner's.
 # An environment assignment before a command; its value may be a `<(…)`
 # process substitution, which carries spaces and pipes of its own. A `<` that
 # opens a closed substitution is read only as that, and any other `<` only as a
 # character, so each value has one parse and no backtracking.
 ASSIGNMENT_RE_FRAGMENT = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:<\([^)]*\)|<(?!\([^)]*\))|[^\s<])*\s+)*"
-PIPED_RUNNER_RE = re.compile(r"^\s*" + ASSIGNMENT_RE_FRAGMENT + r"(?:sudo(?:\s+-\S+)*\s+)?(?:bash|sh)\b")
+PIPED_RUNNER_RE = re.compile(
+    r"^\s*" + ASSIGNMENT_RE_FRAGMENT + r"(?:sudo(?:\s+-\S+)*\s+)?(?:bash|sh)\b"
+    r"(?:\s+-(?!-(?:\s|$))\S*)*(?:\s+--(?=\s|$))?"
+)
 # What may stand before a script's name when the script is the segment's
 # command: a prompt, environment assignments, sudo or time with options, a
 # bash/sh runner with options, a `<(curl …` process substitution feeding it,
@@ -120,8 +139,11 @@ GROUP_CLOSE = ")"
 # fragment is kept.
 SHELL_COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
 LINE_CONTINUATION = "\\"
-# Markdown structure the document scan reads.
-FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# Markdown structure the document scan reads. A fence opens on a run of three
+# or more backticks or tildes and closes on a run of the same character at
+# least as long with nothing else on the line, so a four-backtick block that
+# shows a three-backtick one stays one block.
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 # A code span that is nothing but one long option, with or without `=value`.
 STANDALONE_FLAG_SPAN_RE = re.compile(r"^--([a-z0-9][a-z0-9-]*)(?:=\S*)?$")
@@ -318,7 +340,7 @@ class Document:
 
         for number, line in enumerate(self.lines, start=1):
             fence = FENCE_RE.match(line)
-            if fence and (not in_fence or fence.group(1) == fence_marker):
+            if fence and (not in_fence or closes_fence(fence, fence_marker)):
                 if in_fence:
                     flush_command()
                 else:
@@ -346,6 +368,12 @@ class Document:
             block.append(line)
         flush_command()
         flush_block()
+
+
+def closes_fence(fence: re.Match, marker: str) -> bool:
+    """Whether a fence line closes the block `marker` opened: same character, at least as long, nothing after."""
+    run = fence.group(1)
+    return run[0] == marker[0] and len(run) >= len(marker) and not fence.group(2).strip()
 
 
 # --- Installer flags ---------------------------------------------------------------------
@@ -379,6 +407,32 @@ def installer_flags(repo: Path) -> dict[str, set[str]]:
     return accepted
 
 
+def namesake_script_dirs(repo: Path) -> dict[str, tuple[str, ...]]:
+    """Script file name -> the directories (`agentplugins/x/`) of every other script in the tree with that name."""
+    names = {rel.name for rel in INSTALLER_SCRIPTS_REL}
+    found: dict[str, list[str]] = {name: [] for name in names}
+    for current, dirs, files in os.walk(repo):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(NAMESAKE_SKIP_PREFIX) and d not in NAMESAKE_SKIP_DIRS)
+        directory = Path(current).relative_to(repo)
+        if directory == Path():
+            continue
+        for name in names.intersection(files):
+            found[name].append(directory.as_posix() + DIRECTORY_SEPARATOR)
+    return {name: tuple(dirs) for name, dirs in found.items()}
+
+
+def script_mentions(text: str, namesakes: dict[str, tuple[str, ...]]) -> list[tuple[str, re.Match]]:
+    """(script file name, match) for each installer-script name in a text that is not a namesake's path."""
+    mentions: list[tuple[str, re.Match]] = []
+    for match in SCRIPT_NAME_RE.finditer(text):
+        name = match.group(1) + SCRIPT_NAME_SUFFIX
+        word = WORD_BEFORE_RE.search(text, 0, match.start()).group(0)
+        if any(word.endswith(directory) for directory in namesakes.get(name, ())):
+            continue
+        mentions.append((name, match))
+    return mentions
+
+
 def split_commands(command: str) -> list[str]:
     """The simple commands of a command line, split at `|`, `||`, `&&` and `;` outside parentheses."""
     segments: list[str] = []
@@ -402,40 +456,44 @@ def split_commands(command: str) -> list[str]:
     return segments
 
 
-def command_flag_citations(command: str) -> list[tuple[str, str]]:
+def command_flag_citations(command: str, namesakes: dict[str, tuple[str, ...]] | None = None) -> list[tuple[str, str]]:
     """(script file name, flag) for every long option a command passes to an installer script.
 
     The options after the script's name count when the script is the segment's
-    command (``SCRIPT_COMMAND_PREFIX_RE``); the next segment's options count when
-    it is a ``bash``/``sh`` runner fed by this one (``curl … | bash -s -- …``).
+    command (``SCRIPT_COMMAND_PREFIX_RE``); the next segment's options after
+    the runner's own count when it is a ``bash``/``sh`` runner fed by this one
+    (``curl … | bash -s -- …``, ``PIPED_RUNNER_RE``).
     """
     segments = split_commands(command)
     citations: list[tuple[str, str]] = []
     for index, segment in enumerate(segments):
-        for script in SCRIPT_NAME_RE.finditer(segment):
-            name = script.group(1) + SCRIPT_NAME_SUFFIX
+        for name, script in script_mentions(segment, namesakes or {}):
             flags: list[str] = []
             if SCRIPT_COMMAND_PREFIX_RE.match(segment[: script.start()]):
                 tail = segment[script.end() :]
                 flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(tail))
-            if index + 1 < len(segments) and PIPED_RUNNER_RE.match(segments[index + 1]):
-                flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(segments[index + 1]))
+            runner = PIPED_RUNNER_RE.match(segments[index + 1]) if index + 1 < len(segments) else None
+            if runner:
+                tail = segments[index + 1][runner.end() :]
+                flags.extend(LONG_OPTION_PREFIX + m.group(1) for m in LONG_OPTION_RE.finditer(tail))
             citations.extend((name, flag) for flag in flags)
     return citations
 
 
-def flag_findings(rel: Path, document: Document, accepted: dict[str, set[str]]) -> list[Finding]:
+def flag_findings(
+    rel: Path, document: Document, accepted: dict[str, set[str]], namesakes: dict[str, tuple[str, ...]]
+) -> list[Finding]:
     findings: list[Finding] = []
     seen: set[tuple[int, str, str]] = set()
     for line, command in document.commands:
-        for script, flag in command_flag_citations(command):
+        for script, flag in command_flag_citations(command, namesakes):
             if flag in accepted[script] or (line, script, flag) in seen:
                 continue
             seen.add((line, script, flag))
             findings.append(Finding(CHECK_FLAG, rel, line, flag, UNKNOWN_COMMAND_FLAG.format(script=script, flag=flag)))
     every_flag = set().union(*accepted.values())
     for start, block in document.blocks:
-        named = {m.group(1) + SCRIPT_NAME_SUFFIX for m in SCRIPT_NAME_RE.finditer(block)}
+        named = {name for name, _ in script_mentions(block, namesakes)}
         if len(named) != 1:
             continue
         script = named.pop()
@@ -746,11 +804,12 @@ def scan(repo: Path) -> list[Finding]:
     """Every finding across the scanned documents, sorted by path and line."""
     scanned = documents(repo)
     accepted = installer_flags(repo)
+    namesakes = namesake_script_dirs(repo)
     rules = count_rules(repo)
     findings = field_findings(repo)
     for rel in scanned:
         document = Document((repo / rel).read_text(encoding="utf-8"))
-        findings.extend(flag_findings(rel, document, accepted))
+        findings.extend(flag_findings(rel, document, accepted, namesakes))
         findings.extend(count_findings(rel, document, rules))
     findings.sort(key=lambda f: (f.path.as_posix(), f.line, f.check, f.token))
     return findings
