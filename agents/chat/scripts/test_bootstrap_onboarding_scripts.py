@@ -177,11 +177,16 @@ class DeliveryDecisionTest(unittest.TestCase):
 
     def test_a_hold_without_a_human_present_is_left_alone(self):
         # Aligned first: a touch of the marker that failed leaves this hold, and the
-        # report waits for a turn that binds, as on the path before the hold.
+        # report waits for a turn that binds, as on the path before the hold. The
+        # hold ages out on the first tick after that turn binds.
         hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
         self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
         self.assertTrue(hold.exists())
         self.assertEqual(self._stage_log(), "")
+        (self.d / ALIGNED).touch()
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(self._stage_log().count("\n"), 1)
 
     def test_a_directory_in_place_of_the_hold_never_raises(self):
         (self.d / ALIGNED).touch()
@@ -192,10 +197,22 @@ class DeliveryDecisionTest(unittest.TestCase):
         self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
 
     def test_an_unreadable_hold_never_raises(self):
+        # Only the unreadable hold's stat raises: Python 3.12's Path.exists() goes
+        # through Path.stat(), so a raise on every path would hit the aligned check.
         (self.d / ALIGNED).touch()
-        self._hold()
-        with mock.patch.object(Path, "stat", side_effect=PermissionError("no")):
+        unreadable = self._hold("turn-unreadable")
+        real_stat = Path.stat
+
+        def stat_except_the_unreadable_hold(path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError("no")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=stat_except_the_unreadable_hold):
             self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+            # An unreadable hold is skipped, not fatal: a readable young one still holds.
+            self._hold("turn-readable")
+            self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
         with mock.patch.object(Path, "glob", side_effect=OSError("no")):
             self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
 
