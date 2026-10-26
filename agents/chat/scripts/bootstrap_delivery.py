@@ -233,20 +233,22 @@ REMOTE_MV = "/bin/mv"
 PRESENTED_PLATFORM = "slack"
 # Why the first report went as text and not as the card, one line in the oobe stage log
 # (_stage_note), which an operator reads; the scheduler keeps a zero-exit run's stderr nowhere.
+# No name here reads CARD_NO or CARD_NUM: CodeQL's private-data heuristic takes that for a card
+# number and flags every stage-log line it reaches.
 TEXT_REPORT_NOTE = "the first report went as text: {reason}"
 CARD_FLAG_OFF = "KAGE_SLACK_UX is off"
-CARD_NOT_SLACK = "the report goes to {platform}, which takes text"
-CARD_NO_PLATFORM = "a chat whose platform is not recorded"
+CARD_PLATFORM_TAKES_TEXT = "the report goes to {platform}, which takes text"
+CARD_PLATFORM_UNRECORDED = "a chat whose platform is not recorded"
 CARD_MARKER_UNREAD = "the hand-off marker could not be read, so the files beside the report may be an earlier sweep's"
-CARD_NO_RANKING = "the hand-off filed no prioritization card, so the files beside the report are an earlier sweep's"
+CARD_RANKING_MISSING = "the hand-off filed no prioritization card, so the files beside the report are an earlier sweep's"
 CARD_FILE_UNUSABLE = "{name} could not be read: {problem}"
 CARD_FILE_MISSING = "no {name}"
 CARD_BUILD_FAILED = "the card could not be built: {error!r}"
 # A card that was built and not posted: the Slack doors' reasons.
-CARD_NOT_POSTED = "the report card was not posted, so the text goes: {reason}"
-CARD_NO_CHAT_ID = "the origin is not a Slack chat with a chat id"
-CARD_NO_THREAD = "the origin has no thread for the gateway to post into"
-CARD_NO_RELAY = "no Slack relay is configured"
+CARD_UNPOSTED = "the report card was not posted, so the text goes: {reason}"
+CARD_CHAT_ID_MISSING = "the origin is not a Slack chat with a chat id"
+CARD_THREAD_MISSING = "the origin has no thread for the gateway to post into"
+CARD_RELAY_MISSING = "no Slack relay is configured"
 CARD_REFUSED = "Slack refused the blocks: {error}"
 CARD_GATEWAY_REFUSED = "the gateway did not post it: {error}"
 CARD_POST_FAILED = "{error!r}"
@@ -1307,11 +1309,11 @@ def _first_report_card(
     if not slack_presenter.enabled():
         return None, CARD_FLAG_OFF
     if platform != PRESENTED_PLATFORM:
-        return None, CARD_NOT_SLACK.format(platform=platform or CARD_NO_PLATFORM)
+        return None, CARD_PLATFORM_TAKES_TEXT.format(platform=platform or CARD_PLATFORM_UNRECORDED)
     if no_ranking is None:
         return None, CARD_MARKER_UNREAD
     if no_ranking:
-        return None, CARD_NO_RANKING
+        return None, CARD_RANKING_MISSING
     for name in (ITEMS_NAME, SCORES_NAME, SHOWN_NAME):
         if name in files.problems:
             return None, CARD_FILE_UNUSABLE.format(name=name, problem=files.problems[name])
@@ -1346,24 +1348,24 @@ def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
         channel = str(origin.get(CHAT_ID_KEY) or "")
         thread = str(origin.get(THREAD_ID_KEY) or "")
         if origin.get(PLATFORM_KEY) != PRESENTED_PLATFORM or not channel:
-            _stage_note(data_dir, CARD_NOT_POSTED.format(reason=CARD_NO_CHAT_ID))
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_CHAT_ID_MISSING))
             return False
         if chat_notify.routes(PRESENTED_PLATFORM):
             return _posted_through_gateway(data_dir, card, channel, thread)
         import slack_blocks_post
 
         if not slack_blocks_post.configured():
-            _stage_note(data_dir, CARD_NOT_POSTED.format(reason=CARD_NO_RELAY))
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_RELAY_MISSING))
             return False
         blocks, text = inventory_card.blocks(card)
         try:
             slack_blocks_post.post(channel, text, blocks, thread)
         except slack_blocks_post.Refused as e:
-            _stage_note(data_dir, CARD_NOT_POSTED.format(reason=CARD_REFUSED.format(error=e)))
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_REFUSED.format(error=e)))
             return False
         return True
     except Exception as e:  # noqa: BLE001 - the text must still go
-        _stage_note(data_dir, CARD_NOT_POSTED.format(reason=CARD_POST_FAILED.format(error=e)))
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_POST_FAILED.format(error=e)))
     return False
 
 
@@ -1379,7 +1381,7 @@ def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, channel: 
     ``_posted_as_blocks`` gives.
     """
     if not thread:
-        _stage_note(data_dir, CARD_NOT_POSTED.format(reason=CARD_NO_THREAD))
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_THREAD_MISSING))
         return False
     chat, text = inventory_card.chat(card)
     path = ""
@@ -1402,7 +1404,7 @@ def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, channel: 
             with contextlib.suppress(OSError):
                 os.unlink(path)
     if res.returncode != 0:
-        _stage_note(data_dir, CARD_NOT_POSTED.format(reason=CARD_GATEWAY_REFUSED.format(error=res.stderr.strip())))
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_GATEWAY_REFUSED.format(error=res.stderr.strip())))
         return False
     return True
 
