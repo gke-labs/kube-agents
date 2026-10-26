@@ -137,15 +137,16 @@
 #      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
 #      980-1929s a repetition on 2026-09-14; priced at 1250s in
 #      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
-#      its held-out seat in presubmit-cases.txt opened (#2016 step 2). That
-#      file carries its record under both checks (12/12 under
-#      report_contains on the four graded nights 2026-09-16 to 09-20; under
+#      its held-out seat in presubmit-cases.txt opened (#2016 step 2). Its
+#      task.yaml header and docs/eval-gate-roster.md carry its record under
+#      both checks (12/12 under report_contains on the four graded nights
+#      2026-09-16 to 09-20; under
 #      pull_request_opened, #1780, nothing until #2263, then 90 %) and the
 #      miss shape the seat counts as the case's own; this file never lists a
 #      presubmit case twice. pdb-remediation-pr took the remediation roster
-#      line on 2026-10-14 (#2016 step 4) and was demoted back to this file on
-#      2026-10-17 (#3120, its line with the demotions below);
-#      rca-remediation-pr below stays nightly.
+#      line on 2026-10-14 (#2016 step 4), was demoted back to this file on
+#      2026-10-17 (#3120) and returned to the presubmit file and the roster
+#      on 2026-10-26 after #3145; rca-remediation-pr below stays nightly.
 ./tasks/chat-routing-board-read/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
@@ -333,17 +334,6 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
-
-# #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
-# pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
-# mostly, the worker finds checkout-gateway with no PodDisruptionBudget, then
-# declines to open a pull request because the pool's *-infra GitOps
-# repository holds no manifest for it (on #3017 it named an older pull
-# request it had not opened), so the report names no pull request it opened. Back on the roster once #3145 (seeds checkout-gateway's
-# manifest into every pool's -infra repository) merges and the case's
-# record holds (#3120). Still on the GitLab lane (gitlab-cases.txt), now
-# held out there.
-./tasks/pdb-remediation-pr/task.yaml
 
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on

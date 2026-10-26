@@ -2144,8 +2144,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14, demoted back here 2026-10-17, #3120; the
-# presubmit file's last section).
+# its roster line 2026-10-14, was demoted back here 2026-10-17, #3120, and
+# returned to the roster 2026-10-26; the presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2763,7 +2763,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # launches early and was never the last unit in 385 recorded runs). Only a
 # repetition at its 1929s maximum could be the last unit, by minutes. The
 # first runs of the fourteen-case matrix measure it, and until they have,
-# this is the projection. No Prow deadline change.
+# this is the projection. No Prow deadline change. (That was before #2260
+# moved the cases that request a pull request into a serial second phase;
+# since its return to the roster on 2026-10-26 it runs there, after every
+# other unit: unit_cost_hint has the cost.)
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -2935,7 +2938,8 @@ fi
 
 # The GitLab lane's list may hold no roster case (it held none from
 # pdb-remediation-pr's demotion of 2026-10-17, #3120, until
-# vcs-spent-branch-reuse's roster line of 2026-10-23), which empties the export by design, like a nightly part: said
+# vcs-spent-branch-reuse's roster line of 2026-10-23; pdb-remediation-pr's
+# returned 2026-10-26), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3165,17 +3169,20 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Nightly-only since 2026-10-17 (demoted on #3120); on the roster 2026-10-14
-    # to then (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
+    # On the roster again since 2026-10-26, after #3145; nightly-only
+    # 2026-10-17 to then (demoted on #3120); on the roster 2026-10-14 to
+    # 2026-10-17 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
     # to 2026-09-28. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
     # August); median of the September run, kept although the four graded
     # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
-    # under pull_request_opened says otherwise. While in the presubmit it was
-    # the largest hint, so it launched first in each repetition round; its
-    # three repetitions serialize on the task lock, ~62min at the hint and
-    # ~96min at the measured maximum.
+    # under pull_request_opened says otherwise. It requests a pull request, so
+    # since #2260 it runs in the second phase (unit_phase), one unit at a time
+    # after every other unit, and the hint orders it only among that phase's
+    # units (ahead of vcs-spent-branch-reuse's 1000 in each repetition round,
+    # which changes no total: the phase is serial). The writers nightlies
+    # since #3145 measured 142-265s a repetition.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -4042,8 +4049,8 @@ scheduled_audits pause "fan-out"
 # the first phase's last unit -- must be older than that before the next
 # window can open. The cost is one drain of the lanes at the phase boundary
 # and the settle plus the serial run of the requesting units (on the
-# presubmit tier, one case's repetitions, which the task lock already ran one
-# at a time, so three settles); the order inside each phase is unchanged.
+# presubmit tier, the requesting cases' repetitions, which launch_units runs
+# one at a time, one settle each); the order inside each phase is unchanged.
 # The ordering assumes a unit's writes land before the unit ends. Under the
 # bridge's api executor the harness's delegation wait holds the unit until
 # the cards the case filed are terminal, so their workers' pull requests

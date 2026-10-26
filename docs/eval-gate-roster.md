@@ -34,7 +34,7 @@ the roster's cases plus, since 2026-09-29, one documented exception: the held-ou
 coverage tracker puts in the presubmit file without a roster line, one per tracker
 ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
 [#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
-its roster line on 2026-10-14, and the case was demoted to the nightly on 2026-10-17, #3120).
+its roster line on 2026-10-14).
 Such a seat runs on every pull request, cannot red one on a graded failure under the default
 `roster` mode below (a switch to `record` mode would let the record admit it), and earns its
 record at presubmit volume; `scripts/test_eval_rosters.py` pins the set (`HELD_OUT_IN_PRESUBMIT`)
@@ -134,22 +134,8 @@ with a filed issue naming the exit condition:
   2026-09-22, and with pdb-remediation-pr's seat withdrawn (below) the remediation domain had
   no presubmit case, so `remediation` joined `fleet-audits` on the allowlist until
   pdb-remediation-pr's roster line on 2026-10-14 (below) took it off again; that case's
-  demotion on 2026-10-17 (#3120, below) put it back. Enters when #1189's re-admission bar
-  holds.
-- **pdb-remediation-pr** —
-  [#3120](https://github.com/gke-labs/kube-agents/issues/3120): demoted 2026-10-17 after
-  rung-4 collapses on unrelated pull requests in the days after its roster line of 2026-10-14
-  (below): #2971 (the Slack gateway only) and #3017 (the admin console only) failed it 0/3,
-  and #3329 (the drift card's body only) on 2026-10-17; #3002 was 1/3. Not the diff:
-  in the failed repetitions the worker found checkout-gateway with no PodDisruptionBudget, then
-  declined to open a pull request because the pool's `*-infra` repository holds no manifest for
-  it, or named an older pull request it had not opened, so the reply carries no pull request
-  this run opened. That is the miss the roster line took as a known cost. Its removal leaves
-  `remediation` with no presubmit case, so the domain is back on the `domains.yaml` allowlist
-  until it returns; it stays in `hack/eval/gitlab-cases.txt`, held out on that lane (below).
-  Enters again when [#3145](https://github.com/gke-labs/kube-agents/pull/3145), which seeds
-  checkout-gateway's manifest into every pool's `*-infra` repository, has merged and the case's
-  record holds (#3120).
+  demotion on 2026-10-17 (#3120) put it back until its return on 2026-10-26 (below). Enters
+  when #1189's re-admission bar holds.
 - **consistency-authorized-networks-probe** —
   [#3598](https://github.com/gke-labs/kube-agents/issues/3598): demoted 2026-10-21 after it
   failed about 30% of repetitions on the Gemini setup, on unrelated pull requests (#2997,
@@ -180,7 +166,8 @@ record.
 remediation domain's second writer, was on the roster from 2026-10-14
 ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4; the entry under
 "Admitted on the record since the split" below has the record) until its demotion to the
-nightly on 2026-10-17 ([#3120](https://github.com/gke-labs/kube-agents/issues/3120), above). How it got there, kept for
+nightly on 2026-10-17 ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), and is on
+it again since 2026-10-26 (the first entry under that heading). How it got there, kept for
 the measurements it cites: it held no presubmit seat before 2026-09-28. Its record —
 12/12 on the four graded nights 2026-09-16 to 09-20 (420–1153 s a repetition), after 11/15
 across #1079's five presubmit runs (the misses traced to
@@ -236,7 +223,7 @@ so the shape no longer arises and a reading in that band is regression.
 fourth answer here: it widens only a fleet audit's stream, and this case has no ledger and
 opens submit-suggestion branches. The roster edit of 2026-10-14 (step 4) took `remediation` off
 the `docs/designs/domains.yaml` allowlist, where it had sat beside fleet-audits since 2026-09-22;
-the demotion of 2026-10-17 (#3120) put it back.
+the demotion of 2026-10-17 (#3120) put it back, and the return of 2026-10-26 took it off again.
 
 Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
 the nine that used to wait commented out in the script (the reasons each cannot take a
@@ -263,13 +250,49 @@ obtainability activations from
 repetitions 2026-09-15 to 09-22): 680/688, 600/685, 491/679 and 69/684 — the silence case
 fails on a correct agent today, and the nightly record is what will show a fix landing.
 
-Two re-admissions on record: **agent-kanban-smoke** earned its seat back after the
+Three re-admissions on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
 the reds that once argued for un-arming it belonged to the old vocabulary check. The second is
-**upgrades-lagging-master-probe**, 2026-10-23, below.
+**upgrades-lagging-master-probe**, 2026-10-23, and the third **pdb-remediation-pr**,
+2026-10-26, both below.
 
 Admitted on the record since the split:
 
+- **pdb-remediation-pr**, 2026-10-26
+  ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), back from its demotion on
+  2026-10-17 (rung-4 collapses on #2971, #3017 and #3329: the worker found checkout-gateway with
+  no PodDisruptionBudget, then declined to open a pull request because the pool's `*-infra`
+  repository held no manifest for it, or named an older pull request it had not opened).
+  [#3145](https://github.com/gke-labs/kube-agents/pull/3145), merged 2026-10-23 00:36 UTC, seeds
+  that manifest into every pool repository. The record is the writers nightly
+  (`ci-kube-agents-eval-nightly-writers`, where the case runs because it opens a pull request),
+  read from each build's `case-pdb-remediation-pr.json` and dated, as the dashboard's Nightly page
+  dates it, by the build's UTC start (8 PM ET the evening before): 3/3 on each of the three nights
+  since #3145, 2026-10-24, 10-25 and 10-26 (builds 2113782591684349952, 2114144983022833664 and
+  2114507375523139584), all three under `spec.mode next`, the presubmit's mode and inject lane,
+  since [#3783](https://github.com/gke-labs/kube-agents/pull/3783); 21 of 21 over the seven nights
+  2026-10-20 to 10-26, every one since the agent model became `claude-opus-5-5-kubeagents-mcp`;
+  and 37 of 41 graded repetitions over the fourteen nights 2026-10-13 to 10-26, every miss before
+  #3145 and on the Gemini setup: 0/3 on 2026-10-18 and one repetition on 10-16, all the "names no
+  pull request URL" shape #3145 addresses (10-16 also had one infra repetition). Median repetition
+  172 s (142–265 s) over the nine since #3145. The four Claude nights before #3145 merged passed
+  too (12/12), so the record does not separate #3145's effect from the model change's; either way
+  the miss has not recurred in 21 repetitions. The store reads
+  `collecting: 9/9 runs recorded at this key across 3 recorded run(s), 11 more needed` at the
+  next-mode key, which the model change
+  and then the move to next mode each reset (the last Gemini key reads `would-demote`, 16/20, on
+  the pre-fix misses). So the citation is the nightly record, as for vcs-spent-branch-reuse below,
+  and the eval crew's approval of this line is the call that it suffices before the window fills.
+  The GitLab nightly passed it 21 of 21 on the seven nights that graded it, 2026-10-19 to 10-26.
+  What it costs: like vcs-spent-branch-reuse it requests a pull request, so its three repetitions
+  join that case's in the fan-out's second phase, one at a time after every other unit, each after
+  the repository reset and on the inject lane the 120-second GitHub-write settle ([The inject
+  lane](#the-inject-lane)): about 15 minutes more serial tail at the measured median (3 × (120 s +
+  172 s)), plus three more resets. The two cases' units alternate there, so a late write from one
+  would be charged to the other by the lane's write safeguard; the writers nightly has run them
+  interleaved that way on the inject lane, with six other requesting cases, on all three next-mode
+  nights, and neither tripped it (every repetition's catastrophic score 1.0). Taking the line took
+  `remediation` off the `docs/designs/domains.yaml` allowlist.
 - **vcs-spent-branch-reuse**, 2026-10-23, the source-control domain's first roster seat, moved
   from `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
   the record the writers nightly built: 42 of 42 graded repetitions over the fourteen nights
@@ -287,13 +310,13 @@ Admitted on the record since the split:
   transport, as it will be on the presubmit; and 15 of 15 on the five GitLab nightlies that
   graded, 2026-10-17 to 10-22. `deployer: noop`, and it seeds its own spent branch inside the
   run, so it reads no seeded cluster and no fixture: none of the fleet-drift exposure that
-  demoted the upgrades and consistency probes. What it costs: it is the presubmit's one case
-  that requests a pull request, so its three repetitions run in the fan-out's second phase, one
-  at a time after every other unit, each after the repository reset and on the inject lane the
-  120-second GitHub-write settle ([The inject lane](#the-inject-lane)): about 15 minutes of
-  serial tail at the measured median (3 × (120 s + 173 s)), plus the resets and the drain at the
-  phase boundary. Its seat took `source-control` off the
-  `docs/designs/domains.yaml` allowlist.
+  demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
+  that requests a pull request (until pdb-remediation-pr's return on 2026-10-26), so its three
+  repetitions run in the fan-out's second phase, one at a time after every other unit, each
+  after the repository reset and on the inject lane the 120-second GitHub-write settle
+  ([The inject lane](#the-inject-lane)): about 15 minutes of serial tail at the measured median
+  (3 × (120 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
+  `source-control` off the `docs/designs/domains.yaml` allowlist.
 - **upgrades-lagging-master-probe**, 2026-10-23
   ([#3269](https://github.com/gke-labs/kube-agents/issues/3269)), back from its demotion of
   2026-10-16 (rung-4 collapses on #2997, #2959, #3282, #3271 and more). The fixture was as
@@ -340,8 +363,8 @@ Admitted on the record since the split:
   (PRs #2763, #2874), both the first shape. The terminal exit-255 class
   ([#2174](https://github.com/gke-labs/kube-agents/issues/2174), fixed by
   [#2738](https://github.com/gke-labs/kube-agents/pull/2738) on 2026-10-08) is absent from every
-  artifact read after that merge. Back in the nightly since 2026-10-17, when that first miss
-  shape collapsed it on unrelated pull requests (#3120, above).
+  artifact read after that merge. In the nightly from 2026-10-17, when that first miss shape
+  collapsed it on unrelated pull requests (#3120), until its return on 2026-10-26 (above).
 - **capacity-pinned-pool-probe**, 2026-09-22
   ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)). Held out on
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010) (the delegation receipt
@@ -378,8 +401,9 @@ Admitted on the record since the split:
   shape). Its seat took incident-triage off the `docs/designs/domains.yaml` allowlist; the
   same day's decision that the presubmit runs the roster only put `fleet-audits` on it (the
   compliance canary above) and, with pdb-remediation-pr's promotion withdrawn, `remediation`
-  too, until its roster line on 2026-10-14 (and again since its demotion on 2026-10-17, #3120). Same watch as the case above: a collapse on an unrelated pull request in its first
-  days, and the demotion lever below.
+  too, until its roster line on 2026-10-14 (and again from its demotion on 2026-10-17, #3120,
+  to its return on 2026-10-26). Same watch as the case above: a collapse on an unrelated pull
+  request in its first days, and the demotion lever below.
 
 ## How far the roster's promise reaches
 
@@ -399,17 +423,18 @@ change that breaks either path is seen on the pull request that introduces it ag
 erroring verifier or an empty record is a rung-1–3 red for every case, admitted or not. A
 graded miss on the canary's seat (no ledger URL or the planted binding skipped) is reported as
 UNSTABLE and "(held out)" and blocks nothing; pdb-remediation-pr's (no pull request URL in the
-final answer) armed rung 4 like any roster case from 2026-10-14 until its demotion to the nightly
-on 2026-10-17 (#3120). From then until 2026-10-23 the submit-suggestion path was not in the
-presubmit at all; since then `vcs-spent-branch-reuse`, on the roster, opens two pull requests a
-repetition through it on the leased `*-infra` repository, so a change that breaks that path is a
-rung-4 red on the pull request that introduces it, or a rung-1–3 red when the verifier errors.
-What it does not grade is a remediation: `rca-remediation-pr` and `pdb-remediation-pr` are
-nightly-only, so a fix that never becomes a pull request is first seen by the next nightly that
-finishes grading. The eval crew took that trade with the policy; what makes a break on the ledger
-path block is the canary's roster line (#2013 step 4), and until it holds a pull request that
-touches that path should still say what it ran by hand. The submit-suggestion path has blocked
-since 2026-10-23 (above); #2016's line for it landed 2026-10-14 and was withdrawn 2026-10-17.
+final answer) arms rung 4 like any roster case, as it did from 2026-10-14 until its demotion to
+the nightly on 2026-10-17 (#3120) and again since 2026-10-26. From 2026-10-17 until 2026-10-23
+the submit-suggestion path was not in the presubmit at all; since then `vcs-spent-branch-reuse`,
+on the roster, opens two pull requests a repetition through it on the leased `*-infra`
+repository, so a change that breaks that path is a rung-4 red on the pull request that introduces
+it, or a rung-1–3 red when the verifier errors. Since 2026-10-26 a remediation is graded there
+too: a pdb-remediation-pr fix that never becomes a pull request is a rung-4 red. What
+`rca-remediation-pr` alone grades, the RCA delegation chain ending in a pull request, is still
+nightly-only, so it is first seen by the next nightly that finishes grading. The eval crew took
+that trade with the policy; what makes a break on the ledger path block is the canary's roster
+line (#2013 step 4), and until it holds a pull request that touches that path should still say
+what it ran by hand.
 
 ## The whole-suite rate
 
@@ -623,24 +648,22 @@ GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec
 show in Prow only, as the dashboard collects the GitLab lane's today-mode nightly alone and the GitLab
 lane never records.
 
-The roster above is still the roster, intersected with the lane's list: a roster case in the
-lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on
-the GitHub presubmit. pdb-remediation-pr was on the roster from 2026-10-14
-([#2016](https://github.com/gke-labs/kube-agents/issues/2016)) until its demotion to the nightly
-on 2026-10-17 ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), and while it was,
-its collapse redded the lane's verdict. From then until 2026-10-23 no lane case was on the
-roster and rung 4 was disarmed on the lane; since `vcs-spent-branch-reuse` took its roster line
-that day it arms rung 4 there, the other two are held out, and rungs 1 to 3 red the lane like
-every case. pdb-remediation-pr's demotion leaves its line in `gitlab-cases.txt`: the file needs only
-a registered case, which the nightly line still makes it, and the lane is not a blocking gate, so
-it keeps grading the GitLab merge-request path, held out, until the roster line returns. GitLab runs on demand
-(`/test pull-kube-agents-smoke-test-gitlab`) and nightly, not as a blocking presubmit: the agent
-goes through the same forge abstraction on both forges, so the GitHub presubmit already grades
-what a pull request can break in the agent; what GitLab can break on its own is the provider
-and the forge, which the nightly catches within a day and the on-demand run checks for a pull
-request that touches the provider. The file needs the normal approvers, like
-`nightly-cases.txt`: it changes what one on-demand lane and the two
-nightlies run, not what can red a pull request.
+The roster above is still the roster, intersected with the lane's list: a roster case in the lane
+arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on the GitHub
+presubmit. pdb-remediation-pr was on the roster from 2026-10-14
+([#2016](https://github.com/gke-labs/kube-agents/issues/2016)) until its demotion to the nightly on
+2026-10-17 ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), and while it was, its
+collapse redded the lane's verdict. From then until 2026-10-23 no lane case was on the roster and
+rung 4 was disarmed on the lane; `vcs-spent-branch-reuse` took its roster line that day and
+pdb-remediation-pr took its own back on 2026-10-26, so both arm rung 4 there,
+`vcs-review-feedback-read-back` is held out, and rungs 1 to 3 red the lane like every case. GitLab
+runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and nightly, not as a blocking
+presubmit: the agent goes through the same forge abstraction on both forges, so the GitHub
+presubmit already grades what a pull request can break in the agent; what GitLab can break on its
+own is the provider and the forge, which the nightly catches within a day and the on-demand run
+checks for a pull request that touches the provider. The file needs the normal approvers, like
+`nightly-cases.txt`: it changes what one on-demand lane and the two nightlies run, not what can red
+a pull request.
 
 ## Demoting a flaky case
 
