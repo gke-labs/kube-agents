@@ -23,6 +23,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 FUNCTION = "collect_credential_proxy_evidence"
+# The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
+HELPER = "last_bytes"
 LOG_ARTIFACT = "envoy-credential-proxy.log"
 METRICS_ARTIFACT = "credential-proxy-metrics.prom"
 DEPLOYMENT = "deployment/platform-agent-credential-proxy"
@@ -93,15 +95,19 @@ exec "$@"
 
 
 def lifted() -> str:
-    """The function and the constants it reads, as written in ci-env.sh."""
+    """The function, the byte-cap helper it bounds the log with, and the
+    constants it reads, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly CREDENTIAL_PROXY_[A-Z_]+=.*$", src, re.MULTILINE)
     if len(constants) < 8:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"expected the CREDENTIAL_PROXY_ constants in {ENV_SCRIPT}, found {constants}")
-    match = re.search(rf"^{FUNCTION}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
-    if match is None:  # pragma: no cover
-        raise AssertionError(f"{FUNCTION}() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in (HELPER, FUNCTION):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def constant(name: str) -> int:

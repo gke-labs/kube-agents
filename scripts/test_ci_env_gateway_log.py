@@ -20,6 +20,8 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 FUNCTION = "collect_gateway_log"
+# The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
+HELPER = "last_bytes"
 ARTIFACT = "platform-agent-gateway.log"
 
 # A kubectl that prints its arguments once, then the number of lines the
@@ -37,15 +39,19 @@ for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 
 
 def lifted() -> str:
-    """The function and the constants it reads, as written in ci-env.sh."""
+    """The function, the byte-cap helper it bounds the log with, and the
+    constants it reads, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly GATEWAY_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
     if len(constants) != 2:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"expected two GATEWAY_LOG_ constants in {ENV_SCRIPT}, found {constants}")
-    match = re.search(rf"^{FUNCTION}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
-    if match is None:  # pragma: no cover
-        raise AssertionError(f"{FUNCTION}() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in (HELPER, FUNCTION):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def constant(name: str) -> int:

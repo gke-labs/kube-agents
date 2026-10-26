@@ -73,7 +73,9 @@ for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 """
 
 
-FUNCTIONS = ("_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION, "collect_a2a_component_logs")
+# `last_bytes` first: the byte cap every log read below is piped through
+# (hack/ci-env.sh, "Byte caps").
+FUNCTIONS = ("last_bytes", "_agent_pod_watch_loop", "start_agent_pod_watch", "_stop_agent_pod_watch", FUNCTION, "collect_a2a_component_logs")
 
 
 def lifted(restart_seconds: str | None = None, healthy_seconds: str | None = None) -> str:

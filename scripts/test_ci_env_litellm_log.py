@@ -21,6 +21,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 FUNCTION = "collect_litellm_log"
+# The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
+HELPER = "last_bytes"
 ARTIFACT = "litellm.log"
 # The chart's pod label and container name (charts/kube-agents/templates/litellm.yaml).
 POD_SELECTOR = "app=litellm"
@@ -64,15 +66,19 @@ done
 
 
 def lifted() -> str:
-    """The function and the constants it reads, as written in ci-env.sh."""
+    """The function, the byte-cap helper it bounds the log with, and the
+    constants it reads, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly LITELLM_[A-Z_]+=.*$", src, re.MULTILINE)
     if not constants:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"no LITELLM_ constants in {ENV_SCRIPT}")
-    match = re.search(rf"^{FUNCTION}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
-    if match is None:  # pragma: no cover
-        raise AssertionError(f"{FUNCTION}() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in (HELPER, FUNCTION):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def constant(name: str) -> int:
