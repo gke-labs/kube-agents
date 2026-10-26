@@ -9,9 +9,10 @@ a time. This check counts five kinds of finding per page under
 ``docs/site/src/content/docs/``:
 
 * **banned word** -- a word from ``BANNED_WORDS`` or a phrase from
-  ``BANNED_PHRASES``, whole-word and case-insensitive; ``leverage`` only as a
-  verb (``leverage the``, ``leverages``, ``leveraging``), since the noun is
-  ordinary English;
+  ``BANNED_PHRASES``, whole-word and case-insensitive, a phrase also when it
+  is wrapped across two lines or spelt with a typographic apostrophe;
+  ``leverage`` only as a verb (``leverage the``, ``leverages``,
+  ``leveraging``), since the noun is ordinary English;
 * **antithesis** -- the two epigram forms, ``is not a X[,:;--] it is Y`` and
   ``not (merely|just|simply) X, but Y``. A plain ``is a X, not a Y`` contrast
   ("a namespaced resource, not cluster-scoped") is a fact and is not flagged;
@@ -123,11 +124,22 @@ LEVERAGE_VERB_RE = re.compile(
     r"\b(?:leverages|leveraged|leveraging|leverage\s+(?:the|a|an|this|that|these|those|its|their|your|our|it))\b",
     re.IGNORECASE,
 )
+# A phrase is matched over a run of consecutive lines, so one prettier wrapped
+# (`It is worth` / `noting that`) still hits: the gap between its words is any
+# whitespace, which inside a run is at most one line break. An apostrophe may
+# be the straight or the typographic one.
+PHRASE_GAP = r"\s+"
+APOSTROPHE_CLASS = "['’]"
+BANNED_PHRASE_PATTERNS = tuple(
+    PHRASE_GAP.join(re.escape(word).replace("'", APOSTROPHE_CLASS) for word in phrase.split())
+    for phrase in BANNED_PHRASES
+)
 BANNED_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(w) for w in BANNED_WORDS) + r")\b"
-    r"|\b(?:" + "|".join(re.escape(p) for p in BANNED_PHRASES) + r")\b",
+    r"|\b(?:" + "|".join(BANNED_PHRASE_PATTERNS) + r")\b",
     re.IGNORECASE,
 )
+BANNED_WORD_RES = (BANNED_RE, LEVERAGE_VERB_RE)
 
 # The two epigram forms. Each clause is bounded so the pattern cannot span a
 # whole paragraph: the first allows a short noun phrase between `is not` and
@@ -301,8 +313,10 @@ def prose_lines(text: str) -> list[str]:
                 in_generated = False
             kept.append("")
             continue
-        if GENERATED_BEGIN_RE.search(raw):
-            in_generated = True
+        begin = GENERATED_BEGIN_RE.search(raw)
+        if begin:
+            # A region opened and closed on one line blanks that line only.
+            in_generated = not GENERATED_END_RE.search(raw, begin.end())
             kept.append("")
             continue
         for opener, closer in ((HTML_COMMENT_OPEN, HTML_COMMENT_CLOSE), (MDX_COMMENT_OPEN, MDX_COMMENT_CLOSE)):
@@ -455,15 +469,41 @@ def text_findings(path: Path, start: int, text: str, kind: str, limit: int) -> l
     return findings
 
 
+def line_runs(lines: list[str]) -> list[tuple[int, str]]:
+    """(1-based start line, text) for every run of consecutive non-blank lines, joined."""
+    runs: list[tuple[int, str]] = []
+    start = 0
+    buffer: list[str] = []
+    for index, line in enumerate(lines + [""], start=1):
+        if line.strip():
+            if not buffer:
+                start = index
+            buffer.append(line)
+        elif buffer:
+            runs.append((start, PARAGRAPH_JOIN.join(buffer)))
+            buffer = []
+    return runs
+
+
+def banned_findings(path: Path, lines: list[str]) -> list[Finding]:
+    """Banned words, phrases and verb forms, matched over each run of lines.
+
+    A phrase wrapped across two lines is found and reported at the line it
+    starts on, with the line break in its text read as a space.
+    """
+    findings: list[Finding] = []
+    for start, text in line_runs(lines):
+        for pattern in BANNED_WORD_RES:
+            for match in pattern.finditer(text):
+                detail = " ".join(match.group(0).split())
+                findings.append(Finding(path, line_at(start, text, match.start()), KIND_BANNED_WORD, detail))
+    return findings
+
+
 def page_findings(path: Path, text: str) -> list[Finding]:
     """Every finding on one page, in line order."""
     lines = prose_lines(text)
-    findings: list[Finding] = []
-    for number, line in enumerate(lines, start=1):
-        for match in BANNED_RE.finditer(line):
-            findings.append(Finding(path, number, KIND_BANNED_WORD, match.group(0)))
-        for match in LEVERAGE_VERB_RE.finditer(line):
-            findings.append(Finding(path, number, KIND_BANNED_WORD, match.group(0)))
+    findings = banned_findings(path, lines)
     for start, block in paragraphs(lines):
         findings.extend(text_findings(path, start, block, KIND_PARAGRAPH, PARAGRAPH_WORD_LIMIT))
     for number, cell in table_cells(lines):
@@ -592,9 +632,20 @@ def preconditions(root: Path = SITE_ROOT) -> list[str]:
     return errors
 
 
+def readable_ratchet(ratchet_path: Path) -> dict[str, dict[str, int]] | None:
+    """The committed ratchet, or ``None`` after reporting why it cannot be read."""
+    try:
+        return load_ratchet(ratchet_path)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR: {BAD_RATCHET_ERROR.format(ratchet=display_path(ratchet_path), detail=exc)}")
+        return None
+
+
 def write_ratchet(root: Path = SITE_ROOT, ratchet_path: Path = RATCHET) -> int:
     """Lower or drop the recorded ceilings to today's counts; never raise or add one."""
-    recorded = load_ratchet(ratchet_path)
+    recorded = readable_ratchet(ratchet_path)
+    if recorded is None:
+        return 1
     lowered = lowered_ratchet(recorded, current_ratchet(root))
     ratchet_path.write_text(dump_ratchet(lowered), encoding="utf-8")
     print(WRITTEN_MESSAGE.format(ratchet=display_path(ratchet_path), entries=len(lowered)))
@@ -602,10 +653,8 @@ def write_ratchet(root: Path = SITE_ROOT, ratchet_path: Path = RATCHET) -> int:
 
 
 def check(root: Path = SITE_ROOT, ratchet_path: Path = RATCHET) -> int:
-    try:
-        recorded = load_ratchet(ratchet_path)
-    except (ValueError, json.JSONDecodeError) as exc:
-        print(f"ERROR: {BAD_RATCHET_ERROR.format(ratchet=display_path(ratchet_path), detail=exc)}")
+    recorded = readable_ratchet(ratchet_path)
+    if recorded is None:
         return 1
     findings_by_page = scan(root)
     report = compare(findings_by_page, recorded, root, ratchet_path)

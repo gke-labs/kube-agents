@@ -99,6 +99,12 @@ class ExtractionTest(SiteFixture):
         body = "<!-- BEGIN GENERATED: x -->\nsimply robust\n<!-- END GENERATED: x -->\n"
         self.assertEqual(self.kinds(body), [])
 
+    def test_one_line_generated_region_blanks_only_its_line(self):
+        body = "<!-- BEGIN GENERATED: x --> robust <!-- END GENERATED: x -->\n\nThis is simply text.\n"
+        findings = self.findings(body)
+        self.assertEqual([f.detail for f in findings], ["simply"])
+        self.assertEqual(findings[0].line, FRONTMATTER.count("\n") + 3)
+
     def test_mdx_import_and_tag_lines_are_not_prose(self):
         body = 'import { Aside } from "@astrojs/starlight/components";\n\n<Aside type="note">\n  Fine text.\n</Aside>\n'
         self.assertEqual(self.kinds(body), [])
@@ -174,6 +180,29 @@ class BannedWordTest(SiteFixture):
 
     def test_phrase_match_is_whole_word(self):
         self.assertEqual(self.kinds("The limit is set within today's release.\n"), [])
+
+    def test_phrase_wrapped_across_lines_hits_at_its_first_line(self):
+        for body in (
+            "It is worth\nnoting that.\n",
+            "- We can leverage\n  the controller.\n",
+            "| a | b |\n| --- | --- |\n| it's worth\nnoting | x |\n",
+        ):
+            with self.subTest(body=body[:20]):
+                findings = self.findings(body)
+                self.assertEqual([f.kind for f in findings], [prose.KIND_BANNED_WORD])
+                self.assertNotIn("\n", findings[0].detail)
+        finding = self.findings("Lead-in.\nIt is worth\nnoting that.\n")[0]
+        self.assertEqual(finding.line, FRONTMATTER.count("\n") + 2)
+        self.assertEqual(finding.detail, "It is worth noting")
+
+    def test_phrase_does_not_cross_a_blank_line(self):
+        self.assertEqual(self.kinds("It is worth\n\nnoting that.\n"), [])
+        self.assertEqual(self.kinds("We can leverage\n\nthe controller.\n"), [])
+
+    def test_phrase_with_a_typographic_apostrophe_hits(self):
+        for body in ("It\u2019s worth noting this.\n", "In today\u2019s release.\n"):
+            with self.subTest(body=body):
+                self.assertEqual(self.kinds(body), [prose.KIND_BANNED_WORD])
 
     def test_leverage_as_a_verb_hits(self):
         for text in ("It leverages the cache.", "Leverage the cache.", "We are leveraging it."):
@@ -344,6 +373,16 @@ class RatchetTest(SiteFixture):
                 code, out = self.run_main()
                 self.assertEqual(code, 1)
                 self.assertIn("ERROR", out)
+
+    def test_write_ratchet_on_a_malformed_ratchet_reports_and_leaves_it(self):
+        self.write_page("Fine.\n")
+        for text in ("{not json", "[]"):
+            with self.subTest(text=text):
+                self.ratchet.write_text(text, encoding="utf-8")
+                code, out = self.run_main(prose.WRITE_RATCHET_FLAG)
+                self.assertEqual(code, 1)
+                self.assertIn("ERROR", out)
+                self.assertEqual(self.ratchet.read_text(encoding="utf-8"), text)
 
     def test_write_ratchet_lowers_and_drops(self):
         self.write_page("This is simply text.\n")
