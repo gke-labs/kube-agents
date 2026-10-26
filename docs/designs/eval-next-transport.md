@@ -110,8 +110,9 @@ the presubmit exports nothing new until it chooses to. The exchange:
    reached the bus; and the bound expiring without `ActiveTask` appearing, whatever else the
    record holds. The harness classifies a refusal as the gateway refusing the injection or
    failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
-   literal affordances included, `Delegate` among them; the harness sends none, and a case whose
-   prompt opens with one is the case's defect. The adapter dedupes on the backend message id,
+   literal affordances included, `Delegate` among them; the harness sends none as a prompt, and a
+   case whose prompt opens with one is the case's defect. The one it sends itself is the `stop`
+   after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
    already accepted gets the answer the first one got, the record's task id or the same refusal,
    and starts nothing. Because the id
@@ -138,8 +139,8 @@ the presubmit exports nothing new until it chooses to. The exchange:
    cancels whenever that state still holds an active task, whether or not an executor has
    touched it; the cancel goes through an explicit cancel route that takes the task id the
    adapter answered with, whether or not the record still holds it, and lands on the bus as
-   `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the stop
-   text. The harness sends no message at the deadline, so nothing it does there can mint a
+   `kind: cancel` exactly as the text route's `stop` does, and the timeout never sends the stop
+   text (a stopped ask does, on purpose, to reach the cards). The harness sends no message at the deadline, so nothing it does there can mint a
    task or spend a model turn. The failure edit of step 2 can also arrive after the answer,
    when the record showed the active task before the publish failed; the harness is already
    reading the conversation, so it treats that edit as the terminal: infrastructure, the
@@ -667,12 +668,14 @@ pull from. Under the same flag
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
 changes nothing else about the run except what hangs off that transport switch: the inject
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
-than on this flag) leaves out the cases whose premise needs the chat front door; the lane's
+than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
+(`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
+lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases grade; the lane's
 safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
 remaining task file, which the unit hands devops-bench, over the leased project's GitOps
 repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request run in a second phase after every other unit, one at a time
-and each after a settle, so no repetition that requests nothing shares the repository with one
+cases that request a pull request, and the stopped asks, run in a second phase after every
+other unit, one at a time and each after a settle, so no repetition that requests nothing shares the repository with one
 that writes by design and no window reaches back into the unit before; and after the
 fan-out the script lists in the job log what the run left on that repository, closing nothing.
 With the flag unset both scripts are byte for byte what
@@ -711,8 +714,9 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-its Tide batch runs, the today lane's periodic, the main nightly's two parts
-`ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
+its Tide batch runs, the today lane's periodic, the main nightly's three parts
+`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
+`ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
 under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
 install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode nightly
 `ci-kube-agents-eval-nightly-today` or another postsubmit still stops the deploy before anything is

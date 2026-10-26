@@ -15,7 +15,7 @@ Ten SOPs back the enabled [fleet audits](/kube-agents/concepts/autonomous-watchd
 
 ### `compliance_audit_sop.md`
 
-Security & RBAC posture, daily. Sixteen checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, Pod Security `restricted` gaps, stalled Config Connector objects, image references that name no specific bytes, tokens mounted for ServiceAccounts nothing has granted, LoadBalancer Services publishing a management port to the internet, and bindings whose subject is everyone.
+Security & RBAC posture, daily. Seventeen checks: privileged and `SYS_ADMIN` containers, host namespace sharing, `hostPath` mounts, `cluster-admin` and wildcard grants on **bound** roles only, namespaces with no enforcing `NetworkPolicy`, `default` ServiceAccount token automount, Workload Identity disabled, node pools exposing the legacy GCE metadata endpoint, public control planes with no authorized networks, Pod Security `restricted` gaps, stalled Config Connector objects, Config Sync reconcilers that have stopped applying their repository, image references that name no specific bytes, tokens mounted for ServiceAccounts nothing has granted, LoadBalancer Services publishing a management port to the internet, and bindings whose subject is everyone.
 
 Invoked by the `compliance-audit` watchdog.
 
