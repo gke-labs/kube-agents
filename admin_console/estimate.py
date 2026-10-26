@@ -27,6 +27,9 @@ from admin_console import harness_limits as hl
 
 TABLE_SEPARATOR = " | "
 NOT_REACHED = "not below {ceiling}"
+# Fleets the sizing table answers question 2 for: this many clusters, each shaped like the base.
+REFERENCE_CLUSTERS = (8, 16, 32, 64, 128)
+CELL_SEPARATOR = " · "
 
 
 def _table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
@@ -108,6 +111,39 @@ def proxy_section(records: Sequence[hl.Record]) -> str:
     return "\n\n".join(parts)
 
 
+def sizing_section(records: Sequence[hl.Record], base: Mapping[str, float]) -> str:
+    """Question 2 for the reference fleets: each harness container's limits, the node pool, the PVC."""
+    containers = [name for name in hl.containers(records) if name not in hl.SHORT_LIVED_CONTAINERS]
+    replicas = hl.latest_replicas(records)
+    columns = {clusters: hl.scaled_fleet(base, clusters) for clusters in REFERENCE_CLUSTERS}
+    advice = {clusters: hl.recommendations(records, fleet, containers) for clusters, fleet in columns.items()}
+    rows = []
+    for index, container in enumerate(containers):
+        cells = []
+        for clusters in REFERENCE_CLUSTERS:
+            item = advice[clusters][index]
+            memory = hl.memory_quantity(item.memory_bytes) if item.memory_bytes else hl.NO_VALUE
+            cpu = hl.cpu_quantity(item.cpu_cores) if item.cpu_cores else hl.NO_VALUE
+            cells.append(f"{memory}{CELL_SEPARATOR}{cpu}")
+        rows.append((container, *cells))
+    pools = []
+    for clusters in REFERENCE_CLUSTERS:
+        plan = hl.node_plan(advice[clusters], replicas)
+        pools.append(f"{plan.nodes} × {plan.machine.name}" if plan.machine else "no listed machine type")
+    rows.append(("Node pool", *pools))
+    storage = []
+    for fleet in columns.values():
+        pvc = hl.predict(records, hl.PVC_USED, None, fleet)
+        storage.append(hl.storage_quantity(hl.with_margin(pvc.value)) if pvc else hl.NO_VALUE)
+    rows.append(("Data volume (spec.storage.size)", *storage))
+    headers = ("Container: memory · CPU limit", *(f"{clusters} clusters" for clusters in REFERENCE_CLUSTERS))
+    return (
+        "## Limits and nodes for larger fleets\n\n"
+        "Each limit is the predicted peak plus 30%, for that many clusters shaped like the base; "
+        "the node pool holds every long-running pod at its limits.\n\n" + _table(headers, rows)
+    )
+
+
 def report(
     records: Sequence[hl.Record],
     limits: Mapping[str, Mapping[str, float]],
@@ -145,6 +181,7 @@ def report(
             + capacity_table(hl.factor_capacities(records, containers, limits, factor, base),
                              hl.FACTORS[factor].input_label.lower(), ceiling)
         )
+    sections.append(sizing_section(records, base))
     onsets = [onset for factor in hl.factors(records) if factor in hl.FACTORS
               for onset in hl.count_onsets(records, factor)]
     if onsets:
