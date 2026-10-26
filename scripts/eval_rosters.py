@@ -290,8 +290,23 @@ def parse_lane_requesting(text: str) -> dict[str, int]:
     return out
 
 
+# The first prompt line that makes a case a stopped ask
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE). hack/ci-eval-pr.sh's
+# unit_phase runs a stopped ask in the serial second phase beside the
+# requesting cases; scripts/test_eval_rosters.py holds this text read to
+# stop_hook.is_stopped_ask.
+STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+
+
+def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case's task.yaml carries the stop directive outside a comment."""
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(STOP_DIRECTIVE in line.split("#", 1)[0] for line in text.splitlines())
+
+
 def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the fan-out runs the case in its serial second phase."""
+    """Whether the case requests a pull request: its own checks, or the lane
+    file's ``requesting:`` allowance."""
     if lane_requesting.get(case, 0) > 0:
         return True
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
@@ -304,7 +319,8 @@ def presubmit_wall_estimate() -> dict[str, object]:
     Phase one runs every unit of a case that requests nothing, EVAL_TASK_PARALLELISM
     at a time, and a case's own repetitions one after another on its task
     lock: it takes the longer of the lane time spread over the lanes and the
-    longest case's chain. Phase two runs the requesting cases' units one at a
+    longest case's chain. Phase two runs the units of the cases that request a
+    pull request, and of the stopped asks (unit_phase in the script), one at a
     time after phase one has drained, each after the settle, so it adds
     straight onto the job. Every presubmit case counts, held-out seats too,
     because they run, and the inject lane's exclusions are not taken off.
@@ -324,7 +340,8 @@ def presubmit_wall_estimate() -> dict[str, object]:
     lane_requesting = parse_lane_requesting(INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
     first, second = [], []
     for case in presubmit_cases():
-        (second if requests_a_pull_request(case, lane_requesting) else first).append(case)
+        serial = requests_a_pull_request(case, lane_requesting) or is_stopped_ask(case)
+        (second if serial else first).append(case)
     chain = {case: hints.get(case, default) * repetitions for case in presubmit_cases()}
     phase_one = max(-(-sum(chain[c] for c in first) // parallelism), max((chain[c] for c in first), default=0))
     phase_two = sum(chain[c] + settle * repetitions for c in second)
@@ -354,7 +371,7 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
-        "presubmit requesting cases (serial phase)": len(wall["requesting"]),
+        "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
         "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
         "api lane exclusions": len(api_lane_exclusions()),

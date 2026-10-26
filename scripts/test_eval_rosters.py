@@ -1032,9 +1032,9 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
 # no longer breaks its rule. Kept the way HELD_OUT_IN_PRESUBMIT is: a short
 # written list, each line with its issue, never a way to seat a new case.
 SEAT_BAR_EXEMPT = [
-    ("agent-kanban-smoke", "c", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
-    ("vcs-spent-branch-reuse", "c", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
-    ("pdb-remediation-pr", "c", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
+    ("agent-kanban-smoke", "c-slot", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
+    ("vcs-spent-branch-reuse", "c-repository", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
+    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
 ]
 FLEET_FIXTURE_STATE_SCRIPT = REPO_ROOT / "hack" / "fleet-fixture-state.py"
 FLEET_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
@@ -1046,6 +1046,14 @@ FLEET_OVERLAY = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # `seeded-z` is not a read.
 SEEDED_CLUSTER_NAME_RE = re.compile(r"(?<![\w-])seeded-([a-z])(?![\w-])")
 CLUSTER_PLACEHOLDER_RE = re.compile(r"\{cluster:([a-z])\}")
+# A pattern that names several slots at once -- `{cluster:any}`, or a regex
+# spelling such as `seeded-(b|c)`, `seeded-[bc]` or `seeded-\w` -- reads every
+# slot the overlay declares, so the case lists a role on each (the case
+# format's rule for a case that depends on every slot).
+EVERY_SLOT_RE = re.compile(r"\{cluster:any\}|(?<![\w-])seeded-[(\[\\]")
+# The rule ids a finding carries: rule (c)'s three mechanisms apart, so an
+# exemption covers the one its issue is about and nothing else.
+SEAT_BAR_RULES = frozenset({"c-role", "c-slot", "c-repository", "d"})
 # The subject constant hack/fleet-fixture-state.py defines once it reads a
 # pool `*-infra` repository, the way CLUSTER_SUBJECT names the GKE cluster.
 # Until the scan defines it, no role has a repository assertion, so nothing a
@@ -1108,7 +1116,8 @@ def deterministic_leaves(node, negations: int = 0) -> list[str]:
 
 def seat_bar_findings(doc: dict, *, requests_pull_request: bool, scan: dict[str, list],
                       repository_roles: set[str], role_slots: dict[str, str | None]) -> list[tuple[str, str]]:
-    """What a case's task.yaml breaks of rules (c) and (d), as (rule, why)."""
+    """What a case's task.yaml breaks of rules (c) and (d), as (rule id, why);
+    the ids are SEAT_BAR_RULES."""
     found = []
     spec = doc.get("verification_spec") or []
     objectives = [e for e in spec if isinstance(e, dict) and e.get("role") == "objective"]
@@ -1116,19 +1125,21 @@ def seat_bar_findings(doc: dict, *, requests_pull_request: bool, scan: dict[str,
         found.append(("d", "no objective carries a deterministic check: graded by the judge alone"))
     roles = list(doc.get("fixtures") or [])
     for role in roles:
-        if role in role_slots and not scan.get(role):
-            found.append(("c", f"fixture role {role} has no `state` assertion the seeded-fleet scan runs"))
+        if not scan.get(role):
+            found.append(("c-role", f"fixture role {role} has no `state` assertion the seeded-fleet scan runs"))
     declared_slots = {role_slots.get(r) for r in roles}
     known_slots = {slot for slot in role_slots.values() if slot}
     spec_text = repr(spec)
     named = set(SEEDED_CLUSTER_NAME_RE.findall(spec_text)) | set(CLUSTER_PLACEHOLDER_RE.findall(spec_text))
+    if EVERY_SLOT_RE.search(spec_text):
+        named |= known_slots
     for slot in sorted((named & known_slots) - declared_slots):
-        found.append(("c", f"its checks read seeded slot {slot} and it declares no fixture role there"))
+        found.append(("c-slot", f"its checks read seeded slot {slot} and it declares no fixture role there"))
     # A case with roles writes about them (pdb-remediation-pr's manifest for
     # checkout-gateway), so the assertion sits on one of its roles; a case
     # with none needs the scan to read the pool repository at all.
     if requests_pull_request and not (set(roles) & repository_roles if roles else repository_roles):
-        found.append(("c", "it writes to the pool's GitOps repository, and the scan asserts nothing there it depends on"))
+        found.append(("c-repository", "it writes to the pool's GitOps repository, and the scan asserts nothing there it depends on"))
     return found
 
 
@@ -1170,7 +1181,7 @@ class SeatBarTest(unittest.TestCase):
         roster = eval_rosters.blocking_roster()
         for case, rule, issue, why in SEAT_BAR_EXEMPT:
             with self.subTest(case=case, rule=rule):
-                self.assertIn(rule, {"c", "d"})
+                self.assertIn(rule, SEAT_BAR_RULES)
                 self.assertIn(case, roster, "an exemption is for a seat; a case off the roster drops its entry")
                 self.assertGreater(issue, 0)
                 self.assertTrue(why)
@@ -1200,31 +1211,57 @@ class SeatBarTest(unittest.TestCase):
         doc = {"fixtures": ["version-laggard"], "verification_spec": objective}
         self.assertEqual(self.findings_for(doc), [])
         unasserted = dict(self.scan, **{"version-laggard": []})
-        self.assertEqual([r for r, _ in self.findings_for(doc, scan=unasserted)], ["c"])
+        self.assertEqual([r for r, _ in self.findings_for(doc, scan=unasserted)], ["c-role"])
         # A project-scoped role is not on a cluster the scan reads at all.
-        self.assertEqual([r for r, _ in self.findings_for({"fixtures": ["orphan-disks"], "verification_spec": objective})], ["c"])
+        self.assertEqual([r for r, _ in self.findings_for({"fixtures": ["orphan-disks"], "verification_spec": objective})], ["c-role"])
 
     def test_a_seeded_cluster_named_without_its_role_breaks_rule_c(self):
         def doc(phrase, fixtures=None):
             return {"fixtures": fixtures, "verification_spec": [
                 {"name": "o", "role": "objective", "check": {"type": "report_contains", "required_phrases": [phrase]}}]}
 
-        self.assertEqual([r for r, _ in self.findings_for(doc("seeded-b"))], ["c"])
-        self.assertEqual([r for r, _ in self.findings_for(doc("{cluster:b}"))], ["c"])
+        self.assertEqual([r for r, _ in self.findings_for(doc("seeded-b"))], ["c-slot"])
+        self.assertEqual([r for r, _ in self.findings_for(doc("{cluster:b}"))], ["c-slot"])
         self.assertEqual(self.findings_for(doc("seeded-b", ["version-laggard"])), [])
         self.assertEqual(self.findings_for(doc("seeded-debug")), [], "a namespace is not slot d")
         self.assertEqual(self.findings_for(doc("seeded-a-canary")), [])
         self.assertEqual(self.findings_for(doc("seeded-z")), [], "no slot z: a cluster named as absent is not a read")
+        # A pattern naming several slots at once reads every declared slot.
+        every = {slot for slot in self.role_slots.values() if slot}
+        for phrase in ("{cluster:any}", "seeded-(b|c)", "seeded-[bc]", r"seeded-\w"):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(sorted(why.split("slot ")[1].split()[0] for _, why in self.findings_for(doc(phrase))), sorted(every))
+        one_per_slot = {}
+        for role, slot in self.role_slots.items():
+            if slot and self.scan.get(role):
+                one_per_slot.setdefault(slot, role)
+        self.assertEqual(self.findings_for(doc("{cluster:any}", sorted(one_per_slot.values()))), [])
+
+    def test_a_role_in_the_catalog_alone_is_still_held_to_its_assertions(self):
+        objective = [{"name": "o", "role": "objective", "check": {"type": "report_contains"}}]
+        doc = {"fixtures": ["catalog-only-role"], "verification_spec": objective}
+        self.assertEqual([r for r, _ in self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": []}))], ["c-role"])
+        self.assertEqual(self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": [{"op": "absent"}]})), [])
+
+    def test_an_exemption_covers_its_own_mechanism_only(self):
+        # vcs-spent-branch-reuse is exempt for its pool-repository write; a
+        # slot read added to it would be a c-slot finding the entry does not cover.
+        exempt = {(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT}
+        self.assertIn(("vcs-spent-branch-reuse", "c-repository"), exempt)
+        self.assertNotIn(("vcs-spent-branch-reuse", "c-slot"), exempt)
+        doc = {"verification_spec": [{"name": "o", "role": "objective", "check": {
+            "type": "report_contains", "required_phrases": ["seeded-b"]}}]}
+        self.assertEqual(sorted(r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())), ["c-repository", "c-slot"])
 
     def test_a_pull_request_into_the_pool_repository_needs_a_repository_assertion(self):
         doc = {"fixtures": ["no-pdb-workload"], "verification_spec": [
             {"name": "o", "role": "objective", "check": {"type": "pull_request_opened"}}]}
-        self.assertEqual([r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())], ["c"])
+        self.assertEqual([r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())], ["c-repository"])
         self.assertEqual(self.findings_for(doc, requests=True, repository_roles={"no-pdb-workload"}), [])
-        self.assertEqual([r for r, _ in self.findings_for(doc, requests=True, repository_roles={"crashloop-workload"})], ["c"],
+        self.assertEqual([r for r, _ in self.findings_for(doc, requests=True, repository_roles={"crashloop-workload"})], ["c-repository"],
                          "another role's repository assertion does not guard this case's")
         roleless = {"verification_spec": doc["verification_spec"]}
-        self.assertEqual([r for r, _ in self.findings_for(roleless, requests=True, repository_roles=set())], ["c"])
+        self.assertEqual([r for r, _ in self.findings_for(roleless, requests=True, repository_roles=set())], ["c-repository"])
         self.assertEqual(self.findings_for(roleless, requests=True, repository_roles={"no-pdb-workload"}), [])
         assertions = {
             "no-pdb-workload": [{"subject": "gitrepo/infra", "op": "absent"}],
@@ -1272,6 +1309,31 @@ class PresubmitWallTimeTest(unittest.TestCase):
                              check=True, capture_output=True, text=True).stdout.split()
         hints, default = eval_rosters.parse_cost_hints(src)
         self.assertEqual([int(n) for n in out], [hints.get(c, default) for c in cases])
+
+    def test_the_text_read_of_a_stopped_ask_agrees_with_stop_hook(self):
+        """A stopped ask runs in the serial phase too (unit_phase reads
+        STOPPED_ASK_CASES); hold the stdlib read to stop_hook's on every
+        registered case, and price one in phase two."""
+        import yaml
+        from unittest import mock
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench import stop_hook
+
+        self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
+        stopped = []
+        for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertEqual(eval_rosters.is_stopped_ask(case), stop_hook.is_stopped_ask(str(doc.get("prompt") or "")))
+                if eval_rosters.is_stopped_ask(case):
+                    stopped.append(case)
+        self.assertTrue(stopped, "no registered stopped ask left to price")
+        base = eval_rosters.presubmit_wall_estimate()
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + stopped[:1]):
+            grown = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(grown["phase one"], base["phase one"])
+        self.assertIn(stopped[0], grown["requesting"])
 
     def test_a_requesting_case_adds_its_serial_chain_and_settles(self):
         from unittest import mock

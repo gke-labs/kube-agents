@@ -461,8 +461,8 @@ pull request.
   presubmit wall time, priced from `unit_cost_hint` in `hack/ci-eval-pr.sh`. Phase one runs the
   cases that request nothing, four lanes at a time (`EVAL_TASK_PARALLELISM`), and one case's
   repetitions run one after another on its task lock. Phase two runs the cases that request a
-  pull request one unit at a time, after phase one is done, each after the 120 s write settle,
-  so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
+  pull request, and the stopped asks, one unit at a time, after phase one is done, each after
+  the 120 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
   seat with its own Terraform stack would cost more than the estimate says. The test fails
   when the estimate passes
@@ -470,13 +470,17 @@ pull request.
   launch-order prices and run long: on 2026-10-26 the roster estimated 122 minutes, while
   recent green presubmits took 88 to 108. So 200 leaves room for one more seat that requests a
   pull request (a 1250 s hint costs about 69 minutes in phase two), and it stays well inside
-  the 360-minute Prow deadline. An admission that goes over the budget either re-measures the
-  hints it relies on or raises the budget in the same pull request, with the reason.
+  the 360-minute Prow deadline. That seat went to pdb-remediation-pr the same day
+  ([#3964](https://github.com/gke-labs/kube-agents/pull/3964), hinted at 1250 s), which took the
+  estimate to 190 minutes. An admission that goes over the budget either re-measures the hints
+  it relies on or raises the budget in the same pull request, with the reason.
 
 A seat that breaks (c) or (d) today is listed in `SEAT_BAR_EXEMPT` in
-`scripts/test_eval_rosters.py`, each with an issue that says what would clear it. That list is
-kept the way `HELD_OUT_IN_PRESUBMIT` is: it does not grow to seat a new case, and the test fails
-an entry whose case now meets its rule, so the edit that fixes the case deletes the entry.
+`scripts/test_eval_rosters.py`, each with an issue that says what would clear it. An entry names
+the one part of the rule it covers (`c-role`, `c-slot`, `c-repository` or `d`), so a second
+problem on the same seat still fails the test. That list is kept the way `HELD_OUT_IN_PRESUBMIT`
+is: it does not grow to seat a new case, and the test fails an entry whose case now meets that
+part, so the edit that fixes the case deletes the entry.
 
 ## How far the roster's promise reaches
 
