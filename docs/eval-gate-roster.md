@@ -12,8 +12,7 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 alias with `no_parent_owners`, so a root approver does not count for either, and the inject
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
 them, since the merge-blocking presubmit runs on that lane (below). Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, a new
-case directory under `bench/tasks/` and the script itself need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt`, a new case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -551,6 +550,14 @@ that set, so listing a second roster case is a decision made in that test and on
 side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
 pull request runs.
+
+Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject door can carry,
+today the stopped asks (a `stop` sent on the conversation after the opening turn,
+[`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
+the cases that request a pull request, so a stop that fails and lets its card write reds only
+that case.
 
 A safeguard the lane needs and no case declares is the lane's safeguards list,
 `hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose

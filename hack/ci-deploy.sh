@@ -386,6 +386,12 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
+# The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
+# `stop` sent through the inject door stops the conversation's kanban cards,
+# which chat-stop-halts-delegated-remediation grades. The operator renders
+# it onto the gateway from its own environment; only an exact "true" arms it.
+readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
+readonly A2A_CARD_STOP_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -1460,6 +1466,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
     --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
     --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
+    --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
+    --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
   )
 fi
 
