@@ -2251,8 +2251,8 @@ NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
-# forge and not where it is; the GHES list on ghes (eval/ghes-cases.txt, which
-# arrives with the GHES lane, kube-agents#3684). github runs the catalogue. A
+# forge and not where it is; the GHES list on ghes (eval/ghes-cases.txt).
+# github runs the catalogue. A
 # forge whose list this checkout lacks stops here by name, not at the roster
 # reader's message for a missing file.
 lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
@@ -2265,7 +2265,7 @@ lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
 LANE_CASES_REL="$(lane_cases_file "${EVAL_FORGE}" 2>/dev/null)" || LANE_CASES_REL=""
 LANE_CASES_FILE="${LANE_CASES_REL:+${SCRIPT_DIR}/${LANE_CASES_REL}}"
 if [ -n "${LANE_CASES_FILE}" ] && [ ! -f "${LANE_CASES_FILE}" ]; then
-  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} runs the lane list ${LANE_CASES_REL}, which this checkout does not have; the lane that adds it is kube-agents#3684." >&2
+  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} runs the lane list ${LANE_CASES_REL}, which this checkout does not have." >&2
   exit 1
 fi
 

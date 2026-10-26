@@ -43,10 +43,13 @@ STUB_GCLOUD = textwrap.dedent(
       *"iam service-accounts describe"*)
         [ -e "$state/sa" ] && { echo forge-vm@x; exit 0; } || exit 1 ;;
       *"compute instances list"*)
+        [ -e "$state/list-fails" ] && { echo "listing failed" >&2; exit 1; }
         [ -e "$state/leftovers" ] && cat "$state/leftovers"; exit 0 ;;
       *"compute instances get-serial-port-output"*)
         [ -e "$state/serial" ] && cat "$state/serial"; exit 0 ;;
-      *"builds submit"*) [ -e "$state/build-fails" ] && exit 1; exit 0 ;;
+      *"builds submit"*)
+        [ -e "$state/build-hangs" ] && sleep 5
+        [ -e "$state/build-fails" ] && exit 1; exit 0 ;;
       *"compute instances create"*) exit 0 ;;
       *"compute instances delete"*) exit 0 ;;
       *"container clusters get-credentials"*) exit 0 ;;
@@ -183,11 +186,11 @@ class ForgeScriptTest(unittest.TestCase):
         build = self.calls_of("builds submit")[0]
         self.assertIn(f"--tag=us-central1-docker.pkg.dev/{PROJECT}/kube-agents/ghes-proxy:pr-99-1234", build)
         self.assertIn(f"--project={PROJECT}", build)
-        # The VM: at the reserved address, no external address, the VM identity, the tag and the labels.
+        # The VM: at the reserved address, with an external one, the VM identity, the tag and the labels.
         create = self.calls_of("compute instances create forge-ghes")[0]
         for flag in (
             f"--zone=us-central1-a", "--machine-type=e2-small", "--image-family=cos-stable", "--image-project=cos-cloud",
-            f"--private-network-ip={FORGE_IP}", "--no-address", f"--service-account=forge-vm@{PROJECT}.iam.gserviceaccount.com",
+            f"--private-network-ip={FORGE_IP}", f"--service-account=forge-vm@{PROJECT}.iam.gserviceaccount.com",
             "--tags=forge", "--labels=kube-agents-forge=ghes,kube-agents-build=1234",
             "host=ghes.eval.internal", "enterprise-version=3.17.0", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
         ):
@@ -260,6 +263,16 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn("is not a CA certificate; make-certs.sh needs OpenSSL (Linux)", proc.stderr)
         self.assertFalse(self.calls_of("builds submit") or self.calls_of("instances create"))
 
+    def test_up_bounds_the_image_build_on_the_client(self):
+        if not shutil.which("timeout"):
+            self.skipTest("coreutils timeout is not on PATH; the bound is skipped without it")
+        self.provision()
+        (self.gstate / "build-hangs").write_text("")
+        proc = self.run_forge("up", FORGE_BUILD_CLIENT_BOUND_SECONDS="1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("did not return within 1s", proc.stderr)
+        self.assertFalse(self.calls_of("instances create"))
+
     def test_up_takes_the_vm_down_when_the_serial_console_reports_a_failure(self):
         self.provision(serial="startup-script: FORGE script-start t=1s\nstartup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n")
         proc = self.run_forge("up")
@@ -305,6 +318,14 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertEqual(len(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a")), 2)
         self.assertFalse(self.state_dir.exists())
         self.assertIn("deleting this run's forge-ghes in us-central1-a", proc.stdout)
+
+    def test_down_does_not_count_a_failed_list_as_nothing_to_delete(self):
+        (self.gstate / "list-fails").write_text("")
+        proc = self.run_forge("down")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not list the forge VMs", proc.stderr)
+        self.assertNotIn("VM(s) deleted", proc.stdout)
+        self.assertFalse(self.calls_of("compute instances delete"))
 
     def test_down_with_nothing_to_delete_is_clean(self):
         proc = self.run_forge("down")

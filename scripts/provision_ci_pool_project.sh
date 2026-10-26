@@ -443,7 +443,7 @@ done
 # (docs/designs/eval-scorer.md). In the pool the two need the same set: a
 # project granting only the presubmit's account leases fine and dies at
 # get-credentials the first night it is drawn, as kube-agents-evals-10 did on
-# 2026-09-16 (gke-labs/kube-agents#1491). The same thirteen, not a subset -- the
+# 2026-09-16 (gke-labs/kube-agents#1491). The same fourteen, not a subset -- the
 # run is the same script end to end, so a partial grant fails at a later step
 # on a later night instead.
 #

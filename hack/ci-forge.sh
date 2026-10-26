@@ -57,9 +57,13 @@ readonly FORGE_VM_ZONE_SUFFIX="-a"
 # The certificates live as long as the run: one day covers the 360m presubmit
 # and the 480m nightly ceilings with room, and nothing keeps them after.
 readonly FORGE_CERT_DAYS=1
-readonly FORGE_READY_POLL_SECONDS=5
+readonly FORGE_READY_POLL_SECONDS="${FORGE_READY_POLL_SECONDS:-5}"
 readonly FORGE_SERIAL_TAIL_LINES=40
 readonly FORGE_BUILD_TIMEOUT_SECONDS="${FORGE_BUILD_TIMEOUT_SECONDS:-900}"
+# The submit's own bound: Cloud Build's --timeout ends the build, not a client
+# whose log stream stalled after it (kube-agents#3129), so the client gets the
+# build's time plus the upload and the stream's tail.
+readonly FORGE_BUILD_CLIENT_BOUND_SECONDS="${FORGE_BUILD_CLIENT_BOUND_SECONDS:-$((FORGE_BUILD_TIMEOUT_SECONDS + 120))}"
 # The in-cluster reachability check: one pod, one curl, bounded.
 readonly FORGE_CLUSTER_CHECK_IMAGE="curlimages/curl:8.11.1"
 readonly FORGE_CLUSTER_CHECK_TIMEOUT="180s"
@@ -148,13 +152,19 @@ list_forge_vms() { # [row]
 }
 
 delete_forge_vms() { # <label> [row]: deletes every VM list_forge_vms names
-  local label="$1" row="${2:-}" name zone deleted=0
+  local label="$1" row="${2:-}" name zone deleted=0 vms
+  # The list is read first: a failed list behind a process substitution reads
+  # as an empty one, and a VM that was there would stay, counted as none.
+  vms="$(list_forge_vms "${row}")" || {
+    echo "ERROR: could not list the forge VMs in ${PROJECT_ID}; none deleted" >&2
+    return 1
+  }
   while read -r name zone; do
     [ -n "${name}" ] || continue
     echo "Forge ${ACTION}: deleting ${label} ${name} in ${zone}"
     gcloud compute instances delete "${name}" --zone="${zone}" --project="${PROJECT_ID}" --quiet
     deleted=$((deleted + 1))
-  done < <(list_forge_vms "${row}")
+  done <<<"${vms}"
   echo "Forge ${ACTION}: ${deleted} ${label} VM(s) deleted"
 }
 
@@ -203,6 +213,8 @@ preflight_project_pieces() {
 make_certificates() {
   FORGE_CERT_DIR="$(mktemp -d /tmp/forge-certs.XXXXXX)"
   rmdir "${FORGE_CERT_DIR}" # make-certs.sh wants to create the directory itself
+  # The server key lives here until write_state_dir; no exit leaves it behind.
+  trap 'rm -rf "${FORGE_CERT_DIR}"' EXIT
   bash "${SCRIPT_DIR}/ghes-proxy/make-certs.sh" "${EVAL_FORGE_HOST}" "${FORGE_CERT_DIR}" "${FORGE_CERT_DAYS}"
   # The deploy's gate would refuse this later; refuse it here, before a VM.
   if ! openssl x509 -noout -text -in "${FORGE_CERT_DIR}/ca.crt" 2>/dev/null | grep -q 'CA:TRUE'; then
@@ -216,8 +228,13 @@ make_certificates() {
 build_ghes_proxy_image() {
   GHES_PROXY_IMAGE="${AR_REPO}/${GHES_PROXY_IMAGE_NAME}:${FORGE_IMAGE_TAG}"
   echo "=== [$(stamp)] Building ${GHES_PROXY_IMAGE} with Cloud Build ==="
-  gcloud builds submit "${SCRIPT_DIR}/ghes-proxy" --tag="${GHES_PROXY_IMAGE}" \
-    --project="${PROJECT_ID}" --timeout="${FORGE_BUILD_TIMEOUT_SECONDS}s" --quiet >/dev/null
+  local bound=(timeout --foreground "${FORGE_BUILD_CLIENT_BOUND_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  ${bound[@]+"${bound[@]}"} gcloud builds submit "${SCRIPT_DIR}/ghes-proxy" --tag="${GHES_PROXY_IMAGE}" \
+    --project="${PROJECT_ID}" --timeout="${FORGE_BUILD_TIMEOUT_SECONDS}s" --quiet >/dev/null || {
+    echo "ERROR: building ${GHES_PROXY_IMAGE} failed or did not return within ${FORGE_BUILD_CLIENT_BOUND_SECONDS}s." >&2
+    exit 1
+  }
   echo "✓ Proxy image built: ${GHES_PROXY_IMAGE}"
 }
 
@@ -257,17 +274,19 @@ echo "FORGE done total=$(( $(date +%s) - T0 ))s"
 EOF
 }
 
+# The ephemeral external address is the VM's way to github.com: the pool
+# projects have no Cloud NAT, and the proxy forwards every request there.
 create_ghes_vm() {
   local startup
   startup="$(mktemp /tmp/forge-startup.XXXXXX)"
   ghes_startup_script > "${startup}"
-  echo "=== [$(stamp)] Creating ${FORGE_VM_NAME} (${GHES_PROXY_MACHINE_TYPE}, ${FORGE_VM_ZONE}, ${FORGE_IP}, no external address) ==="
+  echo "=== [$(stamp)] Creating ${FORGE_VM_NAME} (${GHES_PROXY_MACHINE_TYPE}, ${FORGE_VM_ZONE}, ${FORGE_IP}, ephemeral external address) ==="
   gcloud compute instances create "${FORGE_VM_NAME}" \
     --project="${PROJECT_ID}" --zone="${FORGE_VM_ZONE}" \
     --machine-type="${GHES_PROXY_MACHINE_TYPE}" \
     --image-family="${FORGE_VM_IMAGE_FAMILY}" --image-project="${FORGE_VM_IMAGE_PROJECT}" \
     --network="${FORGE_VM_NETWORK}" --subnet="${FORGE_VM_NETWORK}" \
-    --private-network-ip="${FORGE_IP}" --no-address \
+    --private-network-ip="${FORGE_IP}" \
     --service-account="${FORGE_VM_SERVICE_ACCOUNT}" --scopes=cloud-platform \
     --tags="${FORGE_NETWORK_TAG}" \
     --labels="${FORGE_VM_LABEL_KEY}=${EVAL_FORGE},${FORGE_VM_BUILD_LABEL_KEY}=${BUILD_ID:-local}" \
@@ -324,7 +343,7 @@ check_from_cluster() {
   code="$(kubectl run "${pod}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --image="${FORGE_CLUSTER_CHECK_IMAGE}" \
     --restart=Never --rm -i --quiet --pod-running-timeout="${FORGE_CLUSTER_CHECK_TIMEOUT}" \
     --env="FORGE_CA=$(cat "${FORGE_CERT_DIR}/ca.crt")" --env="FORGE_URL=https://${EVAL_FORGE_HOST}${GHES_READY_PATH}" \
-    --command -- sh -c 'printf "%s\n" "$FORGE_CA" > /tmp/ca.crt && curl -sS --cacert /tmp/ca.crt --max-time 20 -o /dev/null -w "%{http_code}" "$FORGE_URL"' 2>/dev/null \
+    --command -- sh -c 'printf "%s\n" "$FORGE_CA" > /tmp/ca.crt && curl -sS --cacert /tmp/ca.crt --max-time 20 -o /dev/null -w "%{http_code}" "$FORGE_URL"' \
     | tr -d '\r\n' | tail -c 3)" || code=""
   if [ "${code}" != "200" ]; then
     echo "ERROR: a pod in ${CLUSTER_NAME} could not reach https://${EVAL_FORGE_HOST}${GHES_READY_PATH} with the CA (got '${code:-nothing}'); the zone, the firewall rule or the VM is wrong, and the deploy would fail after the build." >&2
