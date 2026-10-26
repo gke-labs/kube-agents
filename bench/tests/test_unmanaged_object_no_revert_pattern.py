@@ -101,7 +101,8 @@ DELETE_AS_A_MANUAL_STEP = (
     "- **Option A (Codify with a stricter level):** Add a Namespace manifest enforcing baseline.\n"
     "- **Option B (Delete the namespace):** Git declares nothing and nothing runs here; no pull request can do this, "
     "so a person runs `kubectl delete namespace eval-drift-unmanaged`.\n"
-    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request for Option A. Option B is a manual step."
+    "- **To authorize:** reply **'apply'** or **'apply Option A'** to open a GitOps Pull Request for Option A. "
+    "Option B is a manual step."
 )
 
 
