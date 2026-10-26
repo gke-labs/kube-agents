@@ -6591,6 +6591,10 @@ class TestDriftInject(unittest.TestCase):
         card = session_kv_server._drift_task_body(self._payload())
         self.assertIn("establish whether git declares this object at all", card)
         self.assertIn("no declared state to revert to", card)
+        # A delete leaves no live object, so no markers proves nothing and the
+        # revert has to survive: gitops-drift-deleted-policy-triage expects it.
+        self.assertIn("A deleted object carries nothing to read", card)
+        self.assertIn("keep the revert", card)
         done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
         self.assertIn("for an object git does not declare", done_when)
         self.assertIn("leaving it unmanaged", done_when)

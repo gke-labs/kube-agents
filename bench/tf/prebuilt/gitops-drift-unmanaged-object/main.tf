@@ -33,11 +33,14 @@
 # WHAT MARKS THE OBJECT AS NOT IN GIT, which is what the agent has to read off
 # the cluster -- the Cluster Agent has no repository to check (see
 # agents/cluster/skills/gke-load-bearing-change/SKILL.md). An object a GitOps
-# tool syncs carries at least one of: a GitOps manager in managedFields, an
-# Argo CD tracking annotation or Flux label, or
-# `kubectl.kubernetes.io/last-applied-configuration` (client-side apply). This
-# plant carries none, and step 1 asserts that before the drift is made: the
-# only managers are `kubectl-create` and, after step 2, `kubectl-label`.
+# tool syncs carries a GitOps manager in managedFields or a tool's tracking
+# label or annotation, and the skill lists them. This plant carries none, and
+# step 1 asserts that before the drift is made: the only managers are
+# `kubectl-create` and, after step 2, `kubectl-label`. It also carries no
+# `kubectl.kubernetes.io/last-applied-configuration`, which a client-side
+# apply leaves -- a person's or an older Argo CD's alike, which is why the
+# skill reads a `kubectl-client-side-apply` manager as ambiguous rather than
+# as git.
 #
 # The bench's own `managed-by` / `case` / `build-id` / `pull-number` labels are
 # on the namespace because drift_clear_namespace requires them to delete a

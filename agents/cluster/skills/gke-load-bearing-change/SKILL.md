@@ -23,21 +23,24 @@ Skip it when the live object already matches the declared state: a GitOps contro
 
 Everything below assumes git holds a copy of the object to put back. Check that first: the drift detector forwards a change to an object nobody ever put in git exactly as it forwards one to an object a GitOps tool syncs.
 
+**This needs a live object.** A deleted object carries nothing to read, so no markers is no evidence there: say whether git declares it could not be read off the cluster, and go on to the method with the revert still an option. The same holds when the object is gone by the time you look.
+
 You cannot read the repository, so read what a GitOps tool leaves on the objects it applies:
 
 | Tool | Field manager in `managedFields` | Label or annotation |
 | --- | --- | --- |
-| Argo CD | `argocd-controller`; `kubectl-client-side-apply` on older installs | annotation `argocd.argoproj.io/tracking-id`, or label `app.kubernetes.io/instance` under label tracking |
+| Argo CD | `argocd-controller` | annotation `argocd.argoproj.io/tracking-id` |
 | Flux | `kustomize-controller`, `helm-controller` | labels `kustomize.toolkit.fluxcd.io/name`, `helm.toolkit.fluxcd.io/name` |
 | Config Sync | `configsync.gke.io` | annotations `configmanagement.gke.io/managed`, `configsync.gke.io/resource-id` |
 
-The card's ownership block already lists the field managers. Read the markers by name rather than dumping every annotation: `last-applied-configuration` on a Secret or ConfigMap carries its data.
+Read the managers and the markers by name rather than dumping every annotation: `last-applied-configuration` on a Secret or ConfigMap carries its data.
 
 ```bash
-kubectl get <kind> <name> [-n <namespace>] -o jsonpath='{.metadata.labels}{"\n"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}{.metadata.annotations.configmanagement\.gke\.io/managed}'
+kubectl get <kind> <name> [-n <namespace>] -o jsonpath='{range .metadata.managedFields[*]}{.manager}{" "}{end}{"\n"}{.metadata.labels}{"\n"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}{.metadata.annotations.configmanagement\.gke\.io/managed}'
 ```
 
 - **Any of them present:** a tool syncs it from git. Go on to the method.
+- **Only an ambiguous one:** `kubectl-client-side-apply` as a manager, or the labels `app.kubernetes.io/instance` and `app.kubernetes.io/managed-by: Helm`. A person's `kubectl apply -f` and `helm install` leave these too, as does Argo CD on older installs or under label tracking. Say the object was applied from a manifest or a chart whose source the cluster does not show, and keep both the revert and the options below, saying which depends on where that manifest lives.
 - **None present:** say the object is probably not declared in git, and list what you checked. Probably, not certainly: a pipeline that applies a repository under a field manager of its own leaves nothing this table names, so name any manager you do not recognise and say it may be one. `kubectl-create`, `kubectl-edit`, `kubectl-label` and `kubectl-patch` are a person at a terminal.
 
 An object git does not declare has no declared state, so there is nothing to revert to, and the method below does not apply. Do not offer "revert to the declared state". The choices are:

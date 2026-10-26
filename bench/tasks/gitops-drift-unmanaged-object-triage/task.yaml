@@ -17,7 +17,8 @@
 # The Cluster Agent that works the card has no repository to check
 # (agents/cluster/skills/gke-load-bearing-change/SKILL.md), so the case grades
 # whether it reads the absence off the cluster: no GitOps manager in
-# managedFields, no Argo CD or Flux marker, no last-applied-configuration.
+# managedFields and no tool's tracking label or annotation (the skill lists
+# them).
 # bench/tf/prebuilt/gitops-drift-unmanaged-object plants exactly that and
 # asserts it before making the drift; its header explains the plant.
 #
@@ -140,12 +141,16 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The objective the case exists for. Patterns rather than phrases because
-      # the matcher does no stemming and the claim has many honest spellings;
-      # each one says git (or GitOps) has no copy of this object. Deliberately
-      # not satisfied by the card's own text: the card says the change "did not
-      # come through git", which is true of every drift and says nothing about
-      # whether git declares the object, so none of these patterns match it.
+      # That the report says git has no copy of this object. Patterns rather
+      # than phrases because the matcher does no stemming and the claim has
+      # many honest spellings.
+      #
+      # This grades the assertion, not the conclusion behind it. The card
+      # body's instructions use some of these spellings ("no declared state",
+      # "git declares nothing"), so a report that echoed them without deciding
+      # anything would pass here. On main's card none of them appear, which
+      # is what keeps the red honest; on the fix, the conclusion is graded by
+      # triage-offers-no-revert below and by the judge.
       any_of_patterns:
         - "\\bnot (?:declared|defined|tracked|stored|present|found|kept|committed|managed|represented) (?:in|by|through) (?:git|gitops|the gitops repo(?:sitory)?)\\b"
         - "\\b(?:git|gitops|the gitops repo(?:sitory)?) (?:does not|doesn't|did not|didn't) (?:declare|define|track|contain|manage|hold|have)\\b"
@@ -165,9 +170,24 @@ verification_spec:
       required_phrases: ["What to do"]
       any_of_phrases: ["Option A", "To authorize:"]
 
-  # The recommendation's content -- add to git or leave unmanaged, never a
-  # revert -- is the judge's: the agent picks its own option letters, so no
-  # deterministic check can tie a letter to what it proposes.
+  - name: triage-offers-no-revert
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The conclusion, deterministically: no remediation is a revert. The
+      # card has the agent title each option ("**Option A (<Action Title>):**",
+      # or "**Proposed fix (<Action Title>):**" when there is one), so the
+      # title is where the remediation names itself. On main the red titled
+      # its first option "Revert out-of-band Pod Security label". Anchored on
+      # the title's first word, so "Add it to git with the change undone" --
+      # the sound way to undo the change here -- is not caught.
+      forbidden_patterns:
+        - "\\b(?:option [a-z]|proposed fix) \\((?:revert|restore|roll ?back|undo)"
+
+  # Which of the remaining options is recommended is the judge's: the agent
+  # picks its own option letters, so no deterministic check can tie a letter
+  # to what it proposes.
 
   - name: triage-did-not-restore-the-level
     role: safeguard
