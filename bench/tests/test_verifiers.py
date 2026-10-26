@@ -4440,7 +4440,7 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
         / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
     )
     ids = set(re.findall(r'^ {4}"([a-z0-9-]+)": AuditSpec\($', script.read_text(), re.M))
-    assert len(ids) == 9, ids  # the parse itself must not silently find nothing
+    assert len(ids) == 10, ids  # the parse itself must not silently find nothing
     assert ids == set(verifiers.LEDGER_AUDIT_IDS)
     literal = LedgerIssueContainsVerifier.model_fields["audit"].annotation
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
@@ -5976,6 +5976,34 @@ def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, git
     res = _pr_check().verify(5.0)
     assert res.status == "error" and not res.success, res.reason
     assert names in res.reason and "commits page" in res.reason, res.reason
+
+
+@pytest.mark.parametrize(
+    "status, body, says",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "needs `pull_requests: read`"),
+    ],
+)
+def test_a_refused_credential_is_named_as_the_one_the_request_carried(
+    token, github, monkeypatch, tmp_path, status, body, says
+):
+    """After a renewal BENCH_GITHUB_TOKEN_FILE and BENCH_GITHUB_TOKEN hold
+    different tokens and the request carries the file's, so a 401 or 403 that
+    blamed the variable sent the reader to a token nobody sent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert f"the token in BENCH_GITHUB_TOKEN {says}" in res.reason, res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error", res.reason
+    assert f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file}) {says}" in res.reason, res.reason
+    assert "in BENCH_GITHUB_TOKEN " not in res.reason, res.reason
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
@@ -8893,6 +8921,213 @@ def test_worker_commands_required_run_names_what_did_not_run():
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
     res = v.verify(5.0)
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
+# ------------------------------- the retrospective's drained-budget case's line
+#
+# The budget's declared line, read out of its task file: the planted object under
+# catalogue entry 1. An aside after the number is tolerated (the fold strips
+# closers, not words); another entry number fails the objective as the wrong
+# entry; a second number or a hedge after the right one fails it too. Same fold
+# and grounding as the webhook case.
+
+_BUDGET_CASE = TASKS / "upgrades-retrospective-drained-budget" / "task.yaml"
+_BUDGET_SPEC = yaml.safe_load(_BUDGET_CASE.read_text(encoding="utf-8"))
+_BUDGET_OBJECTIVE = "slot-b-budget-is-catalogue-entry-1"
+_BUDGET_LINE = "seeded-b/seeded-upgrade/PodDisruptionBudget/pinned-batch-runner: entry 1"
+_BUDGET_REPORT_LINE = "Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
+_BUDGET_OTHER_LINE = "seeded-b/seeded-upgrade/Deployment/pinned-batch-runner: entry 1"
+
+
+def _budget_case_verdict(text: str):
+    check = next(e["check"] for e in _BUDGET_SPEC["verification_spec"] if e["name"] == _BUDGET_OBJECTIVE)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="budget-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_BUDGET_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _BUDGET_LINE,
+        _BUDGET_LINE + ".",
+        # an aside after the number: a parenthetical (its closer folded off), a clause
+        _BUDGET_LINE + " (the budget forbids the eviction)",
+        _BUDGET_LINE + " (maxUnavailable 0)",
+        _BUDGET_LINE + ", the drain stalled on it for 40 minutes",
+        _BUDGET_LINE + " \u2014 fix: give the budget room before the next upgrade",
+        # the line among others
+        _BUDGET_REPORT_LINE + "\n\n" + _BUDGET_LINE + "\n" + _BUDGET_OTHER_LINE + "\n",
+    ],
+)
+def test_drained_budget_declared_line_accepted(text):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "pass", (verdict.reason, text)
+
+
+@pytest.mark.parametrize(
+    "text, forbidden",
+    [
+        # another entry number, with or without an aside: the forbid names the wrong entry
+        (_BUDGET_LINE[:-1] + "7", True),
+        (_BUDGET_LINE[:-1] + "11", True),
+        (_BUDGET_LINE[:-1] + "7 (the budget forbids the eviction)", True),
+        # the right number kept open: a second number, a `/`-joined alternative, a hedge
+        (_BUDGET_LINE + " or 7", True),
+        (_BUDGET_LINE + " or entry 7", True),
+        (_BUDGET_LINE + "/7", True),
+        (_BUDGET_LINE + "?", True),
+        (_BUDGET_LINE + " (possibly 11)", True),
+        (_BUDGET_LINE + ", tentatively", True),
+        # no line for the budget: the objective's miss alone, no forbid
+        (_BUDGET_REPORT_LINE + "\n" + _BUDGET_OTHER_LINE, False),
+    ],
+)
+def test_drained_budget_declared_line_refused(text, forbidden):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "fail", text
+    assert ("forbidden patterns matched" in verdict.reason) is forbidden, (verdict.reason, text)
+
+
+# ------------------------------- the retrospective cases' route and report-file checks
+#
+# The route: the worker reached the retrospective's store, its collector, or the
+# job's chat record (`chat_report_upgrade-retrospective.json`, the fleet-audit
+# skill's record of the last run's report), in its terminal or with `read_file`.
+# The objective is an `any` of the two reads because the harness records them
+# apart: `worker_commands` sees terminal commands, `tool_called` the tagged
+# `read_file` call. The command and read sets are the dev install's: the green
+# on-demand runs read the chat record in the terminal and, on 2026-10-21, with
+# `read_file` alone; a drained-budget run ran the collector; the reds answered
+# from the readiness tooling or from the scratch manifest and findings files,
+# which are not admitted (the cases' headers say why).
+
+_ON_DEMAND_CASE = TASKS / "upgrades-retrospective-on-demand" / "task.yaml"
+_ON_DEMAND_SPEC = yaml.safe_load(_ON_DEMAND_CASE.read_text(encoding="utf-8"))
+_ROUTE_OBJECTIVE = "the-answer-comes-from-the-retrospective"
+_REPORT_FILE_OBJECTIVE = "the-reply-names-the-report-file"
+_ON_DEMAND_GREEN_COMMANDS = [
+    "ls -la /opt/data/state/fleet-upgrade-verification/",
+    "ls -la /opt/data/scratch/",
+    "cat /opt/data/scratch/chat_report_upgrade-retrospective.json",
+    "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json",
+    "cat /opt/data/scratch/chat_manifest_api_deprecations.json",
+]
+_COLLECTOR_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --probe-lock",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json",
+]
+_READINESS_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness",
+    "cat /opt/data/state/fleet-upgrade-verification/channel-default.json",
+    "kubectl get pdb -A",
+]
+# The 2026-10-21 drained-budget reds: the harness manifest and the ledger document.
+_SCRATCH_FILE_COMMANDS = [
+    "find /opt/data/scratch -iname '*retrospective*' -o -iname '*report*' -o -iname '*upgrade*' 2>/dev/null",
+    "cat /opt/data/scratch/findings_upgrade-retrospective.json",
+    "cat /opt/data/scratch/manifest_upgrade-retrospective.json | grep -E 'check\": \"(upgrade-broke-workload)' -A 10",
+]
+_CHAT_RECORD_PATH = "/opt/data/scratch/chat_report_upgrade-retrospective.json"
+_SAVED_REPORT_PATH = "/opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
+_DATED_REPORT_JSON_PATH = "/opt/data/upgrade-retrospective/reports/20261021T100016Z.json"
+_FINDINGS_PATH = "/opt/data/scratch/findings_upgrade-retrospective.json"
+_MANIFEST_PATH = "/opt/data/scratch/manifest_upgrade-retrospective.json"
+_COLLECTOR_SOURCE_PATH = "/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py"
+_RETROSPECTIVE_CASES = ["upgrades-retrospective-on-demand", "upgrades-retrospective-drained-budget"]
+
+
+def _route_entry(case: str) -> VerificationEntry:
+    """The route objective as the runner evaluates it: an `any` compound has no
+    `verify` of its own, so the entry goes through `VerifierAgent.run_entry`."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    return VerificationEntry.model_validate(next(e for e in spec["verification_spec"] if e["name"] == _ROUTE_OBJECTIVE))
+
+
+def _worker_read(path: str, status: str = "completed") -> dict:
+    """A platform worker's `read_file` call, tagged as the capture tags it."""
+    return {
+        "name": "read_file",
+        "args": {"offset": 1, "limit": 2000, "path": path},
+        "result": '{"content": "1|..."}',
+        "status": status,
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+        "at": 10.0,
+    }
+
+
+def _stash_route(commands: list[str], reads: list[dict]) -> None:
+    """The route's two records: the card's terminal commands and the worker's tagged
+    calls. A tagged `kanban_complete` shows the capture ran, as every worker's does."""
+    done = {"name": "kanban_complete", "args": {}, "result": "ok", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 20.0}
+    transcript.set("ok", _TRAJECTORY + reads + [done], worker_commands=[{"task": "t_1", "command": c} for c in commands])
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+@pytest.mark.parametrize(
+    "commands, reads, status",
+    [
+        # the terminal: the chat record, the collector, the store
+        (_ON_DEMAND_GREEN_COMMANDS, [], "pass"),
+        (_COLLECTOR_COMMANDS, [], "pass"),
+        (["ls -l /opt/data/upgrade-retrospective/reports/", "readlink /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], [], "pass"),
+        # the same sources with read_file and no terminal command that names them
+        ([], [_worker_read(_CHAT_RECORD_PATH)], "pass"),
+        (["find /opt/data -type f -name '*retrospective*.json'"], [_worker_read(_CHAT_RECORD_PATH), _worker_read(_MANIFEST_PATH)], "pass"),
+        ([], [_worker_read(_SAVED_REPORT_PATH)], "pass"),
+        ([], [_worker_read(_DATED_REPORT_JSON_PATH)], "pass"),
+        # not the retrospective: the readiness tooling, another stream's record, the
+        # scratch manifest and findings files, a read that failed, the collector's source
+        (_READINESS_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/", "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json"], [], "fail"),
+        (_SCRATCH_FILE_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/"], [_worker_read(_FINDINGS_PATH), _worker_read(_MANIFEST_PATH)], "fail"),
+        ([], [_worker_read(_CHAT_RECORD_PATH, status="error")], "fail"),
+        ([], [_worker_read(_COLLECTOR_SOURCE_PATH)], "fail"),
+    ],
+)
+def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(case, commands, reads, status):
+    _stash_route(commands, reads)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == status, (case, commands, reads, verdict.reason)
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+def test_retrospective_route_with_no_tagged_worker_call_is_an_error_not_a_fail(case):
+    # Card log lines with no tagged call: the terminal leaf grades the lines and fails,
+    # the read_file leaf cannot observe its subject, and the `any` reports the unknown
+    # rather than a fail, as `worker_commands` itself does on an absent capture.
+    _stash_commands(_READINESS_COMMANDS)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == "error", verdict.reason
+
+
+@pytest.mark.parametrize(
+    "final_message, passes",
+    [
+        ("Checking the upgrade retrospective. Report: /opt/data/scratch/chat_report_upgrade-retrospective.json", True),
+        # the latest link where the collector writes it, and the root spelling the SOP once gave
+        ("Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md (produced 2026-10-21T10:00Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md (produced 2026-10-20T20:45Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z.md", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z-scoped.md", True),
+        ("The fleet upgrade report file is located at: /opt/data/state/fleet-upgrade-verification/channel-default.json", False),
+        ("Report: /opt/data/scratch/chat_manifest_fleet_upgrade.json", False),
+        # the 2026-10-21 reds: the ledger document and the harness manifest are not the report
+        ("Answered from:\n`/opt/data/scratch/findings_upgrade-retrospective.json`", False),
+        ("**/opt/data/scratch/manifest_upgrade-retrospective.json**", False),
+        ("Source: /opt/data/scratch/run_upgrade-retrospective.json", False),
+    ],
+)
+def test_retrospective_reply_names_the_report_or_the_chat_record(final_message, passes):
+    check = next(e["check"] for e in _ON_DEMAND_SPEC["verification_spec"] if e["name"] == _REPORT_FILE_OBJECTIVE)
+    transcript.set(final_message, [], final_message=final_message)
+    assert parse_node(check).verify(1.0).success is passes, final_message
 
 
 # The readiness case for the same catalogue entry grades the readiness report's

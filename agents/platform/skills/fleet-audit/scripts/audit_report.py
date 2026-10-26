@@ -478,6 +478,27 @@ AUDITS: dict[str, AuditSpec] = {
             ),
         ),
     ),
+    "upgrade-retrospective": AuditSpec(
+        "Upgrade Retrospective",
+        "upgrade_retrospective_sop.md",
+        # The seven ids the collector (`upgrade_retrospective.py`, `CHECK_READS`)
+        # emits; a failure still present from an earlier review is re-emitted
+        # under its original id with its persistence, never under one of its
+        # own. The collector grades an Error at `major` and a Warning at
+        # `minor`, never `critical`, and none of these slugs is on
+        # `MAJOR_SWEEP_CHECKS`, so `finish` opens no pull request on its own
+        # for this stream -- the design's guard against a retrospective that
+        # proposes manifest changes nobody asked for.
+        (
+            "upgrade-operation-failed",
+            "upgrade-broke-workload",
+            "node-broken-after-upgrade",
+            "upgrade-symptom-tentative",
+            "upgrade-symptom-unclassified",
+            "symptom-predates-upgrade",
+            "upgrade-log-volume-rose",
+        ),
+    ),
 }
 
 # The streams whose SOP runs a collector, and so the streams whose `finish`
@@ -500,6 +521,7 @@ COLLECTOR_AUDITS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -826,6 +848,13 @@ REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 # and the copy of the newest. report_status.py spells them the same way.
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# The neutral `state` of an open issue in the broker's `issue-view` answer.
+FORGE_ISSUE_OPEN = "open"
+# The envelope key that names the ledger issue a run left open when
+# `issue_number` cannot: a clean run that held the ledger open with no trusted
+# memory stores no `issue_number`, so the next run's trust check fails. This key
+# is not a trust claim; only the ledger lookup reads it.
+OPEN_LEDGER_KEY = "open_issue_number"
 # The chat report `finish` leaves for the relay: one record per stream in
 # SCRATCH_DIR, read over ssh by `session_kv_server.audit_chat_report`, which
 # spells these keys the same way.
@@ -1210,6 +1239,14 @@ CHECK_PHRASES = {
     "mig-convergence-stalled": "{object} instance group isn't converging",
     "sole-tenant-headroom": "sole-tenant nodes are nearly full",
     "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+    # Upgrade Retrospective
+    "upgrade-operation-failed": "an upgrade operation failed",
+    "upgrade-broke-workload": "{object} broke after the upgrade",
+    "node-broken-after-upgrade": "{object} node stayed broken after its pool's rebuild",
+    "upgrade-symptom-tentative": "{object} may have been broken by the upgrade",
+    "upgrade-symptom-unclassified": "{object} shows a symptom after the upgrade that matches no known pattern",
+    "symptom-predates-upgrade": "{object} was already broken before the upgrade",
+    "upgrade-log-volume-rose": "{object} writes far more logs since the upgrade",
 }
 
 # Applied to a pull request the harness itself closed as stale. It is the
@@ -1877,14 +1914,172 @@ PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_reques
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
-# The end of the note `degrade_missing_remediations` writes for a manifest
-# file that the audit did not write.
+# What `redact_secrets` writes in place of a credential. The route notes
+# below use it too, so it is declared before them.
+REDACTED = "[redacted by audit_report.py]"
+# The notes `disclose_manual_remediation_routes` adds to a `manual` remediation
+# from the collector's candidate fields. Each value in a note is a path or a
+# name that `ROUTE_PATH_PATTERN` or `RECONCILER_PATTERN` accepts, and that
+# `redact_secrets` does not change, so the pass can find and remove the whole
+# note that an earlier copy of the text carries (`ROUTE_NOTE_PATTERN`) before
+# it writes the note again.
+DECLARED_NOTE_LEDE = "_(Declared in this repository at "
+DECLARED_NOTE = (
+    DECLARED_NOTE_LEDE + "`{path}`. Make the change in the repository, not on the live object.)_"
+)
+RELEASE_NOTE_LEDE = "_(Rendered by "
+RELEASE_NOTE = (
+    RELEASE_NOTE_LEDE + "{noun} declared at `{path}`. Make the change in that file: "
+    "the next sync or upgrade of the release can revert a patch to the live object.)_"
+)
+NAMESPACE_DIRECTORY_NOTE_LEDE = "_(A new object for this namespace belongs under "
+NAMESPACE_DIRECTORY_NOTE = NAMESPACE_DIRECTORY_NOTE_LEDE + "`{path}`.)_"
+# The namespace-directory note for the two `namespace_directory.source`
+# values that oblige the worker to do more than add a file. A Kustomize root
+# renders only the files that its `resources:` names. A directory for the
+# whole cluster supplies no namespace, and a cluster-scoped finding can get it.
+NAMESPACE_OVERLAY_NOTE = (
+    NAMESPACE_DIRECTORY_NOTE_LEDE + "the Kustomize root `{path}`. "
+    "List its file in the `resources:` of that root, or it does not render.)_"
+)
+NAMESPACE_CLUSTER_NOTE = (
+    "_(A new object for this cluster belongs under `{path}`. That directory serves the whole "
+    "cluster, so a namespaced object there must set `metadata.namespace`.)_"
+)
+# The `namespace_directory.source` values `collect.namespace_directories`
+# writes, copied because this script does not import the collector, and the
+# note for each. Another value gets `NAMESPACE_DIRECTORY_NOTE`, as `sibling`.
+NAMESPACE_DIRECTORY_NOTES = {
+    "sibling": NAMESPACE_DIRECTORY_NOTE,
+    "overlay": NAMESPACE_OVERLAY_NOTE,
+    "cluster": NAMESPACE_CLUSTER_NOTE,
+}
+RECONCILED_NOTE_LEDE = "_(Reconciled by "
+RECONCILED_NOTE = (
+    RECONCILED_NOTE_LEDE + "{reconciler}. The next sync or upgrade can revert a change made "
+    "by hand to the live object; make the change where that reconciler gets its configuration.)_"
+)
+# The characters a route note shows from a path or a name. The values come
+# from file names in the repository and from annotations on the live object,
+# which anyone who can edit the object can set. A value of these characters
+# cannot close its code span, start a link or an HTML tag, or mention a
+# user, so it shows as plain text. A path with another character gets no
+# location note.
+ROUTE_PATH_TEXT = r"[A-Za-z0-9_./-]+"
+ROUTE_PATH_PATTERN = re.compile(ROUTE_PATH_TEXT)
+# The longest path and the longest reconciler phrase that a route note shows.
+# The two longest notes with values at these caps take less than
+# `MAX_NOTE_CHARS`, so the route notes always leave room for the start of the
+# worker's note and its truncation mark. A longer path gets no location note,
+# and a longer reconciler is shown as `RECONCILER_UNNAMED`.
+ROUTE_PATH_MAX_CHARS = 512
+ROUTE_RECONCILER_MAX_CHARS = 512
+# A name in a reconciler: a Helm release, an Argo CD Application, or an
+# `app.kubernetes.io/managed-by` label value.
+ROUTE_NAME_TEXT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+# A namespace is a DNS label, which has no character that Markdown reads,
+# so it shows outside a code span, as `collect.reconciler_of` writes it.
+ROUTE_NAMESPACE_TEXT = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+# The three phrases `collect.reconciler_of` writes, copied because this script
+# does not import the collector. A reconciler that is not exactly one of
+# them is shown as `RECONCILER_UNNAMED`: the note then still says that a
+# change by hand can be reverted, and it shows nothing from the annotation.
+RECONCILER_TEMPLATE = (
+    "the Helm release `{name}`(?: in {namespace})?"
+    "|the Argo CD Application `{name}`"
+    "|`{name}`"
+)
+RECONCILER_TEXT = RECONCILER_TEMPLATE.format(name=ROUTE_NAME_TEXT, namespace=ROUTE_NAMESPACE_TEXT)
+RECONCILER_PATTERN = re.compile(RECONCILER_TEXT)
+RECONCILER_UNNAMED = "a controller whose name the audit does not show"
+# The `renderer` values `collect.release_declarations` writes, copied because
+# this script does not import the collector, and the noun the release note
+# uses for each. A Kustomize overlay has no values file, so "the chart
+# release" would send the reader to look for a file that does not exist.
+RELEASE_RENDERER_NOUNS = {
+    "helm": "the chart release",
+    "kustomize": "the Kustomize overlay",
+}
+RELEASE_RENDERER_FALLBACK_NOUN = "the release"
+# A value in an earlier route note, also after `redact_secrets` changed it.
+# A note that an older run wrote can hold a value that redaction changed, and
+# a note that the pattern does not find is written again on each run.
+ROUTE_REDACTED_TEXT = re.escape(REDACTED)
+ROUTE_STORED_PATH_TEXT = rf"(?:[A-Za-z0-9_./-]|{ROUTE_REDACTED_TEXT})+"
+ROUTE_STORED_RECONCILER_TEXT = RECONCILER_TEMPLATE.format(
+    name=rf"(?:[A-Za-z0-9_.-]|{ROUTE_REDACTED_TEXT})+",
+    namespace=rf"(?:[a-z0-9-]|{ROUTE_REDACTED_TEXT})+",
+)
+# One earlier route note, exactly as a template above writes it. A value can
+# hold no character of the text around it, so a match is always one whole
+# note, and a removal never leaves part of a note behind.
+ROUTE_NOUN_TEXT = "|".join(
+    re.escape(noun) for noun in (*RELEASE_RENDERER_NOUNS.values(), RELEASE_RENDERER_FALLBACK_NOUN)
+)
+ROUTE_NOTE_PATTERN = re.compile(
+    "|".join(
+        "(?:"
+        + re.escape(template)
+        .replace(re.escape("{path}"), ROUTE_STORED_PATH_TEXT)
+        .replace(re.escape("{noun}"), f"(?:{ROUTE_NOUN_TEXT})")
+        .replace(re.escape("{reconciler}"), f"(?:{ROUTE_STORED_RECONCILER_TEXT}|{re.escape(RECONCILER_UNNAMED)})")
+        + ")"
+        for template in (
+            DECLARED_NOTE,
+            RELEASE_NOTE,
+            NAMESPACE_DIRECTORY_NOTE,
+            NAMESPACE_OVERLAY_NOTE,
+            NAMESPACE_CLUSTER_NOTE,
+            RECONCILED_NOTE,
+        )
+    )
+)
+# What must not touch a path in a worker's note for the note to name that
+# path as a whole path: no path character before it, and no path character
+# after it, also after a full stop that ends a sentence.
+WHOLE_PATH_BEFORE = r"(?<![\w./-])"
+WHOLE_PATH_AFTER = r"(?!\.?[\w/-])"
+# The same, with the spaces before it, so that a removal keeps the newlines.
+ROUTE_NOTE_SPACED_PATTERN = re.compile(r"[ \t]*(?:" + ROUTE_NOTE_PATTERN.pattern + ")")
+# What a worker note is cut with when the route notes need its space.
+ROUTE_NOTE_TRUNCATED = " …(truncated)"
+# The remediation field that keeps the worker's note before that cut. The
+# stored document keeps it, and `carry_unchanged_findings` puts it back as
+# the note, so a cut that the route notes needed on one run does not stay on
+# the note of a later run that has room. Only `finish` writes it:
+# `validate_findings` removes it from the worker's document.
+ROUTE_UNCUT_NOTE_FIELD = "uncut_note"
+# What joins two route notes, and what puts the route notes on their own
+# paragraph after the worker's note. A paragraph of its own is outside any
+# code block the worker's note ends with.
+NOTE_SEPARATOR = " "
+ROUTE_PARAGRAPH_BREAK = "\n\n"
+CODE_FENCE = "```"
+# What closes a code fence that the worker's note leaves open.
+CODE_FENCE_CLOSE = "\n```"
+# The start and the end of the note `degrade_missing_remediations` writes,
+# after the worker's note, for a manifest file that the audit did not write.
+DEGRADED_REMEDIATION_LEDE = "_(The audit "
 DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run the audit.)_"
 # The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
 # fix that Config Connector reverts.
 KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
 # The sentence every note of `degrade_unlisted_kustomize_additions` holds.
 KUSTOMIZE_NOTE_MARK = "A new file in a Kustomize root renders only if its kustomization lists it."
+# The start of a note of `degrade_unlisted_kustomize_additions`: its own text
+# on one line, then the worker's file as a fenced YAML block, or, when no
+# line of the file fits, its own text with no block. The route-note pass
+# does not cut this text, because the block is the only published copy of
+# the fix.
+# Its own text ends at the end of its line when the block follows, and at
+# the first end of a note after the mark when the worker's note follows.
+KUSTOMIZE_NOTE_LINE_TEXT = re.escape(DEGRADED_REMEDIATION_LEDE) + r"[^\n]*" + re.escape(KUSTOMIZE_NOTE_MARK)
+KUSTOMIZE_NOTE_BLOCK_PATTERN = re.compile(
+    r"(?P<prefix>" + KUSTOMIZE_NOTE_LINE_TEXT + r"[^\n]*\.\)_)"
+    r"\n\n(?P<fence>`{3,})yaml\n(?P<body>.*?)\n(?P=fence)(?:\n|\Z)",
+    re.DOTALL,
+)
+KUSTOMIZE_NOTE_PREFIX_PATTERN = re.compile(r"(?P<prefix>" + KUSTOMIZE_NOTE_LINE_TEXT + r"[^\n]*?\.\)_)(?= |\Z)")
 # Text that `finish` itself writes into a remediation note. A note that holds
 # one of these is not the worker's wording, and `carry_unchanged_findings`
 # does not copy it: the pass that wrote it runs again on each run and writes
@@ -2086,6 +2281,32 @@ CLUSTERS_LISTED_KEY = "clusters_listed"
 MANIFEST_FINISHED_KEY = "finished_at"
 # The collector's wall-clock start. Read only for the `collect_s` timer.
 MANIFEST_STARTED_KEY = "started_at"
+# Two keys the upgrade retrospective's collector writes that say the manifest
+# is not one the SOP files from, so `load_manifest` refuses it for `draft`
+# and `finish` alike. `scoped`: the run was narrowed (no `--full`, or
+# `--cluster`, `--since`, `--after-upgrade`); a scoped run files no ledger
+# and the SOP hands it no `--manifest-file`, since a manifest that read a few
+# clusters would have `finish` announce every other cluster's finding
+# resolved. `after_reset`: the store was reset (`--reset-ledger`) and the run
+# is the baseline the SOP files nothing from, or a run before it; the ledger
+# keeps its findings until the next full run reads the fleet again.
+MANIFEST_SCOPED_KEY = "scoped"
+MANIFEST_AFTER_RESET_KEY = "after_reset"
+MANIFEST_SCOPED_REFUSAL = (
+    "--manifest-file: {path} carries {key}: true; the collector ran a scoped run (no "
+    "--full, or --cluster, --since or --after-upgrade), and the SOP hands a scoped run "
+    "no --manifest-file: it files no ledger. This manifest vouches for the clusters it "
+    "read and for no other, so a finish from it would announce every other cluster's "
+    "finding resolved. Run neither draft nor finish on it; only a full run's manifest "
+    "reaches finish."
+)
+MANIFEST_AFTER_RESET_REFUSAL = (
+    "--manifest-file: {path} carries {key}: true; the collector wrote it after "
+    "--reset-ledger archived its store, and no full run has written the new baseline "
+    "yet. The SOP files nothing from such a run: report from the collector's report "
+    "alone, and run neither draft nor finish on this manifest. The ledger keeps its "
+    "findings until the next full run reads the fleet again."
+)
 MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # How much of a collector's `error` a refusal quotes back.
@@ -2318,8 +2539,6 @@ def normalise_newlines(text: str | None) -> str:
         return ""
     return str(text).replace("\r\n", "\n").replace("\r", "\n")
 
-
-REDACTED = "[redacted by audit_report.py]"
 
 # Every hidden marker this harness reads — the delta block, the id scheme, the
 # finding markers, the held-section brackets — is an HTML comment, so a `<!--`
@@ -3321,6 +3540,7 @@ def report_envelope(
     ledger_held_open: bool = False,
     delta_known: bool = True,
     reported_under_gap: list[str] | None = None,
+    open_issue_number: int | None = None,
     not_rechecked: list[dict] | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
@@ -3346,6 +3566,10 @@ def report_envelope(
     open ledger: `new_ids` and `resolved_ids` are then empty because the delta
     was withheld, not because nothing changed, and a reader must say so
     rather than print a zero.
+    `open_issue_number` names the ledger issue the run left open when
+    `issue_number` is None for the trust check (`OPEN_LEDGER_KEY`). Only
+    `find_existing_issue` reads it, to find a ledger the label listing left
+    out; `read_report_memory` does not, so the memory stays lost.
     `not_rechecked` is the entries the run kept under _Not re-checked this
     run_; each is stored with its title and place (`NOT_RECHECKED_KEY`).
     `finished_at` is the run's own generation timestamp, the one the ledger
@@ -3378,6 +3602,7 @@ def report_envelope(
         "silent_ok": payload.get("silent_ok"),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
         "ledger_held_open": ledger_held_open,
+        **({OPEN_LEDGER_KEY: open_issue_number} if open_issue_number is not None else {}),
         "delta_known": delta_known,
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
@@ -3963,20 +4188,26 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
-def _newest_published_envelope(runs: Path) -> dict | None:
-    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
+def _ring_envelopes(runs: Path) -> list[dict]:
+    """The readable envelopes in the `runs/` ring, newest first."""
     try:
         paths = sorted(runs.glob("*.json"), reverse=True)
     except OSError:
-        return None
+        return []
+    envelopes = []
     for path in paths:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(envelope, dict) and not is_diverted(envelope):
-            return envelope
-    return None
+        if isinstance(envelope, dict):
+            envelopes.append(envelope)
+    return envelopes
+
+
+def _newest_published_envelope(runs: Path) -> dict | None:
+    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
+    return next((e for e in _ring_envelopes(runs) if not is_diverted(e)), None)
 
 
 def _envelope_document(envelope: object, key: str) -> dict | None:
@@ -5289,6 +5520,9 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
+        # Only `finish` writes this field, and the carry puts it back as the
+        # note; a worker's copy would replace a later run's note with its own.
+        remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
         # Write the corrected spelling back, for the same reason the manifest
         # path above is normalised here: these strings are what get published,
         # and every reader downstream sees whatever they say.
@@ -6291,6 +6525,12 @@ def load_manifest(path: str, audit_id: str | None = None, command: str | None = 
             f"not {audit_id!r}; a manifest cross-checks the document against its own "
             "stream's roster and corroborates nothing about another's."
         )
+    # The two runs whose manifest the SOP never files from (the constants say
+    # why); a scoped run is the worker's error to pass at all, so it is named
+    # first when a manifest carries both.
+    for key, refusal in ((MANIFEST_SCOPED_KEY, MANIFEST_SCOPED_REFUSAL), (MANIFEST_AFTER_RESET_KEY, MANIFEST_AFTER_RESET_REFUSAL)):
+        if manifest.get(key):
+            raise ValidationError(refusal.format(path=path, key=key))
     if audit_id:
         stale = manifest_predates_run(manifest, audit_id)
         if stale:
@@ -6792,11 +7032,17 @@ def _remediation_is_file_backed(remediation: object) -> bool:
 
 
 def _harness_wrote_note(remediation: object) -> bool:
-    """Whether `finish` wrote part of the note in `remediation`."""
+    """Whether `finish` wrote part of the note in `remediation`, other than
+    the route notes (`HARNESS_NOTE_MARKS` has no route note).
+
+    The note before the route-note cut (`ROUTE_UNCUT_NOTE_FIELD`) counts too:
+    `_strip_route_notes` puts it back after a carry, so a mark that the cut
+    removed from the note must stop the carry all the same.
+    """
     if not isinstance(remediation, dict):
         return False
-    note = str(remediation.get("note") or "")
-    return any(mark in note for mark in HARNESS_NOTE_MARKS)
+    notes = (str(remediation.get(field) or "") for field in ("note", ROUTE_UNCUT_NOTE_FIELD))
+    return any(mark in note for note in notes for mark in HARNESS_NOTE_MARKS)
 
 
 def _remediation_may_carry(before: object, now: object) -> bool:
@@ -6811,9 +7057,11 @@ def _remediation_may_carry(before: object, now: object) -> bool:
     The other direction is safe and is the one the carry is for: a `gcloud`
     command from the previous run stays when the worker now writes `manual`.
 
-    Not when `finish` wrote part of either note. The pass that wrote it
-    runs again after the carry, so a copied note gets the text two times,
-    or keeps a statement that is not true for this run.
+    Not when `finish` wrote part of either note, other than the route notes,
+    which are stripped and written again (`_strip_route_notes`). The pass
+    that wrote the other parts runs again after the carry, so a copied note
+    gets the text two times, or keeps a statement that is not true for this
+    run.
     """
     if not isinstance(before, dict) or not isinstance(now, dict):
         return False
@@ -6877,9 +7125,28 @@ def carry_unchanged_findings(findings: list[dict], previous: dict | None) -> lis
                 finding[field] = copy.deepcopy(before[field])
                 changed = True
         if changed:
+            _strip_route_notes(finding.get("remediation"))
             normalise_finding_commands(finding)
             carried.append(fid)
     return carried
+
+
+def _strip_route_notes(remediation: object) -> None:
+    """Remove the route notes from a carried `remediation` note.
+
+    `disclose_manual_remediation_routes` writes them again from this run's
+    manifest after the carry, and calls this for a finding in its `skip` set,
+    which gets no route note. When the previous run cut the worker's note to give the route notes room,
+    the note before the cut (`ROUTE_UNCUT_NOTE_FIELD`) comes back in its place.
+    """
+    if not isinstance(remediation, dict):
+        return
+    uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+    note = uncut if isinstance(uncut, str) else str(remediation.get("note") or "")
+    if ROUTE_NOTE_PATTERN.search(note):
+        note = ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
+    if isinstance(uncut, str) or note != remediation.get("note"):
+        remediation["note"] = note
 
 
 def collector_flagged_ids(manifest: dict | None) -> set[str]:
@@ -14365,7 +14632,7 @@ def find_existing_issue(
             "issue was found; merge or close the remediation backlog on this label"
         )
     if not issues:
-        return None, None, None, None
+        return _ledger_the_listing_left_out(repo, audit_id)
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
@@ -14384,6 +14651,94 @@ def find_existing_issue(
         body if isinstance(body, str) else None,
         title if isinstance(title, str) else None,
     )
+
+
+def _stored_ledger_numbers(audit_id: str, repo: str) -> list[int]:
+    """The ledger issues the report store names for this stream and `repo`, highest first.
+
+    Each envelope in `latest.json` and the `runs/` ring gives its
+    `issue_number`, and its `OPEN_LEDGER_KEY` when a run held the ledger open
+    with no trusted memory. An envelope that `is_diverted` marks never names a
+    ledger, and neither does one written for another repository. An absent or
+    unreadable store names none. The ring keeps `REPORT_HISTORY` envelopes, so
+    the list is short, and it usually has one number.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError:
+        return []
+    envelopes = _ring_envelopes(directory / REPORT_RUNS_DIR)
+    try:
+        envelopes.append(json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+    numbers: set[int] = set()
+    for envelope in envelopes:
+        if not isinstance(envelope, dict) or is_diverted(envelope):
+            continue
+        if _ledger_key(envelope.get("repo")) != _ledger_key(repo):
+            continue
+        for key in ("issue_number", OPEN_LEDGER_KEY):
+            number = envelope.get(key)
+            if isinstance(number, int) and not isinstance(number, bool):
+                numbers.add(number)
+    return sorted(numbers, reverse=True)
+
+
+def _ledger_the_listing_left_out(
+    repo: str, audit_id: str
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """The open ledger an empty label listing left out, or the four Nones.
+
+    GitHub's label-filtered issue list can leave out an open, labelled issue
+    for a short time, most likely just after a label write, and
+    `ensure_labels` runs a second or two before every lookup. Read as
+    "no ledger", `finish` opens a second ledger with no memory, and the first
+    ledger's state (its held rows, its carried findings) is lost.
+
+    So an empty listing is checked against the issues the report store names
+    (`_stored_ledger_numbers`), highest first, as a full listing picks the
+    highest number. Each issue is read directly, and the first one that is
+    still open and still carries `audit:<id>` is the ledger. A closed issue
+    stays closed: a clean full run closes the ledger on purpose, and the next
+    finding opens a fresh one. A failed read stops the search and gives the
+    empty listing it was: a lower number is not the ledger while a higher one
+    could still be.
+
+    An open, labelled issue that no envelope in the store names (opened by
+    hand, or by a run whose store write failed and that later runs did not
+    name) stays out of reach until the listing shows it again.
+    """
+    none: tuple[None, None, None, None] = (None, None, None, None)
+    label = f"audit:{audit_id}".lower()
+    for number in _stored_ledger_numbers(audit_id, repo):
+        answer = try_forge("issue-view", repo, {"number": number})
+        issue = (answer or {}).get("issue")
+        if not isinstance(issue, dict):
+            log(
+                f"The label listing for audit:{audit_id} in {repo} was empty, and this run "
+                f"could not read #{number}, which the report store names; treating the "
+                "stream as having no open ledger."
+            )
+            return none
+        labels = [str(name).lower() for name in issue.get("labels") or []]
+        if str(issue.get("state") or "").lower() != FORGE_ISSUE_OPEN or label not in labels:
+            continue
+        log(
+            f"WARNING: the label listing for audit:{audit_id} in {repo} left out #{number}, "
+            "which the report store names and which is open and carries the label; "
+            f"updating #{number}. The forge's label index can lag a label write."
+        )
+        body = issue.get("body")
+        title = issue.get("title")
+        url = issue.get("url")
+        return (
+            number,
+            url if isinstance(url, str) and url else None,
+            body if isinstance(body, str) else None,
+            title if isinstance(title, str) else None,
+        )
+    return none
 
 
 def fetch_issue_body(repo: str, number: int) -> str | None:
@@ -16626,7 +16981,7 @@ def degrade_missing_remediations(
         remediation["kind"] = "manual"
         remediation["path"] = ""
         remediation["note"] = (f"{note} " if note else "") + (
-            f"_(The audit {reason}. {DEGRADED_REMEDIATION_TAIL}"
+            f"{DEGRADED_REMEDIATION_LEDE}{reason}. {DEGRADED_REMEDIATION_TAIL}"
         )
         degraded.append(fid)
     return degraded
@@ -16680,22 +17035,32 @@ def _manifest_note_block(root: Path, path: str, prefix: str) -> str:
     except (OSError, ValidationError):
         return ""
     lines = text.rstrip("\n").splitlines()
+    return _sized_manifest_block(
+        lines, True, lambda block: len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+    )
 
-    def render(kept: list[str]) -> str:
-        return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
 
-    def fits(block: str) -> bool:
-        return len(publishable_text(prefix + block)) <= MAX_NOTE_CHARS
+def _manifest_block_text(kept: list[str]) -> str:
+    """The lines `kept` as the fenced YAML block of a Kustomize note."""
+    return "\n\n" + "\n".join(_code_block("\n".join(kept), "yaml")) + "\n"
 
+
+def _sized_manifest_block(lines: list[str], whole_file: bool, fits: Callable[[str], bool]) -> str:
+    """The longest block of `lines` that `fits` accepts, or "".
+
+    The block keeps at most MANUAL_NOTE_MANIFEST_LINES lines, and ends in
+    MANUAL_NOTE_TRUNCATED when it keeps less than the whole file. `lines` is
+    the whole file only when `whole_file` is true. The fences are always
+    closed, because the block is cut by lines and not by characters."""
     whole = lines[:MANUAL_NOTE_MANIFEST_LINES]
-    if len(whole) == len(lines) and fits(render(whole)):
-        return render(whole)
+    if whole_file and len(whole) == len(lines) and fits(_manifest_block_text(whole)):
+        return _manifest_block_text(whole)
     kept: list[str] = []
     for line in whole:
-        if not fits(render(kept + [line, MANUAL_NOTE_TRUNCATED])):
+        if not fits(_manifest_block_text(kept + [line, MANUAL_NOTE_TRUNCATED])):
             break
         kept.append(line)
-    block = render(kept + [MANUAL_NOTE_TRUNCATED])
+    block = _manifest_block_text(kept + [MANUAL_NOTE_TRUNCATED])
     return block if fits(block) else ""
 
 
@@ -16837,6 +17202,19 @@ class UnwrittenFix(NamedTuple):
     declared: bool
 
 
+def promised_paths(findings: list[dict]) -> dict[str, str]:
+    """Finding id to the path each `manifest` remediation names.
+
+    Taken before `degrade_missing_remediations`, which blanks the path of a
+    fix that was not written, for `unwritten_sweep_fixes` to read.
+    """
+    return {
+        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
+        for f in findings
+        if (f.get("remediation") or {}).get("kind") == "manifest"
+    }
+
+
 def unwritten_sweep_fixes(
     findings: list[dict],
     manifest: dict | None,
@@ -16844,6 +17222,7 @@ def unwritten_sweep_fixes(
     degraded: list[str],
     audit_id: str,
     prs: list[dict],
+    log_prefix: str = "",
 ) -> dict[str, UnwrittenFix]:
     """Finding id to where its fix belongs, for each fix the sweep would
     open if only it had been written.
@@ -16898,7 +17277,7 @@ def unwritten_sweep_fixes(
     # carries -- open, merged, or closed by a person -- is answered; the
     # generated check is left to `plan_generated_fixes`, which tells its own
     # pull request from another.
-    carried = {fid for pr in prs if not pr_closed_by_harness(pr) for fid in parse_delta_block(pr.get("body"))}
+    carried = _delta_carried_fixes(prs)
     unwritten: dict[str, UnwrittenFix] = {}
     for finding in findings:
         fid = str(finding.get("id", ""))
@@ -16909,12 +17288,10 @@ def unwritten_sweep_fixes(
             continue
         # Either shape: a promised file for a withheld budget is the same budget.
         if derive_finding_id(finding) in withheld:
-            log(f"{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
+            log(f"{log_prefix}{fid}: not refused, and stays manual: {withheld[derive_finding_id(finding)]}")
             continue
         if fid in degraded_set and promised.get(fid):
-            as_written = {"id": fid, "remediation": {"kind": "manifest", "path": promised[fid]}}
-            pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
-            if pr is None or pr_closed_by_harness(pr):
+            if not _promised_fix_carried(prs, audit_id, fid, promised[fid]):
                 unwritten[fid] = UnwrittenFix(promised[fid], declared=False)
             continue
         remediation = finding.get("remediation") or {}
@@ -16924,6 +17301,445 @@ def unwritten_sweep_fixes(
         if fid in vouched and remediation.get("kind") == "manual" and declared:
             unwritten[fid] = UnwrittenFix(declared, declared=True)
     return unwritten
+
+
+def _delta_carried_fixes(prs: list[dict], *, open_only: bool = False) -> set[str]:
+    """Every finding id that the delta block of a pull request names, when the
+    harness did not close that pull request: open, merged, or closed by a person.
+    With `open_only`, only an open pull request counts."""
+    counted = _pr_is_open if open_only else (lambda pr: not pr_closed_by_harness(pr))
+    return {fid for pr in prs if counted(pr) for fid in parse_delta_block(pr.get("body"))}
+
+
+def _pr_is_open(pr: dict) -> bool:
+    """Whether the pull request is open: not merged and not closed."""
+    return str(pr.get("state") or "").upper() == "OPEN" and not pr_is_merged(pr)
+
+
+def _promised_fix_carried(
+    prs: list[dict], audit_id: str, fid: str, path: str, *, open_only: bool = False
+) -> bool:
+    """Whether a pull request that the harness did not close is on the branch
+    that the promised `path` names, as the sweep joins a fix to its branch.
+    With `open_only`, only an open pull request counts."""
+    as_written = {"id": fid, "remediation": {"kind": "manifest", "path": path}}
+    pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
+    if pr is None:
+        return False
+    return _pr_is_open(pr) if open_only else not pr_closed_by_harness(pr)
+
+
+def pr_carried_fixes(
+    promised: dict[str, str], degraded: list[str], audit_id: str, prs: list[dict]
+) -> set[str]:
+    """The finding ids whose fix an open pull request carries.
+
+    By the joins `unwritten_sweep_fixes` uses: a finding that the delta block
+    of a pull request names, and a degraded fix whose promised path names the
+    branch of a pull request. Only an open pull request counts. A merged pull
+    request whose finding still reproduces did not fix it, and a pull request
+    that a person closed refused the fix, so for both the reader must make
+    the change by hand.
+    """
+    carried = _delta_carried_fixes(prs, open_only=True)
+    carried.update(
+        fid
+        for fid in degraded
+        if promised.get(fid) and _promised_fix_carried(prs, audit_id, fid, promised[fid], open_only=True)
+    )
+    return carried
+
+
+def route_note_skip(
+    unwritten: dict[str, UnwrittenFix],
+    declines: dict[str, str],
+    planned: dict[str, tuple[str, str]],
+    carried: set[str],
+) -> set[str]:
+    """The findings that `disclose_manual_remediation_routes` gives no route note.
+
+    A fix that `finish` wrote (`planned`), a fix that the worker declined, and
+    a fix that an open pull request carries (`carried`, `pr_carried_fixes`).
+    The row already gives the answer for each, and a note that sends the
+    reader to the repository asks for the same change again. A fix that a
+    merged pull request did not fix, or that a person refused, gets the route
+    notes: the reader must make that change by hand.
+    """
+    return {fid for fid in unwritten if fid in declines} | set(planned) | set(carried)
+
+
+class RouteEvidence(NamedTuple):
+    """What the collector found about where a finding's fix belongs.
+
+    Every field is `""` when the candidate does not carry it. An empty field
+    is no claim: the collector attaches a field only where it resolved one,
+    and a missing `declaration` can mean that the index was empty, that two
+    files declare the object, or that content mode could not copy the YAML.
+    A path that `ROUTE_PATH_PATTERN` does not accept is also `""`, and a
+    reconciler that `RECONCILER_PATTERN` does not accept is
+    `RECONCILER_UNNAMED`, so every field is safe to show in Markdown.
+    """
+
+    declaration: str
+    release: str
+    renderer: str
+    namespace_directory: str
+    namespace_source: str
+    reconciler: str
+
+
+def _field_path(candidate: dict, field: str) -> str:
+    """The `path` inside one of the candidate's location fields, or `""`.
+
+    `""` also when the path has a character that `ROUTE_PATH_PATTERN` does not
+    accept: no location note is better than a note that a file name can
+    change into a link or a mention. And `""` when the path is longer than
+    `ROUTE_PATH_MAX_CHARS`, so that the route notes cannot fill the note, or
+    when `redact_secrets` changes it: the stored note would then show a path
+    that is not in the repository.
+    """
+    value = candidate.get(field)
+    path = str(value.get("path") or "").strip() if isinstance(value, dict) else ""
+    shown = len(path) <= ROUTE_PATH_MAX_CHARS and ROUTE_PATH_PATTERN.fullmatch(path)
+    return path if shown and redact_secrets(path) == path else ""
+
+
+def _shown_reconciler(candidate: dict) -> str:
+    """The candidate's `reconciler` as a route note shows it, or `""`.
+
+    The phrase comes from annotations on the live object. When it is not
+    exactly one of the phrases `collect.reconciler_of` writes, with safe
+    names, is longer than `ROUTE_RECONCILER_MAX_CHARS`, or is changed by
+    `redact_secrets`, the note shows `RECONCILER_UNNAMED` in its place.
+    """
+    reconciler = str(candidate.get("reconciler") or "").strip()
+    if not reconciler:
+        return reconciler
+    shown = len(reconciler) <= ROUTE_RECONCILER_MAX_CHARS and RECONCILER_PATTERN.fullmatch(reconciler)
+    if shown and redact_secrets(reconciler) == reconciler:
+        return reconciler
+    return RECONCILER_UNNAMED
+
+
+def route_evidence(manifest: dict | None) -> dict[str, RouteEvidence]:
+    """Finding id to the location fields of the candidate with that identity.
+
+    The same join `adopt_collector_evidence` makes: a candidate keyed as the
+    finding it vouches for. Only candidates that carry one of the fields are
+    included.
+    """
+    evidence: dict[str, RouteEvidence] = {}
+    for entry, candidate in _candidates(manifest):
+        release = candidate.get("release_declaration")
+        directory = candidate.get("namespace_directory")
+        found = RouteEvidence(
+            declaration=_field_path(candidate, "declaration"),
+            release=_field_path(candidate, "release_declaration"),
+            renderer=str((release or {}).get("renderer") or "") if isinstance(release, dict) else "",
+            namespace_directory=_field_path(candidate, "namespace_directory"),
+            namespace_source=str((directory or {}).get("source") or "") if isinstance(directory, dict) else "",
+            reconciler=_shown_reconciler(candidate),
+        )
+        if found.declaration or found.release or found.namespace_directory or found.reconciler:
+            evidence[_candidate_identity(entry, candidate)] = found
+    return evidence
+
+
+def _names_path(text: str, path: str) -> bool:
+    """Whether `text` names `path` as a whole path, not as part of a longer one."""
+    return bool(re.search(WHOLE_PATH_BEFORE + re.escape(path) + WHOLE_PATH_AFTER, text))
+
+
+def _location_note(found: RouteEvidence) -> tuple[str, str]:
+    """The path and the location note for one `manual` finding, or `("", "")`.
+
+    One location note at most, the most specific that the collector found:
+    the object's own file, then the release that renders it, then the
+    directory for a new object, with what its `source` obliges the reader to
+    do (`NAMESPACE_DIRECTORY_NOTES`).
+    """
+    if found.declaration:
+        return found.declaration, DECLARED_NOTE.format(path=found.declaration)
+    if found.release:
+        noun = RELEASE_RENDERER_NOUNS.get(found.renderer, RELEASE_RENDERER_FALLBACK_NOUN)
+        return found.release, RELEASE_NOTE.format(noun=noun, path=found.release)
+    if found.namespace_directory:
+        template = NAMESPACE_DIRECTORY_NOTES.get(found.namespace_source, NAMESPACE_DIRECTORY_NOTE)
+        return found.namespace_directory, template.format(path=found.namespace_directory)
+    return "", ""
+
+
+def _routed_note(found: RouteEvidence, worker_note: str) -> tuple[str, str]:
+    """The worker's note and the route notes for one `manual` finding, made to
+    fit `MAX_NOTE_CHARS` (`_fit_route_notes`).
+
+    The location note is not written when the worker's note names its path,
+    because it would only repeat the worker. That is decided on the worker's
+    note after the cut: when the cut removes the only mention of the path, the
+    location note is written. The reconciler note is independent of the
+    location note.
+    """
+    location, location_note = _location_note(found)
+    reconciled = [RECONCILED_NOTE.format(reconciler=found.reconciler)] if found.reconciler else []
+    if location_note and _names_path(worker_note, location):
+        fitted, added = _fit_route_notes(worker_note, reconciled)
+        if _names_path(fitted, location):
+            return fitted, added
+    notes = [location_note, *reconciled] if location_note else reconciled
+    return _fit_route_notes(worker_note, notes)
+
+
+def _split_harness_tail(note: str) -> tuple[str, str]:
+    """The worker's part of `note` and the note that `degrade_missing_remediations`
+    wrote at its end, or `(note, "")` when there is no such note."""
+    if not note.endswith(DEGRADED_REMEDIATION_TAIL):
+        return note, ""
+    start = note.rfind(DEGRADED_REMEDIATION_LEDE, 0, len(note) - len(DEGRADED_REMEDIATION_TAIL))
+    if start < 0:
+        return note, ""
+    return note[:start].rstrip(), note[start:]
+
+
+class KustomizeNoteHead(NamedTuple):
+    """The start of a note of `degrade_unlisted_kustomize_additions`.
+
+    `prefix` is its own text, `lines` the lines of the copied file without
+    the truncation line (None when the note has no block), `whole` whether
+    the block holds the whole file, and `rest` the worker's note after it.
+    """
+
+    prefix: str
+    lines: list[str] | None
+    whole: bool
+    rest: str
+
+
+def _split_kustomize_head(note: str) -> KustomizeNoteHead:
+    """`note` split after the text of `degrade_unlisted_kustomize_additions`,
+    or with an empty `prefix` when the note does not start with that text."""
+    found = KUSTOMIZE_NOTE_BLOCK_PATTERN.match(note)
+    if found:
+        lines = found.group("body").split("\n")
+        whole = lines[-1] != MANUAL_NOTE_TRUNCATED
+        return KustomizeNoteHead(
+            found.group("prefix"), lines if whole else lines[:-1], whole, note[found.end() :].strip()
+        )
+    found = KUSTOMIZE_NOTE_PREFIX_PATTERN.match(note)
+    if found:
+        return KustomizeNoteHead(found.group("prefix"), None, True, note[found.end() :].strip())
+    return KustomizeNoteHead("", None, True, note)
+
+
+def _is_kcc_reverted_note(note: str) -> bool:
+    """Whether `note` is the note of `degrade_reverted_gcloud_remediations`:
+    its prose in the first paragraph, then the worker's command in a fence."""
+    return KCC_REVERTED_NOTE_MARK in note.split(ROUTE_PARAGRAPH_BREAK, 1)[0]
+
+
+def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
+    """The worker's note and the route notes, made to fit `MAX_NOTE_CHARS`.
+
+    `notes` are the route notes in their order in the note. When they do not
+    all fit, the first ones are left out first, so the reconciler note, which
+    is last, is the last to go. With the caps on a path and a reconciler, the
+    reconciler note always fits with the truncation mark.
+
+    The cut is in the worker's part of the note only. The note that
+    `degrade_missing_remediations` wrote at the end stays whole: without it,
+    the stored note has no `HARNESS_NOTE_MARKS` entry. The cut goes into it
+    only when the reconciler note, or the last route note, leaves no room
+    for it.
+
+    The text of `degrade_unlisted_kustomize_additions` at the start of the
+    note, with the copied file, is not cut either: the block is the only
+    published copy of the fix. When the route notes do not fit with it, the
+    location note goes first. Then the block is made shorter by lines
+    (`_sized_manifest_block`) to make room for the reconciler note, and its
+    fences stay closed.
+
+    The note of `degrade_reverted_gcloud_remediations` is not cut at all: its
+    fenced command is the only pasteable copy of the end state. The route
+    notes that do not fit after it are left out.
+
+    A worker note that leaves a code fence open gets the fence closed, so the
+    text after it is prose. A cut never goes inside a code block: a worker
+    note with a fence loses its first code block and all the text after it,
+    and the text before the block is cut as needed. A cut always ends with
+    `ROUTE_NOTE_TRUNCATED`, and route notes that leave no room for it are left
+    out.
+
+    The length is measured after `publishable_text`, as the renderer measures
+    it: an escaped comment opener and a redaction placeholder make the text
+    longer, and a route note that the renderer cuts loses its end.
+    """
+    notes = [note for note in notes if note]
+    if not notes:
+        return worker_note, ""
+    if _is_kcc_reverted_note(worker_note):
+        # All of it is text that `finish` wrote, so nothing in it is cut.
+        head = KustomizeNoteHead(worker_note, None, True, "")
+    else:
+        head = _split_kustomize_head(worker_note)
+    block = ""
+    if head.lines is not None:
+        block = _manifest_block_text(head.lines if head.whole else [*head.lines, MANUAL_NOTE_TRUNCATED])
+    harness_head = head.prefix + block
+    body, tail = _split_harness_tail(head.rest)
+    for kept, harness in ((body, tail), (head.rest, "")) if tail else ((head.rest, ""),):
+        for first in range(len(notes)):
+            added = NOTE_SEPARATOR.join(notes[first:])
+            fitted = _cut_worker_note(kept, harness, added, harness_head)
+            if fitted is not None:
+                return fitted, added
+    if head.lines is None or not notes[-1].startswith(RECONCILED_NOTE_LEDE):
+        return worker_note, ""
+    # Only the reconciler note, and a shorter copy of the file.
+    added = notes[-1]
+    block = _sized_manifest_block(
+        head.lines,
+        head.whole,
+        lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None,
+    )
+    fitted = _cut_worker_note(head.rest, "", added, head.prefix + block)
+    return (fitted, added) if fitted is not None else (worker_note, "")
+
+
+def _cut_worker_note(body: str, tail: str, added: str, head: str = "") -> str | None:
+    """`body` cut so that it, `tail` and the route notes `added` fit
+    `MAX_NOTE_CHARS`, with `head` before it and `tail` after it, or None when
+    no cut fits. `head` and `tail` are text that `finish` wrote."""
+    if body.count(CODE_FENCE) % 2:
+        body += CODE_FENCE_CLOSE
+
+    def joined(cut: str) -> str:
+        # A fence line with text after it does not close the fence.
+        separator = ROUTE_PARAGRAPH_BREAK if cut.endswith(CODE_FENCE) else NOTE_SEPARATOR
+        worker = separator.join(part for part in (cut, tail) if part)
+        return (head + NOTE_SEPARATOR + worker if worker else head).strip()
+
+    def fits(cut: str) -> bool:
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (joined(cut), added) if part)
+        return len(publishable_text(note).strip()) <= MAX_NOTE_CHARS
+
+    if fits(body):
+        return joined(body)
+    if head and not body:
+        # No worker text to cut, so no truncation mark.
+        return None
+    prose = body[: body.index(CODE_FENCE)] if CODE_FENCE in body else body
+
+    def cut(room: int) -> str:
+        return (prose[:room].rstrip() + ROUTE_NOTE_TRUNCATED).lstrip()
+
+    # The longest cut that fits. Redaction can depend on the text after a
+    # match, so the result is checked again.
+    low, high = 0, len(prose)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if fits(cut(middle)):
+            low = middle
+        else:
+            high = middle - 1
+    # The mark stays even when no character of the worker's note fits; route
+    # notes that leave no room for the mark are left out.
+    if fits(cut(low)):
+        return joined(cut(low))
+    return None
+
+
+def disclose_manual_remediation_routes(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str] = frozenset()
+) -> list[str]:
+    """Add to each `manual` remediation where its fix belongs, as the collector
+    found it. Returns the ids changed.
+
+    A `manual` remediation is prose that asks a person to make a change by
+    hand. It does not say where to make it, and on most objects the obvious
+    place, the live object, is the wrong one: the repository declares the
+    object, or a chart release renders it, or a controller can revert a patch
+    at its next sync or upgrade. A plain `helm install` release reverts a
+    field that the chart sets at the next `helm upgrade`, not before.
+    The collector resolved each of these against the repository and the live
+    object, and the SOPs tell the worker to use them, but the ledger showed
+    the fields only when the worker wrote them into its note.
+
+    The notes come only from fields the candidate carries:
+
+    - `declaration`: the file that declares the object;
+    - `release_declaration`: the chart release or Kustomize overlay that
+      renders it, and that the next sync or upgrade of the release can revert
+      a patch to the live object;
+    - `namespace_directory`: the directory where a new object belongs;
+    - `reconciler`: what reasserts the object's spec, and that its next sync
+      or upgrade can revert a change made by hand.
+
+    There is no note for a candidate without these fields. A missing
+    `declaration` is not a claim that no file declares the object, so a note
+    that says "not declared" would publish a claim that nobody measured.
+
+    A finding in `skip` gets no route note (`route_note_skip`): a fix that
+    `finish` wrote, that the worker declined with a published reason, or that
+    an open pull request carries. Only the route notes that its text copied
+    are removed. The same is true for a remediation that is not `manual`: a
+    worker can copy a route note into its own manifest fix, or into a note
+    that becomes the note of a fix that `finish` writes.
+
+    The pass first removes the route notes that the text already carries,
+    which a worker that copies the previous ledger brings back, and then
+    writes them again from this run's manifest. It removes them also when
+    this run's candidate carries no field. The route notes go in a paragraph
+    of their own after the worker's note. The worker's note is cut first when
+    the total is over `MAX_NOTE_CHARS`, because the renderer cuts from the
+    end and the route notes are at the end (`_fit_route_notes`).
+
+    The pass does not edit the worker's own words. A worker clause that
+    contradicts a note stays, and the note beside it is the correction.
+    """
+    evidence = route_evidence(manifest)
+    disclosed: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        remediation = finding.get("remediation")
+        if not isinstance(remediation, dict):
+            continue
+        if remediation.get("kind") != "manual" or fid in skip:
+            before = remediation.get("note")
+            _strip_route_notes(remediation)
+            if remediation.get("note") != before:
+                disclosed.append(fid)
+            continue
+        original = str(remediation.get("note") or "")
+        # The note before an earlier pass of this run cut it, when there was one.
+        uncut = remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+        worker_note = uncut if isinstance(uncut, str) else original.strip()
+        if ROUTE_NOTE_PATTERN.search(worker_note):
+            worker_note = ROUTE_NOTE_SPACED_PATTERN.sub("", worker_note).strip()
+        found = evidence.get(derive_finding_id(finding))
+        fitted, added = _routed_note(found, worker_note) if found else (worker_note, "")
+        if fitted != worker_note:
+            remediation[ROUTE_UNCUT_NOTE_FIELD] = worker_note
+        note = ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, added) if part)
+        if note != original.strip():
+            remediation["note"] = note
+            disclosed.append(fid)
+    return disclosed
+
+
+def disclose_manual_routes_and_log(
+    findings: list[dict], manifest: dict | None, skip: set[str] | frozenset[str], prefix: str = ""
+) -> None:
+    """Add the route notes, and log each finding that changed.
+
+    A run with no manifest writes no route note, but it still removes the
+    route notes that a worker copied from an earlier ledger.
+    """
+    by_id = {str(finding.get("id", "")): finding for finding in findings}
+    for fid in disclose_manual_remediation_routes(findings, manifest, skip):
+        note = str((by_id[fid].get("remediation") or {}).get("note") or "")
+        if ROUTE_NOTE_PATTERN.search(note):
+            log(f"{prefix}{fid}: its manual remediation now names where the fix belongs, from the collector.")
+        else:
+            log(f"{prefix}{fid}: removed the route notes that its remediation copied from an earlier ledger.")
 
 
 class KccDeclaration(NamedTuple):
@@ -18387,7 +19203,9 @@ def _handle_finish_dry_run(
     # The same degradation the real run applies, so a dry run shows the body
     # that would actually be published rather than an optimistic one. Every
     # step below therefore sees the post-degradation findings, exactly as
-    # `handle_finish` does.
+    # `handle_finish` does. What each fix promised is kept first, because the
+    # degrade blanks the path and the route notes below need it.
+    promised_preview = promised_paths(findings)
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
@@ -18422,6 +19240,21 @@ def _handle_finish_dry_run(
                 "either, the real run publishes it as manual and names the "
                 "`resources:` line to add."
             )
+    # The notes the real run adds. The preview reads no pull request and no
+    # `--decline-fix`, so it leaves alone every fix the refusal would list,
+    # and it can leave out a note the real run adds.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        set(
+            unwritten_sweep_fixes(
+                findings, manifest, promised_preview, degraded, audit_id, [], log_prefix="DRY RUN: "
+            )
+        )
+        if findings and manifest is not None
+        else set(),
+        prefix="DRY RUN: ",
+    )
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -19745,6 +20578,9 @@ def _plan_remediation_files(
     plan carries the refusal (`listing_refusal`), no proposal, the sweep off,
     and no unwritten-fix refusal, because no fix can be told to exist. The
     store ledger asks for this: its store write is the only record of the run.
+
+    Last, it adds the route notes to each `manual` remediation
+    (`disclose_manual_routes_and_log`), because both ledgers publish them.
     """
     listing_refusal = None
     try:
@@ -19822,6 +20658,17 @@ def _plan_remediation_files(
         )
     finally:
         probe.close()
+    # After every pass that changes a remediation, so the notes describe the
+    # remediation that is published, on both ledgers. A fix that `finish`
+    # wrote, that the worker declined, or that an open pull request carries
+    # gets no route note (`route_note_skip`). A refused listing shows no pull
+    # request, so no fix counts as carried and each `manual` fix gets its
+    # notes: they still say where the fix belongs.
+    disclose_manual_routes_and_log(
+        findings,
+        manifest,
+        route_note_skip(unwritten, declines, planned, pr_carried_fixes(promised, degraded, audit_id, remediation_prs)),
+    )
     return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
 
 
@@ -20555,11 +21402,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A fix the audit promised but did not write degrades that one finding to
     # `manual`; it never suppresses the report. What each promised is kept for
     # `unwritten_sweep_fixes`, since the degrade blanks the path.
-    promised = {
-        str(f.get("id", "")): str((f.get("remediation") or {}).get("path") or "")
-        for f in findings
-        if (f.get("remediation") or {}).get("kind") == "manifest"
-    }
+    promised = promised_paths(findings)
     degraded = degrade_missing_remediations(findings, root, noun)
     for fid in degraded:
         log(
@@ -21390,7 +22233,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # next run a trusted memory of an empty ledger — every finding the body
         # carries would be announced as new. The previous body carries forward
         # instead; with no memory of it, the envelope names no issue, so the
-        # next run's trust check fails as a lost memory should.
+        # next run's trust check fails as a lost memory should. The open
+        # ledger's number goes in `OPEN_LEDGER_KEY`, which the trust check
+        # does not read.
         body_untouched = (
             bool(existing_issue)
             and bool(gaps or unaccounted or held_unread)
@@ -21401,6 +22246,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # document the untouched body renders rides alongside as
         # `ledger_document`, for the next run's titles.
         ledger_document = None
+        # The open ledger's number whatever the memory. Without it, a ledger
+        # held open with no memory is named nowhere in the store, and the next
+        # run cannot find it when the label listing leaves it out.
+        open_issue = existing_issue if body_untouched else None
         # The places of the findings the untouched body keeps as not
         # re-checked, as the stored run recorded them (`NOT_RECHECKED_KEY`).
         not_rechecked: list[dict] = []
@@ -21451,6 +22300,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 ledger_held_open=body_untouched,
                 delta_known=delta_known,
                 reported_under_gap=reported_under_gap,
+                open_issue_number=open_issue,
                 not_rechecked=not_rechecked,
             ),
             now,

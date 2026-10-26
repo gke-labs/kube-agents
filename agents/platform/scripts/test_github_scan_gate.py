@@ -1653,5 +1653,64 @@ class ResolverPathTest(unittest.TestCase):
                 self.assertEqual(gate._resolver_path(), expected)
 
 
+class PrCommentsSweepOnGiteaTest(unittest.TestCase):
+    """The sweep reaches a Gitea forge through the same verbs, by its host."""
+
+    GITEA = "gitea.lab/acme/live"
+    ENTRIES = [REPO, GITEA]
+
+    def sweep(self, provider):
+        with mock.patch("gitops_workspace.get_managed_repos", mock.Mock(return_value=self.ENTRIES)), \
+             mock.patch.object(forge, "provider_for", return_value=provider):
+            return gate.sweep_pr_comments()
+
+    def provider(self):
+        github_pr = make_pr(number=12)
+        gitea_pr = make_pr(number=3, head_repo="acme/live")
+
+        class TwoForges(FakeProvider):
+            def list_open_prs(self, repo):
+                return [github_pr] if repo == REPO else [gitea_pr]
+
+            def list_comments(self, repo, pr):
+                return [make_comment(f"IC_{pr.number}", f"@{SELF} please fix")]
+
+        return TwoForges()
+
+    def test_an_agent_pull_request_on_gitea_gets_a_card(self):
+        provider = self.provider()
+        result = self.sweep(provider)
+        self.assertEqual(result.warnings, [])
+        titles = sorted(card.title for card in result.cards)
+        self.assertEqual(
+            titles,
+            [f"Answer review comments on {REPO}#12", f"Answer review comments on {self.GITEA}#3"],
+        )
+        self.assertIn(self.GITEA, provider.viewer_lookups)
+        self.assertIn((3, "IC_3"), provider.acknowledged)
+
+    def test_the_gitea_card_names_its_host_qualified_repo(self):
+        cards = {card.title: card for card in self.sweep(self.provider()).cards}
+        gitea = cards[f"Answer review comments on {self.GITEA}#3"]
+        self.assertIn(f"**{self.GITEA}#3**", gitea.body)
+
+    def test_the_github_card_key_is_unchanged(self):
+        cards = {card.title: card for card in self.sweep(self.provider()).cards}
+        key = cards[f"Answer review comments on {REPO}#12"].idempotency_key
+        self.assertTrue(key.startswith(f"pr-conv-{gate._slug(REPO)}-12-"), key)
+
+    def test_a_fork_on_gitea_is_not_swept(self):
+        fork_pr = make_pr(number=4, head_repo="stranger/live")
+
+        class Fork(FakeProvider):
+            def list_open_prs(self, repo):
+                return [fork_pr] if repo == PrCommentsSweepOnGiteaTest.GITEA else []
+
+            def list_comments(self, repo, pr):
+                return [make_comment("IC_4", f"@{SELF} please fix")]
+
+        self.assertEqual(self.sweep(Fork()).cards, [])
+
+
 if __name__ == "__main__":
     unittest.main()

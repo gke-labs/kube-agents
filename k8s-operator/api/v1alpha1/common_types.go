@@ -178,10 +178,11 @@ var SensitiveEnvVars = map[string]struct{}{
 	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
 	// choosing, the client accepts a server that CA signed as the bus, and
 	// hands it the bearer token at CONNECT.
-	"NATS_CA_FILE":  {},
-	"NATS_URL":      {},
-	"NATS_USER":     {},
-	"NATS_PASSWORD": {},
+	"NATS_CA_FILE":      {},
+	"NATS_URL":          {},
+	"NATS_USER":         {},
+	"NATS_PASSWORD":     {},
+	"VCS_FORGES_CONFIG": {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -254,6 +255,13 @@ var SensitiveEnvVars = map[string]struct{}{
 var ReservedVolumeNames = map[string]struct{}{
 	"a2a-bus-token":                  {},
 	"watcher-credential-proxy-token": {},
+}
+
+// ReservedVolumePrefixes lists volume name prefixes reserved for operator-managed
+// forge credential and CA projections (`vcs-forge-credentials-*`, `vcs-forge-ca-*`).
+var ReservedVolumePrefixes = []string{
+	ForgeCredentialVolumePrefix,
+	ForgeCAVolumePrefix,
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
@@ -1625,11 +1633,18 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
 //
-// A gitlab forge's credentialsRef is required by the API server too, so it
-// holds with the webhook off -- the chart ships it off.
-// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance"
+// A gitlab or gitea forge's credentialsRef (and a gitea forge's host) are
+// required by the API server too, so they hold with the webhook off -- the
+// chart ships it off.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance, gitea for a Gitea instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitea' || has(self.credentialsRef)",message="a gitea forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitea' || (has(self.host) && size(self.host) > 0)",message="a gitea forge has no default host; host is required"
 // +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || !has(self.scheme) || self.scheme != 'http'",message="caBundleRef cannot be set when scheme is http"
+// +kubebuilder:validation:XValidation:rule="!has(self.scheme) || self.scheme != 'http' || (has(self.provider) && self.provider == 'gitea')",message="scheme http is only supported for provider gitea"
+// +kubebuilder:validation:XValidation:rule="!has(self.scheme) || self.scheme != 'http' || (has(self.host) && (self.host.lowerAscii().endsWith('.svc') || self.host.lowerAscii().endsWith('.svc.cluster.local')))",message="scheme http sends the forge token unencrypted and is only allowed for an in-cluster service host (*.svc or *.svc.cluster.local)"
+// +kubebuilder:validation:XValidation:rule="!has(self.port) || self.port == 0 || (has(self.provider) && self.provider == 'gitea')",message="port is only supported for provider gitea"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1643,13 +1658,13 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// "github" and "gitlab" are registered; the enum grows with each
+	// "github", "gitlab", and "gitea" are registered; the enum grows with each
 	// agent-side provider. Omitted, it is "github".
 	//
 	// A forge at a host other than a spelling of github.com must name it, so
 	// a forge written for another instance is never read as a GitHub
 	// Enterprise Server by default.
-	// +kubebuilder:validation:Enum=github;gitlab
+	// +kubebuilder:validation:Enum=github;gitlab;gitea
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
@@ -1657,12 +1672,13 @@ type ForgeSpec struct {
 	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
 	// it does serve resolves to the provider's canonical host. It may also be a
-	// self-managed instance's hostname: a GitLab instance, or a GitHub
-	// Enterprise Server instance. Every repository on the forge must then name
-	// that host or leave it implied. A host another provider serves is
-	// rejected, and so is a host under a domain where the provider runs its own
-	// services (for GitHub: github.com, githubusercontent.com, ghe.com and
-	// others).
+	// self-managed instance's hostname: a GitLab instance, a Gitea instance, or
+	// a GitHub Enterprise Server instance. Every repository on the forge must
+	// then name that host or leave it implied. A self-managed provider such as
+	// "gitea" has no default, so the host is required there. A host another
+	// provider serves is rejected, and so is a host under a domain where the
+	// provider runs its own services (for GitHub: github.com,
+	// githubusercontent.com, ghe.com and others).
 	//
 	// An install serves one GitHub host: github.com, or one GitHub Enterprise
 	// Server instance. A second GitHub forge at another host is rejected, and
@@ -1701,19 +1717,38 @@ type ForgeSpec struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
+	// Scheme is how the forge is reached: "https", the default, or "http".
+	// Only a provider that allows plain http accepts it, and only when it is
+	// written out; GitHub is https only. Over http the token and repository
+	// contents cross the network unencrypted, so admission warns, and it is
+	// meant for a forge inside the cluster.
+	// +kubebuilder:validation:Enum=https;http
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+
+	// Port is the forge's port, for a forge not on the scheme's default port.
+	// Only provider "gitea" accepts it; it is refused for every other provider,
+	// a self-managed GitLab included, whose broker client does not compose one.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	// +optional
+	Port int32 `json:"port,omitempty"`
+
 	// CredentialsRef names a Secret in the PlatformAgent's namespace holding
 	// the credentials for this forge. It is for providers whose credentials an
 	// administrator supplies, and it is required for them. GitHub's come from
 	// the install's GitHub App through the token minter, so it is ignored for
 	// provider "github", and admission warns when it is set there.
 	//
-	// For GitLab the Secret holds an access token under the key `token`: a
-	// group or project access token, or a dedicated account's personal access
-	// token where the tier offers neither. It is mounted into the credential
+	// For GitLab and Gitea the Secret holds an access token under the key
+	// `token`: on GitLab a group or project access token, or a dedicated
+	// account's personal access token where the tier offers neither; on Gitea
+	// a dedicated account's access token. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret. The Secret may also
-	// hold a read-only token under the key `read-token`; the broker presents it
-	// only to clone the forge's context repositories, never on a write.
+	// call, so rotating the token is updating the Secret. A GitLab Secret may
+	// also hold a read-only token under the key `read-token`; the broker
+	// presents it only to clone the forge's context repositories, never on a
+	// write.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
@@ -2306,7 +2341,7 @@ type AgentUsageStatus struct {
 	// caller's channel or scope; the broker's own chat event pull failing,
 	// its Pub/Sub subscription or its credential to it, does count. Read from the
 	// broker's kubeagents_broker_execution_failures_total, summed over its
-	// kind label, every five minutes and kept monotonic the same way as
+	// kind and tool labels, every five minutes and kept monotonic the same way as
 	// ToolExecutionsTotal; a timed-out command counts here and as an error
 	// there. A rising share of this against ToolExecutionsTotal says the
 	// broker, its credentials or its upstreams are failing, where a policy

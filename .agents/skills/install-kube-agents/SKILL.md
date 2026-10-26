@@ -385,7 +385,7 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
 
 ## GitOps Repository & GitHub Token Minter Configuration
 
-When deploying `kube-agents` with GitOps pull-request workflows enabled, the Platform Agent creates pull requests against an infrastructure-as-code repository via the [GitHub Token Minter](https://github.com/abcxyz/github-token-minter) (`minty`). The minter runs in-cluster and signs short-lived GitHub App installation tokens using a private key securely stored in Google Cloud KMS.
+When deploying `kube-agents` with GitOps pull-request workflows enabled, the Platform Agent creates pull requests against an infrastructure-as-code repository via the [GitHub Token Minter](https://github.com/abcxyz/github-token-minter) (`minty`). The minter runs in-cluster and signs short-lived GitHub App installation tokens using a private key securely stored in Google Cloud KMS. (For GitLab or self-managed Gitea GitOps repositories, which use a Kubernetes Secret token instead of the GitHub App token minter, see [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md) and [Gitea as the GitOps forge](../../../docs/site/src/content/docs/install/gitea.md).)
 
 ### Prerequisites
 

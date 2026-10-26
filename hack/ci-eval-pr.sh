@@ -1007,6 +1007,16 @@ LEDGER_MINT_ATTEMPTS=3
 # mint is reported and skipped rather than retried into the unit's budget.
 LEDGER_RESET_MINT_ATTEMPTS=2
 LEDGER_RESET_MINT_RETRY_DELAY=2
+# A unit's grading token is renewed this often while devops-bench runs
+# (start_ledger_token_renewal): well inside the hour an installation token
+# lasts, with room for the mint's own retry ladder.
+LEDGER_TOKEN_RENEW_SECONDS=2400
+# The renewer's sleep step. Short, so the sleep a stopped renewer leaves
+# behind ends within seconds rather than holding the unit's output open.
+LEDGER_TOKEN_RENEW_TICK_SECONDS=10
+# After a renewal that failed, the next attempt comes this soon rather than a
+# whole period later, when the token in the file would already be dead.
+LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
 # What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
 # documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
 # mint rather than inherited from the installation's whole grant -- which,
@@ -1098,6 +1108,76 @@ mint_ledger_token() { # <label>
   rm -f "${diagnostics}"
   export BENCH_GITHUB_TOKEN="${minted%% *}"
   echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
+}
+
+# Keeps a unit's grading token alive for as long as its devops-bench runs.
+# The token is minted just before launch and lasts an hour, but a unit can
+# outlast it before its checks read GitHub: oobe-first-run-audits' first
+# repetition waits out a fresh install's own first-run stage inside its stack
+# (1h18m on 2026-10-17), and its github_writes safeguard then errored on a 401,
+# a rung-2 red on a run that wrote nothing. So the token goes to <file>, which
+# the checks read in preference to BENCH_GITHUB_TOKEN at verify time
+# (bench/kube_agents_bench/forges.py, GITHUB_TOKEN_FILE_ENV_VAR), and a
+# background loop re-mints into it every LEDGER_TOKEN_RENEW_SECONDS. A failed
+# renewal leaves the previous token in place and is tried again after
+# LEDGER_TOKEN_RENEW_RETRY_SECONDS. A renewal's mint runs with its stderr
+# discarded: mint_ledger_token's ERROR block says grading cannot proceed, which
+# is not yet true while the file holds a live token, and a retry every
+# LEDGER_TOKEN_RENEW_RETRY_SECONDS would repeat it for the rest of the unit. The
+# loop prints one WARNING per failure streak instead, carrying the mint's last
+# diagnostic, and a line when renewal recovers. Nothing to renew under gitlab or on the
+# mounted PAT, as in mint_ledger_token. stop_ledger_token_renewal ends it, and
+# the loop ends itself once the unit that started it is gone, so a unit killed
+# before its stop leaves no renewer holding the job's output open.
+start_ledger_token_renewal() { # <label> <file>
+  LEDGER_TOKEN_RENEWER=""
+  unset BENCH_GITHUB_TOKEN_FILE
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
+    || [ -z "${BENCH_GITHUB_TOKEN:-}" ]; then
+    return 0
+  fi
+  local label="$1" file="$2" owner="${BASHPID:-$$}"
+  (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}") || return 0
+  export BENCH_GITHUB_TOKEN_FILE="${file}"
+  (
+    waited=0
+    failures=0
+    while :; do
+      sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
+      kill -0 "${owner}" 2>/dev/null || exit 0
+      waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
+      [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
+      if mint_ledger_token "${label} renewal" 2>/dev/null \
+        && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
+        && mv -f "${file}.next" "${file}"; then
+        if [ "${failures}" -gt 0 ]; then
+          echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+        fi
+        failures=0
+        waited=0
+      else
+        failures=$((failures + 1))
+        if [ "${failures}" -eq 1 ]; then
+          echo "WARNING: ${label}: could not renew the ledger read token" \
+               "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
+               "stays in ${file} until it expires, and renewal is retried every" \
+               "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+        fi
+        waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
+      fi
+    done
+  ) &
+  LEDGER_TOKEN_RENEWER=$!
+}
+
+stop_ledger_token_renewal() { # <file>
+  if [ -n "${LEDGER_TOKEN_RENEWER:-}" ]; then
+    kill "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
+    wait "${LEDGER_TOKEN_RENEWER}" 2>/dev/null || true
+  fi
+  LEDGER_TOKEN_RENEWER=""
+  rm -f "$1" "$1.next"
+  unset BENCH_GITHUB_TOKEN_FILE
 }
 
 # Once here as well as once per unit: a key that cannot mint at all is a
@@ -1299,7 +1379,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts four), read with the YAML parser by
+# runs; oobe-first-run-audits starts five), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -2799,8 +2879,9 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (all three of its seats are
-# held out since pdb-remediation-pr's demotion of 2026-10-17, #3120), which empties the export by design, like a nightly part: said
+# The GitLab lane's list may hold no roster case (it held none from
+# pdb-remediation-pr's demotion of 2026-10-17, #3120, until
+# vcs-spent-branch-reuse's roster line of 2026-10-23), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3045,7 +3126,7 @@ unit_cost_hint() {
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
     # incumbent autoops hint (same watcher and card waits) until it passes.
-    ai-security-planted-model-audit) echo 1450 ;;
+    ai-security-planted-model-audit | ai-security-manual-names-reconciler) echo 1450 ;;
     # Not measured yet: the same stream and stack shape as the case above, so
     # it takes that case's hint until its nightly record says otherwise.
     fleet-audit-clean-close-reads-clean) echo 1450 ;;
@@ -3141,6 +3222,12 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # The upgrade retrospective's cases: each holds the stream, and a
+    # fleet-wide question with a stale report is a full collector run over the
+    # seeded fleet. 540s and 360s a red repetition on a dev install
+    # (2026-10-15); priced at the audit band's floor. The six after-upgrade
+    # cases ask the same fleet-wide question and take the same price.
+    upgrades-retrospective-on-demand | upgrades-retrospective-drained-budget) echo 600 ;;
     # Nightly-only since #3524. One of the five readiness-line cases of that
     # change, each the same read-only run (three project list reads, the
     # server config per location, the per-member kubectl reads); unmeasured.
@@ -3149,6 +3236,10 @@ unit_cost_hint() {
     # the default is cut from this tier rather than from all five; the four
     # siblings pack at the default until the nightly record prices them.
     upgrades-audit-control-plane-capacity) echo 600 ;;
+    upgrades-retrospective-cgroup-blind-runtime | upgrades-retrospective-cuda-pinned-gpu-job) echo 600 ;;
+    upgrades-retrospective-failclosed-webhook | upgrades-retrospective-multi-process-container) echo 600 ;;
+    upgrades-retrospective-network-policy-enforcement | upgrades-retrospective-stale-client-skew) echo 600 ;;
+    upgrades-retrospective-log-volume-gate | upgrades-rollout-family-held-by-canary-gate) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -3296,7 +3387,7 @@ STATE_DIR="$(mktemp -d)"
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds four).
+#                 (audit_streams; oobe-first-run-audits holds five).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count), as the infra
@@ -3811,9 +3902,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # lease is never copied in for this repetition.
   local timing="${STATE_DIR}/${name}.rep${rep}.${EVAL_TIMING_FILE}"
   rm -f "${timing}"
+  local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
+  start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
   (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
+  stop_ledger_token_renewal "${token_file}"
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
   # run someone will need the log for.

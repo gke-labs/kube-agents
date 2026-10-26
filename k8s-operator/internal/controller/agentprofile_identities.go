@@ -133,6 +133,11 @@ func agentProfileServiceAccountName(p *agentv1alpha1.AgentProfile) string {
 //     ServiceAccount, the callout's (TokenReview), the gateway's (pod create).
 //     A profile is not the route to borrowing them.
 //
+// Each is reserved whether or not this agent renders it now (the session
+// account only on next, the MCP account only under A2A_MCP_DOOR): a flip or a
+// flag turned on later must not find a profile or an override already holding
+// the name.
+//
 // `default` is reserved because every pod in the namespace that names no
 // ServiceAccount runs as it, so a profile on `default` would hand its bus
 // identity to all of them.
@@ -147,6 +152,7 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 		a2aVerifierName(agent):                "the capability verifier's ServiceAccount",
 		a2aCalloutName(agent):                 "the auth callout's ServiceAccount",
 		shellSandboxServiceAccountName(agent): "the shell sandbox's ServiceAccount",
+		a2aMCPServiceAccountName(agent):       "the A2A MCP server's ServiceAccount, the broker's mcp caller",
 	}
 }
 

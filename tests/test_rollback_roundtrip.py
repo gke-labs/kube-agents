@@ -1027,7 +1027,7 @@ class PortForwardTest(RoundTripTest):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(passed(result), _PASSING_ORDER)
         forwards = [call for call in state["calls"] if "port-forward" in call]
-        self.assertEqual(len(forwards), 3, forwards)
+        self.assertEqual(len(forwards), 3, "\n".join((repr(forwards), repr(state["counters"]), result.stdout, result.stderr)))
         self.assertTrue(all(call[:2] == ["--context", "gke_test_ctx"] for call in forwards))
         pids = [int(line) for line in sim.pf_pids.read_text().split()]
         time.sleep(0.5)
@@ -1037,10 +1037,10 @@ class PortForwardTest(RoundTripTest):
         # The first port-forward (the pre bus task's) accepts and drops every
         # connection. The script's retry has to be a new tunnel on the same
         # port, which only binds if the dead one was really stopped.
-        result, _, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
+        result, state, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS pre.bus-task:", result.stdout)
-        self.assertIn("pre.bus-task: attempt 1/2", result.stdout)
+        self.assertIn("pre.bus-task: attempt 1/2", result.stdout, "\n".join((repr(state["counters"]), result.stderr)))
 
 
 class FailureTest(RoundTripTest):
@@ -1305,16 +1305,18 @@ class FailureTest(RoundTripTest):
     def test_a_signal_is_a_named_failure(self) -> None:
         sim = Sim(healthy_next_state(never_ready_on="today"))
         self.addCleanup(sim.close)
-        proc = subprocess.Popen(["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600"))
+        proc = subprocess.Popen(
+            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600")
+        )
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"]):
             time.sleep(0.2)
         time.sleep(1)
         proc.send_signal(signal.SIGTERM)
-        out, _ = proc.communicate(timeout=60)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("FAIL leg1.interrupted:", out)
-        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted")
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertIn("FAIL leg1.interrupted:", out, err)
+        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted", out + err)
 
 
 _NATS = "platform-agent-a2a-nats"

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -680,6 +681,9 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 		// that lets it connect.
 		callers = append(callers, networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}})
 	}
+	// The MCP server's pod, under its flag, on the same condition as its
+	// place on allowedBrokerCallers (a2aMCPBrokerPeers).
+	callers = append(callers, a2aMCPBrokerPeers(agent)...)
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
@@ -832,25 +836,135 @@ func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volum
 // whose author believes it took effect, and the failure this guards against is
 // one nobody looks for: the manifest applies cleanly and the agent quietly gains
 // read access to the credentials the proxy exists to keep from it.
-func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent) string {
-	if agent.Spec.Deployment == nil {
-		return ""
+func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent, agentPlugins ...*agentv1alpha1.AgentPlugin) string {
+	var extraMounts []string
+	var containerMounts []string
+	var reservedVolumes []string
+	var forgeVolumeSources []string
+	var forgeEnvRefs []string
+	var forgeSecrets []string
+	if agent.Spec.Integration != nil {
+		forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
 	}
-	var forbidden []string
-	for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
-		if agentForbiddenVolumeNames[mount.Name] {
-			forbidden = append(forbidden, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+
+	if agent.Spec.Deployment != nil {
+		for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
+			if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+				extraMounts = append(extraMounts, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+			}
+		}
+		for i, c := range agent.Spec.Deployment.InitContainers {
+			for _, mount := range c.VolumeMounts {
+				if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+					containerMounts = append(containerMounts, fmt.Sprintf("spec.deployment.initContainers[%d].volumeMounts (%s: %s at %s)", i, c.Name, mount.Name, mount.MountPath))
+				}
+			}
+		}
+		for i, c := range agent.Spec.Deployment.Sidecars {
+			for _, mount := range c.VolumeMounts {
+				if agentForbiddenVolumeNames[mount.Name] || agentv1alpha1.IsForgeCredentialVolumeName(mount.Name) {
+					containerMounts = append(containerMounts, fmt.Sprintf("spec.deployment.sidecars[%d].volumeMounts (%s: %s at %s)", i, c.Name, mount.Name, mount.MountPath))
+				}
+			}
+		}
+
+		for _, volList := range []struct {
+			field   string
+			volumes []corev1.Volume
+		}{
+			{"spec.deployment.extraVolumes", agent.Spec.Deployment.ExtraVolumes},
+			{"spec.deployment.sidecarVolumes", agent.Spec.Deployment.SidecarVolumes},
+		} {
+			for i, vol := range volList.volumes {
+				if agentForbiddenVolumeNames[vol.Name] || agentv1alpha1.IsForgeCredentialVolumeName(vol.Name) {
+					reservedVolumes = append(reservedVolumes, fmt.Sprintf("%s[%d].name (%s)", volList.field, i, vol.Name))
+					continue
+				}
+				if agent.Spec.Integration != nil {
+					for _, route := range agent.Spec.Integration.ForgeCredentialRoutes(vol) {
+						forgeVolumeSources = append(forgeVolumeSources, fmt.Sprintf("%s[%d] (%s -> Secret %s)", volList.field, i, vol.Name, route.Secret))
+					}
+				}
+			}
+		}
+
+		for i, e := range agent.Spec.Deployment.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("spec.deployment.env[%d] (%s -> Secret %s)", i, e.Name, e.ValueFrom.SecretKeyRef.Name))
+			}
+		}
+		for _, cList := range []struct {
+			field      string
+			containers []corev1.Container
+		}{
+			{"spec.deployment.initContainers", agent.Spec.Deployment.InitContainers},
+			{"spec.deployment.sidecars", agent.Spec.Deployment.Sidecars},
+		} {
+			for ci, c := range cList.containers {
+				for ei, e := range c.Env {
+					if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+						forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("%s[%d].env[%d] (%s.%s -> Secret %s)", cList.field, ci, ei, c.Name, e.Name, e.ValueFrom.SecretKeyRef.Name))
+					}
+				}
+				for efi, ef := range c.EnvFrom {
+					if ef.SecretRef != nil && slices.Contains(forgeSecrets, ef.SecretRef.Name) {
+						forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("%s[%d].envFrom[%d] (%s -> Secret %s)", cList.field, ci, efi, c.Name, ef.SecretRef.Name))
+					}
+				}
+			}
 		}
 	}
-	if len(forbidden) == 0 {
-		return ""
+
+	for _, plugin := range agentPlugins {
+		if plugin == nil {
+			continue
+		}
+		for ei, e := range plugin.Spec.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				forgeEnvRefs = append(forgeEnvRefs, fmt.Sprintf("AgentPlugin %s spec.env[%d] (%s -> Secret %s)", plugin.Name, ei, e.Name, e.ValueFrom.SecretKeyRef.Name))
+			}
+		}
 	}
-	return fmt.Sprintf(
-		"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
-			"Those hold the broker's home directory, its generated kubeconfigs, its git "+
-			"workspaces and the watchers' broker token, and mounting them into the agent "+
-			"container defeats the credential isolation the proxy provides. Remove them, or "+
-			"use a volume of your own.",
-		strings.Join(forbidden, ", "),
-	)
+	var messages []string
+	if len(extraMounts) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
+				"Those hold the broker's home directory, its generated kubeconfigs, its git "+
+				"workspaces, and its forge credentials or CA bundles, and mounting them into the agent container "+
+				"defeats the credential isolation the proxy provides. Remove them, or use a volume of your own.",
+			strings.Join(extraMounts, ", "),
+		))
+	}
+	if len(containerMounts) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"User-authored container volumeMounts name volumes owned by the credential proxy: %s. "+
+				"Those volumes belong to the credential proxy alone and may not be mounted into initContainers or sidecars. "+
+				"Remove those volumeMounts, or use a volume of your own.",
+			strings.Join(containerMounts, ", "),
+		))
+	}
+	if len(reservedVolumes) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Volume declarations use names reserved by the operator for the credential proxy: %s. "+
+				"Choose a different volume name.",
+			strings.Join(reservedVolumes, ", "),
+		))
+	}
+	if len(forgeVolumeSources) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Volume declarations reference forge credential Secrets owned by the credential proxy: %s. "+
+				"Forge credentialsRef Secrets are mounted into the credential proxy alone so "+
+				"forge credentials never reach the agent Pod. Remove those volume declarations from spec.deployment.",
+			strings.Join(forgeVolumeSources, ", "),
+		))
+	}
+	if len(forgeEnvRefs) > 0 {
+		messages = append(messages, fmt.Sprintf(
+			"Environment variable declarations reference forge credential Secrets owned by the credential proxy: %s. "+
+				"Forge credentialsRef Secrets are mounted into the credential proxy alone so "+
+				"forge credentials never reach the agent Pod. Remove those Secret references from spec.deployment or the offending AgentPlugin.",
+			strings.Join(forgeEnvRefs, ", "),
+		))
+	}
+	return strings.Join(messages, " ")
 }

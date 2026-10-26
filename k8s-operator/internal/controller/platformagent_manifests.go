@@ -2457,6 +2457,10 @@ type renderOptions struct {
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
 
+// agentSlackHomeChannelEnvVar is the agent's own idea of the Slack home
+// channel, the name today's Hermes platform reads.
+const agentSlackHomeChannelEnvVar = "SLACK_HOME_CHANNEL"
+
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
 // surviving one where it already sits. Order is otherwise untouched, so on the ordinary
 // render -- no plugin naming an operator-owned variable -- the result is the input.
@@ -3083,11 +3087,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// would scaffold or archive optional specialist profiles outside the
 		// operator's AgentProfile reconciliation. The operator renders them only
 		// under next, after this merge.
+		// Drop any plugin env entry that references a forge credentialsRef
+		// Secret, matching the reconcile-time refusal in
+		// validateExtraVolumeMounts so buildPodTemplateSpec never renders a
+		// forge Secret into the platform-agent container even when called
+		// directly in unit tests.
+		var forgeSecrets []string
+		if agent.Spec.Integration != nil {
+			forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
+		}
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar && e.Name != enabledProfilesEnvVar {
-				kept = append(kept, e)
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar {
+				continue
 			}
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				continue
+			}
+			kept = append(kept, e)
 		}
 		extEnvs = kept
 		if len(extEnvs) > 0 {
@@ -3314,7 +3331,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: "SLACK_HOME_CHANNEL", Value: a2aSlackHomeChannel(agent)})
+		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first
@@ -4493,6 +4510,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
 		)
 	}
+	// The MCP server's audience, under its flag on a mode-next install only
+	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
+	envVars = append(envVars, a2aMCPBrokerEnv(agent)...)
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
@@ -4671,6 +4691,16 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// One that could set the session callers could unbind the session
 		// ServiceAccount from its audience, or bind another to it.
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		// One that could set the MCP audience would decide who holds the mcp
+		// role. The MCP pod's own pair is not merged with spec.deployment.env
+		// at all; reserved here as well so no broker-side container can be
+		// handed a name the MCP client reads.
+		credentialProxyMCPAudienceEnvVar,
+		// And one that could set the MCP callers could unbind the MCP
+		// ServiceAccount from its audience, or bind another to it.
+		credentialProxyMCPCallersEnvVar,
+		a2aMCPBrokerURLEnvVar,
+		a2aMCPBrokerTokenFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
@@ -4946,6 +4976,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// day, and a value that does not parse means off, so it bounds a
 		// count of chat messages and triage turns and reaches nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
+
+		// "true" has an event triage also file a card that opens the
+		// report's recommended fix as a GitOps pull request, without waiting
+		// for a human `apply` (INCIDENT_TRIAGE_OPEN_PULL_REQUEST in
+		// session_kv_server.py). Any other value, unset included, is off. It
+		// changes which cards the front door files and nothing else: the pull
+		// request still goes through submit-suggestion and a human merges it.
+		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

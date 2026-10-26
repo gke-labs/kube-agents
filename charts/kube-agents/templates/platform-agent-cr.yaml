@@ -777,6 +777,9 @@ spec:
   {{- if and (has "gitlab" (splitList "," $providers)) (not (has "gitlab" $enum)) }}
   {{- fail "platformAgent.integration.forges declares a gitlab forge, but the installed PlatformAgent CRD does not accept provider gitlab, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- if and (has "gitea" (splitList "," $providers)) (not (has "gitea" $enum)) }}
+  {{- fail "platformAgent.integration.forges declares a gitea forge, but the installed PlatformAgent CRD does not accept provider gitea, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- /* The same for caBundleRef: a CRD that prunes it leaves the forge's certificate untrusted, with nothing to say why. */}}
   {{- $caBundled := false }}
   {{- range $forges }}
@@ -820,6 +823,12 @@ spec:
         provider: {{ .provider | default "github" | quote }}
         {{- with .host }}
         host: {{ . | quote }}
+        {{- end }}
+        {{- with .scheme }}
+        scheme: {{ . | quote }}
+        {{- end }}
+        {{- with .port }}
+        port: {{ . | int }}
         {{- end }}
         {{- with .namespace }}
         namespace: {{ . | quote }}
@@ -897,6 +906,21 @@ spec:
       {{- end }}
       {{- with $integ.slack.homeChannelName }}
       homeChannelName: {{ . | quote }}
+      {{- end }}
+      {{- with $integ.slack.homeChannelPolicy }}
+      {{- $policyCRD := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $policyCRD }}
+      {{- $slackProps := dict }}
+      {{- range $policyCRD.spec.versions }}
+      {{- if eq .name "v1alpha1" }}
+      {{- $slackProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "integration" "properties" "slack" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $slackProps "homeChannelPolicy") }}
+      {{- fail "platformAgent.integration.slack.homeChannelPolicy needs a PlatformAgent CRD that has spec.integration.slack.homeChannelPolicy, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      homeChannelPolicy: {{ . | quote }}
       {{- end }}
     {{- end }}
     {{- if $integ.teams.enabled }}

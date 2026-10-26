@@ -320,7 +320,14 @@ risks, reasons it could not decide, and notes, and declares whether it can block
 blocker joins the verdict, a risk never does, and the table prints them under `other blockers`
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
 note column does. The rules, one per catalogue entry or incident scenario, with their reads and
-actions: [`references/readiness-rules.md`](references/readiness-rules.md).
+actions: [`references/readiness-rules.md`](references/readiness-rules.md). After them runs one plan-level rule, `rollout-sequence-precheck`
+(no catalogue entry, never a blocker): for a fleet member it lists the fleet host project's
+RolloutSequences once per run, with
+`gcloud container fleet rolloutsequences list --project <host> --format=json`, filed on the host's
+first member in the listing (the host's other members carry a note saying where, a non-member a
+note that no sequence can carry it), and an existing sequence is
+a risk naming its stages, since the platform allows one sequence per host project and refuses a
+plan that creates a second; the clause after the cell's last `; ` is the one action.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read
