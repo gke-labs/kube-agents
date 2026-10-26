@@ -344,6 +344,31 @@ def test_a_router_scope_result_pattern_is_worker_blind(write_task):
     assert spec.negated_trace_blind_checks == frozenset()
 
 
+def test_a_tool_called_over_harness_entries_is_never_transport_blind(write_task):
+    """The harness writes these entries itself; a lossy door trace says
+    nothing about them, so a stopped ask's objectives always grade."""
+    path = write_task(
+        "harness-entries",
+        {
+            "verification_spec": [
+                {
+                    "name": "stop-sent",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["harness_stop_sent"], "require_success": True},
+                },
+                {
+                    "name": "mixed",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["harness_stop_sent", "kanban_create"]},
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.trace_blind_checks == {"mixed"}
+    assert spec.worker_blind_checks == frozenset()
+
+
 def test_a_task_with_no_such_check_has_an_empty_set(write_task):
     path = write_task(
         "phrases",
@@ -433,7 +458,7 @@ def test_every_shipped_blind_check_is_named(path):
     import re
 
     import yaml
-    from kube_agents_bench.cases import TRANSPORT_BLIND_CHECK_TYPES
+    from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, TRANSPORT_BLIND_CHECK_TYPES
 
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -454,7 +479,28 @@ def test_every_shipped_blind_check_is_named(path):
     assert unnamed == [], f"{path}: transport-blind entries without a name"
     # Compound node types are not leaves; only leaf types decide.
     compounds = {"sequence", "parallel", "all", "any", "none"}
+    # Leaf by leaf, as the loader decides: an entry is all-blind when every
+    # leaf is of a blind type and none is a check naming only entries the
+    # harness writes, which is graded on every record.
+    def leaves(node):
+        if isinstance(node, list):
+            return [leaf for item in node for leaf in leaves(item)]
+        if not isinstance(node, dict):
+            return []
+        if node.get("type") in compounds:
+            return [leaf for value in node.values() for leaf in leaves(value)]
+        return [node] if "type" in node else []
+
+    def harness_only(leaf):
+        named = leaf.get("tool_names") or []
+        return bool(named) and set(named) <= HARNESS_WRITTEN_ENTRIES
+
     all_blind = {
-        str(e["name"]) for e in declared if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES
+        str(e["name"])
+        for e in declared
+        if all(
+            leaf.get("type") in TRANSPORT_BLIND_CHECK_TYPES and not harness_only(leaf)
+            for leaf in leaves(e.get("check"))
+        )
     }
     assert load_case(path).transport_blind_checks == all_blind

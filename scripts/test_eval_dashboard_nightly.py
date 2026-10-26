@@ -855,6 +855,40 @@ class ThreePartNightTest(unittest.TestCase):
         last = nightly.night_reports(data)[0]
         self.assertEqual((last["missing"], last["missing_parts"]), (["case-c"], []))
 
+    def test_verdict_withheld_by_names_the_absent_main_half(self):
+        """The night document decides once whether it gives a newly-failing
+        verdict: ``verdict_withheld_by`` names the main half that is
+        missing or still running, and the digest and the page both read it."""
+        self.assertIsNone(nightly.night_reports(three_part_nights())[0]["verdict_withheld_by"], "a complete night")
+        # Wednesday: main and writers, main-b missing, case-c newly failing.
+        data = three_part_nights()
+        data["runs"].append(night("3000000000000000003", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00",
+                                  [task("case-a", "pass", "pass", "pass"), task("case-b", "pass", "pass", "pass"), task("case-c", "fail", "fail", "fail")]))
+        data["runs"].append(writers("3000000000000000013", "2026-09-09T00:00:05+00:00", "2026-09-09T02:10:05+00:00",
+                                    [task("pr-a", "pass", "pass", "pass"), task("pr-b", "pass", "pass", "pass")]))
+        last = nightly.night_reports(data)[0]
+        self.assertEqual((last["missing_parts"], last["newly_failing"], last["verdict_withheld_by"]), (["main-b"], ["case-c"], "main-b"))
+        self.assertNotIn("newly failing", self.line(data, DIGEST_AT + datetime.timedelta(days=1)))
+        # main-b still in flight on that date.
+        data["pending_builds"] = [{"build_id": "3000000000000000023", "first_seen": "2026-09-09T00:05:00+00:00", "tier": "nightly",
+                                   "log_url": f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/3000000000000000023"}]
+        last = nightly.night_reports(data, running=nightly.running_nights(data, None))[0]
+        self.assertEqual((last["running_parts"], last["verdict_withheld_by"]), (["main-b"], "main-b"))
+        # The main part missing: main-b and writers alone.
+        data = three_part_nights()
+        data["runs"] = [r for r in data["runs"] if r["build_id"] != NIGHT_2]
+        last = nightly.night_reports(data)[0]
+        self.assertEqual((last["missing_parts"], last["verdict_withheld_by"]), (["main"], "main"))
+        # A pre-split night of the main job alone, a main and writers night
+        # before any main-b build, and a main re-run that borrows the date's
+        # main-b part all give their verdict.
+        self.assertIsNone(nightly.night_reports(two_nights())[0]["verdict_withheld_by"])
+        self.assertIsNone(nightly.night_reports(split_nights())[0]["verdict_withheld_by"])
+        data = three_part_nights()
+        data["runs"].append(night(RERUN_MAIN, "2026-09-08T09:00:00+00:00", "2026-09-08T15:40:00+00:00",
+                                  [task(name, "pass", "pass", "pass") for name in ("case-a", "case-b", "case-c")], result="SUCCESS"))
+        self.assertIsNone(nightly.night_reports(data)[0]["verdict_withheld_by"])
+
     def test_a_main_b_part_cut_short_truncates_the_night(self):
         data = three_part_nights()
         run_of(data, MAIN_B_2).update(result="FAILURE", eval_verdict=None, duration_s=9000, tasks=MAIN_B_SECOND["tasks"][:1])
@@ -1220,6 +1254,36 @@ class ThreePartNightPageTest(unittest.TestCase):
         brief = dom_text(out / "index.html")
         self.assertIn("truncated: 6 of 7 cases recorded · main-b part cut short after 2h 30m.", brief)
         self.assertNotIn("truncated after 6h 40m", brief)
+
+    def test_a_night_missing_its_main_b_part_gives_no_newly_failing_verdict(self):
+        """Wednesday: main and writers, main-b missing, case-c newly failing
+        on the main part. The page and the Brief withhold the verdict, as
+        the digest does (verdict_withheld_by)."""
+        data = load_fixture()
+        data["generated_at"] = "2026-09-09T14:30:00+00:00"
+        data["cases"] = copy.deepcopy(THREE_PART_CASES)
+        data["runs"] += copy.deepcopy([FIRST, SECOND, WRITERS_SECOND, MAIN_B_SECOND])
+        data["runs"].append(night("3000000000000000003", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00",
+                                  [task("case-a", "pass", "pass", "pass"), task("case-b", "pass", "pass", "pass"), task("case-c", "fail", "fail", "fail")]))
+        data["runs"].append(writers("3000000000000000013", "2026-09-09T00:00:05+00:00", "2026-09-09T02:10:05+00:00",
+                                    [task("pr-a", "pass", "pass", "pass"), task("pr-b", "pass", "pass", "pass")]))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={}), \
+                unittest.mock.patch.object(render, "recent_merges", return_value=None):
+            out = render_to(tmp.name, data, health=health_doc("GREEN"))
+        page = dom_text(out / "nightly.html")
+        self.assertIn("No verdict on what is newly failing: the main-b part of this night is missing", page)
+        self.assertNotIn("Nothing newly failing", page)
+        self.assertNotIn("Newly failing</b>", page)
+        self.assertNotIn('class="newly"', page, "no row badged newly failing")
+        self.assertIn("main-b part missing", page)
+        self.assertIn('<div class="k">Newly failing</div><div class="v">—</div>', page)
+        brief = dom_text(out / "index.html")
+        self.assertIn("main-b part missing", brief)
+        self.assertNotIn("newly failing:", brief)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -386,7 +386,11 @@ gh workflow run release-publish.yml --repo gke-labs/kube-agents \
 
 A dispatch runs with `schedule_gate=bypass` unless told otherwise, so it publishes without the
 scheduled gate's verdict; `verify_release_eligibility.sh` still enforces staging promotion in the
-publish job. `dry-run` reports the verdict in the job summary and publishes nothing.
+publish job. `dry-run` reports the verdict in the job summary and publishes nothing. After
+`Publish GitHub Release` succeeds, `release-publish.yml` dispatches `docs-deploy.yml` on `main`
+(warning rather than failing the completed release if the dispatch call errors) so the GitHub Pages
+installer scripts stage the numerically highest published `X.Y.Z` GA release (see
+[`docs/site/README.md`](../../docs/site/README.md)).
 
 ### Emergency hotfix
 
@@ -520,8 +524,8 @@ line; a patch is validated by the RC pipeline and released by hand.
 4. **Check.** The tag `X.Y.Z` on a stamped commit whose parent is the line's previous head,
    `release/<X.Y>` fast-forwarded to it, the images promoted from that parent's SHA tags, and
    release notes starting at the line's previous release. A patch below the newest minor is
-   published without GitHub's `latest` mark, so `releases/latest` keeps pointing at the newest
-   version.
+   published without GitHub's `latest` mark, so `releases/latest` — and the GitHub Pages installer
+   scripts staged by `docs-deploy.yml` — keep pointing at the newest minor.
 
 If the release job fails with "Release line 'release/<X.Y>' already exists ... but points to
 commit", or earlier with "Release line X.Y resolves to its own head ..., not to ...", the line

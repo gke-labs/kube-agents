@@ -51,6 +51,9 @@ readonly NIGHTLY_HALF_CKSUM_BIT=2
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# Its mirror (#3263): the cases every other lane does not run, because their
+# premise needs the inject door (a second message on the same conversation).
+readonly EVAL_API_LANE_EXCLUSIONS_FILE="eval/api-lane-exclusions.txt"
 # A sixth, applied on every lane despite its name (#2079, #2611): the
 # safeguards every case carries beside its own -- today the one that fails a
 # repetition on a GitHub write it made that the case did not request.
@@ -2147,8 +2150,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14, demoted back here 2026-10-17, #3120; the
-# presubmit file's last section).
+# its roster line 2026-10-14, was demoted back here 2026-10-17, #3120, and
+# returned to the roster 2026-10-26; the presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2325,6 +2328,37 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
 fi
+# The mirror (#3263): hack/eval/api-lane-exclusions.txt names the cases only
+# the inject door can carry (a stop sent as the conversation's next message,
+# bench/kube_agents_bench/stop_hook.py). Read and checked on every lane like
+# the list above; applied on every transport but inject. None of them is on
+# the blocking roster (scripts/test_eval_rosters.py), so BOOTSTRAP_ADMITTED
+# needs no drop list for them.
+API_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_API_LANE_EXCLUSIONS_FILE}"
+API_LANE_EXCLUDED="$(roster_entries "${API_LANE_EXCLUSIONS_FILE}")"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${API_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the api lane." >&2
+    exit 1
+  fi
+done <<< "${API_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_EXCLUDED}" ]; then
+  API_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: ${NAME} leaves the matrix -- it runs on the inject lane only; the reason is in ${EVAL_API_LANE_EXCLUSIONS_FILE}"
+    else
+      API_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${API_LANE_KEPT[@]+"${API_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the api lane (${EVAL_API_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
+fi
 
 # ─── The lanes' safeguards (#2079) ───────────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
@@ -2411,6 +2445,27 @@ INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { 
 # in the last seconds of the unit before must be older than it.
 WRITER_LAUNCH_PAUSE="${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
 echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries the lane safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit, each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
+# The stopped asks in the matrix (a prompt opening with the harness's stop
+# directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
+# carries one) run in the same second phase although they request no pull
+# request: a stop that fails leaves its card to open a pull request mid-run,
+# which would land in the write safeguard's window of every case running
+# beside it. Alone in the second phase, a failed stop's write lands in no
+# other case's window.
+# Read from the prompt, as the harness reads it, not from
+# api-lane-exclusions.txt, which may come to list door-only cases of other
+# kinds.
+STOPPED_ASK_CASES=""
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+    exit 1
+  fi
+fi
+if [ -n "${STOPPED_ASK_CASES}" ]; then
+  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
+fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
 # above made one for this case, the file under bench/tasks/ otherwise. Its
@@ -2507,7 +2562,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -2711,7 +2766,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # launches early and was never the last unit in 385 recorded runs). Only a
 # repetition at its 1929s maximum could be the last unit, by minutes. The
 # first runs of the fourteen-case matrix measure it, and until they have,
-# this is the projection. No Prow deadline change.
+# this is the projection. No Prow deadline change. (That was before #2260
+# moved the cases that request a pull request into a serial second phase;
+# since its return to the roster on 2026-10-26 it runs there, after every
+# other unit: unit_cost_hint has the cost.)
 #
 # Setting this to 1 is how the refactor gets a run directly comparable to the
 # old one-run-per-task gate, and it is a legitimate thing to do by hand on a
@@ -2883,7 +2941,8 @@ fi
 
 # The GitLab lane's list may hold no roster case (it held none from
 # pdb-remediation-pr's demotion of 2026-10-17, #3120, until
-# vcs-spent-branch-reuse's roster line of 2026-10-23), which empties the export by design, like a nightly part: said
+# vcs-spent-branch-reuse's roster line of 2026-10-23; pdb-remediation-pr's
+# returned 2026-10-26), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3113,17 +3172,20 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # Nightly-only since 2026-10-17 (demoted on #3120); on the roster 2026-10-14
-    # to then (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
+    # On the roster again since 2026-10-26, after #3145; nightly-only
+    # 2026-10-17 to then (demoted on #3120); on the roster 2026-10-14 to
+    # 2026-10-17 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
     # to 2026-09-28. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
     # August); median of the September run, kept although the four graded
     # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
-    # under pull_request_opened says otherwise. While in the presubmit it was
-    # the largest hint, so it launched first in each repetition round; its
-    # three repetitions serialize on the task lock, ~62min at the hint and
-    # ~96min at the measured maximum.
+    # under pull_request_opened says otherwise. It requests a pull request, so
+    # since #2260 it runs in the second phase (unit_phase), one unit at a time
+    # after every other unit, and the hint orders it only among that phase's
+    # units (ahead of vcs-spent-branch-reuse's 1000 in each repetition round,
+    # which changes no total: the phase is serial). The writers nightlies
+    # since #3145 measured 142-265s a repetition.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -3173,6 +3235,12 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Next-lane nightly only (api-lane-exclusions.txt). The opening turn files
+    # a card, then the harness sends `stop` and waits out the prompt's
+    # observe=900 window (stop_hook.py), so a repetition is never under 900s;
+    # priced in that band so a deadline cut does not take it first.
+    # Unmeasured until its first nights.
+    chat-stop-halts-delegated-remediation) echo 1100 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -3828,7 +3896,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
@@ -3979,8 +4047,8 @@ scheduled_audits pause "fan-out"
 # phase's last unit -- must be older than that before the next window can
 # open. The cost is one drain of the lanes at the phase boundary
 # and the settle plus the serial run of the requesting units (on the
-# presubmit tier, one case's repetitions, which the task lock already ran one
-# at a time, so three settles); the order inside each phase is unchanged.
+# presubmit tier, the requesting cases' repetitions, which launch_units runs
+# one at a time, one settle each); the order inside each phase is unchanged.
 # The ordering assumes a unit's writes land before the unit ends. Under the
 # bridge's api executor the harness's delegation wait holds the unit until
 # the cards the case filed are terminal, so their workers' pull requests
@@ -3990,8 +4058,8 @@ scheduled_audits pause "fan-out"
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"): unattributed there in the first phase, and charged to the unit
 # in the second, whose window is exclusive.
-unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
-  case ",${INJECT_LANE_REQUESTING:-}," in
+unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -4047,7 +4115,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=$
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi

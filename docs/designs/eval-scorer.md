@@ -152,7 +152,7 @@ can carry the delegated workers' tagged entries and token counts. The scorer sti
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
-door showed no trace or a trace that lost calls: the first matrix run through the door (#2007, 2026-09-25) collapsed
+door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`, a stopped ask's) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
