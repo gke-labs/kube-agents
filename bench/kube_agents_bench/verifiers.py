@@ -3591,10 +3591,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             if not is_clipped:
                 continue
             argv_entries = _shell_argvs_with_exit_propagation(cmd)
-            if not any(
-                _argv_runs(argv, run)
-                for run in self.required_runs
-                for argv, _ in argv_entries
+            if any(
+                not any(_argv_runs(argv, run) for argv, _ in argv_entries)
+                for run in uncredited_succeeded
             ):
                 clipped_unmatched = True
                 break

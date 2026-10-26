@@ -9533,6 +9533,15 @@ def test_worker_commands_required_run_succeeded_flag():
     res_succeeded_false = v_succeeded_false.verify(5.0)
     assert res_succeeded_false.status == "pass"
 
+    # Two succeeded: true runs A and B: when a clipped call carries A in its head and B
+    # sits past the cut, B is not seen but folds into capture gaps rather than failing (#3335).
+    run_b = WorkerRun(script="audit_report.py", flags=["--summary"], succeeded=True)
+    v_two_runs = WorkerCommandsVerifier(type="worker_commands", required_runs=[WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True), run_b])
+    transcript.set("ok", traj_arg_clipped, worker_commands=[])
+    res_two_runs = v_two_runs.verify(5.0)
+    assert res_two_runs.status == "error"
+    assert "the pod clipped a worker terminal call's arguments" in res_two_runs.reason
+
     # Trajectory entry where the command runs alone on its line (bare, with redirects, env vars,
     # non-detaching wrappers, transparent subshell parens, quotes, or lone assignments) IS credited when the call exited 0.
     for valid_cmd in [
