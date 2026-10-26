@@ -445,7 +445,7 @@ declares a domain.
 There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
 the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
 one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
-fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist, as a record with `since`, `issue` and an `expires` date (the comment above `allowlist:` describes the fields).
 
 ## Every case declares a verification spec
 
