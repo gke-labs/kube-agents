@@ -193,6 +193,38 @@ TRANSPORT_API = "api"
 TRANSPORT_INJECT = "inject"
 _TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
 
+# Worker tools that do not count as substantive action (protocol reads).
+_WORKER_NON_ACTION_TOOLS = frozenset({
+    "kanban_show",
+    "kanban_heartbeat",
+})
+
+# Sanctioned front-door capabilities on the chat / delegation profile
+# (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
+# substantive worker action or final answer generation: board management,
+# roster discovery, memory queries, and transport envelopes.
+_FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
+    DELEGATION_TOOL,
+    STATUS_TOOL,
+    "kanban_list",
+    "kanban_comment",
+    "kanban_unblock",
+    "list_agents",
+    "mcp__router__list_agents",
+    "memory",
+    "memory_recall",
+    "memory_retain",
+    "memory_reflect",
+    inject.EVENT_ENTRY_POST,
+    inject.EVENT_ENTRY_EDIT,
+    inject.EVENT_ENTRY_TASK,
+    inject.EVENT_ENTRY_STATUS,
+    inject.EVENT_ENTRY_ACTIVITY,
+})
+
+# Character ceiling for card detail quoted in infrastructure failure errors.
+_MAX_CARD_MESSAGE_LOG_CHARS = 200
+
 # The inject transport's port-forward target: the Service the operator renders
 # for the gateway's inject backend under its eval flag, listening on 8099. The
 # local side defaults well away from it so a gateway a developer is already
@@ -3265,45 +3297,18 @@ class KubeAgentsHarness(AgentHarness):
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
-        worker_non_action = {
-            "kanban_show",
-            "kanban_heartbeat",
-        }
         worker_acted = (
             any(
                 isinstance(e, dict)
-                and e.get("name") not in worker_non_action
+                and e.get("name") not in _WORKER_NON_ACTION_TOOLS
                 for e in (captured.entries if captured else [])
             )
             or bool(result.metadata.get("worker_commands"))
         )
-        # Sanctioned front-door capabilities on the chat / delegation profile
-        # (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
-        # substantive worker action or final answer generation: board management,
-        # roster discovery, memory queries, and transport envelopes.
-        non_action = {
-            DELEGATION_TOOL,
-            STATUS_TOOL,
-            "kanban_list",
-            "kanban_show",
-            "kanban_comment",
-            "kanban_unblock",
-            "list_agents",
-            "mcp__router__list_agents",
-            "memory",
-            "memory_recall",
-            "memory_retain",
-            "memory_reflect",
-            inject.EVENT_ENTRY_POST,
-            inject.EVENT_ENTRY_EDIT,
-            inject.EVENT_ENTRY_TASK,
-            inject.EVENT_ENTRY_STATUS,
-            inject.EVENT_ENTRY_ACTIVITY,
-        }
         front_door_acted = any(
             isinstance(e, dict)
             and not e.get("agent")
-            and e.get("name") not in non_action
+            and e.get("name") not in _FRONT_DOOR_NON_ACTION_TOOLS
             for e in result.trajectory
         )
         agent_acted = worker_acted or front_door_acted
@@ -3357,7 +3362,10 @@ class KubeAgentsHarness(AgentHarness):
                     reason = _extract_infra_failure_reason(line)
                     if reason:
                         infra_reason = reason
-                        infra_detail = f"card on board recorded {reason}: {line[:200]}"
+                        infra_detail = (
+                            f"card on board recorded {reason}: "
+                            f"{line[:_MAX_CARD_MESSAGE_LOG_CHARS]}"
+                        )
                         break
                 if infra_reason:
                     break
