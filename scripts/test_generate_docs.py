@@ -1,4 +1,4 @@
-"""The cron-job example region, and a region spliced into more than one page.
+"""The cron-job example region, a region spliced into more than one page, and the CRD field pages.
 
 ``generate_docs.py`` renders one Platform Agent roster entry as the fenced JSON
 three site pages show as the job schema's worked example. The three used to be
@@ -14,8 +14,11 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -284,6 +287,93 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertIn(
             "[`Odd-Name_SOP.md`](agents/platform/governance/Odd-Name_SOP.md)", body
         )
+
+
+class CRDFieldBlocksTest(unittest.TestCase):
+    """The three CRD field pages are registered, rendered as tables, and selectable."""
+
+    def test_each_kind_has_a_block_on_its_own_page(self):
+        for kind, page in generate_docs.CRD_KINDS.items():
+            block_id = f"{generate_docs.CRD_BLOCK_PREFIX}{kind.lower()}"
+            paths, generator = generate_docs.BLOCKS[block_id]
+            self.assertEqual(paths, (page,))
+            self.assertEqual(generator.func, generate_docs.gen_crd_fields)
+            self.assertEqual(generator.args, (kind,))
+            self.assertTrue(page.exists(), page)
+
+    def test_select_blocks_keeps_registry_order_and_rejects_unknown_ids(self):
+        blocks = {"a": 1, "b": 2, "c": 3}
+        self.assertEqual(generate_docs.select_blocks([], blocks), blocks)
+        self.assertEqual(list(generate_docs.select_blocks(["c", "a"], blocks)), ["a", "c"])
+        with self.assertRaises(SystemExit) as caught:
+            generate_docs.select_blocks(["a", "nope"], blocks)
+        self.assertIn("nope", str(caught.exception))
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_the_page_body_is_a_spec_and_a_status_table(self):
+        body = generate_docs.gen_crd_fields("AgentPlugin")
+        self.assertTrue(body.startswith("## Spec\n\n" + "\n".join(generate_docs.CRD_TABLE_HEADER)))
+        self.assertIn("\n## Status\n", body)
+        self.assertIn("| `agentRef` | `string` | yes |  |  | ", body)
+        self.assertIn("one of `Always`, `Never`, `IfNotPresent`", body)
+        self.assertIn("| `env` | `[]corev1.EnvVar` |", body)
+        self.assertNotIn("| `env[]", body)
+
+    def test_a_row_is_rendered_from_the_model(self):
+        with mock.patch.object(
+            generate_docs,
+            "crd_model",
+            return_value={
+                "Widget": {
+                    "spec": [
+                        {
+                            "path": "parts[].name",
+                            "name": "name",
+                            "type": "string",
+                            "kind": "scalar",
+                            "external": False,
+                            "required": True,
+                            "default": "a|b",
+                            "constraints": [
+                                {"name": "MaxLength", "value": "63"},
+                                {"name": "items:Pattern", "value": "^(a|b)$"},
+                                {"name": "Enum", "value": "x;y"},
+                            ],
+                            "description": "Name of the <part>, see `kind: <k>`.",
+                        }
+                    ],
+                    "status": [],
+                }
+            },
+        ):
+            body = generate_docs.gen_crd_fields("Widget")
+        self.assertIn(
+            "| `parts[].name` | `string` | yes | `a\\|b` | max length `63`; items pattern `^(a\\|b)$`; "
+            "one of `x`, `y` | Name of the &lt;part&gt;, see `kind: <k>`. |",
+            body,
+        )
+        self.assertTrue(body.endswith("## Status\n\n" + generate_docs.CRD_EMPTY_TREE))
+
+    def test_escape_cell_leaves_code_spans_alone(self):
+        self.assertEqual(generate_docs.escape_cell("a <b> `<c>` d|e `f|g`"), "a &lt;b&gt; `<c>` d\\|e `f\\|g`")
+
+    def test_an_edited_region_makes_check_exit_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "page.md"
+            page.write_text(
+                "<!-- BEGIN GENERATED: example -->\n"
+                "edited by hand\n"
+                "<!-- END GENERATED: example -->\n",
+                encoding="utf-8",
+            )
+            blocks = {"example": ((page,), lambda: "FRESH")}
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(generate_docs.main(["--check"], blocks), 1)
+                self.assertIn("edited by hand", page.read_text(encoding="utf-8"))
+                self.assertEqual(generate_docs.main([], blocks), 0)
+                self.assertIn("FRESH", page.read_text(encoding="utf-8"))
+                self.assertEqual(generate_docs.main(["--check"], blocks), 0)
+                self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
 
 
 if __name__ == "__main__":

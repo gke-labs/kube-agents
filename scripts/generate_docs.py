@@ -26,19 +26,29 @@ Usage::
 
     python3 scripts/generate_docs.py            # rewrite the generated targets
     python3 scripts/generate_docs.py --check    # exit 1 if anything is stale
+    python3 scripts/generate_docs.py crd-fields-agentplugin   # one block only
 
 ``--check`` is what CI runs: if regenerating would change a file, the committed
-documentation no longer matches its source.
+documentation no longer matches its source. Naming blocks restricts a run to
+those regions; ``make -C k8s-operator manifests`` uses that to refresh the CRD
+field pages beside the CRD YAML.
 
 Standard library only, deliberately -- this must run in CI and in a bare clone
-without installing anything.
+without installing anything. The one tool it calls out to is ``go``: the CRD
+field pages are read from the operator's Go API types by
+``scripts/gen_crd_docs.go``, itself standard library and run with the
+installed toolchain.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -84,6 +94,51 @@ AUDIT_SKILL = "fleet-audit"
 PLATFORM_HOME = "agents/platform"
 
 GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
+
+# The CRD field reference pages, one per kind, read from the operator's API
+# types by the Go program beside this script. GOTOOLCHAIN=local runs the
+# installed toolchain whatever a go.mod might ask for: the program is standard
+# library on an API every supported Go has, so no download starts in CI.
+CRD_API_DIR = REPO / "k8s-operator/api/v1alpha1"
+CRD_DOCS_GENERATOR = REPO / "scripts/gen_crd_docs.go"
+GO_BINARY = "go"
+GO_RUN_ENV = {"GOTOOLCHAIN": "local"}
+OPERATOR_DOCS_DIR = REPO / "docs/site/src/content/docs/operator"
+CRD_KINDS: dict[str, Path] = {
+    "PlatformAgent": OPERATOR_DOCS_DIR / "platformagent-fields.md",
+    "AgentProfile": OPERATOR_DOCS_DIR / "agentprofile-fields.md",
+    "AgentPlugin": OPERATOR_DOCS_DIR / "agentplugin-fields.md",
+}
+CRD_BLOCK_PREFIX = "crd-fields-"
+# The two trees each page carries, with the heading each is rendered under.
+CRD_TREES = (("spec", "Spec"), ("status", "Status"))
+CRD_TABLE_HEADER = (
+    "| Field | Type | Required | Default | Constraints | Description |",
+    "| ----- | ---- | -------- | ------- | ----------- | ----------- |",
+)
+CRD_EMPTY_TREE = "No fields."
+# How a validation marker reads in the Constraints column. A marker on the
+# items of a list (`items:Pattern`) is labelled through the same table with
+# an `items:` prefix; a marker not listed here is shown as its own name.
+CONSTRAINT_LABELS = {
+    "Enum": "one of",
+    "Minimum": "min",
+    "Maximum": "max",
+    "MinLength": "min length",
+    "MaxLength": "max length",
+    "MinItems": "min items",
+    "MaxItems": "max items",
+    "MinProperties": "min properties",
+    "MaxProperties": "max properties",
+    "Pattern": "pattern",
+    "MultipleOf": "multiple of",
+    "Format": "format",
+}
+CONSTRAINT_ITEMS_PREFIX = "items:"
+CONSTRAINT_ITEMS_LABEL = "items"
+# controller-gen separates enum members with `;`.
+ENUM_SEPARATOR = ";"
+CODE_SPAN_RE = re.compile(r"`[^`]*`")
 
 # Editorial grouping for the Platform Agent skill catalogue. Skills missing from
 # this map are emitted under "Other" rather than dropped, so a new skill shows up
@@ -218,6 +273,24 @@ def md_escape(text: str) -> str:
         .replace("\n", " ")
         .strip()
     )
+
+
+def escape_cell(text: str) -> str:
+    """Make prose with inline code safe for a Markdown table cell on a `.md` page.
+
+    Pipes are escaped everywhere, since GFM reads one inside a code span as a
+    column break too. Angle brackets are escaped only outside code spans: a
+    bare `<name>` in prose is an HTML tag to the renderer and vanishes, while
+    inside a code span `&lt;` would show as those four characters.
+    """
+    parts = CODE_SPAN_RE.split(text)
+    spans = CODE_SPAN_RE.findall(text)
+    out: list[str] = []
+    for index, part in enumerate(parts):
+        out.append(part.replace("<", "&lt;").replace(">", "&gt;"))
+        if index < len(spans):
+            out.append(spans[index])
+    return "".join(out).replace("|", "\\|").replace("\n", " ").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +581,94 @@ def gen_container_images() -> str:
     return "\n".join(out).rstrip()
 
 
+def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
+    """Run ``gen_crd_docs.go`` over ``api_dir`` and return its JSON model.
+
+    A missing ``go`` and a generator that refuses the package are both hard
+    failures with the reason: a page silently rendered from nothing would
+    pass ``--check`` while saying nothing.
+    """
+    if shutil.which(GO_BINARY) is None:
+        raise SystemExit(
+            f"{CRD_DOCS_GENERATOR.relative_to(REPO)}: the CRD field pages are read "
+            f"from the Go API types, which needs a Go toolchain; `{GO_BINARY}` is "
+            "not on PATH."
+        )
+    command = [
+        GO_BINARY,
+        "run",
+        str(CRD_DOCS_GENERATOR),
+        "-dir",
+        str(api_dir),
+        "-kinds",
+        ",".join(kinds),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=REPO,
+        env={**os.environ, **GO_RUN_ENV},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"{CRD_DOCS_GENERATOR.relative_to(REPO)} failed "
+            f"(exit {result.returncode}):\n{result.stderr.strip()}"
+        )
+    return json.loads(result.stdout)
+
+
+@functools.lru_cache(maxsize=1)
+def crd_model() -> dict[str, dict]:
+    """The committed API package's model, by kind, read once per run."""
+    model = run_crd_generator(CRD_API_DIR, tuple(CRD_KINDS))
+    return {entry["kind"]: entry for entry in model["kinds"]}
+
+
+def render_constraint(constraint: dict[str, str]) -> str:
+    name, value = constraint["name"], constraint["value"]
+    prefix = ""
+    if name.startswith(CONSTRAINT_ITEMS_PREFIX):
+        prefix = f"{CONSTRAINT_ITEMS_LABEL} "
+        name = name[len(CONSTRAINT_ITEMS_PREFIX) :]
+    label = CONSTRAINT_LABELS.get(name, name)
+    if name == "Enum":
+        shown = ", ".join(f"`{member}`" for member in value.split(ENUM_SEPARATOR))
+    else:
+        shown = f"`{value}`"
+    return f"{prefix}{label} {shown}"
+
+
+def render_crd_row(field: dict) -> str:
+    constraints = "; ".join(render_constraint(c) for c in field["constraints"])
+    default = f"`{field['default']}`" if field["default"] else ""
+    return "| `{path}` | `{type}` | {required} | {default} | {constraints} | {description} |".format(
+        path=field["path"],
+        type=field["type"],
+        required="yes" if field["required"] else "no",
+        default=escape_cell(default),
+        constraints=escape_cell(constraints),
+        description=escape_cell(field["description"]),
+    )
+
+
+def gen_crd_fields(kind: str) -> str:
+    """Render one kind's spec and status trees as two tables."""
+    entry = crd_model()[kind]
+    out: list[str] = []
+    for key, heading in CRD_TREES:
+        out.append(f"## {heading}\n")
+        fields = entry[key]
+        if not fields:
+            out.append(CRD_EMPTY_TREE)
+        else:
+            out.extend(CRD_TABLE_HEADER)
+            out.extend(render_crd_row(field) for field in fields)
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
 # Each region names every file it is spliced into. One generator, one body,
 # however many pages carry it: the job example is the same entry on three
 # pages, and rendering it once is what keeps the three from disagreeing.
@@ -520,6 +681,10 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
     "capabilities": ((README,), gen_capabilities),
+    **{
+        f"{CRD_BLOCK_PREFIX}{kind.lower()}": ((page,), functools.partial(gen_crd_fields, kind))
+        for kind, page in CRD_KINDS.items()
+    },
 }
 
 # Generated artifacts that are a whole file rather than a region inside a
@@ -614,20 +779,43 @@ def collect_targets(blocks=BLOCKS) -> list[Target]:
     return targets
 
 
-def main() -> int:
+def display_path(path: Path) -> Path:
+    """A path as the report prints it: relative to the repository when inside it."""
+    return path.relative_to(REPO) if path.is_relative_to(REPO) else path
+
+
+def select_blocks(names: list[str], blocks=BLOCKS) -> dict:
+    """The blocks a run covers: every one, or the named ones in registry order."""
+    unknown = sorted(set(names) - set(blocks))
+    if unknown:
+        raise SystemExit(
+            f"unknown block id(s): {', '.join(unknown)}; known: {', '.join(blocks)}"
+        )
+    if not names:
+        return dict(blocks)
+    return {block_id: entry for block_id, entry in blocks.items() if block_id in names}
+
+
+def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--check",
         action="store_true",
         help="do not write; exit non-zero if any generated region is out of date",
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "blocks",
+        nargs="*",
+        metavar="BLOCK",
+        help="block ids to regenerate or check; default: all of them",
+    )
+    args = ap.parse_args(argv)
 
-    targets = collect_targets()
+    targets = collect_targets(select_blocks(args.blocks, blocks))
 
     stale: list[str] = []
     for path, new_text, changed, block_id in targets:
-        rel = path.relative_to(REPO)
+        rel = display_path(path)
         if not changed:
             print(f"  ok       {rel} [{block_id}]")
             continue
