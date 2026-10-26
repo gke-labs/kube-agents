@@ -1424,6 +1424,26 @@ def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_sti
     assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason
 
 
+def test_worker_commands_as_typed_succeeded_run_on_log_but_not_in_trajectory_is_error():
+    # Under after_result_pattern and succeeded: true, a card-log run missed by
+    # the trajectory capture is inconclusive (status="error"), not a fail (#3335).
+    one_line = "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+    verifier = WorkerCommandsVerifier(
+        type="worker_commands",
+        after_result_pattern="(?!)",
+        required_runs=[{"script": "collect.py", "word_patterns": ["^ai-security-audit$"], "succeeded": True}],
+    )
+    transcript.set(
+        "ok",
+        _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)],
+        worker_commands=[{"task": "t_1", "command": one_line}],
+        worker_capture_gaps=[],
+    )
+    res = verifier.verify(5.0)
+    assert res.status == "error", res.reason
+    assert "the worker card log shows collect.py ran, but the worker trajectory did not capture the call" in res.reason
+
+
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():
     raw = {"raw": '{"command": "kubectl apply -f /tmp/dns.yaml \\u1'}
     _stash_terminal(
@@ -9455,7 +9475,7 @@ def test_worker_commands_required_run_succeeded_flag():
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line; an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, a preceding !, a command substitution, a detaching wrapper such as setsid -f or sudo -b, or a loop wrapper such as watch) means its exit is not credited" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line" in res_joined.reason and "means its exit is not credited" in res_joined.reason
 
     # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
     # is inconclusive under succeeded: true when the call succeeded (error status, not pass).
@@ -9467,6 +9487,26 @@ def test_worker_commands_required_run_succeeded_flag():
     res_arg_clipped = v.verify(5.0)
     assert res_arg_clipped.status == "error"
     assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_arg_clipped.reason
+
+    # A clipped call whose head ends inside an open quote on a worker-filed card
+    # yields no argv and folds into gaps under succeeded: true, returning status="error" (#3335).
+    raw_unclosed = '{"command": "python3 ' + _SCRIPT_PATH + ' --readiness --scope-projects \\"p1,p2 ...[clipped 40 chars]'
+    traj_unclosed = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_worker_child",
+            "args": {"raw": raw_unclosed},
+            "result": '{"exit_code": 0}',
+            "exit_code": 0,
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj_unclosed, worker_commands=[])
+    res_unclosed = v.verify(5.0)
+    assert res_unclosed.status == "error"
+    assert "the pod clipped a worker terminal call's arguments" in res_unclosed.reason
 
     # A clipped match whose exit was non-zero is a conclusive fail (ran but exited non-zero).
     traj_clipped_failed = [

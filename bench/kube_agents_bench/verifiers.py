@@ -2307,10 +2307,8 @@ _TRAJ_MISSING_NO_TRAJ_REASON = (
 )
 _UNRUN_MASKED_REASON = (
     "{named} ran, but the dictated form is the command alone on its line; "
-    "an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, "
-    "a preceding !, a command substitution, a detaching wrapper such as setsid -f or sudo -b, "
-    "or a loop wrapper such as watch) "
-    "means its exit is not credited"
+    "an operator, connective, or wrapper on the line means its exit is not credited "
+    "(see WorkerRun.succeeded)"
 )
 _UNRUN_CLIPPED_REASON = (
     "the call's command was clipped in the pod, so what followed the run on the line is unknown ({named})"
@@ -2422,11 +2420,12 @@ class WorkerRun(BaseModel):
     ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (graded from
     the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count;
     to ensure the call's exit status faithfully reflects the command, the command segment must run
-    alone on its line; any connective before or after the command at depth 0, such as preceding or
-    following ``&&``, ``||``, ``|``, ``;``, ``&``, or newlines, or a preceding ``!``, or a detaching
-    or loop wrapper such as ``setsid`` without ``-w``, ``sudo -b``, or ``watch``, does not credit
-    exit; lone assignment command substitutions propagate exit status when the inner command runs
-    alone; a required run with ``succeeded: true`` and no worker trajectory to read is not credited)."""
+    alone on its line; connectives at depth 0 such as preceding or following ``&&``, ``||``, ``|``,
+    ``;``, ``&``, or newlines, leading negation (``!``), or detaching, loop, or non-propagating
+    wrappers such as ``setsid`` without ``-w``, ``sudo -b``, ``watch``, ``xargs``, or ``flock``,
+    do not credit exit; lone assignment command substitutions propagate exit status when the inner
+    command runs alone; a required run with ``succeeded: true`` and no worker trajectory to read is
+    not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2680,9 +2679,7 @@ _SETSID_VAL_LESS_FLAGS = set("cwf")
 
 def _has_detaching_wrapper(seg: list[str]) -> bool:
     """True if seg invokes an exec wrapper with options that detach the process
-    or do not guarantee exit propagation (e.g. `setsid` without `-w`/`--wait`,
-    `sudo` with `-b`/`--background` or non-whitelisted options, `watch`, `xargs`,
-    or `flock`)."""
+    or do not guarantee exit propagation (see :class:`WorkerRun` for wrapper and operator rules)."""
     idx = 0
     redirect_target = False
     while idx < len(seg):
@@ -2846,13 +2843,10 @@ def _shell_argvs_with_exit_propagation(
 ) -> list[tuple[list[str], bool]]:
     """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
     shell line's final exit code faithfully reflects this segment's success or failure.
-    Under the literal rule, a command carries exit if and only if it runs alone on its line:
-    no preceding or following connectives (``&&``, ``;``, ``||``, ``|``, ``|&``, bare newlines,
-    or trailing ``&``), no leading negation (``!``), and no detaching or loop wrappers
-    (such as ``setsid`` without ``-w``, ``sudo -b``, or ``watch``). Redirects (``>``, ``2>&1``),
-    environment assignments (``NAME=val``), non-detaching wrappers, transparent subshell parens
-    ``(cmd)``, and lone command substitutions ``VAR=$(cmd)`` where the inner command runs alone
-    propagate exit status."""
+    See :class:`WorkerRun` (``succeeded``) for the exit propagation and operator rules.
+    Redirects (``>``, ``2>&1``), environment assignments (``NAME=val``), non-detaching wrappers,
+    transparent subshell parens ``(cmd)``, and lone command substitutions ``VAR=$(cmd)`` where the
+    inner command runs alone propagate exit status."""
     words, spans = _shell_words_and_spans(command)
     segments: list[list[str]] = []
     leading_ops: list[str] = []
@@ -3575,7 +3569,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                             unrun_failed.append(run)
                     elif matched_clipped:
                         unrun_failed.append(run)
-                    elif self.after_result_pattern is None and any(_argv_runs(argv, run) for argv in argvs):
+                    elif any(_argv_runs(argv, run) for argv in argvs):
                         # The card log carries the command, but the trajectory capture missed it.
                         # Discrepancy between capture sources: cannot verify exit code.
                         traj_missing.append(run)
@@ -3592,6 +3586,20 @@ class WorkerCommandsVerifier(BaseVerifier):
         gaps = list(snap.worker_capture_gaps or ())
         if withheld and uncredited_succeeded:
             gaps.append("the pod withheld a worker terminal call's arguments")
+        clipped_unmatched = False
+        for _, _, cmd, _, _, is_clipped in traj_calls:
+            if not is_clipped:
+                continue
+            argv_entries = _shell_argvs_with_exit_propagation(cmd)
+            if not any(
+                _argv_runs(argv, run)
+                for run in self.required_runs
+                for argv, _ in argv_entries
+            ):
+                clipped_unmatched = True
+                break
+        if clipped_unmatched and uncredited_succeeded:
+            gaps.append("the pod clipped a worker terminal call's arguments")
         gaps_str = "; ".join(gaps)
 
         if self.after_result_pattern is not None:
