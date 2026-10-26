@@ -218,6 +218,18 @@ class FindGapsTest(Harness):
 
     def test_a_store_written_back_after_a_failed_read_is_not_this_ticks(self):
         self.assertIsNone(coverage_gaps.store_records({"error": "store.py timed out", "records": []}, data_doc()))
+        self.assertIsNone(coverage_gaps.store_records({"records": [], "partial": {"fetched": 800, "remaining": 412}}, data_doc()), "a read stopped at its deadline")
+
+    def test_a_since_after_today_reads_as_not_recorded(self):
+        (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS.replace("since: 2026-10-21", "since: 2026-11-30"))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            gamma = next(g for g in self.gaps() if g["slug"] == "gamma")
+        self.assertEqual((gamma["since"], gamma["days"]), (None, None))
+        self.assertIn("after today", err.getvalue())
+        # A not-planned close then holds by the undated rule.
+        closed = bot_issue(4221, "gamma", state="closed", state_reason="not_planned", closed_at="2026-10-25T10:00:00Z")
+        gh, _, _ = self.run_once(FakeGh(closed_issues=[closed]))
+        self.assertEqual([b["labels"][1] for b in self.posted(gh)], ["domain:beta"])
 
     def test_a_roster_case_without_a_spec_covers_nothing(self):
         (self.root / "bench" / "tasks" / "alpha-seat" / "task.yaml").write_text("name: alpha-seat\ndomain: alpha\n")

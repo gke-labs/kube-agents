@@ -148,7 +148,7 @@ Kept current by `scripts/eval_dashboard/coverage_gaps.py` on the CI-health tick 
 TABLE_HEAD = "| Case | Nightly record | Bar | Evidence store |\n|---|---|---|---|"
 TABLE_ROW = "| `{case}`{held} | {record} | {bar} | {store} |"
 CANDIDATES_NOT_READ = "Not read this tick: the data.json it read held no cases."
-NO_CANDIDATES = "None: no case of this domain is on the nightly matrix. The domain needs a new case, and this issue is where to ask for one."
+NO_CANDIDATES = "None: no case of this domain on the nightly matrix carries a `verification_spec` without `expected_fail`, off the roster. The domain needs a new case, or a spec on one it has, and this issue is where to ask for it."
 # Where the owner comes from: the domain row, or the allowlist record's own
 # `owner:`, which wins.
 OWNER_FROM_DOMAIN = "the domain owner in `docs/designs/domains.yaml`"
@@ -298,8 +298,10 @@ def store_records(store: dict | None, data: dict) -> dict[str, dict] | None:
     mode the main nightly and the blocking presubmit grade (today's series
     only when the store holds no next-mode records); None without a store,
     or for the last published one written back after a failed read
-    (``error`` set), whose verdicts are not this tick's."""
-    if not isinstance(store, dict) or store.get("error"):
+    (``error`` set) or a read stopped at its deadline (``partial``), whose
+    verdicts are not this tick's."""
+    # A read stopped at its deadline (``partial``) holds only some cases.
+    if not isinstance(store, dict) or store.get("error") or trend.partial_read(store):
         return None
     document = trend.trend_document(store, data)
     cases = (document.get("next") or document).get("cases") or {}
@@ -356,6 +358,9 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
             continue
         entry = allowlist.get(slug)
         since = entry["since"] if entry else None
+        if since and since > today:
+            log(f"warning: the allowlist entry for {slug} has since {since}, after today; read as not recorded")
+            since = None
         cands = sorted((candidate(c, nights.get(c, []), records, c in presubmit) for c in by_domain.get(slug, [])), key=rank_key) if data.get("cases") else None
         gaps.append({
             "slug": slug, "name": row.get("name") or slug, "meaning": row.get("meaning") or "",

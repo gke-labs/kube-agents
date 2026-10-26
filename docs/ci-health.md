@@ -936,7 +936,8 @@ wins), with `backup:` mentioned; when GitHub refuses the owner as assignee it
 is filed unassigned and says so. Its body names how many days the domain has
 been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
 or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
-or "start date not recorded" (also for a date that does not parse); why, from the entry
+or "start date not recorded" (also for a date that does not parse or is after
+today); why, from the entry
 and the issue it cites; and the candidates. A candidate is a case of the
 domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
 not on the roster, with its
@@ -944,7 +945,8 @@ graded repetitions over the last 14 nightly nights (read as [Nightly
 bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 (90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
 bar, and who clears it"), and, when the tick read the evidence store (not the
-last published copy written back after a failed read), what the
+last published copy written back after a failed read, nor a read stopped at its
+deadline), what the
 store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
