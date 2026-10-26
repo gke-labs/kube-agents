@@ -610,6 +610,10 @@ class EvaluateTest(unittest.TestCase):
         assert ffs.evaluate(entry, [{"releaseChannel": {"channel": "REGULAR"}}], channel_valid=lookup) == (
             "cluster currentMasterVersion not_ahead_of_channel: observed nothing"
         )
+        # A roster with no version the operator can order is a failed read,
+        # never "ahead of every version it offers".
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [on_channel], channel_valid={"REGULAR": ["1.34", "latest"]}.get)
 
     def test_not_ahead_of_channel_is_cluster_only_and_takes_no_value(self):
         def load(entry):
@@ -1110,13 +1114,18 @@ class PassTest(_Harness):
         assert self.drift_files() == {}
 
     def test_a_channel_entry_without_valid_versions_leaves_the_laggard_not_checked(self):
-        world = _healthy_world()
-        for channel in world["server_config"]["channels"]:
-            channel.pop("validVersions")
-        done = self.run_script(world)
-        assert "0 drifted, 1 not checked" in done.stderr, done.stderr
-        assert "carries no validVersions list" in done.stderr, done.stderr
-        assert self.drift_files() == {}
+        for roster in (None, []):
+            with self.subTest(roster=roster):
+                world = _healthy_world()
+                for channel in world["server_config"]["channels"]:
+                    if roster is None:
+                        channel.pop("validVersions")
+                    else:
+                        channel["validVersions"] = roster
+                done = self.run_script(world)
+                assert "0 drifted, 1 not checked" in done.stderr, done.stderr
+                assert "carries no validVersions list" in done.stderr, done.stderr
+                assert self.drift_files() == {}
 
     def test_a_lapsed_exclusion_is_drift_before_the_master_moves(self):
         world = _healthy_world()

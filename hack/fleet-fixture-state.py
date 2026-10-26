@@ -682,6 +682,8 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
             if version is None:
                 return f"{label}: {_describe(values)}, not a GKE version"
             offered = [(key, str(v)) for v in valid if (key := _gke_version(v))]
+            if not offered:
+                raise Unreadable(f"none of {name}'s {len(valid)} valid versions is a GKE version, so nothing can be ordered against them")
             same_minor = [(key, v) for key, v in offered if key[:MINOR_PREFIX_LEN] == version[:MINOR_PREFIX_LEN]]
             ok = str(values[0]) in valid or any(key > version for key, _ in same_minor or offered)
             if not ok:
@@ -755,7 +757,9 @@ class Reader:
             if entry is None:
                 return None
             valid = entry.get(SERVER_CONFIG_VALID)
-            if not isinstance(valid, list):
+            # An empty roster is a failed read, as bench/tf/fleet/seeded_b_pin.py
+            # treats it: every master would otherwise read as ahead of it.
+            if not isinstance(valid, list) or not valid:
                 raise Unreadable(f"get-server-config's {channel} entry carries no {SERVER_CONFIG_VALID} list")
             return [str(v) for v in valid]
 
