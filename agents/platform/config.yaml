@@ -394,7 +394,8 @@ memory:
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
 # to audit this privileged specialist's tool calls. pr_opened records each pull
 # request this profile's kanban workers open on their card, which is what posts
-# the thread's PR message (plugins/pr_opened/__init__.py).
+# the thread's PR message, and refuses submit_suggestion.py from a worker whose
+# run on its card has ended (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
