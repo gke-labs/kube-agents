@@ -174,11 +174,13 @@ on_error() {
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of install.sh instead. Piped through
-  # stdin, bash labels this script's frames `main` or not at all, and $0 is
-  # `bash`; both read as the script by name.
+  # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
+  # 5.3: `bash`, or the path it was invoked by), or not at all (bash 3.2);
+  # all read as the script by name. A frame run from a file keeps the path
+  # bash recorded, so `bash ./install.sh` still names the file it ran.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
-    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+    ""|main|bash|*/bash) source_file="$INSTALL_SCRIPT_NAME" ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2

@@ -9681,29 +9681,35 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         """The curl | bash entry has no file for bash to name a frame after.
 
         Read from stdin, BASH_SOURCE for this script's own frames is `main` on
-        a modern bash and unset on bash 3.2, and $0 is `bash`. The banner
-        names the script instead, so the line number has a file to belong to.
+        bash 5.2, `$0` on bash 5.3 (`bash`, or the path the shell was invoked
+        by) and unset on bash 3.2, and $0 is `bash`. The banner names the
+        script instead, so the line number has a file to belong to. Run once
+        through `bash` and once through its absolute path, which is the 5.3
+        spelling a `curl | /bin/bash` gives.
         """
         script = (
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
             "piped_step() {\n  false\n}\n"
             "piped_step\n"
         )
-        proc = subprocess.run(
-            ["bash"],
-            input=script,
-            capture_output=True,
-            text=True,
-            env=get_isolated_test_env(
-                overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
-            ),
-            cwd=str(_REPO_ROOT),
-        )
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("Error encountered at install.sh:", proc.stderr)
-        self.assertIn(" in piped_step (exit code 1): false", proc.stderr)
-        self.assertNotIn(" at bash:", proc.stderr)
-        self.assertNotIn(" at main:", proc.stderr)
+        for shell in ("bash", shutil.which("bash")):
+            with self.subTest(shell=shell):
+                proc = subprocess.run(
+                    [shell],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    env=get_isolated_test_env(
+                        overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+                    ),
+                    cwd=str(_REPO_ROOT),
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn("Error encountered at install.sh:", proc.stderr)
+                self.assertIn(" in piped_step (exit code 1): false", proc.stderr)
+                self.assertNotIn(" at bash:", proc.stderr)
+                self.assertNotIn(f" at {shell}:", proc.stderr)
+                self.assertNotIn(" at main:", proc.stderr)
 
     def test_a_handled_miss_inside_a_substitution_prints_no_banner_and_no_report(self):
         """A probe whose miss the caller handles is not an abort.
