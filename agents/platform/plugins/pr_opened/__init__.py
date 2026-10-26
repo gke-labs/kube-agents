@@ -303,12 +303,22 @@ def _own_run_id():
 
 
 def _card_run(task_id):
-    """``(status, current_run_id)`` of card ``task_id`` on this process's board, or None when it has no row."""
+    """``(status, current_run_id)`` of card ``task_id`` on this process's board, or None when it has no row.
+
+    The read waits at most CARD_READ_BUSY_MS on a locked board, not Hermes' 120 s writer timeout: Hermes
+    gives a pre_tool_call hook 30 s and blocks the call when it runs over, which would refuse a live
+    card's submit. A board still locked after that raises, and the caller lets the call through.
+    """
     from hermes_cli.kanban_db_connect import connect_closing
 
     with connect_closing() as conn:
+        conn.execute(f"PRAGMA busy_timeout={CARD_READ_BUSY_MS}")
         row = conn.execute(CARD_RUN_SQL, (task_id,)).fetchone()
     return None if row is None else (row[0], row[1])
+
+
+# How long the guard's card read waits on a locked board (see _card_run).
+CARD_READ_BUSY_MS = 2000
 
 
 def ended_run_text(task_id, status):

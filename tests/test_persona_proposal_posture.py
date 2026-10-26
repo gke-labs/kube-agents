@@ -47,7 +47,7 @@ WRITE_PATH_DEFERS = "under §3's rule"
 SKILL_REFUSAL = "Answering a request that asked for a diagnosis, not a change."
 # A platform worker on a "propose a remediation manifest" card opened the pull
 # request after kanban_complete, acting on its own [next: ...] line (#2610).
-CARD_PROPOSE_IN_RESULT = "only a card that says to open a pull request or submit the change authorises one"
+CARD_PROPOSE_IN_RESULT = "only a card that asks for a change (open a pull request, submit, fix or install it) authorises one"
 NEXT_LINE_NOT_YOURS = "is the requester's to send, never yours to carry out, before or after `kanban_complete`"
 # The line a card filed for a request that asked for no change ends with.
 PROPOSE_ONLY_LINE = "Propose only: put the fix in result; do not open a pull request."

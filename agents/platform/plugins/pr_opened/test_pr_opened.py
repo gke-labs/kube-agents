@@ -273,7 +273,9 @@ class _Board:
         def connect_closing(db_path=None, *, board_slug=None):
             if board.fail:
                 raise board.fail
-            with contextlib.closing(sqlite3.connect(board.path)) as conn:
+            # As Hermes' connect does: a 120 s writer timeout, set by PRAGMA.
+            with contextlib.closing(sqlite3.connect(board.path, timeout=120)) as conn:
+                conn.execute("PRAGMA busy_timeout=120000")
                 yield conn
 
         connect.connect_closing = connect_closing
@@ -291,6 +293,26 @@ class EndedRunGuardTest(unittest.TestCase):
             board = _Board(tmp, status=status, current_run_id=current_run_id, fail=fail)
             with mock.patch.dict(sys.modules, board.modules()), mock.patch.dict(os.environ, env, clear=True):
                 return plugin.on_pre_tool_call(tool_name=tool, args={"command": command}, task_id="x")
+
+    def test_a_locked_board_lets_the_call_through_well_inside_hermes_hook_timeout(self):
+        # Hermes blocks a pre_tool_call hook that runs past 30 s, so a read that waited out the
+        # board's 120 s writer timeout would refuse a live card's submit.
+        import sqlite3
+        import time
+
+        env = {plugin.TASK_ENV: TASK, plugin.RUN_ID_ENV: str(RUN_ID)}
+        with tempfile.TemporaryDirectory() as tmp:
+            board = _Board(tmp, status="done")
+            with contextlib.closing(sqlite3.connect(board.path, isolation_level=None)) as holder:
+                holder.execute("BEGIN EXCLUSIVE")
+                with mock.patch.dict(sys.modules, board.modules()), mock.patch.dict(os.environ, env, clear=True):
+                    start = time.monotonic()
+                    with self.assertLogs(plugin.logger, "WARNING"):
+                        verdict = plugin.on_pre_tool_call(tool_name="terminal", args={"command": PREPARE}, task_id="x")
+                    took = time.monotonic() - start
+                holder.execute("ROLLBACK")
+        self.assertIsNone(verdict)
+        self.assertLess(took, 10)
 
     def test_a_worker_whose_card_is_done_is_refused_prepare_and_submit(self):
         # #3622's shape: kanban_complete, then the worker acts on its own [next: ...] line.

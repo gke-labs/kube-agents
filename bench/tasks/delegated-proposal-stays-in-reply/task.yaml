@@ -14,7 +14,9 @@
 # prepare and submit inside its card; on #3622 it called kanban_complete with a
 # closing "[next: Submit a pull request with this manifest]" line and then, in
 # the same session, acted on that line. The prompt below is the card body those
-# runs carried, so the worker meets the request in the shape it failed on.
+# runs carried. It goes to the front door, which files the card in its own
+# words, so the worker sees a request close to the one it failed on, not the
+# same text.
 #
 # Not red on demand: at about 4% a repetition, three runs on main rarely show
 # it. The red record is the gate's (the issue's run list) and a replay of the
