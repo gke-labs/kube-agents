@@ -19,7 +19,7 @@ import subprocess
 import sys
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import test_session_kv_server as harness  # noqa: F401  (database path, mcp stub)
