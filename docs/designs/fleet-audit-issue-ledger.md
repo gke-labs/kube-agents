@@ -90,14 +90,17 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   the open-ledger search lists open issues only.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, and no
+  `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, on a
+  scheduled run the same published ids as the last scheduled run (§7.5), and no
   collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md)). If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
   finds a new or changed coverage gap is never silent even when both counters are zero, because "I
   found nothing" and "I could not look" are different statements and only one of them is
   reassuring (§7.4). A gap that is the same as on the stored previous run does not make the run
-  speak again (§7.4 says why). `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports regardless.
+  speak again (§7.4 says why); for a scheduled run, the previous run is the last stored scheduled
+  run. `silent_ok` is the _scheduled_ verdict: only a run that passes
+  `--scheduled` can get `true`, so an operator-dispatched run always reports (§7.5).
 
 ### Tier 2 — remediation pull requests
 
@@ -608,7 +611,7 @@ the repository, so a scheduled run with nothing new is silent.
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.
 
-### `finish --audit <id> --findings-file <path> [--dry-run] [--manifest-file <path> | --no-collector-manifest <why>]`
+### `finish --audit <id> --findings-file <path> [--dry-run] [--scheduled] [--manifest-file <path> | --no-collector-manifest <why>]`
 
 The two collector flags are the subject of
 [`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md), which says why a stream
@@ -692,6 +695,9 @@ recorded no complete declared-intent search (§7.4); empty on every other run.
 When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_checks` and
 `uncorroborated_findings` join the line; they are absent on every other run
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.6).
+
+The last example, `silent_ok: true`, is possible only on a run that passed `--scheduled` (§7.5).
+Without the flag, `silent_ok` is false on every line.
 
 `publish_s`, `inspect_s` and `collect_s` are timing data in seconds, and nothing decides on them.
 `publish_s` is the time `finish` used to publish. `inspect_s` is the time from `start` to `finish`,
@@ -1212,21 +1218,30 @@ coverage, and nothing else:
 - A run with a new or changed gap is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5).
   "I found nothing" and "I could not look" must not arrive in chat as the same silence. A gap is new
   or changed when no trusted stored record exists, when the record does not list its gaps, or when
-  the set of gaps differs from the record's `coverage_gaps`. A gap that did not change does not make
+  the set of gaps differs from the record's gaps (for a scheduled run, the gaps of the last
+  scheduled run, as below). A gap that did not change does not make
   the run speak again, unless a finding id that the stored run listed is not in this run's published
   set (its findings, the postures it withheld, the collector-held ids, and the ids under
   _Not re-checked this run_). A gap holds `resolved` at 0, so
   that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
   those ids under `unreported_under_gap`. Each id is reported once: the stored record keeps, under
   `reported_under_gap`, the ids that a run already reported and that are still not published, and
-  the next run does not report them again. A record without that key subtracts nothing, so a run
+  the next run does not report them again. A run with full coverage clears the list: it did not find
+  those ids, so it resolved them. A record without that key subtracts nothing, so a run
   that held the ledger open without reporting an id (an unreadable conversation, an unaccounted
-  finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. `finish`
-  cannot tell a scheduled run from an on-demand one (§7.5), so it compares with the last stored run
-  of either kind: a gap first seen on an on-demand run reached the person who asked, but not the
-  channel, and the next scheduled run with the same gaps does not report it. The first-install
-  audits count as scheduled runs: the `oobe` job marks each one due, and it stores its record like
-  any other. The comparison uses each gap's sentence as written. The sentence comes from the run's
+  finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. A
+  scheduled run (`--scheduled`, §7.5) compares its gaps with the last stored _scheduled_ run, not
+  with the last stored run: a gap first seen on an on-demand run reached the person who asked, but
+  not the channel, so the next scheduled run with the same gaps still reports it. For this, each
+  stored record says whether its run was scheduled (`scheduled`) and carries the gaps of the last
+  scheduled run (`scheduled_coverage_gaps`): a scheduled run writes its own gaps there, and an
+  on-demand run copies the value from the record before it. A record written before `finish` knew
+  the run kind has neither key, and its `coverage_gaps` are read as a scheduled run's, which was
+  the rule when it was written. The partial all-clear comment goes on the issue, which every run
+  writes to, so for the comment every run compares with the last stored run of either kind: the
+  scheduled run after an on-demand run with the same gaps speaks, but it does not comment again.
+  The first-install audits count as scheduled runs: the `oobe` job marks each one due, the run
+  takes the cron prompt, and it stores its record like any other. The comparison uses each gap's sentence as written. The sentence comes from the run's
   findings document: the reason the worker writes for a cluster it could not read
   (`scope.skipped`) or read only in part (`limitations`), plus the checks that did not run, which
   `finish` adds. Some reasons carry an error message, for example the first line of a failed
@@ -1330,22 +1345,91 @@ collector candidate the document dropped ([collector design §3.5](fleet-audit-c
 — and it is computed from the numbers `finish` is
 about to _report_,
 not the ones it privately knows. A partial run reports `resolved: 0`; a report store with no record of
-the open ledger makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
+the open ledger makes the delta unknowable and reports `new: 0`. On a scheduled run, one more
+term applies: the published ids are the ids the last scheduled run published (below).
+`silent_ok` follows what was published, so the flag
 and the report can never disagree. The PR counters are in the conjunction because opening a fix is
 news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
 while a pull request now exists that did not before.
 
-`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
-to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
-the second half of the rule lives with the agent and cannot be moved into the harness — **an
-on-demand run is never silent.** A run a person asked for — a kanban card naming the stream, or a
-request straight from chat — reports its outcome and its ledger URL whatever `silent_ok` says, and
-every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule
-cannot reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks
-the job due for the next `profile-cron-tick` instead of re-enacting the audit in the session that
-fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
-one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
-the session that triggered it says only that the job is queued and leaves the report to the run.
+`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and only a run
+that passes `--scheduled` can get `true`. **An on-demand run is never silent:** a run a person asked
+for — a kanban card naming the stream, or a request straight from chat — does not pass the flag, so
+its `silent_ok` is always false, and it reports its outcome and its ledger URL. Every SOP's close
+section says so. The one limit: an on-demand run that goes through `hermes cron run` (below) uses
+the cron prompt, so it counts as a scheduled run and can be silent.
+
+The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
+`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`. The SOPs do
+not, because a scheduled run and an on-demand run read the same SOP, and an SOP that passed the
+flag would make every on-demand run of its stream able to go silent. A scheduled worker that
+forgets the flag reports a run that could have been silent. That is noise in the channel, and it
+costs less than an answer that a person never gets.
+
+Why the harness and not the SOP: the SOP rule alone does not hold. A worker that reads
+`silent_ok: true` on an on-demand rerun that moved nothing can follow the flag over the SOP and
+answer `[SILENT]`, and then the person who asked gets no answer and no ledger URL. A rule that the
+agent applies correctly most of the time is a rule the harness should apply. The harness cannot
+know that a person is waiting, but the cron prompt knows that no person is. So the default is
+vocal, and the scheduled run is the one that says what it is: an on-demand path that forgets a
+flag then reports, and does not go silent.
+
+The channel hears only scheduled runs, so a scheduled run measures "did anything move" against
+the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
+last scheduled run published (`scheduled_published_ids`: with a ledger, its findings, the postures
+it withheld, the held ids and the ids under _Not re-checked this run_, or for a clean run that left
+the body untouched, the ids that body still lists; with the ledger in the report store, the same ids
+as with a ledger, and no value when it held a ledger it could not read; with no forge, its findings,
+the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+values there, and an on-demand run copies them from the record before it. A scheduled run whose
+published ids differ from `scheduled_published_ids` is not silent, also when its delta against
+the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
+the channel. An id that a scheduled run already reported under a gap (`scheduled_reported_under_gap`)
+is not a difference. Its `new` and `resolved` then can be 0, so the JSON line also carries
+`since_last_scheduled`, the ids new and resolved since the last scheduled run, and the text chat
+report says them on a line of its own ("Changed since the last scheduled run: 1 resolved (…)."), with
+no count of zero. A Slack card built from the ledger issue (`KAGE_SLACK_UX` on) replaces the text and
+does not show this line. The card of a run with no ledger issue is built from its summary, which puts
+the line under the finding rows, so that card shows it. When no record shows
+the ids, or the record was written under another finding id scheme, the value is `null` and the
+line says that the change is not known. The key is absent when the last stored run was a scheduled
+run on the open ledger, because `new` and `resolved` then say the change. An id that left under a
+gap, on this run or an earlier one (`reported_under_gap`), is not counted as resolved, and when
+every id that moved left under a gap the key is absent: "0 new, 0 resolved" is not why the run
+speaks. An id that an on-demand run resolved with full coverage is counted as resolved, also on a
+scheduled run with a gap. A run with full coverage clears `reported_under_gap`, with a ledger, with
+the ledger in the report store, and with no forge, so an id that it resolved is not counted as one that left under a gap.
+`new` and `resolved` keep their meaning: they count against the last stored run. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
+that a scheduled run reported (`scheduled_reported_under_gap`). An id that the last scheduled run
+published and that an on-demand run dropped since then is in `unreported_under_gap` only when it
+left under a gap (the on-demand run then put it in `reported_under_gap`). An id that an on-demand
+run resolved with full coverage is not.
+
+When no record shows the ids of the last scheduled run, the scheduled run speaks. This is the case
+for a record written before `finish` stored the key, for a record that an on-demand run wrote
+with no value to copy, and for the record that `finish` seeds from the ledger's hidden block when
+the store holds none ([report store](fleet-audit-report-store.md) §4). The delta against the last run cannot replace the baseline, because the last
+run can be the on-demand run that saw the change first. So every stream speaks once after the
+upgrade that adds the key, or after the report store is rebuilt from the ledger. A store that holds no run of the stream is not "unknown": no scheduled
+run published anything, so the baseline is empty.
+
+The stored memory belongs to the open ledger. With no open ledger, a scheduled run reads the
+baseline from the newest record that the stream stored for the repository, which is the record of
+the ledger that a run closed. A marked envelope from a run that could not reach the repository is
+not read, because that run published nothing there ([report store](fleet-audit-report-store.md)
+§2). When the store holds only marked envelopes, no baseline is known and the run speaks. So a
+scheduled run after an on-demand run that closed the ledger
+speaks once, and the channel hears that the stream is clean. When a person closed the ledger, the
+newest record is the record of its last run, and it still lists that run's ids. A scheduled run
+with a gap does not call those ids resolved, because no run checked them. It lists them under
+`unreported_under_gap`.
+
+The Platform Agent's `AGENTS.md` adds one more case: "run the `<x>` cron job now" is answered with
+`hermes cron run <job-id>`, which marks the job due for the next `profile-cron-tick` instead of
+re-enacting the audit in the session that fielded the request. That run takes the same execute →
+save → deliver → mark path and the same cron prompt as a scheduled one, so it passes `--scheduled`
+and `silent_ok` judges it like any other scheduled run; the session that triggered it says only
+that the job is queued and leaves the report to the run.
 
 On a scheduled run the Platform Agent has no channel of its own: a scheduled audit is a cron run on the Platform Agent's own roster
 (`agents/platform/cron/jobs.json`, ticked by `profile-cron-tick`), executed in a process of its own
@@ -1636,10 +1720,12 @@ findings ledger's body alone; a clean close changes the title and adds the banne
 makes no edit when the close fails, adds no second banner, and keeps the old body when the edit
 fails.
 
-**Silence cases** (§7.5): `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
+**Silence cases** (§7.5): on a run that passed `--scheduled`, `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
 `false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, or a
 remediation PR opened or closed, and `true` again over a gap that did not change — asserted on both `finish` branches, since each prints its own
-JSON. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
+JSON. The same quiet runs without `--scheduled` give `false`, on both branches and with no
+forge, and a scheduled run after an on-demand run that first saw a gap still reports the gap.
+Every fleet-audit cron prompt tells the worker to pass `--scheduled`, and no SOP does. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
 governance-job bullet names the Platform Agent's own roster
 (`/opt/data/profiles/platform/cron/jobs.json`) and `profile-cron-tick`, the on-demand bullet names
 `hermes cron run` and `cronjob(action='run')` so that "run it now" stays a trigger rather than a

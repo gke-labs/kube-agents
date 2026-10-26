@@ -125,9 +125,17 @@ CI enforcement: `make docs-check` runs the same checks as
   `scripts/generate_docs.py --check`; fails if a generated region or prompt
   line pin no longer matches its source.
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
-  resolve to **git-tracked** targets, and a `docs/designs/…` or
-  `docs/architecture/…` path cited from a code or configuration file (Python,
-  Go, shell, Dockerfiles, YAML, Terraform, TypeScript) must be one too. The
+  resolve to **git-tracked** targets; a `#fragment` on a relative link, a
+  same-page link or a site route whose target is a tracked Markdown file must
+  name a heading there (slugged as GitHub and Starlight slug it) or an explicit
+  `id` or `<a name>`; a site page named by its route or linked from another
+  site page is read as Starlight serves it (`_top` present, a slug's trailing
+  hyphen trimmed), by a relative path from any other document as GitHub
+  renders it; a break that has to be staged goes in the script's second
+  allowlist, which only shrinks the same way and starts empty; and a
+  `docs/designs/…` or `docs/architecture/…` path
+  cited from a code or configuration file (Python, Go, shell, Dockerfiles,
+  YAML, Terraform, TypeScript) must be one too. The
   same script holds the **reachability rule**: every tracked `.md`/`.mdx`
   outside a root-level dot-directory, the skill overlays' `append.md` fragments aside, must be reachable from where a reader
   starts. The starting points are files at the repository root, any
@@ -169,9 +177,7 @@ CI enforcement: `make docs-check` runs the same checks as
   page with no entry must be clean, and a count below its entry fails until the
   entry is lowered (`--write-ratchet` lowers or drops entries and never raises
   or adds one). The rule is `.agents/rules/documentation.md`, "Write it
-  straight". The workflow has no step for this target yet; until it gains one,
-  CI holds the ratchet through `scripts/test_check_docs_prose.py` in the Python
-  unit-test job.
+  straight".
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
   and their combined size must stay inside the `BUDGET` that file sets.
@@ -201,7 +207,7 @@ identifier appears, add its source here.
 | The two drift switches and the rule between them: the ingress, the consumer, and the fact that the second is refused without the first | `enable_drift_pubsub` and `enable_drift_detector` in `terraform/examples/full-install/variables.tf`, and the `helm_release` preconditions in its `main.tf`; `DEFAULT_ENABLE_DRIFT_DETECTOR` in `install.defaults.env` for the single `install.env` key the front doors write both from; `driftDetectorEnabled` in `k8s-operator/internal/controller/platformagent_manifests.go` for what the operator does with the field afterwards; `tests/test_drift_subscription_wiring.py` pins the composition side |
 | The drift batch join budget and the ack deadline it must fit inside | `defaultBatchJoinBudget`, `batchJoinBudgetCeiling` and `maxBudgetShareOfAckDeadline` in `k8s-operator/cmd/drift-detector/subscriber.go`; `ack_deadline_seconds` in `terraform/modules/drift-pubsub/variables.tf`. The detector reads the deadline at startup and warns when the budget takes more than half of it, but does not adopt it, so a doc stating one states both |
 | A2A wire constants: protocol version, stream names, size thresholds, token grammar | `a2a/lib/envelope.go` and `a2a/lib/topics.go` |
-| Executor terminal reason tokens (`reason: <token>`) and their infrastructure/persona classification | `INFRASTRUCTURE_REASONS` and `PERSONA_REASONS` in `bench/kube_agents_bench/inject_transport.py`; written by `a2a/hermes-bridge/bridge.go` (`failureReason` and the `reason:` constants), `a2a/hermes-bridge/api.go` (`runTaskAPI`, `finalizeAPIError` and `finalizeTurnNotSent`) and `a2a/worker-adapter/adapter.go`; the lists in `docs/designs/eval-next-transport.md`, `docs/designs/spec-chatops-gateway.md` and `bench/README.md` must agree |
+| Executor terminal reason tokens (`reason: <token>`) and their infrastructure/persona classification | `INFRASTRUCTURE_REASONS` and `PERSONA_REASONS` in `bench/kube_agents_bench/inject_transport.py`; written by `a2a/hermes-bridge/bridge.go` (`failureReason` and the `reason:` constants), `a2a/hermes-bridge/api.go` (`runTaskAPI`, `finalizeAPIError` and `finalizeTurnNotSent`), `a2a/hermes-bridge/reasoning_leak.go` (`unstructuredReasoningToken`) and `a2a/worker-adapter/adapter.go`; the lists in `docs/designs/eval-next-transport.md`, `docs/designs/spec-chatops-gateway.md` and `bench/README.md` must agree |
 | A2A payload vocabulary: the reserved artifact names (`result`, `thinking`, `activity`, `progress`, `delegate`, `turn`, `notice`, `handoff`, `usage`) and the steer-notice outcomes and refusal reason tokens | `Artifact*`, `SteerQueued`/`SteerRefused` and `SteerReason*` in `a2a/lib/payload.go`; the room's wording for each reason is `steerRefusalWhy` in `a2a/gateway/gateway.go`, except `task-ended`, which is counted into the terminal's `noticeSteersUnrun` beside it |
 | A2A subject grammar: the task subject classes (`in`, `events`, `supervisor`), their constructors and the parse that recovers addressee, taskId and class | `a2a/lib/client.go` |
 | The A2A gateway process's env (backend selection, Slack token pair and allowlist, gchat relay, allowlist and home channel, Slack home channel, display mode, addressee, the relay token path it reads, and the A2A door's Google client id and allowlist) | `a2a/gateway/config.go` (`FromEnv`) |
