@@ -436,7 +436,7 @@ class RosterPageTest(unittest.TestCase):
         # return to the roster on 2026-10-26, and its "Admitted on the record
         # since the split" bullets carry no "demoted <date>" phrase.
         self.assertIsNone(dates.get("pdb-remediation-pr"))
-        self.assertEqual(dates.get("consistency-authorized-networks-probe"), "2026-10-21")  # #3598
+        self.assertIsNone(dates.get("consistency-authorized-networks-probe"))  # #3598; same shape, returned with #3975
 
     def test_case_status_rules(self):
         status = render.case_status

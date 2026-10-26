@@ -65,9 +65,9 @@
 # are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
-# Spec-ready, each domain covered in the presubmit by its probe (consistency's
-# probe nightly since 2026-10-21, #3598; upgrades' was nightly-only 2026-10-16
-# to 2026-10-23, #3269):
+# Spec-ready, each domain covered in the presubmit by its probe (upgrades' was
+# nightly-only 2026-10-16 to 2026-10-23, #3269; consistency's from 2026-10-21,
+# #3598, until #3975 on #3609's drift route):
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
 #      (build 2092638061140643840); too slow for a presubmit seat.
 #   -- stockout-pinned-pool: same full-audit shape and cost band; its
@@ -194,8 +194,8 @@
 # (registered above until its roster seat of 2026-10-26), grading the
 # collector-only `no-environment-label` check (SOP §4.14) against the
 # install's own unlabelled host cluster beside the labelled seeded trio. Its
-# domain's presubmit seat was the probe's until 2026-10-21 (#3598) and is
-# consistency-drift-outlier's since 2026-10-26.
+# domain's presubmit seat was the probe's until 2026-10-21 (#3598),
+# consistency-drift-outlier's since 2026-10-26, and both's since #3975.
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
@@ -777,8 +777,8 @@
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
 # Nightly rather than presubmit: consistency-authorized-networks-probe held
-# the domain's presubmit seat (nightly too since 2026-10-21, #3598;
-# consistency-drift-outlier holds it since 2026-10-26). Green on
+# the domain's presubmit seat (nightly too from 2026-10-21, #3598, until
+# #3975; consistency-drift-outlier holds it since 2026-10-26). Green on
 # the SOUL.md drift row (#3398, #3609); ran as expected_fail from #3135 until
 # then.
 ./tasks/drift-chat-request-runs-collector/task.yaml
@@ -940,20 +940,6 @@
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
-
-# #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
-# Gemini setup it failed about 30% of repetitions on unrelated pull requests
-# and on main's eval-next (37 of 126 across 42 runs; the store's record
-# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
-# #3448); 22 were real misses: the agent read seeded-c's leftover
-# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
-# `enabled`) as configured or open and said seeded-c matches its peers, or
-# named the wrong facet, or (once) a tool error. The Claude nightlies pass
-# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
-# lands, and the case passes the roster's bar, 90% over 20 runs, on the
-# Gemini nightly (#3598). The domain's roster seat is consistency-drift-outlier
-# since 2026-10-26.
-./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change
 # (#3199): the HPA scaling inference-server (hpa-saturated) and ledger-writer's

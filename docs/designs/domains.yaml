@@ -156,8 +156,9 @@ domains:
 # Known-uncovered; empty is Phase 2's exit criterion. agent-kanban-smoke
 # covers chat-and-routing; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security,
-# upgrades and cost are covered by domain probes, upgrades again since 2026-10-23
-# (its probe was nightly-only from 2026-10-16, #3269) --
+# upgrades, consistency and cost are covered by domain probes, upgrades again
+# since 2026-10-23 (its probe was nightly-only from 2026-10-16, #3269),
+# consistency's probe again with #3975 beside the full audit (below) --
 # see the header above for why probes rather than six full audits.
 # consistency's probe was demoted on 2026-10-21 (#3598), which put the
 # domain on the allowlist until 2026-10-26, when consistency-drift-outlier,

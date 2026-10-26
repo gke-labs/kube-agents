@@ -138,23 +138,6 @@ with a filed issue naming the exit condition:
   pdb-remediation-pr's roster line on 2026-10-14 (below) took it off again; that case's
   demotion on 2026-10-17 (#3120) put it back until its return on 2026-10-26 (below). Enters
   when #1189's re-admission bar holds.
-- **consistency-authorized-networks-probe** —
-  [#3598](https://github.com/gke-labs/kube-agents/issues/3598): demoted 2026-10-21 after it
-  failed about 30% of repetitions on the Gemini setup, on unrelated pull requests (#2997,
-  #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
-  2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
-  `would-demote`. 15 of the 37 were Vertex 429s
-  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), fix open in
-  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
-  being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
-  still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
-  `enabled`, and the agent read that leftover block as configured or open and said seeded-c
-  matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
-  encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
-  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal left
-  `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
-  consistency-drift-outlier took a roster seat on 2026-10-26 (below). Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
-  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -252,11 +235,11 @@ obtainability activations from
 repetitions 2026-09-15 to 09-22): 680/688, 600/685, 491/679 and 69/684 — the silence case
 fails on a correct agent today, and the nightly record is what will show a fix landing.
 
-Three re-admissions on record: **agent-kanban-smoke** earned its seat back after the
+Four re-admissions on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
 the reds that once argued for un-arming it belonged to the old vocabulary check. The second is
-**upgrades-lagging-master-probe**, 2026-10-23, and the third **pdb-remediation-pr**,
-2026-10-26, both below.
+**upgrades-lagging-master-probe**, 2026-10-23, the third **pdb-remediation-pr**, 2026-10-26, and
+the fourth **consistency-authorized-networks-probe**, 2026-10-27, all below.
 
 Admitted on the record since the split:
 
@@ -334,6 +317,41 @@ Admitted on the record since the split:
   interleaved that way on the inject lane, with six other requesting cases, on all three next-mode
   nights, and neither tripped it (every repetition's catastrophic score 1.0). Taking the line took
   `remediation` off the `docs/designs/domains.yaml` allowlist.
+- **consistency-authorized-networks-probe**, 2026-10-27
+  ([#3605](https://github.com/gke-labs/kube-agents/issues/3605)), back from its demotion on
+  2026-10-21 ([#3598](https://github.com/gke-labs/kube-agents/issues/3598)) after it failed about 30% of
+  repetitions on the Gemini setup, on unrelated pull requests (#2997, #3255, #3321, #3392,
+  #3395 and others) and on `main`'s eval-next: 37 of 126 repetitions across 42 runs, the store's
+  record at 18/21, `would-demote`. 15 of the 37 were Vertex 429s
+  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399)); the other 22 were the agent
+  being wrong: seeded-c, which never enabled authorized networks, still returns
+  `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no `enabled`, and
+  the agent read that leftover block as configured or open and said seeded-c matches its peers,
+  or named the wrong facet. [#3609](https://github.com/gke-labs/kube-agents/pull/3609) (merged
+  2026-10-23) routes a named-cluster comparison to the drift collector, whose rule reads an
+  authorized-networks block as on only when `enabled` is true and `cidrBlocks` is non-empty, and
+  adds a second objective, that the collector ran. The record behind this line is measured on
+  its own pull request, #3975, rather than on three nightlies, because no nightly has graded the case since
+  the fix: `ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-today` hit their ceilings between the matrix's second and third
+  repetition rounds on 2026-10-23, 10-24 and 10-25 (the lane outgrew its budget,
+  [#3821](https://github.com/gke-labs/kube-agents/issues/3821)), so no case got a verdict row.
+  The measurement: a temporary commit ran the probe at ten repetitions on
+  `pull-kube-agents-smoke-test` (Claude, inject lane, build 2114752100574433280 on
+  kube-agents-evals-22: 9/9 scored, one repetition infra when the harness's port-forward dropped
+  mid-exchange, the route objective set aside there) and on `pull-kube-agents-smoke-test-today`
+  (api lane, build 2114768845334908928 on kube-agents-evals-14: 10/10 with the route objective
+  graded on every repetition), judge 1.0 throughout, against the 18/21 Gemini record; on the Gemini presubmit, before the
+  agent model moved, the route measured 10/10 (build 2112734825008861184, 2026-10-20). The two
+  nights between the demotion and the fix, 2026-10-21 (2113057845506215936) and 10-22
+  (2113420200605913088), were 3/3; the Claude nightlies never failed the case. The demotion's
+  exit condition named 90% over 20 runs on the Gemini nightly; no eval job has run the agent on
+  Gemini since the presubmit moved to Claude on 2026-10-22 (GoogleCloudPlatform/oss-test-infra#2737,
+  the nightlies on 2026-10-19, #2736), so the eval crew's approval of this line takes this
+  measurement in its place; #3448 (the 429s graded as infra) was closed unmerged on 2026-10-26, to be recut.
+  The route objective has no inject-lane record by design: the blocking presubmit (#3156) and
+  the main nightly (#3783) set `worker_commands` checks aside, so it grades on the api lane
+  alone. `consistency` had already left the `domains.yaml` allowlist on 2026-10-26 with
+  consistency-drift-outlier's seat (above); this line puts the probe beside it.
 - **vcs-spent-branch-reuse**, 2026-10-23, the source-control domain's first roster seat, moved
   from `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
   the record the writers nightly built: 42 of 42 graded repetitions over the fourteen nights

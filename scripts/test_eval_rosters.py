@@ -297,7 +297,8 @@ DEMOTED_AFTER_THE_SPLIT = [
     # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
     # pdb-remediation-pr sat here 2026-10-17 to 2026-10-26 (#3120; its line followed
     # fleet-cost-idle-pool) and took its roster line back after #3145 seeded the manifest it needs.
-    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
+    # consistency-authorized-networks-probe sat here from 2026-10-21 (#3598; its line in the sorted
+    # section) until #3609's drift route and a record measured on its own pull request put its line back.
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the
