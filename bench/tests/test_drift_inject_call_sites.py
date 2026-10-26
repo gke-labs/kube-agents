@@ -92,6 +92,7 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
         "gitops-drift",
         "gitops-drift-deleted-policy",
         "gitops-drift-load-bearing",
+        "gitops-drift-unmanaged-object",
     )
 
     def test_every_call_has_the_arity_the_builder_requires(self):
@@ -124,6 +125,8 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
                 "networking.k8s.io",
             ),
             "gitops-drift-load-bearing": ("patch", "deployments", "apps"),
+            # The core group is empty on the record, as the detector maps it.
+            "gitops-drift-unmanaged-object": ("patch", "namespaces", ""),
         }
         for stack, (verb, resource, group) in expected.items():
             with self.subTest(stack=stack):
@@ -206,6 +209,15 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
                 "principal": "TF_var.drift_principal",
                 "namespace": "TF_local.ns",
                 "name": "TF_local.workload",
+            },
+            # The namespace object itself: no namespace scope, and the
+            # namespace is the name.
+            "gitops-drift-unmanaged-object": {
+                "cluster": "TF_var.host_cluster_name",
+                "location": "TF_var.host_cluster_location",
+                "principal": "TF_var.drift_principal",
+                "namespace": "",
+                "name": "TF_local.ns",
             },
         }
         for stack, fields_expected in expected.items():
