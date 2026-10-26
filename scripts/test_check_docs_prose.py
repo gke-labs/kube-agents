@@ -118,6 +118,36 @@ class ExtractionTest(SiteFixture):
         body = '<LinkCard title="Seamless" description="A robust card, simply put." href="/x/" />\n'
         self.assertEqual(self.kinds(body), [])
 
+    def test_blockquote_separator_ends_a_paragraph(self):
+        """Two quoted paragraphs are two, and a sentence does not run across the `>` line."""
+        half = words(prose.PARAGRAPH_WORD_LIMIT // 2 + 1)
+        self.assertEqual(self.kinds(f"> {half}\n>\n> {half}\n"), [])
+        quoted = f"> {one_sentence(prose.SENTENCE_WORD_LIMIT // 2)}.\n>\n> {one_sentence(prose.SENTENCE_WORD_LIMIT // 2 + 1)}.\n"
+        self.assertEqual(self.kinds(quoted), [])
+
+    def test_quoted_table_row_is_a_table_row(self):
+        body = f"> Lead-in.\n>\n> | a | b |\n> | --- | --- |\n> | x | {words(prose.CELL_WORD_LIMIT + 1)} |\n"
+        self.assertEqual(self.kinds(body), [prose.KIND_CELL])
+
+    def test_wrapped_code_span_is_one_word_and_the_prose_after_it_is_read(self):
+        self.assertEqual(self.kinds("Set `--robust\nflag` here.\n"), [])
+        finding = self.findings("Set `a\nb` simply `c` here.\n")[0]
+        self.assertEqual(finding.kind, prose.KIND_BANNED_WORD)
+        self.assertEqual(finding.line, FRONTMATTER.count("\n") + 2)
+
+    def test_comment_opening_after_prose_is_not_prose(self):
+        for body in (
+            "Rollback is manual today. <!-- TODO: simply\nautomate -->\nAfter.\n",
+            "Rollback is manual today. {/* TODO: simply\nautomate */}\nAfter.\n",
+            "Rollback is manual today. <!-- simply --> After.\n",
+        ):
+            with self.subTest(body=body[:50]):
+                self.assertEqual(self.kinds(body), [])
+
+    def test_comment_opener_in_a_code_span_is_not_an_opener(self):
+        body = "The `<!--` opener is documented here.\nThis is simply text.\n"
+        self.assertEqual(self.kinds(body), [prose.KIND_BANNED_WORD])
+
     def test_line_numbers_are_one_based_source_lines(self):
         body = "First line.\n\n```\ncode\n```\n\nThis is simply text.\n"
         finding = self.findings(body)[0]
@@ -141,6 +171,9 @@ class BannedWordTest(SiteFixture):
 
     def test_match_is_whole_word(self):
         self.assertEqual(self.kinds("A robustness test with delvers and synergistic facet.\n"), [])
+
+    def test_phrase_match_is_whole_word(self):
+        self.assertEqual(self.kinds("The limit is set within today's release.\n"), [])
 
     def test_leverage_as_a_verb_hits(self):
         for text in ("It leverages the cache.", "Leverage the cache.", "We are leveraging it."):
@@ -231,6 +264,12 @@ class StructuralCeilingTest(SiteFixture):
     def test_abbreviation_and_version_do_not_split_a_sentence(self):
         text = "Use e.g. `flag` and v1.2 (i.e. `two`). " + one_sentence(prose.SENTENCE_WORD_LIMIT - 5) + "."
         self.assertEqual(self.kinds(text + "\n"), [prose.KIND_SENTENCE])
+
+    def test_bare_url_keeps_the_sentence_end(self):
+        for url in ("https://example.com/docs", "<https://example.com/>"):
+            with self.subTest(url=url):
+                body = f"Read {url}. Then " + one_sentence(prose.SENTENCE_WORD_LIMIT - 1) + ".\n"
+                self.assertEqual(self.kinds(body), [])
 
     def test_code_span_counts_as_one_word(self):
         spans = " ".join(["`a.very.long.identifier/with-parts`"] * prose.SENTENCE_WORD_LIMIT)

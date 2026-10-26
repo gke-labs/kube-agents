@@ -43,7 +43,7 @@
   },
   "deploy/kustomize.md": {
     "long-paragraph": 2,
-    "long-sentence": 7
+    "long-sentence": 5
   },
   "deploy/multi-project.md": {
     "long-paragraph": 3,
@@ -115,7 +115,7 @@
     "banned-word": 6,
     "long-paragraph": 55,
     "long-table-cell": 10,
-    "long-sentence": 190
+    "long-sentence": 189
   },
   "overview/architecture.mdx": {
     "long-paragraph": 2,

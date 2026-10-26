@@ -23,10 +23,14 @@ a time. This check counts five kinds of finding per page under
 Only prose is read. Frontmatter, fenced code (backtick and tilde), HTML and
 MDX comments, generated regions, MDX ``import`` lines and component tags
 (one-line, or an opening tag whose attributes run on to a closing ``>``) are
-blanked line for line, so every finding keeps its 1-based line number; inline
-code spans and link URLs are replaced in place so an identifier in backticks
-never counts as a word or a banned one. A long paragraph or sentence is
-reported at the line it starts on, with its opening words.
+blanked line for line, so every finding keeps its 1-based line number; a
+blockquote's ``>`` prefix is dropped so the quoted text is read as the
+paragraphs, list items and table rows it is. Inline code spans and link URLs
+are replaced in place so an identifier in backticks never counts as a word or
+a banned one; a code span prettier wrapped across lines, and a comment that
+opens after text, are matched over the whole paragraph with their line
+breaks kept. A long paragraph or sentence is reported at the line it starts
+on, with its opening words.
 
 **The ratchet.** ``scripts/docs_prose_ratchet.json`` records, per page and
 per kind, the count the page carried when the check arrived. A page with no
@@ -121,7 +125,7 @@ LEVERAGE_VERB_RE = re.compile(
 )
 BANNED_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(w) for w in BANNED_WORDS) + r")\b"
-    r"|(?:" + "|".join(re.escape(p) for p in BANNED_PHRASES) + r")",
+    r"|\b(?:" + "|".join(re.escape(p) for p in BANNED_PHRASES) + r")\b",
     re.IGNORECASE,
 )
 
@@ -146,6 +150,10 @@ FRONTMATTER_DELIMITER = "---"
 FENCE_RE = re.compile(r"^\s*(?P<fence>```+|~~~+)")
 HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+# A blockquote's `>` prefix (one per nesting level). Dropped before the line
+# is classified, so a `>`-only separator is a blank line, a quoted `| … |` row
+# is a table row and a quoted paragraph starts at its own capital.
+BLOCKQUOTE_RE = re.compile(r"^\s*(?:>\s?)+")
 TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-*:?\s*\|?\s*$")
 IMPORT_LINE_RE = re.compile(r"^\s*import\s+.*\sfrom\s+['\"].*['\"];?\s*$")
@@ -167,13 +175,22 @@ GENERATED_END_RE = re.compile(r"END GENERATED")
 
 # In-place replacements that keep the column roughly where it was. The code
 # placeholder is capitalised so a sentence that opens with an identifier still
-# starts a sentence for the splitter below.
-CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+# starts a sentence for the splitter below. A span is matched over the
+# paragraph's joined lines, since prettier wraps a long one at the column
+# limit; the line breaks inside it are kept so line numbers survive.
+CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
 CODE_SPAN_PLACEHOLDER = "Code"
+# A comment that opens after prose on its line, closed on the same line or a
+# later line of the paragraph (an inline comment cannot cross a blank line);
+# one left open runs to the paragraph's end. Matched after code spans, so a
+# documented `<!--` in backticks is not an opener.
+INLINE_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)|\{/\*.*?(?:\*/\}|\Z)", re.DOTALL)
 LINK_URL_RE = re.compile(r"\]\([^)\s]*(?:\s+\"[^\"]*\")?\)")
 LINK_URL_PLACEHOLDER = "]"
 # Bare URLs and autolinks count as one word, not as several split on dots.
-BARE_URL_RE = re.compile(r"<?https?://\S+>?")
+# The match stops before trailing punctuation, so the period that ends the
+# sentence after a URL is still there for the splitter.
+BARE_URL_RE = re.compile(r"<?https?://[^\s<>]*[^\s<>.,;:!?)\]]>?")
 BARE_URL_PLACEHOLDER = "url"
 # Emphasis markers would otherwise glue to a word and defeat `\b`.
 EMPHASIS_RE = re.compile(r"[*_]{1,3}")
@@ -230,56 +247,63 @@ class Finding:
         return f"Finding({self.path!s}:{self.line}, {self.kind!r}, {self.detail!r})"
 
 
+def keeping_newlines(placeholder: str):
+    """A ``re.sub`` replacement: ``placeholder`` plus the match's line breaks."""
+    return lambda match: placeholder + PARAGRAPH_JOIN * match.group(0).count(PARAGRAPH_JOIN)
+
+
 def prose_lines(text: str) -> list[str]:
     """The page's lines with everything that is not prose blanked, line for line.
 
     Frontmatter, fences, comments, generated regions, import and tag lines
-    become empty strings; code spans, link URLs, bare URLs, emphasis and inline
-    tags are replaced inside the line. The list has one entry per source line,
-    so index + 1 is the source line number.
+    become empty strings and a blockquote prefix is dropped; code spans and
+    inline comments are replaced over each run of prose lines, then link
+    URLs, bare URLs, emphasis and inline tags inside the line. The list has one
+    entry per source line, so index + 1 is the source line number.
     """
     lines = text.splitlines()
-    out: list[str] = []
+    kept: list[str] = []
     in_frontmatter = False
     fence: str | None = None
     in_comment: str | None = None
     in_generated = False
     in_tag = False
     for index, raw in enumerate(lines):
+        raw = BLOCKQUOTE_RE.sub("", raw, count=1)
         stripped = raw.strip()
         if index == 0 and stripped == FRONTMATTER_DELIMITER:
             in_frontmatter = True
-            out.append("")
+            kept.append("")
             continue
         if in_frontmatter:
             if stripped == FRONTMATTER_DELIMITER:
                 in_frontmatter = False
-            out.append("")
+            kept.append("")
             continue
         if fence is not None:
             match = FENCE_RE.match(raw)
             if match and match.group("fence")[0] == fence[0] and len(match.group("fence")) >= len(fence):
                 fence = None
-            out.append("")
+            kept.append("")
             continue
         match = FENCE_RE.match(raw)
         if match:
             fence = match.group("fence")
-            out.append("")
+            kept.append("")
             continue
         if in_comment is not None:
             if in_comment in raw:
                 in_comment = None
-            out.append("")
+            kept.append("")
             continue
         if in_generated:
             if GENERATED_END_RE.search(raw):
                 in_generated = False
-            out.append("")
+            kept.append("")
             continue
         if GENERATED_BEGIN_RE.search(raw):
             in_generated = True
-            out.append("")
+            kept.append("")
             continue
         for opener, closer in ((HTML_COMMENT_OPEN, HTML_COMMENT_CLOSE), (MDX_COMMENT_OPEN, MDX_COMMENT_CLOSE)):
             if stripped.startswith(opener):
@@ -288,31 +312,60 @@ def prose_lines(text: str) -> list[str]:
                 raw = ""
                 break
         if not raw:
-            out.append("")
+            kept.append("")
             continue
         if in_tag:
             if TAG_CLOSE_RE.search(raw):
                 in_tag = False
-            out.append("")
+            kept.append("")
             continue
         if TAG_OPEN_RE.match(raw):
             in_tag = True
-            out.append("")
+            kept.append("")
             continue
         if IMPORT_LINE_RE.match(raw) or TAG_LINE_RE.match(raw):
-            out.append("")
+            kept.append("")
             continue
-        # A `* item` bullet keeps its marker: the emphasis strip below would
-        # otherwise turn it into plain text and merge it into the paragraph.
-        marker = LIST_ITEM_RE.match(raw)
-        prefix, line = (marker.group(0), raw[marker.end() :]) if marker else ("", raw)
-        line = CODE_SPAN_RE.sub(CODE_SPAN_PLACEHOLDER, line)
-        line = LINK_URL_RE.sub(LINK_URL_PLACEHOLDER, line)
-        line = BARE_URL_RE.sub(BARE_URL_PLACEHOLDER, line)
-        line = INLINE_TAG_RE.sub(" ", line)
-        line = EMPHASIS_RE.sub("", line)
-        out.append(prefix + line)
-    return out
+        kept.append(raw if stripped else "")
+    return [line for run in prose_runs(kept) for line in run]
+
+
+def prose_runs(kept: list[str]) -> list[list[str]]:
+    """``kept`` split at its blank lines, each run's prose replaced in place.
+
+    A run is one paragraph's worth of consecutive lines. Code spans and inline
+    comments are replaced over the run joined with ``PARAGRAPH_JOIN``, with
+    their line breaks kept, so a span wrapped across two lines is one ``Code``
+    and the prose after it stays on its own line; the rest is per line.
+    """
+    runs: list[list[str]] = []
+    run: list[str] = []
+    for line in kept + [""]:
+        if line:
+            run.append(line)
+            continue
+        if run:
+            joined = PARAGRAPH_JOIN.join(run)
+            joined = CODE_SPAN_RE.sub(keeping_newlines(CODE_SPAN_PLACEHOLDER), joined)
+            joined = INLINE_COMMENT_RE.sub(keeping_newlines(""), joined)
+            runs.append([prose_line(part) for part in joined.split(PARAGRAPH_JOIN)])
+            run = []
+        runs.append([""])
+    runs.pop()  # the sentinel's own blank
+    return runs
+
+
+def prose_line(raw: str) -> str:
+    """One prose line with link URLs, bare URLs, inline tags and emphasis replaced."""
+    # A `* item` bullet keeps its marker: the emphasis strip below would
+    # otherwise turn it into plain text and merge it into the paragraph.
+    marker = LIST_ITEM_RE.match(raw)
+    prefix, line = (marker.group(0), raw[marker.end() :]) if marker else ("", raw)
+    line = LINK_URL_RE.sub(LINK_URL_PLACEHOLDER, line)
+    line = BARE_URL_RE.sub(BARE_URL_PLACEHOLDER, line)
+    line = INLINE_TAG_RE.sub(" ", line)
+    line = EMPHASIS_RE.sub("", line)
+    return prefix + line
 
 
 def word_count(text: str) -> int:
