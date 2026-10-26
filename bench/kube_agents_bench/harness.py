@@ -204,31 +204,15 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
-# Worker tools that do not count as substantive action (protocol reads, board management, read-only memory, and research lookups).
-_WORKER_NON_ACTION_TOOLS = frozenset({
-    *_BOARD_NON_ACTION_TOOLS,
-    "memory",
-    "memory_recall",
-    "memory_reflect",
-    "multiuser_memory",
-    "web_search",
-    "tool_search",
-    "skill_view",
-    "todo",
-    "todo_list",
-    "session_search",
-    "mcp__developer_knowledge__search_documents",
-})
-
-
 def _is_substantive_worker_action(name: str | None) -> bool:
     """Whether a tool entry recorded for a delegated worker constitutes substantive action.
 
     Action is defined affirmatively by verbs and toolsets that mutate state or execute
     infrastructure operations: terminal/shell commands, code execution, file mutation
     tools, platform control / GKE MCP tools, and worker completion/block verbs.
-    Protocol reads, board queries, memory lookups, and research tools (such as web_search
-    and developer knowledge document lookups) are non-action lookups.
+    Protocol reads (such as read_file and search_files), board queries, memory lookups,
+    and research tools (such as web_search and developer knowledge document lookups)
+    are non-action lookups.
     """
     if not name:
         return False
@@ -241,11 +225,11 @@ def _is_substantive_worker_action(name: str | None) -> bool:
     # Code execution toolset
     if name in {"execute_code"}:
         return True
-    # File tools
-    if name in {"write_file", "patch", "read_file", "search_files"}:
+    # File mutation tools
+    if name in {"write_file", "patch"}:
         return True
     # Platform control and GKE infrastructure MCP tools
-    if name.startswith(("mcp__platform_control__", "mcp__gke__", "mcp__platform_control_", "mcp__gke_")):
+    if name.startswith(("mcp__platform_control_", "mcp__gke_")):
         return True
     return False
 
@@ -806,6 +790,20 @@ def _canonical_session_tokens(
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+
+
+def _is_rate_limited_triage(
+    status: str,
+    task_id: str,
+    summaries: dict[str, str],
+    errors: dict[str, str],
+) -> bool:
+    """Whether a card in triage carries an infrastructure rate limit failure reason."""
+    if status != "triage":
+        return False
+    summary = summaries.get(task_id) or ""
+    error = errors.get(task_id) or ""
+    return bool(_extract_infra_failure_reason(summary) or _extract_infra_failure_reason(error))
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
 # can file a card can always read one back.
@@ -2911,6 +2909,19 @@ class KubeAgentsHarness(AgentHarness):
         def _status(task_id: str) -> str:
             return str(read.cards.get(task_id, {}).get("status") or "unknown")
 
+        def _is_terminal(task_id: str) -> bool:
+            st = _status(task_id)
+            if st in _TERMINAL_STATUSES:
+                return True
+            if st == "triage":
+                card = read.cards.get(task_id, {}) if read is not None else {}
+                runs = card.get("runs") or []
+                newest = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+                summary = str(newest.get("summary") or "")
+                error = str(newest.get("error") or "")
+                return bool(_extract_infra_failure_reason(summary) or _extract_infra_failure_reason(error))
+            return False
+
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
             _purge_card_state(awaited, _EXEC_TIMEOUT)
             return _DelegationTransportExhausted(
@@ -2942,7 +2953,7 @@ class KubeAgentsHarness(AgentHarness):
                 )
             missing.extend(gone)
             awaited = [t for t in awaited if t not in gone]
-            return [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+            return [t for t in awaited if not _is_terminal(t)]
 
         outstanding = _merge()
         deadline = time.monotonic() + delegation_timeout
@@ -2967,7 +2978,7 @@ class KubeAgentsHarness(AgentHarness):
         # the card is unblocked to run again), or a ``tasks.result`` stashed
         # before a refused completion -- and delivering it would both grade
         # that text and hide the ceiling from the scorer.
-        settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
+        settled = [t for t in awaited if _is_terminal(t)]
         if settled:
             final = _read(settled)
             if final is None:
@@ -2978,7 +2989,7 @@ class KubeAgentsHarness(AgentHarness):
         observed.extend(
             e
             for t in settled
-            if _status(t) in _TERMINAL_STATUSES and (e := read.as_shown(t)) is not None
+            if _is_terminal(t) and (e := read.as_shown(t)) is not None
         )
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if missing:
@@ -3143,7 +3154,7 @@ class KubeAgentsHarness(AgentHarness):
                         last_board_errors.pop(t, None)
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
-                    (on_board[t] in _TERMINAL_STATUSES or (on_board[t] == "triage" and (t in bsummaries or t in berrors)))
+                    (on_board[t] in _TERMINAL_STATUSES or _is_rate_limited_triage(on_board[t], t, bsummaries, berrors))
                     for t in outstanding
                 ):
                     continue
@@ -3232,13 +3243,19 @@ class KubeAgentsHarness(AgentHarness):
             fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
             latest.update(fresh_reported)
             for t, st in fresh_reported.items():
-                if st not in _TERMINAL_STATUSES:
+                if st not in _TERMINAL_STATUSES and not _is_rate_limited_triage(
+                    st, t, last_board_summaries, last_board_errors
+                ):
                     last_board_summaries.pop(t, None)
                     last_board_errors.pop(t, None)
             _fold_status_turn(
                 result,
                 status_turn,
-                settled=any(s in _TERMINAL_STATUSES for s in fresh_reported.values()),
+                settled=any(
+                    s in _TERMINAL_STATUSES
+                    or _is_rate_limited_triage(s, t, last_board_summaries, last_board_errors)
+                    for t, s in fresh_reported.items()
+                ),
             )
             # ``observed`` needs each distinct result once, so it stays on the
             # content test -- a replayed reading adds nothing to the answer.
@@ -3264,7 +3281,14 @@ class KubeAgentsHarness(AgentHarness):
             merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
             awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
-            outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]
+            outstanding = [
+                t
+                for t in awaited
+                if statuses.get(t) not in _TERMINAL_STATUSES
+                and not _is_rate_limited_triage(
+                    statuses.get(t, ""), t, last_board_summaries, last_board_errors
+                )
+            ]
 
         # Only on the deadline path: after a transport failure or a mute agent
         # the budget is untouched, and claiming it ran out would misreport why
@@ -3357,7 +3381,10 @@ class KubeAgentsHarness(AgentHarness):
         worker_acted = (
             any(
                 isinstance(e, dict)
-                and _is_substantive_worker_action(e.get("name"))
+                and any(
+                    _is_substantive_worker_action(n)
+                    for n in ({e.get("name")} | worker_trajectory.wrapped_tool_names(e))
+                )
                 for e in (captured.entries if captured else [])
             )
             or bool(result.metadata.get("worker_commands"))

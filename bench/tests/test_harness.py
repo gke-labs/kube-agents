@@ -2475,6 +2475,47 @@ def test_delegated_worker_board_rate_limit_clearing_branches_pinned(
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
 
 
+@pytest.mark.parametrize(
+    ("key", "val"),
+    [
+        ("summaries", "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"),
+        ("errors", "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"),
+    ],
+)
+def test_delegated_worker_board_rate_limit_triage_marks_run_infra(
+    key: str,
+    val: str,
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board read reporting triage with a rate limit summary or error retires the wait and marks infra."""
+    board_payload = {
+        "statuses": {_TASK_ID: "triage"},
+        "summaries": {_TASK_ID: val} if key == "summaries" else {},
+        "errors": {_TASK_ID: val} if key == "errors" else {},
+    }
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            return f"{board.BOARD_PRESENT}\n{json.dumps(board_payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("triage")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+
+
 def test_a_mute_agent_leaves_no_transcript_behind(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4535,8 +4576,8 @@ def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
     monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
         "t_1": harness._WorkerLog(body, "100", "100")
     })
-    # Worker executed a tool call
-    tool_entry = {"name": "kubectl", "args": {"command": "get pods"}, "result": "ok"}
+    # Worker executed a tool call tagged with agent
+    tool_entry = {"name": "kubectl", "agent": "platform", "args": {"command": "get pods"}, "result": "ok"}
     monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
         entries=[tool_entry],
         tokens={},
@@ -4666,20 +4707,25 @@ def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
     assert "card on board recorded rate_limit" in res.errors[0]
 
 
-def test_worker_non_action_tools_contains_mandated_board_verbs() -> None:
-    """_WORKER_NON_ACTION_TOOLS must include all non-substantive board verbs and read-only memory tools."""
-    assert {
-        "kanban_show",
-        "kanban_heartbeat",
-        "kanban_comment",
-        "kanban_create",
-        "memory",
-        "memory_recall",
-        "memory_reflect",
-    }.issubset(harness._WORKER_NON_ACTION_TOOLS)
+_WORKER_NON_ACTION_TEST_TOOLS = (
+    *harness._BOARD_NON_ACTION_TOOLS,
+    "read_file",
+    "search_files",
+    "memory",
+    "memory_recall",
+    "memory_reflect",
+    "multiuser_memory",
+    "web_search",
+    "tool_search",
+    "skill_view",
+    "todo",
+    "todo_list",
+    "session_search",
+    "mcp__developer_knowledge__search_documents",
+)
 
 
-@pytest.mark.parametrize("tool_name", sorted(harness._WORKER_NON_ACTION_TOOLS))
+@pytest.mark.parametrize("tool_name", sorted(_WORKER_NON_ACTION_TEST_TOOLS))
 def test_settle_delegated_worker_rate_limit_after_kanban_show_is_infra(
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
@@ -4749,14 +4795,54 @@ def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra
     assert "worker transcript for t_1 logged rate_limit" in res.errors[0]
 
 
+@pytest.mark.parametrize(
+    "substantive_call",
+    [
+        {"name": "kanban_complete", "args": {"task_id": "t_1"}},
+        {"name": "kanban_block", "args": {"task_id": "t_1"}},
+        {"name": "terminal", "args": {"command": "kubectl get pods"}},
+        {"name": "bash", "args": {"command": "kubectl get pods"}},
+        {"name": "execute_code", "args": {"code": "print(1)"}},
+        {"name": "write_file", "args": {"path": "/tmp/out.txt", "content": "ok"}},
+        {"name": "patch", "args": {"path": "/tmp/out.txt", "patch": "diff"}},
+        {"name": "mcp__gke__list_clusters", "args": {}},
+        {"name": "mcp__platform_control__apply", "args": {}},
+        {"name": "tool_call", "args": {"name": "mcp__gke__delete_k8s_resource"}},
+        {"name": "tool_call", "args": {"calls": [{"name": "mcp__platform_control__get_cluster_profile_name"}]}},
+    ],
+    ids=[
+        "kanban_complete",
+        "kanban_block",
+        "terminal",
+        "bash",
+        "execute_code",
+        "write_file",
+        "patch",
+        "mcp_gke_direct",
+        "mcp_platform_control_direct",
+        "mcp_gke_wrapped",
+        "mcp_platform_control_wrapped",
+    ],
+)
 def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_tool_stays_graded(
     monkeypatch: pytest.MonkeyPatch,
+    substantive_call: dict[str, Any],
 ) -> None:
-    """A worker that executed a substantive tool (e.g. bash/kubectl) after kanban_show remains graded."""
+    """A worker that executed a substantive tool after kanban_show remains graded."""
     body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
     monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
         "t_1": harness._WorkerLog(body, "100", "100")
     })
+    substantive_entry = {
+        "agent": "platform",
+        "task": "t_1",
+        "session": "sess_1",
+        "result": "ok",
+        "failed": False,
+        "at": "2026-10-26T12:00:05Z",
+        "_id": "call_2",
+        **substantive_call,
+    }
     monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
         entries=[
             {
@@ -4770,17 +4856,7 @@ def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_to
                 "at": "2026-10-26T12:00:00Z",
                 "_id": "call_1",
             },
-            {
-                "name": "bash",
-                "agent": "platform",
-                "task": "t_1",
-                "session": "sess_1",
-                "args": {"command": "kubectl get pods"},
-                "result": "pod-1",
-                "failed": False,
-                "at": "2026-10-26T12:00:05Z",
-                "_id": "call_2",
-            },
+            substantive_entry,
         ],
         tokens={},
         unbilled=[],

@@ -1635,25 +1635,8 @@ class AnswerFirstVerifier(BaseVerifier):
 
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
-_TOOL_CALL_WRAPPER = "tool_call"
-
-
-def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
-    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
-    if entry.get("name") != _TOOL_CALL_WRAPPER:
-        return set()
-    args = entry.get("args")
-    if not isinstance(args, dict):
-        return set()
-    names: set[str] = set()
-    if args.get("name"):
-        names.add(str(args["name"]))
-    calls = args.get("calls")
-    if isinstance(calls, list):
-        for c in calls:
-            if isinstance(c, dict) and c.get("name"):
-                names.add(str(c["name"]))
-    return names
+_TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
+_wrapped_tool_names = worker_trajectory.wrapped_tool_names
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
