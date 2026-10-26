@@ -171,7 +171,9 @@ class SpecToolRegistryTest(unittest.TestCase):
     # disables, and the Platform Agent's config gives its kanban workers the
     # `hermes-cli` bundle (which holds that toolset) on `cli` and does not
     # disable `file`. A name added here needs the same.
-    HERMES_FILE_TOOLS = {"write_file", "patch"}
+    # `read_file` is the read half of the same toolset: the retrospective cases
+    # grade the worker reading the saved report or the chat record through it.
+    HERMES_FILE_TOOLS = {"read_file", "write_file", "patch"}
     HERMES_FILE_TOOLSET = "file"
     HERMES_FILE_TOOL_DOC = "agents/chat/config.yaml"
     PLATFORM_CONFIG = "agents/platform/config.yaml"

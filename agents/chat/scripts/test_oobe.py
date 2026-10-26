@@ -379,9 +379,10 @@ class StageTest(unittest.TestCase):
             self.assertEqual(env["HERMES_HOME"], str(self.d / "profiles" / "platform"))
 
     def test_the_chain_follows_1866s_order(self):
+        # #1866's four in its order, then the upgrade retrospective.
         self.assertEqual(
             oobe.FIRST_RUN_AUDITS,
-            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention"),
+            ("fleet-wide-cost-analysis", "compliance-audit", "obtainability-audit", "stockout-prevention", "upgrade-retrospective"),
         )
 
     def test_the_trigger_marks_the_job_due_and_does_not_run_it(self):
@@ -791,11 +792,12 @@ class StageTest(unittest.TestCase):
             {"id": "obtainability-audit", "enabled": False, "state": "paused", "paused_at": "2026-10-06T00:00:00"},
             {"id": "stockout-prevention", "enabled": True, "paused_at": "2026-10-06T00:00:00"},
             {"id": "fleet-wide-cost-analysis", "enabled": True},
+            {"id": "upgrade-retrospective", "enabled": True},
         ])
         self._file_scan()
         _board(self.board, [_ranking("done")])
         self._drive()
-        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis"])
+        self.assertEqual(self._started_ids(), ["fleet-wide-cost-analysis", "upgrade-retrospective"])
         state = oobe.read_state(self.d)
         self.assertEqual(state[oobe.STATE_HELD], {
             "compliance-audit": "disabled",

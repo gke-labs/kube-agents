@@ -167,16 +167,6 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
-    # Has its fixture (its own stack) and its eval record (#3467: red on main,
-    # three greens on the fix, on a dev install), and belongs in the nightly.
-    # The pool runners hold no role that creates a Cloud Monitoring alert
-    # policy, so every apply of its stack would fail with 403; #3632 grants
-    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
-    # hack/eval/nightly-cases.txt.
-    "monitoring-alert-policy-read": (
-        "#3632: stack case held out of the nightly until the pool runners can "
-        "create a Cloud Monitoring alert policy"
-    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -312,6 +302,9 @@ FIXTURE_NOT_READY = {
     "terraform-node-pool-autoscaling-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    "terraform-new-cluster-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
@@ -443,6 +436,11 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env "
+        "and a manifest for eval-open-pr-workload in each pool project's *-infra repository "
+        "so the follow-up Platform Agent card can open the recommended remediation Pull Request"
+    ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
         "version the cluster's next minor stops serving, which no standing fleet "
@@ -463,6 +461,15 @@ FIXTURE_NOT_READY = {
         "and an accelerator pool costs by the hour on every pool project), so "
         "the surge-capacity rule's two surge halves are covered by unit tests on "
         "a recorded cluster record and node list until the fixture lands"
+    ),
+    "upgrades-readiness-rollout-sequence-precheck": (
+        "#3798: needs gkehub.googleapis.com enabled, roles/gkehub.viewer bound for "
+        "the agent's service account, a fleet, and the standing RolloutSequence "
+        "`seeded-train` on every pool project, so a worker's `gcloud container fleet "
+        "rolloutsequences list` on the eval project answers `existing 1; plan "
+        "blocked`, the line the case pins; no pool project has them today, so the "
+        "read fails for a reason that is not the case's, and the blocked path is "
+        "graded by the rule's unit tests on a recorded list"
     ),
 }
 
@@ -537,6 +544,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
@@ -591,6 +599,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
     "audit_chat_report_posted": (),
+    # This repository, agent-pod- and cluster-reading: the namespace names the
+    # burst whose admitted alerts must each have started a triage turn.
+    "triage_starts": ("namespace",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

@@ -260,18 +260,19 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertIn(f"EVAL_FORGE=gitlab: the GitLab lane runs {len(self.lane_entries())} case(s) on the presubmit tier", result.stdout)
         self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
         # pdb-remediation-pr was the lane's one roster case from 2026-10-14
-        # (#2016) until its demotion to the nightly on 2026-10-17 (#3120), so
-        # the roster intersected with the lane is empty: all three seats are
-        # held out, the export is empty, and the log says rung 4 is disarmed.
-        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
-        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+        # (#2016) until its demotion to the nightly on 2026-10-17 (#3120),
+        # and the lane held none until vcs-spent-branch-reuse's roster line
+        # of 2026-10-23: the roster intersected with the lane is that case,
+        # and rung 4 is armed for it.
+        self.assertEqual(lines_tagged(result, "ROSTER"), ["vcs-spent-branch-reuse"])
+        self.assertNotIn("rung 4 is disarmed", result.stdout)
 
     def test_a_roster_case_in_the_lane_arms_the_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
             # Two roster cases, listed out of roster order; the real lane holds
-            # none since pdb-remediation-pr's demotion (2026-10-17, #3120).
+            # one, vcs-spent-branch-reuse, since 2026-10-23.
             (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/reliability-pdb-probe/task.yaml\n")
             result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -286,8 +287,8 @@ class GitLabLaneTest(unittest.TestCase):
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
             # agent-kanban-smoke is the lane's only roster case and is
-            # inject-excluded; vcs-spent-branch-reuse is held out.
-            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/vcs-spent-branch-reuse/task.yaml\n")
+            # inject-excluded; vcs-review-feedback-read-back is held out.
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/vcs-review-feedback-read-back/task.yaml\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("every blocking-roster case in eval/gitlab-cases.txt is excluded on the inject lane", result.stderr)
@@ -301,29 +302,30 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            # Built here rather than read from the real lane (roster-free
-            # again since 2026-10-17, #3120, but with no inject-excluded
-            # case): two held-out seats, one of them inject-excluded.
-            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/vcs-spent-branch-reuse/task.yaml\n./tasks/vcs-review-feedback-read-back/task.yaml\n")
-            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\nvcs-review-feedback-read-back\n")
+            # Built here rather than read from the real lane (which holds a
+            # roster case since 2026-10-23): two held-out seats, one of them
+            # inject-excluded.
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/vcs-review-feedback-read-back/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\npdb-remediation-pr\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-spent-branch-reuse/task.yaml"])
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-review-feedback-read-back/task.yaml"])
         self.assertNotIn("excluded on the inject lane", result.stderr)
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
     def test_a_gitlab_nightly_runs_the_same_lane_list(self):
         """The GitLab nightly is the lane's list once a night, not the
         catalogue: nothing else grades the forge, and the roster export is
-        the lane's (empty since pdb-remediation-pr's demotion of 2026-10-17,
-        #3120; it held the lane's one roster line from 2026-10-14)."""
+        the lane's (vcs-spent-branch-reuse since its roster line of
+        2026-10-23; empty from pdb-remediation-pr's demotion of 2026-10-17,
+        #3120, until then)."""
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
         self.assertIn(f"the GitLab lane runs {len(self.lane_entries())} case(s) on the nightly tier", result.stdout)
         self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
-        self.assertEqual(lines_tagged(result, "ROSTER"), [""])
-        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), ["vcs-spent-branch-reuse"])
+        self.assertNotIn("rung 4 is disarmed", result.stdout)
 
     def test_the_github_nightlys_part_split_is_refused_on_the_gitlab_lane(self):
         section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
@@ -730,7 +732,7 @@ class NightlyPartTest(unittest.TestCase):
         left_out = ",".join(pathlib.Path(e).parent.name for e in self.nightly_matrix() if self.is_writer(e))
         self.assertIn(f"Nightly part: main ({len(expected)} of {len(self.nightly_matrix())} cases); left out: {left_out}\n", result.stdout)
         # A roster case in the writers part (pdb-remediation-pr 2026-10-14 to
-        # 2026-10-17; none since its demotion, #3120) leaves the main part's
+        # 2026-10-17; vcs-spent-branch-reuse since 2026-10-23) leaves the main part's
         # export: the other part grades it.
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c not in INJECT_LANE_REQUESTING)])
 
@@ -743,8 +745,9 @@ class NightlyPartTest(unittest.TestCase):
         self.assertIn(f"Nightly part: writers ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
         # The export is the roster intersected with the part: a roster name
         # the suite never grades would trip bench-gate's misspelled-roster
-        # banner, so only requesting cases on the roster are named (none since
-        # pdb-remediation-pr's demotion of 2026-10-17, #3120: an empty export).
+        # banner, so only requesting cases on the roster are named
+        # (vcs-spent-branch-reuse since 2026-10-23; empty from
+        # pdb-remediation-pr's demotion of 2026-10-17, #3120, until then).
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in INJECT_LANE_REQUESTING)])
 
     def test_the_two_parts_cover_the_nightly_once(self):

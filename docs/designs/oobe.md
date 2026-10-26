@@ -121,8 +121,8 @@ reason it records says what it knows: the scan had settled (`SKIP_NOT_NEW`) or h
 ### 4.2 Which audits
 
 The four audits [#1866](https://github.com/gke-labs/kube-agents/issues/1866) names, in the order it
-chains them (cost, security, reliability, capacity), by their job ids in
-`agents/platform/cron/jobs.json`:
+chains them (cost, security, reliability, capacity), then the upgrade retrospective, by their job
+ids in `agents/platform/cron/jobs.json`:
 
 | Order | Job id                     | Audit                            | Normal schedule (UTC) |
 | ----- | -------------------------- | -------------------------------- | --------------------- |
@@ -130,7 +130,11 @@ chains them (cost, security, reliability, capacity), by their job ids in
 | 2     | `compliance-audit`         | Security and RBAC posture        | Daily 06:20           |
 | 3     | `obtainability-audit`      | Workload reliability             | Daily 06:50           |
 | 4     | `stockout-prevention`      | Stockout prevention and capacity | Daily 09:20           |
+| 5     | `upgrade-retrospective`    | Upgrade retrospective            | Sundays 18:00         |
 
+The upgrade retrospective is chained after the four, so they keep #1866's order and the review of
+every cluster's last upgrade follows the audits whose findings it cites; its first run is the
+baseline of every cluster the install manages ([`upgrade-retrospective.md`](upgrade-retrospective.md)).
 The other five governance jobs keep their schedules.
 
 ### 4.3 Firing
@@ -140,7 +144,7 @@ has ended, whatever its outcome. The shipped schedule staggers the audits for th
 (`autonomous-watchdogs.md`: "Stagger start minutes so two audits never contend for the same
 session"). Four started in the same minute put a fresh CI install's gateway pod under memory
 pressure for the best part of an hour and broke the cluster reads of a case running beside them.
-For the same reason the chain waits while any of the four has a run going, whatever started it,
+For the same reason the chain waits while any of the five has a run going, whatever started it,
 before the first mark and between marks; a mark that finds its audit already running counts that
 run as its own, and one the store skipped for any other reason counts as not claimed.
 A mark the scheduler has not claimed after `START_LIMIT_SECONDS` (10 minutes) is made again, as a
@@ -195,9 +199,9 @@ repository, a one-line summary in the home channel when one is set, and remediat
 for the findings that auto-promote, at most five per audit run (`audit_report.py`,
 `AUTO_PROMOTION_CAP`): critical findings whose fix is a manifest, and major ones on the checks the
 collector vouches for (`MAJOR_SWEEP_CHECKS`). Each audit's SOP lists its own in §5. A scheduled run with nothing new is silent
-(same section), so the morning after brings no second burst. The four run one after another
-(§4.3), so the last starts once the first three have ended (§9, chain length); each
-takes 9–15 minutes on its own, most of it inside the SOP
+(same section), so the morning after brings no second burst. The five run one after another
+(§4.3), so the last, the retrospective, starts once the first four have ended (§9, chain length);
+each takes 9–15 minutes on its own, most of it inside the SOP
 ([#985 "Fleet audit SOPs cost 9–15 min per run"](https://github.com/gke-labs/kube-agents/issues/985)).
 
 ## 5. Folding in the bootstrap jobs
@@ -246,15 +250,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation              | What the operator sees                                                                                   | Recovery                                                                                              |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
-| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
-| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)             | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                                  | Recovery                                                                                              |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                     | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                      | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                | As today                                                                                              |
+| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying no GitOps repository is connected | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)                            | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the fallback                                                                                            | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                    | As today for the report                                                                               |
 
 ## 7. Not in this design
 
@@ -284,7 +288,7 @@ times. It rides with the audits stage, whose eval case covers both.
 3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
 
 Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
-off the infra lock; each repetition waits for the previous one's four audits to finish). The stack
+off the infra lock; each repetition waits for the previous one's five audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
@@ -292,9 +296,9 @@ at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, 
 `.oobe_audits_fired`, and puts back the `oobe` job when the image ships one; the teardown restores
 the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
-passes when the stage's `.oobe_audits_fired` lists all four audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
-an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions. The case's runs are
-real audit runs on four streams, so it declares them (`audit_streams`) and the runner holds their
+passes when the stage's `.oobe_audits_fired` lists all five audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
+an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions, before the retrospective joined the stage; the five-audit stage's green is the case's nightly record, not this document's. The case's runs are
+real audit runs on five streams, so it declares them (`audit_streams`) and the runner holds their
 locks for the unit. Every unit on an audit stream first waits, up to two hours, while the install
 has a run of that audit claimed, running or marked due, a stage under way is to mark it next, or a
 stage this case armed and could not disarm has still to run it (`wait_platform_runs` in
@@ -311,8 +315,9 @@ forge: the shared install has a repository, and removing it mid-run would break 
 ## 9. Open questions
 
 - **Chain length.** Each audit took one to eight minutes on a four-cluster install with
-  `gemini-3.1-flash-lite`, so the chain ends within about half an hour of the scan there. On a large
-  fleet the last audit may land an hour or more after the scan.
+  `gemini-3.1-flash-lite`, so with the retrospective fifth the stage is done, the four audits ended
+  and the fifth started, within about forty minutes of the scan there, inside the eval stack's
+  hour-long wait. On a large fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
   it reads as noise, day one narrows to fewer audits. The inventory report no longer duplicates any
   of the four (#2386), so the choice is about volume, not overlap.

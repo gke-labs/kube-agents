@@ -97,12 +97,27 @@ type NATSBus struct {
 	client *lib.Client
 	cfg    BusConfig
 
-	// mu serialises status reads, so concurrent callers share one read
-	// rather than each opening a consumer, and guards the cached answer.
+	// mu guards the cached answer and the read in flight, which concurrent
+	// callers share rather than each opening a consumer.
 	mu       sync.Mutex
 	cached   BusStatus
 	cachedAt time.Time
+	inflight *statusRead
 	now      func() time.Time
+	// readBus is one read of the bus (read, but for tests).
+	readBus func(context.Context) BusStatus
+
+	// readers holds one token per consumer this server may still hold
+	// (maxTaskReaders); reapDelay is how long a released slot stays taken.
+	readers   chan struct{}
+	reapDelay time.Duration
+}
+
+// statusRead is one status read in flight: st is its answer once done is
+// closed.
+type statusRead struct {
+	done chan struct{}
+	st   BusStatus
 }
 
 // DialBus connects to the bus once. Its caller retries a bus that is not
@@ -129,7 +144,9 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
 	}
-	return &NATSBus{client: client, cfg: cfg, now: time.Now}, nil
+	b := &NATSBus{client: client, cfg: cfg, now: time.Now, readers: make(chan struct{}, maxTaskReaders), reapDelay: taskConsumerIdle}
+	b.readBus = b.read
+	return b, nil
 }
 
 // Close drops the connection.
@@ -138,22 +155,56 @@ func (b *NATSBus) Close() { b.client.Close() }
 // Status reports the bus's state, read at most statusCacheTTL ago. Every
 // part that fails is named in Problems rather than failing the whole report,
 // so a half-working bus still tells the caller which half.
+//
+// The read runs detached from its caller, bounded by statusTimeout alone,
+// and is cached when it ends: a caller that gives up (a client that
+// disconnected) is answered at once with that, and the read it started still
+// answers the next caller rather than leaving it to read DIRECTORY again.
 func (b *NATSBus) Status(ctx context.Context) BusStatus {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.cachedAt.IsZero() && b.now().Sub(b.cachedAt) < statusCacheTTL {
+		defer b.mu.Unlock()
 		return b.cached
 	}
-	rctx, cancel := context.WithTimeout(ctx, statusTimeout)
-	defer cancel()
-	st := b.read(rctx)
-	// A read the caller cut short (a client that disconnected) answers that
-	// caller only: cached, its cancellation would be every caller's answer.
-	if ctx.Err() != nil {
-		return st
+	sr := b.inflight
+	if sr == nil {
+		sr = &statusRead{done: make(chan struct{})}
+		b.inflight = sr
+		go b.refresh(sr)
 	}
-	b.cached, b.cachedAt = st, b.now()
-	return b.cached
+	b.mu.Unlock()
+	select {
+	case <-sr.done:
+		return sr.st
+	case <-ctx.Done():
+		return BusStatus{
+			Deployment: b.cfg.Deployment,
+			URL:        b.cfg.URL,
+			User:       b.cfg.User,
+			Problems:   []string{fmt.Sprintf("the request ended while the status read was still running: %v", ctx.Err())},
+		}
+	}
+}
+
+// refresh runs one read for sr and caches its answer.
+func (b *NATSBus) refresh(sr *statusRead) {
+	rctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+	defer cancel()
+	// The read runs outside net/http's per-request recovery, so a panic in
+	// it is turned into a problem here; either way the read is stored and
+	// its waiters released, or every later caller would wait on it.
+	defer func() {
+		if p := recover(); p != nil {
+			sr.st = BusStatus{Deployment: b.cfg.Deployment, URL: b.cfg.URL, User: b.cfg.User,
+				Problems: []string{fmt.Sprintf("the status read failed: %v", p)}}
+		}
+		b.mu.Lock()
+		b.cached, b.cachedAt = sr.st, b.now()
+		b.inflight = nil
+		b.mu.Unlock()
+		close(sr.done)
+	}()
+	sr.st = b.readBus(rctx)
 }
 
 func (b *NATSBus) read(ctx context.Context) BusStatus {
@@ -241,45 +292,41 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 	if pending == 0 {
 		return cards, nil
 	}
+	// Read through the shared byte-bounded reader, as every read here is:
+	// a DIRECTORY that grew past readMaxBytes is reported, with the cards
+	// read before it, rather than read whole into the pod.
+	r, err := b.newBudgetReader(cons, int(min(pending, directoryFetchBatch)), readMaxBytes)
+	if err != nil {
+		return cards, err
+	}
+	defer r.stop()
 	seen := 0
 	for {
-		wait := directoryFetchWait
-		if dl, ok := ctx.Deadline(); ok {
-			wait = min(wait, time.Until(dl))
-		}
+		wait := fetchWait(ctx, directoryFetchWait)
 		if wait < minFetchWait {
 			return cards, fmt.Errorf("read %d of the directory before the deadline", seen)
 		}
-		// Sized to what is pending, so the fetch returns as soon as it has
-		// it rather than waiting out FetchMaxWait for a batch that cannot fill.
-		batch, err := cons.Fetch(int(min(pending, directoryFetchBatch)), jetstream.FetchMaxWait(wait))
-		if err != nil {
-			return cards, err
-		}
-		n := 0
-		for msg := range batch.Messages() {
-			n++
-			seen++
-			if seen > maxAgentCards {
-				return cards, fmt.Errorf("DIRECTORY holds more than %d cards; showing the first %d", maxAgentCards, maxAgentCards)
+		msg, err := r.next(wait)
+		if errors.Is(err, nats.ErrTimeout) {
+			if ctx.Err() != nil {
+				return cards, ctx.Err()
 			}
-			addCard(cards, msg.Subject(), msg.Data())
-			if md, err := msg.Metadata(); err == nil {
-				if pending = md.NumPending; pending == 0 {
-					return cards, nil
-				}
-			}
-		}
-		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-			return cards, err
-		}
-		if n == 0 {
-			// Messages were pending and the fetch brought none: it did not
+			// Messages were pending and none came: the read did not
 			// complete, which is not an empty directory.
 			return cards, fmt.Errorf("read %d of the directory; a fetch came back empty with cards still pending", seen)
 		}
-		if ctx.Err() != nil {
-			return cards, ctx.Err()
+		if err != nil {
+			return cards, fmt.Errorf("DIRECTORY: %w", err)
+		}
+		seen++
+		if seen > maxAgentCards {
+			return cards, fmt.Errorf("DIRECTORY holds more than %d cards; showing the first %d", maxAgentCards, maxAgentCards)
+		}
+		addCard(cards, msg.Subject(), msg.Data())
+		if md, err := msg.Metadata(); err == nil {
+			if pending = md.NumPending; pending == 0 {
+				return cards, nil
+			}
 		}
 	}
 }

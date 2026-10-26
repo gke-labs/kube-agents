@@ -517,7 +517,7 @@ spec:
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
     model: model-default
-    maxTurns: 250 # today's value, set for fleet-audit remediation loops
+    maxTurns: 250 # the fleet audits' per-entry value today; the profile itself carries 150
   bus:
     publishTopics:
       - agent.platform.upgrade-readiness

@@ -330,7 +330,10 @@ func TestAProfileAdapterRunsAWholeTaskUnderItsOwnGrants(t *testing.T) {
 		Profile:            auditor,
 		ProfileExecutor:    true,
 		CapabilityOptional: true,
+		// The stub reads the opening prompt before answering: one that exits
+		// first fails the adapter's stdin write and the task ends spawn-failed.
 		HarnessCommand: harnessStub(t, `
+read first || exit 1
 echo '{"type":"result","subtype":"success","result":"audited"}'
 `),
 		HarnessEnv:   os.Environ(),
