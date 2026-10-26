@@ -33,13 +33,32 @@ case "$*" in
   "get deployments -A"*)
     echo "kubeagents-system:platform-agent-gateway"
     [ "${STUB_WITH_CALLOUT:-0}" -eq 1 ] && echo "kubeagents-system:platform-agent-a2a-callout" ;;
-  "get deployment platform-agent-gateway"*) printf 'agent-api-auth\\nplatform-agent\\n' ;;
-  "get deployment platform-agent-a2a-callout"*) printf 'callout\\n' ;;
+  "get deployment "*)
+    if [ "${STUB_GET_DEPLOYMENT_EXIT:-0}" -ne 0 ]; then
+      echo 'Error from server (Forbidden): deployments.apps "platform-agent-gateway" is forbidden' >&2
+      exit "$STUB_GET_DEPLOYMENT_EXIT"
+    fi
+    case "$3" in
+      platform-agent-gateway) printf 'agent-api-auth\\nplatform-agent\\n' ;;
+      platform-agent-a2a-callout) printf 'callout\\n' ;;
+    esac ;;
   "set image"*)
     if [ "${STUB_SET_IMAGE_EXIT:-0}" -ne 0 ]; then
       echo 'Error from server (Forbidden): deployments.apps "platform-agent-gateway" is forbidden' >&2
       exit "$STUB_SET_IMAGE_EXIT"
-    fi ;;
+    fi
+    # Refuse a container the Deployment does not have, as kubectl does.
+    case "$3" in
+      deployment/platform-agent-gateway) have=" agent-api-auth platform-agent " ;;
+      deployment/platform-agent-a2a-callout) have=" callout " ;;
+      *) have=" " ;;
+    esac
+    for update in "${@:6}"; do
+      case "$have" in
+        *" ${update%%=*} "*) ;;
+        *) echo "error: unable to find container named \"${update%%=*}\"" >&2; exit 1 ;;
+      esac
+    done ;;
 esac
 exit 0
 """
@@ -71,8 +90,13 @@ class DevRebuildAgentReportsTest(unittest.TestCase):
             "KUBECTL_CALLS": str(self.calls),
         }
 
-    def run_script(self, *args, set_image_exit=0, with_callout=False):
-        env = {**self.env, "STUB_SET_IMAGE_EXIT": str(set_image_exit), "STUB_WITH_CALLOUT": str(int(with_callout))}
+    def run_script(self, *args, set_image_exit=0, with_callout=False, get_deployment_exit=0):
+        env = {
+            **self.env,
+            "STUB_SET_IMAGE_EXIT": str(set_image_exit),
+            "STUB_WITH_CALLOUT": str(int(with_callout)),
+            "STUB_GET_DEPLOYMENT_EXIT": str(get_deployment_exit),
+        }
         return subprocess.run(
             ["bash", str(self.root / SCRIPT), *args],
             cwd=self.root, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECONDS,
@@ -101,6 +125,14 @@ class DevRebuildAgentReportsTest(unittest.TestCase):
         self.assertIn(SUCCESS_LINE, proc.stdout)
         set_image_calls = [call for call in self.calls.read_text().splitlines() if call.startswith("set image")]
         self.assertEqual([call.split()[2] for call in set_image_calls], ["deployment/platform-agent-gateway"])
+
+    def test_a_failed_read_of_a_deployments_containers_fails_the_step_instead_of_skipping(self):
+        proc = self.run_script("platform", get_deployment_exit=1)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("is forbidden", proc.stderr)
+        self.assertIn(STEP_FAILED_LINE, proc.stdout + proc.stderr)
+        self.assertNotIn("skipping", proc.stdout)
+        self.assertNotIn(SUCCESS_LINE, proc.stdout)
 
     def test_a_closed_stdin_takes_the_default_agent_instead_of_dying_at_the_prompt(self):
         proc = self.run_script()

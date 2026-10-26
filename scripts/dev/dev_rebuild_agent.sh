@@ -233,7 +233,7 @@ execute_redeploy() {
         # Both lists: the credential proxy is a native sidecar, so it is an
         # initContainer. Querying only .containers[] silently skips its image
         # update and leaves the dev loop running a stale proxy.
-        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}') || return 1
         # Both containers built from the credential-proxy image, wherever they
         # turn up: `envoy-credential-proxy` is the credential runtime, now a
         # native sidecar in the agent pod, and `agent-api-auth` is what is left
