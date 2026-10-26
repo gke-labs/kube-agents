@@ -91,12 +91,35 @@ class FollowupInjectTest(unittest.TestCase):
         self.assertIn("was not re-read", text)
         self.assertEqual(comment.call_args.args, ("k8s-evt-quiet", text))
 
-    def test_an_unrouted_session_posts_nothing(self):
-        with patch.object(session_kv_server, "_send_to_chat") as send, \
+    def test_a_session_with_no_thread_still_gets_the_card_comment(self):
+        # An install with no chat surface routes no session anywhere; the card
+        # is the one place its reader looks, so the line lands there alone.
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1"), \
+             patch.object(session_kv_server, "_send_to_chat") as send, \
+             patch.object(session_kv_server, "_comment_alert_card", return_value=True) as comment:
+            resp = self.client.post("/sessions/k8s-evt-nochat/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual(resp.json(), {"status": "followup"})
+        send.assert_not_called()
+        session_id, text = comment.call_args.args
+        self.assertEqual(session_id, "k8s-evt-nochat")
+        self.assertIn("Quiet since 15:28 UTC", text)
+
+    def test_a_session_with_neither_thread_nor_card_is_unrouted(self):
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value=None), \
+             patch.object(session_kv_server, "_send_to_chat") as send, \
              patch.object(session_kv_server, "_comment_alert_card") as comment:
             resp = self.client.post("/sessions/k8s-evt-nowhere/inject", json={"message": json.dumps(FOLLOWUP)})
         self.assertEqual(resp.json(), {"status": "unrouted"})
         send.assert_not_called()
+        comment.assert_not_called()
+
+    def test_an_unreadable_board_with_no_thread_asks_the_watcher_to_retry(self):
+        # Unknown is not absence: answering `unrouted` would mark the incident
+        # notified for good, so the watcher is told to come back next sweep.
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value=session_kv_server.BOARD_UNREADABLE), \
+             patch.object(session_kv_server, "_comment_alert_card") as comment:
+            resp = self.client.post("/sessions/k8s-evt-locked/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual(resp.status_code, 503)
         comment.assert_not_called()
 
     def test_the_message_reads_without_stamps_or_object(self):

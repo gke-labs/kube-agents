@@ -231,7 +231,8 @@ reads the session's routing, posts one line into the alert's thread ("Quiet sinc
 leaves the same line as a comment on the card the session filed, found by `tasks.session_id` as the
 stall watch finds its card. It writes no ledger row, claims no quota and starts no turn: nothing new
 happened, something stopped happening. The line says what it is, silence and not a confirmed recovery,
-since the watcher reads events only. A session nothing routed to a thread is answered `unrouted`. It
+since the watcher reads events only. A session with a card but no thread, every session on an install
+without a chat surface, gets the line on its card alone; one with neither is answered `unrouted`. It
 is a reply rather than an edit of the alert: the gateway edits by update key only inside a
 conversation request, and the alert was a home-channel post whose key was never bound.
 

@@ -175,7 +175,7 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
-			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon accepted it for the session's thread; it posts after answering, so a chat failure past that is invisible here), unrouted (it had no thread for the session and posted nothing), error (the inject failed).",
+			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon accepted it for the session's thread; it posts after answering, so a chat failure past that is invisible here), unrouted (the session had neither a thread nor a card, so it posted nothing), error (the inject failed).",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",

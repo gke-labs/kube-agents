@@ -6437,8 +6437,8 @@ def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[da
 
 
 def _post_followup(session_id: str, platform: str, chat_id: str, thread_id: str, text: str) -> None:
-    """Deliver a follow-up line into the alert's thread and onto its card."""
-    if _send_to_chat(platform, text, chat_id, thread_id) is None:
+    """Deliver a follow-up line into the alert's thread, when one is routed, and onto its card."""
+    if platform and thread_id and _send_to_chat(platform, text, chat_id, thread_id) is None:
         logger.error(f"Follow-up for session {session_id} did not reach {platform} thread {thread_id}")
     _comment_alert_card(session_id, text)
 
@@ -6456,10 +6456,13 @@ def _inject_followup(
     recorded; the line goes there as a reply, and onto the card the session
     filed as a comment, so a reader of either sees that the object went quiet
     and when. No ledger row, no quota, no agent turn: nothing new happened in
-    the cluster, something stopped happening. A session nothing routed (the
-    alert never reached chat) gets `unrouted` and nothing is posted; the
-    watcher marks the incident notified either way, which is right, since
-    there is no thread to tell.
+    the cluster, something stopped happening. The card does not need the
+    thread: an install with no chat surface (every eval install) routes no
+    session anywhere, and its cards still have to say the object went quiet.
+    `unrouted` is the answer only when there is neither a thread nor a card,
+    and the watcher marks the incident notified on it, which is right, since
+    there is nowhere to tell. A board that cannot say whether the card exists
+    is a 503, so the watcher retries on its next sweep rather than giving up.
 
     A reply, not an edit of the alert: the gateway edits by update key only
     inside a conversation request (a2a/gateway/notify.go, postConversation),
@@ -6469,8 +6472,12 @@ def _inject_followup(
     """
     platform, chat_id, thread_id = _lookup_session_routing(session_id)
     if not platform or not thread_id:
-        logger.info(f"Follow-up for session {session_id}: no chat thread is routed to it; nothing posted")
-        return {"status": "unrouted"}
+        card = _card_for_alert_session(session_id)
+        if card == BOARD_UNREADABLE:
+            raise HTTPException(status_code=503, detail="the board cannot say whether the session has a card; retry")
+        if not card:
+            logger.info(f"Follow-up for session {session_id}: no chat thread and no card; nothing posted")
+            return {"status": "unrouted"}
     text = _followup_message(session_id, payload)
     background_tasks.add_task(_post_followup, session_id, platform, chat_id, thread_id, text)
     return {"status": "followup"}

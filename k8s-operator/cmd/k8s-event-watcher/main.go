@@ -89,7 +89,7 @@ const (
 	// The outcomes of k8s_event_watcher_followups_total: the daemon accepted
 	// the line for the session's thread (it posts after answering, so a chat
 	// failure past that point is invisible here, as for the alert), it had
-	// no thread to post into, or the inject failed.
+	// neither a thread nor a card to post into, or the inject failed.
 	followupOutcomeSent     = "sent"
 	followupOutcomeUnrouted = "unrouted"
 	followupOutcomeError    = "error"
