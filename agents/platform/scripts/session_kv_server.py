@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import hmac
 import importlib.util
 import json
@@ -26,7 +25,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence
+from typing import Any, Dict, NamedTuple, Optional, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
 from contextlib import ExitStack, closing, nullcontext
 from pathlib import Path
@@ -43,6 +42,7 @@ import gitops_workspace
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
+import worker_transcript
 
 # Configure logging
 logging.basicConfig(
@@ -150,13 +150,12 @@ SESSION_TASK_LIVE_STEPS_MAX = 10
 TASK_STEP_ROW_MULTIPLIER = 2
 TASK_STEP_PREVIEW_MAX_CHARS = 240
 TASK_STEP_DETAIL_MAX_CHARS = 4000
-# The user prompt the kanban dispatcher starts a worker session with
-# (`hermes -p <profile> chat -q "work kanban task <id>"`). Used to map a card
-# to its worker session in the profile's `state.db` when `task_runs.metadata`
-# does not record `worker_session_id`.
-WORKER_PROMPT_PREFIX = "work kanban task "
+# The user prompt the kanban dispatcher starts a worker session with, and the
+# session-store layout under the data root: the shared transcript reader's,
+# so the feed and the bench map a card to its worker session the same way.
+WORKER_PROMPT_PREFIX = worker_transcript.WORKER_PROMPT_PREFIX
 HERMES_JSON_CONTENT_PREFIX = "\x00json:"
-HERMES_STATE_DB_FILENAME = "state.db"
+HERMES_STATE_DB_FILENAME = worker_transcript.HERMES_STATE_DB_FILENAME
 # Fail-closed placeholder returned for every worker step kind (`thinking`,
 # `tool_call`, `tool_result`, `reply`) and card text field whenever
 # `AuditRedactor` cannot be loaded or structural recursion exceeds Python's limit.
@@ -7107,558 +7106,11 @@ def _get_audit_redactor() -> Any:
         return _AUDIT_REDACTOR
 
 
-_REDACTED_SECRET_MARKER = "[REDACTED_SECRET]"
-_REDACTED_PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]"
-_YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
-_YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
-_JSON_SECRET_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
-_JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
-_URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
-_UNTERMINATED_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[ \t]*\r?\n[A-Za-z0-9+/=\s]*\Z",
-    re.IGNORECASE,
-)
-_CLI_LONG_FLAG_RE = re.compile(
-    r"(?P<prefix>(?:^|\s)--)(?P<flag>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<sep>[ \t=]+)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|\S+)"
-)
-_CLI_EXTRA_SECRET_FLAGS = frozenset(
-    {
-        "docker-password",
-        "admin-password",
-        "auth-token",
-        "authtoken",
-        "bearer-token",
-        "passphrase",
-    }
-)
-_CLI_NON_SECRET_FLAGS = frozenset({"with-token"})
-_CLI_USERPASS_FLAG_RE = re.compile(
-    r"\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b[^\r\n;|&]*"
-)
-_CLI_USERPASS_ARG_RE = re.compile(
-    r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
-    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
-    r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
-)
-_CLI_SHORT_P_RE = re.compile(
-    r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
-    r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
-)
-# The two rules above end a command's segment at `;`, `|` or `&`, but a
-# shell operator inside a quoted argument (`?query=x&type=dash-db`,
-# `-e "select 1 | 2"`) is data. `_sub_shell_segments` therefore finds the
-# segment on a copy of the text whose quoted interiors are blanked to spaces
-# (same length, so every offset holds) and reads the flag and its value out
-# of the original at that span. A quote that does not close on its own line
-# is left as written, which is how a shell would reject it.
-_SHELL_QUOTE_CHARS = ("'", '"')
-_SHELL_QUOTE_BLANK_CHAR = " "
-_SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
-# A scheme-led value (`Bearer <token>`) after any credential-named key, with
-# `:` or `=` as the separator: the redactor's own bearer rule needs twelve
-# token characters from its alphabet, so a short or `~`-bearing token after
-# `auth:`, `token:` or `AUTH_HEADER=` would otherwise outlive the marker.
-# The redactor runs first and, for a key its own key rule knows (`token:`),
-# masks the scheme word as the value; the marker it leaves there counts as
-# the scheme so the token after it is still taken.
-_AUTH_SCHEME_HEADER_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
-    r"(?:bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
-    + re.escape(_REDACTED_SECRET_MARKER)
-    + r")[ \t]+)"
-    r"(?P<val>[^\s\"',}{\[\]\\]+)"
-)
-_TEXT_COLON_KV_RE = re.compile(
-    r"(?m)^(?P<prefix>[ \t]*(?:-[ \t]+)?[\"']?)(?P<key>[\w.\-]+)(?P<sep>[\"']?[ \t]*:[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
-)
-_QUOTED_COLON_KV_RE = re.compile(
-    r"(?P<prefix>[\"'])(?P<key>[\w.\-]+)(?P<sep>(?P=prefix)[ \t]*:[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
-)
-_TEXT_EQUALS_KV_RE = re.compile(
-    r"(?<![\w.\-/\"])(?P<prefix>)(?P<key>[\w.\-]+)(?P<sep>[ \t]*=[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"',}{\[\]]+)"
-)
-_SUPPLEMENT_BLOCK_SCALAR_RE = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?[\"']?(?P<key>[\w.\-]+)[\"']?[ \t]*:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
-    r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
-)
-_SUPPLEMENT_ENV_BLOCK_RE = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
-    r"[ \t]*\r?\n(?P=indent)(?P<keyindent>[ \t]*)value:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
-    r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)(?P=keyindent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
-)
-_SUPPLEMENT_ENV_YAML_PATTERNS = (
-    re.compile(
-        r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
-        r"[ \t]*\r?\n(?P=indent)[ \t]*value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)(?=\r?$)"
-    ),
-    re.compile(
-        r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)\r?\n"
-        r"(?P=indent)[ \t]*name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)[ \t]*(?=\r?$)"
-    ),
-)
-_KEY_DATA_WORDS = ({"key", "data"}, {"certificate", "data"})
-# A key that is a file name (`tls.crt`, `cert.pem`) opens ordinary diagnostic
-# lines: `kubectl describe secret` rows (`tls.crt:  1679 bytes`), `openssl
-# verify` (`cert.pem: OK`), `file` (`cert.pem: PEM certificate`), `grep -n`
-# (`cert.pem:1:-----BEGIN`, `cert.pem:28:-----END`). The value there is a
-# byte count followed by the word `bytes`, a line number with at most a PEM
-# marker after it, or one of the words those tools print, never key
-# material, so the name alone does not mask it. A `grep -n` body line
-# (`tls.key:2:MIIEvQ...`), a bare number (`api.key: 1234567890123456`) and a
-# describe row of a non-file key (`token:  1234 bytes`) stay masked: the
-# first two can be a credential, the third is over-masking that is safe.
-_FILE_NAME_KEY_SUFFIXES = (".key", ".pem", ".crt", ".p12", ".pfx")
-_FILE_KEY_LINE_NUMBER_RE = re.compile(r"^\d+:(?:-----[A-Za-z]*)?$")
-_FILE_KEY_BYTE_COUNT_RE = re.compile(r"^\d+$")
-_FILE_KEY_BYTES_WORD_RE = re.compile(r"^[ \t]+bytes\b")
-_FILE_KEY_BENIGN_WORDS = frozenset(
-    {"ok", "pem", "openssh", "data", "ascii", "certificate", "verification", "error", "cannot", "unable", "bytes"}
-)
-_SENSITIVE_KEY_SUFFIXES = (
-    *_FILE_NAME_KEY_SUFFIXES,
-    ".dockercfg",
-    ".dockerconfigjson",
-    "privatekey",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-)
-_BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
-_INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
-# A `kubectl get` of a secret whose output is shaped (`-o`/`--output`/
-# `--template`, in any spelling: `-o json`, `-o=go-template=...`,
-# `--output=yaml`) or piped anywhere (`| jq`, `| yq`, `| base64`) can print a
-# value; the formatter is not enumerated because the agent writes the command
-# and a form the list does not name would land as the value alone, which no
-# key rule recognises. kubectl takes its flags in any position, so the two
-# conditions are lookaheads from `kubectl`, not a token order: `get` with
-# `secret` somewhere after it on the same unpiped segment, and a flag or a
-# pipe anywhere on the line. A whitespace-led `-o` counts whatever follows
-# it (`-ojson`, `-o'go-template=...'`, `-o"..."`, `-o$FMT`): kubectl reads
-# the attached text as the format, and a quote or a variable is the shell's
-# to resolve. A bare list (`kubectl get secrets -n ns`) prints names and ages
-# only; a ConfigMap whose name contains `secret` is withheld too, which is
-# the safe direction. gcloud and aws take global flags and a release track
-# before the subcommand (`gcloud --project=p beta secrets versions access`,
-# `aws --region r secretsmanager get-secret-value`), so those two match the
-# subcommand anywhere on the same unpiped segment after the binary.
-# A shell joins a backslash-newline before it parses, so the detector folds
-# the continuation (and the indentation after it) to one space first; every
-# alternative below is line-bounded and would otherwise see two commands.
-_SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
-# The tool-call argument keys that carry a shell command, in the order
-# `_is_secret_read_tool_call` and `_scrub_worker_step_text` read them.
-_COMMAND_ARG_KEYS = ("command", "cmd")
-_SECRET_READ_COMMAND_RE = re.compile(
-    r"(?i)(?:"
-    r"\bkubectl\b(?=[^\r\n]*\bget\b[^\r\n|]*\bsecrets?\b)"
-    r"(?=[^\r\n]*(?:(?:^|\s)(?:-o|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|))"
-    r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
-    r"|\bgcloud\b[^\r\n|;&]*\bsecrets\s+versions\s+access\b"
-    r"|\baws\b[^\r\n|;&]*\bsecretsmanager\s+get-secret-value\b"
-    r"|\baws\b[^\r\n|;&]*\bssm\s+get-parameters?\b"
-    r"|\baz\b[^\r\n|;&]*\bkeyvault\s+secret\s+show\b"
-    r"|\bvault\s+(?:kv\s+get|read)\b"
-    r"|\bsops\s+(?:-d|--decrypt|decrypt)\b"
-    # A file read (also after `kubectl exec ... --`) under a well-known secret
-    # mount, or under a directory component that is, or ends in `-`,
-    # `secret(s)`, `creds` or `credentials` (`/etc/db-creds/password`).
-    r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/"
-    r"(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_|(?:[^\s/]*-)?(?:secrets?|creds|credentials)/)[^\r\n]*"
-    r")"
-)
-
-
-def _scrub_secret_blocks(redactor: Any, text: str) -> str:
-    # `stringData` carries its only "data" capitalised; the fast path must
-    # let it through to the block rules below.
-    if "data" not in text and "Data" not in text:
-        return text
-    lines = text.split("\n")
-    block: Optional[int] = None
-    for i, line in enumerate(lines):
-        opener = _YAML_SECRET_BLOCK_RE.match(line)
-        if opener:
-            block = len(opener.group(1))
-            continue
-        if block is None or not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= block:
-            block = None
-            continue
-        pair = _YAML_PAIR_RE.match(line)
-        if pair is None:
-            lines[i] = " " * indent + _REDACTED_SECRET_MARKER
-        elif pair.group(3):
-            lines[i] = f"{pair.group(1)}{pair.group(2)}: {_REDACTED_SECRET_MARKER}"
-    joined = "\n".join(lines)
-
-    def _mask_json_block(m: "re.Match[str]") -> str:
-        if '"stringData"' not in m.group(1) and not redactor.JSON_CREDENTIAL_KIND_PATTERN.search(joined):
-            return m.group(0)
-        return (
-            m.group(1)
-            + _JSON_PAIR_RE.sub(lambda p: p.group(1) + _REDACTED_SECRET_MARKER + p.group(3), m.group(2))
-            + m.group(3)
-        )
-
-    return _JSON_SECRET_BLOCK_RE.sub(_mask_json_block, joined)
-
-
-def _is_non_credential_key_suffix(redactor: Any, name: str) -> bool:
-    last_word = redactor._last_key_word(name)
-    non_cred_suffixes = getattr(
-        sys.modules.get("kube_agents_session_kv_redactor"),
-        "NON_CREDENTIAL_KEY_SUFFIXES",
-        frozenset({"name", "names", "path", "file", "mode", "ref", "type", "kind"}),
-    )
-    return last_word in non_cred_suffixes
-
-
-def _cli_flag_is_sensitive(redactor: Any, flag: str) -> bool:
-    norm_flag = flag.lower().replace("_", "-")
-    if norm_flag in _CLI_NON_SECRET_FLAGS or _is_non_credential_key_suffix(redactor, norm_flag):
-        return False
-    return norm_flag in _CLI_EXTRA_SECRET_FLAGS or bool(redactor.CREDENTIAL_NAME_PATTERN.match(norm_flag))
-
-
-def _dict_key_needs_supplement(redactor: Any, name: str) -> bool:
-    """Supplemental dictionary key check for keys `AuditRedactor.SENSITIVE_KEYS`
-    does not cover (`client-key-data`, `client-certificate-data`, and `.key`/`.crt`
-    file-name keys)."""
-    if _is_non_credential_key_suffix(redactor, name):
-        return False
-    words = redactor._get_key_words(name)
-    return (
-        any(w <= words for w in _KEY_DATA_WORDS)
-        or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
-    )
-
-
-def _named_value_is_sensitive(redactor: Any, name: str) -> bool:
-    if _is_non_credential_key_suffix(redactor, name):
-        return False
-    words = redactor._get_key_words(name)
-    return (
-        bool(words & redactor.SENSITIVE_KEYS)
-        or any(w <= words for w in _KEY_DATA_WORDS)
-        or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
-    )
-
-
-def _blank_quoted_spans(text: str) -> str:
-    """Return `text` with the interior of every single- or double-quoted span
-    replaced by spaces, keeping the quotes and the length."""
-    if not any(q in text for q in _SHELL_QUOTE_CHARS):
-        return text
-    return _SHELL_QUOTED_SPAN_RE.sub(
-        lambda m: m.group(0)[0] + _SHELL_QUOTE_BLANK_CHAR * (len(m.group(0)) - 2) + m.group(0)[-1], text
-    )
-
-
-def _sub_shell_segments(
-    segment_re: "re.Pattern[str]",
-    text: str,
-    mask: "Callable[[re.Match[str], str], str]",
-) -> str:
-    """Find each `segment_re` match on the quote-blanked copy of `text` and
-    replace that span of the original with `mask(match, text)`."""
-    blanked = _blank_quoted_spans(text)
-    out: list[str] = []
-    pos = 0
-    for match in segment_re.finditer(blanked):
-        out.append(text[pos : match.start()])
-        out.append(mask(match, text))
-        pos = match.end()
-    out.append(text[pos:])
-    return "".join(out)
-
-
-def _unquote_token(raw: str) -> str:
-    stripped = raw.strip()
-    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
-        return stripped[1:-1]
-    if len(stripped) >= 1 and stripped[0] in ("'", '"'):
-        return stripped[1:]
-    return stripped
-
-
-def _scrub_supplement_env_pairs(redactor: Any, text: str) -> str:
-    if "name" not in text or "value" not in text:
-        return text
-
-    def _mask_env_block(match: "re.Match[str]") -> str:
-        if not _named_value_is_sensitive(redactor, match.group("name")):
-            return match.group(0)
-        body = match.group("body")
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        if lines and all(line.startswith("[REDACTED_") for line in lines):
-            return match.group(0)
-        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
-        ending = "\n" if body.endswith("\n") else ""
-        return f"{match.group(0)[: match.start('body') - match.start()]}{body_indent}{_REDACTED_SECRET_MARKER}{ending}"
-
-    def _mask_env_span(match: "re.Match[str]", start: int, end: int) -> str:
-        value = match.string[start:end]
-        if not redactor._is_credential_value(value) or not _named_value_is_sensitive(
-            redactor, match.group("name")
-        ):
-            return match.group(0)
-        whole = match.group(0)
-        return f"{whole[:start - match.start()]}{_REDACTED_SECRET_MARKER}{whole[end - match.start():]}"
-
-    def _mask_env_yaml(match: "re.Match[str]") -> str:
-        raw = match.group("value").rstrip()
-        start = match.start("value")
-        if len(raw) > 1 and raw[0] in ("'", '"') and raw[-1] == raw[0]:
-            return _mask_env_span(match, start + 1, start + len(raw) - 1)
-        return _mask_env_span(match, start, start + len(raw))
-
-    def _mask_env_json(match: "re.Match[str]") -> str:
-        return _mask_env_span(match, match.start("value"), match.end("value"))
-
-    text = _SUPPLEMENT_ENV_BLOCK_RE.sub(_mask_env_block, text)
-    for pattern in _SUPPLEMENT_ENV_YAML_PATTERNS:
-        text = pattern.sub(_mask_env_yaml, text)
-    for pattern in getattr(redactor, "ENV_PAIR_JSON_PATTERNS", ()):
-        text = pattern.sub(_mask_env_json, text)
-    return text
-
-
-def _file_key_value_is_benign(value: str, tail: str) -> bool:
-    """True for what a file-named key holds on a diagnostic line and never as
-    key material: a line number, a byte count that the word `bytes` follows
-    (tail is the text after the value), or one of the words the tools print."""
-    if _FILE_KEY_LINE_NUMBER_RE.match(value):
-        return True
-    if _FILE_KEY_BYTE_COUNT_RE.match(value):
-        return bool(_FILE_KEY_BYTES_WORD_RE.match(tail))
-    return value.lower() in _FILE_KEY_BENIGN_WORDS
-
-
-def _blank_named_values(redactor: Any, text: str) -> str:
-    def _mask_block(match: "re.Match[str]") -> str:
-        if not _named_value_is_sensitive(redactor, match.group("key")):
-            return match.group(0)
-        body = match.group("body")
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        if lines and all(line.startswith("[REDACTED_") for line in lines):
-            return match.group(0)
-        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
-        ending = "\n" if body.endswith("\n") else ""
-        head = match.group(0)[: match.start("body") - match.start()]
-        return f"{head}{body_indent}{_REDACTED_SECRET_MARKER}{ending}"
-
-    def _mask_colon_kv(match: "re.Match[str]") -> str:
-        key = match.group("key")
-        unquoted = _unquote_token(match.group("val"))
-        if key.lower().endswith(_FILE_NAME_KEY_SUFFIXES) and _file_key_value_is_benign(
-            unquoted, match.string[match.end() :]
-        ):
-            return match.group(0)
-        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
-        return match.group(0)
-
-    def _mask_equals_kv(match: "re.Match[str]") -> str:
-        key = match.group("key")
-        raw_val = match.group("val")
-        unquoted = _unquote_token(raw_val)
-        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
-        if "=" in unquoted:
-            rescanned = _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, unquoted)
-            if rescanned != unquoted:
-                if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in ("'", '"'):
-                    return f"{match.group('prefix')}{key}{match.group('sep')}{raw_val[0]}{rescanned}{raw_val[0]}"
-                return f"{match.group('prefix')}{key}{match.group('sep')}{rescanned}"
-        return match.group(0)
-
-    def _mask_long_flag(match: "re.Match[str]") -> str:
-        flag = match.group("flag")
-        raw_val = match.group("val")
-        unquoted = _unquote_token(raw_val)
-        if unquoted.startswith("-"):
-            return match.group(0)
-        if _cli_flag_is_sensitive(redactor, flag) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{flag}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
-        return match.group(0)
-
-    def _mask_short_p(match: "re.Match[str]", source: str) -> str:
-        # `match` comes from the quote-blanked copy; the value is read from `source`.
-        unquoted = _unquote_token(source[match.start("val") : match.end("val")])
-        if unquoted.startswith("-") or not redactor._is_credential_value(unquoted):
-            return source[match.start() : match.end()]
-        return f"{source[match.start() : match.start('val')]}{_REDACTED_SECRET_MARKER}"
-
-    def _mask_userpass_segment(match: "re.Match[str]", source: str) -> str:
-        return _CLI_USERPASS_ARG_RE.sub(_mask_userpass, source[match.start() : match.end()])
-
-    def _mask_userpass(match: "re.Match[str]") -> str:
-        quote = match.group("quote") or ""
-        user = match.group("quser") if quote else match.group("user")
-        val = match.group("qval") if quote else _unquote_token(match.group("val"))
-        if val.startswith("-") or not redactor._is_credential_value(val):
-            return match.group(0)
-        return f"{match.group('prefix')}{quote}{user}{_REDACTED_SECRET_MARKER}{quote}"
-
-    def _mask_auth_scheme(match: "re.Match[str]") -> str:
-        val = _unquote_token(match.group("val"))
-        if not _named_value_is_sensitive(redactor, match.group("key")) or not redactor._is_credential_value(val):
-            return match.group(0)
-        return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
-
-    text = _scrub_supplement_env_pairs(redactor, text)
-    text = _SUPPLEMENT_BLOCK_SCALAR_RE.sub(_mask_block, text)
-    text = _AUTH_SCHEME_HEADER_RE.sub(_mask_auth_scheme, text)
-    text = _CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
-    text = _sub_shell_segments(_CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment)
-    text = _sub_shell_segments(_CLI_SHORT_P_RE, text, _mask_short_p)
-    text = _TEXT_COLON_KV_RE.sub(_mask_colon_kv, text)
-    text = _QUOTED_COLON_KV_RE.sub(_mask_colon_kv, text)
-    return _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, text)
-
-
-def _as_json_structure(text: str) -> Any:
-    if text.lstrip()[:1] not in "{[":
-        return None
-    try:
-        parsed = json.loads(text)
-    except (ValueError, RecursionError):
-        return None
-    return parsed if isinstance(parsed, (dict, list)) else None
-
-
-def _is_base64_encoded_secret_value(v: str) -> bool:
-    if len(v) < 4 or len(v) % 4 != 0 or _BASE64_SECRET_VALUE_RE.fullmatch(v) is None:
-        return False
-    try:
-        raw = base64.b64decode(v, validate=True)
-    except ValueError:
-        return False
-    if not raw:
-        return False
-    try:
-        decoded_text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return v.endswith("=")
-    return all(ch.isprintable() or ch in "\n\r\t" for ch in decoded_text)
-
-
-def _is_flat_base64_secret_map(redactor: Any, value: Dict[Any, Any]) -> bool:
-    if not value:
-        return False
-    has_long_or_sensitive = False
-    for k, v in value.items():
-        if not isinstance(k, str) or not isinstance(v, str):
-            return False
-        if not _is_base64_encoded_secret_value(v):
-            return False
-        if len(v) >= 16 or _named_value_is_sensitive(redactor, k):
-            has_long_or_sensitive = True
-    return has_long_or_sensitive
-
-
-def _supplement_redact(
-    redactor: Any,
-    value: Any,
-    key: Optional[str] = None,
-    *,
-    is_tool_result: bool = False,
-    parent_is_secret: bool = False,
-) -> Any:
-    if isinstance(value, str):
-        nested = _as_json_structure(value)
-        if nested is not None:
-            return json.dumps(
-                _supplement_redact(redactor, nested, key=None, is_tool_result=is_tool_result)
-            )
-        if is_tool_result and "{" in value and "}" in value:
-
-            def _scrub_inline_obj(m: "re.Match[str]") -> str:
-                obj = _as_json_structure(m.group(0))
-                if isinstance(obj, dict) and _is_flat_base64_secret_map(redactor, obj):
-                    return json.dumps(
-                        {
-                            k: _REDACTED_SECRET_MARKER if isinstance(v, str) else v
-                            for k, v in obj.items()
-                        }
-                    )
-                return m.group(0)
-
-            value = _INLINE_JSON_OBJECT_RE.sub(_scrub_inline_obj, value)
-        text = redactor.PRIVATE_KEY_PATTERN.sub(_REDACTED_PRIVATE_KEY_MARKER, value)
-        text = _UNTERMINATED_PRIVATE_KEY_RE.sub(_REDACTED_PRIVATE_KEY_MARKER, text)
-        text = _URL_USERINFO_RE.sub(lambda m: m.group(1) + _REDACTED_SECRET_MARKER, text)
-        return _blank_named_values(redactor, _scrub_secret_blocks(redactor, text))
-    if isinstance(value, dict):
-        if (
-            key == "stringData"
-            or (key == "data" and parent_is_secret)
-            or (is_tool_result and key is None and _is_flat_base64_secret_map(redactor, value))
-        ):
-            return {
-                k: _REDACTED_SECRET_MARKER
-                if isinstance(v, str)
-                else _supplement_redact(redactor, v, str(k), is_tool_result=is_tool_result)
-                for k, v in value.items()
-            }
-        is_secret_obj = value.get("kind") == "Secret"
-        env_name = value.get("name")
-        is_cred_env = isinstance(env_name, str) and _named_value_is_sensitive(redactor, env_name)
-        return {
-            k: (
-                _REDACTED_SECRET_MARKER
-                if isinstance(v, str)
-                and ((is_cred_env and k == "value") or _dict_key_needs_supplement(redactor, str(k)))
-                and redactor._is_credential_value(v.strip())
-                else _supplement_redact(
-                    redactor,
-                    v,
-                    str(k),
-                    is_tool_result=is_tool_result,
-                    parent_is_secret=is_secret_obj,
-                )
-            )
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_supplement_redact(redactor, v, is_tool_result=is_tool_result) for v in value]
-    return value
-
-
 def _scrub_worker_step_text(kind: str, text: str) -> str:
-    """Scrub worker step text with `AuditRedactor.redact`, then supplemental key/block rules;
-    withhold step text across all kinds if the redactor module is unavailable."""
-    redactor = _get_audit_redactor()
-    if redactor is None:
-        return WORKER_STEP_WITHHELD
-    try:
-        parsed = _as_json_structure(text)
-        if kind == "tool_call":
-            # Fold a shell line continuation once, here, so every line-bounded
-            # CLI rule below (`-u user:pass`, `-p pass`, `--password pass`)
-            # reads the command the shell would run; `_as_json_structure`
-            # returns a fresh object, so the fold does not touch the row.
-            if isinstance(parsed, dict):
-                for arg_key in _COMMAND_ARG_KEYS:
-                    if isinstance(parsed.get(arg_key), str):
-                        parsed[arg_key] = _SHELL_CONTINUATION_RE.sub(" ", parsed[arg_key])
-            elif parsed is None:
-                text = _SHELL_CONTINUATION_RE.sub(" ", text)
-        if parsed is not None:
-            return json.dumps(
-                _supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == "tool_result"))
-            )
-        return str(_supplement_redact(redactor, redactor.redact(text), is_tool_result=(kind == "tool_result")))
-    except RecursionError:
-        return WORKER_STEP_WITHHELD
+    """Scrub worker step text by the shared rules (`worker_transcript.scrub_step_text`):
+    `AuditRedactor.redact`, then the supplement; withheld across all kinds when
+    the redactor module is unavailable."""
+    return worker_transcript.scrub_step_text(_get_audit_redactor(), kind, text, WORKER_STEP_WITHHELD)
 
 
 def _decode_hermes_content(content: Any) -> str:
@@ -7692,15 +7144,7 @@ def _parse_tool_calls(raw: Any) -> list[Dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)]
 
 
-def _is_secret_read_tool_call(raw_args: Any) -> bool:
-    parsed = _as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
-    if isinstance(parsed, dict):
-        cmd = next((parsed.get(k) for k in _COMMAND_ARG_KEYS if parsed.get(k)), "")
-        if isinstance(cmd, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", cmd)):
-            return True
-    elif isinstance(raw_args, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", raw_args)):
-        return True
-    return False
+_is_secret_read_tool_call = worker_transcript.is_secret_read_tool_call
 
 
 def _make_worker_step(
@@ -7728,8 +7172,6 @@ def _make_worker_step(
         step["at"] = at
     return step
 
-
-_WORKER_PROMPT_TASK_RE = re.compile(re.escape(WORKER_PROMPT_PREFIX) + r"([\w-]+)(?![\w-])")
 
 
 def _extract_steps_from_conn(
@@ -8263,7 +7705,7 @@ class _WorkerStepReader:
                     if not isinstance(sid, str) or not sid:
                         continue
                     content = _decode_hermes_content(row["content"])
-                    for matched_task in _WORKER_PROMPT_TASK_RE.findall(content):
+                    for matched_task in worker_transcript.WORKER_PROMPT_TASK_RE.findall(content):
                         bucket = index.setdefault(matched_task, [])
                         if sid not in bucket:
                             bucket.append(sid)
@@ -8299,24 +7741,10 @@ def _read_task_worker_steps(
                 include_detail=include_detail,
             )
 
-    stamped_sessions: list[tuple[str, str]] = []
-    seen_sids: set[str] = set()
-    missing_run_session = not runs
-
-    for run in runs:
-        raw_meta = run.get("metadata")
-        try:
-            meta = json.loads(raw_meta) if isinstance(raw_meta, str) and raw_meta else {}
-        except ValueError:
-            meta = {}
-        sid = meta.get("worker_session_id") if isinstance(meta, dict) else None
-        prof = str(run.get("profile") or assignee or "")
-        if isinstance(sid, str) and sid:
-            if sid not in seen_sids:
-                seen_sids.add(sid)
-                stamped_sessions.append((sid, prof))
-        else:
-            missing_run_session = True
+    stamped_sessions, unstamped = worker_transcript.stamped_worker_sessions(runs, assignee)
+    seen_sids: set[str] = {sid for sid, _ in stamped_sessions}
+    # A run without a stamp sends the read to the prompt index below.
+    missing_run_session = not runs or unstamped
 
     window_size = max_steps * TASK_STEP_ROW_MULTIPLIER
     session_chunks: list[tuple[tuple[float, int, int], list[Dict[str, Any]]]] = []

@@ -171,8 +171,9 @@ jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
-spare again) — a red on a case that depends on the drifted fixture, from a run
-that leased one of those projects, is the fixture's, not the change's; for pool
+spare again) — a case whose grade depends on the drifted fixture is recorded as
+infrastructure on a run whose own lease-time scan saw the drift, and a red on such a
+case from a run whose scan could not read the role is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries. Who the
 fleet owner, the pool owner and the person who owns the gate are is recorded
 in [`docs/ownership.md`](ownership.md).
@@ -983,10 +984,11 @@ crashloop fixture lagged the node repair by about 40 minutes on one project (it
 needs its first restart before OOMKilled evidence exists), and one hourly scan
 can land inside that window. Three projects at once is the fleet-wide shape
 (#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
-run-based condition (nothing in the presubmit runs this check or acts on a
-drift, so a drifted fixture reds only the cases that depend on it, on the runs that
-lease those projects; the run-based conditions see that red as it happens, and
-this one names the cause and its owner), and it ends the hour a scan that could
+run-based condition (the presubmit runs the same check on its own lease and
+records the cases that need a drifted role as infrastructure under
+`fixture-drift:<role>` rather than running them, so a fixture the lease's own
+scan saw drifted reds no pull request; this condition names the cause and its
+owner), and it ends the hour a scan that could
 read the incident's roles on the incident's projects no longer shows it — three
 green runs could all have leased healthy projects and say nothing about the
 fixture, and a scan that is missing, stale, blind, or that could not read one of

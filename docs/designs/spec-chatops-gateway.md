@@ -773,7 +773,7 @@ only the gateway's grant reaches (the 9/9 split), never on its `…events`. The 
 every task this rule reaches is detached, and detached means a `stop` already
 published a cancel, so the gateway is finishing the cancel the requester asked for
 rather than reporting an error. That keeps assertion 13's enumeration intact
-(`canceled`, or `completed` if the race was lost) and keeps replay able to tell a
+(`canceled`, or the race-lost outcomes it lists) and keeps replay able to tell a
 stopped task from one that broke. Deleting first strands the task
 non-terminal for the whole retention window - the adapter's deadline dies with the
 process, and a deleted pod never reaches the terminal phase Sweep watches for - which
@@ -1224,7 +1224,7 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
-`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`) and any reason it does not
+`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
 runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
 renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
@@ -1731,7 +1731,21 @@ adds that if the agent filed a card, that card keeps working until it finishes, 
 `stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
 stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
-A bare `/session` asks for the next message in its thread.
+A bare `/session` asks for the next message in its thread. Slack's Stop button on an Agent
+Session's Working… line sends `agent_session_stopped`, which the adapter turns into a cancel that
+names no task, keyed on the thread's conversation, with `IntentCancel`, which no chat message
+carries, so the gateway tells the button from the word. The event names no team for the presser, so
+the adapter checks the workspace itself: a member the allowed-users list names passes, anyone else
+must be in this workspace by `users.info` (cached per member for five minutes), and a lookup that
+fails, or a workspace auth.test never named, drops the press. Only a requester the conversation's record
+holds (a task's requester or steer author, or a session author) may press it; anyone else's press
+cancels nothing and posts nothing (`stopgate.go`), while typed `stop` keeps its rule. A record that
+cannot tell who asked gates nobody: nothing ran, a requester was cleared past `AskTTL`, a steer or
+session author was dropped past its cap, or the history is at its cap (`cannotTellWhoAsked`). With
+the card
+stop armed the button cancels the turn without the `🛑` lines and sends the same control, and the
+gateway words the result as the Slack Stop's one reply (`slack_stop.go`); unarmed, it is a typed
+`stop`.
 
 The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
 is keyed that way. It is the form a DM record from before DMs threaded carries, so such
@@ -1940,7 +1954,7 @@ otherwise leaves the old process's Working… on it; the thread is renamed once 
 verified ask that is not a gateway command, with today's title rules: the ask up to its first
 question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
-three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
+three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses
