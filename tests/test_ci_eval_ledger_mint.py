@@ -481,7 +481,7 @@ class UnitNotRunTest(unittest.TestCase):
         self.key = self.tmp / "ledger.pem"
         self.key.write_text("not a real key -- the mint itself is stubbed\n")
 
-    def _unit(self, rep, grading_mint, reset_mint=None, phase="0", name="case-under-test", reset_helper="clean"):
+    def _unit(self, rep, grading_mint, reset_mint=None, phase="0", name="case-under-test", reset_helper="clean", drifted=None):
         """Run run_one_unit for one repetition.
 
         grading_mint / reset_mint: "ok", "transient" or "refused" -- what the
@@ -490,7 +490,13 @@ class UnitNotRunTest(unittest.TestCase):
         the reset's mint is good -- "clean", "github-500" (its retries ran out
         on GitHub's answer; it exits 1, as the real helper does) or "unclean"
         (it ran and the read-back found a leftover).
+        drifted: ``{case: reason}`` written into the fixture-drift directory,
+        as kube_agents_bench.fixture_drift writes it before the fan-out.
         """
+        drift_dir = self.tmp / "fixture-drift"
+        drift_dir.mkdir(exist_ok=True)
+        for case, reason in (drifted or {}).items():
+            (drift_dir / case).write_text(reason + "\n", encoding="utf-8")
         hack = self.tmp / "hack"
         hack.mkdir(exist_ok=True)
         (hack / "ci_reset_agent_pulls.py").write_text(RESET_HELPER_STUB)
@@ -594,6 +600,7 @@ class UnitNotRunTest(unittest.TestCase):
                     "SCRIPT_DIR": str(self.tmp / "hack"),
                     "RESET_HELPER": reset_helper,
                     "TMPDIR": str(self.tmp),
+                    "FIXTURE_DRIFT_DIR": str(drift_dir),
                 },
             ),
         )
@@ -642,6 +649,27 @@ class UnitNotRunTest(unittest.TestCase):
         self._unit(2, "transient")
         self.assertTrue(self._record(2)["errors"][0].startswith("KUBE_AGENTS_INFRA_FAILURE: "))
         self.assertNotIn("graded", self.finished.read_text())
+
+    def test_a_case_on_a_drifted_fixture_is_recorded_as_infrastructure_without_running(self):
+        reason = "fixture-drift:version-laggard: cluster currentMasterVersion minor_behind_channel_default: observed the default"
+        proc = self._unit(1, "ok", drifted={"case-under-test": reason})
+        record = self._record(1)
+        self.assertEqual([f"KUBE_AGENTS_INFRA_FAILURE: {reason}"], record["errors"])
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+        self.assertIn("a fixture it needs drifted", proc.stderr)
+        self.assertNotIn("graded case-under-test", self.finished.read_text(), "rep 1 of 3 does not grade the case")
+
+    def test_the_last_drifted_repetition_grades_its_case(self):
+        reason = "fixture-drift:crashloop-workload: no OOMKilled termination"
+        for rep in (1, 2, 3):
+            self._unit(rep, "ok", drifted={"case-under-test": reason})
+        self.assertIn("graded case-under-test", self.finished.read_text())
+        self.assertNotIn("devops-bench reached", self.finished.read_text())
+
+    def test_a_case_needing_no_drifted_fixture_runs_as_usual(self):
+        self._unit(1, "ok", drifted={"some-other-case": "fixture-drift:version-laggard: observed the default"})
+        self.assertIn("devops-bench reached", self.finished.read_text())
+        self.assertFalse((self.state / "not-run").exists())
 
     def test_a_refused_mint_stays_missing(self):
         # A credential fault is not weather: no record, no state, MISSING.

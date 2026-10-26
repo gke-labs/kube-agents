@@ -808,6 +808,23 @@ class InfraCaseTest(Harness):
         self.assertIn("`3 of 3 repetitions infrastructure: agent run failed: http 429 RESOURCE_EXHAUSTED`", body)
         self.assertIn("eval_case-red_rep1.log", body)
 
+    def test_a_drifted_fixture_files_no_domain_bug_and_one_infra_issue_naming_the_role(self):
+        # hack/ci-eval-pr.sh recorded every repetition without running it:
+        # the lease-time scan saw version-laggard drifted on each night.
+        reason = (
+            "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade "
+            "(fixture-drift:version-laggard: cluster currentMasterVersion minor_behind_channel_default: observed the default)"
+        )
+
+        def drifted():
+            return {"name": "case-red", "result": "infra", "reps": [rep(i + 1, "infra", reason) for i in range(3)]}
+
+        gh, _, _ = self.run_once(data(*(night(d, [drifted()]) for d in (15, 16, 17))))
+        self.assertEqual(self.filed(gh), [], "never a nightly-red bug against the case")
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("3 of 3 repetitions infrastructure: ", issue["body"])
+        self.assertIn("fixture-drift:version-laggard", issue["body"])
+
     def test_a_case_with_no_line_on_clean_nights_files(self):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
         [issue] = self.filed(gh, infra=True)

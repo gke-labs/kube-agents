@@ -793,6 +793,42 @@ platformAgent:
   vmPodScrape: null
   # Additional labels to merge into rendered VMPodScrape metadata.labels.
   vmPodScrapeLabels: {}
+  # The health-cohort rules: one Managed Prometheus Rules object per install
+  # (monitoring.googleapis.com/v1), carrying the At-Risk and Friction alerts
+  # over the operator's gauges (kubeagents_platformagent_usage,
+  # kubeagents_platformagent_phase, kubeagents_platformagent_usage_time_seconds)
+  # and recording rules for their ratios. Off by default: on means alerts
+  # fire in the project, which an upgrade must not start on its own. true
+  # renders it and fails at apply time where the Rules CRD is absent. The
+  # rule-evaluator forwards the alerts to the managed Alertmanager, routed by
+  # the `alertmanager` Secret in gmp-public; configure that first. Tune the
+  # thresholds and sample floors per install.
+  healthRules:
+    enabled: false
+    thresholds:
+      # At-Risk
+      degradedFor: 24h
+      unwatchedClustersFor: 48h
+      chatTurnsErroredRatio: 0.15
+      chatTurnsErroredMinMessages: 3
+      brokerFailureRatio: 0.15
+      brokerFailureMinCalls: 10
+      backgroundTasksGaveUp7d: 3
+      # Friction
+      stalledOnboardingDays: 5
+      stalledOnboardingSilentDays: 30
+      proposalsRejectedMin14d: 3
+      proposalsDecidedMin14d: 4
+      proposalsRejectedRatio: 0.75
+      proposalsProposedMin14d: 5
+      proposalsMergeRateBelow: 0.10
+      commandsBlockedRatio: 0.30
+      commandsBlockedMinCalls: 10
+      negativeFeedbackPerDay: 2
+      scrapeBrokenFor: 48h
+      # How long every alert without a window of its own, the ratio and count
+      # alerts, stays true before it fires.
+      ratiosFor: 1h
   # Namespace where Prometheus Operator or VictoriaMetrics scrapers run.
   # When set, the chart renders NetworkPolicies admitting ingress on the agent's
   # metrics ports (9095, 9097, 8766, 9096) from this namespace. The gateway

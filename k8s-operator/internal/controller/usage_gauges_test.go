@@ -123,8 +123,9 @@ func TestUsageGauges_ForgetDropsEveryFamilyOfTheAgent(t *testing.T) {
 	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields) {
 		t.Errorf("%d usage samples after forgetting one agent, want the other agent's %d", n, len(usageExportFields))
 	}
-	if n := testutil.CollectAndCount(g.times, usageTimeGaugeName); n != 1 {
-		t.Errorf("%d time samples after forgetting one agent, want 1", n)
+	// The other agent's lastActiveTime and its createdTime.
+	if n := testutil.CollectAndCount(g.times, usageTimeGaugeName); n != 2 {
+		t.Errorf("%d time samples after forgetting one agent, want the other agent's 2", n)
 	}
 	if n := testutil.CollectAndCount(g.phase, usagePhaseGaugeName); n != len(usagePhases) {
 		t.Errorf("%d phase samples after forgetting one agent, want %d", n, len(usagePhases))
@@ -382,5 +383,47 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 	}
 	if _, ok := got[usageCounterBrokerFailures]; !ok {
 		t.Errorf("brokerFailuresTotal has no sample; a field with no record is published, zero included")
+	}
+}
+
+// The agent's creation time rides in the time family as createdTime, from the
+// CR's own timestamp rather than from status.usage: the stalled-onboarding
+// rule needs an install's age even when nobody has spoken to it, and the hold
+// on a pruned status.usage does not touch it.
+func TestReconcile_PublishesTheAgentsCreationTime(t *testing.T) {
+	scheme := setupScheme()
+	created := metav1.NewTime(time.Unix(1_700_000_000, 0))
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "aged", Namespace: "reconcile-created", CreationTimestamp: created},
+		Status:     agentv1alpha1.AgentStatus{Phase: readyPhase},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	// The whole block is held: an empty status.usage. createdTime is not part of it.
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := testutil.ToFloat64(usageMetrics.times.WithLabelValues(agent.Namespace, agent.Name, usageCreatedTimeField)); got != float64(created.Unix()) {
+		t.Errorf("createdTime = %v, want %v, the CR's creation timestamp, held back by nothing", got, created.Unix())
+	}
+	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != 0 {
+		t.Errorf("%d usage samples on an empty block, want 0", n)
+	}
+	if err := cl.Get(context.Background(), req.NamespacedName, agent); err != nil {
+		t.Fatal(err)
+	}
+	agent.Finalizers = nil
+	if err := cl.Update(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Delete(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile after delete: %v", err)
+	}
+	if n := samplesOfAgent(t, usageMetrics.times, agent.Namespace); n != 0 {
+		t.Errorf("%d time samples after the agent was deleted, want 0", n)
 	}
 }

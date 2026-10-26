@@ -1,0 +1,98 @@
+# NIGHTLY-TIER, registered on landing in hack/eval/nightly-cases.txt: the
+# default home for a new case. A full audit, tofu-provisioned, the same shape
+# and cost band as fleet-audit-clean-close-reads-clean.
+#
+# WHAT THIS GRADES (#1929). A run that a person asks for gets an answer that
+# names the ledger, also when the run moved nothing. `finish` returns
+# `silent_ok: true` only for a run that passed `--scheduled`, which only the
+# cron prompts pass. Before this, `finish` could not tell an on-demand run
+# from a scheduled one, and on an unchanged rerun the worker followed
+# `silent_ok: true` and answered `[SILENT]`, although the SOP says that an
+# on-demand run is never silent.
+#
+# THE PLANT (prebuilt/stale-audit-ledger, ledger_kind "gap"). The stack opens
+# one ai-security-audit ledger that a coverage gap opened: no finding, an
+# invented cluster checked in full, and a second invented cluster under
+# `scope.skipped`. It writes the stored record of that ledger, with the gap,
+# from the shell sandbox with audit_report's own functions. The stream is
+# clean on the eval fleet (fleet-audit-clean-close-reads-clean says why), so
+# the run finds nothing, has no gap, and closes the ledger with nothing new,
+# nothing resolved and no pull request. A gap that cleared is not news. So on
+# main `finish` returns `silent_ok: true` for this run.
+#
+# THE GRADE. `ledger_issue_contains` reads the issue that the report cites.
+# With the change, `silent_ok` is false and the worker reports the ledger URL.
+# A `[SILENT]` answer names no issue, and the check fails at "report names no
+# github.com issue URL". The clean close does not rewrite the footer, so
+# `max_clock_skew_sec` is the sibling's (its header says why).
+#
+# THE RED, OBSERVED ON MAIN. On a dev install on main d05869ae (2026-10-20),
+# the check `the-report-cites-the-closed-ledger` failed: "the run's report
+# names no github.com issue URL, but says the ledger was retired as clean
+# ('ledger issue #81 was closed')". The run closed the ledger and its report
+# gave no URL. The red depends on the worker: on main the SOP still tells the
+# worker that an on-demand run is never silent, and a worker that obeys that
+# rule over `silent_ok: true` reports the URL. So a run on main can pass, and
+# no run measured how often it does. The green is deterministic in the
+# harness: with the change, `silent_ok` is false on this run
+# (test_audit_report.py, TestOnDemandRunIsNeverSilent).
+#
+# Two ways the case breaks without the change being wrong, both reported as
+# failures of the stack or the run rather than as a red:
+#   -- a run with a coverage gap of its own (a fleet cluster it could not
+#      read) keeps the ledger open and speaks on main too;
+#   -- an AI-classified workload on the fleet (another case's plant left
+#      behind) makes the run report findings, which speaks on main too.
+#
+# Isolation class: read-only cluster sweep, GitOps-repo write (the ledger, the
+# same throwaway-repo terms as every audit case).
+id: fleet-audit-on-demand-run-reports
+name: An on-demand audit that moved nothing still reports its ledger URL
+prompt: >-
+  Run the AI workload security audit, following the ai-security-audit SOP.
+expected_output: >-
+  The audit finds no AI workload findings and no coverage gap on the fleet,
+  and closes the open ledger, which a coverage gap had opened. The run was
+  asked for, so it is not silent: the closing response is the SOP's one line,
+  carrying the ledger URL in full.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/stale-audit-ledger"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh).
+  variables:
+    audit_id: "ai-security-audit"
+    ledger_kind: "gap"
+
+validated: false
+
+# Slug per docs/designs/domains.yaml: the SOP-machinery domain. The stack
+# plants the ledger; no seeded-fleet defect domain claims it.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
+
+# The stack plants everything this case asserts on; no seeded-fleet role is
+# read (docs/designs/bench-case-format.md, the `fixtures: []` rule).
+fixtures: []
+
+verification_spec:
+  # The report cites the ledger, and the ledger is the one the stack opened,
+  # closed by this run. A `[SILENT]` answer cites no issue and fails here.
+  - name: the-report-cites-the-closed-ledger
+    role: objective
+    # assert: the ledger is written once, at `finish`.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: ai-security-audit
+      scope: body
+      # The banner marker is an HTML comment that `publishable_text` escapes
+      # in every model-written field, so only audit_report.py can write it.
+      # The invented cluster names the ledger as the stack's.
+      required_phrases:
+        ["<!-- audit-clean-closed -->", "eval-unreachable-cluster"]
+      max_clock_skew_sec: 900
