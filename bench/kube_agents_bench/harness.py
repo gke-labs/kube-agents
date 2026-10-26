@@ -3252,10 +3252,21 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         worker_acted = bool(captured and captured.entries) or bool(result.metadata.get("worker_commands"))
+        non_action = {
+            DELEGATION_TOOL,
+            STATUS_TOOL,
+            "kanban_list",
+            "delegate",
+            inject.EVENT_ENTRY_POST,
+            inject.EVENT_ENTRY_EDIT,
+            inject.EVENT_ENTRY_TASK,
+            inject.EVENT_ENTRY_STATUS,
+            inject.EVENT_ENTRY_ACTIVITY,
+        }
         front_door_acted = any(
             isinstance(e, dict)
             and not e.get("agent")
-            and e.get("name") not in {DELEGATION_TOOL, STATUS_TOOL, "kanban_list", "delegate"}
+            and e.get("name") not in non_action
             for e in result.trajectory
         )
         agent_acted = worker_acted or front_door_acted
@@ -3272,8 +3283,11 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
-        if not infra_reason and board_messages:
-            for text in board_messages:
+        all_messages: list[str] = list(board_messages)
+        all_messages.extend(delivered_results(observed, awaited).values())
+
+        if not infra_reason and all_messages:
+            for text in all_messages:
                 if not text:
                     continue
                 for line in text.splitlines():

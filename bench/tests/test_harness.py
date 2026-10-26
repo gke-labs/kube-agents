@@ -4202,3 +4202,37 @@ def test_settle_spoofed_rate_limit_without_hermes_prefix_stays_graded(
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
+
+
+def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When board_messages is empty (e.g. board exec hiccup), observed kanban_show summary marks infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    observed = [{
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]

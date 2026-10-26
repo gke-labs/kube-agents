@@ -2672,6 +2672,32 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
     assert "RESOURCE_EXHAUSTED" not in result.output
 
 
+def test_inject_transport_delegated_worker_rate_limit_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On inject transport, when a card closes with the Hermes rate limit summary and worker did not act, mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "blocked", summary=rate_limit_msg)
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+
+
 def test_a_board_that_stops_answering_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
