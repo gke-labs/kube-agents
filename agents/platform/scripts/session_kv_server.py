@@ -4027,7 +4027,9 @@ FLEET_AUDIT_SKILL = "fleet-audit"
 DEFAULT_PROFILE = "default"
 PROFILES_DIR = "profiles"
 CRON_ROSTER = ("cron", "jobs.json")
-# A profile name is one path segment; anything else is never a roster.
+# A profile name is one path segment; anything else is never a roster, a
+# ledger or a session store. `_profile_home` applies it, then normalises the
+# directory and checks it stays under its root.
 _PROFILE_SEGMENT_RE = re.compile(r"\A(?!\.{1,2}\Z)[\w.-]+\Z")
 
 # Newlines and the tokens that could open a role or forge a fence. Labels get a
@@ -4377,32 +4379,46 @@ def _slack_audit_headline(
     return AuditHeadline(text, issue, ref)
 
 
-def _validated_profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Path]:
-    """Return the validated directory for `profile` under `data_root` (or `agent_home()`)."""
+def _profile_home(profile: str, data_root: str | os.PathLike | None = None) -> str | None:
+    """`profile`'s home under `data_root` (the agent home when None), where its roster, ledger and state live; None when it names no profile.
+
+    `profile` is caller-supplied. The default profile's home is the root
+    itself; any other is one path segment under the profiles directory, and a
+    name that leaves it is no profile. Every reader of a profile's files gets
+    its directory here: abspath (a relative root resolves against the working
+    directory, as the open would) followed by startswith is the containment
+    check CodeQL recognises (py/path-injection); the segment check alone, and
+    `Path.resolve` with `is_relative_to`, are not. A second containment check
+    on the real paths then refuses a `profiles/<name>` that is a symlink out
+    of the profiles directory, which the lexical check cannot see; a home
+    that is itself a symlink passes, since both sides resolve through it.
+    A root that cannot be resolved (a relative home whose working directory
+    is gone) names no profile either, so every reader keeps its fallback.
+    """
     if not _PROFILE_SEGMENT_RE.match(profile):
         return None
-    root = data_root if data_root is not None else Path(gitops_workspace.agent_home())
     try:
-        root_resolved = root.resolve()
-        candidate = (
-            root_resolved
-            if profile == DEFAULT_PROFILE
-            else (root_resolved / PROFILES_DIR / profile).resolve()
-        )
-        if candidate != root_resolved and not candidate.is_relative_to(root_resolved):
+        home = os.path.abspath(os.fspath(data_root) if data_root is not None else gitops_workspace.agent_home())
+        if profile == DEFAULT_PROFILE:
+            return home
+        root = os.path.join(home, PROFILES_DIR)
+        base = os.path.normpath(os.path.join(root, profile))
+        if not base.startswith(root + os.sep):
             return None
-        return candidate
+        if not os.path.realpath(base).startswith(os.path.realpath(root) + os.sep):
+            return None
     except OSError:
         return None
+    return base
 
 
 def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster runs fleet-audit; False when it cannot be read."""
-    home = _validated_profile_home(profile)
-    if home is None:
+    base = _profile_home(profile)
+    if base is None:
         return False
     try:
-        with open(home.joinpath(*CRON_ROSTER), encoding="utf-8") as handle:
+        with open(os.path.join(base, *CRON_ROSTER), encoding="utf-8") as handle:
             store = json.load(handle)
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
@@ -4805,23 +4821,10 @@ def _delivering_run_start(profile: str, job_id: str) -> float | None:
     allows one live run per job. `claimed` rows are left out: a tick writes one
     at submit and may lose the claim. Read-only, and any failure is None.
     """
-    from gitops_workspace import agent_home
-
-    # `profile` is caller-supplied, and a ledger is only ever under the agent
-    # home (the default profile) or the profiles directory (the rest): a path
-    # that leaves its root is no ledger. abspath (a relative home resolves
-    # against the working directory, as the open would) followed by startswith
-    # is the containment check CodeQL recognises (py/path-injection).
-    home = os.path.abspath(agent_home())
-    if profile == DEFAULT_PROFILE:
-        root, base = home, home
-    else:
-        root = os.path.join(home, PROFILES_DIR)
-        base = os.path.join(root, profile)
-    path = os.path.normpath(os.path.join(base, *RUN_LEDGER))
-    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
-    if not path.startswith(prefix):
+    base = _profile_home(profile)
+    if base is None:
         return None
+    path = os.path.join(base, *RUN_LEDGER)
     if not os.path.exists(path):
         return None
     try:
@@ -4939,19 +4942,11 @@ class SchedulerFailure(NamedTuple):
     text: str
 
 
-def _profile_home(profile: str) -> str:
-    """`profile`'s home under the agent home, where its cron roster and run ledger live."""
-    from gitops_workspace import agent_home
-
-    return agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
-
-
 def _runs_daily(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster fires once a day, every day; False when it cannot be read."""
-    if not _PROFILE_SEGMENT_RE.match(profile):
-        return False
     try:
-        return cron_schedule.job_runs_daily(_profile_home(profile), job_id)
+        base = _profile_home(profile)
+        return base is not None and cron_schedule.job_runs_daily(base, job_id)
     except Exception as exc:
         logger.warning(f"Relay for {profile}/{job_id}: cron schedule unreadable: {exc}")
         return False
@@ -4987,13 +4982,14 @@ def _run_completed_since(profile: str, job_id: str, since: float) -> bool:
     """Whether the scheduler's ledger has a run of `job_id` that started after `since` and finished cleanly.
 
     True when the ledger cannot say, so a failure that cannot be told from a
-    repeat is posted rather than withheld; that includes a `profile` that is not
-    one path segment, since it is caller-supplied and a path that leaves the
-    profiles directory is no ledger.
+    repeat is posted rather than withheld; that includes a `profile` that
+    :func:`_profile_home` refuses, since it is caller-supplied and a name that
+    is no profile has no ledger.
     """
-    if not _PROFILE_SEGMENT_RE.match(profile):
+    base = _profile_home(profile)
+    if base is None:
         return True
-    path = os.path.join(_profile_home(profile), *RUN_LEDGER)
+    path = os.path.join(base, *RUN_LEDGER)
     if not os.path.exists(path):
         return True
     try:
@@ -7071,10 +7067,10 @@ def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: 
 
 def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
     """Return the read-only `state.db` path for `profile` under `data_root`."""
-    home = _validated_profile_home(profile or DEFAULT_PROFILE, data_root)
+    home = _profile_home(profile or DEFAULT_PROFILE, data_root)
     if home is None:
         return None
-    candidate = home / HERMES_STATE_DB_FILENAME
+    candidate = Path(home) / HERMES_STATE_DB_FILENAME
     try:
         return candidate if candidate.is_file() else None
     except OSError:
