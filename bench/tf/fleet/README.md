@@ -64,9 +64,12 @@ it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one pro
 when asked, and the CI health bot's hourly scan runs it against every pool project and
 reports a repeated drift the way it reports a lost build node
 ([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan"). The
-presubmit does not run it and does not act on a drift: an eval
-run's verdict is about the pull request, and skipping or excusing cases on the fleet's
-account is deliberately not part of evals v1. The script's `--wait` exists for a
+presubmit and the nightly run it once against their own leased project, and a case
+whose grade depends on a role the scan saw drifted is recorded as infrastructure under
+`fixture-drift:<role>` instead of being run
+([`docs/eval-gate-roster.md`](../../../docs/eval-gate-roster.md), "Demoting a flaky
+case"): an eval run's verdict is about the pull request, and a broken fixture is not.
+Nothing repairs a drift there. The script's `--wait` exists for a
 fixture that has just been rescheduled (the crashloop needs its first restart before
 OOMKilled evidence exists, observed about 40 minutes behind the node repair on one
 project in the #1278 retest sweep); a role still drifted at the deadline gets a

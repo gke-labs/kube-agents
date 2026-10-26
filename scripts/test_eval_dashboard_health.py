@@ -260,6 +260,24 @@ class RepKinds(unittest.TestCase):
         self.assertFalse(t.collapsed, "nothing graded, nothing collapsed")
         self.assertTrue(health.Task(task("x", "ffc")).collapsed, "a ceiling rep never softens a collapse")
 
+    def test_the_fixture_drift_marker_is_the_bench_modules(self):
+        module = SCORER.parent / "fixture_drift.py"
+        label = next(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in module.read_text(encoding="utf-8").splitlines()
+            if line.startswith("FIXTURE_DRIFT_LABEL = ")
+        )
+        self.assertEqual(health.FIXTURE_DRIFT_MARKER, f"({label}:")
+
+    def test_drifted_fixture_reps_are_neither_graded_nor_storms(self):
+        drifted = {"result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade (fixture-drift:crashloop-workload: pod crashloop status.containerStatuses[*].lastState.terminated.reason any_eq OOMKilled: observed none)"}
+        self.assertEqual(health.rep_kind(drifted), "fixture")
+        t = health.Task({"name": "x", "result": "infra", "reps": [dict(drifted, n=i + 1) for i in range(3)]})
+        self.assertEqual((t.passes, t.fails, t.storms, t.ceilings, t.fixtures, t.graded), (0, 0, 0, 0, 3, 0))
+        self.assertFalse(t.collapsed)
+        r = health.Run({"build_id": "1", "pr": 1, "result": "SUCCESS", "tasks": [{"name": "x", "result": "infra", "reps": [dict(drifted, n=i + 1) for i in range(3)]}]})
+        self.assertEqual((r.storm_reps, r.total_reps), (0, 3))
+
 
 # --------------------------------------------------------------------------- #
 # Rule 1: shared break
