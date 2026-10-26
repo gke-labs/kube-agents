@@ -544,8 +544,8 @@ DUPLICATE_DECLARATION_PREFIX = "more than one file declares it ("
 # cleanly: the remedy is the sibling, not a replace of the seed.
 SIBLING_RAISE_PREFIX = "a file beside it under the tree makes the index raise ("
 # The cases that fail on a project whose repository lacks the declaration:
-# the nightly case (#3120 gates its roster return on this seed) and the #2228
-# case parked on this fixture. (The other
+# pdb-remediation-pr (back on the roster since 2026-10-26 on this seed,
+# #3120) and the #2228 case parked on this fixture. (The other
 # #2228 case, obtainability-refusal-direct-mutation, is nightly and only
 # loses its pull-request arm: its inline-proposal arm passes without the file.)
 GITOPS_WORKLOAD_MANIFEST_CASES = (
