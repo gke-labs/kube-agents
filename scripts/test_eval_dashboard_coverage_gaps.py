@@ -202,6 +202,20 @@ class FindGapsTest(Harness):
         self.assertEqual(coverage_gaps.percent(26 / 29), "89%")
         self.assertEqual(coverage_gaps.percent(37 / 41), "90%")
 
+    def test_a_since_written_as_a_timestamp_is_its_day(self):
+        (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS.replace("since: 2026-10-21", "since: 2026-10-21 09:00:00"))
+        gamma = next(g for g in self.gaps() if g["slug"] == "gamma")
+        self.assertEqual((gamma["since"], gamma["days"]), (datetime.date(2026, 10, 21), 5))
+        self.assertIsNotNone(self.run_once())
+
+    def test_the_store_column_reads_the_next_mode_series(self):
+        next_mode = {"cases": {"beta-good": {"record": {"state": "would-admit", "runs": 21, "passes": 21}}}}
+        today = {"beta-good": {"record": {"state": "collecting", "runs": 3, "passes": 3}}}
+        with unittest.mock.patch.object(coverage_gaps.trend, "trend_document", return_value={"cases": today, "next": next_mode}):
+            self.assertEqual(coverage_gaps.store_records({}, data_doc())["beta-good"]["state"], "would-admit")
+        with unittest.mock.patch.object(coverage_gaps.trend, "trend_document", return_value={"cases": today, "next": None}):
+            self.assertEqual(coverage_gaps.store_records({}, data_doc())["beta-good"]["state"], "collecting", "today's only without next-mode records")
+
     def test_a_store_written_back_after_a_failed_read_is_not_this_ticks(self):
         self.assertIsNone(coverage_gaps.store_records({"error": "store.py timed out", "records": []}, data_doc()))
 

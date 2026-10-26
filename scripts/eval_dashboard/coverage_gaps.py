@@ -30,7 +30,7 @@ no verdict), and whether that record meets the roster's bar, 90% over at
 least 20 graded runs (docs/eval-gate-roster.md, "The admission bar, and who
 clears it"). When
 ``--store`` names the store.json the tick read, each also carries what the
-evidence store says at the current version key (``trend.record_state``:
+evidence store says at the current next-mode version key, the mode the main nightly grades (``trend.record_state``:
 ``would-admit``, ``would-demote``, ``collecting`` with the runs still needed
 for a full window of 20). They are ranked store ``would-admit`` first, then
 by whether the nightly record meets the bar, then by pass rate.
@@ -131,7 +131,7 @@ BODY = """\
 
 {expiry}**Why it is uncovered:** {why}
 
-**Candidates** (the domain's cases on the nightly matrix with a `verification_spec`, not `expected_fail`, best first). The nightly record is the graded repetitions over the last {nights} nightly nights, read as the nightly bug filer reads them; **Bar** holds it to the roster's {bar_pct}% over at least {bar_runs} graded runs, and the evidence store applies the same bar at the current version key.
+**Candidates** (the domain's cases on the nightly matrix with a `verification_spec`, not `expected_fail`, best first). The nightly record is the graded repetitions over the last {nights} nightly nights, read as the nightly bug filer reads them; **Bar** holds it to the roster's {bar_pct}% over at least {bar_runs} graded runs, and the evidence store applies the same bar at the current next-mode version key.
 
 {candidates}
 
@@ -202,6 +202,9 @@ def allowlist_entry(raw) -> dict | None:
         return {"slug": raw.strip(), "since": None, "issue": None, "owner": None, "held_out": None}
     if isinstance(raw, dict) and isinstance(raw.get("slug"), str):
         def date(value):
+            # A timestamp (a datetime, which is a date subclass) is its day.
+            if isinstance(value, datetime.datetime):
+                return value.date()
             if isinstance(value, datetime.date):
                 return value
             try:
@@ -291,12 +294,15 @@ def case_of(path: str) -> str:
 
 
 def store_records(store: dict | None, data: dict) -> dict[str, dict] | None:
-    """``{case: trend.record_state}`` at the current key; None without a
-    store, or for the last published one written back after a failed read
+    """``{case: trend.record_state}`` at the current next-mode key, the
+    mode the main nightly and the blocking presubmit grade (today's series
+    only when the store holds no next-mode records); None without a store,
+    or for the last published one written back after a failed read
     (``error`` set), whose verdicts are not this tick's."""
     if not isinstance(store, dict) or store.get("error"):
         return None
-    cases = trend.trend_document(store, data).get("cases") or {}
+    document = trend.trend_document(store, data)
+    cases = (document.get("next") or document).get("cases") or {}
     return {name: doc.get("record") for name, doc in cases.items() if doc.get("record")}
 
 

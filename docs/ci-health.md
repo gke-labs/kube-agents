@@ -945,7 +945,7 @@ bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 (90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
 bar, and who clears it"), and, when the tick read the evidence store (not the
 last published copy written back after a failed read), what the
-store says at the current version key: `would-admit`, `would-demote`,
+store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
 bar, then by pass rate. The body is edited in place when any of this changes,
