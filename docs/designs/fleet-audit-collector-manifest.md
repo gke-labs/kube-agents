@@ -113,8 +113,9 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `error` (top level)                        | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                                                                                                                                            |
 
 `kcc_unready` and `kcc_unread` come from `kcc_health.py`. Each `kcc_unready` entry is
-`{kind, namespace, name, why}`, with `resource` (the object's `spec.resourceID`) and `cluster` (a
-`ContainerNodePool`'s `clusterRef`) where they are set; an empty list means the cluster runs Config
+`{kind, namespace, name, why}`, with `resource` (the object's `spec.resourceID`), `cluster` (a
+`ContainerNodePool`'s `clusterRef`) and `project` (the project the object manages, from its
+`cnrm.cloud.google.com/project-id` annotation; the namespace is not read) where they are set; an empty list means the cluster runs Config
 Connector and nothing there is unready. An object with no `Ready` condition yet is left out, and so
 is one whose reason is `Updating` or `Deleting`: Config Connector sets those while it still applies
 the object. The compliance collector writes the keys from its read for `kcc-object-wedged`
@@ -124,7 +125,10 @@ drift, patch readiness and stockout collectors, whose fixes can edit a `Containe
 worker pool of the sweep's size. Drift and patch readiness fetch credentials for the read; stockout
 uses the kubeconfig its sweep fetched. These reads end `kcc_health.RUN_DEADLINE_S` (540 s) after
 the collector starts, so the manifest prints inside the 600 s terminal call; an entry whose read
-cannot start in time gets `kcc_unread`. `finish` adds a note to a
+cannot start in time gets `kcc_unread`. Only cluster entries are read: a `project/<id>` entry at
+location `global` is skipped, and an entry with no kubeconfig file gets `kcc_unread`. When more than
+one entry carries `kcc_unready`, `finish` names an object only when its `project` is known and
+agrees with the fix (the issue-ledger design, §6). `finish` adds a note to a
 `manifest` fix whose file declares one of the objects, and states the stall on a merged fix that
 still reproduces (the issue-ledger design, §6).
 

@@ -807,7 +807,12 @@ it declares on kind, `metadata.name`, `metadata.namespace` when the file sets on
 when the file object and the recorded object both set one. A match that is not certain gives no
 note: the same object not ready on more than one host cluster with nothing to tell them apart
 (Config Controller puts the objects of each instance in `config-control`), or, when the file sets
-no namespace, more than one object that fits. The collectors leave out the transient reasons
+no namespace, more than one object that fits. A ready object is not in the list, so when more than
+one cluster entry ran Config Connector (carries `kcc_unready`, also empty), the same name can be
+ready on one host and not ready on another. Then a match is certain only when the recorded object's
+target project (its `cnrm.cloud.google.com/project-id` annotation, which the collector records as
+`project`) is known and equals the file object's project annotation, or the finding's project when
+the file has none. With one such host, the name decides. The collectors leave out the transient reasons
 `Updating` and `Deleting`, which Config Connector sets while it still applies the object. The note is
 the last paragraph of the remediation note, starts "**Config Connector is not applying this
 file.**", and names each matched object and the controller's reason in code spans; when the reason
@@ -822,7 +827,7 @@ back the text it cut. The pass first removes an earlier copy of the note from ev
 and the carry removes it too, so a note never shows a stall that this run's manifest does not. A
 cluster whose read failed (`kcc_unread`) gives no stall and a warning in the log: the absence of the
 note never says that Config Connector applies a file. The same match, or a `Cluster/` or `NodePool/`
-finding whose own object is not ready, makes the `pr-merged-persists` row and the comment on the
+finding whose own object is not ready when the fix's file declares a Config Connector object, makes the `pr-merged-persists` row and the comment on the
 merged pull request state the stall in place of "the remediation was incomplete, or something
 outside this repository reverted it".
 
