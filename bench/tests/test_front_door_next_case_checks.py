@@ -223,6 +223,8 @@ def test_a_paused_specialists_question_is_not_the_front_doors_ask() -> None:
     ack = "On it: fixing the three files the report names."
     question = QUESTION + "The report names payments-api and checkout. Which should go first?"
     assert _confirm_first_ack_passes(f"{ack}\n\n{question}")
+    # The second pattern forbids `sample` and `demo` over the same span; a specialist may say either.
+    assert _confirm_first_ack_passes(f"{ack}\n\n{QUESTION}The report reads like a sample. Should I still start?")
     assert _confirm_first_ack_passes(f"{ack}\n\n{RESULT}Fixed all three files.")
     assert not _confirm_first_ack_passes("Shall I fix the three files the report names?")
 
