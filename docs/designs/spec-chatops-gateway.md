@@ -1597,9 +1597,10 @@ Slack API error) is adopted in memory for that boot with no re-stamp, so `reader
 that did not happen. An empty record arms the learn: the first verified, top-level channel mention that is not a command, whose
 channel passes the same check, is written once (`slack`, `slack.setBy`, `slack.setAt`, `writer`,
 `reader`), the gateway's notify route is armed on it, and one line in the learning thread names the
-channel; a candidate the check refuses is written to `slack.refused` once per boot (a write that
-fails is tried again at the next refusal; a refusal written at boot describes the recorded channel,
-and a refused candidate does not relabel it) and the next mention may learn; a record another writer
+channel; a candidate the check refuses is written to `slack.refused` while the record names no
+channel and does not name that reason already (a write that fails is tried again at the next
+refusal; while a channel is recorded, `slack.refused` describes it, only the boot check writes it,
+and a refused candidate writes nothing) and the next mention may learn; a record another writer
 filled first is adopted after the same check, with `reader` re-stamped, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
 candidate. One hand-reachable

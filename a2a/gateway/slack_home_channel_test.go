@@ -437,6 +437,57 @@ func TestSlackHomeRefusedRecordIsReplacedByTheNextMention(t *testing.T) {
 	}
 }
 
+// TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel: while a
+// channel is recorded, slack.refused describes that channel. A candidate
+// refused for another reason writes nothing, whether the boot's own refusal
+// write landed or failed; the next channel that passes replaces the record.
+func TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel(t *testing.T) {
+	cases := []struct {
+		name          string
+		bootWriteOK   bool
+		refusedAfter  string
+		patchesBefore int
+	}{
+		{"the boot refusal landed", true, homeRefusedArchived, 1},
+		{"the boot refusal write failed", false, "", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, api, cs, setter := newHomeLearnAdapter(t, map[string]string{
+				homeRecordKeySlack: "C0AA1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyReader: homeTestOldImage,
+			})
+			api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true })
+			api.conversations["C0BB2"] = homeChannelInfo("C0BB2", func(c *slack.Channel) { c.IsExtShared = true })
+			api.conversations["C0CC3"] = homeChannelInfo("C0CC3", nil)
+			if !tc.bootWriteOK {
+				failOnce(cs, "patch")
+			}
+			a.AdoptHomeRecord(context.Background())
+			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != tc.refusedAfter || !a.homeLearn.armed {
+				t.Fatalf("after boot: record %v, armed %v; want refused=%q and armed", data, a.homeLearn.armed, tc.refusedAfter)
+			}
+			// A mention in a shared channel: refused, and the record still
+			// describes the recorded channel.
+			homeMention(t, a, slackChannelTypeChannel, "C0BB2", "U1", "<@UBOT> hi", "120.0", "", true)
+			data := homeRecordData(t, cs)
+			if data[homeRecordKeyRefused] != tc.refusedAfter || data[homeRecordKeySlack] != "C0AA1" || homePatches(cs) != tc.patchesBefore || len(setter.all()) != 0 {
+				t.Fatalf("after a refused candidate: record %v, patches %d, SetHome %v; want refused=%q beside C0AA1, %d patches and none",
+					data, homePatches(cs), setter.all(), tc.refusedAfter, tc.patchesBefore)
+			}
+			// A channel that passes replaces the recorded one and clears the
+			// refusal, as before.
+			homeMention(t, a, slackChannelTypeChannel, "C0CC3", "U1", "<@UBOT> here then", "121.0", "", true)
+			data = homeRecordData(t, cs)
+			if _, stale := data[homeRecordKeyRefused]; stale || data[homeRecordKeySlack] != "C0CC3" {
+				t.Errorf("record after the replacement = %v, want slack=C0CC3 and no refusal", data)
+			}
+			if got := setter.all(); len(got) != 1 || got[0] != "C0CC3" {
+				t.Errorf("SetHome = %v, want [C0CC3]", got)
+			}
+		})
+	}
+}
+
 func TestSlackHomeBootAdopt(t *testing.T) {
 	valid := map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyReader: homeTestOldImage, homeRecordKeyRefused: homeRefusedArchived}
 	cases := []struct {

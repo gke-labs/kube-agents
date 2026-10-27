@@ -106,11 +106,10 @@ type slackHomeLearn struct {
 	setter homeSetter
 	image  string
 	// armed is set once the boot read found no channel to adopt; busy while
-	// a learn runs; refused once a refusal is on the record this boot, so
-	// later refusals only log (a write that failed leaves it unset, so the
-	// next refusal tries again); closed once Run is shutting down, so no
-	// learn starts while Run waits for the ones in flight.
-	armed, busy, refused, closed bool
+	// a learn runs; closed once Run is shutting down, so no learn starts
+	// while Run waits for the ones in flight. The refusal on the record has
+	// no copy here: the record is read before every refusal write.
+	armed, busy, closed bool
 	// wg counts the learn and adopt goroutines, so Run waits for a write in
 	// flight before the gateway exits.
 	wg sync.WaitGroup
@@ -180,14 +179,13 @@ func (s *SlackAdapter) adoptHome(ctx context.Context) {
 		return
 	case refused != "":
 		s.log.Warn("slack: recorded home channel refused; the first admitted channel mention replaces it", "channel", id, "reason", refused)
-		// The record's refusal describes the recorded channel, so the learn
-		// path's one write this boot is spent here: a refused candidate must
-		// not relabel it. A write that fails leaves the budget unspent, so
-		// until the next boot writes it again a refused candidate's reason
-		// can land beside the recorded channel.
-		recorded := cm.Data[homeRecordKeyRefused] == refused || s.writeRefusal(ctx, cm, refused)
+		// A write that fails leaves the recorded channel without its reason
+		// until the next boot or the mention that replaces it; refuseHome
+		// never fills it in, because the reason it holds is a candidate's.
+		if cm.Data[homeRecordKeyRefused] != refused {
+			s.writeRefusal(ctx, cm, refused)
+		}
 		l.mu.Lock()
-		l.refused = recorded
 		l.armed = true
 		l.mu.Unlock()
 		return
@@ -325,41 +323,30 @@ func (s *SlackAdapter) checkHomeChannel(ctx context.Context, id string) (refused
 	return "", nil
 }
 
-// refuseHome records why a candidate was refused, once per boot: a channel
-// that keeps being refused is one log line per mention, not one write. The
-// budget is spent when the reason is on the record, not before: a read or a
-// write that failed is tried again at the next refusal. Learns run one at a
-// time (busy), so the flag is read and set without holding the lock across
-// the calls.
+// refuseHome records why a candidate was refused. The record decides: while
+// it names a channel, slack.refused describes that channel and only the boot
+// check writes it, so a refused candidate writes nothing; otherwise the reason
+// is written unless the record names it already, so a channel that keeps
+// being refused is one log line per mention, not one write, and a read or a
+// write that failed is tried again at the next refusal.
 func (s *SlackAdapter) refuseHome(ctx context.Context, reason string) {
 	l := &s.homeLearn
-	l.mu.Lock()
-	recorded := l.refused
-	l.mu.Unlock()
-	if recorded {
-		return
-	}
 	cm, err := l.record.get(ctx)
 	if err != nil {
 		s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "err", err)
 		return
 	}
-	if cm.Data[homeRecordKeyRefused] != reason && !s.writeRefusal(ctx, cm, reason) {
+	if strings.TrimSpace(cm.Data[homeRecordKeySlack]) != "" || cm.Data[homeRecordKeyRefused] == reason {
 		return
 	}
-	l.mu.Lock()
-	l.refused = true
-	l.mu.Unlock()
+	s.writeRefusal(ctx, cm, reason)
 }
 
-// writeRefusal answers whether the reason landed.
-func (s *SlackAdapter) writeRefusal(ctx context.Context, cm *corev1.ConfigMap, reason string) bool {
+func (s *SlackAdapter) writeRefusal(ctx context.Context, cm *corev1.ConfigMap, reason string) {
 	l := &s.homeLearn
 	if err := l.record.patch(ctx, cm.ResourceVersion, map[string]*string{homeRecordKeyRefused: &reason}); err != nil {
 		s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "err", err)
-		return false
 	}
-	return true
 }
 
 // recordHome writes the learned channel, unless the record names one already:
