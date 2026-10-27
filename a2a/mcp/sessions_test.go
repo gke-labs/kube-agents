@@ -275,7 +275,6 @@ func TestManageSessionControlActionsSendTheirText(t *testing.T) {
 	}{
 		actionSessionOn:  {sessionOnText, "Session started."},
 		actionSessionOff: {sessionOffText, "Session ended."},
-		actionStatus:     {statusText, "Nothing is running"},
 		actionHelp:       {helpText, answerText},
 	} {
 		t.Run(action, func(t *testing.T) {
@@ -328,6 +327,7 @@ func TestManageSessionAnswersDroppedActions(t *testing.T) {
 		"debug_off":    "not available in the in-cluster server yet: per-conversation formatting comes with a later change",
 		"transcript":   "not available in the in-cluster server yet: reading a conversation's history needs a cheaper bus read than a scan of every task; use task_control get for a task",
 		"clear_killed": "not available in the in-cluster server: it cannot see session pods",
+		actionStatus:   "task_control get",
 	} {
 		res := callTool(t, s, ToolManageSession, map[string]any{"action": action, "conversation": "ops"})
 		mustFail(t, res, want)
@@ -357,7 +357,7 @@ func TestManageSessionRefusesBadInput(t *testing.T) {
 		"delete without a name":   {"action": actionDelete},
 		"delete by token alone":   {"action": actionDelete, "conversation_token": "mcpabc"},
 		"a wildcard token":        {"action": actionSessionOn, "conversation_token": "*"},
-		"a dotted token":          {"action": actionStatus, "conversation_token": "a.b"},
+		"a dotted token":          {"action": actionSessionOff, "conversation_token": "a.b"},
 		"a doubly prefixed token": {"action": actionHelp, "conversation_token": "console:console:mcpabc"},
 	} {
 		start := time.Now()
@@ -440,12 +440,13 @@ func TestEveryCallByTokenIsLabelledByIt(t *testing.T) {
 	mustContain(t, out, "Conversation by token `"+token+"`")
 }
 
-// The tool's description promises nothing about steering a running task:
-// status and help wait for it like any message.
+// The tool's description promises nothing about steering a running task or
+// replaying its progress: help waits for it like any message, and status is
+// not offered.
 func TestTheSchemaDoesNotPromiseASteer(t *testing.T) {
 	d := ManageSessionTool(nil, NewConversations()).Definition.Description
-	mustNotContain(t, d, "steers", "replays its progress")
-	mustContain(t, d, "wait for the conversation's running turn")
+	mustNotContain(t, d, "steers", "replays its progress", "status")
+	mustContain(t, d, "waits for the conversation's running turn")
 }
 
 // Only a token's own spelling is a token: upper-case hex is a name, since
