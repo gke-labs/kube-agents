@@ -50,8 +50,7 @@
     "long-sentence": 15
   },
   "deploy/release-versioning.md": {
-    "long-paragraph": 1,
-    "long-sentence": 8
+    "long-sentence": 3
   },
   "deploy/rollback.md": {
     "long-paragraph": 9,
@@ -89,7 +88,7 @@
     "long-sentence": 9
   },
   "install/slack-app.md": {
-    "long-paragraph": 4,
+    "long-paragraph": 3,
     "long-sentence": 3
   },
   "install/uninstall.md": {
@@ -97,7 +96,7 @@
     "long-sentence": 9
   },
   "install/upgrade.md": {
-    "long-paragraph": 6,
+    "long-paragraph": 5,
     "long-sentence": 13
   },
   "operator/agentplugin-crd.md": {
