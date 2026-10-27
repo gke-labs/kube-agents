@@ -3343,7 +3343,11 @@ class KubeAgentsHarness(AgentHarness):
                 and (
                     (
                         e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER
-                        and not worker_trajectory.wrapped_tool_names(e)
+                        and (
+                            not isinstance(e.get("args"), dict)
+                            or isinstance(e.get("args", {}).get("raw"), str)
+                            or not worker_trajectory.wrapped_tool_names(e)
+                        )
                     )
                     or any(
                         _is_substantive_worker_action(n)
@@ -3364,25 +3368,25 @@ class KubeAgentsHarness(AgentHarness):
         agent_acted = worker_acted or front_door_acted
         infra_reason: str | None = None
         infra_detail: str = ""
-        for tid, wlog in (logs or {}).items():
-            if wlog and wlog.body:
-                for line in wlog.body.splitlines():
-                    reason = _extract_infra_failure_reason(line)
-                    if reason:
-                        infra_reason = reason
-                        infra_detail = f"worker transcript for {tid} logged {reason}"
-                        break
-                if infra_reason:
-                    break
 
         # Collect the last observed board payload per awaited card from observed.
         # We read status and newest run summary from the same final payload rather than
         # relying on delivered_results (which has first-payload-wins semantics for deliverables).
         # Both kanban_show ({"task": {...}, "runs": [...]}) and kanban_list ({"tasks": [...]})
         # are tracked so that a later batched status read supersedes an earlier show's summary.
+        # If a card was unblocked, its prior run's summary is discarded.
         # Note: Assumes Hermes _handle_show lists task_runs ascending by id so runs[-1] is the newest run.
         last_observed_cards: dict[str, tuple[str | None, str | None]] = {}
         for entry in observed or []:
+            if entry.get("name") == "kanban_unblock":
+                uargs = entry.get("args") or {}
+                if isinstance(uargs, dict):
+                    utid = str(uargs.get("task_id") or uargs.get("id") or "")
+                    if utid in last_observed_cards:
+                        last_observed_cards[utid] = ("ready", None)
+                    elif not utid:
+                        for k in list(last_observed_cards.keys()):
+                            last_observed_cards[k] = ("ready", None)
             payload = _json_object(entry.get("result"))
             shown = payload.get("task")
             if isinstance(shown, dict) and (shown.get("id") in awaited or str(shown.get("id")) in awaited):

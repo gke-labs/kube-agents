@@ -4333,11 +4333,12 @@ def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}], errors=["pre-existing ceiling note"])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+    assert "card on board recorded rate_limit" in res.errors[0]
     # Existing errors are preserved, with the infra marker inserted at index 0
     assert len(res.errors) == 2
     assert res.errors[1] == "pre-existing ceiling note"
@@ -4366,7 +4367,7 @@ def test_settle_delegated_worker_rate_limit_front_door_acted_stays_graded(
     # Front door executed a forbidden worker verb (kanban_complete) before delegating
     trajectory = [{"name": "kanban_complete"}, {"name": "kanban_create"}]
     res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     # Must stay graded so Rung 1 catastrophic safeguard can block
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
@@ -4399,11 +4400,12 @@ def test_settle_delegated_worker_rate_limit_sanctioned_front_door_tools_is_infra
         {"name": "kanban_unblock"},
     ]
     res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+    assert "card on board recorded rate_limit" in res.errors[0]
     assert res.output == "router ack"
     assert res.trajectory == trajectory
 
@@ -4428,7 +4430,7 @@ def test_settle_delegated_worker_rate_limit_every_sanctioned_tool_individually_i
 
     trajectory = [{"name": tool_name}]
     res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
@@ -4453,7 +4455,7 @@ def test_settle_delegated_worker_rate_limit_orphaned_tool_output_is_infra(
 
     orphan_entry = {"name": "", "args": {}, "result": "orphan", "status": "completed"}
     res = harness.AgentResult(output="router ack", trajectory=[orphan_entry])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
@@ -4478,7 +4480,7 @@ def test_settle_delegated_worker_rate_limit_preserves_front_door_trajectory(
 
     front_door_entries = [{"name": "kanban_create"}]
     res = harness.AgentResult(output="router ack", trajectory=list(front_door_entries))
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
@@ -4498,7 +4500,7 @@ def test_settle_delegated_worker_rate_limit_with_failed_capture_stays_graded(
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
@@ -4521,7 +4523,7 @@ def test_settle_delegated_worker_rate_limit_with_capture_gaps_stays_graded(
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
@@ -4546,7 +4548,7 @@ def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     # Result was NOT converted to infra failure because worker acted
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
@@ -4574,7 +4576,7 @@ def test_settle_delegated_worker_rate_limit_with_worker_commands_in_log_stays_gr
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
@@ -4713,11 +4715,11 @@ def test_settle_delegated_worker_rate_limit_after_kanban_show_is_infra(
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "worker transcript for t_1 logged rate_limit" in res.errors[0]
+    assert "card on board recorded rate_limit" in res.errors[0]
 
 
 def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra(
@@ -4747,11 +4749,33 @@ def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "worker transcript for t_1 logged rate_limit" in res.errors[0]
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_worker_log_body_rate_limit_alone_does_not_mark_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker stdout transcript containing rate-limit prefix text without board corroboration does not mark infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
 @pytest.mark.parametrize(
@@ -4776,6 +4800,24 @@ def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra
                 + ' ...[clipped 300 chars]"}}]}'
             },
         },
+        {"name": "tool_call", "args": {"raw": "clipped"}},
+        {"name": "tool_call", "args": {"calls": "not-a-list"}},
+        {
+            "name": "tool_call",
+            "args": {
+                "raw": '{"arguments": {"resourceType": "deployment", "name": "checkout", "patch": "'
+                + "x" * 2100
+                + '"}, "name": "mcp__gke__patch_k8s_resource"}'
+            },
+        },
+        {
+            "name": "tool_call",
+            "args": {
+                "raw": '{"calls": [{"name": "mcp__developer_knowledge__search_documents", "arguments": {"query": "'
+                + "a" * 2100
+                + ' ...[clipped 300 chars]"}}]}'
+            },
+        },
     ],
     ids=[
         "kanban_complete",
@@ -4790,6 +4832,10 @@ def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra
         "mcp_gke_wrapped",
         "mcp_platform_control_wrapped",
         "mcp_platform_control_wrapped_clipped",
+        "tool_call_unparseable_raw",
+        "tool_call_unparseable_calls",
+        "mcp_gke_arguments_first_clipped",
+        "mcp_batch_substantive_clipped_past_cut",
     ],
 )
 def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_tool_stays_graded(
@@ -4833,7 +4879,7 @@ def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_to
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
     res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], board_messages=[body])
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
@@ -5047,6 +5093,51 @@ def test_settle_kanban_list_after_kanban_show_same_blocked_status_preserves_summ
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_kanban_list_after_kanban_unblock_discards_stale_summary_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a card is unblocked after kanban_show, a later kanban_list blocked status is from a new run and must not reuse the stale summary."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show_1 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    unblock_entry = {
+        "name": "kanban_unblock",
+        "args": {"task_id": "t_1"},
+        "result": json.dumps({"status": "ready"}),
+    }
+    list_entry = {
+        "name": "kanban_list",
+        "result": json.dumps({
+            "tasks": [{"id": "t_1", "status": "blocked"}],
+        }),
+    }
+    observed = [show_1, unblock_entry, list_entry]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
 def test_settle_delegated_worker_rate_limit_with_failed_log_read_stays_graded(

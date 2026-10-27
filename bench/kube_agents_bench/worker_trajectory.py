@@ -134,7 +134,12 @@ def wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
             if isinstance(c, dict) and c.get("name"):
                 names.add(str(c["name"]))
     if isinstance(args.get("raw"), str):
-        for match in re.finditer(r'"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', args["raw"]):
+        # Anchor name matching to top-level object or elements of a calls array,
+        # avoiding harvesting argument properties (e.g. k8s resource names) as tool names.
+        for match in re.finditer(
+            r'(?:^\s*\{\s*|"\s*calls\s*"\s*:\s*\[\s*\{\s*)"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            args["raw"],
+        ):
             try:
                 name = json.loads('"' + match.group(1) + '"')
             except ValueError:
