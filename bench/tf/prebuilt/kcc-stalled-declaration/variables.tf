@@ -67,6 +67,17 @@ variable "gitops_repo" {
   default     = ""
 }
 
+# Required when Config Connector runs in namespaced mode on kcc_cluster_name:
+# the plant then creates a ConfigConnectorContext in kcc_namespace with this
+# service account, because no controller watches a namespace without one. The
+# account needs no IAM role: the planted object stops at DependencyNotFound
+# before any call to GCP. Not used in cluster mode.
+variable "kcc_google_service_account" {
+  type        = string
+  description = "Service account email for the ConfigConnectorContext in namespaced mode"
+  default     = ""
+}
+
 # Contents read and write, and pull requests write, on gitops_repo. Empty uses
 # BENCH_GITHUB_TOKEN from the environment.
 variable "gitops_token_file" {

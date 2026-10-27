@@ -22,11 +22,15 @@
 # seeded pinned-inference-pool, in the namespace eval-kcc-stalled on the
 # cluster that runs Config Connector, whose clusterRef names a ContainerCluster
 # the namespace does not hold: Config Connector stops at DependencyNotFound
-# with Ready=False and makes no GCP call. The same declaration, committed to
+# with Ready=False and makes no GCP call. When Config Connector runs in
+# namespaced mode, the plant first creates a ConfigConnectorContext in that
+# namespace with the service account in kcc_google_service_account (it needs
+# no IAM role), because no controller watches a namespace without one. The same declaration, committed to
 # the GitOps repository at clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml,
 # is the file the SOP's fix for the capped, single-zone pool edits. The
-# teardown closes the pull request the run opened on that file, deletes the
-# file, the object and the namespace, and the plant does the same when it
+# teardown closes the pull request the run opened on that file (only from the
+# audit's branch for that path, and only when the file is the stack's),
+# deletes the file, the object, the context and the namespace, and the plant does the same when it
 # fails. bench/tests/test_kcc_stalled_declaration_stack.py holds the plant to
 # the note finish writes for it.
 #
@@ -52,9 +56,9 @@ infrastructure:
   provider: "gcp"
   stack: "prebuilt/kcc-stalled-declaration"
   teardown: true
-  # Only what this case sets; project_id, kcc_cluster_* and the GitOps
-  # repository arrive from the environment once a pool carries a Config
-  # Connector cluster. Each value is repeated in the stack's variables.tf and
+  # Only what this case sets; project_id, kcc_cluster_*, the GitOps
+  # repository and, in namespaced mode, kcc_google_service_account arrive
+  # from the environment once a pool carries a Config Connector cluster. Each value is repeated in the stack's variables.tf and
   # in the checks below; change one and change all.
   variables:
     kcc_namespace: "eval-kcc-stalled"

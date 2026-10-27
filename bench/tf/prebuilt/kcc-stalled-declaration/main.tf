@@ -27,6 +27,11 @@
 # `cnrm.cloud.google.com/deletion-policy: abandon`, so its delete cannot delete
 # the pool. The real pool is never read or changed.
 #
+# When Config Connector runs in namespaced mode, the plant also creates a
+# `ConfigConnectorContext` in the namespace, with the service account in
+# `kcc_google_service_account`, and waits until its controller is healthy. The
+# plant stops with an error when that mode has no service account set.
+#
 # Teardown on both paths. A failed plant removes what it wrote before it
 # exits, because Terraform taints a resource whose create provisioner failed
 # and then skips its destroy provisioner. The destroy provisioner removes the
@@ -49,15 +54,17 @@ terraform {
 locals {
   # The settings plant.py reads, the same for the plant and the teardown.
   # Destroy-time provisioners may read only `self`, so the triggers carry them.
+  # KCC_EVAL_GOOGLE_SERVICE_ACCOUNT is read only in namespaced mode.
   settings = {
-    KCC_EVAL_PROJECT           = var.project_id
-    KCC_EVAL_CLUSTER           = var.kcc_cluster_name
-    KCC_EVAL_LOCATION          = var.kcc_cluster_location
-    KCC_EVAL_NAMESPACE         = var.kcc_namespace
-    KCC_EVAL_SLOT              = var.seeded_slot
-    KCC_EVAL_POOL              = var.seeded_pool
-    KCC_EVAL_GITOPS_REPO       = var.gitops_repo
-    KCC_EVAL_GITOPS_TOKEN_FILE = var.gitops_token_file
+    KCC_EVAL_PROJECT                = var.project_id
+    KCC_EVAL_CLUSTER                = var.kcc_cluster_name
+    KCC_EVAL_LOCATION               = var.kcc_cluster_location
+    KCC_EVAL_NAMESPACE              = var.kcc_namespace
+    KCC_EVAL_SLOT                   = var.seeded_slot
+    KCC_EVAL_POOL                   = var.seeded_pool
+    KCC_EVAL_GITOPS_REPO            = var.gitops_repo
+    KCC_EVAL_GITOPS_TOKEN_FILE      = var.gitops_token_file
+    KCC_EVAL_GOOGLE_SERVICE_ACCOUNT = var.kcc_google_service_account
   }
 }
 

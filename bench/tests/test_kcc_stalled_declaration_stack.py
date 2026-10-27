@@ -74,7 +74,10 @@ def done(rc=0, stdout="", stderr=""):
 class Cluster:
     """The commands plant.py runs, against an in-memory Config Connector cluster."""
 
-    def __init__(self, crd=True, namespace_owner=None, ready="False", fail_on=None):
+    def __init__(self, crd=True, namespace_owner=None, ready="False", fail_on=None, mode=None, context_healthy=True):
+        # `mode` is the ConfigConnector object's `spec.mode`, None with no object.
+        self.mode = mode
+        self.context_healthy = context_healthy
         self.crd = crd
         self.namespace_owner = namespace_owner
         self.ready = ready
@@ -95,6 +98,12 @@ class Cluster:
             return done()
         if argv[:3] == ["kubectl", "get", "crd"]:
             return done(0 if self.crd else 1)
+        if argv[:3] == ["kubectl", "get", plant.CONFIG_CONNECTOR_RESOURCE]:
+            if self.mode is None:
+                return done(1, stderr='Error from server (NotFound): configconnectors "x" not found')
+            return done(stdout=json.dumps({"spec": {"mode": self.mode}}))
+        if argv[:3] == ["kubectl", "get", plant.CONTEXT_RESOURCE]:
+            return done(stdout=json.dumps({"status": {"healthy": self.context_healthy}}))
         if argv[:3] == ["kubectl", "get", "namespace"]:
             if self.namespace_owner is None:
                 return done(1, stderr="NotFound")
@@ -331,3 +340,69 @@ def test_a_failed_cluster_list_still_runs_the_kubernetes_half_and_fails_the_tear
     assert DELETE_NAMESPACE in cluster.calls
     assert forge.closed == [] and DECLARATION in forge.files
     assert "ERROR: cannot resolve the seeded cluster" in capsys.readouterr().err
+
+
+def test_namespaced_mode_gets_a_context_before_the_node_pool():
+    """In namespaced mode no controller watches the stack's namespace until
+    it holds a ConfigConnectorContext, so the object would never stall."""
+    cluster = Cluster(mode="namespaced")
+    plant_ = plant.Plant(settings()._replace(google_service_account="kcc-eval@acme.iam.gserviceaccount.com"), run=cluster, http=Forge(), sleep=lambda _s: None)
+    plant_.plant()
+    assert [d["kind"] for d in cluster.applied] == ["Namespace", "ConfigConnectorContext", "ContainerNodePool"]
+    context = cluster.applied[1]
+    assert context["metadata"]["name"] == "configconnectorcontext.core.cnrm.cloud.google.com"
+    assert context["metadata"]["namespace"] == "eval-kcc-stalled"
+    assert context["spec"] == {"googleServiceAccount": "kcc-eval@acme.iam.gserviceaccount.com"}
+    assert ["kubectl", "get", plant.CONTEXT_RESOURCE, plant.CONTEXT_NAME, "-n", "eval-kcc-stalled", "-o", "json"] in cluster.calls
+
+
+def test_cluster_mode_and_no_config_connector_object_get_no_context():
+    for mode in ("cluster", None):
+        cluster = Cluster(mode=mode)
+        new_plant(cluster, Forge()).plant()
+        assert [d["kind"] for d in cluster.applied] == ["Namespace", "ContainerNodePool"]
+
+
+def test_namespaced_mode_without_a_service_account_stops_before_it_writes():
+    cluster = Cluster(mode="namespaced")
+    with pytest.raises(RuntimeError, match="namespaced mode.*kcc_google_service_account"):
+        new_plant(cluster, Forge()).plant()
+    assert cluster.applied == []
+
+
+def test_a_context_that_does_not_come_up_stops_the_plant_in_bounded_time():
+    cluster = Cluster(mode="namespaced", context_healthy=False)
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    planted = plant.Plant(
+        settings()._replace(google_service_account="sa@acme.iam.gserviceaccount.com"),
+        run=cluster, http=Forge(), sleep=sleep, clock=lambda: now[0],
+    )
+    with pytest.raises(RuntimeError, match="did not report healthy"):
+        planted.plant()
+    assert now[0] <= plant.CONTEXT_WAIT_S + plant.POLL_S
+    assert "ContainerNodePool" not in [d["kind"] for d in cluster.applied]
+    assert DELETE_NAMESPACE in cluster.calls
+
+
+def test_the_teardown_deletes_the_node_pool_before_the_context_and_the_namespace_last():
+    cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced")
+    assert new_plant(cluster, Forge()).teardown()
+    deletes = [c[2] for c in cluster.calls if c[:2] == ["kubectl", "delete"]]
+    assert deletes == ["containernodepool", plant.CONTEXT_RESOURCE, "namespace"]
+    [context_delete] = [c for c in cluster.calls if c[:3] == ["kubectl", "delete", plant.CONTEXT_RESOURCE]]
+    assert f"--timeout={plant.DELETE_TIMEOUT_S}s" in context_delete
+
+
+def test_the_service_account_comes_from_the_environment(monkeypatch):
+    env = {
+        "KCC_EVAL_PROJECT": "acme", "KCC_EVAL_CLUSTER": "hub", "KCC_EVAL_LOCATION": "us-central1",
+        "KCC_EVAL_NAMESPACE": "eval-kcc-stalled", "KCC_EVAL_SLOT": "a", "KCC_EVAL_POOL": "pinned-inference-pool",
+        "KCC_EVAL_GITOPS_REPO": "acme/fleet", "KCC_EVAL_GOOGLE_SERVICE_ACCOUNT": "sa@acme.iam.gserviceaccount.com",
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    assert plant.Settings.from_env().google_service_account == "sa@acme.iam.gserviceaccount.com"

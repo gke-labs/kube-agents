@@ -32,6 +32,16 @@ plant:
    GCP: the real pool is never read or changed. The object also carries
    `cnrm.cloud.google.com/deletion-policy: abandon`, so a delete of the object
    cannot delete the pool either.
+   When Config Connector runs in namespaced mode (the `ConfigConnector`
+   object's `spec.mode` is `namespaced`), no controller watches a namespace
+   until it holds a `ConfigConnectorContext`. So the plant creates one in the
+   namespace, with `spec.googleServiceAccount` from
+   `KCC_EVAL_GOOGLE_SERVICE_ACCOUNT`, and waits until the context reports
+   `healthy`, before it creates the node pool. The service account needs no
+   IAM role: the object stops at `DependencyNotFound` before any call to GCP.
+   The plant stops with an error when the mode is namespaced and no service
+   account is set. In cluster mode, or with no `ConfigConnector` object, it
+   creates no context.
 3. Waits until Config Connector reports `Ready=False` on the object.
 4. Commits the same declaration to the GitOps repository's default branch at
    `clusters/<cluster>/provisioning/<pool>.yaml`, where the stockout SOP finds
@@ -50,9 +60,11 @@ teardown, every step independent of the others:
    closes nothing.
 2. Deletes the declaration from the default branch, when the file there is
    this stack's (it carries the stack's label).
-3. Deletes the `ContainerNodePool` and the namespace, when the namespace is
-   this stack's. The object delete has a time limit, and the namespace delete
-   runs when the object delete fails.
+3. Deletes the `ContainerNodePool`, then the `ConfigConnectorContext`, then
+   the namespace, when the namespace is this stack's. The node pool goes first,
+   while its controller still runs and can remove its finalizer. Each object
+   delete has a time limit, and the namespace delete runs when an object delete
+   fails.
 
 Steps 1 and 2 need the seeded cluster's name from `gcloud container clusters
 list`, and the GitHub token. When either is not available, the teardown logs
@@ -111,6 +123,21 @@ READY_WAIT_S = 300
 POLL_S = 10
 # How long a namespace from an earlier run gets to go away.
 NAMESPACE_WAIT_S = 180
+# The Config Connector install object, and the mode in which each namespace
+# needs a `ConfigConnectorContext` before a controller watches it.
+CONFIG_CONNECTOR_RESOURCE = "configconnector.core.cnrm.cloud.google.com"
+CONFIG_CONNECTOR_NAME = "configconnector.core.cnrm.cloud.google.com"
+NAMESPACED_MODE = "namespaced"
+CONTEXT_API_VERSION = "core.cnrm.cloud.google.com/v1beta1"
+CONTEXT_KIND = "ConfigConnectorContext"
+CONTEXT_RESOURCE = "configconnectorcontext.core.cnrm.cloud.google.com"
+# The one name Config Connector accepts for a context.
+CONTEXT_NAME = "configconnectorcontext.core.cnrm.cloud.google.com"
+# How long the namespaced controller gets to come up after the context is
+# created, and how often the plant reads it.
+CONTEXT_WAIT_S = 300
+# What kubectl says when an object or a type is not there.
+NOT_FOUND_MARKERS = ("NotFound", "not found", "doesn't have a resource type")
 GITHUB_API = "https://api.github.com"
 GITHUB_PAGE = 100
 HTTP_NOT_FOUND = 404
@@ -135,6 +162,7 @@ class Settings(NamedTuple):
     gitops_repo: str
     token: str = ""
     token_file: str = ""
+    google_service_account: str = ""
 
     def github_token(self) -> str:
         """The GitHub token, read from `token_file` when one is set.
@@ -158,6 +186,7 @@ class Settings(NamedTuple):
             gitops_repo=os.environ["KCC_EVAL_GITOPS_REPO"],
             token=os.environ.get("BENCH_GITHUB_TOKEN", ""),
             token_file=os.environ.get("KCC_EVAL_GITOPS_TOKEN_FILE", ""),
+            google_service_account=os.environ.get("KCC_EVAL_GOOGLE_SERVICE_ACCOUNT", ""),
         )
 
 
@@ -263,11 +292,14 @@ def stack_branch(path: str) -> str:
 
 
 class Plant:
-    def __init__(self, settings: Settings, run: RunFn = default_run, http: HttpFn | None = None, sleep=time.sleep):
+    def __init__(
+        self, settings: Settings, run: RunFn = default_run, http: HttpFn | None = None, sleep=time.sleep, clock=time.monotonic
+    ):
         self.settings = settings
         self.run = run
         self.http = http or github_http(settings.github_token)
         self.sleep = sleep
+        self.clock = clock
         self.kubeconfig_dir = tempfile.mkdtemp(prefix="kcc-stalled-")
         self.env = {**os.environ, "KUBECONFIG": str(Path(self.kubeconfig_dir) / "config")}
 
@@ -306,6 +338,27 @@ class Plant:
         if result.returncode != 0:
             return None
         return str(((json.loads(result.stdout).get("metadata") or {}).get("labels") or {}).get(MANAGED_BY_KEY, ""))
+
+    def config_connector_mode(self) -> str:
+        """The `ConfigConnector` object's `spec.mode`, or `""` when there is
+        no such object (Config Connector then watches every namespace)."""
+        result = self.run(
+            ["kubectl", "get", CONFIG_CONNECTOR_RESOURCE, CONFIG_CONNECTOR_NAME, "-o", "json"], env=self.env
+        )
+        if result.returncode != 0:
+            if any(marker in result.stderr for marker in NOT_FOUND_MARKERS):
+                return ""
+            raise RuntimeError(f"cannot read the ConfigConnector object: {result.stderr.strip()}")
+        return str((json.loads(result.stdout).get("spec") or {}).get("mode") or "")
+
+    def context_healthy(self) -> bool:
+        result = self.run(
+            ["kubectl", "get", CONTEXT_RESOURCE, CONTEXT_NAME, "-n", self.settings.namespace, "-o", "json"],
+            env=self.env,
+        )
+        if result.returncode != 0:
+            return False
+        return (json.loads(result.stdout).get("status") or {}).get("healthy") is True
 
     def ready_condition(self) -> dict | None:
         result = self.run(
@@ -349,6 +402,12 @@ class Plant:
         self.credentials()
         if self.run(["kubectl", "get", "crd", NODE_POOL_CRD], env=self.env).returncode != 0:
             raise RuntimeError(f"Config Connector is not installed on {self.settings.kcc_cluster}: no CRD {NODE_POOL_CRD}")
+        namespaced = self.config_connector_mode() == NAMESPACED_MODE
+        if namespaced and not self.settings.google_service_account:
+            raise RuntimeError(
+                f"Config Connector runs in namespaced mode on {self.settings.kcc_cluster}, so the namespace needs a "
+                f"{CONTEXT_KIND}; set kcc_google_service_account (KCC_EVAL_GOOGLE_SERVICE_ACCOUNT) to a service account"
+            )
         owner = self.namespace_owner()
         if owner is not None and owner != MANAGED_BY:
             raise RuntimeError(f"namespace {self.settings.namespace} exists and is not this stack's; refusing to use it")
@@ -366,13 +425,37 @@ class Plant:
         }
         manifest = node_pool_manifest(self.settings, target)
         self.must(["kubectl", "apply", "-f", "-"], stdin=json.dumps(namespace))
+        if namespaced:
+            self.must(["kubectl", "apply", "-f", "-"], stdin=json.dumps(self.context_manifest()))
+            self.wait_context_healthy()
         self.must(["kubectl", "apply", "-f", "-"], stdin=json.dumps(manifest))
         self.wait_not_ready()
         self.commit_declaration(target, manifest)
         log(f"planted {KIND} {self.settings.namespace}/{self.settings.pool} for {target.cluster}")
 
+    def context_manifest(self) -> dict:
+        """The context that makes the namespaced controller watch the namespace."""
+        return {
+            "apiVersion": CONTEXT_API_VERSION,
+            "kind": CONTEXT_KIND,
+            "metadata": {
+                "name": CONTEXT_NAME,
+                "namespace": self.settings.namespace,
+                "labels": {MANAGED_BY_KEY: MANAGED_BY},
+            },
+            "spec": {"googleServiceAccount": self.settings.google_service_account},
+        }
+
+    def wait_context_healthy(self) -> None:
+        deadline = self.clock() + CONTEXT_WAIT_S
+        while not self.context_healthy():
+            if self.clock() >= deadline:
+                raise RuntimeError(f"the {CONTEXT_KIND} in {self.settings.namespace} did not report healthy in {CONTEXT_WAIT_S}s")
+            self.sleep(POLL_S)
+        log(f"the {CONTEXT_KIND} in {self.settings.namespace} is healthy")
+
     def wait_not_ready(self) -> None:
-        deadline = time.monotonic() + READY_WAIT_S
+        deadline = self.clock() + READY_WAIT_S
         while True:
             condition = self.ready_condition()
             if condition and str(condition.get("status")) == "True":
@@ -380,7 +463,7 @@ class Plant:
             if condition and str(condition.get("status")) == "False":
                 log(f"Config Connector reports Ready=False: {condition.get('reason')}")
                 return
-            if time.monotonic() >= deadline:
+            if self.clock() >= deadline:
                 raise RuntimeError(f"Config Connector wrote no Ready condition in {READY_WAIT_S}s")
             self.sleep(POLL_S)
 
@@ -478,20 +561,33 @@ class Plant:
         if status != 200:
             raise RuntimeError(f"cannot delete {path} (HTTP {status})")
 
-    def delete_kubernetes(self) -> None:
-        """Delete the object, then the namespace, also when the object delete
-        fails or runs out of time: the namespace delete removes the object
-        with it."""
-        object_delete = [
-            "kubectl", "delete", KIND.lower(), self.settings.pool, "-n", self.settings.namespace,
+    def delete_object(self, resource: str, name: str) -> str:
+        """Delete one object in the namespace, with a time limit; the error,
+        or `""`. A type the server does not serve is not an error."""
+        argv = [
+            "kubectl", "delete", resource, name, "-n", self.settings.namespace,
             "--ignore-not-found", "--wait=true", f"--timeout={DELETE_TIMEOUT_S}s",
         ]
-        result = self.run(object_delete, env=self.env, timeout=DELETE_PROCESS_TIMEOUT_S)
-        if result.returncode != 0:
-            log(f"the {KIND} delete exited {result.returncode} ({result.stderr.strip()}); deleting the namespace")
+        result = self.run(argv, env=self.env, timeout=DELETE_PROCESS_TIMEOUT_S)
+        if result.returncode == 0 or any(marker in result.stderr for marker in NOT_FOUND_MARKERS):
+            return ""
+        error = f"the {resource} delete exited {result.returncode}: {result.stderr.strip()}"
+        log(f"{error}; the teardown goes on")
+        return error
+
+    def delete_kubernetes(self) -> None:
+        """Delete the node pool, then the context, then the namespace.
+
+        The node pool goes while its controller still runs, so the controller
+        can remove its finalizer; the context delete stops that controller.
+        The namespace delete runs also when an object delete fails or runs
+        out of time: it removes the objects with it.
+        """
+        errors = [self.delete_object(KIND.lower(), self.settings.pool), self.delete_object(CONTEXT_RESOURCE, CONTEXT_NAME)]
         self.must(["kubectl", "delete", "namespace", self.settings.namespace, "--ignore-not-found", "--wait=false"])
-        if result.returncode != 0:
-            raise RuntimeError(f"the {KIND} delete exited {result.returncode}: {result.stderr.strip()}")
+        errors = [e for e in errors if e]
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
 
 def main(argv: list[str]) -> int:
