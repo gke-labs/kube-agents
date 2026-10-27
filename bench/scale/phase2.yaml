@@ -27,14 +27,15 @@ base:
   proxy_concurrency: 1
 
 # Levels run in this order: the 2-cluster points first, then the combined point and the cluster
-# counts in rising order, so each fleet change only adds clusters.
+# counts. The zone's capacity set the largest fleet at 24 clusters, run before 16 so the clusters
+# created for it were measured before the 16-cluster level deleted them.
 factors:
   proxy_concurrency: [1, 4, 8, 16, 32]
   concurrent: [1, 8, 10, 12]
   failing_pods: [1, 10, 30]
   # Level N is the Nth point under combined.
   combined: [1]
-  clusters: [2, 16, 32]
+  clusters: [2, 24, 16]
 
 # Points that move several factors at once. The first checks memory against total watched
 # objects (the design's first open question).
