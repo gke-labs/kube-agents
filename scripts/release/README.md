@@ -80,8 +80,8 @@ page under "Why there is no `gke-admin` set".
 ## Tag families
 
 Every commit and build moves through six tag families. The site's
-[release versioning page](../../docs/site/src/content/docs/deploy/release-versioning.md) carries
-only the GA row; the rest is this runbook's.
+[release versioning page](../../docs/site/src/content/docs/deploy/release-versioning.md) describes
+the GA tag `X.Y.Z` in prose; the other families are this runbook's.
 
 | Family            | Shape                                 | Pushed by                                                   | What it means                                                                                                                                                                  |
 | ----------------- | ------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -94,9 +94,9 @@ only the GA row; the rest is this runbook's.
 
 The two nightly tags name the same candidate, and the eval runs between them: one tag could not
 both start the eval and trigger the staging deploy, since the deploy reaches the cluster in
-minutes while the eval is hours from a verdict. An `evalcand_` tag with no `staging_` tag beside it
-is a candidate the eval rejected, one whose eval has not finished, or one whose withdrawal failed
-([The nightly environment](#the-nightly-environment) has the three cases).
+minutes while the eval is hours from a verdict. Nothing deploys from an `evalcand_` tag with no
+`staging_` tag beside it; [The nightly environment](#the-nightly-environment) says what each such
+tag means and which are retried.
 
 ## Pipeline Cadence & Execution Flow
 

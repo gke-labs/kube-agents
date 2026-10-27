@@ -1,6 +1,6 @@
 ---
 title: Release versioning & artifacts
-description: What a kube-agents version number means, what each release publishes, how to verify a release bundle, and how to pin a release in Helm and Terraform.
+description: What a kube-agents version number means, what each release publishes, how to verify a release bundle, how the Helm chart is versioned, and how to pin a release in Terraform.
 sidebar:
   order: 4
 ---
@@ -15,15 +15,15 @@ older release's checkout, and what they leave as it is.
 
 ## What a version number means
 
-The next version is calculated from the Conventional Commit titles merged since the previous release:
+The next version is calculated from the Conventional Commits merged since the previous release:
 
 - A release from `main` bumps `MINOR`. Almost every range carries a `feat:`, and once the previous minor has its release line (`release/X.Y`), a fix-only range bumps `MINOR` too, because the patch numbers belong to the line. So the minor number advances with each release rather than with how much changed; the release notes say what changed between two versions.
 - A `PATCH` release, `X.Y.Z+1`, is cut from the release line `release/X.Y`: fixes are cherry-picked onto the line. A `feat:` or a breaking change is refused on a line.
 - A breaking change (`feat!:`, `fix!:`, `BREAKING CHANGE:`) bumps `MINOR` while the version is `0.y.z`, per [SemVer 2.0 Clause 4](https://semver.org/#spec-item-4), and `MAJOR` from `1.0.0` on.
 - Nothing promotes `0.y.z` to `1.0.0` on its own. Declaring API stability is a decision the maintainers make and publish with an explicit version.
 
-Releases come about every two days. To count the releases between two versions, use
-[the releases page](https://github.com/gke-labs/kube-agents/releases), not the number of days.
+[The releases page](https://github.com/gke-labs/kube-agents/releases) lists every release; count
+the releases between two versions there, not by date.
 [The latest release](https://github.com/gke-labs/kube-agents/releases/latest) is the numerically
 highest version, which may be a patch cut on the newest release line; a patch below the newest
 minor is published without the `latest` mark.
@@ -52,7 +52,7 @@ cut from `main`, lists every pull request it will contain if it is cut from the 
 
 1. The container images built for the release's commit are retagged to `X.Y.Z` in GHCR without being rebuilt, and signed with keyless Cosign through GitHub Actions OIDC.
 2. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed with Cosign.
-3. The tag sits on a stamped release commit: `BAKED_RELEASE_VERSION="X.Y.Z"` is written into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`). `install.sh` and `upgrade.sh` verify that the source tree they run from matches that stamp, and that a Git checkout matches the tag's commit, and halt when the scripts diverge from the images.
+3. The tag sits on a stamped release commit: `BAKED_RELEASE_VERSION="X.Y.Z"` is written into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`). Both `install.sh` and `upgrade.sh` check that a Git checkout matches the tag's commit and that a tree outside Git carries a matching stamp or bundle marker; `upgrade.sh` also refuses a tree whose stamp names another release. [Provenance attribution](#provenance-attribution-and-release-bundle-marker) has the steps.
 4. The offline bundle is staged from the tagged commit with `git archive`, carries the `.release-bundle` provenance marker, and is packaged as `.tar.gz` and `.zip`.
 5. Software Bills of Materials are generated with Syft, SPDX 2.3 JSON and CycloneDX 1.5 JSON for the bundle and SPDX 2.3 JSON for each container image, and published with `checksums.txt`, which carries SHA256 checksums for every release asset.
 

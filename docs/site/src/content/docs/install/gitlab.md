@@ -11,7 +11,7 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 
 ## Before you start
 
-- **The release.** The latest release is on
+- **The release.** GitLab support is in release 0.9.0 and later. The latest release is on
   [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest).
 - **The GitLab version.** GitLab 16.11 or later. Tested with 16.11 and 19.4. GitLab 16.x needs
   release 0.12.0 or later: an older release cannot show the diff of a merge request on it.

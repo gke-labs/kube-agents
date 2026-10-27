@@ -233,8 +233,10 @@ the CRDs and the chart, and a harness run applies only the chart.
   `TF_VAR_agent_service_account_id`. If a run prints such a warning, change `install.env` before
   the next upgrade. A later release can remove them.
 
-Each release is tested as an upgrade from the release before it. No automated path moves an
-install across several releases, and no policy says whether such a move is supported.
+The release pipeline upgrades an install from the previous GA release to each candidate from
+`main` in the operator and harness modes; that leg does not gate the release, and the full mode is
+not run release to release. No automated path moves an install across several releases, and no
+policy says whether such a move is supported.
 
 Before a move across several releases:
 
