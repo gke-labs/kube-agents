@@ -801,6 +801,17 @@ class MainOutputContractTests(unittest.TestCase):
     def test_other_findings_post_as_text_with_no_card(self):
         self.run_main([stuck("t_1", "Triage x", 30)], ["  ghost claim: task t is 'ready'"])
         self.assertIsNone(self.card())
+    def test_an_unreadable_board_removes_the_card(self):
+        self.run_main([stuck("t_1", "Triage x", 30)], [])
+        self.assertIsNotNone(self.card())
+
+        def boom(home, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        self._patch("report", boom)
+        with contextlib.redirect_stdout(io.StringIO()):
+            kbh.main(env=self.env, now=1000.0 + 86400)
+        self.assertIsNone(self.card())
     def test_an_unreadable_board_reports_and_still_exits_zero(self):
         def boom(home, **kwargs):
             raise sqlite3.OperationalError("unable to open database file")

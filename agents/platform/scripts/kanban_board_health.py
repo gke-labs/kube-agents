@@ -916,6 +916,7 @@ def main(argv=None, *, env=None, now=None) -> int:
     except sqlite3.Error as exc:
         if state != recorded:
             save_state(path, state)
+        save_card(card_path(home, env), None)
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
     out = []

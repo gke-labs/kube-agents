@@ -504,7 +504,8 @@ place of the text, and only for that text
 ([cron-report-relay.md](../../../docs/designs/cron-report-relay.md)). The ids ride
 in the buttons' values, unseen. Retry unblocks the row's cards and Drop archives
 them, through session-kv's `POST /v1/board/actions`, which touches only a card
-still `blocked`, so a stale button changes nothing. The row is edited in place
+`blocked` when pressed: a stale button leaves alone a card that has moved on,
+and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
