@@ -48,6 +48,8 @@ class FakeRun:
         self.calls.append((list(argv), (env or {}).get("KUBECONFIG", "")))
         self.timeouts.append(timeout)
         if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+            if self.credentials_rc == 0:
+                Path(env["KUBECONFIG"]).write_text("apiVersion: v1\n")
             return kcc_health.Result(self.credentials_rc, "", "" if self.credentials_rc == 0 else "Permission denied")
         cluster = Path((env or {})["KUBECONFIG"]).name
         for key, answer in self.reads.items():
@@ -259,11 +261,41 @@ class AnnotateManifestTest(unittest.TestCase):
         run = FakeRun({"hub": listing(STALLED_TOPIC)})
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
         swept = self.dir / "kubeconfig_acme_hub_us-central1.yaml"
+        swept.parent.mkdir(parents=True)
+        swept.write_text("apiVersion: v1\n")
         kcc_health.annotate_manifest(
             manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock, kubeconfig_for=lambda entry: swept
         )
         self.assertEqual(run.calls, [(["kubectl", "get", "gcp", "-A", "-o", "json"], str(swept))])
         self.assertEqual([r["name"] for r in manifest["clusters"][0]["kcc_unready"]], ["fleet-events"])
+
+    def test_a_missing_kubeconfig_file_runs_no_read(self):
+        """kubectl reads the defaults or the in-cluster account when the
+        `KUBECONFIG` file is not there, which is another cluster."""
+        run = FakeRun({"hub": listing(STALLED_TOPIC)})
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        missing = self.dir / "kubeconfig_acme_hub_us-central1.yaml"
+        kcc_health.annotate_manifest(
+            manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock, kubeconfig_for=lambda entry: missing
+        )
+        self.assertEqual(run.calls, [])
+        self.assertIn("no kubeconfig", manifest["clusters"][0]["kcc_unread"])
+
+    def test_a_project_entry_is_not_a_cluster_and_is_not_read(self):
+        """Stockout's `project/<id>` entries are `collected` at location
+        `global`; they hold project reads and have no kubeconfig."""
+        run = FakeRun({})
+        manifest = {
+            "clusters": [
+                {"name": "project/acme", "project": "acme", "location": "global", "outcome": "collected"},
+                {"name": "acme/global/odd", "project": "acme", "location": "global", "outcome": "collected"},
+            ]
+        }
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        self.assertEqual(run.calls, [])
+        for entry in manifest["clusters"]:
+            self.assertNotIn("kcc_unread", entry)
+            self.assertNotIn("kcc_unready", entry)
 
 
 class DeadlineTest(unittest.TestCase):
@@ -299,6 +331,8 @@ class DeadlineTest(unittest.TestCase):
                 self.now += timeout
                 return kcc_health.Result(kcc_health.TIMEOUT_RC, "", "killed")
             self.now += seconds
+            if argv[0] != "kubectl":
+                Path(env["KUBECONFIG"]).write_text("apiVersion: v1\n")
             return listing() if argv[0] == "kubectl" else kcc_health.Result(0, "", "")
 
         return run, timeouts

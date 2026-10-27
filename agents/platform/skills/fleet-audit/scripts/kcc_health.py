@@ -106,6 +106,17 @@ RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
 MAX_ERROR_CHARS = 300
 # The manifest outcome of a cluster the collector read.
 OUTCOME_COLLECTED = "collected"
+# The entries that are not clusters: stockout's `project/<id>` targets, at
+# location `global`, hold the project-level reads and have no kubeconfig.
+PROJECT_TARGET_PREFIX = "project/"
+GLOBAL_LOCATION = "global"
+# What `kcc_unread` says when the kubeconfig file is not there. kubectl does
+# not fail on a missing `KUBECONFIG` file: it reads the defaults or the
+# in-cluster account, which is another cluster.
+NO_KUBECONFIG_REASON = (
+    "no kubeconfig at {path}, so the read did not run and whether Config Connector applies "
+    "its objects here is not known."
+)
 # Where the fetched kubeconfigs go: collect.py's `KUBECONFIG_DIR`, which
 # `collect.usable_kubeconfig_dir` makes usable.
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
@@ -294,6 +305,8 @@ def _annotate_entry(
                 UNREAD_FIELD: f"get-credentials exited {fetched.rc} ({excerpt}), so whether Config "
                 "Connector applies its objects here is not known."
             }
+    if not kubeconfig.is_file():
+        return {UNREAD_FIELD: NO_KUBECONFIG_REASON.format(path=kubeconfig)}
     left = _time_left(deadline, clock)
     if not left:
         return _budget_spent()
@@ -312,8 +325,10 @@ def annotate_manifest(
 ) -> None:
     """Read every collected cluster in `manifest` once and add its keys.
 
-    Only `collected` entries that name a project and a location are read; an
-    entry that already carries either key was read by its collector.
+    Only `collected` cluster entries that name a project and a location are
+    read: a `project/<id>` entry at location `global` is not a cluster. An
+    entry that already carries either key was read by its collector. No read
+    runs without a kubeconfig file: that entry gets `kcc_unread`.
     `deadline` is a `clock` time (`run_deadline`): every read ends before it,
     and an entry whose read cannot start in time gets `kcc_unread`.
     `kubeconfig_for` gives the kubeconfig the collector already fetched for
@@ -330,6 +345,8 @@ def annotate_manifest(
         and entry.get("outcome") == OUTCOME_COLLECTED
         and entry.get("project")
         and entry.get("location")
+        and entry.get("location") != GLOBAL_LOCATION
+        and not str(entry.get("name") or "").startswith(PROJECT_TARGET_PREFIX)
         and UNREADY_FIELD not in entry
         and UNREAD_FIELD not in entry
     ]
