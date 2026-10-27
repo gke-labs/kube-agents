@@ -2541,6 +2541,50 @@ def test_delegated_worker_board_rate_limit_clearing_branches_pinned(
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
 
 
+@pytest.mark.parametrize(
+    ("key", "val"),
+    [
+        ("summaries", "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"),
+        ("errors", "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"),
+    ],
+)
+def test_delegated_worker_board_rate_limit_triage_marks_run_infra(
+    key: str,
+    val: str,
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board read reporting triage with a rate limit summary or error retires the wait and marks infra."""
+    board_payload = {
+        "statuses": {_TASK_ID: "triage"},
+        "summaries": {_TASK_ID: val} if key == "summaries" else {},
+        "errors": {_TASK_ID: val} if key == "errors" else {},
+    }
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            return f"{board.BOARD_PRESENT}\n{json.dumps(board_payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
+        return ""
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.3")
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("triage")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert not any(harness.DELEGATION_CEILING_MARKER in e or "did not finish within" in e for e in result.errors)
+    assert len(result.errors) == 1
+
+
 def test_a_mute_agent_leaves_no_transcript_behind(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -5184,3 +5228,39 @@ def test_settle_delegated_worker_rate_limit_with_failed_log_read_stays_graded(
         board_messages=[rate_limit_text],
     )
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_delegated_worker_triage_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a card ends in triage (e.g. block loop / second storm) with a rate limit summary, it is marked infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    harness.KubeAgentsHarness._settle(
+        res,
+        [show],
+        ["t_1"],
+        board_messages=[],
+    )
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
