@@ -15,29 +15,17 @@ import (
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// completionHead and completionFoot wrap the answer text in the completion
-// completionOfSize serves.
-const (
-	completionHead = `{"choices":[{"message":{"role":"assistant","content":"`
-	completionFoot = `"},"finish_reason":"stop"}]}`
-)
-
-// answerOfSize is the answer text completionOfSize(size) carries: the padding
-// that makes the completion exactly size bytes.
-func answerOfSize(t *testing.T, size int) string {
-	t.Helper()
-	pad := size - len(completionHead) - len(completionFoot)
-	if pad < 0 {
-		t.Fatalf("size %d is smaller than an empty completion", size)
-	}
-	return strings.Repeat("x", pad)
-}
-
 // completionOfSize answers with a valid chat completion whose body is
 // exactly size bytes, padding the answer text to get there.
 func completionOfSize(t *testing.T, size int) func(w http.ResponseWriter, r *http.Request, c apiCall) {
 	t.Helper()
-	body := completionHead + answerOfSize(t, size) + completionFoot
+	const head = `{"choices":[{"message":{"role":"assistant","content":"`
+	const foot = `"},"finish_reason":"stop"}]}`
+	pad := size - len(head) - len(foot)
+	if pad < 0 {
+		t.Fatalf("size %d is smaller than an empty completion", size)
+	}
+	body := head + strings.Repeat("x", pad) + foot
 	return func(w http.ResponseWriter, _ *http.Request, c apiCall) {
 		w.Header().Set(apiSessionIDHeader, c.sessionID)
 		w.Header().Set("Content-Type", "application/json")
@@ -80,62 +68,50 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 // budget is the one that decides.
 const atCapTerminalWait = 60 * time.Second
 
-// resultPublishCall is what the at-cap test's publish hook records: how
-// much of the publish window was left when resultPublish was entered, and
-// the answer it was handed.
+// resultPublishCall is what the at-cap test's hooks record: when the
+// bridge's chat fold returned, and the deadline of the context resultPublish
+// was then entered with.
 type resultPublishCall struct {
-	remaining   time.Duration
+	foldedAt    time.Time
+	deadline    time.Time
 	hasDeadline bool
-	output      string
-}
-
-// foldTime folds answer into a chat part once and returns how long it took:
-// the at-cap test's reference for what a fold inside the publish window
-// would have spent of it.
-func foldTime(t *testing.T, answer string) time.Duration {
-	t.Helper()
-	start := time.Now()
-	if _, ok := resultChatPart(answer); !ok {
-		t.Fatal("the at-cap answer did not fold into a chat part")
-	}
-	return time.Since(start)
 }
 
 // The boundary's other side: an answer of exactly apiResponseCap bytes is
 // read whole and completes, so the one-byte look-ahead refuses nothing the
 // cap admits.
 //
-// The same answer is the one whose chat fold costs enough to see, so the
-// test also checks where finalizeResult runs it. The publish context
-// resultPublish receives is opened just before it, so on entry its deadline
-// is short of the whole finalizePublishTimeout by one nil check; with the
-// fold inside the window it is short by the fold, about 0.85 s for this
-// answer without the race detector and 5 s under it. The bound is half of a
-// fold of the same answer timed here, outside the window, so the check is
-// red on that order in either mode without a timing constant of its own.
-// The reference fold is taken twice, once before the submit and once after
-// the terminal, and the smaller of the two is the bound: the bridge's fold
-// runs between them, so a load change on the host between it and either
-// reference cannot double the reference and let the old order through.
-// What the bound still cannot see is a load dip confined to the bridge's
-// fold alone, with both references slower than it.
+// The same answer is the one whose chat fold costs enough to matter, so the
+// test also checks where finalizeResult runs it: before the publish window
+// opens, not inside it. The chatPart hook records when the fold returned,
+// the resultPublish hook the deadline of the context it was entered with,
+// and the window opened finalizePublishTimeout before that deadline. Both
+// run on the finalizer's goroutine, in that order, so the fold's time rides
+// the publish's record. context.WithTimeout takes its deadline from
+// time.Now, which keeps the monotonic reading, so the comparison is exact in
+// either test mode and under any load.
 func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
-	answer := answerOfSize(t, apiResponseCap)
 	published := make(chan resultPublishCall, 1)
 	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil, func(b *Bridge) {
+		var foldedAt time.Time
+		fold := b.chatPart
+		b.chatPart = func(answer string) (lib.Part, bool) {
+			part, ok := fold(answer)
+			foldedAt = time.Now()
+			return part, ok
+		}
 		publish := b.resultPublish
 		b.resultPublish = func(ctx context.Context, run *taskRun, output string, chat []byte) error {
 			deadline, ok := ctx.Deadline()
 			select {
-			case published <- resultPublishCall{time.Until(deadline), ok, output}:
+			case published <- resultPublishCall{foldedAt, deadline, ok}:
 			default:
 			}
 			return publish(ctx, run, output, chat)
 		}
 	}, func(net.Addr) bool { return true })
 	c := gatewayClient(t, url)
-	foldBefore := foldTime(t, answer)
 	submitIn(t, c, "task-atcap", "ctx-atcap", "write something large")
 	task := waitTerminalFor(t, c, "task-atcap", atCapTerminalWait)
 	if task.State != lib.StateCompleted {
@@ -154,17 +130,15 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	if !call.hasDeadline {
 		t.Fatal("resultPublish got a context with no deadline; finalizeResult publishes under finalizePublishTimeout")
 	}
-	if call.output != answer {
-		t.Fatalf("resultPublish got an answer of %d bytes, want the %d-byte answer the stub served", len(call.output), len(answer))
+	if call.foldedAt.IsZero() {
+		t.Fatal("the answer was not folded through chatPart before resultPublish")
 	}
-	foldAfter := foldTime(t, call.output)
-	fold := min(foldBefore, foldAfter)
-	spent := finalizePublishTimeout - call.remaining
-	t.Logf("resultPublish entered %v into its %v window; a fold of its answer takes %v before the submit and %v after the terminal",
-		spent, finalizePublishTimeout, foldBefore, foldAfter)
-	if spent > fold/2 {
-		t.Errorf("resultPublish entered %v into its window, more than half the %v shorter fold of its answer: the chat fold ran inside the window",
-			spent, fold)
+	opened := call.deadline.Add(-finalizePublishTimeout)
+	if opened.Before(call.foldedAt) {
+		t.Errorf("the publish window opened %v before the chat fold returned: the fold ran inside the window",
+			call.foldedAt.Sub(opened))
+	} else {
+		t.Logf("the chat fold returned %v before the publish window opened", opened.Sub(call.foldedAt))
 	}
 }
 

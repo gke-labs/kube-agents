@@ -429,6 +429,11 @@ type Bridge struct {
 	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
 	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
+	// chatPart folds a completed task's answer into the chat message its
+	// result carries, resultChatPart by default; a field so a test can see
+	// when the fold returns against the publish window finalizeResult opens
+	// after it, without an answer whose fold is slow enough to time.
+	chatPart func(answer string) (lib.Part, bool)
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -479,6 +484,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
 	b.resultPublish = b.publishResult
+	b.chatPart = resultChatPart
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
@@ -1772,7 +1778,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	if resultOutput != nil {
 		chat = data
 		if chat == nil && state == lib.StateCompleted {
-			if part, ok := resultChatPart(*resultOutput); ok {
+			if part, ok := b.chatPart(*resultOutput); ok {
 				chat = part.Data
 			}
 		}
