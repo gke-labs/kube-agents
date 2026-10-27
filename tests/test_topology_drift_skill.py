@@ -32,6 +32,8 @@ SKILLS = {
 SHARED_START = "<!-- shared:reading-start -->"
 SHARED_END = "<!-- shared:reading-end -->"
 FLEET_FIXTURES = REPO_ROOT / "docs/designs/fleet-fixtures.yaml"
+SANDBOX_DOCKERFILE = REPO_ROOT / "deploy/sandbox/Dockerfile"
+LEEWAY_VERSION = "v0.1.3"
 
 # leeway v0.1.3 (go-steer/leeway@4366049), pkg/leeway: the strings a report
 # carries in these fields. The kind inventory is frozen by leeway's schema;
@@ -112,6 +114,12 @@ def _findings(report):
 
 
 class ExampleReportTest(unittest.TestCase):
+    def test_vocabulary_matches_the_leeway_version_pinned_in_the_sandbox_dockerfile(self):
+        dockerfile = SANDBOX_DOCKERFILE.read_text(encoding="utf-8")
+        match = re.search(r"go-steer/leeway/releases/download/(v[0-9.]+)/", dockerfile)
+        self.assertIsNotNone(match, "deploy/sandbox/Dockerfile should pin a go-steer/leeway release download URL")
+        self.assertEqual(match.group(1), LEEWAY_VERSION)
+
     def test_both_copies_carry_the_same_report(self):
         cluster = (SKILLS["cluster"] / "references/report-example.json").read_bytes()
         platform = (SKILLS["platform"] / "references/report-example.json").read_bytes()

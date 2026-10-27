@@ -123,7 +123,7 @@ verification_spec:
       required_phrases:
         - "zone-pinned-api"
       any_of_patterns:
-        - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node[ -]?affinity|node ?selector)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node[ -]?affinity|node ?selector|schedule ?anyway|constraint[_ -]ignored|conflicting)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume|node-pool)\b'
   - name: report-attributes-volume-skew
@@ -138,7 +138,7 @@ verification_spec:
         - "zone-bound-store"
         - "seeded-zonal-pd"
       any_of_patterns:
-        - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowed ?topolog|persistent ?volume|pvc|storage ?class|zonal (?:pd|disk|volume)|volume[_ ]pinning)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowed ?topolog|persistent ?volume|pvc|storage ?class|zonal (?:pd|disk|volume)|volume[_ -]pinning)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|node-pool)\b'
   - name: report-attributes-capacity-skew
@@ -153,7 +153,7 @@ verification_spec:
         - "capacity-starved-worker"
         - "Pending"
       any_of_patterns:
-        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|failedscheduling|capacity[_ ]shortfall)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|failedscheduling|capacity[_ -]shortfall)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume|node-pool)\b'
   # The line leeway does not write for the agent. `first-zone-sponge` has no
@@ -171,7 +171,7 @@ verification_spec:
       required_phrases:
         - "first-zone-sponge"
       any_of_patterns:
-        - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is node-pool(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node ?pool|default-pool|node ?selector|one zone|single[- ]zone)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is node-pool(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node ?pool|default-pool|node ?selector|one zone|single[- ]zone)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
         - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|volume)\b'
   # The tool ran, on a delegated card (see the header). Read each tagged

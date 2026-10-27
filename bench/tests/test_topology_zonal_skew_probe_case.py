@@ -109,6 +109,33 @@ def test_the_declared_line_passes_its_objective(objective: str, tmp_path: Path) 
     assert _grades(objective, _answer(), tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("objective", "line"),
+    [
+        (
+            "report-attributes-scheduling-skew",
+            "zone-pinned-api: cause is scheduling; primary evidence: constraint_ignored, whenUnsatisfiable: ScheduleAnyway with maxSkew 1 and observed skew 2; blast-radius zone: europe-west10-a; running there: 2/2",
+        ),
+        (
+            "report-attributes-volume-skew",
+            "zone-bound-store: cause is volume; primary evidence: volume_pinning on seeded-zonal-pd; blast-radius zone: europe-west10-a; running there: 2/2",
+        ),
+        (
+            "report-attributes-capacity-skew",
+            "capacity-starved-worker: cause is capacity; primary evidence: domain_capacity_shortfall (3 Pending); blast-radius zone: europe-west10-b; running there: 1/1",
+        ),
+        (
+            "report-attributes-node-pool-skew",
+            "first-zone-sponge: cause is node-pool; primary evidence: single-zone node pool; blast-radius zone: europe-west10-a; running there: 6/6",
+        ),
+    ],
+)
+def test_leeway_cause_words_and_two_digit_regions_pass_their_objectives(
+    objective: str, line: str, tmp_path: Path
+) -> None:
+    assert _grades(objective, _answer(**{objective: line}), tmp_path)
+
+
 @pytest.mark.parametrize("objective", sorted(LINES))
 @pytest.mark.parametrize(
     "render",
