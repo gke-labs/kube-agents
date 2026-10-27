@@ -812,10 +812,10 @@ class Filer:
 
     def file_infra(self, kind, key, newest, title, body, nights, good, closed_issues, result) -> None:
         """File the infra issue for ``key`` unless a closed one still tracks
-        this streak (``still_tracks``; ``good`` are the clean or graded
-        nights). ``body(addressee=...)`` renders it with the assignment
+        this streak (``still_tracks``, from the streak's oldest night
+        ``nights[0]``; ``good`` are the clean or graded nights). ``body(addressee=...)`` renders it with the assignment
         line."""
-        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon)], key, kind)
+        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon, nights[0])], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})
             return

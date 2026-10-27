@@ -1014,8 +1014,15 @@ class InfraCaseTest(Harness):
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
         self.assertEqual(self.filed(gh, infra=True), [])
-        # Closed as completed (fixed), the next kept night files again.
-        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[dict(closed, state_reason="completed")]))
+        # Closed as completed (fixed) on the 16th while the streak's nights
+        # (15th-17th) include ones that started before the close: still
+        # tracked, as for domain bugs (#4041).
+        fixed = dict(closed, state_reason="completed")
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[fixed]))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # Three kept nights that all started after the close: filed again.
+        after = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17, 18, 19)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[fixed]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
         # Graded after the close, then kept again: a new problem, filed.
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [green("case-red")]),

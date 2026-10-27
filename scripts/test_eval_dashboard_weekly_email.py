@@ -461,8 +461,9 @@ class BugsExist(Base):
         handed_off = bug("obs-1", "obs", closed_at="2026-10-17T12:00:00Z", state_reason="not_planned")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [handed_off]))
         self.assertEqual(failures, [])
-        # The same close as "completed" tracks too: the 16th, 17th and 18th
-        # nights started before it, so it has not had three nights (#4041).
+        # The same close as "completed" tracks too: some of the streak's
+        # nights started before it, so it has not had three nights that all
+        # started after it (#4041).
         completed = dict(handed_off, state_reason="completed")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [completed]))
         self.assertEqual(failures, [])

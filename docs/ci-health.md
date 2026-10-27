@@ -776,7 +776,7 @@ adopted instead, so a case is filed once and a human's issue wins. A
 started counts too: a fix that merges closes its issue while the nights on
 record, even one still running when it merged, tested the code from before it,
 so the case is filed again only after 3 failing nights whose runs all started
-after the close (#4041). An issue closed as not planned (or a duplicate), the
+after the close. An issue closed as not planned (or a duplicate), the
 close a triager picks when handing an infra failure to the infra issue, keeps
 tracking the case until it passes on a night after the close; a red streak
 after that pass files a new issue. A hand-off closed before the 14 nights on
