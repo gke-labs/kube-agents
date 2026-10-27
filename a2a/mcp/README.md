@@ -72,9 +72,9 @@ Names are this server's memory only, and they're shared:
 - `list`: the named conversations, most recently used first, with token, description and last use;
 - `new`: create a name, with an optional description of at most 200 characters; an existing name is refused;
 - `delete`: forget a name, given as the name or as the conversation's token. The conversation's history stays on the bus, and a `/session` worker for it idles out by itself. To end one now, stop its running task and send `session_off` first;
-- `session_on`, `session_off`, `status`, `help`: send `/session`, `/session off`, `status` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `status` and `help` are messages to the agent, sent like any other: while the conversation's turn is still running they wait for it to end, as a second `send_message` does, so neither reaches the running task.
+- `session_on`, `session_off`, `help`: send `/session`, `/session off` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `help` is a message to the agent, sent like any other: while the conversation's turn is still running it waits for it to end, as a second `send_message` does.
 
-The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered; a call to one is answered with an error that says why.
+The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.
 
 ## Card reports and poll_events
 
