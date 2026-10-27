@@ -44,8 +44,10 @@ FIXTURE = textwrap.dedent(
     	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     )
 
-    // Mode is how the widget runs.
+    // Mode is how the widget runs; its CEL rule stays off the page wherever
+    // the type is used.
     // +kubebuilder:validation:Enum=fast;slow
+    // +kubebuilder:validation:XValidation:rule="self != 'root'",message="root is reserved"
     type Mode string
 
     // Speed carries a default and an enum of its own, which a field overrides.
@@ -99,9 +101,10 @@ FIXTURE = textwrap.dedent(
     	// +optional
     	Mode Mode `json:"mode,omitempty"`
 
-    	// Tags label the widget.
+    	// Tags label the widget; the hand-written items rule stays off the page.
     	// +kubebuilder:validation:MaxItems=4
     	// +kubebuilder:validation:items:Pattern=`^[a-z]+$`
+    	// +kubebuilder:validation:items:XValidation:rule="self != 'none'",message="none is reserved"
     	// +optional
     	Tags []string `json:"tags,omitempty"`
 
@@ -420,6 +423,17 @@ class FixturePackageTest(unittest.TestCase):
             self.spec["levels"]["constraints"],
             [{"name": "MaxItems", "value": "2"}, {"name": "items:Enum", "value": "fast;slow"}],
         )
+
+    def test_a_cel_rule_stays_out_under_the_items_and_values_prefixes_too(self):
+        # `Mode` carries an XValidation marker beside its Enum, and `tags`
+        # a hand-written `items:XValidation`; the column lists schema
+        # bounds only, so none of the four rows carries the rule under any
+        # spelling.
+        for path in ("mode", "levels", "ranks", "tags"):
+            names = [constraint["name"] for constraint in self.spec[path]["constraints"]]
+            self.assertFalse(any("XValidation" in name for name in names), (path, names))
+        self.assertIn({"name": "items:Enum", "value": "fast;slow"}, self.spec["levels"]["constraints"])
+        self.assertIn({"name": "values:Enum", "value": "fast;slow"}, self.spec["ranks"]["constraints"])
 
     def test_a_map_of_a_named_type_carries_the_type_s_enum_on_its_values(self):
         # controller-gen writes the value type's validation under the map's

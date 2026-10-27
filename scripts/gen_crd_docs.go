@@ -650,7 +650,10 @@ func constraints(markers []string) []Constraint {
 		}
 		// controller-gen accepts both `Enum=a;b` and `Enum:=a;b`.
 		name = strings.TrimSuffix(name, markerNameColon)
-		if strings.HasPrefix(name, xValidationMarker) {
+		// A CEL rule is left out under the `items:` and `values:` prefixes
+		// too, where elementMarkers or a hand-written marker puts it.
+		bare := strings.TrimPrefix(strings.TrimPrefix(name, itemsMarkerPrefix), valuesMarkerPrefix)
+		if strings.HasPrefix(bare, xValidationMarker) {
 			continue
 		}
 		value = strings.TrimSpace(value)
