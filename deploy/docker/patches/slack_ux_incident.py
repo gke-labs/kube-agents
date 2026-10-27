@@ -164,8 +164,10 @@ OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 #: A proposed fix the section names in any shape: bullet, numbered, bold label, heading, any case.
 PROPOSED_FIX_NAMED = re.compile(r"\bproposed fix\b", re.IGNORECASE)
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
-#: word, so ``Not Recommended: Option A`` is not one.
-RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
+#: word, so ``Not Recommended: Option A`` is not one. The emphasis may be ``_`` as well as ``*``
+#: (``__Recommended: Option B__``), so the letter's boundary excludes ``_`` where ``\b`` would
+#: count it as a letter, as ``OPENING_PULL_REQUEST`` does for its marker words.
+RECOMMENDED = re.compile(r"^[^\w\n]*[*_]*Recommended[*_]*:?[*_\s]*Option ([A-Z])(?![^\W_])", re.MULTILINE)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: How many edited alerts this process remembers.

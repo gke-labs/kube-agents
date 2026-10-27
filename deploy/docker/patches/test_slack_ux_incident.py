@@ -476,12 +476,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([e[0] for e in adapter.log], ["chat_update"])
 
     def test_not_recommended_is_not_the_recommendation(self):
-        report = REPORT.replace(
-            "- ✅ **Recommended: Option B**",
-            "- ❌ **Not Recommended: Option A** — it hides the cause.\n- ✅ **Recommended: Option B**",
-        )
-        triage = runtime.parse_triage(report)
-        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
+        for not_recommended in ("- ❌ **Not Recommended: Option A**", "- ❌ __Not Recommended: Option A__"):
+            with self.subTest(line=not_recommended):
+                report = REPORT.replace(
+                    "- ✅ **Recommended: Option B**",
+                    f"{not_recommended} — it hides the cause.\n- ✅ **Recommended: Option B**",
+                )
+                triage = runtime.parse_triage(report)
+                self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
 
     def test_a_title_ending_in_the_suffix_clicks_through_to_its_apply_reply(self):
         for title in ("Roll back (recommended)", "Roll back (recommended) (recommended)"):
@@ -806,6 +808,31 @@ class RuntimeTest(unittest.TestCase):
                 self.deliver(adapter_rendered_single, result=rendered_single)
                 self.assertEqual(
                     [b["type"] for b in adapter_rendered_single.log[0][1]["blocks"]], ["rich_text", "container"]
+                )
+        # The recommendation line may carry underscore emphasis too. It names the choice the filter
+        # drops, so a miss there keeps both lettered buttons on an open-PR card, and the recommended
+        # one would open the same pull request again. On a reply-wanted report the same line marks
+        # the choice recommended.
+        for recommended_line in ("- ✅ __Recommended: Option B__", "- ✅ _Recommended: Option B_"):
+            with self.subTest(recommended_line=recommended_line):
+                underscored_open_pr = open_pr_report.replace("- ✅ **Recommended: Option B**", recommended_line)
+                self.assertEqual(
+                    runtime.parse_triage(underscored_open_pr)["choices"],
+                    [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+                )
+                runtime._edited.clear()
+                adapter_underscored = _Adapter()
+                self.deliver(adapter_underscored, result=underscored_open_pr)
+                underscored_action_texts = [
+                    btn["text"]["text"]
+                    for block in adapter_underscored.log[0][1]["blocks"]
+                    if block.get("type") == "actions"
+                    for btn in block.get("elements", [])
+                ]
+                self.assertEqual(underscored_action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+                underscored_report = REPORT.replace("- ✅ **Recommended: Option B**", recommended_line)
+                self.assertEqual(
+                    [rec for _label, _reply, rec in runtime.parse_triage(underscored_report)["choices"]], [False, True]
                 )
         # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
         # continuation line, keeps every button: stripping one would leave a report that asks for
