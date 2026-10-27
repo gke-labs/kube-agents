@@ -1362,6 +1362,22 @@ class CappedCpuTest(unittest.TestCase):
         # 0.4 at 2 clusters and 0.6 at 4: 0.1 per cluster, so 1.8 cores of need at 16.
         self.assertAlmostEqual(fit.at(16), 1.8)
 
+    def test_cpu_runs_group_by_operation_fleet_and_limit(self):
+        proxy = "envoy-credential-proxy"
+        records = parse(
+            *(
+                record("clusters", 16, "audits_30m", run, totals={"clusters": 16},
+                       limits={proxy: {"cpu_cores": limit}},
+                       metrics=((hl.CPU_PEAK, proxy, peak), (hl.CPU_SECONDS, proxy, seconds)))
+                for run, limit, peak, seconds in ((1, 1.0, 1.0, 1440.0), (2, 1.0, 0.8, 1080.0), (3, 4.0, 2.2, 3600.0))
+            ),
+        )
+        default, raised = hl.cpu_runs(records, proxy)
+        self.assertEqual((default.limit, default.runs, default.peak, default.capped), (1.0, 2, 1.0, True))
+        # 1,440 and 1,080 CPU-seconds over 30-minute windows: 0.8 and 0.6 cores on average.
+        self.assertAlmostEqual(default.average, 0.7)
+        self.assertEqual((raised.limit, raised.peak, raised.capped), (4.0, 2.2, False))
+
 
 if __name__ == "__main__":
     unittest.main()
