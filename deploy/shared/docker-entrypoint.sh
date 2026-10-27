@@ -531,9 +531,10 @@ fi
 # and its post_llm_call hook releases it. A stale plugin beside a new bootstrap_delivery.py
 # writes no hold, so the report races the greeting as before the hold existed.
 #
-# Reported, not fatal, like the scripts above: `$TARGET_DIR/plugins` is root-owned on a volume
-# where the kubelet created it as the parent of a plugin mounted beneath it, and `set -e` would
-# otherwise end the container on the mkdir.
+# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
+# created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
+# the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
+# copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
 if [ -d "/opt/defaults/plugins/bootstrap_onboarding" ]; then
     { mkdir -p "$TARGET_DIR/plugins/bootstrap_onboarding" \
         && cp -rf /opt/defaults/plugins/bootstrap_onboarding/. "$TARGET_DIR/plugins/bootstrap_onboarding/"; } \
