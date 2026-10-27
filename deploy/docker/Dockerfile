@@ -2685,7 +2685,7 @@ RUN set -eu; \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
       exit 1; \
     fi; \
-    for binary in gcloud kubectl gh git helm k9s yq; do \
+    for binary in gcloud kubectl gh git helm k9s yq leeway; do \
       if command -v "${binary}" >/dev/null 2>&1; then \
         echo "cluster tooling is back in the agent image: ${binary}" >&2; \
         exit 1; \

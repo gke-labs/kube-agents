@@ -76,19 +76,32 @@ RUN apt-get update && \
       wget && \
     rm -rf /var/lib/apt/lists/*
 
-# The credential-free utility CLIs, at the versions the agent image carried
-# before #737 moved them here. This is now their only home — deploy/docker's
-# step 2 says so and its guard enforces it — so a version bump has one place to
-# happen. k9s did not come across: it is a full-screen terminal UI, and every
-# command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
-# it could not run even if a skill asked for it. Nothing in agents/ does.
+# The credential-free utility CLIs: yq and helm (at the versions the agent
+# image carried before #737 moved them here) plus leeway for GKE capacity,
+# spot, and zonal topology-skew diagnostics. This is their only home —
+# deploy/docker's step 2 says so and its guard enforces it — so a version bump
+# has one place to happen. leeway holds no credentials of its own; inside the
+# sandbox session `CREDENTIAL_PROXY_URL` is set (`pkg/clusters/broker.go`:
+# `BrokerFromEnv` sets `ShellMode: true`), so `leeway report` (`v0.1.3+`) leaves
+# `Cluster.Config = nil` and `fetchViaKubectl` (`pkg/report/collector.go`)
+# shells out to the sandbox's `kubectl` credential-proxy shim on `PATH`
+# (`/opt/credential-proxy/bin/kubectl`, governed by `KUBECTL_READ_VERBS`) rather
+# than dialing the Kubernetes API server directly through `client-go`.
+# k9s did not come across: it is a full-screen terminal UI, and every command
+# here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
+# could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
-    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH} && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz "https://github.com/go-steer/leeway/releases/download/v0.1.3/leeway_v0.1.3_linux_${ARCH}.tar.gz" && \
+    tar -xzf /tmp/leeway.tar.gz -C /usr/local/bin leeway && \
+    chmod +x /usr/local/bin/leeway && \
+    rm -f /tmp/leeway.tar.gz && \
+    /usr/local/bin/leeway version
 
 # OpenTofu, for one command: `tofu fmt -check -diff`, the gcp-terraform skill's
 # syntax check on the HCL it writes before a pull request. It is the only check

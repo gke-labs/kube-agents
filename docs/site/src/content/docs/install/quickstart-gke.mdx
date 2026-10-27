@@ -36,7 +36,7 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   or AI Agent without cloning the repository manually.
 </Aside>
 
-Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.4.0`; a GitLab install needs `0.9.0` or later):
+Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.19.0`; a GitLab install needs `0.9.0` or later):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
@@ -93,7 +93,7 @@ Only run the real install after I say yes.
    cd kube-agents-<RELEASE_VERSION>
    ```
 
-   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.4.0`; a GitLab install needs `0.9.0` or later):
+   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.19.0`; a GitLab install needs `0.9.0` or later):
 
    ```bash
    git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
@@ -204,7 +204,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
    | `platform-agent-a2a-callout-…`          | 2                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-verifier-…`         | 2                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-console-…`          | 1                             | `Running`                                                                                                                                                              |
-   | `platform-agent-a2a-gateway-…`          | 1, with a chat backend only   | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-gateway-…`          | 1                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-provision-<hash>-…` | 1 per run, more if it retries | `Completed`; a failed attempt stays `Error`; all removed 24 hours after the Job finishes                                                                               |
    | `<profile>-<animal>-<hex>`              | 1 per session                 | For a `/session` conversation, `Running` until 30 minutes after its last message, and for 4 hours at most; for a `delegate` message, `Running` while its one task runs |
 
