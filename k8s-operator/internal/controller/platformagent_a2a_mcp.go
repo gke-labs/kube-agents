@@ -117,8 +117,12 @@ func a2aMCPGoMemLimit() string {
 	return strconv.FormatInt(limit.Value()*a2aMCPGoMemLimitPercent/100, 10)
 }
 
-// a2aMCPFenceIndex is the fence's place in a2aMCPObjects.
-const a2aMCPFenceIndex = 2
+// a2aMCPFenceIndex and a2aMCPTokenIndex are the fence's and the token's
+// places in a2aMCPObjects.
+const (
+	a2aMCPFenceIndex = 2
+	a2aMCPTokenIndex = 3
+)
 
 // a2aMCPDoorEnabled reports whether the operator was deployed with the MCP
 // flag.
@@ -300,34 +304,40 @@ func buildA2AMCPNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.
 // ensureA2AMCPToken mints the bearer token into its Secret when it is absent
 // or unusable (a2aMCPTokenUsable), and never rotates one that is there: a
 // person rotates it by editing the Secret, and the server reads it per
-// request. An unowned Secret of that name is refused, as the door token's is.
-func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// request. An unowned Secret of that name is not adopted, as the door
+// token's is not; unlike the door token's it is not an error either, for
+// the reason reconcileA2AMCPBrokerIdentity gives for the account (#3871):
+// the return says whether the token is ours and the server may render, and
+// false is reported on the CR with a2aMCPTokenUnownedReason.
+func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	name := types.NamespacedName{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
 		if !metav1.IsControlledBy(existing, agent) {
-			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the MCP server's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+			logf.FromContext(ctx).Info("not adopting an unowned Secret as the MCP server's token; the MCP server is not rendered",
+				"namespace", name.Namespace, "name", name.Name)
+			return false, nil
 		}
 		if a2aMCPTokenUsable(existing.Data[a2aMCPAccessKey]) {
-			return nil
+			return true, nil
 		}
 		token, err := randomA2AInjectToken()
 		if err != nil {
-			return fmt.Errorf("mint the MCP server's token: %w", err)
+			return false, fmt.Errorf("mint the MCP server's token: %w", err)
 		}
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}
 		}
 		existing.Data[a2aMCPAccessKey] = []byte(token)
-		return r.Update(ctx, existing)
+		return true, r.Update(ctx, existing)
 	}
 	if !errors.IsNotFound(err) {
-		return err
+		return false, err
 	}
 	token, err := randomA2AInjectToken()
 	if err != nil {
-		return fmt.Errorf("mint the MCP server's token: %w", err)
+		return false, fmt.Errorf("mint the MCP server's token: %w", err)
 	}
 	secret := &corev1.Secret{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -335,9 +345,9 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 		Data:       map[string][]byte{a2aMCPAccessKey: []byte(token)},
 	}
 	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
-	return r.Create(ctx, secret)
+	return true, r.Create(ctx, secret)
 }
 
 // a2aMCPTokenUsable reports whether a caller could present v as the token.
@@ -363,23 +373,52 @@ func a2aMCPTokenUsable(v []byte) bool {
 
 // reconcileA2AMCP applies the MCP server under its flag and removes it
 // without. Its fence is reconcileA2ANetworkFences's, applied before this
-// runs, so the pod never runs unfenced.
-func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// runs, so the pod never runs unfenced. The return is the reason the server
+// is not rendered with the flag on (a2aMCPTokenUnownedReason), or "": a
+// token Secret under the reserved name that is not ours is reported, and
+// the server removed, rather than an error (#3871). The fence stays: the
+// fences pass re-applies it every pass while the flag is on, so removing
+// it here would create and delete it on each pass, each an event that
+// wakes the next (NetworkPolicy is an Owns() kind). A fence over nothing
+// denies nothing.
+func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
 	if !a2aMCPDoorEnabled() {
-		return r.removeA2AMCP(ctx, agent)
+		return "", r.removeA2AMCP(ctx, agent)
 	}
-	if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
-		return fmt.Errorf("failed to ensure the MCP server's token: %w", err)
+	tokenOwned, err := r.ensureA2AMCPToken(ctx, agent)
+	if err != nil {
+		return "", fmt.Errorf("failed to ensure the MCP server's token: %w", err)
+	}
+	if !tokenOwned {
+		return a2aMCPTokenUnownedReason, r.removeA2AMCPServer(ctx, agent)
 	}
 	for _, obj := range []client.Object{
 		buildA2AMCPDeployment(agent),
 		buildA2AMCPService(agent),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return err
+			return "", err
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("failed to apply the MCP server's %T: %w", obj, err)
+			return "", fmt.Errorf("failed to apply the MCP server's %T: %w", obj, err)
+		}
+	}
+	return "", nil
+}
+
+// removeA2AMCPServer is removeA2AMCP for a pass that keeps the flag on but
+// may not render the server over an object it does not own: the Deployment
+// and its Service go. The fence stands (see reconcileA2AMCP), and so does a
+// token of ours: removing it would rotate the bearer token every client
+// holds the moment the server renders again, a rotation nobody asked for,
+// and a token with no server behind it is inert.
+func (r *PlatformAgentReconciler) removeA2AMCPServer(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for i, entry := range r.a2aMCPObjects(agent) {
+		if i == a2aMCPFenceIndex || i == a2aMCPTokenIndex {
+			continue
+		}
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
+			return fmt.Errorf("failed to remove the MCP server's %T: %w", entry.obj, err)
 		}
 	}
 	return nil
@@ -397,7 +436,9 @@ func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *ag
 // With the flag off this runs on every next reconcile, so an object under a
 // reserved name that this PlatformAgent does not own, the fence included, is
 // not ours to remove and must not stop the rest of the reconcile: it is
-// skipped. Only the flag's own path refuses it (ensureA2AMCPToken).
+// skipped. With the flag on, an unowned token or account is reported on the
+// CR and the server is not rendered (ensureA2AMCPToken,
+// reconcileA2AMCPBrokerIdentity).
 func (r *PlatformAgentReconciler) removeA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	noPodLeft := func() (bool, error) {
 		pods := &corev1.PodList{}
@@ -445,8 +486,8 @@ func (r *PlatformAgentReconciler) deleteA2AObjectIfOwned(ctx context.Context, ag
 }
 
 // a2aMCPObjects names the MCP server's objects: the server, its Service, its
-// fence (at a2aMCPFenceIndex), then its token, read uncached like every
-// Secret here.
+// fence (at a2aMCPFenceIndex), then its token (at a2aMCPTokenIndex), read
+// uncached like every Secret here.
 func (r *PlatformAgentReconciler) a2aMCPObjects(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	ns := agent.Namespace
 	return []a2aTeardownEntry{
