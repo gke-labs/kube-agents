@@ -26,8 +26,9 @@
 # severity as the planted one, so `finish` publishes the planted title.
 #
 # The stream is fleet-consistency-drift because its collector is the
-# cheapest one: one `clusters list` per project, and no kubeconfig. Its
-# candidates on the seeded fleet do not change between the plant and the run.
+# cheapest one: one `clusters list` per project, and no kubeconfig for its
+# checks. Its candidates on the seeded fleet do not change between the plant
+# and the run.
 #
 # Planted defect required: drift-outlier (bench/tf/fleet/fixtures.json), the
 # authorized-networks outlier on slot c. Isolation class: cluster-read-only,
