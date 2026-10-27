@@ -117,10 +117,13 @@ func (r *budgetReader) next(wait time.Duration) (jetstream.Msg, error) {
 		// drainFetchBatch bounds the conversion; no read asks for more.
 		ask := max(1, min(int(min(r.pending, drainFetchBatch)), r.batch))
 		msgs, err := r.sub.Fetch(ask, nats.PullMaxBytes(pullMaxBytes), nats.MaxWait(wait))
-		// "409 Batch Completed" is the server ending a pull whose count filled
-		// with bytes to spare. The client reports it as an error only when it
-		// delivered nothing, which is the end of a pull, not a failed read
-		// (#4097): ask again, a bounded number of times.
+		// The server ends a pull whose count filled with bytes to spare with a
+		// "409 Batch Completed" trailer after its last message. The legacy
+		// Fetch returns once it has its batch, so it never reads that trailer,
+		// and every pull shares one reply inbox: a trailer that lands just
+		// after the next Fetch starts is read as that Fetch's answer, which it
+		// reports as an error with nothing delivered (#4097). It is the last
+		// pull's end, not this one's, so ask again, a bounded number of times.
 		for retry := 0; retry < batchCompletedRetries && err != nil && len(msgs) == 0 && strings.Contains(err.Error(), "Batch Completed"); retry++ {
 			msgs, err = r.sub.Fetch(ask, nats.PullMaxBytes(pullMaxBytes), nats.MaxWait(wait))
 		}
@@ -128,7 +131,11 @@ func (r *budgetReader) next(wait time.Duration) (jetstream.Msg, error) {
 		case err != nil && strings.Contains(err.Error(), "Exceeds MaxBytes"):
 			// Not a sentinel in the client: the server's description.
 			return nil, fmt.Errorf("read %d messages before one over the %d-byte pull cap, which the server will not send: %w", r.read, pullMaxBytes, ErrReadByteBudget)
-		case errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) || (err == nil && len(msgs) == 0):
+		// "No messages" here is the same kind of stale answer: a 404 the server
+		// sent to an earlier pull's no_wait request that a retry above left
+		// open. An empty pull either way.
+		case errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) || (err == nil && len(msgs) == 0) ||
+			(err != nil && len(msgs) == 0 && strings.Contains(err.Error(), "no messages")):
 			return nil, nats.ErrTimeout
 		case err != nil:
 			return nil, err

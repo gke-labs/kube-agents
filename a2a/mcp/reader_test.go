@@ -338,3 +338,51 @@ func TestABatchCompletedPullIsNotAFailedRead(t *testing.T) {
 		t.Fatalf("got %v after %d fetches; want the next pull's message", msg, src.fetches)
 	}
 }
+
+// Against a real server: a reader that pulls one message at a time fills
+// each pull's count with bytes to spare, so every pull ends with a "409
+// Batch Completed" trailer, and now and then the next pull reads it first.
+// On main this failed most runs under -race; every read must succeed (#4097).
+func TestManyOneMessagePullsNeverFailOnALateTrailer(t *testing.T) {
+	url, js := bigBus(t)
+	b := dial(t, url)
+	ctx := context.Background()
+	const subject = "a2a.tasks.platform.task-trailer.in"
+	const n = 2000
+	publishN(t, js, subject, []byte("{}"), n)
+	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{FilterSubject: subject, AckPolicy: jetstream.AckNonePolicy, MemoryStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := b.newBudgetReader(cons, 1, readMaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.stop()
+	for i := 0; i < n; i++ {
+		if _, err := r.next(time.Second); err != nil {
+			t.Fatalf("read %d of %d: %v", i, n, err)
+		}
+	}
+}
+
+// staleNoMessages is a pull subscription whose fetch reads a 404 the server
+// sent to an earlier pull's no_wait request.
+type staleNoMessages struct{}
+
+func (staleNoMessages) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) {
+	return nil, errors.New("nats: no messages")
+}
+func (staleNoMessages) Unsubscribe() error { return nil }
+
+// A stale "no messages" is an empty pull, as a timeout is, not a failed read.
+func TestAStaleNoMessagesIsAnEmptyPull(t *testing.T) {
+	r := &budgetReader{sub: staleNoMessages{}, batch: 1, budget: readMaxBytes}
+	if _, err := r.next(time.Second); !errors.Is(err, nats.ErrTimeout) {
+		t.Fatalf("got %v; want nats.ErrTimeout", err)
+	}
+}
