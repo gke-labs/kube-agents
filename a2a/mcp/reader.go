@@ -49,6 +49,10 @@ const (
 	readMaxBytes = 4 << 20
 )
 
+// batchCompletedRetries bounds how many pulls in a row may end on "409
+// Batch Completed" with nothing delivered before next gives up on the read.
+const batchCompletedRetries = 3
+
 // ErrReadByteBudget is a read stopped by its byte budget (readMaxBytes), or
 // by a message the server will not send under the per-pull cap
 // (pullMaxBytes).
@@ -113,6 +117,13 @@ func (r *budgetReader) next(wait time.Duration) (jetstream.Msg, error) {
 		// drainFetchBatch bounds the conversion; no read asks for more.
 		ask := max(1, min(int(min(r.pending, drainFetchBatch)), r.batch))
 		msgs, err := r.sub.Fetch(ask, nats.PullMaxBytes(pullMaxBytes), nats.MaxWait(wait))
+		// "409 Batch Completed" is the server ending a pull whose count filled
+		// with bytes to spare. The client reports it as an error only when it
+		// delivered nothing, which is the end of a pull, not a failed read
+		// (#4097): ask again, a bounded number of times.
+		for retry := 0; retry < batchCompletedRetries && err != nil && len(msgs) == 0 && strings.Contains(err.Error(), "Batch Completed"); retry++ {
+			msgs, err = r.sub.Fetch(ask, nats.PullMaxBytes(pullMaxBytes), nats.MaxWait(wait))
+		}
 		switch {
 		case err != nil && strings.Contains(err.Error(), "Exceeds MaxBytes"):
 			// Not a sentinel in the client: the server's description.

@@ -309,3 +309,32 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 		t.Errorf("sent %d pulls for %d events; want each pull sized from what is pending", got, n)
 	}
 }
+
+// batchCompletedOnce is a pull subscription whose first fetch ends on the
+// server's "409 Batch Completed" with nothing delivered, as #4097's flake
+// does, and whose next fetch brings a message.
+type batchCompletedOnce struct{ fetches int }
+
+func (f *batchCompletedOnce) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) {
+	f.fetches++
+	if f.fetches == 1 {
+		return nil, errors.New("nats: Batch Completed")
+	}
+	return []*nats.Msg{{Subject: "a2a.tasks.x", Data: []byte("{}")}}, nil
+}
+func (*batchCompletedOnce) Unsubscribe() error { return nil }
+
+// A pull that ends on "409 Batch Completed" with nothing delivered is the end
+// of a pull, not a failed read: the reader asks again within its wait rather
+// than failing the read (#4097).
+func TestABatchCompletedPullIsNotAFailedRead(t *testing.T) {
+	src := &batchCompletedOnce{}
+	r := &budgetReader{sub: src, batch: 4, budget: readMaxBytes, pending: 4}
+	msg, err := r.next(time.Second)
+	if err != nil {
+		t.Fatalf("read failed on a Batch Completed pull: %v", err)
+	}
+	if msg == nil || src.fetches != 2 {
+		t.Fatalf("got %v after %d fetches; want the next pull's message", msg, src.fetches)
+	}
+}
