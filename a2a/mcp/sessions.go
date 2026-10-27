@@ -25,10 +25,14 @@ const (
 
 	// The console texts the control actions send, as a person would type
 	// them. The gateway settles /session and /session off with a notice
-	// (turnFate). status and help are messages to the agent, sent as any
-	// turn is: while the conversation's turn is still running they wait for
-	// it to end (SendTurn), so neither reaches the running task (#3895).
-	// sendAndWait takes a notice or a task either way.
+	// (turnFate). help is a message to the agent, sent as any turn is: while
+	// the conversation's turn is still running it waits for it to end
+	// (SendTurn). sendAndWait takes a notice or a task either way.
+	//
+	// status is not offered (droppedActions): sent the same way it would
+	// wait out a running turn rather than report its progress, and once
+	// offered, clients' prompts would learn it. It comes back when it can
+	// report progress (#3895).
 	sessionOnText  = "/session"
 	sessionOffText = "/session off"
 	statusText     = "status"
@@ -57,7 +61,6 @@ const (
 var controlTexts = map[string]string{
 	actionSessionOn:  sessionOnText,
 	actionSessionOff: sessionOffText,
-	actionStatus:     statusText,
 	actionHelp:       helpText,
 }
 
@@ -79,6 +82,7 @@ var droppedActions = map[string]string{
 	"debug_off":    "not available in the in-cluster server yet: per-conversation formatting comes with a later change",
 	"transcript":   "not available in the in-cluster server yet: reading a conversation's history needs a cheaper bus read than a scan of every task; use task_control get for a task",
 	"clear_killed": "not available in the in-cluster server: it cannot see session pods",
+	actionStatus:   "not available in the in-cluster server yet: it would wait for the running turn to end rather than report its progress; read a task's state and progress with task_control get, by the task send_message reported",
 }
 
 type manageSessionArgs struct {
@@ -91,21 +95,21 @@ type manageSessionArgs struct {
 }
 
 // ManageSessionTool lists, creates and forgets conversation aliases, and sends
-// /session, /session off, status and help on a conversation.
+// /session, /session off and help on a conversation.
 func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 	return Tool{
 		Definition: ToolDefinition{
 			Name: ToolManageSession,
 			Description: "Manage this server's named conversations: list them, create one (new), forget one (delete), " +
 				"or send a control turn on one: start a /session worker (session_on), end it (session_off), " +
-				"or send the agent the message status or help (like any message, these wait for the conversation's running turn to end first). " +
+				"or send the agent the message help (like any message, it waits for the conversation's running turn to end first). " +
 				"Names are this server's memory only; " +
 				"a conversation resumes by its token after a restart.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"action": map[string]any{"type": "string", "description": "Default: " + actionList + ".", "enum": []string{
-						actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionStatus, actionHelp,
+						actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionHelp,
 					}},
 					"conversation": map[string]any{"type": "string", "description": "The conversation's name. new: the name to create " +
 						"(default session-<unix time>); delete: the name to forget (or its conversation's token); the control actions: the conversation to send on " +
@@ -150,8 +154,8 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 			case actionDelete:
 				return deleteConversation(convs, a)
 			default:
-				return "", fmt.Errorf("unknown action %s; use %s, %s, %s, %s, %s, %s or %s", cell(a.Action),
-					actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionStatus, actionHelp)
+				return "", fmt.Errorf("unknown action %s; use %s, %s, %s, %s, %s or %s", cell(a.Action),
+					actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionHelp)
 			}
 		},
 	}
