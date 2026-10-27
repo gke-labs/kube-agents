@@ -47,11 +47,12 @@ CHAT_HEADROOM = 2
 # The admitted count at or above which the headroom is taken; below it the
 # width stays at most FALLBACK_WIDTH, so no install sweeps slower than before.
 HEADROOM_FROM = 6
-# The whole admission read's deadline, connect and body together. The broker
-# client's own opener drops its socket timeout after connecting, on purpose,
-# because an exec may run for minutes; this read is one small JSON body, and a
-# connection that goes half-open must not hold the sweep back before it reads a
-# single cluster.
+# The admission read's socket timeout: urllib applies it to the connect and to
+# each blocking read, not to the exchange as a whole. The broker client's own
+# opener drops its socket timeout after connecting, on purpose, because an exec
+# may run for minutes; this read is one small JSON body that arrives in a read or
+# two, so a connection that goes half-open times out here instead of holding the
+# sweep back before it reads a single cluster.
 ADMISSION_TIMEOUT_S = 10
 # Never follow a redirect out of the broker: urllib would re-send the
 # Authorization header to wherever it points (credential_proxy_client._NoRedirect
