@@ -1345,5 +1345,23 @@ class ProxyCapacityTest(unittest.TestCase):
         self.assertIsNone(concurrent.per_cluster_per_minute)
 
 
+class CappedCpuTest(unittest.TestCase):
+    def test_a_cpu_peak_at_the_limit_stays_out_of_the_line(self):
+        proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
+        records = parse(
+            record(metrics=((hl.CPU_PEAK, proxy, 0.4),), limits=limits, values=planned()),
+            record("clusters", 4, metrics=((hl.CPU_PEAK, proxy, 0.6),), limits=limits,
+                   totals={"clusters": 4}, values=planned(clusters=4)),
+            # Pinned at the 1-core limit: the need is unknown, so it is not a point of the line.
+            record("clusters", 16, metrics=((hl.CPU_PEAK, proxy, 1.0),), limits=limits,
+                   totals={"clusters": 16}, values=planned(clusters=16)),
+        )
+        points = hl.series_points(records, "fleet_audit", hl.CLUSTERS, hl.CPU_PEAK, proxy)
+        self.assertEqual([p.excluded for p in points], [False, False, True])
+        fit = hl.fit_line(points)
+        # 0.4 at 2 clusters and 0.6 at 4: 0.1 per cluster, so 1.8 cores of need at 16.
+        self.assertAlmostEqual(fit.at(16), 1.8)
+
+
 if __name__ == "__main__":
     unittest.main()

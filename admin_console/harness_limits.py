@@ -85,6 +85,9 @@ PLAN_BASE_LEVELS = MappingProxyType(
 MEMORY_PEAK = "memory_peak_bytes"
 CPU_PEAK = "cpu_peak_cores"
 CPU_SECONDS = "cpu_seconds"
+# A CPU peak this close to the container's own CPU limit is the limit, not the need: the container
+# was throttled, and what it would have used is unknown. Such a point stays out of the CPU line.
+CPU_CAPPED_SHARE = 0.9
 RESTARTS = "restarts"
 OOMKILLS = "oomkills"
 PVC_USED = "pvc_used_bytes"
@@ -1055,10 +1058,18 @@ def series_points(
         if x is None or y is None:
             continue
         level = BASE_LEVEL if record.is_base else f"{record.level:g}"
-        points.append(
-            Point(x, y, record.key, record.run, record.is_base, record.excluded(metric), level)
-        )
+        excluded = record.excluded(metric) or capped(record, metric, container)
+        points.append(Point(x, y, record.key, record.run, record.is_base, excluded, level))
     return tuple(sorted(points, key=lambda point: (point.x, point.key)))
+
+
+def capped(record: Record, metric: str, container: str | None) -> bool:
+    """Whether a run's CPU peak is its container's CPU limit rather than its need."""
+    if metric != CPU_PEAK or container is None:
+        return False
+    limit = record.limits.get(container, {}).get(LIMIT_CPU)
+    value = record.value(metric, container)
+    return bool(limit) and value is not None and value >= CPU_CAPPED_SHARE * limit
 
 
 def fit_line(points: Iterable[Point]) -> Fit | None:
@@ -1111,6 +1122,7 @@ def _base_value(
         value
         for record in base_records(records, operation)
         if not record.excluded(metric)
+        and not capped(record, metric, container)
         and (value := record.value(metric, container)) is not None
     ]
     return _mean(values) if values else None

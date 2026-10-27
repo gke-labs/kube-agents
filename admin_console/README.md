@@ -213,7 +213,8 @@ fixture achieved; any other factor sits at the run's planned value. Each chart h
 its dashed prediction. A line through two distinct planned points is a two-point
 estimate; past the largest measured value it is predicted, not measured. A run
 with a provider 429, a failed prompt or an unfinished one (the record's
-`excluded_from`) stays out of the response-time fit. A factor that is a load the
+`excluded_from`) stays out of the response-time fit, and a CPU peak at 90% or more of the
+container's CPU limit stays out of the CPU fit: it shows the limit, not what the container needed. A factor that is a load the
 runner applies, such as the credential proxy load's workers, is charted against
 its runs but is no fleet input. Runs at a combined point, which move several
 factors at once, are listed against the page's prediction for the same fleet; a
