@@ -57,10 +57,9 @@ const (
 	// changed under it: the second read adopts the winner.
 	homeRecordAttempts = 2
 
-	// slackChannelTypeMpIM is a group direct message's channel_type, and
-	// slackKindGroup the InboundMessage.Kind of every non-DM Slack turn.
+	// slackChannelTypeMpIM is a group direct message's channel_type. The
+	// InboundMessage.Kind of a non-DM turn is slackKindGroup (slack_stop.go).
 	slackChannelTypeMpIM = "mpim"
-	slackKindGroup       = "group"
 
 	// homeLearnedLine is the one line posted in the learning thread. It names
 	// the channel and the field that overrides it, never the member.
