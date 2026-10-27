@@ -2640,12 +2640,26 @@ class CandidateSummaryTest(unittest.TestCase):
         self.assertIn("1 cluster(s) collected; 1 candidate(s) to report", err.getvalue())
         self.assertIn("shielded-nodes: 1 (a)", err.getvalue())
 
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "RUN_DEADLINE_S", 0):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fd.main([])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
     def test_main_adds_the_config_connector_read_before_it_prints(self):
         """A drift fix can edit a `ContainerCluster` declaration, so `main`
         puts `kcc_health`'s keys on the manifest `finish` reads."""
         manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
 
-        def annotate(found, *, mapper):
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
             found["clusters"][0]["kcc_unready"] = list(mapper(lambda entry: {"seen": entry["name"]}, found["clusters"]))
 
         out = io.StringIO()

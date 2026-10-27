@@ -13,15 +13,22 @@ the collectors do the reading. This module is the one read they share. On each
 cluster a collector swept, it runs `kubectl get gcp -A -o json` once, and puts
 the result on that cluster's manifest entry:
 
-- `kcc_unready`: the objects whose `Ready` condition is `False`, each as
+- `kcc_unready`: the objects whose `Ready` condition is `False` for a reason
+  other than a transient one (`TRANSIENT_REASONS`: Config Connector is still
+  applying or deleting the object), each as
   `{kind, namespace, name, why}`, plus `resource` (the object's
   `spec.resourceID`) and `cluster` (a `ContainerNodePool`'s `clusterRef`) where
   they are set. An empty list means the cluster runs Config Connector and every
   object it holds is ready or not yet reached.
 - `kcc_unread`: why the read did not give an answer (a timeout, a forbidden
   read, output that is not a list). This is "unknown", never "healthy".
-- Neither key: the API server does not serve the `gcp` category, so Config
-  Connector does not run on that cluster.
+- Neither key on a `collected` entry: the API server does not serve the `gcp`
+  category, so Config Connector does not run on that cluster.
+
+The reads start after the sweep and must end inside the collector's time
+budget (`RUN_DEADLINE_S` from the collector's start), so the manifest prints
+before the SOP's terminal timeout. Each timeout is cut to the time left, and
+an entry whose read cannot start in time gets `kcc_unread` that says so.
 
 An object with no `Ready` condition yet is left out: that is the normal state
 for seconds after an apply, and it is not evidence of a stall.
@@ -39,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, NamedTuple
 
@@ -47,6 +55,10 @@ from typing import Callable, Iterable, Iterator, NamedTuple
 KCC_CATEGORY = "gcp"
 # The one condition every Config Connector kind carries.
 KCC_READY_CONDITION = "Ready"
+# The `Ready=False` reasons Config Connector sets while it still applies or
+# deletes an object. They are not a stall: the next reconcile usually clears
+# them, so a note that says "not applying" on them would be false.
+TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
 # The kind whose identity needs its cluster: every cluster has a `default-pool`.
 KCC_NODE_POOL_KIND = "ContainerNodePool"
 # The manifest keys this module writes on a cluster entry.
@@ -65,6 +77,22 @@ NO_REASON_GIVEN = "no reason given"
 READ_TIMEOUT_S = 240
 # The timeout for `get-credentials`, collect.py's `DEFAULT_TIMEOUT_S`.
 CREDENTIALS_TIMEOUT_S = 60
+# The SOPs run each collector in one terminal call with this timeout. When it
+# expires, the call is killed and the manifest is lost.
+TERMINAL_TIMEOUT_S = 600
+# The time kept free after the last read: the manifest must be printed, and
+# the interpreter started before the collector's clock did.
+PRINT_MARGIN_S = 60
+# When the reads must end, in seconds from the collector's start.
+RUN_DEADLINE_S = TERMINAL_TIMEOUT_S - PRINT_MARGIN_S
+# A step that has less time than this left does not start: a read cut to a
+# few seconds cannot finish on a cluster that runs Config Connector.
+MIN_STEP_S = 10
+# What `kcc_unread` says for an entry whose read did not start in time.
+BUDGET_SPENT_REASON = (
+    "the collector's time budget ({budget}s from its start) was spent before this read could start, "
+    "so whether Config Connector applies its objects here is not known."
+)
 # What `default_run` returns for a command it killed, as `timeout(1)` does.
 TIMEOUT_RC = 124
 # The API server's answer when it does not serve the category.
@@ -73,11 +101,13 @@ RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
 MAX_ERROR_CHARS = 300
 # The manifest outcome of a cluster the collector read.
 OUTCOME_COLLECTED = "collected"
-# Where the fetched kubeconfigs go: the agent's data volume, as every
-# collector's own kubeconfigs do.
+# Where the fetched kubeconfigs go: collect.py's `KUBECONFIG_DIR`, which
+# `collect.usable_kubeconfig_dir` makes usable.
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
-# The file name of one cluster's kubeconfig in `KUBECONFIG_DIR`.
-KUBECONFIG_NAME = "kcc_{project}_{cluster}_{location}.yaml"
+# The file name of one cluster's kubeconfig in `KUBECONFIG_DIR`: the name
+# collect.py's `kubeconfig_path` gives it, so every collector writes one file
+# for a cluster.
+KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
 
 class Result(NamedTuple):
@@ -88,10 +118,15 @@ class Result(NamedTuple):
 
 RunFn = Callable[..., Result]
 # How `annotate_manifest` maps its read over the clusters: the builtin `map`,
-# one at a time, or a collector's own `ThreadPoolExecutor.map`, so the reads
-# share the pool that collector already holds to the broker's admitted count
-# (collect.py's `MAX_WORKERS`) rather than opening a second one.
+# one at a time, or the `map` of a `ThreadPoolExecutor` that the collector
+# opens after its sweep. That pool is a new one, with the sweep's size
+# (`MAX_WORKERS`), so the reads stay inside the broker's admitted count.
 MapFn = Callable[[Callable[[dict], dict], Iterable[dict]], Iterator[dict]]
+# The kubeconfig a collector already fetched for an entry, or None. With one,
+# `annotate_manifest` does not run `get-credentials` again.
+KubeconfigFn = Callable[[dict], "Path | None"]
+# The clock the deadline is measured on.
+ClockFn = Callable[[], float]
 
 
 def default_run(argv: list[str], *, env: dict | None = None, timeout: int = READ_TIMEOUT_S) -> Result:
@@ -140,6 +175,8 @@ def unready_objects(items: list) -> list[dict]:
         ready = ready_condition(item)
         if ready is None or str(ready.get("status")) != "False":
             continue
+        if str(ready.get("reason") or "").strip() in TRANSIENT_REASONS:
+            continue
         meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         kind = str(item.get("kind") or "")
         name = str(meta.get("name") or "")
@@ -161,16 +198,17 @@ def unready_objects(items: list) -> list[dict]:
     return sorted(found, key=lambda r: (r["kind"], r["namespace"], r["name"]))
 
 
-def entry_fields(parsed: object, rc: int, stderr: str) -> dict:
+def entry_fields(parsed: object, rc: int, stderr: str, timeout_s: int = READ_TIMEOUT_S) -> dict:
     """The keys one cluster's `gcp` read puts on its manifest entry.
 
     `parsed` is the read's output as JSON, or None when it was not readable.
+    `timeout_s` is the timeout the read had.
     """
     if rc == 0 and isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
         return {UNREADY_FIELD: unready_objects(parsed["items"])}
     if rc == TIMEOUT_RC:
         return {
-            UNREAD_FIELD: f"`kubectl get {KCC_CATEGORY} -A` did not finish in {READ_TIMEOUT_S}s, "
+            UNREAD_FIELD: f"`kubectl get {KCC_CATEGORY} -A` did not finish in {timeout_s}s, "
             "so whether Config Connector applies its objects here is not known."
         }
     if rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in stderr:
@@ -192,45 +230,88 @@ def read_argv() -> list[str]:
     return ["kubectl", "get", KCC_CATEGORY, "-A", "-o", "json"]
 
 
-def read_cluster(kubeconfig: Path, *, run: RunFn = default_run) -> dict:
+def read_cluster(kubeconfig: Path, *, run: RunFn = default_run, timeout_s: int = READ_TIMEOUT_S) -> dict:
     """Read one cluster and return its entry keys (`entry_fields`)."""
-    result = run(read_argv(), env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=READ_TIMEOUT_S)
+    result = run(read_argv(), env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=timeout_s)
     try:
         parsed = json.loads(result.stdout) if result.rc == 0 and result.stdout.strip() else None
     except json.JSONDecodeError:
         parsed = None
-    return entry_fields(parsed, result.rc, result.stderr)
+    return entry_fields(parsed, result.rc, result.stderr, timeout_s)
 
 
-def _annotate_entry(entry: dict, run: RunFn, kubeconfig_dir: Path) -> dict:
-    """Fetch one cluster's credentials and read it; the keys for its entry."""
+def run_deadline(started: float) -> float:
+    """The `deadline` for `annotate_manifest`, from the collector's start."""
+    return started + RUN_DEADLINE_S
+
+
+def _budget_spent() -> dict:
+    return {UNREAD_FIELD: BUDGET_SPENT_REASON.format(budget=RUN_DEADLINE_S)}
+
+
+def _time_left(deadline: float, clock: ClockFn) -> int:
+    """Whole seconds to `deadline`, or 0 when less than `MIN_STEP_S` is left."""
+    left = int(deadline - clock())
+    return left if left >= MIN_STEP_S else 0
+
+
+def _annotate_entry(
+    entry: dict, run: RunFn, kubeconfig_dir: Path, deadline: float, clock: ClockFn, kubeconfig_for: KubeconfigFn | None
+) -> dict:
+    """Fetch one cluster's credentials and read it; the keys for its entry.
+
+    Each step's timeout is cut to the time left before `deadline`, so the
+    read ends before it. A step that cannot start in time is not run.
+    """
     project = str(entry.get("project") or "")
     location = str(entry.get("location") or "")
     cluster = str(entry.get("name") or "").rpartition("/")[2]
-    kubeconfig = kubeconfig_dir / KUBECONFIG_NAME.format(project=project, cluster=cluster, location=location)
-    argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
-    fetched = run(argv, env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=CREDENTIALS_TIMEOUT_S)
-    if fetched.rc != 0:
-        excerpt = " ".join(fetched.stderr.split())[:MAX_ERROR_CHARS] or "no stderr"
-        return {
-            UNREAD_FIELD: f"get-credentials exited {fetched.rc} ({excerpt}), so whether Config "
-            "Connector applies its objects here is not known."
-        }
-    return read_cluster(kubeconfig, run=run)
+    kubeconfig = kubeconfig_for(entry) if kubeconfig_for else None
+    if kubeconfig is None:
+        left = _time_left(deadline, clock)
+        if not left:
+            return _budget_spent()
+        from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+        kubeconfig = kubeconfig_dir / KUBECONFIG_NAME.format(project=project, cluster=cluster, location=location)
+        note = prepare_kubeconfig(kubeconfig)
+        if note:
+            return {UNREAD_FIELD: f"{note}, so whether Config Connector applies its objects here is not known."}
+        argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
+        fetched = run(argv, env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=min(CREDENTIALS_TIMEOUT_S, left))
+        if fetched.rc != 0:
+            excerpt = " ".join(fetched.stderr.split())[:MAX_ERROR_CHARS] or "no stderr"
+            return {
+                UNREAD_FIELD: f"get-credentials exited {fetched.rc} ({excerpt}), so whether Config "
+                "Connector applies its objects here is not known."
+            }
+    left = _time_left(deadline, clock)
+    if not left:
+        return _budget_spent()
+    return read_cluster(kubeconfig, run=run, timeout_s=min(READ_TIMEOUT_S, left))
 
 
 def annotate_manifest(
     manifest: dict,
     *,
+    deadline: float,
     run: RunFn = default_run,
     kubeconfig_dir: Path = KUBECONFIG_DIR,
     mapper: MapFn = map,
+    clock: ClockFn = time.monotonic,
+    kubeconfig_for: KubeconfigFn | None = None,
 ) -> None:
     """Read every collected cluster in `manifest` once and add its keys.
 
     Only `collected` entries that name a project and a location are read; an
-    entry that already carries either key was read by its collector. A read
-    that raises is recorded as `kcc_unread`: this is an addition to a manifest
+    entry that already carries either key was read by its collector.
+    `deadline` is a `clock` time (`run_deadline`): every read ends before it,
+    and an entry whose read cannot start in time gets `kcc_unread`.
+    `kubeconfig_for` gives the kubeconfig the collector already fetched for
+    an entry, so no second `get-credentials` runs.
+
+    This function never raises. A read that raises, or a failure around the
+    reads, is recorded as `kcc_unread`: this is an addition to a manifest
     whose work is done, and it must not lose that work.
     """
     targets = [
@@ -245,18 +326,33 @@ def annotate_manifest(
     ]
     if not targets:
         return
-    try:
-        kubeconfig_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        for entry in targets:
-            entry[UNREAD_FIELD] = f"no directory for the kubeconfig ({exc}), so whether Config Connector applies its objects here is not known."
-        return
 
     def one(entry: dict) -> dict:
         try:
-            return _annotate_entry(entry, run, kubeconfig_dir)
+            return _annotate_entry(entry, run, kubeconfig_dir, deadline, clock, kubeconfig_for)
         except Exception as exc:  # noqa: BLE001 -- the manifest stands without this read
             return {UNREAD_FIELD: f"the read raised {type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]}
 
-    for entry, fields in zip(targets, mapper(one, targets)):
-        entry.update(fields)
+    try:
+        if not _time_left(deadline, clock):
+            # Nothing can start: no directory is touched and nothing is run.
+            for entry in targets:
+                entry.update(_budget_spent())
+            return
+        if kubeconfig_for is None:
+            from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+
+            # Made usable once before the pool opens, as fleet_stockout.py
+            # does: the threads would otherwise race one another's move-aside.
+            note = usable_kubeconfig_dir(kubeconfig_dir)
+            if note:
+                for entry in targets:
+                    entry[UNREAD_FIELD] = f"{note}, so whether Config Connector applies its objects here is not known."
+                return
+        for entry, fields in zip(targets, mapper(one, targets)):
+            entry.update(fields)
+    except Exception as exc:  # noqa: BLE001 -- the manifest stands without this read
+        reason = f"the Config Connector read raised {type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]
+        for entry in targets:
+            if UNREADY_FIELD not in entry and UNREAD_FIELD not in entry:
+                entry[UNREAD_FIELD] = reason

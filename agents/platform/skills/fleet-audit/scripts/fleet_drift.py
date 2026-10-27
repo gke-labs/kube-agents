@@ -8,13 +8,16 @@ emits and governance/fleet_consistency_drift_sop.md for the checks.
 This stream's own collector: every one of its twenty checks -- nineteen
 comparative facets and §4.14's cohort-independent `no-environment-label` --
 reads GKE control-plane and node-pool metadata through `gcloud container`, no
-`kubectl` and no kubeconfig, so it needs no per-cluster credential fetch —
+`kubectl` and no kubeconfig, so the checks need no per-cluster credential fetch —
 `clusters list` alone, once per project, returns every field every facet
 compares, the same shape `clusters describe` would (the SOP's own §1.3
 frames `describe` as each finding's `evidence.command`; this collector
 issues the cheaper per-project `list` instead and records that as the
 command it actually ran: the manifest publishes what happened, not what
-the SOP originally described).
+the SOP originally described). After the sweep, `main` fetches credentials
+for each collected cluster and makes one Config Connector read there
+(`kcc_health.py`), inside the collector's time budget; that read needs list
+access on the Config Connector CRDs, else the entry gets `kcc_unread`.
 
 **What is procedural here and what stays judgment.** Normalizing a raw
 field to one comparable token per facet (§4), computing the majority and
@@ -2148,11 +2151,15 @@ def main(argv: list[str] | None = None) -> int:
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    # The Config Connector reads below end inside a budget measured from here.
+    started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # After the sweep, on the pool size the sweep used: one `kubectl get gcp`
-    # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry.
+    # After the sweep, in a new pool of the sweep's size: a credential fetch
+    # and one `kubectl get gcp` per collected cluster, as `kcc_unready` or
+    # `kcc_unread` on its entry. The reads end inside the collector's time
+    # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        kcc_health.annotate_manifest(manifest, mapper=pool.map)
+        kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         # The manifest is still written -- the shell has already redirected

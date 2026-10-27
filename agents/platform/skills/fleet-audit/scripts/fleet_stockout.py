@@ -2663,17 +2663,30 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     }
 
 
+def swept_kubeconfig(entry: dict) -> Path:
+    """The kubeconfig `fetch_credentials` wrote for a `collected` entry, so
+    the Config Connector read (`kcc_health`) does not fetch it again."""
+    return kubeconfig_path(str(entry.get("project") or ""), str(entry.get("name") or "").rpartition("/")[2], str(entry.get("location") or ""))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="audit only this project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else every project the credential can see")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    # The Config Connector reads below end inside a budget measured from here.
+    started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # After the sweep, on the pool size the sweep used: one `kubectl get gcp`
-    # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry.
+    # After the sweep, in a new pool of the sweep's size: one `kubectl get gcp`
+    # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry,
+    # with the kubeconfig the sweep fetched for that cluster
+    # (`fetch_credentials`). The reads end inside the collector's time budget
+    # (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        kcc_health.annotate_manifest(manifest, mapper=pool.map)
+        kcc_health.annotate_manifest(
+            manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map, kubeconfig_for=swept_kubeconfig
+        )
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 

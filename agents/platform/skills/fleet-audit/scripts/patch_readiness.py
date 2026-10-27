@@ -244,7 +244,11 @@ BEHIND_CHECKS = (MASTER_BEHIND_CHECK, "pool-skew")
 # 600 seconds (the SOP's §3 says to give it exactly that), after every
 # project's metadata reads, so the runs share a budget and each run's cap
 # has to leave room: a cluster whose run overruns it loses 3.11
-# (unevaluated, below) rather than the manifest.
+# (unevaluated, below) rather than the manifest. After the reporter runs,
+# `main` fetches credentials and makes one Config Connector read on each
+# collected cluster (`kcc_health.py`). Those reads end by
+# `kcc_health.RUN_DEADLINE_S` from the start of `main`, which leaves time to
+# print the manifest before the terminal call ends.
 READINESS_TIMEOUT_S = 240
 # The reporter runs sit on `MAX_WORKERS` threads, so a per-run cap bounds one
 # project and not the sum: a fleet with more behind projects than workers
@@ -2340,11 +2344,15 @@ def main(argv: list[str] | None = None) -> int:
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    # The Config Connector reads below end inside a budget measured from here.
+    started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # After the sweep, on the pool size the sweep used: one `kubectl get gcp`
-    # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry.
+    # After the sweep, in a new pool of the sweep's size: a credential fetch
+    # and one `kubectl get gcp` per collected cluster, as `kcc_unready` or
+    # `kcc_unread` on its entry. The reads end inside the collector's time
+    # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        kcc_health.annotate_manifest(manifest, mapper=pool.map)
+        kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         log(f"WARNING: {manifest['error']}")

@@ -3642,12 +3642,27 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertTrue(fs._only_a_scope_note(entry, None))
         self.assertFalse(fs._only_a_scope_note({"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
 
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "RUN_DEADLINE_S", 0):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main([])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
     def test_main_adds_the_config_connector_read_before_it_prints(self):
         """A stockout fix can edit a `ContainerNodePool` declaration, so `main`
         puts `kcc_health`'s keys on the manifest `finish` reads."""
         manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
 
-        def annotate(found, *, mapper):
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
+            self.assertEqual(kwargs["kubeconfig_for"](found["clusters"][0]), fs.kubeconfig_path("acme", "hub", "us-central1"))
             found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
 
         out = io.StringIO()
