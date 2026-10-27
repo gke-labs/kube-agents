@@ -256,6 +256,10 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+# The Config Connector read that `main` adds to the manifest: this stream's
+# `manifest` fixes can edit Config Connector declarations, and `finish` says so
+# on a fix whose object Config Connector does not apply.
+import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -2666,6 +2670,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project)
+    # After the sweep, on the pool size the sweep used: one `kubectl get gcp`
+    # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        kcc_health.annotate_manifest(manifest, mapper=pool.map)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 

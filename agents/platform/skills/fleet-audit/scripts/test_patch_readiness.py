@@ -1466,6 +1466,20 @@ class CollectFleetTest(unittest.TestCase):
         self.assertNotIn("held none", manifest["error"])
         self.assertIn("out-of-scope", {c["outcome"] for c in manifest["clusters"]})
 
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A patch fix can edit a `ContainerCluster` or `ContainerNodePool`
+        declaration, so `main` puts `kcc_health`'s keys on the manifest."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper):
+            found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
+
+        out = io.StringIO()
+        with mock.patch.object(pr, "collect_fleet", return_value=manifest), mock.patch.object(pr.kcc_health, "annotate_manifest", side_effect=annotate):
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                pr.main([])
+        self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
+
     def test_main_exits_non_zero_on_a_manifest_error_and_still_prints_it(self):
         run = self.discovering(base="", listing=(1, ""))
         real = pr.collect_fleet

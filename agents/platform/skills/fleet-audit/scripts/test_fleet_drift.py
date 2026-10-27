@@ -2640,6 +2640,21 @@ class CandidateSummaryTest(unittest.TestCase):
         self.assertIn("1 cluster(s) collected; 1 candidate(s) to report", err.getvalue())
         self.assertIn("shielded-nodes: 1 (a)", err.getvalue())
 
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A drift fix can edit a `ContainerCluster` declaration, so `main`
+        puts `kcc_health`'s keys on the manifest `finish` reads."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper):
+            found["clusters"][0]["kcc_unready"] = list(mapper(lambda entry: {"seen": entry["name"]}, found["clusters"]))
+
+        out = io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "annotate_manifest", side_effect=annotate):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fd.main([])
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed["clusters"][0]["kcc_unready"], [{"seen": "acme/us-central1/hub"}])
+
     def test_main_says_nothing_about_candidates_when_the_run_failed(self):
         manifest = {"clusters": [], "error": "project discovery failed"}
         out, err = io.StringIO(), io.StringIO()

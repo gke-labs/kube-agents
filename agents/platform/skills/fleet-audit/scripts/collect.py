@@ -255,6 +255,9 @@ for _shared_dir in _platform_script_dirs():
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+# The Config Connector read that the collectors share: this file's `gcp` read
+# gives the compliance stream's entries their `kcc_unready` keys through it.
+import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -7024,13 +7027,12 @@ def check_lb_world_open(context: dict) -> list[dict]:
 
 
 def _kcc_ready_condition(item: dict) -> dict | None:
-    """The `Ready` condition off a Config Connector object, if it has one."""
-    status = item.get("status")
-    conditions = status.get("conditions") if isinstance(status, dict) else None
-    for condition in conditions or []:
-        if isinstance(condition, dict) and condition.get("type") == KCC_READY_CONDITION:
-            return condition
-    return None
+    """The `Ready` condition off a Config Connector object, if it has one.
+
+    `kcc_health.ready_condition`, so this check and the `kcc_unready` keys on
+    the manifest read one condition the same way.
+    """
+    return kcc_health.ready_condition(item)
 
 
 def check_kcc_object_wedged(context: dict) -> list[dict]:
@@ -7041,9 +7043,10 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
     has stopped applying is invisible to every other check in this skill --
     while being the one condition that makes every `manifest` remediation the
     skill produces a no-op. `audit_report.disclose_stalled_kcc_remediations`
-    covers the half where some finding's fix edits the stalled object's file.
-    This covers the rest, which is most of it: nothing in the ledger has to
-    point at an object for it to be wedged.
+    covers the half where some finding's fix edits the stalled object's file,
+    from the `kcc_unready` keys this read also gives the manifest entry
+    (`kcc_health`). This covers the rest, which is most of it: nothing in the
+    ledger has to point at an object for it to be wedged.
 
     Twice in two days on this fleet, and neither showed up anywhere a person
     was looking. On 2026-09-05 a `PubSubTopic` failed on a missing
@@ -7083,7 +7086,7 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
         # No condition yet means KCC has not reached the object, which is the
         # normal state for seconds after an apply and is not evidence of
         # anything. Only an explicit `False` is -- the same bar
-        # `audit_report.kcc_resource_health` sets, for the same reason.
+        # `kcc_health.unready_objects` sets, for the same reason.
         if ready is None or str(ready.get("status")) != "False":
             continue
         meta = item.get("metadata") or {}
@@ -8381,6 +8384,10 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     kcc_argv = ["kubectl", "get", KCC_CATEGORY, "-A", "-o", "json"]
     kcc_parsed, kcc_result = run_and_gate(kcc_argv, kubeconfig, run=run, timeout=KCC_READ_TIMEOUT_S)
     context["kcc_objects"] = (kcc_parsed or {}).get("items") or []
+    # The same read, as the manifest entry's `kcc_unready` or `kcc_unread`
+    # key, so `finish` can say when a fix edits a declaration Config Connector
+    # does not apply. No second read.
+    context["kcc_health"] = kcc_health.entry_fields(kcc_parsed, kcc_result.rc, kcc_result.stderr)
     # `run_and_gate` returns `None` for four different things, and only one of
     # them means "no Config Connector here". Collapsing them would publish
     # "Config Connector is not installed on this cluster" as the audit's own
@@ -9629,6 +9636,9 @@ def collect_cluster(
     }
     if checks_not_applicable:
         result["checks_not_applicable"] = checks_not_applicable
+    # Only the compliance context builder reads `gcp`, so only its entries
+    # carry these keys.
+    result.update(collected.context.get("kcc_health") or {})
     if unevaluated:
         result["checks_unevaluated"] = [
             {"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())

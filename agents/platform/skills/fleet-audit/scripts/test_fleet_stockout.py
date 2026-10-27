@@ -7,6 +7,8 @@ not shapes invented to match the parser. Both APIs were the reason those two
 checks stayed prose-only, so a hand-written fixture would re-create exactly the
 problem converting them was meant to solve."""
 
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -3639,6 +3641,20 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         entry = {"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": note}
         self.assertTrue(fs._only_a_scope_note(entry, None))
         self.assertFalse(fs._only_a_scope_note({"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
+
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A stockout fix can edit a `ContainerNodePool` declaration, so `main`
+        puts `kcc_health`'s keys on the manifest `finish` reads."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper):
+            found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest", side_effect=annotate):
+            with contextlib.redirect_stdout(out):
+                fs.main([])
+        self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
 
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the three flags main parses reach the

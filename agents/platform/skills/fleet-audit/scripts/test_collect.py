@@ -8140,6 +8140,34 @@ class TestComplianceCollectCluster(unittest.TestCase):
         # than in a report.
         self.assertNotIn("does not serve", reason)
 
+    def test_the_entry_lists_the_unready_config_connector_objects(self):
+        """The same `gcp` read gives the entry its `kcc_unready` key, which
+        `finish` matches against the files the run's manifest fixes edit."""
+        result = self.run_with(
+            kcc_items=[
+                kcc_object("ComputeFirewall", "allow-ssh"),
+                kcc_object("PubSubTopic", "fleet-events", ready="False", reason="UpdateFailed", message="Error 403"),
+                kcc_object("ContainerCluster", "fresh", ready=None),
+            ]
+        )
+        self.assertEqual(
+            result["kcc_unready"],
+            [{"kind": "PubSubTopic", "namespace": "kubeagents-system", "name": "fleet-events", "why": "UpdateFailed: Error 403"}],
+        )
+        self.assertNotIn("kcc_unread", result)
+        reads = [argv for argv in self.issued if argv[:3] == ["kubectl", "get", collect.KCC_CATEGORY]]
+        self.assertEqual(len(reads), 1, "the key must come from the check's own read, not a second one")
+
+    def test_a_failed_gcp_read_is_recorded_as_unknown_on_the_entry(self):
+        result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        self.assertIn("not known", result["kcc_unread"])
+        self.assertNotIn("kcc_unready", result)
+
+    def test_a_cluster_without_config_connector_gets_neither_key(self):
+        result = self.run_with()
+        self.assertNotIn("kcc_unready", result)
+        self.assertNotIn("kcc_unread", result)
+
     def test_the_gcp_read_gets_the_longer_timeout_and_the_others_do_not(self):
         """A truthful `Undetermined` still leaves the check having never run on
         the only cluster it can apply to, so the timeout is the other half of
