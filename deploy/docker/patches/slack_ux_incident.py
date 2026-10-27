@@ -178,9 +178,12 @@ EDITED_MAX = 512
 #: changes is read against the call to action it actually carries. Only the marker counts: a
 #: restatement of the reply-wanted clause (``a Pull Request will be opened``, ``is being opened for
 #: review``) keeps its buttons, because stripping them would leave a report that asks for ``apply``
-#: with no button for it. The words may wrap onto continuation lines of the bullet.
+#: with no button for it. The words may wrap onto continuation lines of the bullet. The label
+#: may carry underscore emphasis (``__To authorize__``), and a continuation line may open with
+#: bold (``**is being opened automatically**``): only a list marker followed by whitespace, a
+#: heading, or a blank line ends the clause.
 OPENING_PULL_REQUEST = re.compile(
-    r"^[^\w\n]*To authorize[*_]*:?(?:[^\n]|\n(?![ \t]*[-*#]|\s*$))*?\bis\s+being\s+opened\s+automatically\b",
+    r"^[^\w\n]*[*_]*To authorize[*_]*:?(?:[^\n]|\n(?![ \t]*(?:[-*+][ \t]|#)|\s*$))*?\bis\s+being\s+opened\s+automatically\b",
     re.IGNORECASE | re.MULTILINE,
 )
 

@@ -751,6 +751,55 @@ class RuntimeTest(unittest.TestCase):
             "  opened automatically, or reply **'apply Option A'** to open another option.",
         )
         self.assertEqual(len(runtime.parse_triage(wrapped_report)["choices"]), 1)
+        # Two other Markdown renderings of the same clause: underscore emphasis on the label, and a
+        # wrapped bullet whose continuation line opens with bold. Each yields the same filtered
+        # choices and the same action block as the bold form above.
+        for label, rendering_multi, rendering_single in (
+            (
+                "underscore",
+                "- __To authorize__: a GitOps Pull Request for the recommended fix is being opened automatically, "
+                "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+                "- __To authorize__: a GitOps Pull Request for this fix is being opened automatically.",
+            ),
+            (
+                "wrapped bold",
+                "- **To authorize:** a GitOps Pull Request for the recommended fix\n"
+                "  **is being opened automatically**, or reply **'apply Option A'** / **'apply Option B'** "
+                "to open a Pull Request for a different option.",
+                "- **To authorize:** a GitOps Pull Request for this fix\n  **is being opened automatically**.",
+            ),
+        ):
+            with self.subTest(rendering=label):
+                rendered_report = REPORT.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                    "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                    rendering_multi,
+                )
+                self.assertEqual(
+                    runtime.parse_triage(rendered_report)["choices"],
+                    [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+                )
+                runtime._edited.clear()
+                adapter_rendered = _Adapter()
+                self.deliver(adapter_rendered, result=rendered_report)
+                rendered_action_texts = [
+                    btn["text"]["text"]
+                    for block in adapter_rendered.log[0][1]["blocks"]
+                    if block.get("type") == "actions"
+                    for btn in block.get("elements", [])
+                ]
+                self.assertEqual(rendered_action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+                rendered_single = SINGLE.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.",
+                    rendering_single,
+                )
+                self.assertEqual(runtime.parse_triage(rendered_single)["choices"], [])
+                runtime._edited.clear()
+                adapter_rendered_single = _Adapter()
+                self.deliver(adapter_rendered_single, result=rendered_single)
+                self.assertEqual(
+                    [b["type"] for b in adapter_rendered_single.log[0][1]["blocks"]], ["rich_text", "container"]
+                )
         # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
         # continuation line, keeps every button: stripping one would leave a report that asks for
         # `apply` with no button for it, on an install that is not opening anything.
