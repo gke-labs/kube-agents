@@ -6,10 +6,11 @@ half drives it over a fixture package and holds it to the rules the pages
 rely on: inline embeds flatten, ``json:"-"`` drops, pointers are transparent,
 slices and maps carry their element, a named scalar resolves, markers give
 required, default and constraints, a type from another package is a leaf, and
-a description is the first paragraph without citations. The second half runs
-it over the committed package and checks every path and ``required`` list
-against the committed CRD schemas in both directions, so a page can neither
-list a field the API server does not know nor miss one it does.
+a description is the first paragraph without citations plus a deprecation
+notice. The second half runs it over the committed package and checks every
+path, ``required`` list, type, constraint and default against the committed
+CRD schemas in both directions, so a page can neither list a field the API
+server does not know nor miss one it does, nor describe one differently.
 
 Run:
   python3 -m unittest discover -s scripts -p 'test_gen_crd_docs.py' -v

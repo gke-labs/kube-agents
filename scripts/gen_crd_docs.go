@@ -22,7 +22,9 @@
 // comment, plus any later paragraph that opens with "Deprecated:", with the
 // marker lines removed, parenthetical issue citations cut, and a sentence that
 // cites an issue bare dropped; a struct-typed field with no comment of its
-// own takes its type's, as controller-gen does.
+// own takes its type's. controller-gen does the same for a single struct;
+// for a list or a map of structs it puts the type's text on the items and
+// leaves the field blank, where the page shows it on the field.
 package main
 
 import (

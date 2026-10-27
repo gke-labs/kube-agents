@@ -122,8 +122,9 @@ CRD_BLOCK_PREFIX = "crd-fields-"
 # The paragraph above the tables, rendered once here rather than kept by hand
 # on each page, so the three pages cannot drift apart. It states what the
 # tables leave out: standard metadata, the inside of upstream Kubernetes
-# types, every paragraph of a field's documentation after the first, and the
-# CEL rules the Constraints column does not carry.
+# types, every paragraph of a field's documentation after the first other
+# than its deprecation notice, and the CEL rules the Constraints column does
+# not carry.
 CRD_GROUP = "kubeagents.x-k8s.io"
 CRD_INTRO = (
     "Every field of the `{kind}` resource's `spec` and `status`, generated from the "
@@ -135,7 +136,8 @@ CRD_INTRO = (
     "map. Each description is the opening paragraph of the field's documentation, "
     "plus its deprecation notice when it has one, and names other fields in their Go "
     "spelling (`MaxSessions` for `maxSessions`); `kubectl explain "
-    "{resource}.spec.<field>` prints the whole text. The Constraints column lists the "
+    "{resource}.spec.<field>` (`{resource}.status.<field>` for a row of the Status "
+    "table) prints the whole text. The Constraints column lists the "
     "schema bounds on a field: allowed values, ranges, lengths and patterns. The API "
     "server also enforces CEL rules on these fields and on whole sections, which the "
     "column does not show; `kubectl get crd {resource}s.{group} -o yaml` lists them "

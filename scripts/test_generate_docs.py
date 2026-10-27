@@ -349,6 +349,7 @@ class CRDFieldBlocksTest(unittest.TestCase):
         self.assertTrue(intro.startswith("Every field of the `AgentPlugin` resource's"), intro)
         self.assertIn("[AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/)", intro)
         self.assertIn("`kubectl explain agentplugin.spec.<field>`", intro)
+        self.assertIn("(`agentplugin.status.<field>` for a row of the Status table)", intro)
         # The Constraints column leaves the CEL rules out, and the intro says so
         # and where they are listed.
         self.assertIn("`kubectl get crd agentplugins.kubeagents.x-k8s.io -o yaml`", intro)
