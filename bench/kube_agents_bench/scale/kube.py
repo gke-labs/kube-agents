@@ -235,8 +235,10 @@ def node_pool_size(project: str, zone: str, cluster: str, pool: str) -> int | No
 
 
 def ensure_node_pool(project: str, zone: str, cluster: str, pool: str, machine_type: str, size: int) -> None:
-    """Create the fixture pool at ``size`` nodes, or resize it when it exists."""
+    """Create the fixture pool at ``size`` nodes, or resize it when it exists; never create an empty one."""
     current = node_pool_size(project, zone, cluster, pool)
+    if current is None and size == 0:
+        return
     if current is None:
         gcloud(
             "container", "node-pools", "create", pool, f"--cluster={cluster}", f"--zone={zone}",

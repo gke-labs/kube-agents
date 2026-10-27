@@ -739,3 +739,38 @@ def test_a_level_that_failed_half_way_is_settled_next_time(monkeypatch, tmp_path
     monkeypatch.setattr(run, "ensure_fixtures", lambda *a: None)
     run.apply_level("proxy_concurrency", 8)
     assert sleeps == [300, 300]
+
+
+def test_the_default_pool_holds_fixture_pods_up_to_its_share(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    sized = {}
+    monkeypatch.setattr(runner.kube, "ensure_node_pool",
+                        lambda project, zone, cluster, pool, machine, size: sized.__setitem__(cluster, size))
+    values = run.plan.level_values("clusters", 16)
+    run.settings["default_pool_pods"] = 0
+    run.ensure_nodes(values)
+    assert set(sized.values()) == {1, 2}
+    run.settings["default_pool_pods"] = 150
+    run.ensure_nodes(values)
+    assert set(sized.values()) == {0}
+
+
+def test_an_empty_fixture_pool_is_not_created(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kube, "node_pool_size", lambda *a: None)
+    monkeypatch.setattr(kube, "gcloud", lambda *a, **k: calls.append(a))
+    kube.ensure_node_pool("p", "z", "c", "pool", "n2-standard-2", 0)
+    assert calls == []
+
+
+def test_a_pool_that_cannot_be_emptied_does_not_stop_the_level(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    run.settings["default_pool_pods"] = 150
+
+    def resize(project, zone, cluster, pool, machine, size):
+        raise kube.CommandError("Cluster is running incompatible operation")
+    monkeypatch.setattr(runner.kube, "ensure_node_pool", resize)
+    run.ensure_nodes(run.plan.level_values("clusters", 16))
+    run.settings["default_pool_pods"] = 0
+    with pytest.raises(kube.CommandError):
+        run.ensure_nodes(run.plan.level_values("clusters", 16))

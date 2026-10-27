@@ -45,11 +45,13 @@ combined:
 settings:
   settle_seconds: 300
   pods_per_node: 90
-  # us-central1-c ran out of E2 capacity at the 16-cluster level; clusters and fixture pools
-  # created from then on use N2. Phase 1 and the earlier Phase 2 levels used e2-standard-2
-  # default pools and e2-small fixture pools.
+  fixture_machine_type: e2-small
+  # us-central1-c ran out of E2 and N2 capacity at the 16-cluster level. From then on the
+  # default pool holds up to this many fixture Pods, so the 100-object levels need no fixture
+  # pool, and new clusters use N2 default pools. The earlier levels had a fixture pool on every
+  # cluster (3-4 nodes per cluster); the 16- and 32-cluster levels have 2.
+  default_pool_pods: 150
   test_cluster_machine_type: n2-standard-2
-  fixture_machine_type: n2-standard-2
   fixture_pool: scale-pool
   churn_pod_lifetime_seconds: 30
   cluster_registration_timeout_seconds: 5400

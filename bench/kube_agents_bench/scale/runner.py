@@ -249,20 +249,29 @@ class Runner:
         names = self.cluster_names(int(values["clusters"]))
         lifetime = int(self.settings["churn_pod_lifetime_seconds"])
         per_node = int(self.settings["pods_per_node"])
+        # Fixture Pods the default pool holds before a fixture pool is needed; 0 puts every one there.
+        on_default = int(self.settings.get("default_pool_pods", 0))
         sizes = {}
         for index, name in enumerate(names):
-            pods = fixtures.fixture_pods(values, lifetime, first=index == 0)
-            sizes[name] = max(int(values["nodes"]), DEFAULT_POOL_NODES + math.ceil(pods / per_node)) - DEFAULT_POOL_NODES
+            spill = max(0, fixtures.fixture_pods(values, lifetime, first=index == 0) - on_default)
+            sizes[name] = max(int(values["nodes"]) - DEFAULT_POOL_NODES, math.ceil(spill / per_node))
         if not names:
             return
         with ThreadPoolExecutor(max_workers=min(self.parallelism(len(names)), len(names))) as pool:
             jobs = [
-                pool.submit(kube.ensure_node_pool, self.project, self.zone, name, self.settings["fixture_pool"],
-                            self.settings["fixture_machine_type"], size)
+                (name, size, pool.submit(kube.ensure_node_pool, self.project, self.zone, name,
+                                         self.settings["fixture_pool"], self.settings["fixture_machine_type"], size))
                 for name, size in sizes.items()
             ]
-            for job in jobs:
-                job.result()
+            for name, size, job in jobs:
+                try:
+                    job.result()
+                except kube.CommandError as exc:
+                    if size:
+                        raise
+                    # A pool the level does not need, mid-operation or failed: its nodes, if any come,
+                    # are in the run's totals, and the level goes on without it.
+                    LOG.warning("could not empty the fixture pool on %s; leaving it: %s", name, exc)
 
     # --- fixtures -----------------------------------------------------------------------------
 
