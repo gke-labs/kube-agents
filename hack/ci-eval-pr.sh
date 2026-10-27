@@ -3477,18 +3477,29 @@ for TASK in "${TASKS[@]}"; do
   fi
 done
 
-# How long a stack-bearing unit waits for lock-infra before giving up. The
-# lock is held for a unit's whole invocation and the queue launches every
-# repetition-1 unit within the first few lanes, so with N stack-bearing
-# tasks the last waiter has to outlast N-1 holders in a row: at 1800s flat
-# the third and fourth contenders in a four-tofu nightly cannot, and which
-# one loses is the mkdir race (the #1103 presubmit run showed it at N=2, a
-# 2279s audit rep starving its sibling). 1800s a contender keeps the
-# holder-died guard the flat figure was for, scaled to the matrix; the
-# presubmit, with no stack-bearing task, keeps the flat 1800s.
+# How long a stack-bearing unit waits for lock-infra before giving up, in
+# holds. The lock is held for a unit's whole invocation, and launch_units
+# keeps the lock takers it counts to INFRA_IN_FLIGHT_MAX in flight, so a
+# counted waiter outlasts the holder, the other counted unit, and every lock
+# taker with a state lock (which launch_units does not count): each release
+# is a mkdir race, and one of those can win it each time, one after another.
+# So two holds plus one per state-lock lock-taking task, not one per
+# stack-bearing task. The longest hold is the longest devops-bench run of a
+# lock taker: 2068s (autoops-quiet-followup rep 3) in the 2026-10-24
+# ci-kube-agents-eval-nightly and ci-kube-agents-eval-nightly-today runs,
+# 2279s for the audit rep in the #1103 presubmit run; 2300s covers both. With
+# the three bootstrap cases that is 5 x 2300s; without them, 2 x 2300s. A
+# holder that dies holding the lock costs one deadline per pair of waiters
+# (lock_release never ran, and nothing frees it), which the old figure of
+# 1800s per stack-bearing task multiplied.
+readonly INFRA_LOCK_LONGEST_HOLD_SECONDS=2300
 STACK_CONTENDERS=0
 for HAS in "${TASK_HAS_STACK[@]}"; do [ -n "${HAS}" ] && STACK_CONTENDERS=$((STACK_CONTENDERS + 1)); done
-INFRA_LOCK_DEADLINE=$(( 1800 * (STACK_CONTENDERS > 1 ? STACK_CONTENDERS : 1) ))
+STATE_LOCK_TAKERS=0
+for i in "${!TASK_HAS_STACK[@]}"; do
+  [ -n "${TASK_HAS_STACK[i]}" ] && [ -n "$(unit_state_lock "${TASK_NAMES[i]}")" ] && STATE_LOCK_TAKERS=$((STATE_LOCK_TAKERS + 1))
+done
+INFRA_LOCK_DEADLINE=$(( (2 + STATE_LOCK_TAKERS) * INFRA_LOCK_LONGEST_HOLD_SECONDS ))
 echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to ${INFRA_LOCK_DEADLINE}s for lock-infra"
 
 # One unit, in a background subshell: its exports stay local, its output goes
@@ -3567,8 +3578,7 @@ fi
 #                 (audit_streams; oobe-first-run-audits holds five).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
-#                 the cases on the stream (stream_case_count), as the infra
-#                 lock's does by contender.
+#                 the cases on the stream (stream_case_count).
 #   infra      -- at most one stack-bearing (tofu) unit runs at a time,
 #                 across tasks: BENCH_PARALLEL stays false, so devops-bench's
 #                 per-run isolation (own kubeconfig, gcloud config, tofu data
@@ -4215,16 +4225,87 @@ UNIT_QUEUE_WRITERS="$(
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
+# Whether a unit takes lock-infra. TASK_HAS_STACK is "true" exactly for a
+# stack-bearing case off infra_lock_exempt, and it is what run_one_unit tests.
+unit_takes_infra_lock() { # <task-index>
+  [ -n "${TASK_HAS_STACK[$1]:-}" ]
+}
+
+# Whether a unit counts toward INFRA_IN_FLIGHT_MAX: a lock taker without a
+# state lock. One with a state lock (unit_state_lock) can spend hours giving
+# lock-infra back while an exempt case holds that state, as the bootstrap
+# cases do behind oobe-first-run-audits' "onboarding"; counted, two of them
+# would fill the limit and idle lock-infra for the whole chain. Uncounted,
+# each parks its slot while it waits, as every lock taker did before.
+unit_counts_toward_infra_limit() { # <task-index>
+  unit_takes_infra_lock "$1" && [ -z "$(unit_state_lock "${TASK_NAMES[$1]}")" ]
+}
+
+# How many counted lock takers may be in flight at once: one holding
+# lock-infra and one staged behind it. One alone would stall the tofu chain
+# whenever the holder waits on something other than lock-infra (its task or
+# stream lock, wait_platform_runs); two let the staged unit take lock-infra
+# in that window, at the cost of at most one counted slot parked on the lock.
+# A second counted place can go to the same task's next rep, which waits on
+# the task lock rather than lock-infra; that costs a little at rep boundaries.
+INFRA_IN_FLIGHT_MAX=2
+
 # One phase's units, launched in queue order at the given parallelism, each
 # after the given pause. The caller `wait`s between phases; UNIT_SEQ carries
 # across them.
+#
+# Counted lock takers are limited to INFRA_IN_FLIGHT_MAX in flight (#3384). The
+# lock lets one run anyway, and before this every free slot went to the next
+# queued unit, so stack-bearing units piled up in slots waiting for lock-infra,
+# doing nothing: on 2026-10-24 the main nightly's waits held 25.7 of its ~70
+# slot-hours and it ran out of time (#3821). Past the limit, a counted lock
+# taker is held back in the queue and the next unit that is not one gets the
+# slot; the held one launches as soon as a counted lock taker's job ends. Queue
+# order is otherwise unchanged.
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
-  while read -r REP _COST IDX; do
-    [ -n "${IDX:-}" ] || continue
+  local pending=() line i pick running pid alive infra_pids="" counted
+  # Each line carries whether its unit counts toward INFRA_IN_FLIGHT_MAX, worked
+  # out once here rather than on every poll.
+  while read -r line; do
+    [ -n "${line}" ] || continue
+    read -r REP _COST IDX <<<"${line}"
+    counted=0
+    if unit_counts_toward_infra_limit "${IDX}"; then counted=1; fi
+    pending+=("${line} ${counted}")
+  done <<EOF_UNIT_QUEUE
+${queue}
+EOF_UNIT_QUEUE
+  while [ "${#pending[@]}" -gt 0 ]; do
     while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${parallelism}" ]; do
       sleep 3
     done
+    # The counted lock takers still running. `jobs` keeps the job table inside a
+    # command substitution, as the slot count above relies on.
+    running=" $(jobs -rp | tr '\n' ' ') "
+    alive=""
+    for pid in ${infra_pids}; do
+      case "${running}" in *" ${pid} "*) alive="${alive} ${pid}" ;; esac
+    done
+    infra_pids="${alive}"
+    pick=""
+    for i in "${!pending[@]}"; do
+      read -r REP _COST IDX counted <<<"${pending[i]}"
+      if [ "${counted}" = 0 ] || [ "$(printf '%s\n' ${infra_pids} | grep -c .)" -lt "${INFRA_IN_FLIGHT_MAX}" ]; then
+        pick="${i}"
+        break
+      fi
+    done
+    if [ -z "${pick}" ]; then
+      # Only counted lock takers are left and the limit is in flight: wait.
+      sleep 3
+      continue
+    fi
+    read -r REP _COST IDX counted <<<"${pending[pick]}"
+    unset 'pending[pick]'
+    if [ "${#pending[@]}" -gt 0 ]; then
+      pending=("${pending[@]}")
+    fi
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
     # in the second phase the pause is the writer pause instead (the settle).
@@ -4236,9 +4317,10 @@ launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before e
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
-  done <<EOF_UNIT_QUEUE
-${queue}
-EOF_UNIT_QUEUE
+    if [ "${counted}" = 1 ]; then
+      infra_pids="${infra_pids} $!"
+    fi
+  done
 }
 
 profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"

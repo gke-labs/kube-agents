@@ -586,11 +586,7 @@ INJECT_LANE_EXCLUDED = [
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
     "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
     "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
-    "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
-    "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
     "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
-    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
-    "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
@@ -618,11 +614,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-question-typed-answer-fresh-session": "nightly",
     "chat-question-click-answer-stays-silent": "nightly",
     "chat-voice-ack-names-target": "nightly",
-    "chat-reset-history-names-the-command": "nightly",
-    "chat-routing-board-read": "nightly",
     "chat-routing-fleet-question": "nightly",
-    "first-install-hello-running": "nightly",
-    "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
     "chat-question-asked-to-choose-pauses": "nightly",

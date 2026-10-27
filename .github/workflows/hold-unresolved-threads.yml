@@ -59,6 +59,9 @@ jobs:
         github.event.label.name == 'lgtm' ||
         github.event.label.name == 'approved')
     runs-on: ubuntu-latest
+    # One concurrency group and no cancel: a hung call would hold every sweep
+    # until the 6-hour job limit.
+    timeout-minutes: 10
     permissions:
       contents: read # check out the default branch: the script
       pull-requests: write # add and remove the label, post the comment

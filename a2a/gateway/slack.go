@@ -272,6 +272,9 @@ type SlackAdapter struct {
 	// sessionErrorsSeen is the setStatus error texts already logged at Warn
 	// (firstSessionError), under s.mu.
 	sessionErrorsSeen map[string]bool
+	// pressers caches each Stop presser's workspace answer (slack_stop.go,
+	// presserInWorkspace), so a press costs at most one users.info call.
+	pressers map[string]slackPresser
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
@@ -742,6 +745,12 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
 					msg.Answer = s.answersOpenQuestion(msg)
+					handler(msg)
+				}
+			case *slackevents.AgentSessionStoppedEvent:
+				// Not notePending: a Stop is no message, so there is
+				// nothing to draw a mark or a refusal on.
+				if msg, ok := s.inboundStop(inner); ok {
 					handler(msg)
 				}
 			case *slackevents.AssistantThreadStartedEvent:

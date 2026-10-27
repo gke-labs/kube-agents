@@ -4721,6 +4721,105 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     assert "pull_requests: read" in res.reason
 
 
+# ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
+
+_SYNCED_MANIFEST = "manifests/apps/eval-autoops-open-pr/deployment.yaml"
+
+
+def test_changed_paths_only_admits_the_single_allowed_manifest(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": _SYNCED_MANIFEST, "status": "modified"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_changed_paths_only_rejects_sibling_manifests_and_iac_bundles(token, github):
+    for extra in (
+        "manifests/apps/other-app/deployment.yaml",
+        "manifests/apps/eval-autoops-open-pr/kustomization.yaml",
+        "clusters/x/terraform.tfvars.json",
+        "iac/clusters.yaml",
+        "tf/main.hcl",
+        "clusters/x/.kube-agents/registration.yaml",
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=2)
+        _pr_files_route(
+            github,
+            {"filename": _SYNCED_MANIFEST, "status": "modified"},
+            {"filename": extra, "status": "modified"},
+        )
+        res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+        assert res.status == "fail", f"{extra} passed: {res.reason}"
+        assert extra in res.reason and "changed_paths_only" in res.reason
+
+
+def test_changed_paths_only_rejects_rename_from_or_to_unallowed_path(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {
+            "filename": _SYNCED_MANIFEST,
+            "previous_filename": "manifests/apps/other-app/deployment.yaml",
+            "status": "renamed",
+        },
+    )
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "fail"
+    assert "manifests/apps/other-app/deployment.yaml" in res.reason
+
+
+def test_changed_paths_only_refuses_empty_list_and_unreadable_or_truncated_files(token, github):
+    with pytest.raises(ValidationError):
+        _pr_check(changed_paths_only=[])
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "error"
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3001)
+    _pr_files_route(github, {"filename": _SYNCED_MANIFEST, "status": "modified"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "error"
+    assert "3000-file listing cap" in res.reason
+
+
+def test_file_entries_grades_exact_3000_file_cap_and_rejects_uncounted_30_page_fill(token, github):
+    pulls = _pr_api("pulls")
+    for page in range(1, 31):
+        github.routes[f"{pulls}/files?per_page=100&page={page}"] = (
+            200,
+            [
+                {"filename": f"manifests/apps/allowed/f{page}_{idx}.yaml", "status": "modified"}
+                for idx in range(100)
+            ],
+        )
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3000)
+    res = _pr_check(changed_paths_only=["manifests/apps/allowed/*.yaml"]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+    for reported_changed in (None, 5):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=reported_changed)
+        res = _pr_check(changed_paths_only=["manifests/apps/allowed/*.yaml"]).verify(5.0)
+        assert res.status == "error"
+        assert "filled all 30 pages" in res.reason
+
+
 # ---- removed_paths: a delete is the removal of the declaring manifest
 
 _NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
@@ -4781,6 +4880,14 @@ def test_removed_paths_unreadable_files_are_unevaluable(token, github):
     res = _pr_check(removed_paths=_REMOVED).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3001)
+    _pr_files_route(github, *(dict(filename=p, status="removed") for p in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "error"
+    assert "3000-file listing cap" in res.reason
 
 
 # ---- content: what the pull request writes, read at its head
