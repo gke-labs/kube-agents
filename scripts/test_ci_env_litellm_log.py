@@ -107,6 +107,12 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    tail = stubs / "tail"
+    tail.write_text(
+        '#!/usr/bin/env bash\nif [ "${1:-}" = "-c" ] && [ "$#" -eq 2 ]; then /usr/bin/tail "$@"; printf "uutils-pipe-overrun"; exit 0; fi\nexec /usr/bin/tail "$@"\n',
+        encoding="utf-8",
+    )
+    tail.chmod(tail.stat().st_mode | stat.S_IXUSR)
     artifacts = tmp / "artifacts"
     script = "\n".join(
         [

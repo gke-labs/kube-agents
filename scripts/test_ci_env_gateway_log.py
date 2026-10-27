@@ -37,6 +37,19 @@ line=$(head -c "${STUB_LINE_BYTES:-100}" /dev/zero | tr '\\0' 'a')
 for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 """
 
+# uutils tail -c N on a pipe ($# -eq 2) over-prints after short reads
+# (uutils/coreutils#15804); on a regular file ($# -ge 3) both GNU and uutils
+# seek and take N. Mimic the pipe overrun so the cap test fails on a GNU
+# runner too if the collector reverts to `| tail -c`.
+TAIL_STUB = """#!/usr/bin/env bash
+if [ "${1:-}" = "-c" ] && [ "$#" -eq 2 ]; then
+  /usr/bin/tail "$@"
+  printf 'uutils-pipe-overrun'
+  exit 0
+fi
+exec /usr/bin/tail "$@"
+"""
+
 
 def lifted() -> str:
     """The function, the byte-cap helper it bounds the log with, and the
@@ -72,6 +85,9 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    tail = stubs / "tail"
+    tail.write_text(TAIL_STUB, encoding="utf-8")
+    tail.chmod(tail.stat().st_mode | stat.S_IXUSR)
     artifacts = tmp / "artifacts"
     script = "\n".join(
         [
