@@ -535,7 +535,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		// A Slack Stop answers with its own one reply (slack_stop.go).
+		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
+			g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		}
 	case lib.StateRejected:
 		// Same shape as failed above, and for the same reason. Both
 		// executors put the cause in the terminal message -- a capability

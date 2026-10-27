@@ -628,7 +628,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Eight workflows hold it, and none can give an approval:
+        Seven workflows hold it, and none can give an approval:
 
         - auto-enqueue: `schedule`, `workflow_dispatch` and
           `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
@@ -639,15 +639,13 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           auto-merge calls run on a GitHub App token, which the tests below
           pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
-        - auto-assign-milestone: triggers on `pull_request_target: closed`
-          gated on `merged == true`, so it runs only after the merge decision
-          has been taken, and its one call is `gh pr edit --milestone`.
         - coverage-comment: `workflow_run`-triggered in the base repository,
           job-gated on `github.repository`, and its one write is posting the
           coverage comment.
         - risk_classify: `pull_request_target` with `permissions: {}` at the
-          top, the grant job-scoped, checkout pinned to the default branch,
-          and its one write is swapping the `risk:*` label.
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch, and its one write is swapping the
+          `risk:*` label.
         - hold-unresolved-threads: `schedule` plus `pull_request_target:
           labeled`, `permissions: {}` at the top, the grant job-scoped,
           checkout pinned to the default branch, and its writes are the
@@ -671,8 +669,8 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
-        a capability, and this asserts membership rather than absence so a
-        ninth holder is a red test and a conversation rather than a silent
+        a capability, and this asserts membership rather than absence so an
+        eighth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -690,7 +688,6 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                     break
         self.assertEqual(
             [
-                "auto-assign-milestone.yml",
                 "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",

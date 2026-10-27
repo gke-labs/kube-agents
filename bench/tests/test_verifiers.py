@@ -1669,6 +1669,19 @@ def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
     assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
 
 
+def test_worker_budget_withheld_credential_reads_are_unreadable_not_a_wrong_cap():
+    # Every call read a secret, so every result is the read placeholder: the
+    # checkpoint notice went with the output. An error, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {"command": "kubectl get secret db -o yaml"},
+               "result": worker_trajectory.WITHHELD_READ_RESULT, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
 def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
     # A worker killed mid-call leaves one call with no result row; the notice
     # would have landed on one of the other 200 readable results, so the plain
@@ -2887,10 +2900,34 @@ def test_tool_called_result_ignores_an_unread_call_whose_arguments_rule_it_out()
     assert res.raw == {"matching_calls": 0}
 
 
+def test_tool_called_result_reads_a_redacted_credential_read_as_a_recorded_call():
+    from kube_agents_bench import worker_trajectory
+
+    entry = {
+        "name": "terminal",
+        "args": {"command": "kubectl get secret db -o yaml"},
+        "result": worker_trajectory.WITHHELD_READ_RESULT,
+        "status": "completed",
+        "agent": "platform",
+    }
+    transcript.set("done", [entry])
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", result=r"^<persisted-output>"
+    ).verify(5.0)
+    assert res.status == "fail"
+    assert "no readable result" not in res.reason
+    assert ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", result=r"^\[REDACTED_RESULT"
+    ).verify(5.0).status == "pass"
+
+
 def test_the_withheld_marker_matches_the_in_pod_script():
     from kube_agents_bench import worker_trajectory
 
     assert f'WITHHELD = "{worker_trajectory.WITHHELD}"' in worker_trajectory._IN_POD_SCRIPT
+    assert f'WITHHELD_READ_RESULT = "{worker_trajectory.WITHHELD_READ_RESULT}"' in worker_trajectory._IN_POD_SCRIPT
+    # Starts with the verifiers' redaction prefix: a redacted result, not an unread one.
+    assert worker_trajectory.WITHHELD_READ_RESULT.startswith(verifiers._REDACTED_PREFIX)
 
 
 def test_tool_called_result_must_be_a_pattern():
@@ -4684,6 +4721,105 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     assert "pull_requests: read" in res.reason
 
 
+# ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
+
+_SYNCED_MANIFEST = "manifests/apps/eval-autoops-open-pr/deployment.yaml"
+
+
+def test_changed_paths_only_admits_the_single_allowed_manifest(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": _SYNCED_MANIFEST, "status": "modified"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_changed_paths_only_rejects_sibling_manifests_and_iac_bundles(token, github):
+    for extra in (
+        "manifests/apps/other-app/deployment.yaml",
+        "manifests/apps/eval-autoops-open-pr/kustomization.yaml",
+        "clusters/x/terraform.tfvars.json",
+        "iac/clusters.yaml",
+        "tf/main.hcl",
+        "clusters/x/.kube-agents/registration.yaml",
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=2)
+        _pr_files_route(
+            github,
+            {"filename": _SYNCED_MANIFEST, "status": "modified"},
+            {"filename": extra, "status": "modified"},
+        )
+        res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+        assert res.status == "fail", f"{extra} passed: {res.reason}"
+        assert extra in res.reason and "changed_paths_only" in res.reason
+
+
+def test_changed_paths_only_rejects_rename_from_or_to_unallowed_path(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {
+            "filename": _SYNCED_MANIFEST,
+            "previous_filename": "manifests/apps/other-app/deployment.yaml",
+            "status": "renamed",
+        },
+    )
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "fail"
+    assert "manifests/apps/other-app/deployment.yaml" in res.reason
+
+
+def test_changed_paths_only_refuses_empty_list_and_unreadable_or_truncated_files(token, github):
+    with pytest.raises(ValidationError):
+        _pr_check(changed_paths_only=[])
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "error"
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3001)
+    _pr_files_route(github, {"filename": _SYNCED_MANIFEST, "status": "modified"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "error"
+    assert "3000-file listing cap" in res.reason
+
+
+def test_file_entries_grades_exact_3000_file_cap_and_rejects_uncounted_30_page_fill(token, github):
+    pulls = _pr_api("pulls")
+    for page in range(1, 31):
+        github.routes[f"{pulls}/files?per_page=100&page={page}"] = (
+            200,
+            [
+                {"filename": f"manifests/apps/allowed/f{page}_{idx}.yaml", "status": "modified"}
+                for idx in range(100)
+            ],
+        )
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3000)
+    res = _pr_check(changed_paths_only=["manifests/apps/allowed/*.yaml"]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+    for reported_changed in (None, 5):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=reported_changed)
+        res = _pr_check(changed_paths_only=["manifests/apps/allowed/*.yaml"]).verify(5.0)
+        assert res.status == "error"
+        assert "filled all 30 pages" in res.reason
+
+
 # ---- removed_paths: a delete is the removal of the declaring manifest
 
 _NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
@@ -4744,6 +4880,14 @@ def test_removed_paths_unreadable_files_are_unevaluable(token, github):
     res = _pr_check(removed_paths=_REMOVED).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3001)
+    _pr_files_route(github, *(dict(filename=p, status="removed") for p in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "error"
+    assert "3000-file listing cap" in res.reason
 
 
 # ---- content: what the pull request writes, read at its head
@@ -10396,6 +10540,16 @@ def test_verified_claims_backed_masks_addresses_as_the_pod_does():
 def test_verified_claims_backed_a_capture_gap_is_an_error():
     res = _grade_claims(_EVIDENCE, [], gaps=["profile platform: state.db missing"])
     assert res.status == "error" and "state.db missing" in res.reason
+
+
+def test_verified_claims_backed_a_redacted_credential_read_is_not_checked():
+    from kube_agents_bench import worker_trajectory
+
+    command = "kubectl get secret db -o yaml"
+    read = _terminal(command, result=worker_trajectory.WITHHELD_READ_RESULT)
+    res = _grade_claims(_block(command, "type: kubernetes.io/tls"), [read])
+    assert res.status == "pass", res
+    assert "not checked" in res.reason and command in res.reason
 
 
 def test_verified_claims_backed_withheld_arguments_are_an_error():

@@ -14,14 +14,17 @@ import (
 // operator pod reads the same numbers the usage poller wrote to status.usage
 // and the reconciler wrote to status.phase, Tier 1 included, without a second
 // scrape of the producers. Labels are closed sets: the agent's namespace and
-// name, the status field's JSON name, and the phase vocabulary. Nothing from
-// conditions, messages or interfaces is exported.
+// name (agent_namespace, agent), the field (usageExportFields' and
+// usageExportTimeFields' names, status.usage's JSON keys, plus createdTime)
+// and the phase vocabulary (usagePhases). Nothing from conditions, messages
+// or interfaces is exported.
 const (
 	// usageGaugeName carries every counter and cluster gauge of status.usage,
 	// one sample per field, the value as the status holds it.
 	usageGaugeName = "kubeagents_platformagent_usage"
-	// usageTimeGaugeName carries status.usage's two times as unix seconds; a
-	// time the status does not hold has no sample.
+	// usageTimeGaugeName carries status.usage's two times, and the CR's
+	// creation time, as unix seconds; a time the status does not hold has no
+	// sample.
 	usageTimeGaugeName = "kubeagents_platformagent_usage_time_seconds"
 	// usagePhaseGaugeName is one-hot over usagePhases: the agent's phase at 1,
 	// the others at 0, so an alert can read a phase without a text match.
@@ -36,6 +39,10 @@ const (
 	// The two cluster gauges' field names, which share one pruning record.
 	usageExportClustersRegistered = "clustersRegistered"
 	usageExportClustersMonitored  = "clustersMonitored"
+	// usageCreatedTimeField is the one time sample that is not status.usage's:
+	// the CR's creation timestamp, so a rule can read an install's age before
+	// anyone has spoken to it. Published beside the phase, outside every hold.
+	usageCreatedTimeField = "createdTime"
 )
 
 // pendingPhase and failedPhase are the API's two phases this controller
@@ -130,7 +137,7 @@ func newUsageGauges(reg prometheus.Registerer) *usageGauges {
 	agentLabels := []string{usageGaugeNamespaceLabel, usageGaugeNameLabel}
 	g := &usageGauges{
 		usage: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageGaugeName, Help: "A PlatformAgent's status.usage counters and cluster gauges, one sample per field, as the operator last wrote them."}, append(agentLabels, usageGaugeFieldLabel)),
-		times: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageTimeGaugeName, Help: "A PlatformAgent's status.usage times as unix seconds; absent while the status holds no time."}, append(agentLabels, usageGaugeFieldLabel)),
+		times: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageTimeGaugeName, Help: "A PlatformAgent's status.usage times, and its creation time, as unix seconds; a status time is absent while the status holds none."}, append(agentLabels, usageGaugeFieldLabel)),
 		phase: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usagePhaseGaugeName, Help: "A PlatformAgent's status.phase, one-hot over Pending, Provisioning, Ready, Degraded and Failed."}, append(agentLabels, usageGaugePhaseLabel)),
 	}
 	reg.MustRegister(g.usage, g.times, g.phase)
@@ -163,10 +170,12 @@ func (g *usageGauges) publishUsage(agent *agentv1alpha1.PlatformAgent) {
 	}
 }
 
-// publishPhase sets the one-hot phase samples from status.phase.
+// publishPhase sets the one-hot phase samples from status.phase, and the
+// agent's creation time, the two samples no hold on status.usage touches.
 func (g *usageGauges) publishPhase(agent *agentv1alpha1.PlatformAgent) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.times.WithLabelValues(agent.Namespace, agent.Name, usageCreatedTimeField).Set(float64(agent.CreationTimestamp.Unix()))
 	for _, phase := range usagePhases {
 		v := 0.0
 		if agent.Status.Phase == phase {

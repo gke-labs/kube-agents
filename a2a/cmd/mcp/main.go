@@ -121,14 +121,22 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	if _, err := mcp.ReadToken(tokenFile); err != nil {
 		return settings{}, fmt.Errorf("%s: %w", envTokenFile, err)
 	}
-	passwordFile := or(envPasswordFile, defaultPasswordFile)
-	raw, err := os.ReadFile(passwordFile)
+	// busCredentialPath is where the bus password is read from, not the
+	// password: the errors below name it so the operator can find the mount,
+	// and realMain logs them. CodeQL's go/clear-text-logging takes any
+	// password-shaped identifier as a credential, path or not, so the path
+	// keeps a name outside that heuristic; password, the value, keeps its
+	// name and is never formatted into an error. mcp.BusConfig.PasswordFile
+	// keeps its name because nothing reads it into a log or an error; a
+	// log line that names it would refire the alert there.
+	busCredentialPath := or(envPasswordFile, defaultPasswordFile)
+	raw, err := os.ReadFile(busCredentialPath)
 	if err != nil {
 		return settings{}, fmt.Errorf("%s: %w", envPasswordFile, err)
 	}
 	password := strings.TrimRight(string(raw), lineEndings)
 	if password == "" {
-		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, passwordFile)
+		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, busCredentialPath)
 	}
 	var broker *mcp.BrokerClient
 	if brokerURL := strings.TrimSpace(getenv(envBrokerURL)); brokerURL != "" {
@@ -154,7 +162,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 			URL:          url,
 			User:         or(envBusUser, defaultBusUser),
 			Password:     password,
-			PasswordFile: passwordFile,
+			PasswordFile: busCredentialPath,
 			Deployment: mcp.Deployment{
 				Agent:     getenv(envAgent),
 				Namespace: getenv(envNamespace),

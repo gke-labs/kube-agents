@@ -143,5 +143,15 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         self.assertIn("`tofu fmt` after any `.tf` edit", step5)
         self.assertIn("submit do not apply: stay on `<source>` in this copy", step5)
 
+    def test_step_two_scopes_multi_option_reports_to_chosen_option_only(self):
+        content = (REPO_ROOT / "agents/platform/skills/submit-suggestion/SKILL.md").read_text(encoding="utf-8")
+        step2 = content[content.index("### Step 2: Make the Changes"):content.index("### Deleting a resource")]
+        flat = " ".join(step2.split())
+        self.assertIn("**Implement only the chosen option.**", flat)
+        self.assertIn("edit only the file(s) that option calls for", flat)
+        self.assertIn("edit only the synced workload manifest(s)", flat)
+        self.assertIn("Never bundle unchosen options or optional hardening into the same pull request", flat)
+        self.assertIn("never touch unrelated manifests or infrastructure definitions", flat)
+
 if __name__ == "__main__":
     unittest.main()

@@ -295,6 +295,15 @@ def test_an_unread_time_with_a_partial_read_is_an_error(read, gaps, missing):
     assert missing in outcome.reason
 
 
+def test_a_redacted_credential_read_is_not_a_partial_read():
+    from kube_agents_bench import worker_trajectory
+
+    now = datetime.now(tz=timezone.utc) - timedelta(minutes=1)
+    outcome = _run(f"Observed at {_stamp(now)}", read=[worker_trajectory.WITHHELD_READ_RESULT], gaps=[])
+    assert outcome.status == "fail"
+    assert "withheld" not in outcome.reason
+
+
 def _front_door(report: str, *, delegated: bool):
     started = datetime.now(tz=timezone.utc) - RUN_LENGTH
     calls = [{"name": "kanban_create", "args": {}, "result": '{"task_id": "t_1"}', "status": "completed"}]
@@ -401,5 +410,6 @@ def test_the_markers_match_the_in_pod_script():
 
     script = worker_trajectory._IN_POD_SCRIPT
     assert f'WITHHELD = "{verifiers._WITHHELD_RESULT}"' in script
+    assert f'WITHHELD_READ_RESULT = "{worker_trajectory.WITHHELD_READ_RESULT}"' in script
     assert '" ...[clipped %d chars]"' in script
     assert verifiers._CLIPPED_RESULT.search("abc ...[clipped 12 chars]")

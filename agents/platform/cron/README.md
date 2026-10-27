@@ -893,6 +893,20 @@ No prompt is quoted here on purpose. A copy in prose is one more place for the
 same numbers to go stale, and the test above checks the roster against the SOPs
 — not this file against the roster.
 
+## The `--scheduled` sentence in audit prompts
+
+Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`.
+Only a run with that flag can get `silent_ok: true`, so the sentence is what
+lets a quiet scheduled run answer `[SILENT]`. It is in the prompt and not in
+the SOP, because a scheduled run and an on-demand run read the same SOP: an SOP
+that passed the flag would let every on-demand run of its stream go silent.
+`test_every_audit_cron_prompt_passes_scheduled_to_finish` in
+`../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
+prompt has the phrase `pass --scheduled to finish` and that no SOP passes the
+flag. A prompt without it
+only makes its job noisier. The rule is in
+[ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
+
 ## `risk` tier contract
 
 Every job entry across both rosters declares an explicit `"risk": "low" | "high"`.
