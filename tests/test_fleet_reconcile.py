@@ -345,6 +345,18 @@ class TargetsTest(unittest.TestCase):
         }
         self.assertEqual(reconcile.drifted_projects(document), [P8, "kube-agents-evals-9"])
 
+    def test_a_project_whose_only_drift_no_re_apply_clears_is_skipped(self):
+        # #4005: the age gate and a master ahead of its channel; one ordinary line beside them keeps the project.
+        age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"'
+        document = {
+            "projects": {
+                P7: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age]}, "version-laggard": {"state": "drifted", "detail": [ahead]}}},
+                P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age, "cluster masterAuthorizedNetworksConfig.enabled none_eq true: observed true"]}}},
+            }
+        }
+        self.assertEqual(reconcile.drifted_projects(document), [P8])
+
     def test_a_scan_with_no_drift_targets_nothing(self):
         self.assertEqual(reconcile.drifted_projects({"projects": {P7: {"roles": {}}}}), [])
         self.assertEqual(reconcile.drifted_projects({}), [])
@@ -601,6 +613,15 @@ class MainTest(unittest.TestCase):
         self.assertIn("-var=project_id=%s" % P8, tofu.calls[1])
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
+
+    def test_drifted_skips_and_names_a_project_no_re_apply_clears(self):
+        scan = {"projects": {P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": ['cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old']}}}}}
+        tofu = _Tofu({})
+        with mock.patch("builtins.print") as printed:
+            rc, _ = self._main(["--drifted"], _Boskos(free=[P8]), tofu, scan=scan)
+        self.assertEqual(rc, reconcile.EXIT_OK)
+        self.assertEqual(tofu.verbs(), [], "an apply there changes nothing")
+        self.assertIn("skipped, no re-apply clears their drift: %s" % P8, [c.args[0] for c in printed.call_args_list if c.args])
 
     def test_all_asks_for_every_mapped_project_after_resetting_strands_and_applies_each(self):
         # The full-pass arm: every mapped project is asked for by name, held

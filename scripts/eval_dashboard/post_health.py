@@ -106,6 +106,7 @@ try:
         POOL_UNMEASURED,
         PROW_JOB_TIMEOUT,
         SECONDS_PER_MINUTE,
+        fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
         near_deadline_margin,
@@ -123,6 +124,7 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
         POOL_UNMEASURED,
         PROW_JOB_TIMEOUT,
         SECONDS_PER_MINUTE,
+        fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
         near_deadline_margin,
@@ -282,6 +284,9 @@ FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the p
 # own role), and so would "edit main.tf" in the hours after a size change has
 # merged, while the postsubmit is still rolling it; the hint covers both.
 FIXTURE_CAPACITY_HINT = "default-pool-headroom reads capacity, not an unapplied stack: seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, and a re-apply changes nothing. The fix is the pool's size in bench/tf/fleet/main.tf (seeded_a_default): if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands; otherwise the pool needs a larger machine type or node count."
+# When every drift line is one no re-apply clears (health.fixture_no_reapply,
+# #4005), the retest line names the remedy instead of the reconcile.
+FIXTURE_NO_REAPPLY_LEAD = "No re-apply of bench/tf/fleet clears this drift."
 # A reconcile run older than this is printed with its date in the digest.
 RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
@@ -770,7 +775,11 @@ def fixture_drift_sentence(health: dict, since: str) -> str:
 
 def fixture_drift_advice(health: dict) -> str:
     """The retest line and the hint, by what drifted: a re-apply for a planted
-    object out of shape, the pool's size for a capacity role, both when mixed."""
+    object out of shape, the pool's size for a capacity role, both when mixed,
+    and the real remedy when no re-apply clears any drift line."""
+    remedy = fixture_no_reapply(health.get("incident") or {})
+    if remedy:
+        return f"{FIXTURE_NO_REAPPLY_LEAD} {remedy}"
     roles = set((health.get("incident") or {}).get("roles") or [])
     if roles and roles <= CAPACITY_ROLES:
         return f"Retest once the pool has headroom. {FIXTURE_CAPACITY_HINT}"
