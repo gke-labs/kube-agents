@@ -1,0 +1,66 @@
+# Phase 3 with the credential proxy's limits raised: the two 30-minute windows of phase3.yaml at
+# the base and at 16 clusters, with the experiment install's PlatformAgent setting
+# spec.deployment.credentialProxy.resources.limits to 4 CPU and 4Gi. From about 7 clusters the
+# default proxy runs at its 1-core CPU limit, so its CPU peak shows the limit, not the need, and a
+# CPU-starved proxy holds commands longer, which raises its memory peak. These runs show what the
+# proxy uses when CPU does not cap it. The runner reads the limits from the live pods into every
+# record; it does not change them: set the field before these runs and remove it after. Run
+# `--only-factor clusters` while the fleet has 16 clusters, before phase3.yaml moves to 8, and
+# `--only-factor base` after phase3.yaml's base runs.
+phase: phase3-proxy-raised
+
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-c
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+
+factors:
+  clusters: [2, 16]
+
+settings:
+  settle_seconds: 300
+  pods_per_node: 90
+  fixture_pool: scale-pool
+  fixture_machine_type: e2-small
+  # Every cluster's default pool holds the fixture Pods, so no level needs a fixture pool: 2 nodes
+  # per cluster at every point.
+  default_pool_pods: 150
+  test_cluster_machine_type: n2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 8
+  watcher_wait_seconds: 600
+
+operations:
+  onboarding_30m_proxy_raised:
+    kind: reset_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 1800
+  audits_30m_proxy_raised:
+    kind: trigger_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 1800
+    jobs_home: /opt/data/profiles/platform
+    jobs:
+      - fleet-wide-cost-analysis
+      - compliance-audit
+      - obtainability-audit
+      - stockout-prevention
+      - upgrade-retrospective
