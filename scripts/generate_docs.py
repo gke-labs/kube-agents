@@ -163,9 +163,11 @@ PIPE_ESCAPE = "\\|"
 # page, and the schema keyword controller-gen writes for it, which the parity
 # test in test_gen_crd_docs.py reads back from the committed CRD YAML. One
 # table for both, so a marker cannot render on a page that the test does not
-# know. A marker on the items of a list (`items:Pattern`) goes through the
-# same table with an `items:` prefix; a marker not listed here is shown as
-# its own name, and the parity test fails on it until it is added.
+# know. A marker on the elements of a collection goes through the same table
+# under a prefix, `items:` for a list's items (controller-gen's own spelling)
+# and `values:` for a map's values (the generator's, since controller-gen has
+# none); a marker not listed here is shown as its own name, and the parity
+# test fails on it until it is added.
 CONSTRAINT_MARKERS: dict[str, tuple[str, str]] = {
     "Enum": ("one of", "enum"),
     "Minimum": ("min", "minimum"),
@@ -185,8 +187,13 @@ CONSTRAINT_MARKERS: dict[str, tuple[str, str]] = {
 # field. The schema therefore carries these where no row does, so the parity
 # test holds a marker to its keyword, never the keyword to a marker.
 SCHEMA_IMPLIED_MARKERS = frozenset({"Format"})
-CONSTRAINT_ITEMS_PREFIX = "items:"
-CONSTRAINT_ITEMS_LABEL = "items"
+# Each collection prefix with the word the page puts before the constraint,
+# and the schema keyword controller-gen writes the element's validation
+# under, which the parity test reads back.
+CONSTRAINT_PREFIXES: dict[str, tuple[str, str]] = {
+    "items:": ("items", "items"),
+    "values:": ("values", "additionalProperties"),
+}
 # controller-gen separates enum members with `;`.
 ENUM_SEPARATOR = ";"
 CODE_SPAN_RE = re.compile(r"`[^`]*`")
@@ -680,9 +687,11 @@ def crd_model() -> dict[str, dict]:
 def render_constraint(constraint: dict[str, str]) -> str:
     name, value = constraint["name"], constraint["value"]
     prefix = ""
-    if name.startswith(CONSTRAINT_ITEMS_PREFIX):
-        prefix = f"{CONSTRAINT_ITEMS_LABEL} "
-        name = name[len(CONSTRAINT_ITEMS_PREFIX) :]
+    for marker_prefix, (word, _) in CONSTRAINT_PREFIXES.items():
+        if name.startswith(marker_prefix):
+            prefix = f"{word} "
+            name = name[len(marker_prefix) :]
+            break
     label = CONSTRAINT_MARKERS[name][0] if name in CONSTRAINT_MARKERS else name
     if name == "Enum":
         shown = ENUM_MEMBER_SEPARATOR.join(f"`{member}`" for member in value.split(ENUM_SEPARATOR))

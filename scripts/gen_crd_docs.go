@@ -74,8 +74,14 @@ const (
 	requiredMarkerKB       = "+kubebuilder:validation:Required"
 	optionalMarkerKB       = "+kubebuilder:validation:Optional"
 	validationMarkerPrefix = "+kubebuilder:validation:"
-	itemsMarkerPrefix      = "items:"
-	defaultMarkerPrefix    = "+kubebuilder:default"
+	// A named type's validation reaches the elements of a collection of it,
+	// and the model spells where: `items:` is controller-gen's own prefix
+	// for a list's elements; `values:` is this generator's for a map's
+	// values, which controller-gen writes under the schema's
+	// `additionalProperties` and has no marker spelling for.
+	itemsMarkerPrefix   = "items:"
+	valuesMarkerPrefix  = "values:"
+	defaultMarkerPrefix = "+kubebuilder:default"
 	// A paragraph after the first that opens this way is operative for a
 	// reader deciding whether to use the field, so it stays on the page.
 	deprecatedParagraphPrefix = "Deprecated:"
@@ -159,7 +165,8 @@ type Field struct {
 }
 
 // Constraint is one validation marker: its name after the
-// `+kubebuilder:validation:` prefix (`Enum`, `items:Pattern`) and its value.
+// `+kubebuilder:validation:` prefix (`Enum`, `items:Pattern`, `values:Enum`)
+// and its value.
 type Constraint struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
@@ -467,9 +474,10 @@ func (p *pkg) resolve(expr ast.Expr) (typeRef, error) {
 }
 
 // typeMarkers returns the markers declared on a local named type the field
-// uses directly (through a pointer or not), or as the element of a slice,
-// where controller-gen applies the type's validation to the items and this
-// returns it under the `items:` spelling. A struct's markers describe the
+// uses directly (through a pointer or not), or as the element of a slice or
+// the value of a map, where controller-gen applies the type's validation to
+// the schema's `items` or `additionalProperties` and this returns it under
+// the `items:` or `values:` spelling. A struct's markers describe the
 // object, not the field, so only non-struct types contribute.
 func (p *pkg) typeMarkers(expr ast.Expr) []string {
 	for {
@@ -479,14 +487,11 @@ func (p *pkg) typeMarkers(expr ast.Expr) []string {
 		}
 		expr = star.X
 	}
-	if array, ok := expr.(*ast.ArrayType); ok {
-		var items []string
-		for _, m := range p.typeMarkers(array.Elt) {
-			if strings.HasPrefix(m, validationMarkerPrefix) {
-				items = append(items, validationMarkerPrefix+itemsMarkerPrefix+strings.TrimPrefix(m, validationMarkerPrefix))
-			}
-		}
-		return items
+	switch t := expr.(type) {
+	case *ast.ArrayType:
+		return elementMarkers(p.typeMarkers(t.Elt), itemsMarkerPrefix)
+	case *ast.MapType:
+		return elementMarkers(p.typeMarkers(t.Value), valuesMarkerPrefix)
 	}
 	ident, ok := expr.(*ast.Ident)
 	if !ok {
@@ -500,6 +505,20 @@ func (p *pkg) typeMarkers(expr ast.Expr) []string {
 		return nil
 	}
 	return markerLines(decl.doc)
+}
+
+// elementMarkers respells an element type's validation markers under the
+// collection's prefix (`+kubebuilder:validation:Enum=a;b` becomes
+// `+kubebuilder:validation:items:Enum=a;b`); a default or a required
+// marker on the element type describes no collection and is dropped.
+func elementMarkers(markers []string, prefix string) []string {
+	var out []string
+	for _, m := range markers {
+		if strings.HasPrefix(m, validationMarkerPrefix) {
+			out = append(out, validationMarkerPrefix+prefix+strings.TrimPrefix(m, validationMarkerPrefix))
+		}
+	}
+	return out
 }
 
 // jsonTag reads a field's json tag: its name, and whether it says omitempty,

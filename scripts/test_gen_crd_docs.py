@@ -155,6 +155,11 @@ FIXTURE = textwrap.dedent(
     	// +optional
     	Levels []Mode `json:"levels,omitempty"`
 
+    	// Ranks are modes by slot, so the type's enum applies to each value.
+    	// +kubebuilder:validation:MaxProperties=3
+    	// +optional
+    	Ranks map[string]*Mode `json:"ranks,omitempty"`
+
     	// Speed overrides its type's default and enum, the enum in the colon spelling.
     	// +kubebuilder:default:="c"
     	// +kubebuilder:validation:Enum:=b;c
@@ -354,12 +359,20 @@ class FixturePackageTest(unittest.TestCase):
             [{"name": "MinProperties", "value": "1"}, {"name": "MaxProperties", "value": "8"}],
         )
         emitted = {
-            constraint["name"].removeprefix("items:")
+            constraint["name"].rsplit(":", 1)[-1]
             for tree in (self.spec, self.status)
             for row in tree.values()
             for constraint in row["constraints"]
         }
         self.assertEqual(sorted(emitted - set(generate_docs.CONSTRAINT_MARKERS)), [])
+        prefixes = {
+            constraint["name"].rsplit(":", 1)[0] + ":"
+            for tree in (self.spec, self.status)
+            for row in tree.values()
+            for constraint in row["constraints"]
+            if ":" in constraint["name"]
+        }
+        self.assertEqual(sorted(prefixes - set(generate_docs.CONSTRAINT_PREFIXES)), [])
         self.assertLessEqual(generate_docs.SCHEMA_IMPLIED_MARKERS, set(generate_docs.CONSTRAINT_MARKERS))
 
     def test_external_types_are_leaves_named_by_their_go_type(self):
@@ -406,6 +419,16 @@ class FixturePackageTest(unittest.TestCase):
         self.assertEqual(
             self.spec["levels"]["constraints"],
             [{"name": "MaxItems", "value": "2"}, {"name": "items:Enum", "value": "fast;slow"}],
+        )
+
+    def test_a_map_of_a_named_type_carries_the_type_s_enum_on_its_values(self):
+        # controller-gen writes the value type's validation under the map's
+        # additionalProperties, as it writes a slice's under items; the
+        # pointer in the value type is transparent as it is on a field.
+        self.assertEqual(self.spec["ranks"]["type"], "map[string]string")
+        self.assertEqual(
+            self.spec["ranks"]["constraints"],
+            [{"name": "MaxProperties", "value": "3"}, {"name": "values:Enum", "value": "fast;slow"}],
         )
 
     def test_rows_keep_source_order(self):
@@ -568,14 +591,20 @@ def schema_constraints(schema: dict, generated: list[tuple[str, str]]) -> list[t
     """The constraints a schema node carries, spelled as the generator spells them.
 
     The marker table is the generator's own, so a marker the page labels is one
-    this reads back. A keyword controller-gen writes without a marker (`format`
+    this reads back, and so is the prefix table: a list's items are read under
+    `items` and a map's values under `additionalProperties`. A keyword
+    controller-gen writes without a marker (`format`
     from an integer's Go width) counts only where the generator emitted that
     marker on the same node, so the schema's implied entries are not demanded
     of the page.
     """
     emitted = {name for name, _ in generated}
+    nodes = [(schema, "")] + [
+        (schema.get(keyword) or {}, prefix)
+        for prefix, (_, keyword) in generate_docs.CONSTRAINT_PREFIXES.items()
+    ]
     out: list[tuple[str, str]] = []
-    for node, prefix in ((schema, ""), (schema.get("items") or {}, "items:")):
+    for node, prefix in nodes:
         for marker, (_, key) in generate_docs.CONSTRAINT_MARKERS.items():
             if key not in node:
                 continue

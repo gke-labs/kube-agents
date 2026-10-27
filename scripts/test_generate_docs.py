@@ -380,6 +380,7 @@ class CRDFieldBlocksTest(unittest.TestCase):
                                 {"name": "items:Pattern", "value": "^(a|b)$"},
                                 {"name": "Enum", "value": "x;y"},
                                 {"name": "MultipleOf", "value": "5"},
+                                {"name": "values:Enum", "value": "p;q"},
                             ],
                             "description": "Name of the <part>, see `kind: <k>`.",
                         }
@@ -391,7 +392,7 @@ class CRDFieldBlocksTest(unittest.TestCase):
             body = generate_docs.gen_crd_fields("AgentPlugin")
         self.assertIn(
             "| `parts[].name` | `string` | yes | `a\\|b` | max length `63`; items pattern `^(a\\|b)$`; "
-            "one of `x`, `y`; multiple of `5` | Name of the &lt;part&gt;, see `kind: <k>`. |",
+            "one of `x`, `y`; multiple of `5`; values one of `p`, `q` | Name of the &lt;part&gt;, see `kind: <k>`. |",
             body,
         )
         self.assertTrue(body.endswith("## Status\n\n" + generate_docs.CRD_EMPTY_TREE))
