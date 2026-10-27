@@ -1330,7 +1330,7 @@ gitlab_token_source() { # <agent|ledger> -> a description for the log
 }
 read_gitlab_token() { # <agent|ledger> -> the token on stdout, newline stripped
   if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
-    tr -d '\r\n' <"$(gitlab_token_source "$1")" 2>/dev/null
+    tr -d '\r\n' 2>/dev/null <"$(gitlab_token_source "$1")"
   else
     local secret="${GITLAB_AGENT_SM_SECRET}"
     [ "$1" = "ledger" ] && secret="${GITLAB_LEDGER_SM_SECRET}"

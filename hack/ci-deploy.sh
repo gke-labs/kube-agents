@@ -1071,12 +1071,12 @@ fi
 EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
 EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
 forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override
-  local kind host var
+  local kind host var example
   case "$1" in
     github)    echo "github github.com no"; return 0 ;;
     gitlab)    echo "gitlab gitlab.com no"; return 0 ;;
-    ghes)      kind=github; var=EVAL_GHES_HOST; host="${EVAL_GHES_HOST:-${EVAL_FORGE_DEFAULT_GHES_HOST}}" ;;
-    gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; host="${EVAL_GITLAB_CE_HOST:-${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}}" ;;
+    ghes)      kind=github; var=EVAL_GHES_HOST; example="${EVAL_FORGE_DEFAULT_GHES_HOST}"; host="${EVAL_GHES_HOST:-${example}}" ;;
+    gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; example="${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}"; host="${EVAL_GITLAB_CE_HOST:-${example}}" ;;
     *) return 1 ;;
   esac
   # A dotted bare hostname only: the row is split on whitespace, and the chart
@@ -1084,7 +1084,7 @@ forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 un
   # two public hosts are not self-managed; the chart refuses them with a CA set.
   # The chart's finer rules (reserved domains, length) stay the chart's.
   if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
-    echo "ERROR: ${var}='${host}' is not a dotted bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${EVAL_FORGE_DEFAULT_GHES_HOST}." >&2
+    echo "ERROR: ${var}='${host}' is not a dotted bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${example}." >&2
     return 2
   fi
   case "$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')" in
