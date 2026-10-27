@@ -48,6 +48,7 @@ gitops-drift-backlog-digest
 # Placed on the arithmetic alone: no periodic set main-a or main-b when it
 # was added, so no night had measured the halves.
 gitops-drift-load-bearing-change-triage
+gitops-drift-unmanaged-object-triage
 # Registered 2026-10-22 (#3583) at 1500s. With autoops-quiet-followup (1800s)
 # on main-a since #3617, the halves stand at 11250s (main-a) against 11100s
 # (main-b) with gpu-stress-test-diagnosis kept above; moved to main-a they
