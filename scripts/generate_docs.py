@@ -26,19 +26,32 @@ Usage::
 
     python3 scripts/generate_docs.py            # rewrite the generated targets
     python3 scripts/generate_docs.py --check    # exit 1 if anything is stale
+    python3 scripts/generate_docs.py crd-fields-agentplugin   # one block only
+    python3 scripts/generate_docs.py --block-prefix crd-fields-  # one family
 
 ``--check`` is what CI runs: if regenerating would change a file, the committed
-documentation no longer matches its source.
+documentation no longer matches its source. Naming blocks, or a prefix,
+restricts a run to those regions; ``make -C k8s-operator manifests`` uses the
+prefix to refresh the CRD field pages beside the CRD YAML.
 
 Standard library only, deliberately -- this must run in CI and in a bare clone
-without installing anything.
+without installing anything. The one tool it calls out to is ``go``: the CRD
+field pages are read from the operator's Go API types by
+``scripts/gen_crd_docs.go``, itself standard library and run with the
+installed toolchain. Without ``go`` on PATH a write run skips those pages and
+says so, so the other regions still refresh; ``--check`` fails, since a check
+that cannot read the pages cannot vouch for them.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -84,6 +97,108 @@ AUDIT_SKILL = "fleet-audit"
 PLATFORM_HOME = "agents/platform"
 
 GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
+
+# The CRD field reference pages, one per kind, read from the operator's API
+# types by the Go program beside this script. GOTOOLCHAIN=local runs the
+# installed toolchain whatever a go.mod might ask for: the program is standard
+# library on an API every supported Go has, so no download starts in CI.
+CRD_API_DIR = REPO / "k8s-operator/api/v1alpha1"
+CRD_DOCS_GENERATOR = REPO / "scripts/gen_crd_docs.go"
+GO_BINARY = "go"
+GO_RUN_ENV = {"GOTOOLCHAIN": "local"}
+OPERATOR_DOCS_DIR = REPO / "docs/site/src/content/docs/operator"
+CRD_KINDS: dict[str, Path] = {
+    "PlatformAgent": OPERATOR_DOCS_DIR / "platformagent-fields.md",
+    "AgentProfile": OPERATOR_DOCS_DIR / "agentprofile-fields.md",
+    "AgentPlugin": OPERATOR_DOCS_DIR / "agentplugin-fields.md",
+}
+# The narrative guide each field page points its reader at, as a site route.
+CRD_GUIDES = {
+    "PlatformAgent": "/kube-agents/operator/platformagent-crd/",
+    "AgentProfile": "/kube-agents/operator/agentprofile-crd/",
+    "AgentPlugin": "/kube-agents/operator/agentplugin-crd/",
+}
+CRD_BLOCK_PREFIX = "crd-fields-"
+# The paragraph above the tables, rendered once here rather than kept by hand
+# on each page, so the three pages cannot drift apart. It states what the
+# tables leave out: standard metadata, the inside of upstream Kubernetes
+# types, every paragraph of a field's documentation after the first other
+# than its deprecation notice, and the CEL rules the Constraints column does
+# not carry.
+CRD_GROUP = "kubeagents.x-k8s.io"
+CRD_INTRO = (
+    "Every field of the `{kind}` resource's `spec` and `status`, generated from the "
+    "operator's Go API types. The standard Kubernetes `apiVersion`, `kind` and "
+    "`metadata` are not listed. A field whose type comes from the Kubernetes API "
+    "(`corev1`, `metav1`, `networkingv1`, `resource.Quantity`) names that type and is "
+    "not expanded; the Kubernetes API reference describes it. Paths read "
+    "`parent.child`, with `[]` for each item of a list and `{{}}` for each value of a "
+    "map. Each description is the opening paragraph of the field's documentation, "
+    "plus its deprecation notice when it has one, and names other fields in their Go "
+    "spelling (`MaxSessions` for `maxSessions`); `kubectl explain "
+    "{resource}.spec.<field>` (`{resource}.status.<field>` for a row of the Status "
+    "table) prints the whole text. The Constraints column lists the "
+    "schema bounds on a field: allowed values, ranges, lengths and patterns. The API "
+    "server also enforces CEL rules on these fields and on whole sections, which the "
+    "column does not show; `kubectl get crd {resource}s.{group} -o yaml` lists them "
+    "under `x-kubernetes-validations`, each with the message the API server returns "
+    "when a value breaks it. For what the fields do together, read the "
+    "[{kind} CRD]({guide}) guide."
+)
+# The two trees each page carries, with the heading each is rendered under.
+CRD_TREES = (("spec", "Spec"), ("status", "Status"))
+CRD_TABLE_HEADER = (
+    "| Field | Type | Required | Default | Constraints | Description |",
+    "| ----- | ---- | -------- | ------- | ----------- | ----------- |",
+)
+CRD_EMPTY_TREE = "No fields."
+REQUIRED_YES = "yes"
+REQUIRED_NO = "no"
+CONSTRAINT_SEPARATOR = "; "
+ENUM_MEMBER_SEPARATOR = ", "
+# Entities for the brackets a `.md` page would otherwise read as a tag, and
+# the escape GFM reads as a literal pipe inside a table cell.
+LT_ENTITY = "&lt;"
+GT_ENTITY = "&gt;"
+PIPE_ESCAPE = "\\|"
+# The validation markers the Constraints column shows: how each reads on the
+# page, and the schema keyword controller-gen writes for it, which the parity
+# test in test_gen_crd_docs.py reads back from the committed CRD YAML. One
+# table for both, so a marker cannot render on a page that the test does not
+# know. A marker on the elements of a collection goes through the same table
+# under a prefix, `items:` for a list's items (controller-gen's own spelling)
+# and `values:` for a map's values (the generator's, since controller-gen has
+# none); a marker not listed here is shown as its own name, and the parity
+# test fails on it until it is added.
+CONSTRAINT_MARKERS: dict[str, tuple[str, str]] = {
+    "Enum": ("one of", "enum"),
+    "Minimum": ("min", "minimum"),
+    "Maximum": ("max", "maximum"),
+    "MinLength": ("min length", "minLength"),
+    "MaxLength": ("max length", "maxLength"),
+    "MinItems": ("min items", "minItems"),
+    "MaxItems": ("max items", "maxItems"),
+    "MinProperties": ("min properties", "minProperties"),
+    "MaxProperties": ("max properties", "maxProperties"),
+    "Pattern": ("pattern", "pattern"),
+    "MultipleOf": ("multiple of", "multipleOf"),
+    "Format": ("format", "format"),
+}
+# Markers whose keyword controller-gen also writes with no marker present:
+# `format: int32`, `int64` or `byte` comes from the Go width of every such
+# field. The schema therefore carries these where no row does, so the parity
+# test holds a marker to its keyword, never the keyword to a marker.
+SCHEMA_IMPLIED_MARKERS = frozenset({"Format"})
+# Each collection prefix with the word the page puts before the constraint,
+# and the schema keyword controller-gen writes the element's validation
+# under, which the parity test reads back.
+CONSTRAINT_PREFIXES: dict[str, tuple[str, str]] = {
+    "items:": ("items", "items"),
+    "values:": ("values", "additionalProperties"),
+}
+# controller-gen separates enum members with `;`.
+ENUM_SEPARATOR = ";"
+CODE_SPAN_RE = re.compile(r"`[^`]*`")
 
 # Editorial grouping for the Platform Agent skill catalogue. Skills missing from
 # this map are emitted under "Other" rather than dropped, so a new skill shows up
@@ -218,6 +333,24 @@ def md_escape(text: str) -> str:
         .replace("\n", " ")
         .strip()
     )
+
+
+def escape_cell(text: str) -> str:
+    """Make prose with inline code safe for a Markdown table cell on a `.md` page.
+
+    Pipes are escaped everywhere, since GFM reads one inside a code span as a
+    column break too. Angle brackets are escaped only outside code spans: a
+    bare `<name>` in prose is an HTML tag to the renderer and vanishes, while
+    inside a code span `&lt;` would show as those four characters.
+    """
+    parts = CODE_SPAN_RE.split(text)
+    spans = CODE_SPAN_RE.findall(text)
+    out: list[str] = []
+    for index, part in enumerate(parts):
+        out.append(part.replace("<", LT_ENTITY).replace(">", GT_ENTITY))
+        if index < len(spans):
+            out.append(spans[index])
+    return "".join(out).replace("|", PIPE_ESCAPE).replace("\n", " ").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +641,103 @@ def gen_container_images() -> str:
     return "\n".join(out).rstrip()
 
 
+def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
+    """Run ``gen_crd_docs.go`` over ``api_dir`` and return its JSON model.
+
+    A missing ``go`` and a generator that refuses the package are both hard
+    failures with the reason: a page silently rendered from nothing would
+    pass ``--check`` while saying nothing.
+    """
+    if shutil.which(GO_BINARY) is None:
+        raise SystemExit(
+            f"{CRD_DOCS_GENERATOR.relative_to(REPO)}: the CRD field pages are read "
+            f"from the Go API types, which needs a Go toolchain; `{GO_BINARY}` is "
+            "not on PATH."
+        )
+    command = [
+        GO_BINARY,
+        "run",
+        str(CRD_DOCS_GENERATOR),
+        "-dir",
+        str(api_dir),
+        "-kinds",
+        ",".join(kinds),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=REPO,
+        env={**os.environ, **GO_RUN_ENV},
+        capture_output=True,
+        # The model carries the doc comments' non-ASCII (section signs, em
+        # dashes) as UTF-8 whatever the locale's codec is.
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"{CRD_DOCS_GENERATOR.relative_to(REPO)} failed "
+            f"(exit {result.returncode}):\n{result.stderr.strip()}"
+        )
+    return json.loads(result.stdout)
+
+
+@functools.lru_cache(maxsize=1)
+def crd_model() -> dict[str, dict]:
+    """The committed API package's model, by kind, read once per run."""
+    model = run_crd_generator(CRD_API_DIR, tuple(CRD_KINDS))
+    return {entry["kind"]: entry for entry in model["kinds"]}
+
+
+def render_constraint(constraint: dict[str, str]) -> str:
+    name, value = constraint["name"], constraint["value"]
+    prefix = ""
+    for marker_prefix, (word, _) in CONSTRAINT_PREFIXES.items():
+        if name.startswith(marker_prefix):
+            prefix = f"{word} "
+            name = name[len(marker_prefix) :]
+            break
+    label = CONSTRAINT_MARKERS[name][0] if name in CONSTRAINT_MARKERS else name
+    if name == "Enum":
+        shown = ENUM_MEMBER_SEPARATOR.join(f"`{member}`" for member in value.split(ENUM_SEPARATOR))
+    else:
+        shown = f"`{value}`"
+    return f"{prefix}{label} {shown}"
+
+
+def render_crd_row(field: dict) -> str:
+    constraints = CONSTRAINT_SEPARATOR.join(render_constraint(c) for c in field["constraints"])
+    default = f"`{field['default']}`" if field["default"] else ""
+    return "| `{path}` | `{type}` | {required} | {default} | {constraints} | {description} |".format(
+        path=field["path"],
+        type=field["type"],
+        required=REQUIRED_YES if field["required"] else REQUIRED_NO,
+        default=escape_cell(default),
+        constraints=escape_cell(constraints),
+        description=escape_cell(field["description"]),
+    )
+
+
+def gen_crd_fields(kind: str) -> str:
+    """Render one kind's page body: the intro paragraph, then a spec and a status table."""
+    entry = crd_model()[kind]
+    out: list[str] = [
+        CRD_INTRO.format(
+            kind=kind, resource=kind.lower(), group=CRD_GROUP, guide=CRD_GUIDES[kind]
+        ),
+        "",
+    ]
+    for key, heading in CRD_TREES:
+        out.append(f"## {heading}\n")
+        fields = entry[key]
+        if not fields:
+            out.append(CRD_EMPTY_TREE)
+        else:
+            out.extend(CRD_TABLE_HEADER)
+            out.extend(render_crd_row(field) for field in fields)
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
 # Each region names every file it is spliced into. One generator, one body,
 # however many pages carry it: the job example is the same entry on three
 # pages, and rendering it once is what keeps the three from disagreeing.
@@ -520,6 +750,10 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
     "capabilities": ((README,), gen_capabilities),
+    **{
+        f"{CRD_BLOCK_PREFIX}{kind.lower()}": ((page,), functools.partial(gen_crd_fields, kind))
+        for kind, page in CRD_KINDS.items()
+    },
 }
 
 # Generated artifacts that are a whole file rather than a region inside a
@@ -614,20 +848,78 @@ def collect_targets(blocks=BLOCKS) -> list[Target]:
     return targets
 
 
-def main() -> int:
+def display_path(path: Path) -> Path:
+    """A path as the report prints it: relative to the repository when inside it."""
+    return path.relative_to(REPO) if path.is_relative_to(REPO) else path
+
+
+def select_blocks(names: list[str], prefixes: list[str] = (), blocks=BLOCKS) -> dict:
+    """The blocks a run covers, in registry order.
+
+    No names and no prefixes selects every block. A name must be a registered
+    id and a prefix must match at least one, so a typo fails the run rather
+    than quietly covering nothing.
+    """
+    unknown = sorted(set(names) - set(blocks))
+    if unknown:
+        raise SystemExit(
+            f"unknown block id(s): {', '.join(unknown)}; known: {', '.join(blocks)}"
+        )
+    for prefix in prefixes:
+        if not any(block_id.startswith(prefix) for block_id in blocks):
+            raise SystemExit(
+                f"no block id starts with '{prefix}'; known: {', '.join(blocks)}"
+            )
+    if not names and not prefixes:
+        return dict(blocks)
+    return {
+        block_id: entry
+        for block_id, entry in blocks.items()
+        if block_id in names or any(block_id.startswith(prefix) for prefix in prefixes)
+    }
+
+
+def needs_go(block_id: str) -> bool:
+    """Whether a block's generator reads the Go API types."""
+    return block_id.startswith(CRD_BLOCK_PREFIX)
+
+
+def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--check",
         action="store_true",
         help="do not write; exit non-zero if any generated region is out of date",
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "--block-prefix",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help="also cover every block whose id starts with PREFIX (repeatable)",
+    )
+    ap.add_argument(
+        "blocks",
+        nargs="*",
+        metavar="BLOCK",
+        help="block ids to regenerate or check; default: all of them",
+    )
+    args = ap.parse_args(argv)
 
-    targets = collect_targets()
+    selected = select_blocks(args.blocks, args.block_prefix, blocks)
+    # A write run on a machine without Go still refreshes every region that
+    # needs none; the CRD pages are reported skipped, not silently left. A
+    # block asked for by name is wanted, so it fails as it would in --check.
+    if not args.check and not args.blocks and not args.block_prefix and shutil.which(GO_BINARY) is None:
+        for block_id in [b for b in selected if needs_go(b)]:
+            print(f"  skipped  [{block_id}]: needs `{GO_BINARY}` on PATH; regions that need none are refreshed")
+            del selected[block_id]
+
+    targets = collect_targets(selected)
 
     stale: list[str] = []
     for path, new_text, changed, block_id in targets:
-        rel = path.relative_to(REPO)
+        rel = display_path(path)
         if not changed:
             print(f"  ok       {rel} [{block_id}]")
             continue

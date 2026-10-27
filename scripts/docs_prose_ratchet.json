@@ -1,0 +1,170 @@
+{
+  "concepts/autonomous-watchdogs.md": {
+    "banned-word": 1,
+    "antithesis": 1,
+    "long-paragraph": 16,
+    "long-sentence": 36
+  },
+  "concepts/chatops.md": {
+    "long-paragraph": 34,
+    "long-sentence": 88
+  },
+  "concepts/cluster-agents.md": {
+    "long-paragraph": 4,
+    "long-sentence": 10
+  },
+  "concepts/declarative-workflow.md": {
+    "long-paragraph": 17,
+    "long-sentence": 31
+  },
+  "concepts/governance-sops.md": {
+    "long-paragraph": 4,
+    "long-sentence": 17
+  },
+  "concepts/inference-gateway.md": {
+    "long-paragraph": 9,
+    "long-sentence": 18
+  },
+  "concepts/observability.md": {
+    "long-paragraph": 10,
+    "long-sentence": 27
+  },
+  "concepts/skills.md": {
+    "long-paragraph": 2,
+    "long-sentence": 3
+  },
+  "deploy/docker-images.md": {
+    "banned-word": 1,
+    "long-paragraph": 5,
+    "long-sentence": 19
+  },
+  "deploy/gitops-argocd.md": {
+    "long-sentence": 2
+  },
+  "deploy/kustomize.md": {
+    "long-paragraph": 2,
+    "long-sentence": 5
+  },
+  "deploy/multi-project.md": {
+    "long-paragraph": 3,
+    "long-sentence": 15
+  },
+  "deploy/release-versioning.md": {
+    "long-paragraph": 1,
+    "long-sentence": 8
+  },
+  "deploy/rollback.md": {
+    "long-paragraph": 9,
+    "long-sentence": 20
+  },
+  "deploy/telemetry.md": {
+    "long-paragraph": 4,
+    "long-sentence": 10
+  },
+  "deploy/token-minter.md": {
+    "long-paragraph": 1,
+    "long-sentence": 5
+  },
+  "index.mdx": {
+    "long-sentence": 2
+  },
+  "install/first-prompts.md": {
+    "long-paragraph": 2,
+    "long-sentence": 4
+  },
+  "install/gitlab.md": {
+    "long-paragraph": 2,
+    "long-sentence": 4
+  },
+  "install/manual.md": {
+    "long-sentence": 1
+  },
+  "install/prerequisites.md": {
+    "long-paragraph": 4,
+    "long-table-cell": 1,
+    "long-sentence": 15
+  },
+  "install/quickstart-gke.mdx": {
+    "long-paragraph": 5,
+    "long-sentence": 9
+  },
+  "install/slack-app.md": {
+    "long-paragraph": 4,
+    "long-sentence": 3
+  },
+  "install/uninstall.md": {
+    "long-paragraph": 3,
+    "long-sentence": 9
+  },
+  "install/upgrade.md": {
+    "long-paragraph": 6,
+    "long-sentence": 13
+  },
+  "operator/agentplugin-crd.md": {
+    "long-paragraph": 1,
+    "long-sentence": 4
+  },
+  "operator/agentprofile-crd.md": {
+    "long-sentence": 2
+  },
+  "operator/index.md": {
+    "long-paragraph": 2,
+    "long-sentence": 9
+  },
+  "operator/platformagent-crd.md": {
+    "banned-word": 6,
+    "long-paragraph": 55,
+    "long-table-cell": 10,
+    "long-sentence": 189
+  },
+  "overview/architecture.mdx": {
+    "long-paragraph": 2,
+    "long-sentence": 8
+  },
+  "overview/day-in-the-life.md": {
+    "long-paragraph": 2,
+    "long-sentence": 2
+  },
+  "overview/proactive-autonomy.md": {
+    "banned-word": 1,
+    "long-paragraph": 2,
+    "long-sentence": 6
+  },
+  "overview/what-is-kube-agents.md": {
+    "long-sentence": 1
+  },
+  "reference/admin-console.md": {
+    "long-sentence": 4
+  },
+  "reference/config.md": {
+    "long-paragraph": 8,
+    "long-sentence": 24
+  },
+  "reference/credential-isolation.md": {
+    "banned-word": 1,
+    "antithesis": 1,
+    "long-paragraph": 16,
+    "long-sentence": 42
+  },
+  "reference/cron-jobs.md": {
+    "banned-word": 1,
+    "long-paragraph": 5,
+    "long-sentence": 13
+  },
+  "reference/examples.md": {
+    "long-sentence": 1
+  },
+  "reference/glossary.md": {
+    "long-paragraph": 1,
+    "long-sentence": 2
+  },
+  "reference/resource-labels.md": {
+    "long-paragraph": 3,
+    "long-sentence": 7
+  },
+  "reference/security-and-iam.md": {
+    "banned-word": 1,
+    "long-paragraph": 36,
+    "long-sentence": 91
+  }
+}

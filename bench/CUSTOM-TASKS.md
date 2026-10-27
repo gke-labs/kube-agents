@@ -635,12 +635,17 @@ file whether it lands beside the workload's declaration or over it, and only the
 the Deployment it was meant to protect. The clause lists `/pulls/{n}/files`, counts a rename under
 both names, and needs `pull_requests: read`; an answer it cannot read is an error, not a pass.
 
+`changed_paths_only` lists the full allowlist of repository paths, as non-empty `fnmatch` globs,
+the pull request is permitted to change: every changed file (and both names of any rename) in
+`/pulls/{n}/files` must match at least one listed glob. It reads the same listing as
+`unchanged_paths`, with the same permission and the same error on an unreadable or truncated answer.
+
 `removed_paths` lists repository paths, as `fnmatch` globs, the pull request must delete: each glob
 must match a file `/pulls/{n}/files` lists as `removed`. A delete reaches review as the removal of
 the manifest that declares the object, and a pull request that adds a "delete" marker or annotates
 the manifest in place changes a file while keeping the declaration, so merging it keeps the object.
 A rename moves the declaration rather than deleting it and does not count. It reads the same
-listing as `unchanged_paths`, with the same permission and the same error on an unreadable answer. GitLab has no such listing here, so on GitLab the clause leaves the check unevaluated (an error), as `content` does.
+listing as `unchanged_paths` and `changed_paths_only`, with the same permission and the same error on an unreadable answer. GitLab has no such listing here, so on GitLab `unchanged_paths`, `changed_paths_only` and `removed_paths` leave the check unevaluated (an error), as `content` does.
 
 `content` lists assertions over what the pull request writes, for a case whose answer is an object
 with particular fields rather than any change at all: the `ContainerCluster` a provisioning request
@@ -672,7 +677,7 @@ and a `quantifier` of `all` (the default) or `any` over the documents kept.
   file GitHub left no patch for (large or binary), makes the check an error naming it: reading that
   file needs `contents: read`, which the grading mint does not grant. A case asserting over an edit
   to an existing file (a node pool resize in Terraform, say) needs that permission added first.
-- GitHub only: on a GitLab merge request a check with `content` or `removed_paths` is an error, not a pass.
+- GitHub only: on a GitLab merge request a check with `content`, `unchanged_paths`, `changed_paths_only` or `removed_paths` is an error, not a pass.
 
 ```yaml
 - name: the-new-cluster-turns-on-both-beta-apis

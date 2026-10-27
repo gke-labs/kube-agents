@@ -1,0 +1,184 @@
+{
+  "name": "first-report-no-critical-item",
+  "source": "agents/chat/scripts/test_inventory_card.py::CasesTest.test_the_shared_cases_are_these_fixtures",
+  "notes": "inventory_card.chat: a scan with no critical item is done. No rows, no fix button, the queue line counts the smaller items, and the detail says what the checks found.",
+  "input": {
+    "first_report": {
+      "items": {
+        "items": [
+          {
+            "check": "readonly-root-fs",
+            "project": "onboarding-posture-prod",
+            "cluster": "prod-east",
+            "object": "storefront",
+            "title": "storefront runs with a writable root filesystem",
+            "namespace": "web",
+            "detail": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes",
+            "severity_hint": "low",
+            "line": 51,
+            "id": "f001"
+          },
+          {
+            "check": "probes-startup",
+            "project": "onboarding-posture-prod",
+            "cluster": "prod-east",
+            "object": "search-api",
+            "title": "search-api has no startupProbe",
+            "namespace": "web",
+            "detail": "Add a startupProbe so a slow start is not read as a failed liveness check",
+            "severity_hint": "low",
+            "line": 52,
+            "id": "f002"
+          },
+          {
+            "check": "no-resourcequota",
+            "project": "onboarding-posture-prod",
+            "cluster": "prod-east",
+            "object": "jobs",
+            "title": "Namespace jobs has no ResourceQuota or LimitRange",
+            "namespace": "jobs",
+            "detail": "Add a ResourceQuota and a LimitRange to jobs",
+            "severity_hint": "low",
+            "line": 53,
+            "id": "f003"
+          },
+          {
+            "check": "managed-prometheus",
+            "project": "onboarding-posture-prod",
+            "cluster": "prod-east",
+            "object": "prod-east",
+            "title": "Managed Service for Prometheus is not enabled on prod-east",
+            "detail": "Enable Managed Service for Prometheus so workload metrics are collected",
+            "severity_hint": "low",
+            "line": 54,
+            "id": "f004"
+          }
+        ]
+      },
+      "scores": {
+        "scores": {
+          "f001": {
+            "rubric": {
+              "B": 2,
+              "L": 2,
+              "detect": 1,
+              "recover": 2,
+              "C": 0.9
+            },
+            "recommendation": {
+              "action": "Set readOnlyRootFilesystem: true.",
+              "rationale": "why",
+              "risk": "A compromised container can rewrite its own binaries."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f002": {
+            "rubric": {
+              "B": 2,
+              "L": 2,
+              "detect": 1,
+              "recover": 2,
+              "C": 0.9
+            },
+            "recommendation": {
+              "action": "Add a startupProbe.",
+              "rationale": "why",
+              "risk": "A slow start reads as a failed liveness check."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f003": {
+            "rubric": {
+              "B": 2,
+              "L": 2,
+              "detect": 1,
+              "recover": 2,
+              "C": 0.9
+            },
+            "recommendation": {
+              "action": "Add a ResourceQuota and a LimitRange.",
+              "rationale": "why",
+              "risk": "One workload can take the namespace's share."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f004": {
+            "rubric": {
+              "B": 2,
+              "L": 2,
+              "detect": 1,
+              "recover": 2,
+              "C": 0.9
+            },
+            "recommendation": {
+              "action": "Enable Managed Service for Prometheus.",
+              "rationale": "why",
+              "risk": "No workload metrics are collected."
+            },
+            "remediation": {
+              "kind": "gcloud",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          }
+        },
+        "complete_clusters": ["onboarding-posture-prod/prod-east"]
+      },
+      "limits": {
+        "first_report_criticals": 2
+      },
+      "shown": {
+        "items": []
+      }
+    }
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "First look at your fleet: done",
+        "detail": "1 cluster scanned in full \u00b7 no critical item in this scan's 9 checks",
+        "after": ["4 smaller items are queued."],
+        "fold": {
+          "title": "What the scan checked",
+          "text": "startup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities"
+        },
+        "choices": [
+          {
+            "text": "See all 4 items",
+            "primary": true
+          }
+        ]
+      }
+    }
+  ]
+}

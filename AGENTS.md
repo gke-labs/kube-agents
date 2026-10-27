@@ -223,7 +223,7 @@ user" clauses here. Agents with a user in the loop follow this file.
 ### The behavioural presubmit gate
 
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
-install (3 repetitions per active case, 1.5–3.5 hours against a 360-minute ceiling). Non-inert
+install (3 repetitions per active case, 1.5–3.5 hours). Non-inert
 pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
 `main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
 or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
@@ -233,9 +233,9 @@ Roster, inject-lane exclusions: `docs/eval-gate-roster.md`; verdict ladder:
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2. On a red, read the
 health bot comment and <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>:
 fix a regression your PR caused, or file a `presubmit-gate` issue for a gate flake. One `/retest` is
-reasonable for a suspected transient; never merge around a red gate, and never instruct anyone to.
-`/override` (admin-only) is only for a red the eval crew classified as not the PR's
-([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
+fine for a suspected transient; never merge around a red gate or tell anyone to.
+`/override` (admin-only) is only for a red the eval crew classified as not the PR's. Never `/test`
+the smoke on an approved PR with a green `Smoke gate` ([why](docs/pull-request-workflow.md#how-a-change-merges)).
 
 ## Automated Review After Opening a Pull Request
 

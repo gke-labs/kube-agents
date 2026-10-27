@@ -314,3 +314,13 @@ func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 		}
 	}
 }
+
+// SetFeedbackRecorder hands the answer-feedback recorder to every backend
+// that draws rating controls (FeedbackSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(FeedbackSink); ok {
+			sink.SetFeedbackRecorder(r)
+		}
+	}
+}

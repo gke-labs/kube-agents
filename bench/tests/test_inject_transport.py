@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from kube_agents_bench import board, harness, worker_trajectory
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import scoring
+from kube_agents_bench import scoring, stop_hook
 from kube_agents_bench.harness import KubeAgentsHarness
 
 # The gateway's own placeholder, which the relay then edits in place. Spelled
@@ -2547,6 +2547,7 @@ from test_board import (  # noqa: E402 -- the store builders live with the board
     FRONT as CARD_A,
     CHILD as CARD_B,
     SESSION as API_SESSION,
+    block_card,
     build_session_store,
     local_shell,
     set_card,
@@ -2628,6 +2629,34 @@ def test_two_cards_are_each_waited_for_and_graded(
     assert len(api_executor.submissions) == 1
 
 
+def test_a_card_paused_on_a_question_is_graded_on_the_question(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked on ``needs_input`` delivers no result; the conversation
+    shows its question, and the wait ends there (blocked is terminal)."""
+    build_session_store(tmp_path, created=[CARD_A])
+    question = "payments-api is OOMKilled. Which fix?\n- raise the limit\n- set a request"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            block_card(tmp_path, CARD_A, question)
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, advance))
+
+    result = KubeAgentsHarness().run("why does payments-api restart? give me options")
+
+    assert not result.errors, result.errors
+    final = result.metadata["final_message"]
+    assert final.startswith(ACK)
+    # The worker's run closed with the question as its summary; it is
+    # delivered once, as the question, never as the card's result.
+    assert f"Question from delegated task {CARD_A}:\n{question}" in final
+    assert "Result of delegated task" not in final
+    assert final.count(question) == 1
+    assert result.metadata["delegated_cards"] == {CARD_A: "blocked"}
+    assert len(api_executor.submissions) == 1
+
+
 def test_a_card_that_never_settles_ends_at_the_delegation_ceiling(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2670,6 +2699,39 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
     ]
     assert result.metadata["final_message"] == ACK
     assert "RESOURCE_EXHAUSTED" not in result.output
+
+
+def test_inject_transport_delegated_worker_rate_limit_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On inject transport, when a card closes with the Hermes rate limit summary and worker did not act, mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "blocked", summary=rate_limit_msg)
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
 
 
 def test_a_board_that_stops_answering_is_infrastructure(
@@ -2977,3 +3039,133 @@ def test_one_cap_counts_every_card_and_awaits_the_moving_ones_first(
     final = result.metadata["final_message"]
     for tid in late:
         assert f"Result of delegated task {tid}:\nlate {tid}" in final
+
+
+# --------------------------------------------------------------------------
+# A stopped ask (stop_hook.py): the opening POST and the `stop` the harness
+# sends after it. _stop_after_first_card is replaced with a seam that sets
+# the stub up for the stop and calls send_stop, so these tests read what the
+# door was sent and what the closure answered, not the board.
+
+STOPPED_ASK = f"{stop_hook.STOP_DIRECTIVE} observe=60\nscale checkout-gateway to 4"
+
+
+def run_stopped_ask(
+    stub: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, arrange: Any = None
+) -> tuple[Any, list[Any]]:
+    """Run STOPPED_ASK; ``arrange(stub)`` runs before the stop is sent.
+    Returns the result and what send_stop answered."""
+    stub.entries = completed_transcript(stub.task_id, "filed a card")
+    answers: list[Any] = []
+
+    def seam(self: Any, result: Any, session_id: str, stop: Any, *, send_stop: Any, poll_interval: float) -> None:
+        if arrange is not None:
+            arrange(stub)
+        answers.append(send_stop())
+
+    monkeypatch.setattr(KubeAgentsHarness, "_stop_after_first_card", seam)
+    return KubeAgentsHarness().run(STOPPED_ASK), answers
+
+
+def refuse_no_task(stub: _StubGatewayServer) -> None:
+    """The door's answer to a stop it took: no task started."""
+    stub.accept_submissions = False
+    stub.refusal_code = inject.REFUSAL_NO_TASK
+
+
+def test_a_stopped_ask_posts_the_ask_without_its_directive(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_stopped_ask(stub_gateway, monkeypatch, refuse_no_task)
+
+    assert stub_gateway.submissions[0]["text"] == "scale checkout-gateway to 4"
+
+
+def test_the_stop_is_the_word_on_the_same_conversation_under_its_own_message_id(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, answers = run_stopped_ask(stub_gateway, monkeypatch, refuse_no_task)
+
+    opening, stop = stub_gateway.submissions[0], stub_gateway.submissions[-1]
+    assert stop["text"] == stop_hook.STOP_WORD
+    # The door answers with its prefixed key, which the stop sends back as is,
+    # as the status turns do; the gateway takes a key that already carries
+    # the prefix unchanged, so both name one conversation.
+    assert stop["conversation"] == "inject:" + opening["conversation"]
+    assert stop["messageId"] == opening["messageId"] + harness._INJECT_STOP_SUFFIX
+    assert answers[0][0] is True
+
+
+def test_a_stop_the_gateway_minted_a_task_for_is_cancelled_and_fails(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cancels_before: list[int] = []
+
+    _, answers = run_stopped_ask(
+        stub_gateway, monkeypatch, lambda stub: cancels_before.append(len(stub.cancels))
+    )
+
+    ok, detail = answers[0]
+    assert ok is False
+    assert "started task" in detail
+    assert len(stub_gateway.cancels) > cancels_before[0]
+
+
+def test_a_stop_refused_for_another_reason_fails_with_the_refusal(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unverified(stub: _StubGatewayServer) -> None:
+        stub.accept_submissions = False
+        stub.refusal_code = inject.REFUSAL_UNVERIFIED_AUTHOR
+        stub.refusal_note = "who are you"
+
+    _, answers = run_stopped_ask(stub_gateway, monkeypatch, unverified)
+
+    ok, detail = answers[0]
+    assert ok is False
+    assert detail == f"{inject.refusal_detail(inject.REFUSAL_UNVERIFIED_AUTHOR)}: who are you"
+
+
+def test_a_stop_the_door_never_carried_is_infrastructure(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable(self: Any) -> str:
+        raise inject.InjectUnavailable("connection refused")
+
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "filed a card")
+
+    def seam(self: Any, result: Any, session_id: str, stop: Any, *, send_stop: Any, poll_interval: float) -> None:
+        monkeypatch.setattr(inject.InjectTask, "submit", unavailable)
+        send_stop()
+
+    monkeypatch.setattr(KubeAgentsHarness, "_stop_after_first_card", seam)
+
+    result = KubeAgentsHarness().run(STOPPED_ASK)
+
+    assert infra(result)
+    assert "the stop could not reach the gateway" in result.errors[0]
+
+
+def test_a_stop_that_drops_once_in_transport_is_retried(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opening exchange and the status turns retry a retryable transport
+    failure; the stop does too, under its own message id, which the door
+    dedupes on."""
+    real_submit = inject.InjectTask.submit
+    drops: list[int] = []
+
+    def flaky(self: Any) -> str:
+        if self.prompt == stop_hook.STOP_WORD and not drops:
+            drops.append(1)
+            raise inject.InjectUnavailable("connection reset", retryable=True)
+        return real_submit(self)
+
+    def arrange(stub: _StubGatewayServer) -> None:
+        refuse_no_task(stub)
+        monkeypatch.setattr(inject.InjectTask, "submit", flaky)
+
+    _, answers = run_stopped_ask(stub_gateway, monkeypatch, arrange)
+
+    assert drops == [1]
+    assert answers[0][0] is True
