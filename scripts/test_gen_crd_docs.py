@@ -178,6 +178,17 @@ FIXTURE = textwrap.dedent(
     	// +optional
     	Notes map[string]string `json:"notes,omitempty"`
 
+    	// Listen is the address the widget binds; its unquoted default opens
+    	// with a colon.
+    	// +kubebuilder:default=:8080
+    	// +optional
+    	Listen string `json:"listen,omitempty"`
+
+    	// Slug is bounded by a pattern written in double quotes.
+    	// +kubebuilder:validation:Pattern="^[a-z]+\\\\.[a-z]+$"
+    	// +optional
+    	Slug string `json:"slug,omitempty"`
+
     	Extra Part `json:"extra"`
     }
 
@@ -322,6 +333,14 @@ class FixturePackageTest(unittest.TestCase):
         )
         self.assertEqual(self.spec["name"]["default"], "")
         self.assertEqual(self.spec["name"]["constraints"], [])
+
+    def test_a_default_keeps_a_leading_colon_and_a_quoted_pattern_loses_its_quotes(self):
+        # `default=` and `default:=` differ by one prefix character, so the
+        # colon that opens an unquoted value is not part of the spelling.
+        self.assertEqual(self.spec["listen"]["default"], ":8080")
+        # A pattern in double quotes is read the way controller-gen reads it,
+        # escapes included, so the row shows the regular expression itself.
+        self.assertEqual(self.spec["slug"]["constraints"], [{"name": "Pattern", "value": r"^[a-z]+\.[a-z]+$"}])
 
     def test_every_marker_the_generator_emits_is_one_the_page_and_the_parity_test_name(self):
         # The page labels a marker and the parity test maps it to its schema

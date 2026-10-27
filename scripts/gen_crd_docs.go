@@ -37,6 +37,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -53,20 +54,19 @@ const (
 	specFieldJSON   = "spec"
 	statusFieldJSON = "status"
 
-	jsonTagKey         = "json"
-	jsonTagInline      = "inline"
-	jsonTagOmitEmpty   = "omitempty"
-	jsonTagSkip        = "-"
-	jsonTagSeparator   = ","
-	structTagQuote     = "`"
-	lineCommentPrefix  = "//"
-	blockCommentOpen   = "/*"
-	blockCommentClose  = "*/"
-	commentLeadingPad  = " "
-	markerValueAssign  = "="
-	markerNameColon    = ":"
-	defaultValueCutset = ":="
-	patternQuote       = "`"
+	jsonTagKey        = "json"
+	jsonTagInline     = "inline"
+	jsonTagOmitEmpty  = "omitempty"
+	jsonTagSkip       = "-"
+	jsonTagSeparator  = ","
+	structTagQuote    = "`"
+	lineCommentPrefix = "//"
+	blockCommentOpen  = "/*"
+	blockCommentClose = "*/"
+	commentLeadingPad = " "
+	markerValueAssign = "="
+	markerNameColon   = ":"
+	patternQuote      = "`"
 
 	markerPrefix           = "+"
 	requiredMarker         = "+required"
@@ -594,14 +594,18 @@ func required(markers []string, omitEmpty bool) bool {
 }
 
 // defaultValue returns the `+kubebuilder:default` value, unquoted when it is
-// a JSON string, or "" when the field has none.
+// a JSON string, or "" when the field has none. controller-gen accepts both
+// `default=v` and `default:=v`, so the name's optional colon and the one
+// `=` are cut as prefixes; a cutset would also eat the colon that opens an
+// unquoted value such as `:8080`.
 func defaultValue(markers []string) string {
 	for _, m := range markers {
 		if !strings.HasPrefix(m, defaultMarkerPrefix) {
 			continue
 		}
 		rest := strings.TrimPrefix(m, defaultMarkerPrefix)
-		rest = strings.TrimLeft(rest, defaultValueCutset)
+		rest = strings.TrimPrefix(rest, markerNameColon)
+		rest = strings.TrimPrefix(rest, markerValueAssign)
 		rest = strings.TrimSpace(rest)
 		var unquoted string
 		if json.Unmarshal([]byte(rest), &unquoted) == nil {
@@ -631,7 +635,14 @@ func constraints(markers []string) []Constraint {
 			continue
 		}
 		value = strings.TrimSpace(value)
-		value = strings.Trim(value, patternQuote)
+		// controller-gen reads a quoted value, `Pattern="^a$"` or
+		// Pattern=`^a$`, through strconv.Unquote; a value it cannot unquote
+		// (an Enum list, a number) is taken as written.
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			value = unquoted
+		} else {
+			value = strings.Trim(value, patternQuote)
+		}
 		out = append(out, Constraint{Name: name, Value: value})
 	}
 	return out
