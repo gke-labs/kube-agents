@@ -6,6 +6,7 @@ Run:
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
@@ -25,8 +26,12 @@ class WidthForTest(unittest.TestCase):
             with self.subTest(admitted=admitted):
                 self.assertEqual(width, broker_admission.width_for(admitted))
 
-    def test_a_large_headroom_never_takes_the_width_below_one(self):
-        self.assertEqual(1, broker_admission.width_for(6, headroom=10))
+    def test_a_raised_session_cap_never_takes_the_width_below_four(self):
+        # An operator can raise the session cap; the width still never drops
+        # below today's four.
+        for admitted, headroom in ((8, 6), (8, 8), (6, 10), (16, 15)):
+            with self.subTest(admitted=admitted, headroom=headroom):
+                self.assertEqual(4, broker_admission.width_for(admitted, headroom=headroom))
 
 
 class _Response(io.BytesIO):
@@ -42,21 +47,24 @@ class ReadReportTest(unittest.TestCase):
     ENDPOINT = "http://credential-proxy:8080"
 
     def _reading(self, body=None, error=None):
-        def opener(request):
-            self.seen.append(request)
+        def opener(request, timeout=None):
+            self.seen.append((request, timeout))
             if error is not None:
                 raise error
             return _Response(json.dumps(body).encode())
 
         self.seen = []
-        return mock.patch.object(credential_proxy_client, "open_broker_request", side_effect=opener)
+        return mock.patch.object(broker_admission._OPENER, "open", side_effect=opener)
 
     def test_it_reads_the_admitted_count_from_the_route(self):
         with mock.patch.object(credential_proxy_client, "authorization_headers", return_value={"Authorization": "Bearer t"}), \
                 self._reading({"slot_cap": 8, "budget_admits": 9, "admitted": 8, "session_cap": 2}):
             self.assertEqual((8, 2), broker_admission.read_report(self.ENDPOINT))
-        self.assertEqual(self.ENDPOINT + "/v1/exec/admission", self.seen[0].full_url)
-        self.assertEqual("Bearer t", self.seen[0].get_header("Authorization"))
+        request, timeout = self.seen[0]
+        self.assertEqual(self.ENDPOINT + "/v1/exec/admission", request.full_url)
+        self.assertEqual("Bearer t", request.get_header("Authorization"))
+        # Bounded end to end, unlike the broker client's exec opener.
+        self.assertEqual(broker_admission.ADMISSION_TIMEOUT_S, timeout)
 
     def test_a_missing_or_bad_session_cap_reads_as_the_default(self):
         for name, body in {"missing": {"admitted": 8}, "zero": {"admitted": 8, "session_cap": 0}, "text": {"admitted": 8, "session_cap": "2"}}.items():
@@ -69,6 +77,9 @@ class ReadReportTest(unittest.TestCase):
             "an older broker's 404": dict(error=urllib.error.HTTPError(self.ENDPOINT, 404, "Not Found", {}, None)),
             "a refusal": dict(error=urllib.error.HTTPError(self.ENDPOINT, 403, "Forbidden", {}, None)),
             "no connection": dict(error=urllib.error.URLError("refused")),
+            "a body cut short": dict(error=http.client.IncompleteRead(b"{")),
+            "a mangled status line": dict(error=http.client.BadStatusLine("garbage")),
+            "a read that times out": dict(error=TimeoutError("timed out")),
             "not a count": dict(body={"admitted": "eight"}),
             "a boolean": dict(body={"admitted": True}),
             "zero": dict(body={"admitted": 0}),

@@ -38,6 +38,10 @@ import collect  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -453,6 +457,10 @@ class TestSweepPool(unittest.TestCase):
                 assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
 
 
+class _WidthAsked(Exception):
+    """Raised by a patched broker_admission.sweep_width, to show it was asked."""
+
+
 def assert_resolves_the_broker_width(case, mod, name):
     """``mod``'s pool width is the broker's: ``collect_fleet(max_workers=None)``
     resolves it through broker_admission, and no constant stands in for it."""
@@ -462,11 +470,20 @@ def assert_resolves_the_broker_width(case, mod, name):
         f"{name}: collect_fleet's max_workers must default to None, resolved from the broker",
     )
     case.assertIn("broker_admission", vars(mod), f"{name} doesn't import broker_admission")
-    case.assertTrue(
-        "max_workers = max_workers or broker_admission.sweep_width()" in inspect.getsource(mod.collect_fleet),
-        f"{name}: collect_fleet doesn't resolve its width through broker_admission.sweep_width()",
-    )
     case.assertFalse(hasattr(mod, "MAX_WORKERS"), f"{name} still carries a MAX_WORKERS constant")
+    # By behaviour, not by the line's spelling: with max_workers unset,
+    # collect_fleet asks the broker before anything else. The patched
+    # sweep_width raises, so nothing past that point runs, and the required
+    # arguments it never reaches can be placeholders.
+    required = [
+        param
+        for param in inspect.signature(mod.collect_fleet).parameters.values()
+        if param.default is inspect.Parameter.empty
+        and param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    with mock.patch.object(mod.broker_admission, "sweep_width", side_effect=_WidthAsked):
+        with case.assertRaises(_WidthAsked, msg=f"{name}: collect_fleet doesn't ask broker_admission.sweep_width() for its width"):
+            mod.collect_fleet(*[None] * len(required))
 
 
 class TestNoRequests(unittest.TestCase):

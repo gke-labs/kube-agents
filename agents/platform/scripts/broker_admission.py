@@ -16,8 +16,8 @@ effective limit, so only the broker can say.
 `sweep_width` leaves the session role's cap free (two by default; the broker
 reports it) when the broker admits six or more, so a sweep doesn't take every
 slot a live chat read would queue behind, and
-otherwise reads at most four wide, today's width, so no install sweeps slower
-than it did. This doesn't coordinate sweeps that run at the same time: each
+otherwise reads at most four wide, today's width. The headroom never takes the
+width below four either, so no install sweeps slower than it did. This doesn't coordinate sweeps that run at the same time: each
 sizes its own pool, and the broker admits in arrival order, so live reads still
 queue behind all of them. Putting live reads first takes priority admission in
 the broker, which is separate work.
@@ -28,6 +28,7 @@ width of four.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -46,6 +47,16 @@ CHAT_HEADROOM = 2
 # The admitted count at or above which the headroom is taken; below it the
 # width stays at most FALLBACK_WIDTH, so no install sweeps slower than before.
 HEADROOM_FROM = 6
+# The whole admission read's deadline, connect and body together. The broker
+# client's own opener drops its socket timeout after connecting, on purpose,
+# because an exec may run for minutes; this read is one small JSON body, and a
+# connection that goes half-open must not hold the sweep back before it reads a
+# single cluster.
+ADMISSION_TIMEOUT_S = 10
+# Never follow a redirect out of the broker: urllib would re-send the
+# Authorization header to wherever it points (credential_proxy_client._NoRedirect
+# says why).
+_OPENER = urllib.request.build_opener(credential_proxy_client._NoRedirect())
 
 _cached_width: int | None = None
 
@@ -53,9 +64,12 @@ _cached_width: int | None = None
 def width_for(admitted: int, headroom: int = CHAT_HEADROOM) -> int:
     """The sweep width for a broker that admits ``admitted`` commands at once
     and keeps ``headroom`` for a chat session's reads."""
+    floor = max(1, min(FALLBACK_WIDTH, admitted))
     if admitted >= HEADROOM_FROM:
-        return max(1, admitted - headroom)
-    return max(1, min(FALLBACK_WIDTH, admitted))
+        # Never below today's width, however large a session cap the broker
+        # reports: the headroom only takes from what this change added.
+        return max(floor, admitted - headroom)
+    return floor
 
 
 def _positive_int(value: object) -> int | None:
@@ -75,9 +89,18 @@ def read_report(endpoint: str | None = None) -> tuple[int, int] | None:
             endpoint.rstrip("/") + ADMISSION_PATH,
             headers=credential_proxy_client.authorization_headers(),
         )
-        with credential_proxy_client.open_broker_request(request) as response:
+        with _OPENER.open(request, timeout=ADMISSION_TIMEOUT_S) as response:
             report = json.load(response)
-    except (urllib.error.URLError, OSError, ValueError, credential_proxy_client.TokenUnavailable):
+    except (
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+        # A broker or intermediary that cuts the body short or mangles the
+        # status line raises IncompleteRead or BadStatusLine, neither an
+        # OSError (credential_proxy_client.BrokerDisconnected says the same).
+        http.client.HTTPException,
+        credential_proxy_client.TokenUnavailable,
+    ):
         return None
     if not isinstance(report, dict):
         return None

@@ -12901,9 +12901,17 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
 
     class _RecordingExecutor:
         ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+        # What the admission report reads off a real executor.
+        max_concurrent_commands = 8
 
         def __init__(self):
             self.executed = []
+
+        def requests_the_budget_admits(self):
+            return 9
+
+        def admitted_requests(self):
+            return 8
 
         def git_lease_violation(self, argv, cwd):
             return None
@@ -13017,6 +13025,24 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
     def test_healthz_stays_open_for_the_readiness_probe(self):
         with urllib.request.urlopen(self.endpoint + "/healthz") as response:
             self.assertEqual(200, response.status)
+
+    def test_an_authenticated_get_on_the_admission_report_answers_the_four_numbers(self):
+        """The dispatch itself: past authentication, the exact path reaches the
+        report. A regression here would only show as the sweeps' silent fallback
+        to four, so it is pinned over the socket."""
+        request = urllib.request.Request(
+            self.endpoint + credential_proxy.ADMISSION_PATH,
+            headers={"Authorization": "Bearer good-token"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(200, response.status)
+            report = json.loads(response.read())
+        self.assertEqual(
+            {"slot_cap": 8, "budget_admits": 9, "admitted": 8, "session_cap": credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS},
+            report,
+        )
+        self.assertEqual([], self.executor.executed, "the admission report must run nothing")
 
     def test_an_unauthenticated_get_on_the_admission_report_is_401(self):
         request = urllib.request.Request(self.endpoint + credential_proxy.ADMISSION_PATH, method="GET")

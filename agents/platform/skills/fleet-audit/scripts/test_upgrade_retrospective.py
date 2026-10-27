@@ -35,6 +35,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 # file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell that carries either would turn
 # this suite's --project runs into refusals; both are neutralised at import, as the sibling suites do.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import upgrade_retrospective as ur  # noqa: E402
 
 ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
