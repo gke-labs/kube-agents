@@ -25,6 +25,7 @@ whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why, and
 section on last night's nightly run in its daily digest (`nightly_digest.py`). `nightly_bugs.py` files an
 issue for a case the nightly fails on every run three nights in a row, and
 (`nightly_infra.py`) one for the infra owner when the nightly or a case is
-kept from running.
-docs/ci-health.md is the page for all three.
+kept from running. `weekly_email.py` renders the weekly health email
+from the same nightly runs, refusing when an integrity check fails.
+docs/ci-health.md is the page for all of them.
 """

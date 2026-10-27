@@ -30,7 +30,11 @@ DOMAINS_TEXT = textwrap.dedent(
         owner: "alice"
         backup: Carol
     allowlist:
-      - cost
+      - slug: cost
+        since: 2026-10-17
+        issue: 1
+        owner: dave
+        expires: 2026-10-31
     """
 )
 
@@ -40,6 +44,13 @@ DOMAINS = case_owner.parse_domain_owners(DOMAINS_TEXT)
 class TestParsers(unittest.TestCase):
     def test_domain_owners_ignore_infra_owner(self):
         self.assertEqual(DOMAINS, {"cost": "Carol", "security": "alice"})
+
+    def test_an_allowlist_record_owner_is_not_the_domain_owner(self):
+        # An allowlist record starts `- slug:` and may name the person bringing
+        # coverage back; the domain's owner stays the row's, even when the
+        # record comes first.
+        text = "allowlist:\n  - slug: cost\n    owner: dave\n" + DOMAINS_TEXT
+        self.assertEqual(case_owner.parse_domain_owners(text), {"cost": "Carol", "security": "alice"})
 
     def test_the_scan_agrees_with_yaml_on_the_real_file(self):
         domains = yaml.safe_load(case_owner.DOMAINS_FILE.read_text())

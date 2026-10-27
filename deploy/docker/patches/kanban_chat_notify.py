@@ -200,6 +200,15 @@ API_SERVER_KEY_ENV = "API_SERVER_KEY"
 # send()'s metadata (see "Chat messages" above), and the route record's ask.
 CHAT_METADATA_KEY = "kage_chat"
 UPDATE_METADATA_KEY = "kage_update"
+#: Metadata key marking a conversation post as an ask's answer: the delivered
+#: report of the card that settles every card of the ask's plan, its value that
+#: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
+#: draws its rating controls on it, under the ask the plan is bound to.
+ANSWER_METADATA_KEY = "kage_answer"
+#: The ``a2a notify`` flags a conversation post and its answer ride on.
+CONVERSATION_FLAG = "--conversation"
+ANSWER_FLAG = "--answer-to"
+UPDATE_FLAG = "--update"
 CONVERSATION_ASK_KEY = "ask"
 # The chat message's file for `a2a notify --chat-file`: written mode 0600 by
 # tempfile, removed once the command returns.
@@ -823,7 +832,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
                 raise
             argv += ["--chat-file", path]
         if update:
-            argv += ["--update", update]
+            argv += [UPDATE_FLAG, update]
         return argv, path
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -842,6 +851,11 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
             chat_argv, chat_file = [], ""
         argv += chat_argv
+        # Only a conversation post answers an ask; the CLI refuses the flag on
+        # a home channel post, which would lose the report.
+        answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
+        if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
+            argv += [ANSWER_FLAG, answer_to]
         # The chat message above was laid out from the text as written; what a person reads has no step line.
         argv += ["--", _visible(content)]
         try:

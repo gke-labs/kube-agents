@@ -228,12 +228,14 @@ class Builder:
     def tracking(self, case: str, verdicts: list[dict]) -> dict | None:
         """The issue tracking ``case`` as the filer reads it: an open one, or
         a closed one that still tracks the streak ending at the newest
-        verdict (``nightly_bugs.still_tracks``)."""
+        verdict (``nightly_bugs.still_tracks``), closed after a red streak's
+        first night started among them."""
         issue = nightly_bugs.tracking_issue(self.open_issues, case)
         if issue:
             return issue
         passes = [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]
-        held = [i for i in self.closed_issues if nightly_bugs.still_tracks(i, verdicts[-1], passes, self.horizon)]
+        streak = nightly_bugs.red_streak(verdicts)
+        held = [i for i in self.closed_issues if nightly_bugs.still_tracks(i, verdicts[-1], passes, self.horizon, streak[0] if streak else None)]
         closed = nightly_bugs.tracking_issue(held, case)
         return {**closed, "state": STATE_CLOSED} if closed else None
 
@@ -475,7 +477,7 @@ def build(data: dict, now: datetime.datetime, gh, repo_root: pathlib.Path | None
     if gh is None:
         raise Skipped(SKIP_NO_GITHUB)
     # The closed ones the filer reads too, from the window's first night: one
-    # closed after a streak's newest night, or handed off, still tracks it.
+    # closed after a streak's oldest night started, or handed off, still tracks it.
     starts = [nightly.parse_iso(n.get("started")) for ns in nightly_infra.part_nights(data, LOOKBACK_NIGHTS).values() for n in ns]
     horizon = min((t for t in starts if t), default=None)
     # Read and cross-checked as the filer reads them: a REST listing that

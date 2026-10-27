@@ -54,7 +54,8 @@
 # ("presubmit cases", "presubmit units"); no count is written here, so a seat
 # change edits only its own entry. The mix: domain probes, a reliability
 # prompt variation, cluster-debugging cases, the incident-triage probe, the
-# kanban smoke, the two cases here that request a pull request (the
+# kanban smoke, the consistency drift audit (since 2026-10-26, the one full
+# audit on the roster), the two cases here that request a pull request (the
 # remediation writer pdb-remediation-pr and the source-control branch-reuse
 # writer), and the held-out seats (the compliance canary among them since
 # 2026-09-29, ~1000-2000s a repetition; its three repetitions serialize on
@@ -62,7 +63,8 @@
 # left for the nightly 2026-10-16 (#3269) and came back 2026-10-23 on three
 # clean nightlies after its prompt fix (#3338); consistency-authorized-networks-probe
 # left 2026-10-21 (#3598), putting consistency on the docs/designs/domains.yaml
-# allowlist. The remediation writer
+# allowlist until consistency-drift-outlier took its roster line on
+# 2026-10-26. The remediation writer
 # pdb-remediation-pr took its roster line 2026-10-14 (#2016), which took
 # remediation off that allowlist, was demoted to the nightly 2026-10-17
 # (#3120), which put it back on, and returned 2026-10-26 after #3145;
@@ -75,7 +77,9 @@
 # at 600-1300s each do not fit one presubmit, so each audit domain is
 # covered by a PROBE -- a targeted question about that domain's planted
 # defect, graded on the reply, the shape cluster-agent-crashloop-debug
-# proved at 142s. The one full audit kept here as the machinery canary
+# proved at 142s. (consistency-drift-outlier came back as a full audit on
+# 2026-10-26, at about 200s a repetition on the claude-opus-5-5 agent model.)
+# The full audit kept here as the machinery canary
 # (compliance-rbac-overgrant, under the fleet-audits domain) ran on every
 # pull request from 2026-08-25 until 2026-09-22 without ever being admitted,
 # was a nightly case 2026-09-22 to 2026-09-29 and is seated held out below
@@ -89,6 +93,34 @@
 ./tasks/security-overgrant-probe/task.yaml
 ./tasks/upgrades-lagging-master-probe/task.yaml
 ./tasks/cost-idle-pool-probe/task.yaml
+
+# The consistency domain's roster seat since 2026-10-26, moved in from
+# nightly-cases.txt on its record there after the domain's probe,
+# consistency-authorized-networks-probe, was demoted on 2026-10-21 (#3598).
+# Not a probe: the full fleet-consistency-drift audit, one of the four
+# recast out of this file on 2026-08-26 at 600-1300s a repetition, which
+# runs at about 200s on the claude-opus-5-5 agent model. 33/34 graded
+# repetitions on the twelve main nightlies that graded it 2026-10-13 to
+# 10-26 (UTC build start; 10-21's build uploaded nothing and 10-25's hit its
+# deadline before grading), the one miss on 10-16 on the Gemini setup (the
+# Platform Agent fanned the audit out to cluster agents; one filed the right
+# ledger, and the final answer carried no ledger URL); 14/14 on the five
+# graded nights since the model change of 2026-10-19, 5/5 under spec.mode
+# next (10-24 2/2 with one infra repetition, 10-26 3/3), median repetition
+# 198s (165-397s) on the fourteen. The evidence store reads `collecting`
+# because the model change and then next mode each reset the key. Graded on
+# the ledger (ledger_issue_contains on the finding ids, seeded-c and the
+# authorized-networks facet), not the reply, so the ledger path blocks with
+# it. It reads seeded-c's drift-outlier role, which the hourly fleet scan
+# asserts (masterAuthorizedNetworksConfig.enabled never true). The scan does
+# not yet assert the majority side: a peer (seeded-a, -b or -d) losing its
+# block, or any seeded cluster under a day old, leaves no baseline and fails
+# every repetition (#4015; docs/eval-gate-roster.md, "Demoting a flaky
+# case"). It requests
+# no pull request (the audit's remediation sweep is off on the inject lane,
+# #3439), so it runs in the first phase. Hinted at 600s in unit_cost_hint.
+# This line took consistency off the docs/designs/domains.yaml allowlist.
+./tasks/consistency-drift-outlier/task.yaml
 
 # The reliability prompt variation that grades what the probe does not ask
 # for: reliability-pdb-probe asks whether checkout-gateway survives a drain;
@@ -218,8 +250,9 @@
 # Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
 # lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. One of the
 # presubmit cases that write to GitHub, with pdb-remediation-pr and
-# vcs-spent-branch-reuse above, and the one that writes a ledger: the
-# minted token, the cloned *-infra workspace, the ledger write.
+# vcs-spent-branch-reuse above, and one of the two that write a ledger,
+# with consistency-drift-outlier above since 2026-10-26: the minted token,
+# the cloned *-infra workspace, the ledger write.
 # 1002s median / 2074s p90 over 903 presubmit
 # repetitions 2026-09-04 to 09-15, the 3000s delegation ceiling, priced in
 # unit_cost_hint. Roster line when #2013 step 3's three clean days hold;
@@ -242,8 +275,9 @@
 #   (obtainability-planted-pdb, stockout-pinned-pool,
 #   upgrade-readiness-lagging-cluster, consistency-drift-outlier), each
 #   domain covered by its probe above (the consistency probe left for the
-#   nightly 2026-10-21, #3598; the upgrades probe was nightly-only 2026-10-16
-#   to 2026-10-23, #3269);
+#   nightly 2026-10-21, #3598, and consistency-drift-outlier itself came back
+#   to the roster above on 2026-10-26; the upgrades probe was nightly-only
+#   2026-10-16 to 2026-10-23, #3269);
 #   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.

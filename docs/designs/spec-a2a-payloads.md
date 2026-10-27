@@ -837,8 +837,12 @@ matches a key that adds a `-` suffix to it. The alert is a
 home-channel post and its triage a reply in its thread, so the edit asks the gateway to
 keep `update` keys for a home-channel thread as it does for a conversation. The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
-while one waits on the user, and `settle: done` or `failed` once all have settled. The
-notifier has not seen the ask, so the bridge records its kind on the conversation route
+while one waits on the user, and `settle: done` or `failed` once all have settled. A
+completed card's report, or a hard-wall block's reason, whose settle finished the ask's plan goes
+out with `--answer-to <plan key>` (`answer_to` on the request): it is that ask's answer, the one
+post the gateway draws rating controls on, under the ask the plan's key is bound to
+(spec-chatops-gateway.md, "Answer feedback"). A fan-out's children fold into their rows and post
+nothing, so a fan-out flags its creator's completion alone. The notifier has not seen the ask, so the bridge records its kind on the conversation route
 (`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
 typed answer read back onto the question it answers, which needs the backend's own
 history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
@@ -882,7 +886,9 @@ counts are what it could not promise: `failed` cards it could not archive, `pend
 archives still running when it ran out of time, and `unresolved` cards claimed just before
 the stop, for which a worker may still start. `truncated` says more cards were open than one
 stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
-cut to fit the part. A stop that failed carries no part and ends `failed` with
+cut to fit the part. An optional list rides beside them for the Slack Stop button's reply
+(spec-chatops-gateway, the Slack adapter): `notStopped`, the cards the three counts count, by id
+and title. An executor that sends none leaves it out, which reads as none named. A stop that failed carries no part and ends `failed` with
 `reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
 bus refuses the result with the part, the text goes alone, so a `completed` control can
 arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.

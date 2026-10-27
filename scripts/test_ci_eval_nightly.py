@@ -287,9 +287,11 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            # agent-kanban-smoke is the lane's only roster case and is
-            # inject-excluded; vcs-review-feedback-read-back is held out.
+            # agent-kanban-smoke is the lane's only roster case, inject-excluded
+            # here by a scratch entry (the real list holds no roster case since
+            # #4004); vcs-review-feedback-read-back is held out.
             (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/vcs-review-feedback-read-back/task.yaml\n")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\nagent-kanban-smoke\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("every blocking-roster case in eval/gitlab-cases.txt is excluded on the inject lane", result.stderr)
@@ -534,16 +536,28 @@ class InjectLaneExclusionTest(unittest.TestCase):
         # A nightly-only exclusion has nothing to leave on the presubmit tier.
         for name in (n for n in eval_rosters.inject_lane_exclusions() if n in eval_rosters.presubmit_cases()):
             self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
+        # No roster case is excluded since #4004, so the export is the whole
+        # roster; test_an_excluded_roster_case_leaves_the_export covers a
+        # roster case on the list.
+        excluded_names = set(eval_rosters.inject_lane_exclusions())
+        self.assertFalse(excluded_names & set(eval_rosters.blocking_roster()))
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
+
+    def test_an_excluded_roster_case_leaves_the_export(self):
         # The roster FILE is untouched (an exclusion is not a demotion), but
         # the export leaves the dropped names out: a roster name the suite
         # never grades would trip bench-gate's misspelled-roster banner on
-        # every run of the lane.
-        excluded_names = set(eval_rosters.inject_lane_exclusions())
-        self.assertTrue(excluded_names & set(eval_rosters.blocking_roster()), "the pinned exclusion is a roster case, so the export must differ from the file")
-        self.assertEqual(
-            lines_tagged(result, "ROSTER"),
-            [",".join(c for c in eval_rosters.blocking_roster() if c not in excluded_names)],
-        )
+        # every run of the lane. A scratch exclusion of one roster case.
+        roster = eval_rosters.blocking_roster()
+        dropped = roster[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text(f"# #2039: a scratch exclusion for the test\n{dropped}\n")
+            result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"AGENT_TRANSPORT=inject: {dropped} leaves the matrix", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in roster if c != dropped)])
 
     def test_the_api_lane_exports_the_whole_roster(self):
         result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "api"})
@@ -926,7 +940,7 @@ class NightlyPartTest(unittest.TestCase):
         src = SCRIPT.read_text(encoding="utf-8")
         tier = src.index('EVAL_TIER="${EVAL_TIER:-presubmit}"')
         check = src.index('EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"')
-        lane = src.index("# ─── The inject lane's safeguards")
+        lane = src.index("# ─── The lanes' safeguards")
         step = src.index("# ─── The nightly part")
         roster = src.index("\nBLOCKING_ROSTER_ENTRIES=")
         names = src.index("\nTASK_NAMES=()")

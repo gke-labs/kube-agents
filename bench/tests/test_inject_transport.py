@@ -2547,6 +2547,7 @@ from test_board import (  # noqa: E402 -- the store builders live with the board
     FRONT as CARD_A,
     CHILD as CARD_B,
     SESSION as API_SESSION,
+    block_card,
     build_session_store,
     local_shell,
     set_card,
@@ -2628,6 +2629,34 @@ def test_two_cards_are_each_waited_for_and_graded(
     assert len(api_executor.submissions) == 1
 
 
+def test_a_card_paused_on_a_question_is_graded_on_the_question(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked on ``needs_input`` delivers no result; the conversation
+    shows its question, and the wait ends there (blocked is terminal)."""
+    build_session_store(tmp_path, created=[CARD_A])
+    question = "payments-api is OOMKilled. Which fix?\n- raise the limit\n- set a request"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            block_card(tmp_path, CARD_A, question)
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, advance))
+
+    result = KubeAgentsHarness().run("why does payments-api restart? give me options")
+
+    assert not result.errors, result.errors
+    final = result.metadata["final_message"]
+    assert final.startswith(ACK)
+    # The worker's run closed with the question as its summary; it is
+    # delivered once, as the question, never as the card's result.
+    assert f"Question from delegated task {CARD_A}:\n{question}" in final
+    assert "Result of delegated task" not in final
+    assert final.count(question) == 1
+    assert result.metadata["delegated_cards"] == {CARD_A: "blocked"}
+    assert len(api_executor.submissions) == 1
+
+
 def test_a_card_that_never_settles_ends_at_the_delegation_ceiling(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2670,6 +2699,39 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
     ]
     assert result.metadata["final_message"] == ACK
     assert "RESOURCE_EXHAUSTED" not in result.output
+
+
+def test_inject_transport_delegated_worker_rate_limit_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On inject transport, when a card closes with the Hermes rate limit summary and worker did not act, mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "blocked", summary=rate_limit_msg)
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

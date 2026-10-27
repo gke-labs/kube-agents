@@ -12,7 +12,9 @@ sends a message only when:
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
                                                plus a section on last night's
                                                nightly run when --data is given
-                                               (nightly_digest.py)
+                                               (nightly_digest.py), and one
+                                               line per domain with no blocking
+                                               presubmit seat (coverage_gaps.py)
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only
@@ -1549,7 +1551,7 @@ def pool_digest_line(pool: dict) -> str:
     )
 
 
-def render_digest(health: dict, now: datetime, data: dict | None = None, section=None) -> str:
+def render_digest(health: dict, now: datetime, data: dict | None = None, section=None, coverage=()) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- last night's nightly run. ``section`` is what
     ``nightly_section`` returned: the nightly section's lines
@@ -1558,7 +1560,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     is newly failing against the night before, the opening chat turn's p50
     and p95 when the reps carried it, and the wall clock, or that the night
     was truncated or missing -- and a reason adds a line saying why the
-    section is missing."""
+    section is missing. ``coverage`` is ``coverage_lines``'s: one line per
+    domain with no blocking presubmit seat, none while every domain has one."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1602,6 +1605,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
         lines.append(NIGHTLY_URL)
         if isinstance(section, str):
             lines.append(NIGHTLY_SKIPPED.format(reason=section))
+    lines.extend(coverage)
     fleet = fixture_digest_line(health)
     if fleet:
         lines.append(fleet)
@@ -1613,11 +1617,11 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     return "\n".join(lines)
 
 
-def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None, data: dict | None = None, section=None) -> str:
+def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None, data: dict | None = None, section=None, coverage=()) -> str:
     if kind == KIND_RECOVERY:
         return render_recovery(health, prev or {}, now)
     if kind == KIND_DIGEST:
-        return render_digest(health, now, data, section)
+        return render_digest(health, now, data, section, coverage)
     if kind == KIND_STALE:
         return render_stale(health)
     if kind == KIND_FIXTURE_SCAN:
@@ -1719,6 +1723,7 @@ def run(
     tracker: gate_issue.Tracker | None = None,
     data: dict | None = None,
     nightly_section=None,
+    coverage_lines=None,
 ) -> tuple[dict, list[tuple[str, str]], list[str]]:
     """Decide, render, send. Returns (new state, [(kind, text)], kinds that failed).
 
@@ -1726,6 +1731,8 @@ def run(
     night's nightly run from it. `nightly_section`, when given, is called
     once, only on a tick that sends the digest, and returns the nightly
     section (an object with `lines`) or the reason it was skipped.
+    `coverage_lines`, when given, is called the same way and returns the
+    digest's coverage-gap lines.
 
     `tracker`, when given, files the tracking issue a new OUTAGE or a new
     lost-pods condition lacks before the message is rendered (so it can say
@@ -1804,7 +1811,8 @@ def run(
         if issue and issue not in carried:
             carried.append(issue)
     section = nightly_section() if nightly_section is not None and data is not None and KIND_DIGEST in kinds else None
-    messages = [(kind, render(kind, health, told, now, issue, data, section)) for kind in kinds]
+    coverage = coverage_lines() if coverage_lines is not None and KIND_DIGEST in kinds else []
+    messages = [(kind, render(kind, health, told, now, issue, data, section, coverage)) for kind in kinds]
     failed = []
     for kind, text in messages:
         if dry_run:
@@ -1985,6 +1993,22 @@ def nightly_section(data: dict, now: datetime, gh, environ=os.environ):
         return reason
 
 
+def coverage_lines(data: dict | None, now: datetime, store_path: pathlib.Path | None = None) -> list[str]:
+    """coverage_gaps.digest_lines over this checkout: one line per domain
+    with no blocking presubmit seat. Imported here for the reason
+    nightly_section is; any failure is a warning and no lines, never a lost
+    digest."""
+    try:
+        from eval_dashboard import coverage_gaps
+
+        store = coverage_gaps.read_json(store_path, "store.json")
+        return coverage_gaps.digest_lines(coverage_gaps.find_gaps(coverage_gaps.REPO_ROOT, data or {}, store, now))
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: coverage-gap lines skipped")
+        return []
+
+
 def parse_tz(name: str):
     try:
         return ZoneInfo(name)
@@ -1997,6 +2021,7 @@ def parse_args(argv):
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote")
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
     parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries a section on last night's nightly run, or one line when the section cannot be built (unreadable: a warning and the digest says so)")
+    parser.add_argument("--store", type=pathlib.Path, default=None, help="the store.json the tick read; the digest's coverage-gap lines then carry the evidence store's verdict on each domain's best candidate")
     parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
     parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ}); times in messages stay {DEFAULT_TZ} ({TZ_LABEL}) regardless")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
@@ -2039,8 +2064,11 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
     def section():
         return nightly_section(data, now, gh, environ)
 
+    def coverage():
+        return coverage_lines(data, now, args.store)
+
     prev = read_state(args.state, runner)
-    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker, data, section)
+    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker, data, section, coverage)
     if prev is None and failed and len(failed) == len(messages):
         # Nothing has ever been told and nothing got through: there is no
         # state worth recording, and the next tick starts from scratch.

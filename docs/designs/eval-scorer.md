@@ -126,8 +126,8 @@ it delegates, so `classify_rep()` classifies the repetition `infra` under a reas
 with the marker. The dashboard reads that lead to count these apart from quota-storm repetitions
 (`scripts/eval_dashboard/SCHEMA.md`). A ceiling hit after a partial delivery carries no marker
 and grades on what arrived. Both the ceiling check and the never-ran signature sit after rung 1 —
-the catastrophic score grades the world outside the record — the cluster, and on the inject lane
-the GitOps repository — rather than the record, so a tripped safeguard is
+the catastrophic score grades the world outside the record — the cluster and the GitOps
+repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one without the marker still blocks at rung 2. The near-misses still block at rung 3:
@@ -1051,8 +1051,7 @@ export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
 the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
-so record under the version key's `next` mode; `ci-kube-agents-eval-nightly-today` in the same file
-is the same recorder on a `today` install, and keeps today's window.
+so record under the version key's `next` mode. No job in the file records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the

@@ -10,7 +10,7 @@ wired in by ``deploy/docker/patches/apply_kanban_verified_claims.py``:
 
 ``tools/kanban_tools.py``
     :func:`apply_completion_rules` runs each rule in :data:`RULES` before the
-    card closes. The first, :func:`verified_claims_rule`, checks
+    card closes. One, :func:`verified_claims_rule`, checks
     ``kanban_complete``'s new ``verified_claims`` parameter against that
     record, or against the claims the gate already accepted on the cards this
     card created. Another rule can read the record through

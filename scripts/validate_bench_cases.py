@@ -448,9 +448,11 @@ FIXTURE_NOT_READY = {
         "verification sweep"
     ),
     "autoops-warning-event-triage-open-pr": (
-        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env "
-        "and a manifest for eval-open-pr-workload in each pool project's *-infra repository "
-        "so the follow-up Platform Agent card can open the recommended remediation Pull Request"
+        "#2513 / #3576: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in "
+        "spec.deployment.env and a GitOps repository declaring eval-open-pr-workload alongside "
+        "provisioning files; every CI eval install leaves INCIDENT_TRIAGE_OPEN_PULL_REQUEST off "
+        "(which the nightly AutoOps triage cases require) and no pool *-infra repository carries "
+        "both paths, so no CI tier can run it; run it by hand against such an install"
     ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
@@ -548,8 +550,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
     # Likewise: "the run wrote to the GitOps repository since it started" is
-    # the assertion, and every field narrows it. The inject lane appends it
-    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # the assertion, and every field narrows it. Both lanes append it to
+    # every case they run (hack/eval/inject-lane-safeguards.yaml); a case
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),

@@ -1,15 +1,16 @@
 name: Hold Unresolved Threads
 
-# Keep a pull request with unresolved review threads out of Tide's merge pool.
+# Keep a pull request with unresolved review threads out of the merge queue.
 #
-# `main` requires every conversation resolved before a merge, and Tide does
-# not read that rule: it picks the lowest-numbered `lgtm`+`approved` pull
-# request, GitHub refuses the merge, and Tide retries the same one every ~85
-# seconds while every other pull request in the pool waits behind it. #608
-# and #1197 held the queue that way for an hour on 2026-09-05.
+# `main` requires every conversation resolved before a merge. This workflow
+# was written for Tide, which did not read that rule: it picked the
+# lowest-numbered `lgtm`+`approved` pull request, GitHub refused the merge,
+# and Tide retried the same one every ~85 seconds while every other pull
+# request waited behind it. #608 and #1197 held the queue that way for an
+# hour on 2026-09-05.
 #
 # `scripts/hold_unresolved_threads.py` mirrors thread state onto the bare
-# `do-not-merge` label, which Tide's query for this repository excludes and no
+# `do-not-merge` label, which the enqueue sweep reads as a hold and no
 # Prow plugin writes: on while any thread is unresolved (with one comment
 # saying so), off once they all are -- unless a person applied it, in which
 # case it is theirs. The script's docstring is the reference.
@@ -18,8 +19,8 @@ name: Hold Unresolved Threads
 # `pull_request_review_thread`, but from a fork -- where every pull request
 # here comes from -- that event hands the workflow a read-only token, so it
 # cannot be the mechanism. The `labeled` fast path closes the window that
-# matters most: the moment `lgtm` or `approved` lands is the moment Tide would
-# otherwise start retrying, and `pull_request_target` carries a write token
+# matters most: the moment `lgtm` or `approved` lands is also the moment the
+# enqueue sweep's own fast path turns auto-merge on, and `pull_request_target` carries a write token
 # whatever the head's origin. Nothing from the pull request is checked out or
 # read as code on either path.
 on:

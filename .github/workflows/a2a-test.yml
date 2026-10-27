@@ -11,9 +11,10 @@ name: A2A Module Tests
 # assertion is about Kubernetes rather than about a stub this repository also
 # wrote. Those tests SKIP when KUBEBUILDER_ASSETS is unset, so without this step
 # they would run nowhere and the job would still report green. The nats CLI the
-# step below installs is the same shape of dependency with the same failure
-# mode. Both are checked before the tests run, because these are the only two
-# things this job arms that a test quietly does without.
+# step below installs and the `node` binary `cmd/web-console`'s page harness
+# runs are the same shape of dependency with the same failure mode. All three
+# are checked before the tests run, because these are the only three things a
+# test in this module quietly does without.
 #
 # The trigger arrangement is k8s-operator-test.yml's, for the reasons its
 # header comment gives: `Run A2A Module Tests` is a required check, so on a
@@ -186,6 +187,10 @@ jobs:
           NATS_CLI="$GO_BIN_DIR/nats"
           if [ ! -x "$NATS_CLI" ]; then
             echo "::error::the nats CLI install did not produce an executable at '$NATS_CLI'. The three CLI-backed tests would skip and this job would pass regardless."
+            exit 1
+          fi
+          if ! command -v node >/dev/null 2>&1; then
+            echo "::error::'node' is not on PATH. The web-console page harness test would skip and this job would pass regardless."
             exit 1
           fi
           cd a2a

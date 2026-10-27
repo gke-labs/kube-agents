@@ -13,9 +13,9 @@
 # Three things count as a verdict this run could only repeat. The first is a
 # green build at THIS head (#1202), or at an earlier head with the same tree
 # (an empty commit, or a message-only rewrite: the matrix gets the same
-# files, so it is the same head in all but name): Tide credits a presubmit only against the
-# base SHA it ran on, so every merge to main retests, or batches, every other
-# green pull request whose head has not changed -- over the three weeks to
+# files, so it is the same head in all but name): Tide credited a presubmit only against the
+# base SHA it ran on, so every merge to main retested, or batched, every other
+# green pull request whose head had not changed -- over the three weeks to
 # 2026-10-05 that was 150 Tide-started runs against 831 merges, 34 of them on
 # a pull request that had already merged, and batches held the pool for 53
 # hours in all with nothing merging while one was in flight. A head that
@@ -43,10 +43,10 @@
 # the override plugin posts a success status reading "Overridden by <user>"
 # (kubernetes-sigs/prow, pkg/plugins/override), which only a repository
 # admin can obtain, and it is the admin's decision that this head merges
-# without the job passing. A retest Tide starts after main moves posts
-# `pending` over that status and, run in full, comes back with whatever red
+# without the job passing. A retest Tide started after main moved posted
+# `pending` over that status and, run in full, came back with whatever red
 # the override was given for -- so the override had to be repeated after
-# every merge, and the phantom retest Tide starts on a pull request it has
+# every merge, and the phantom retest Tide started on a pull request it had
 # just merged by override ran the whole matrix for nobody (#2464 on
 # 2026-10-06: two overrides six minutes apart, then a phantom). Reusing
 # the override is the same trade as reusing a green, at the admin's
@@ -75,11 +75,11 @@
 # and skips the build as an override's standing rather than a run. A reuse
 # of a green is not marked: a build that reused a real green is attested in
 # its own right, and marking it would push the real green past the scan's
-# depth on a pull request Tide retests often. A run that cannot write the
+# depth on a pull request that is retested often. A run that cannot write the
 # record (no ARTIFACTS directory, an unwritable file) does not reuse an
 # override.
 #
-# A batch job (Tide testing several pull requests merged together) is
+# A batch job (one in which Tide tested several pull requests merged together) is
 # revalidated pull by pull: every one must hold a reusable verdict, else the
 # batch runs in full. PULL_REFS carries the batch's pulls; a serial presubmit
 # names its one pull in PULL_NUMBER and PULL_PULL_SHA.
@@ -750,8 +750,8 @@ print("attested")
   esac
 
   # The head itself has passed: the first kind of reusable verdict. The
-  # base is not compared -- a retest Tide starts because main moved, serial
-  # or batch, is exactly this case, and the header says what that trades
+  # base is not compared -- a retest Tide started because main moved, serial
+  # or batch, was exactly this case, and the header says what that trades
   # away. No git work is needed: the attested record names the head, and
   # the head is this run's.
   if [ "${prev_head}" = "${cur_head}" ]; then

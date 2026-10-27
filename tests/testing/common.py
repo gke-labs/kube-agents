@@ -101,20 +101,44 @@ INSTALLER_HELP_BANNER = "kube-agents Zero-Friction Installer"
 UPGRADER_HELP_BANNER = "Lifecycle Upgrade Engine"
 
 
+# Installer configuration keys that install.sh and installer_common.sh read from
+# the environment when seeding PARAM_* defaults. Stripped by default in
+# get_isolated_test_env so a developer's shell exports cannot steer hermetic
+# unit tests; tests that want a specific value pass it via `overrides`.
+SEEDED_INSTALLER_ENV_KEYS = (
+    "ACCEPT_NO_NETWORK_POLICY",
+    "ENABLE_NETWORK_POLICY",
+    "MIGRATE_NODE_POOLS",
+    "GOOGLE_CHAT_ENABLED",
+    "SLACK_ENABLED",
+    "ENABLE_GKE_BACKUP_PLAN",
+    "ENABLE_PUBSUB_PLATFORM",
+    "ENABLE_STOCKOUT_INVESTIGATOR",
+    "ENABLE_DRIFT_DETECTOR",
+    "WEB_CONSOLE_ENABLED",
+    "LITELLM_REDACTION_ENABLED",
+    "LITELLM_REDACTION_IP_ACTION",
+    "LITELLM_REDACTION_IP_ALLOW_CIDRS",
+    "LITELLM_REDACTION_RULES",
+    "SCOPED_SA_POOL_ENABLED",
+)
+
+
 def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     """Returns a sanitized environment for hermetic script execution, free of CI runner pollution.
 
-    `absent` names variables the child must not see even when the developer's
-    shell exports them: a test that relies on a variable being unset has to say
-    so here, because the copy starts from os.environ and an override of None is
-    not the same as no entry. Popped before the overrides, so a caller can name
-    a key in both and the override wins.
+    `SEEDED_INSTALLER_ENV_KEYS` and `absent` name variables the child must not
+    see even when the developer's shell exports them: a test that relies on a
+    variable being unset has to be insulated from os.environ. Popped before the
+    overrides, so a caller can name a key in `overrides` and the override wins.
     """
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("GITHUB_", "RUNNER_")) and k not in ("CI", "CONTINUOUS_INTEGRATION", "GH_TOKEN")
     }
+    for key in SEEDED_INSTALLER_ENV_KEYS:
+        env.pop(key, None)
     for key in absent:
         env.pop(key, None)
     if bin_dir:

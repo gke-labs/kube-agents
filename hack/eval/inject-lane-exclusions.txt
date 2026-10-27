@@ -2,10 +2,7 @@
 # matrix goes through the A2A gateway's inject door (the harness's
 # AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
 # EVAL_MODE_NEXT=1 except on the today lane), because the case's premise needs something the door
-# does not carry: a specialist's answer folded back into the chat thread, or
-# a card's wake, which the harness replays on the api transport only. A case
-# excluded while the lane pinned the bridge's cli executor, for a reason that
-# executor gave, stays here until a run on the default api executor grades it.
+# does not carry, such as a replay's turn that next's door would never send.
 #
 # One case id per line; `#` starts a comment, blank lines are skipped. The
 # reason is the comment block directly above the id, and it names the issue
@@ -15,9 +12,11 @@
 # only under AGENT_TRANSPORT=inject, drops the named cases from TASKS before the fan-out
 # and says so in the log; on the api transport the file changes nothing,
 # and the api lane's rosters (presubmit-cases.txt, blocking-roster.txt,
-# nightly-cases.txt) are untouched -- an entry here is not a demotion, and
-# the case still runs every night on ci-kube-agents-eval-nightly-today, the
-# nightly that grades spec.mode today. The
+# nightly-cases.txt) are untouched. An entry still takes a case out of CI:
+# the nightlies grade over inject, and the only api-transport job on main is
+# the today lane (ci-kube-agents-eval-today), which runs the presubmit matrix,
+# so a listed presubmit case runs there and a listed nightly case runs
+# nowhere. The
 # same shape as the validator's FIXTURE_NOT_READY: an exclusion with a
 # reason, not a marker on the case (docs/eval-gate-roster.md, "The inject
 # lane").
@@ -34,120 +33,11 @@
 # pull request's matrix and, for a blocking-roster case, out of what can red
 # one; hack/OWNERS scopes this file to the eval-crew alias.
 
-# #2039: grades delegation through the chat front door -- kanban_create by
-# the default profile, then the specialist's answer folded back into the
-# thread. Under the bridge's default api executor the default profile
-# answers the door's task and can file the card, but the card's completion
-# never reaches the A2A thread (a2a/docs/hermes-bridge.md, Executors) and
-# the lane's delegation wait reads no card ids, so the answer alone would
-# be graded on a premise the case does not have. Returns to the lane when
-# the delegation wait reads card ids on this path, or when the case is
-# rewritten for a transport-neutral premise.
-agent-kanban-smoke
-
-# #2039: grades the chat front door's reply to the wake a crashed card sends
-# it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
-# only turn). A card-wake replay needs AGENT_TRANSPORT=api and errors on
-# this lane (_execute_card_wake in bench/kube_agents_bench/harness.py),
-# whichever profile answers the door. Returns to the lane when the replay
-# can send its wake through the door.
-chat-voice-retry-says-it-is-retried
-# #2039: the same for the wake a card sends on its last attempt.
-chat-voice-final-attempt-is-not-retried
-
-# #2039: grades the chat front door's reply to the wake a blocked card sends
-# it (bench/kube_agents_bench/card_wake.py replays that wake as the run's
-# only turn). A card-wake replay needs AGENT_TRANSPORT=api and errors on
-# this lane (_execute_card_wake in bench/kube_agents_bench/harness.py),
-# whichever profile answers the door. Returns to the lane when the replay
-# can send its wake through the door.
-chat-voice-failure-leads-with-fact
-
-# #2039: grades the chat front door's silence on the wake a card sends when
-# its question is already posted (bench/kube_agents_bench/card_wake.py
-# replays that wake as the run's first turn). A card-wake replay needs
-# AGENT_TRANSPORT=api and errors on this lane (_execute_card_wake in
-# bench/kube_agents_bench/harness.py). Returns to the lane when the replay
-# can send its wake through the door.
-chat-question-wake-stays-silent
-# #2039: the same for a typed answer to that question in a session the wake
-# never reached (session: fresh).
+# #4004: grades a typed answer sent on a new session that starts from the
+# thread's context as today's Slack adapter renders it
+# (bench/kube_agents_bench/card_wake.py, session: fresh). Next's door sends
+# the message's own text, and a cold conversation is primed from the bus in
+# another frame (a2a/worker-adapter/adapter.go), so the replay's answer turn
+# is one no next-mode user sends. Returns to the lane when the replay builds
+# that turn as next's door does.
 chat-question-typed-answer-fresh-session
-# #2039: the same for an answer to that question given by clicking its button
-# (answer_by: click).
-chat-question-click-answer-stays-silent
-
-# #2039: a nightly-only case that grades the chat front door's own turn: its
-# delegation ack and the kanban_create behind it, with the specialist's
-# answer following in the thread. Under the bridge's default api executor
-# the default profile answers the door's task and can file the card, but the
-# card's completion never reaches the A2A thread (a2a/docs/hermes-bridge.md,
-# Executors) and the lane's delegation wait reads no card ids, the same gap
-# that keeps agent-kanban-smoke off. Returns to the lane with it.
-chat-voice-ack-names-target
-
-# #2039: a nightly-only case that grades the front door's answer to a reset
-# request. It was excluded while the lane pinned the bridge's cli executor,
-# under which the door's task reached `platform` and no front door took the
-# turn. Under the default api executor the default profile takes it, so that
-# reason no longer holds, but the case has not been graded on this lane.
-# Returns to the lane once a run on the api executor with it included grades
-# it.
-chat-reset-history-names-the-command
-# #2039: the same for the front door's choice to read the board for a board
-# question rather than file a card.
-chat-routing-board-read
-# #2039: the same gap as chat-voice-ack-names-target, for the front door
-# routing a fleet question to the platform specialist through kanban_create,
-# whose answer is the specialist's reading of the fleet. Returns to the lane
-# with agent-kanban-smoke.
-chat-routing-fleet-question
-
-# #2039: grades the greeting the chat profile's bootstrap_onboarding plugin
-# gives on a new user's first chat turn, which the stack arms for the API
-# server path. It was excluded while the lane pinned the bridge's cli
-# executor, under which the door's task reached `platform`, which carries no
-# onboarding greeting. Under the default api executor the door's task is a
-# turn on that API server, so that reason no longer holds, but the case has
-# not been graded on this lane. Returns to the lane once a run on the api
-# executor with it included grades it.
-first-install-hello-running
-# #2039: the same for the greeting once the first-look scan has finished.
-first-install-hello-done
-
-# #2039: grades the specialist's answer as the chat front door's card round
-# trip delivers it into the thread (answer_first reads each delivered card
-# result). The inject door addresses `platform` directly, so no card is
-# filed and no result is delivered, and the check fails every repetition.
-# Returns to the lane when the door routes through the chat profile.
-chat-voice-answer-first
-# #2039: grades the chat front door's ack for a fleet question and the
-# platform worker's fan-out beneath the one card it files. The same gap as
-# chat-voice-ack-names-target: under the default api executor the front
-# door acks and can file the card, but the worker's rows never reach the A2A
-# thread and the lane's delegation wait reads no card ids. Returns to the
-# lane with agent-kanban-smoke.
-chat-fanout-fleet-restarts-rows
-# #2039: grades the worker's needs_input block under the one card the chat front
-# door files for an asked-for choice (scope: workers). The same gap as
-# chat-fanout-fleet-restarts-rows: the lane's delegation wait reads no card
-# ids, so the worker checks fail closed. Returns to the lane with
-# agent-kanban-smoke.
-chat-question-asked-to-choose-pauses
-# #2039: grades the chat front door's reply to the wake a blocked card sends
-# it, as chat-voice-failure-leads-with-fact does: a card-wake replay needs
-# AGENT_TRANSPORT=api and errors on this lane. Returns to the lane with it.
-chat-failure-reply-declares-next-step
-# #2039: grades the worker's answer under the one card the chat front door
-# files, as chat-question-asked-to-choose-pauses does: the lane's delegation
-# wait reads no card ids. Returns to the lane with agent-kanban-smoke.
-chat-answer-declares-next-step
-# #2039: grades the worker's answer under the door's one card, as
-# chat-answer-declares-next-step does. Returns to the lane with agent-kanban-smoke.
-chat-answer-tangent-offer-declares-no-step
-# #2619: grades the platform worker's answer to a request for every fleet
-# audit's latest report, which on the api lane the harness folds into the
-# reply from the card the chat front door files. Under the api executor the lane's delegation
-# wait settles on the card's receipt and the worker's answer never reaches
-# the A2A thread, so the reply carries no report to grade.
-fleet-audit-request-line

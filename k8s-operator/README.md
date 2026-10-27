@@ -13,6 +13,7 @@ The operator is built using the Kubebuilder framework and is written in Go.
 Before building or deploying the operator, ensure you have the following installed:
 
 - [Go](https://go.dev/doc/install) (version 1.27+)
+- Python 3 (`make manifests`, and so `make build`, `make run` and `make test`, regenerate the CRD field pages on the docs site through `scripts/generate_docs.py`)
 - [Docker](https://docs.docker.com/get-docker/) or Podman (for building container images)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) (configured to access your Kubernetes/GKE cluster)
 - Access to a running Kubernetes/GKE cluster
@@ -92,15 +93,18 @@ is unset.
 ## Local Development (Fast Iteration)
 
 The operator is a standard Kubebuilder project; `make help` lists every target. `make manifests`
-writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, and `make test` downloads the
-envtest binaries to `bin/` on first run.
+writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the three CRD
+field reference pages under `docs/site/src/content/docs/operator/` from the API types (it needs
+`python3` and exits with an error without it), and `make test` downloads the envtest binaries to
+`bin/` on first run.
 
 `make build`, `make run` and `make test` all run `manifests`, `generate`, `fmt` and `vet` first, so
 generated code and manifests stay in sync automatically. `make install`, `make uninstall` and
 `make deploy` deliberately do not: they apply the manifests exactly as committed, so a deploy ships
 what is in git rather than whatever the local tree happens to regenerate, and leaves no modified
-files behind. Run `make manifests` yourself after changing the API types — CI fails if the committed
-output is stale.
+files behind. Run `make manifests` yourself after changing the API types or their doc comments — CI
+fails if the committed output is stale: the operator tests gate checks `config/`, and
+`make docs-check-generated` at the repository root checks the field pages.
 
 For local development and testing, you can run the operator controller as a local Go process on your machine, while pointing it to a remote GKE or local Kubernetes cluster. This bypasses the need to build and push container images on every code change.
 
