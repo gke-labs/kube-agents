@@ -861,13 +861,16 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
 # through session-kv's ``POST /v1/board/actions``, which unblocks or archives
 # only cards still blocked. It is never a turn. The row is then edited in
 # place: its buttons give way to "✓ Retrying. <name>, <time>" or "Dropped.
-# <name>, <time>" (or "No longer stuck." when the cards had already moved);
+# <name>, <time>" (or "No longer stuck. <name>, <time>" when the cards had already moved);
 # a tap that did not land keeps the buttons, with a line saying so, and the
 # row can be tapped again. One tap per row at a time, in this process.
 # --------------------------------------------------------------------------
 
 #: ``(channel, ts, row block id)`` of a row whose tap is running or landed.
 _board_tapped: OrderedDict[tuple, None] = OrderedDict()
+#: ``(channel, ts)`` of a card a tap edited: the lock its edits take, and the
+#: blocks the last one sent, or None before any landed.
+_board_edits: OrderedDict[tuple, tuple[asyncio.Lock, list | None]] = OrderedDict()
 
 
 def _board_request(verb: str, tasks: list[str], by: str) -> list[dict]:
@@ -891,14 +894,13 @@ def _board_request(verb: str, tasks: list[str], by: str) -> list[dict]:
 
 
 def board_outcome(results: list[dict]) -> str:
-    """One word for a row: ``done`` when any card was acted on, ``moved`` when every
-    card was already unstuck or gone, ``failed`` otherwise."""
+    """One word for a row: ``failed`` when any card was not settled, so the row keeps
+    its buttons and a second tap reaches the cards left; else ``done`` when any card
+    was acted on, ``moved`` when every card was already unstuck or gone."""
     outcomes = {str((r or {}).get("outcome") or "") for r in results}
-    if BOARD_DONE in outcomes:
-        return BOARD_DONE
-    if outcomes and outcomes <= BOARD_SETTLED_OUTCOMES:
-        return "moved"
-    return "failed"
+    if not outcomes or outcomes - BOARD_SETTLED_OUTCOMES - {BOARD_DONE}:
+        return "failed"
+    return BOARD_DONE if BOARD_DONE in outcomes else "moved"
 
 
 def board_line(verb: str, outcome: str, name: str, now: float) -> str:
@@ -961,10 +963,23 @@ async def board_action(adapter: Any, ack: Any, body: dict, action: dict) -> None
     if not settled:
         _board_tapped.pop(key, None)
     logger.info("slack_ux_clicks: %s by %s on %s: %s", verb, user_id, ", ".join(tasks), outcome)
-    blocks = board_row_blocks(message.get("blocks"), block_id, board_line(verb, outcome, name, time.time()), settled)
-    try:
-        await adapter._get_client(channel_id, team_id=team_id).chat_update(
-            channel=channel_id, ts=msg_ts, text=str(message.get("text") or ""), blocks=blocks,
-        )
-    except Exception as exc:  # noqa: BLE001 - the cards moved either way
-        logger.warning("slack_ux_clicks: could not edit the board row on %s: %s", msg_ts, exc)
+    line = board_line(verb, outcome, name, time.time())
+    message_key = (channel_id, msg_ts)
+    if message_key not in _board_edits:
+        _board_edits[message_key] = (asyncio.Lock(), None)
+        while len(_board_edits) > ANSWERED_MAX:
+            _board_edits.popitem(last=False)
+    lock = _board_edits[message_key][0]
+    # One edit of a message at a time, each from the blocks the last one sent: a
+    # tap's payload holds the message as it was when tapped, and another row's
+    # edit may have landed since.
+    async with lock:
+        sent = _board_edits.get(message_key, (lock, None))[1]
+        blocks = board_row_blocks(sent if sent is not None else message.get("blocks"), block_id, line, settled)
+        try:
+            await adapter._get_client(channel_id, team_id=team_id).chat_update(
+                channel=channel_id, ts=msg_ts, text=str(message.get("text") or ""), blocks=blocks,
+            )
+            _board_edits[message_key] = (lock, blocks)
+        except Exception as exc:  # noqa: BLE001 - the cards moved either way
+            logger.warning("slack_ux_clicks: could not edit the board row on %s: %s", msg_ts, exc)

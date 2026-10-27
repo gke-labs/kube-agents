@@ -367,6 +367,7 @@ class BoardActionTest(unittest.TestCase):
 
     def setUp(self):
         runtime._board_tapped.clear()
+        runtime._board_edits.clear()
         self.requests = []
         self.answer = [{"id": "t_1", "outcome": "done"}]
 
@@ -445,8 +446,18 @@ class BoardActionTest(unittest.TestCase):
         self.assertEqual(self.tap(_Adapter(), value=""), [])
         self.assertEqual(self.requests, [])
 
+    def test_a_second_rows_tap_keeps_the_first_rows_edit(self):
+        """Each tap's payload holds the card as it was when tapped; the second edit builds on the first."""
+        adapter = _Adapter()
+        self.tap(adapter)
+        self.answer = [{"id": "t_2", "outcome": "done"}, {"id": "t_3", "outcome": "done"}]
+        updates = self.tap(adapter, "kage_board.drop", row=1, value="t_2,t_3")
+        ids = self.ids(updates[1][1])
+        self.assertEqual(ids, [None, "kage_board.text.0", "kage_board.row.0.note", "kage_board.text.1", "kage_board.row.1.note"])
     def test_mixed_outcomes(self):
-        self.assertEqual(runtime.board_outcome([{"outcome": "done"}, {"outcome": "failed"}]), "done")
+        # A row is settled only when every card is: a failed one keeps the buttons for a second tap.
+        self.assertEqual(runtime.board_outcome([{"outcome": "done"}, {"outcome": "failed"}]), "failed")
+        self.assertEqual(runtime.board_outcome([{"outcome": "done"}, {"outcome": "moved"}]), "done")
         self.assertEqual(runtime.board_outcome([{"outcome": "moved"}, {"outcome": "gone"}]), "moved")
         self.assertEqual(runtime.board_outcome([{"outcome": "failed"}, {"outcome": "gone"}]), "failed")
         self.assertEqual(runtime.board_outcome([]), "failed")

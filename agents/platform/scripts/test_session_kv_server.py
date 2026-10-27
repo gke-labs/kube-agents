@@ -10713,6 +10713,13 @@ class TestBoardAction(unittest.TestCase):
                 self.assertEqual(self.client.post("/v1/board/actions", json=body).status_code, 400)
         self.assertEqual(self.status("t_a"), "blocked")
 
+    def test_cards_the_deadline_leaves_unstarted_answer_failed(self):
+        self.card("t_a", "blocked")
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 0.0):
+            results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "failed"}])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_a"), "blocked")
     def test_no_board_answers_every_card_gone(self):
         self.board.unlink()
         results = self.act("retry", ["t_a"]).json()["results"]

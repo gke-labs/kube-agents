@@ -2125,7 +2125,7 @@ over the board route as a request with a body (`lib.BoardAction`), which the Her
 to session-kv's `POST /v1/board/actions`; that unblocks (Retry) or archives (Drop) the row's cards
 while they are still `blocked`, and answers each card's outcome. The row is then edited in place:
 its buttons give way to "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>", or "No longer
-stuck." when the cards had already moved, the time as Slack's date token; a tap that did not land
+stuck. <name>, <time>" when the cards had already moved, the time as Slack's date token; a tap that did not land
 keeps the buttons under a line saying so. One tap per row at a time, in this process.
 
 ### Answer feedback (added 10/16)

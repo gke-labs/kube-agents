@@ -280,6 +280,10 @@ type SlackAdapter struct {
 	// (slack_board.go).
 	boardActor BoardActor
 	boardTaps  map[string]bool
+	// boardSent is the blocks each board card's last edit sent, by
+	// channel/ts, under s.mu; boardEditMu runs one board edit at a time.
+	boardSent   map[string]json.RawMessage
+	boardEditMu sync.Mutex
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.

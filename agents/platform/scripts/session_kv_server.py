@@ -4744,6 +4744,8 @@ def _post_board_health_card(
         return None
     built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
     return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
     """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
 
@@ -8890,12 +8892,16 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
 # (a2a/hermes-bridge/board.go). Who may press is decided before this call, by
 # whichever of the two the click came through; this route checks the card.
 #
-# Only a card still `blocked` is touched, so a stale button cannot archive a
-# card that has since been unblocked and claimed, or retry one that finished.
-# Retry is Hermes' `unblock_task`, which returns the card to `ready` for the
-# dispatcher; Drop is the card stop's `_archive_card`, Hermes' `archive_task`
-# with our worker kill (a blocked card has no worker, so the kill is moot).
-# Nothing here writes a card's status itself.
+# Only a card still `blocked` is touched, so a stale button does not retry a
+# card that finished or archive one that is running again. Retry is Hermes'
+# `unblock_task`, which checks the card is blocked inside its own write and
+# returns it to `ready` for the dispatcher. Drop is the card stop's
+# `_archive_card`, Hermes' `archive_task` with our worker kill; the blocked
+# check is the read just before it, so a card unblocked and claimed in that
+# instant would be archived as a running card, its worker killed, as a card
+# stop would. Nothing here writes a card's status itself. Every card is
+# started inside the card stop's deadline, and one the deadline leaves
+# unstarted answers `failed`, so the answer comes before the callers give up.
 # --------------------------------------------------------------------------
 
 BOARD_ACTION_RETRY = "retry"
@@ -8978,6 +8984,9 @@ def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
     with closing(conn):
         for task_id in ids:
+            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+                continue
             try:
                 results.append(_board_action_one(kanban_db, conn, action, task_id, budget))
             except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest untried

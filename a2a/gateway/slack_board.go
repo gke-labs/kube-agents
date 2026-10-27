@@ -28,7 +28,7 @@ import (
 // hermes-bridge relays to session-kv's POST /v1/board/actions; that unblocks
 // (Retry) or archives (Drop) the row's cards while they are still blocked.
 // The row is then edited in place: its buttons give way to "✓ Retrying.
-// <name>, <time>" or "Dropped. <name>, <time>", or "No longer stuck." when
+// <name>, <time>" or "Dropped. <name>, <time>", or "No longer stuck. <name>, <time>" when
 // the cards had already moved; a tap that did not land keeps the buttons
 // under a line saying so, and the row can be tapped again. The time is
 // Slack's date token, which each reader sees in their own zone.
@@ -178,36 +178,72 @@ func (s *SlackAdapter) runBoardTap(p slackClickPayload, key, verb string, tasks 
 	if outcome == slackBoardFailed {
 		release()
 	}
-	blocks, err := slackBoardRowLayout(p.Message.Blocks, blockID, slackBoardLine(verb, outcome, name, s.now()), outcome != slackBoardFailed)
+	line := slackBoardLine(verb, outcome, name, s.now())
+	// One board edit at a time, each from the blocks the last edit of that
+	// message sent: a tap's payload holds the message as it was when tapped,
+	// and another row's edit may have landed since.
+	s.boardEditMu.Lock()
+	defer s.boardEditMu.Unlock()
+	msgKey := p.Channel.ID + "/" + p.Message.TS
+	s.mu.Lock()
+	base, ok := s.boardSent[msgKey]
+	s.mu.Unlock()
+	if !ok {
+		base = p.Message.Blocks
+	}
+	sent, err := slackBoardRowLayout(base, blockID, line, outcome != slackBoardFailed)
+	var blocks []slack.Block
+	if err == nil {
+		blocks, err = slackRawBlocksJSON(sent)
+	}
 	if err == nil {
 		_, _, _, err = s.api.UpdateMessage(p.Channel.ID, p.Message.TS,
 			slack.MsgOptionText(p.Message.Text, false), slack.MsgOptionBlocks(blocks...))
 	}
 	if err != nil {
 		s.log.Warn("slack: editing a board row failed", "channel", p.Channel.ID, "ts", p.Message.TS, "err", err)
+		return
 	}
+	s.mu.Lock()
+	if s.boardSent == nil || len(s.boardSent) >= slackUXCap {
+		s.boardSent = map[string]json.RawMessage{}
+	}
+	s.boardSent[msgKey] = sent
+	s.mu.Unlock()
 }
 
-// slackBoardOutcome is one word for a row: done when any card was acted on,
-// moved when every card was already unstuck or gone, failed otherwise.
+// slackRawBlocksJSON is slackRawBlocks over blocks held as JSON.
+func slackRawBlocksJSON(raw json.RawMessage) ([]slack.Block, error) {
+	var blocks []map[string]any
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, err
+	}
+	return slackRawBlocks(blocks)
+}
+
+// slackBoardOutcome is one word for a row: failed when any card was not
+// settled, else done when any card was acted on, moved when every card was
+// already unstuck or gone.
 func slackBoardOutcome(res *lib.BoardActionResult, err error) string {
 	if err != nil || res == nil || res.Error != "" || len(res.Results) == 0 {
 		return slackBoardFailed
 	}
-	settled := true
+	done := false
 	for _, r := range res.Results {
 		switch r.Outcome {
 		case lib.BoardOutcomeDone:
-			return lib.BoardOutcomeDone
+			done = true
 		case lib.BoardOutcomeMoved, lib.BoardOutcomeGone:
 		default:
-			settled = false
+			// A card not settled keeps the row's buttons, so a second tap
+			// reaches the cards left; the settled ones answer "moved".
+			return slackBoardFailed
 		}
 	}
-	if settled {
-		return lib.BoardOutcomeMoved
+	if done {
+		return lib.BoardOutcomeDone
 	}
-	return slackBoardFailed
+	return lib.BoardOutcomeMoved
 }
 
 // slackBoardLine is the row's line after a tap: who and when for one that
@@ -236,9 +272,9 @@ var errSlackBoardRowGone = errors.New("the tapped row is not in the message")
 
 // slackBoardRowLayout is the message's blocks with the row's line put in: in
 // place of its buttons when settled, else just above them, replacing any line
-// an earlier tap left. Sent as written (slackRawBlocks), as the renderer
-// sends them.
-func slackBoardRowLayout(raw json.RawMessage, blockID, line string, settled bool) ([]slack.Block, error) {
+// an earlier tap left. JSON, to be sent as written (slackRawBlocks), as the
+// renderer sends them.
+func slackBoardRowLayout(raw json.RawMessage, blockID, line string, settled bool) (json.RawMessage, error) {
 	var blocks []map[string]any
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil, err
@@ -266,5 +302,5 @@ func slackBoardRowLayout(raw json.RawMessage, blockID, line string, settled bool
 	if !found {
 		return nil, errSlackBoardRowGone
 	}
-	return slackRawBlocks(out)
+	return json.Marshal(out)
 }

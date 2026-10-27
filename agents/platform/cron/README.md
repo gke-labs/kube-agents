@@ -506,7 +506,7 @@ in the buttons' values, unseen. Retry unblocks the row's cards and Drop archives
 them, through session-kv's `POST /v1/board/actions`, which touches only a card
 still `blocked`, so a stale button changes nothing. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
-stuck." when the cards had already moved). Whoever the gateway would answer may
+stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
 today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
 agent turn. Google Chat, and a run that also reports the board's other

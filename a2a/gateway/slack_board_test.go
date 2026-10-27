@@ -239,6 +239,21 @@ func TestSlackBoardTapThatDidNotLandKeepsTheButtonsAndCanBeTappedAgain(t *testin
 	}
 }
 
+// TestSlackSecondRowsTapKeepsTheFirstRowsEdit: each tap's payload holds the
+// card as it was when tapped, so the second edit builds on the first one sent.
+func TestSlackSecondRowsTapKeepsTheFirstRowsEdit(t *testing.T) {
+	a, api, _ := newBoardSlackAdapter()
+	a.interactive(boardTap(t, "U1", "kage_board.retry", 0, "61.0"))
+	a.interactive(boardTap(t, "U1", "kage_board.drop", 1, "62.0"))
+	if len(api.updated) != 2 {
+		t.Fatalf("updates = %d", len(api.updated))
+	}
+	ids := strings.Join(blockIDs(updatedBlocks(t, api, 1)), ",")
+	if want := ",,kage_board.text.0,kage_board.row.0.note,kage_board.text.1,kage_board.row.1.note,"; ids != want {
+		t.Errorf("block ids = %s, want %s", ids, want)
+	}
+}
+
 func TestSlackBoardTapIsNotRepeated(t *testing.T) {
 	a, _, actor := newBoardSlackAdapter()
 	a.interactive(boardTap(t, "U1", "kage_board.retry", 0, "61.0"))
@@ -279,7 +294,8 @@ func TestSlackBoardOutcome(t *testing.T) {
 		err  error
 		want string
 	}{
-		{result("done", "failed"), nil, lib.BoardOutcomeDone},
+		{result("done", "failed"), nil, slackBoardFailed},
+		{result("done", "moved"), nil, lib.BoardOutcomeDone},
 		{result("moved", "gone"), nil, lib.BoardOutcomeMoved},
 		{result("gone", "failed"), nil, slackBoardFailed},
 		{result(), nil, slackBoardFailed},
