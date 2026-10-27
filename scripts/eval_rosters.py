@@ -25,6 +25,11 @@ out of the text of ``hack/ci-eval-pr.sh`` from a commit before the move
 separate function from ``parse_blocking_roster`` on purpose: a reader always
 knows which shape it holds, and a parser that guessed would take a comment in
 the roster file that quotes the override syntax for the roster itself.
+
+``presubmit_wall_estimate`` prices the presubmit from ``unit_cost_hint`` and
+the fan-out's two phases in ``hack/ci-eval-pr.sh``, read out of the script's
+text; ``--summary`` prints it beside ``PRESUBMIT_WALL_BUDGET_MINUTES``, and
+``scripts/test_eval_rosters.py`` fails a roster that goes over (#3968, rule 5e).
 """
 
 from __future__ import annotations
@@ -44,6 +49,9 @@ GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
+# Its mirror (#3263): the cases every lane but the inject one drops, because
+# their premise needs the inject door. Same shape, same reason rule.
+API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
 # The inject lane's safeguards (#2079): the verification_spec entries the
 # script appends to every case it runs on that lane. YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
@@ -181,6 +189,10 @@ def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> 
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
 
 
+def api_lane_exclusions(path: pathlib.Path = API_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
+    return parse_lane_exclusions(path.read_text(encoding="utf-8"))
+
+
 # The nightly file's last section opens with this line (#3495). Entries above
 # it are frozen in the order they landed; entries below it are kept in case-id
 # order, each with its reason as the comment lines directly above it, so two
@@ -205,10 +217,151 @@ def split_nightly(text: str) -> tuple[list[str], list[str], str]:
     return case_names(head), case_names(tail), tail
 
 
+# ─── The presubmit's wall time, estimated (#3968, rule 5e) ──────────────────
+# The fan-out in hack/ci-eval-pr.sh, priced from the script's own numbers so
+# the two cannot disagree: unit_cost_hint's per-case seconds, the default
+# EVAL_TASK_PARALLELISM and the GitHub-write settle. Read out of the script's
+# text, the way parse_script_roster reads the old roster line.
+CI_EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+COST_HINT_FUNCTION_RE = re.compile(r"^unit_cost_hint\(\) \{\n(.*?)^\}$", re.MULTILINE | re.DOTALL)
+COST_HINT_ARM_RE = re.compile(r"^\s*([A-Za-z0-9_*|\s-]+?)\)\s*echo\s+(\d+)\s*;;", re.MULTILINE)
+DEFAULT_ARM = "*"
+PARALLELISM_RE = re.compile(r'^EVAL_TASK_PARALLELISM="\$\{EVAL_TASK_PARALLELISM:-(\d+)\}"', re.MULTILINE)
+SETTLE_RE = re.compile(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", re.MULTILINE)
+REPETITIONS_RE = re.compile(r'^EVAL_REPETITIONS="\$\{EVAL_REPETITIONS:-(\d+)\}"', re.MULTILINE)
+# The check types that request a pull request, as
+# bench/kube_agents_bench/lane.py's REQUESTING_CHECK_TYPES names them. A
+# case with such a leaf, or with an allowance in the safeguards file's
+# `requesting:` map, runs in the fan-out's serial second phase.
+# scripts/test_eval_rosters.py holds this text read to lane.py's YAML one.
+REQUESTING_CHECK_RE = re.compile(r"\btype:\s*[\"']?(pull_request_opened|pull_request_diff_contains)\b")
+# Build, deploy and lease, outside the fan-out: "~15min of build and deploy
+# outside it" in hack/ci-eval-pr.sh's 2026-09-22 note on the green presubmits.
+PRESUBMIT_FIXED_OVERHEAD_SECONDS = 15 * 60
+# The ceiling on the estimate below, in minutes. A roster edit that pushes the
+# estimate past it fails scripts/test_eval_rosters.py, and the pull request
+# either re-measures the hints it relies on or raises this number on purpose.
+# docs/eval-gate-roster.md, "The five rules a seat meets", rule (e), says why
+# it is 200. Priced at the script's default EVAL_REPETITIONS, the presubmit's.
+PRESUBMIT_WALL_BUDGET_MINUTES = 200
+
+
+def parse_cost_hints(script_text: str) -> tuple[dict[str, int], int]:
+    """unit_cost_hint's case arms as {case id: seconds}, and its default."""
+    m = COST_HINT_FUNCTION_RE.search(script_text)
+    if not m:
+        raise ValueError("no unit_cost_hint() function in the script")
+    body = "\n".join(line for line in m.group(1).splitlines() if not line.lstrip().startswith("#"))
+    hints: dict[str, int] = {}
+    default = None
+    for arm in COST_HINT_ARM_RE.finditer(body):
+        for name in (part.strip() for part in arm.group(1).split("|")):
+            if name == DEFAULT_ARM:
+                default = int(arm.group(2))
+            elif name:
+                hints.setdefault(name, int(arm.group(2)))  # first arm wins, as in `case`
+    if default is None:
+        raise ValueError("unit_cost_hint() has no default arm")
+    return hints, default
+
+
+def _script_number(pattern: re.Pattern, script_text: str, what: str) -> int:
+    m = pattern.search(script_text)
+    if not m:
+        raise ValueError(f"no {what} in the script")
+    return int(m.group(1))
+
+
+def parse_lane_requesting(text: str) -> dict[str, int]:
+    """The safeguards file's top-level ``requesting:`` map, read as text."""
+    out: dict[str, int] = {}
+    inside = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line:
+            continue
+        if not line[0].isspace():
+            inside = line == "requesting:"
+            continue
+        if inside:
+            key, _, value = line.strip().partition(":")
+            out[key.strip()] = int(value.strip())
+    return out
+
+
+# The first prompt line that makes a case a stopped ask
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE). hack/ci-eval-pr.sh's
+# unit_phase runs a stopped ask in the serial second phase beside the
+# requesting cases; scripts/test_eval_rosters.py holds this text read to
+# stop_hook.is_stopped_ask.
+STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+
+
+def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case's task.yaml carries the stop directive outside a comment."""
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(STOP_DIRECTIVE in line.split("#", 1)[0] for line in text.splitlines())
+
+
+def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case requests a pull request: its own checks, or the lane
+    file's ``requesting:`` allowance."""
+    if lane_requesting.get(case, 0) > 0:
+        return True
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(REQUESTING_CHECK_RE.search(line.split("#", 1)[0]) for line in text.splitlines())
+
+
+def presubmit_wall_estimate() -> dict[str, object]:
+    """The presubmit's wall time from the hints, in seconds, by phase.
+
+    Phase one runs every unit of a case that requests nothing, EVAL_TASK_PARALLELISM
+    at a time, and a case's own repetitions one after another on its task
+    lock: it takes the longer of the lane time spread over the lanes and the
+    longest case's chain. Phase two runs the units of the cases that request a
+    pull request, and of the stopped asks (unit_phase in the script), one at a
+    time after phase one has drained, each after the settle, so it adds
+    straight onto the job. Every presubmit case counts, held-out seats too,
+    because they run, and the inject lane's exclusions are not taken off.
+    Not modelled: the launch stagger, a unit holding a lane while it waits on
+    its task lock, and locks shared across cases (the infra lock a stack case
+    takes, an audit stream's lock); a seat with a stack would cost more than
+    this says. A hint is a launch-order price, not a measurement, so this is
+    the hints' answer, not a prediction of any one run. Priced at the
+    script's default EVAL_REPETITIONS, whatever ``--repetitions`` says, since
+    that is what the presubmit runs and what the budget is set against.
+    """
+    script = CI_EVAL_SCRIPT.read_text(encoding="utf-8")
+    repetitions = _script_number(REPETITIONS_RE, script, "EVAL_REPETITIONS default")
+    hints, default = parse_cost_hints(script)
+    parallelism = _script_number(PARALLELISM_RE, script, "EVAL_TASK_PARALLELISM default")
+    settle = _script_number(SETTLE_RE, script, "EVAL_GITHUB_WRITE_SETTLE_SECONDS")
+    lane_requesting = parse_lane_requesting(INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
+    first, second = [], []
+    for case in presubmit_cases():
+        serial = requests_a_pull_request(case, lane_requesting) or is_stopped_ask(case)
+        (second if serial else first).append(case)
+    chain = {case: hints.get(case, default) * repetitions for case in presubmit_cases()}
+    phase_one = max(-(-sum(chain[c] for c in first) // parallelism), max((chain[c] for c in first), default=0))
+    phase_two = sum(chain[c] + settle * repetitions for c in second)
+    return {
+        "phase one": phase_one,
+        "phase two": phase_two,
+        "overhead": PRESUBMIT_FIXED_OVERHEAD_SECONDS,
+        "total": phase_one + phase_two + PRESUBMIT_FIXED_OVERHEAD_SECONDS,
+        "requesting": second,
+        "parallelism": parallelism,
+        "repetitions": repetitions,
+    }
+
+
 def summary(repetitions: int = 3) -> dict[str, int]:
     """Each roster file's size and the nightly matrix's, computed from the
-    files: the totals the lists' comments used to carry by hand (#3495)."""
+    files: the totals the lists' comments used to carry by hand (#3495); and
+    the presubmit's estimated wall time against its budget (#3968)."""
     presubmit, nightly = presubmit_cases(), nightly_cases()
+    wall = presubmit_wall_estimate()
     return {
         "presubmit cases": len(presubmit),
         "blocking roster": len(blocking_roster()),
@@ -218,6 +371,10 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
+        "presubmit serial-phase cases": len(wall["requesting"]),
+        "presubmit wall estimate, minutes": -(-wall["total"] // 60),
+        "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
+        "api lane exclusions": len(api_lane_exclusions()),
     }
 
 
@@ -226,7 +383,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--summary", action="store_true",
-                        help="print each roster's case count and the matrix sizes")
+                        help="print each roster's case count, the matrix sizes and the presubmit's estimated "
+                             "wall time against its budget")
     def positive(value: str) -> int:
         if not value.isdigit() or int(value) < 1:
             raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
@@ -235,7 +393,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repetitions", type=positive, default=3,
                         help="repetitions a unit count assumes (EVAL_REPETITIONS, default 3). The matrix "
                              "is the default lane's whole nightly, before inject-lane exclusions or "
-                             "EVAL_NIGHTLY_PART")
+                             "EVAL_NIGHTLY_PART. The presubmit wall estimate ignores it: it is priced "
+                             "at the script's default, which the presubmit runs")
     args = parser.parse_args(argv)
     if not args.summary:
         parser.print_help()

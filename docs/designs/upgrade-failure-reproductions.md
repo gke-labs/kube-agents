@@ -406,7 +406,7 @@ Harness: none. The entry comes from one production fleet's support history, read
 design's Scope table; no scenario script plants it and no run upgraded a cluster behind it.
 
 Fleet: `readiness-lb-drain-timeout` on seeded-b (`drain-timeout-<prefix>-b`, a backend service on
-the default pool's instance group draining for 3600 seconds, six times the 600 seconds GKE waits
+the default pool's instance group draining for 720 seconds, a fifth over the 600 seconds GKE waits
 per node, behind a TCP health check and no forwarding rule) carries the before-state once the pool
 projects are re-applied with it.
 

@@ -711,6 +711,38 @@ Takes a dict of field name to value.
 {{- end }}
 
 {{/*
+The model LiteLLM serves as model-default: litellm.modelDefaultName, or the
+provider's default when that is empty. litellm.yaml renders it into the gateway
+config and web-console.yaml shows it in the console banner, so the two cannot
+name different models. Fails on a provider the table does not know.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.litellmModel" -}}
+{{- $provider := .Values.litellm.modelProvider }}
+{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
+       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
+{{- /*
+  openai_compatible has no default model, so it is allowed beside the table
+  rather than in it. Any other value is taken as a LiteLLM provider slug
+  (azure, bedrock, databricks, ...) whose credentials arrive through
+  envFromSecret: the chart knows no default model for it, so modelDefaultName
+  is required, and the slug's shape is checked here so a typo fails the render
+  rather than the first model call.
+*/}}
+{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
+{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
+{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
+{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
+{{- end }}
+{{- .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- end }}
+
+{{/*
 The LiteLLM gateway config, mirroring
 k8s-operator/config/integrations/litellm/base/config.yaml and its provider
 overlays.
@@ -726,7 +758,10 @@ in-place updates, so the running pod would have kept the old file indefinitely.
 Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
-neither key), which only openai_compatible passes.
+neither key), which only openai_compatible passes, and the optional
+dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds
+and numRetries. Every optional input renders nothing when unset, so the default
+render is unchanged.
 callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
@@ -734,15 +769,21 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   max_tokens on every alias when .maxTokens is above zero, and no key at all
   otherwise, so the default render adds no key the kustomize base
   (k8s-operator/config/integrations/litellm/base/config.yaml) lacks beyond the
-  Gemini thinking key below; the base carries no max_tokens on purpose. One value for all three aliases: they are one
+  Gemini thinking key below; the base carries no max_tokens on purpose. One
+  value for every rendered alias (three by default, four with fallback): they are one
   upstream model, and the budget is the backend's property, not the alias's.
   LiteLLM's router spreads litellm_params underneath the request's own
   arguments, so this is what a request that names no max_tokens gets, not a
   ceiling on one that does; values.yaml says what that means for the agent.
+
+  The fallback alias, when asked for, is one more entry for the same upstream
+  model at its own reasoning_effort, and router_settings.fallbacks sends each
+  primary alias to it once the primary's retries are spent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
 {{- /*
-  reasoning_effort on every alias when .reasoningEffort is set, and no key at
+  reasoning_effort on every primary alias when .reasoningEffort is set (the
+  fallback alias carries its own), and no key at
   all otherwise, for the same reason as max_tokens above: the default render
   and its checksum stay what they were. LiteLLM translates the OpenAI-style
   value per provider (thinkingLevel on Gemini 3.x through gemini or vertex_ai,
@@ -754,7 +795,7 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   deploy/shared/defaults/config.yaml).
 */}}
 {{- /*
-  thinking: {type: enabled} on every alias for a Gemini model that thinks, so
+  thinking: {type: enabled} on every primary alias for a Gemini model that thinks, so
   its thoughts come back as thought parts (reasoning_content) rather than not
   at all. Gemini thinks by default but returns its thoughts only when the
   request sets thinkingConfig.includeThoughts. With that off, Gemini 3.x has
@@ -817,8 +858,55 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   api_key line: the key arrives as HOSTED_VLLM_API_KEY (litellm.yaml).
 */}}
 {{- $litellmProvider := ternary "hosted_vllm" .provider (eq .provider "openai_compatible") -}}
+{{- $fallback := .fallback | default dict -}}
+{{- $fallbackEffort := $fallback.reasoningEffort | default "" -}}
+{{- if and $fallback.modelName (not (regexMatch `^[A-Za-z0-9][A-Za-z0-9_.@\-]*$` $fallback.modelName)) -}}
+{{- fail (printf "litellm.fallback.modelName %q must start with a letter or digit and use only letters, digits, _ . @ -" $fallback.modelName) -}}
+{{- end -}}
+{{- $fallbackName := "" -}}
+{{- if and $fallback.modelName (not $fallbackEffort) -}}
+{{- fail (printf "litellm.fallback.modelName %q is set without litellm.fallback.reasoningEffort, which is what renders the fallback alias" $fallback.modelName) -}}
+{{- end -}}
+{{- if $fallbackEffort -}}
+{{- $fallbackName = $fallback.modelName | default (printf "%s-%s" .model $fallbackEffort) -}}
+{{- end -}}
+{{- $timeout := int (.timeoutSeconds | default 0) -}}
+{{- $numRetries := int (.numRetries | default 0) -}}
+{{- $primaries := list "model-default" "hermes-agent" .model -}}
+{{- if and $fallbackName (has $fallbackName $primaries) -}}
+{{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
+{{- end -}}
 model_list:
-  - model_name: model-default
+{{- range $primaries }}
+  - model_name: {{ . }}
+    litellm_params:
+      model: {{ printf "%s/%s" $litellmProvider $.model }}
+      {{- with $.apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with $.sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- with $.reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
+      {{- if $claudeDrop }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
+      {{- end }}
+{{- end }}
+{{- /*
+  The fallback alias carries its own reasoning_effort, so it never takes the
+  Gemini thinking key: the two on one deployment fail every Gemini 3.x request
+  (see $geminiThoughts above).
+*/}}
+{{- if $fallbackName }}
+  - model_name: {{ $fallbackName | quote }}
     litellm_params:
       model: {{ printf "%s/%s" $litellmProvider .model }}
       {{- with .apiBase }}
@@ -830,58 +918,15 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- with .reasoningEffort }}
-      reasoning_effort: {{ . | quote }}
-      {{- end }}
-      {{- if $geminiThoughts }}
-      thinking: {"type": "enabled"}
-      {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
-  - model_name: hermes-agent
-    litellm_params:
-      model: {{ printf "%s/%s" $litellmProvider .model }}
-      {{- with .apiBase }}
-      api_base: {{ . | quote }}
-      {{- end }}
-      {{- with .sslVerify }}
-      ssl_verify: {{ . | quote }}
-      {{- end }}
-      {{- if gt $maxTokens 0 }}
-      max_tokens: {{ $maxTokens }}
-      {{- end }}
-      {{- with .reasoningEffort }}
-      reasoning_effort: {{ . | quote }}
-      {{- end }}
-      {{- if $geminiThoughts }}
-      thinking: {"type": "enabled"}
-      {{- end }}
-      {{- if $claudeDrop }}
-      additional_drop_params: ["temperature", "top_p", "top_k"]
-      {{- end }}
-  - model_name: {{ .model }}
-    litellm_params:
-      model: {{ printf "%s/%s" $litellmProvider .model }}
-      {{- with .apiBase }}
-      api_base: {{ . | quote }}
-      {{- end }}
-      {{- with .sslVerify }}
-      ssl_verify: {{ . | quote }}
-      {{- end }}
-      {{- if gt $maxTokens 0 }}
-      max_tokens: {{ $maxTokens }}
-      {{- end }}
-      {{- with .reasoningEffort }}
-      reasoning_effort: {{ . | quote }}
-      {{- end }}
-      {{- if $geminiThoughts }}
-      thinking: {"type": "enabled"}
-      {{- end }}
-      {{- if $claudeDrop }}
-      additional_drop_params: ["temperature", "top_p", "top_k"]
-      {{- end }}
+      reasoning_effort: {{ $fallbackEffort | quote }}
+{{- end }}
 litellm_settings:
+  {{- if or .dropParams $fallbackEffort }}
+  drop_params: true
+  {{- end }}
   callbacks: {{ .callbacks }}
 {{- /*
   Prompt caching, for Anthropic-family models only: the $claude gate, which
@@ -894,8 +939,21 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if $claude }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) }}
 router_settings:
+  {{- if $fallbackName }}
+  fallbacks:
+    {{- range $primaries }}
+    - {{ . }}: [{{ $fallbackName | quote }}]
+    {{- end }}
+  {{- end }}
+  {{- if gt $timeout 0 }}
+  timeout: {{ $timeout }}
+  {{- end }}
+  {{- if gt $numRetries 0 }}
+  num_retries: {{ $numRetries }}
+  {{- end }}
+  {{- if $claude }}
   default_litellm_params:
     cache_control_injection_points:
       - location: message
@@ -907,6 +965,7 @@ router_settings:
         index: -3
       - location: message
         index: -1
+  {{- end }}
 {{- end }}
 {{- end }}
 
@@ -2057,6 +2116,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end -}}
 {{- if .Values.githubMinter.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
 {{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall

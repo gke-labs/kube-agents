@@ -1518,26 +1518,64 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades,
         # and took its line back on 2026-10-23 after #3338, covering it again.
         # pdb-remediation-pr, remediation's only roster case, was demoted to
-        # the nightly on 2026-10-17 (#3120), uncovering remediation again.
+        # the nightly on 2026-10-17 (#3120), uncovering remediation again,
+        # and took its line back on 2026-10-26 after #3145, covering it again.
         # consistency-authorized-networks-probe, consistency's only roster
         # case, was demoted to the nightly on 2026-10-21 (#3598), uncovering
-        # consistency.
+        # consistency until consistency-drift-outlier took a roster seat on
+        # 2026-10-26.
         # observability and source-control are new rows whose cases are all
         # nightly cases, so both start on the allowlist; source-control came
         # off on 2026-10-23, when vcs-spent-branch-reuse took a roster seat.
         self.assertEqual(
             cov["uncovered"],
-            ["fleet-audits", "remediation", "consistency", "observability"],
+            ["fleet-audits", "observability"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
+
+    def test_coverage_reads_allowlist_records_and_counts_only_domain_rows(self):
+        # The allowlist entries are records (#3968): each starts `- slug:` like
+        # a domain row and carries indented keys. Those slugs are uncovered
+        # domains, not more domains, and a record's keys do not end the list.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "docs" / "designs").mkdir(parents=True)
+            (root / "docs" / "designs" / "domains.yaml").write_text(
+                "infra_owner: ivan\n"
+                "domains:\n"
+                "  - slug: cost\n"
+                "    owner: carol\n"
+                "  - slug: security\n"
+                "    owner: sam\n"
+                "  - slug: upgrades\n"
+                "    owner: sam\n"
+                "\n"
+                "# Known-uncovered.\n"
+                "allowlist:\n"
+                "  # cost: a comment between records.\n"
+                "  - slug: cost\n"
+                "    since: 2026-10-17\n"
+                "    issue: 1\n"
+                "    owner: carol\n"
+                "    expires: 2026-10-31\n"
+                '    why: "A sentence with #2 in it."\n'
+                "    held_out: some-case\n"
+                "  - slug: upgrades\n"
+                "    since: 2026-10-20\n"
+                "    issue: 2\n"
+                "    expires: 2026-11-01\n"
+            )
+            cov = collect.coverage(root)
+        self.assertEqual(cov, {"domains_total": 3, "domains_covered": 1, "uncovered": ["cost", "upgrades"]})
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
-        self.assertNotIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only since 2026-10-17 (#3120)
+        self.assertIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only 2026-10-17 to 10-26 (#3120)
         self.assertNotIn("consistency-authorized-networks-probe", active)  # on the roster from the split, nightly only since 2026-10-21 (#3598)
+        self.assertIn("consistency-drift-outlier", active)  # nightly from 2026-08-26, on the roster since 2026-10-26
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 

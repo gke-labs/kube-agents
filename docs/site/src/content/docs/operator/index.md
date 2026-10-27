@@ -205,5 +205,7 @@ minutes.
 
 - [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) — reference for `PlatformAgent` custom resource.
 - [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) — reference for `AgentPlugin` custom resource.
+- [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/) — reference for `AgentProfile` custom resource.
+- [PlatformAgent fields](/kube-agents/operator/platformagent-fields/), [AgentPlugin fields](/kube-agents/operator/agentplugin-fields/) and [AgentProfile fields](/kube-agents/operator/agentprofile-fields/) — every `spec` and `status` field of each resource, generated from the operator's Go API types.
 - [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) — build, test, and run the operator locally.
 - [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md) — the installer helper scripts (`install.env` loader, tfvars generator), at the repository root rather than under `k8s-operator/`.

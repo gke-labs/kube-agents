@@ -94,12 +94,12 @@ type InboundMessage struct {
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
-// task. The chat backends have no way to express it -- a human types "stop"
-// and the text matcher reads it -- but a program should not have to spell a
-// phrase to reach a control path, and a phrase that changes meaning is a
-// class of bug an API does not have. The inject door has an explicit route
-// for it, and it lands on the bus as kind: cancel exactly as the text route
-// does.
+// task. A chat message cannot express it -- a human types "stop" and the
+// text matcher reads it -- but a program should not have to spell a phrase
+// to reach a control path, and a phrase that changes meaning is a class of
+// bug an API does not have. The inject door has an explicit route for it,
+// Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
+// as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:
@@ -128,7 +128,8 @@ type Adapter interface {
 	// a backend that cannot hold this one, or whose API refuses it, returns
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
-	// With m.Chat nil it is Post(conversation, m.Text).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go).
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
@@ -217,6 +218,11 @@ type OutMessage struct {
 	// already read and validated for its carrier (chatmsg.Read); an adapter
 	// renders it or declines it, and never repairs one.
 	Chat *chatmsg.Message
+	// Feedback, when set, is the task id an answer can be rated under: the
+	// root of the chain whose final answer this message is (answer
+	// feedback, feedback.go). A backend that draws rating controls draws
+	// them on this message; every other backend ignores it.
+	Feedback string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message

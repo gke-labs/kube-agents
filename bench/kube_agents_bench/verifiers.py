@@ -186,13 +186,16 @@ _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
-# connection) is tried this many times, with this pause between tries, before
-# the check reports the API unreachable. One slow read must not red a run on
-# rung 2: gitlab.com's API times out a read now and then where GitHub's does
-# not, and the in-job GitLab helper retries its reads for the same reason. An
-# HTTP answer, whatever its status, is not retried: it is an observation.
+# connection) or is answered 5xx is tried this many times, with this pause
+# between tries, before the check reports the API unreachable or returns the
+# last 5xx. One slow read must not red a run on rung 2: gitlab.com's API times
+# out a read now and then where GitHub's does not, and the in-job GitLab helper
+# retries its reads for the same reason; a GitHub 502 on one branch listing
+# redded a merge gate (#3823). Any other HTTP answer is not retried: it is an
+# observation.
 _FORGE_READ_ATTEMPTS = 3
 _FORGE_READ_RETRY_PAUSE_SEC = 2.0
+_HTTP_SERVER_ERROR_FLOOR = 500
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -882,7 +885,10 @@ _KANBAN_TOOL_PREFIX = "kanban_"
 # What worker_trajectory's in-pod script puts in place of a result when the
 # pod's redactor will not load (its WITHHELD), and the marker its clip ends a
 # cut result with. Both live inside that script's source, so they are
-# spelled again here; test_report_times_in_window.py pins them to it.
+# spelled again here; test_report_times_in_window.py pins them to it. The
+# script's other placeholder, worker_trajectory.WITHHELD_READ_RESULT for the
+# one result of a call that read a credential, is a recorded call whose
+# output is redacted: it starts with `[REDACTED_` and is never a read gap.
 _WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
 _CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
 
@@ -972,6 +978,10 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             continue
         if result == _WITHHELD_RESULT:
             withheld.append(f"a {name or 'tool'} result was withheld")
+            continue
+        if result == worker_trajectory.WITHHELD_READ_RESULT:
+            # A credential read, recorded without its output: no time in it,
+            # and no gap in the capture.
             continue
         if _CLIPPED_RESULT.search(result):
             clipped += 1
@@ -1430,11 +1440,13 @@ class ReportManifestVerifier(BaseVerifier):
         )
 
 
-# The header ``_append_delivered`` opens each card's result with in the final
-# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
-# delivered result runs from its header to the next header of either kind.
+# The headers ``_append_delivered`` opens each card's result and each paused
+# card's question with in the final message (harness.py), and the one
+# ``_append_artifacts`` opens a file with. A delivered result runs from its
+# header to the next header of any kind.
 _DELIVERED_HEADER = re.compile(
-    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    r"^(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):\n",
     re.MULTILINE,
 )
 _RESULT_HEADER_PREFIX = "Result of delegated task "
@@ -1635,25 +1647,8 @@ class AnswerFirstVerifier(BaseVerifier):
 
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
-_TOOL_CALL_WRAPPER = "tool_call"
-
-
-def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
-    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
-    if entry.get("name") != _TOOL_CALL_WRAPPER:
-        return set()
-    args = entry.get("args")
-    if not isinstance(args, dict):
-        return set()
-    names: set[str] = set()
-    if args.get("name"):
-        names.add(str(args["name"]))
-    calls = args.get("calls")
-    if isinstance(calls, list):
-        for c in calls:
-            if isinstance(c, dict) and c.get("name"):
-                names.add(str(c["name"]))
-    return names
+_TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
+_wrapped_tool_names = worker_trajectory.wrapped_tool_names
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -1747,6 +1742,9 @@ class ToolCalledVerifier(BaseVerifier):
     check ``status="error"``, since a pattern over it would read as no match --
     but only when its arguments are withheld too or still match ``arguments``;
     an unread call whose readable arguments rule it out is left out instead.
+    A call that read a credential has its result recorded as
+    ``worker_trajectory.WITHHELD_READ_RESULT``: a recorded call whose output is
+    redacted, matched against the pattern like any other.
     """
 
     type: Literal["tool_called"]
@@ -1879,9 +1877,11 @@ class ToolCalledVerifier(BaseVerifier):
             and not (self.require_success and entry.get("status") == "error")
         ]
         if self.result is not None:
-            # A pod that withholds results withholds arguments too, so the
-            # arguments filter cannot rule out a withheld call; it still rules
-            # out an unread call whose readable arguments name something else.
+            # A pod whose redactor did not load withholds results and
+            # arguments alike, so the arguments filter cannot rule out such a
+            # call; it still rules out an unread call whose readable arguments
+            # name something else. A credential read's WITHHELD_READ_RESULT is
+            # a recorded result, not an unread one.
             unread = [
                 entry for entry in named
                 if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
@@ -3377,7 +3377,10 @@ class WorkerBudgetVerifier(BaseVerifier):
             calls[task] = calls.get(task, 0) + 1
             tagged += 1
             result = entry.get("result")
-            if result is None or result == worker_trajectory.WITHHELD:
+            # A credential read's result is withheld whole, the checkpoint
+            # notice that may have landed in it with the rest: unreadable
+            # here, as a redactor-less pod's results are.
+            if result is None or result in (worker_trajectory.WITHHELD, worker_trajectory.WITHHELD_READ_RESULT):
                 unreadable += 1
                 continue
             match = _BUDGET_NOTICE_RE.search(str(result))
@@ -3920,10 +3923,10 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     Returns ``(status, decoded_json_or_None)``. Raises :class:`OSError`-family
     exceptions for transport failures, which the caller turns into
     ``status="error"`` rather than a fail — an unreachable API is the absence
-    of an observation, not a violation. A transport failure is retried
-    ``_FORGE_READ_ATTEMPTS`` times first, so one slow read does not become
-    that error; an HTTP answer is returned on the first try, whatever its
-    status.
+    of an observation, not a violation. A transport failure or a 5xx answer is
+    retried ``_FORGE_READ_ATTEMPTS`` times first, so one slow read or one
+    forge fault does not become that error; any other HTTP answer is returned
+    on the first try.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -3962,6 +3965,9 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
                 payload = json.loads(exc.read().decode("utf-8", errors="replace"))
             except (ValueError, OSError):
                 payload = None
+            if exc.code >= _HTTP_SERVER_ERROR_FLOOR and attempt < _FORGE_READ_ATTEMPTS:
+                time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
+                continue
             return exc.code, payload
         except json.JSONDecodeError as exc:
             raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc
@@ -5036,6 +5042,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Repository paths, as `fnmatch` globs, that exhaust what the pull request
+    # may change: every `filename` and `previous_filename` in `/pulls/{n}/files`
+    # must match at least one glob here. Use when a case knows the exact synced
+    # manifest(s) a targeted remediation touches and must reject bundling any
+    # other path in the repository without enumerating every possible sibling
+    # directory in `unchanged_paths`.
+    changed_paths_only: list[str] | None = Field(default=None, min_length=1)
     # Repository paths, as `fnmatch` globs, the pull request must delete: each
     # glob is matched by at least one file the pull request lists as
     # `removed`. A delete reaches review as the removal of the manifest that
@@ -5104,9 +5117,22 @@ class PullRequestOpenedVerifier(BaseVerifier):
         return texts, None
 
     def _file_entries(
-        self, owner: str, repo: str, number: int, token: str, budget: float
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        *,
+        changed: int | None = None,
     ) -> tuple[list[dict], str | None]:
         """``(the entries of /pulls/{n}/files, unevaluable reason)``."""
+        cap = _PR_FILES_MAX_PAGES * _PR_FILES_PAGE_SIZE
+        if changed is not None and changed > cap:
+            return [], (
+                f"{owner}/{repo}#{number} changes {changed} files, past GitHub's "
+                f"{cap}-file listing cap, so path checks could not inspect the full diff"
+            )
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
@@ -5122,17 +5148,33 @@ class PullRequestOpenedVerifier(BaseVerifier):
             entries += [entry for entry in files if isinstance(entry, dict)]
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
+        else:
+            if changed != cap or len(entries) < cap:
+                return [], (
+                    f"{owner}/{repo}#{number} filled all {_PR_FILES_MAX_PAGES} pages of "
+                    f"{_PR_FILES_PAGE_SIZE} files ({cap}-file listing cap), so path checks "
+                    "could not inspect the full diff"
+                )
         return entries, None
 
     def _changed_paths(
-        self, owner: str, repo: str, number: int, token: str, budget: float
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        *,
+        changed: int | None = None,
     ) -> tuple[list[str], str | None]:
         """``(paths the pull request changes, unevaluable reason)``.
 
         A rename counts under both names: moving the declaration away is as
         much a change to it as rewriting it.
         """
-        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        entries, unevaluable = self._file_entries(
+            owner, repo, number, token, budget, changed=changed
+        )
         paths = [
             str(entry[key])
             for entry in entries
@@ -5142,14 +5184,23 @@ class PullRequestOpenedVerifier(BaseVerifier):
         return paths, unevaluable
 
     def _removed_paths(
-        self, owner: str, repo: str, number: int, token: str, budget: float
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        token: str,
+        budget: float,
+        *,
+        changed: int | None = None,
     ) -> tuple[list[str], str | None]:
         """``(paths the pull request deletes, unevaluable reason)``.
 
         Only status `removed` counts. A rename moves the declaration rather
         than deleting it, so a renamed file's old name is not a removal.
         """
-        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        entries, unevaluable = self._file_entries(
+            owner, repo, number, token, budget, changed=changed
+        )
         removed = [
             str(entry["filename"])
             for entry in entries
@@ -5833,13 +5884,17 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "files and are not implemented for GitLab, so this check could not be evaluated"
                     )
                     continue
-                if verdict == "pass" and self.removed_paths:
-                    # removed_paths reads GitHub's file listing too; a merge request
-                    # that adds a marker passes every other clause, so ungraded on
-                    # what it removes it is not a pass either.
+                if verdict == "pass" and (
+                    self.removed_paths or self.unchanged_paths or self.changed_paths_only is not None
+                ):
+                    # The path clauses read GitHub's file listing too; a merge
+                    # request that adds a marker, rewrites the declaration or
+                    # bundles a sibling passes every other clause, so ungraded on
+                    # which paths it changes it is not a pass either.
                     unresolved.append(
-                        f"{full}!{number}: `removed_paths` reads GitHub's pull request "
-                        "files and is not implemented for GitLab, so this check could not be evaluated"
+                        f"{full}!{number}: `removed_paths`, `unchanged_paths` and `changed_paths_only` "
+                        "read GitHub's pull request files and are not implemented for GitLab, so this "
+                        "check could not be evaluated"
                     )
                     continue
                 if verdict == "pass":
@@ -5966,7 +6021,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
             if self.removed_paths:
                 try:
-                    removed, unevaluable = self._removed_paths(owner, repo, number, token, budget)
+                    removed, unevaluable = self._removed_paths(
+                        owner, repo, number, token, budget, changed=changed
+                    )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                     continue
@@ -5984,26 +6041,54 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "delete that leaves the declaration keeps the object"
                     )
                     continue
-            if self.unchanged_paths:
+            if self.unchanged_paths or self.changed_paths_only is not None:
                 try:
-                    paths, unevaluable = self._changed_paths(owner, repo, number, token, budget)
+                    paths, unevaluable = self._changed_paths(
+                        owner, repo, number, token, budget, changed=changed
+                    )
                 except OSError as exc:
                     unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
                     continue
                 if unevaluable:
                     unresolved.append(unevaluable)
                     continue
-                touched_kept = sorted(
-                    path for path in paths
-                    if any(fnmatch.fnmatchcase(path, pattern) for pattern in self.unchanged_paths)
-                )
-                if touched_kept:
-                    rejected.append(
-                        f"{slug}: changes {', '.join(touched_kept)}, which this case "
-                        "requires the fix to leave unchanged (`unchanged_paths`) -- a "
-                        "remediation written over the workload's own declaration"
+                if self.unchanged_paths:
+                    touched_kept = sorted(
+                        {
+                            path for path in paths
+                            if any(fnmatch.fnmatchcase(path, pattern) for pattern in self.unchanged_paths)
+                        }
                     )
-                    continue
+                    if touched_kept:
+                        rejected.append(
+                            f"{slug}: changes {', '.join(touched_kept)}, which this case "
+                            "requires the fix to leave unchanged (`unchanged_paths`) -- a "
+                            "remediation written over the workload's own declaration"
+                        )
+                        continue
+                if self.changed_paths_only is not None:
+                    if not paths:
+                        unresolved.append(
+                            f"GitHub returned an empty files listing for {slug} despite "
+                            f"changed_files={changed}, so `changed_paths_only` could not be evaluated"
+                        )
+                        continue
+                    outside_allowed = sorted(
+                        {
+                            path for path in paths
+                            if not any(
+                                fnmatch.fnmatchcase(path, pattern)
+                                for pattern in self.changed_paths_only
+                            )
+                        }
+                    )
+                    if outside_allowed:
+                        rejected.append(
+                            f"{slug}: changes {', '.join(outside_allowed)}, outside the "
+                            f"allowed path(s) {', '.join(self.changed_paths_only)} "
+                            "(`changed_paths_only`)"
+                        )
+                        continue
             if self.content:
                 try:
                     texts, unevaluable = self._head_files(owner, repo, number, token, budget)
@@ -7078,7 +7163,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "privileged-container", "host-namespace", "hostpath-mount", "cluster-admin-binding", "wildcard-rbac",
         "netpol-missing", "default-sa-automount", "workload-identity-off", "legacy-metadata",
         "public-control-plane", "podsecurity-gaps", "kcc-object-wedged", "image-floating-tag",
-        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding",
+        "unbound-sa-automount", "lb-world-open", "anonymous-rbac-binding", "configsync-reconciler-stalled",
     ),
     "obtainability-audit": (
         "no-requests", "no-memory-limit", "no-pdb", "blocking-pdb", "no-hpa", "hpa-cannot-scale",

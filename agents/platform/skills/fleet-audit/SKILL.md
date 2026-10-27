@@ -97,8 +97,11 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    ```bash
    /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <findings_path> \
      [--repo "<owner>/<repo>"] [--manifest-file <path> | --no-collector-manifest "<why>"] \
-     [--decline-fix <finding-id> "<why>" ...]
+     [--decline-fix <finding-id> "<why>" ...] [--scheduled]
    ```
+
+   Pass `--scheduled` only when the cron prompt tells you to; never on a run a person asked for
+   (`references/finish.md`).
 
    Exit 0 published. Exit 2 (`FINDINGS REJECTED`) published nothing and kept the run yours: fix
    what the message names and run `finish` again, never `start`. A `BROKER UNAVAILABLE` exit 2 is

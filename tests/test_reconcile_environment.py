@@ -1065,6 +1065,38 @@ class ReportDriftTest(unittest.TestCase):
         ensure = source.index("ensure_label(args.repo)")
         self.assertLess(ensure, create)
 
+    def test_a_coloured_plan_reads_as_the_plain_one_would(self):
+        """`terraform plan` runs without `-no-color`, and Terraform colours its
+        output whether or not a terminal is attached, so every line of the log
+        opens with an escape sequence. These lines are the 2026-10-24 staging
+        log's; the anchored patterns matched none of them until the strip."""
+        plan = (
+            '\x1b[1m  # google_project_service.required["gkehub.googleapis.com"]\x1b[0m'
+            " will be created\n"
+            "\x1b[1m  # module.chat_pubsub[0].data.google_project.this\x1b[0m"
+            " will be read during apply\n"
+            "\x1b[1m  # module.chat_pubsub[0].google_pubsub_topic_iam_member"
+            ".gsuiteaddons_publisher\x1b[0m must be \x1b[1m\x1b[31mreplaced\x1b[0m\n"
+            "\x1b[1m  # module.gke_cluster.terraform_data.create_after\x1b[0m"
+            " will be updated in-place\n"
+            "\x1b[1mPlan:\x1b[0m \x1b[0m4 to add, 1 to change, 2 to destroy.\n"
+        )
+        totals, actions, destructive = self.module.summarise(plan)
+        self.assertEqual(totals, "Plan: 4 to add, 1 to change, 2 to destroy.")
+        self.assertEqual(actions, [
+            ('google_project_service.required["gkehub.googleapis.com"]', "created"),
+            ("module.chat_pubsub[0].data.google_project.this", "read during apply"),
+            ("module.chat_pubsub[0].google_pubsub_topic_iam_member.gsuiteaddons_publisher",
+             "replaced"),
+            ("module.gke_cluster.terraform_data.create_after", "updated in-place"),
+        ])
+        self.assertTrue(destructive)
+        body = self.module.body_for("staging", "http://run", totals, actions, destructive)
+        self.assertIn("[!WARNING]", body)
+        self.assertIn("Plan: 4 to add, 1 to change, 2 to destroy.", body)
+        self.assertIn("gsuiteaddons_publisher", body)
+        self.assertNotIn("\x1b", body)
+
     def test_an_empty_plan_yields_no_actions(self):
         totals, actions, destructive = self.module.summarise(
             "No changes. Your infrastructure matches the configuration.\n")

@@ -3,7 +3,7 @@
 
 Run: cd scripts && python3 -m unittest test_rerun_failed_checks
 
-Three things here fail green if they go wrong. The per-name state is Tide's:
+Three things here fail green if they go wrong. The per-name state is the one Tide used:
 one success clears a check name, one pending holds it, and only a name every
 check run failed is red -- read it differently and the command re-runs
 superseded runs that block nothing, or misses one that does. The plan decides
@@ -103,7 +103,7 @@ class FakeAPI(rfc.GitHubAPI):
         matched = re.search(rf"/commits/{HEAD}/check-runs\?(.*)$", path)
         if matched:
             query = dict(part.split("=") for part in matched.group(1).split("&"))
-            assert query["filter"] == "latest", path  # the attempt set Tide sees; `all` would hide a red re-run behind a green first attempt
+            assert query["filter"] == "latest", path  # the attempt set the rollup lists; `all` would hide a red re-run behind a green first attempt
             return self._page(self.checks, "check_runs", query)
         raise AssertionError(f"unexpected call: {path}")
 
@@ -117,9 +117,9 @@ class FakeAPI(rfc.GitHubAPI):
 
 
 class StateTest(unittest.TestCase):
-    """Tide's reading of a check run and of a name with several."""
+    """The reading, kept from Tide, of a check run and of a name with several."""
 
-    def test_a_check_run_reads_as_tide_reads_it(self):
+    def test_a_check_run_reads_as_tide_read_it(self):
         for conclusion in ("success", "neutral", "skipped"):
             self.assertEqual(rfc.STATE_SUCCESS, rfc.check_state(check(1, "x", conclusion, 1)))
         for conclusion in ("failure", "cancelled", "timed_out", "action_required", "stale"):
@@ -298,7 +298,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("1 still running", out)
 
     def test_a_cancelled_run_that_never_made_a_check_run_is_not_rerun(self):
-        """Displaced from its concurrency group while queued: no job ran, so Tide sees nothing."""
+        """Displaced from its concurrency group while queued: no job ran, so the rollup lists nothing."""
         api = FakeAPI(runs=[run(1, "cancelled", 10), run(2, "success", 20)], checks=[check(2, "Tests", "success", 20)])
         code, out, err = self.run_main(api)
         self.assertEqual(0, code, err)

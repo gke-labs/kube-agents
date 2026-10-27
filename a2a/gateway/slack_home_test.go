@@ -85,6 +85,35 @@ func viewText(t *testing.T, v slack.HomeTabViewRequest) string {
 	return strings.Join(lines, "\n")
 }
 
+func TestSlackHomeCountsTheWeeksRatingsWhenFeedbackIsOn(t *testing.T) {
+	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	if got := viewText(t, api.views[0].view); strings.Contains(got, "This week") {
+		t.Errorf("feedback off: the tab drew a ratings line:\n%s", got)
+	}
+	rec := &fakeRecorder{up: 4, down: 1}
+	a.SetFeedbackRecorder(rec)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[1].view)
+	if !strings.HasSuffix(got, "divider:\ncontext: This week: 4 👍, 1 👎") {
+		t.Errorf("the tab must end with the week's ratings:\n%s", got)
+	}
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	if rec.tallies != 1 {
+		t.Errorf("tally read %d times for two opens inside its freshness, want 1", rec.tallies)
+	}
+}
+
+func TestSlackHomeLeavesOutATallyItCouldNotRead(t *testing.T) {
+	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
+	a.SetFeedbackRecorder(&fakeRecorder{tallyErr: errors.New("bucket gone")})
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[0].view)
+	if strings.Contains(got, "This week") || !strings.Contains(got, "header: Fleet") {
+		t.Errorf("a failed tally must leave the line out and the rest of the tab drawn:\n%s", got)
+	}
+}
+
 func TestSlackHomeDrawsTheDashboardForAnAllowedMember(t *testing.T) {
 	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
 	a.noteAsker("slack:C1/40.0", "U1")
