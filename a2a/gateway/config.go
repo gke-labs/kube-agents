@@ -61,6 +61,11 @@ const (
 	envTrue               = "true"
 )
 
+// envSlackAnswerFeedback turns answer feedback off when "false"
+// (feedback.go); the operator renders it only from
+// slack.answerFeedback=false.
+const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -198,6 +203,10 @@ type Config struct {
 	HomeChannelRecord string
 	SelfImage         string
 	HomeChannelLearn  bool
+	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
+	// rating controls are drawn and nothing is kept, whatever the feedback
+	// bucket holds.
+	AnswerFeedbackOff bool
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -677,6 +686,7 @@ func FromEnv() (*Config, error) {
 	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
 	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
 	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
+	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for

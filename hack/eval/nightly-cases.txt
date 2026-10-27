@@ -701,9 +701,10 @@
 ./tasks/not-found-target-stops-as-failure/task.yaml
 
 # gke-alert-configuration skill probe: a Terraform memory-saturation alert
-# for a GKE workload uses condition_prometheus_query_language, the cAdvisor
-# memory limit and the skill's created-with-google-skill label. deployer:
-# noop, transcript-only, one delegation round trip.
+# for a GKE workload uses condition_prometheus_query_language, a native
+# memory limit (cAdvisor or GKE built-in) and the skill's
+# created-with-google-skill label. deployer: noop, transcript-only, one
+# delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
 
 # A pod count with no events in it: the Cluster Agent's audit trail states no
