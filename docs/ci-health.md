@@ -44,7 +44,8 @@ writers job), reported as one night: the line names a part that is missing,
 still running or cut short, the night counts as cut short when its main or
 main-b part is, and a night without its main or main-b part gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
-and the report from the same nightly runs.
+and the report from the same nightly runs. After it, the digest carries one
+line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -72,7 +73,8 @@ OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
 pool-project drift owes its owner (`gate_issue.py`), files a bug for a case
 the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
-([Nightly bugs](#nightly-bugs)), renders the weekly health email beside
+([Nightly bugs](#nightly-bugs)), keeps an issue open for the owner of each
+domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)), renders the weekly health email beside
 `data.json` ([The weekly health email](#the-weekly-health-email)), and appends
 `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
@@ -642,7 +644,7 @@ commented on is never commented on twice. The watermark and the comment ids
 live in `gate-comment-state.json` beside `health.json`; a first tick with no
 state looks back one hour. Posting uses the workflow's own `GITHUB_TOKEN`
 through `gh api` (the job holds `pull-requests: write` and `issues: write` for
-this, the tracking issue and the nightly bug). A failure to post is a warning; the run is
+this, the tracking issue, the nightly bug and the coverage-gap issue). A failure to post is a warning; the run is
 retried next tick and the job never reds for it. `--dry-run` prints the
 comments instead.
 
@@ -661,7 +663,8 @@ whose body also carries a word the condition's own evidence uses ("drift" or
 "pending" beside a fixture role, "NotReady" or "lost" beside a node), so an
 issue that mentions a role or node in passing is not the tracker; case names
 never match an unlabelled body, since a roster tracker lists them all. The
-bot's own `nightly-red` issues are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
+bot's own `nightly-red` issues, and its coverage-gap issues (the
+`kube-agents-bot:coverage-gap` marker, [Coverage gaps](#coverage-gaps)), are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
 in `health-state.json` and in `health.json`'s `issue` field (`{number, url, condition}`,
 `null` outside an incident; `health.py` reads it back through
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
@@ -842,7 +845,8 @@ or when GitHub refuses that login, the issue is filed unassigned and says so.
 
 The step runs in dry run until armed: it reads the open issues and the comments
 it needs, prints what it would file, comment and assign, and writes nothing.
-Setting the repository variable `NIGHTLY_BUGS_LIVE=true` arms it;
+Setting the repository variable `NIGHTLY_BUGS_LIVE=true` arms it, and the
+coverage-gap filer with it ([Coverage gaps](#coverage-gaps));
 `CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
 `python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
 against any `data.json`; `--live` writes.
@@ -914,6 +918,90 @@ add up, or a link that is not a well-formed `https` URL (an issue link must
 point into this repository). Links are checked for form, not fetched: the
 dashboard's links sit behind a Google login a fetch from the job cannot pass.
 It never posts partial numbers.
+
+## Coverage gaps
+
+`scripts/eval_dashboard/coverage_gaps.py` keeps one issue open for each domain
+in [`docs/designs/domains.yaml`](designs/domains.yaml) that has no blocking
+presubmit seat, and closes it when the domain has one again. A domain is
+covered when a case on `hack/eval/blocking-roster.txt` claims it with
+`domain:` and carries a non-empty `verification_spec`; the step and
+`scripts/test_domain_coverage.py` both read coverage through
+`scripts/domain_coverage.py`, so the two agree. When `domains.yaml` gives no
+domains the step writes nothing, and the same when any uncovered domain is not
+on its allowlist: `scripts/test_domain_coverage.py` keeps every uncovered
+domain listed on `main`, so such a gap means a bad read (a truncated roster, no
+`bench/tasks`). The step logs each one, and the digest carries no gap line that
+tick.
+It runs every tick after the nightly bug filer and before the post, capped at
+2 minutes.
+
+An allowlist entry is either a bare slug, the shape `domains.yaml` used first,
+or a record with `since`, `issue`, `expires` and optional `owner` and
+`held_out`; the step reads both. The issue is labelled `presubmit-gate` and
+`domain:<slug>` and assigned to the domain's `owner:` (a record's own `owner:`
+wins), with `backup:` mentioned; when GitHub refuses the owner as assignee it
+is filed unassigned and says so. Its body names how many days the domain has
+been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
+or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
+or "start date not recorded" (also for a date that does not parse or is after
+today); why, from the entry
+and the issue it cites; and the candidates. A candidate is a case of the
+domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
+not on the roster, with its
+graded repetitions over the last 14 nightly nights (read as [Nightly
+bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
+(90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
+bar, and who clears it"), and, when the tick read the evidence store (not the
+last published copy written back after a failed read, nor a read stopped at its
+deadline), what the
+store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
+`collecting` with the runs still needed for a full window, `cut` (the read left
+older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
+bar, then by pass rate. The body is edited in place when any of this changes,
+about once a day; its assignees are never touched, and the assignment line of an
+open issue names the assignees GitHub holds, with the owner beside them when
+the owner is not one. The body is the bot's: an edit to it or the title is
+rewritten on the next tick, so notes go in comments.
+
+A record past its `expires` date fails no pull request; this issue is where it
+is chased. Which records have expired is `expired_records` in
+`scripts/domain_allowlist.py`, which ships with the record shape; on a checkout
+without it nothing expires. Once a record has expired, the body says "The
+allowlist exception expired on <date>, N days ago", and a comment @-mentions
+the owner and backup at most once every 24 hours: not while the last such
+comment is younger than that, nor in the 24 hours after an issue filed after
+the expiry (its body carries the mentions). A bare slug has no expiry.
+
+The bot's issue carries the marker `<!-- kube-agents-bot:coverage-gap
+domain=<slug> -->` and is found by it among the open `presubmit-gate` issues
+(an issue whose label a person removes is no longer seen, and the next tick
+files another); an issue without the marker is never taken for the bot's, and no tracking issue the gate files or adopts ([The
+tracking issue](#the-tracking-issue)) ever takes one for its own. The listing
+is read the way [Nightly bugs](#nightly-bugs) reads it, cross-checked against
+GraphQL up to 4 times; when no read agrees, nothing is written that tick. When
+the domain is covered again, the bot comments once naming the roster case and
+closes the issue as completed. An issue a person closes as not planned (or a
+duplicate) after the gap began stays closed; the bot files again only for a
+later gap. For a domain whose start date is not recorded, a close in the last
+90 days counts, and after that the bot files again. An issue whose domain has
+left `domains.yaml` without a roster case covering it is left open, with a
+warning in the job log.
+
+The 9 AM digest carries one line per uncovered domain, after the nightly part:
+the domain, days uncovered, "exception expired N days ago" once its record has
+expired, the owner (as text, not a mention), and the best
+candidate with its record and the store's verdict when the store was read
+(`post_health.py --store`). With every domain covered there is no line. It
+reads no GitHub.
+
+It runs dry until armed, on the nightly bug filer's switch: `NIGHTLY_BUGS_LIVE=true`
+arms it, `CI_HEALTH_MUTE=true` disarms it, and it has no variable of its own. It
+writes with the job's token under the `issues: write` the job already holds.
+It opens no roster pull request: the job holds no branch write path, and the
+eval crew approves every roster line. Locally,
+`python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
+is a dry run; `--live` writes.
 
 ## The weekly health email
 
@@ -1274,7 +1362,8 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_SA` override them. The off switch is the repository variable
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
-step on pull requests is skipped, the nightly bug filer runs dry, and the refresh, the verdict and the
+step on pull requests is skipped, the nightly bug filer and the coverage-gap
+filer run dry, and the refresh, the verdict and the
 `health.json` upload carry on. It exits before writing `health-state.json`
 too, so what the poster remembers stands still while muted: an alert already
 sent stays sent. The dashboard is unaffected — the pool episode's start rides

@@ -1094,11 +1094,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 #     output, once, then drops it on the retry. Accepted claims are appended to
 #     `result` as an evidence section. A card's claim also passes when it
 #     matches one the gate accepted on a card it created.
-#   * kanban_rightsizing_checks: a second rule in that gate. A card whose body
-#     names the gke-rightsizing-checks skill must open its result with its
-#     dependency lines and show the five checks, and a card above such cards
-#     must carry their dependency lines word for word. Refused once, then
-#     accepted, with the gate's one refusal per card.
+#   * kanban_rightsizing_checks: a second rule in that gate. kanban_complete
+#     takes `rightsizing`, one entry per workload with its dependency kind and
+#     the five checks, required on a card whose body names the
+#     gke-rightsizing-checks skill and refused once when missing or invalid.
+#     A Platform card whose request asks to cut requests or limits, and that
+#     created no card, is refused once when it passed no entries.
+#     The gate renders a card's entries, and its settled descendants', in
+#     `result` before any evidence section, so a summary cannot drop one.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
@@ -1155,9 +1158,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
     grep -q "_apply_verified_claims_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "record_terminal_call(command, returncode, output)" /opt/hermes/tools/terminal_tool_result.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_rightsizing_checks.py /opt/hermes && \
-    grep -q "^import tools.kanban_rightsizing_checks" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "^from tools import kanban_rightsizing_checks as _kanban_rightsizing_checks" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 -c "from tools import kanban_verified_claims as g, kanban_rightsizing_checks as r; assert r.rightsizing_rule in g.RULES" && \
+    grep -q "^_kanban_rightsizing_checks.apply_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_result.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_report_format.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_verified_claims.py && \
@@ -2685,7 +2689,7 @@ RUN set -eu; \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
       exit 1; \
     fi; \
-    for binary in gcloud kubectl gh git helm k9s yq; do \
+    for binary in gcloud kubectl gh git helm k9s yq leeway; do \
       if command -v "${binary}" >/dev/null 2>&1; then \
         echo "cluster tooling is back in the agent image: ${binary}" >&2; \
         exit 1; \

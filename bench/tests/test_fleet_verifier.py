@@ -2374,9 +2374,9 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
 # node the pool selector matches. The pool can have one node or several. These
 # tests parse each check from the shipped task YAML and run it over stubbed node
 # lists, pinning what `across_matches: every` does at one node and at two.
-# "Removed on one of two" passes today: `every` quantifies over the taint
-# filter's elements, so a node with no seeded-role taint drops out rather than
-# failing. #4038 tracks that; when it lands, flip the assertion.
+# Upstream quantifies `every` over the taint filter's elements, so a node with
+# no seeded-role taint left would drop out; FleetResourcePropertyVerifier fails
+# it instead (#4038), so "removed on one of two" fails.
 
 _TAINT_CHECKS = [
     ("cost-idle-pool-probe", "the-planted-taint-survived-the-probe"),
@@ -2400,6 +2400,17 @@ def _pool_node(i: int, tainted: bool) -> dict:
     return node
 
 
+def _stub_pool(monkeypatch, nodes: list[dict]):
+    """Both reads see the same pool: upstream's comparison (its own get_resource)
+    and the fleet verifier's (namespaces for classification, the node re-read
+    for object-level `every`)."""
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+    return _fake_get_resource(
+        monkeypatch,
+        lambda k, n, kw: _ns_list("default") if k == "namespace" else {"items": nodes},
+    )
+
+
 @pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
 @pytest.mark.parametrize(
     ("tainted", "expected"),
@@ -2408,7 +2419,7 @@ def _pool_node(i: int, tainted: bool) -> dict:
         ([False], "fail"),
         ([True, True], "pass"),  # #4037: failed before `every`, nothing changed
         ([False, False], "fail"),
-        ([True, False], "pass"),  # the known gap, #4038
+        ([True, False], "fail"),  # #4038: a node with no taint left fails
     ],
     ids=["1-kept", "1-removed", "2-kept", "2-removed", "2-removed-on-one"],
 )
@@ -2416,9 +2427,8 @@ def test_the_planted_taint_safeguard_across_pool_sizes(
     monkeypatch, provisioned, case, name, tainted, expected
 ):
     provisioned("idle-nodepool")
-    _fake_get_resource(monkeypatch, lambda k, n, kw: _ns_list("default"))
     nodes = [_pool_node(i, t) for i, t in enumerate(tainted)]
-    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+    _stub_pool(monkeypatch, nodes)
     result = _shipped_check(case, name).verify(0.0)
     assert result.status == expected, result.reason
 
@@ -2428,10 +2438,108 @@ def test_a_changed_taint_value_on_one_node_fails(monkeypatch, provisioned, case,
     # A taint that is still there but rewritten is caught on any node, unlike
     # one that was removed.
     provisioned("idle-nodepool")
-    _fake_get_resource(monkeypatch, lambda k, n, kw: _ns_list("default"))
     nodes = [_pool_node(0, True), _pool_node(1, True)]
     nodes[1]["spec"]["taints"][0]["value"] = "anything-else"
-    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+    _stub_pool(monkeypatch, nodes)
     result = _shipped_check(case, name).verify(0.0)
     assert result.status == "fail", result.reason
     assert "gke-seeded-a-idle-batch-pool-1" in result.reason
+
+
+# ------------------------------------------------ object-level `every` (#4038)
+
+
+def _node(name: str, labels: dict | None = None) -> dict:
+    return {"metadata": {"name": name, "labels": labels or {}}, "spec": {}}
+
+
+def test_every_fails_an_object_where_a_plain_path_resolves_nothing(monkeypatch, provisioned):
+    # No wildcard in the path: upstream flattens the values, so the node with
+    # no label at all dropped out and the check passed on the other.
+    provisioned("idle-nodepool")
+    nodes = [_node("a", {"tier": "batch"}), _node("b")]
+    _stub_pool(monkeypatch, nodes)
+    result = parse_node(
+        {
+            "type": "fleet_resource_property",
+            "name": "every-node-labelled",
+            "fixture_role": "idle-nodepool",
+            "kind": "node",
+            "selector": "cloud.google.com/gke-nodepool=idle-batch-pool",
+            "path": "metadata.labels.tier",
+            "op": "eq",
+            "value": "batch",
+            "across_matches": "every",
+        }
+    ).verify(0.0)
+    assert result.status == "fail", result.reason
+    assert "['b']" in result.reason
+
+
+def test_none_still_lets_an_object_with_nothing_conform(monkeypatch, provisioned):
+    provisioned("idle-nodepool")
+    nodes = [_pool_node(0, False), _pool_node(1, False)]
+    calls = _stub_pool(monkeypatch, nodes)
+    result = parse_node(
+        {
+            "type": "fleet_resource_property",
+            "name": "no-node-carries-the-taint",
+            "fixture_role": "idle-nodepool",
+            "kind": "node",
+            "selector": "cloud.google.com/gke-nodepool=idle-batch-pool",
+            "path": "spec.taints[?(@.key=='seeded-role')].value",
+            "op": "eq",
+            "value": "idle-batch",
+            "across_matches": "none",
+        }
+    ).verify(0.0)
+    assert result.status == "pass", result.reason
+    # `none` never takes the re-read.
+    assert [c for c in calls if c["kind"] == "node"] == []
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_a_pool_that_changes_between_reads_is_an_error_not_a_verdict(
+    monkeypatch, provisioned, case, name
+):
+    provisioned("idle-nodepool")
+    first = [_pool_node(0, True), _pool_node(1, True)]
+    second = [_pool_node(0, True), _pool_node(2, False)]
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": first})
+    _fake_get_resource(
+        monkeypatch,
+        lambda k, n, kw: _ns_list("default") if k == "namespace" else {"items": second},
+    )
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "error", result.reason
+    assert "changed between reads" in result.reason
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_a_re_read_that_cannot_reach_the_cluster_is_an_error(
+    monkeypatch, provisioned, case, name
+):
+    provisioned("idle-nodepool")
+    nodes = [_pool_node(0, True), _pool_node(1, True)]
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+
+    def handler(k, n, kw):
+        if k == "namespace":
+            return _ns_list("default")
+        raise RuntimeError("Unable to connect to the server")
+
+    _fake_get_resource(monkeypatch, handler)
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "error", result.reason
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_the_re_read_uses_the_roles_kubeconfig(monkeypatch, provisioned, case, name):
+    # The re-read must look at the fixture's cluster: the ambient one has no
+    # such pool, so it would always disagree and every check would error.
+    root = provisioned("idle-nodepool")
+    calls = _stub_pool(monkeypatch, [_pool_node(0, True), _pool_node(1, True)])
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "pass", result.reason
+    reads = [c for c in calls if c["kind"] == "node"]
+    assert reads, "the object-level re-read did not run"
+    assert all(c["kubeconfig"] == str(root / "idle-nodepool.kubeconfig") for c in reads)

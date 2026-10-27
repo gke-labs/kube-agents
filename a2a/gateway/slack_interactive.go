@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -123,11 +124,14 @@ type slackQuestion struct {
 // the thread, and whose responseURL reaches its clicker alone.
 type slackPending struct {
 	conversation, author, text string
-	click                      bool
-	label                      string
-	question                   slackQuestion
-	shortcut                   bool
-	responseURL                string
+	// homeType is the channel_type of a top-level channel mention, the one
+	// shape that can set the home channel (noteHomeCandidate); "" otherwise.
+	homeType    string
+	click       bool
+	label       string
+	question    slackQuestion
+	shortcut    bool
+	responseURL string
 	// clicker is a shortcut clicker's Slack name, for the credit line.
 	clicker string
 }
@@ -344,6 +348,25 @@ func (s *SlackAdapter) notePending(msg InboundMessage) {
 		slackPending{conversation: msg.Conversation, author: slackMemberOf(msg.AuthorID), text: msg.Text})
 }
 
+// noteHomeCandidate marks a pending turn that could set the home channel: a
+// top-level message in a channel, a private channel or a group direct message
+// (Kind "group"; a DM is never one). A top-level channel message that reached
+// here mentioned the bot (inboundEvent). InboundVerified acts on the mark
+// once the gateway has verified the sender.
+func (s *SlackAdapter) noteHomeCandidate(msg InboundMessage, m *slackevents.MessageEvent) {
+	if msg.Kind != slackKindGroup || m.ThreadTimeStamp != "" || msg.Unaddressed {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	key := slackPendingKey(msg.Conversation, msg.MessageID)
+	if p, ok := ux.pending[key]; ok {
+		p.homeType = m.ChannelType
+		ux.pending[key] = p
+	}
+}
+
 // slackMemberOf is the Slack member id behind an author id: the id itself for
 // our own member, the part after the workspace for an admitted guest's
 // "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
@@ -511,6 +534,12 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		// still waiting for its task is not about the task this turn may
 		// start. A shortcut arms its own below.
 		s.uncreditLocked(conversation)
+	}
+	if verified && p.homeType != "" && !p.click && !p.shortcut && !chattext.IsCommand(p.text) {
+		// A verified ask typed at the top of a channel: the one turn that can
+		// set the home channel (slack_home_channel.go). A command is not an
+		// ask, and a click or a shortcut is not typed there.
+		s.homeCandidate(conversation, p.homeType, p.author)
 	}
 	if p.shortcut {
 		// A shortcut answers no question: it is an ask about a message, so

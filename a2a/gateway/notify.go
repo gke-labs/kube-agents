@@ -146,8 +146,11 @@ type notifyChatPoster interface {
 // Notifier answers chat.notify requests for one backend.
 type Notifier struct {
 	subject string
-	home    string
-	poster  notifyPoster
+	// home is the channel home requests post into, "" for none; read through
+	// homeChannel and written by SetHome under mu, because a Slack gateway
+	// that learns its home channel sets it while the worker posts.
+	home   string
+	poster notifyPoster
 	// threadOK is the backend's test that a requested thread may be
 	// replied on. The home channel is the bound either way: Chat's thread
 	// names its space, so it is checked against the home space (inHome);
@@ -276,6 +279,28 @@ func (n *Notifier) ServesConversations() bool {
 	return n.conv != nil
 }
 
+// SetHome arms home requests on a channel learned after start (the Slack
+// gateway's learned home, slack_home_channel.go): the same check the
+// constructor makes, so a home that is not a channel id is refused rather
+// than posted into. The route serves it from the next request.
+func (n *Notifier) SetHome(home string) error {
+	if !slackIsHomeChannelID(home) {
+		return fmt.Errorf("notify: home channel %q is not a Slack channel id (C... or G...)", home)
+	}
+	n.mu.Lock()
+	n.home = home
+	n.mu.Unlock()
+	n.log.Info("chat.notify home posts armed", "subject", n.subject, "home", home)
+	return nil
+}
+
+// homeChannel is the home channel as it stands, "" for none.
+func (n *Notifier) homeChannel() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.home
+}
+
 // Start subscribes the notifier on client and starts the worker that posts.
 // The subscription survives connection rebuilds (lib.Client.SubscribeCore);
 // stopping it also stops the worker once the queue drains.
@@ -287,7 +312,7 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 		return nil, fmt.Errorf("notify: %w", err)
 	}
 	go n.work()
-	n.log.Info("chat.notify route armed", "subject", n.subject, "home", n.home, "conversations", n.ServesConversations())
+	n.log.Info("chat.notify route armed", "subject", n.subject, "home", n.homeChannel(), "conversations", n.ServesConversations())
 	return &notifierSub{sub: sub, n: n}, nil
 }
 
@@ -504,7 +529,7 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, *lib.NotifyReply) {
 	if req.Conversation != "" || req.ContextID != "" {
 		return n.validateConversation(req)
 	}
-	if n.home == "" {
+	if n.homeChannel() == "" {
 		return refuse(notifyNoHome)
 	}
 	if req.Thread != "" && !n.threadOK(req.Thread) {
@@ -635,10 +660,10 @@ func (n *Notifier) post(job notifyJob) {
 		if job.req.Conversation != "" {
 			message, err = n.conv.Post(job.req.Conversation, chunk)
 		} else {
-			message, landed, err = n.poster.PostNotify(n.home, thread, chunk)
+			message, landed, err = n.poster.PostNotify(n.homeChannel(), thread, chunk)
 		}
 		if err != nil {
-			n.log.Error("notify post failed", "home", n.home, "thread", thread, "chunk", i+1, "err", err)
+			n.log.Error("notify post failed", "home", n.homeChannel(), "thread", thread, "chunk", i+1, "err", err)
 			if !answered {
 				n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
 			}
@@ -653,7 +678,7 @@ func (n *Notifier) post(job notifyJob) {
 			n.reply(job, lib.NotifyReply{MessageID: first, ThreadID: thread})
 		}
 	}
-	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
+	n.log.Info("notify posted", "home", n.homeChannel(), "thread", thread, "message", first)
 }
 
 // postConsole answers a console conversation's request with one notify
@@ -841,19 +866,19 @@ func (n *Notifier) postHomeChat(job notifyJob) bool {
 		n.metrics.chatMessage(chatInvalid)
 		for _, p := range reading.Problems {
 			n.log.Warn("notify: "+chatDroppedWhat(chatmsg.Notify, reading),
-				"home", n.home, "rule", truncateRunes(p.Error(), chatProblemMax))
+				"home", n.homeChannel(), "rule", truncateRunes(p.Error(), chatProblemMax))
 		}
 	}
 	m := layoutOf(reading)
 	if m == nil {
 		return false
 	}
-	message, landed, err := poster.PostNotifyMessage(n.home, job.req.Thread, OutMessage{Text: job.req.Text, Chat: m})
-	if !n.chatOutcome(n.home, err) {
+	message, landed, err := poster.PostNotifyMessage(n.homeChannel(), job.req.Thread, OutMessage{Text: job.req.Text, Chat: m})
+	if !n.chatOutcome(n.homeChannel(), err) {
 		return false
 	}
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
-	n.log.Info("notify posted", "home", n.home, "thread", landed, "message", message, "chat", true)
+	n.log.Info("notify posted", "home", n.homeChannel(), "thread", landed, "message", message, "chat", true)
 	return true
 }
 
@@ -1069,7 +1094,7 @@ func (n *Notifier) slackThreadOK(thread string) bool {
 	if !qualified {
 		return slackIsTS(thread)
 	}
-	return channel == n.home && slackIsTS(ts)
+	return channel == n.homeChannel() && slackIsTS(ts)
 }
 
 // slackThreadTS is the ts of an admitted Slack thread, qualified or bare.
@@ -1085,20 +1110,20 @@ func slackThreadTS(thread string) string {
 // chunk. validate has already refused blocks to a backend without them.
 func (n *Notifier) postBlocks(job notifyJob) {
 	poster := n.poster.(notifyBlocksPoster)
-	message, landed, err := poster.PostNotifyBlocks(n.home, job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks)
+	message, landed, err := poster.PostNotifyBlocks(n.homeChannel(), job.req.Thread, truncateRunes(job.req.Text, discordChunk), job.req.Blocks)
 	if err != nil {
-		n.log.Error("notify blocks post failed", "home", n.home, "thread", job.req.Thread, "err", err)
+		n.log.Error("notify blocks post failed", "home", n.homeChannel(), "thread", job.req.Thread, "err", err)
 		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
 		return
 	}
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
-	n.log.Info("notify posted", "home", n.home, "thread", landed, "message", message, "blocks", true)
+	n.log.Info("notify posted", "home", n.homeChannel(), "thread", landed, "message", message, "blocks", true)
 }
 
 // inHome reports whether thread is a thread resource of the home space
 // ("spaces/AAA/threads/BBB", nothing nested further).
 func (n *Notifier) inHome(thread string) bool {
-	id, ok := strings.CutPrefix(thread, n.home+gchatThreadsToken)
+	id, ok := strings.CutPrefix(thread, n.homeChannel()+gchatThreadsToken)
 	return ok && id != "" && !strings.Contains(id, "/")
 }
 

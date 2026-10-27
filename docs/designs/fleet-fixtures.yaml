@@ -329,11 +329,12 @@ fixtures:
       - healthcheck/drain-timeout-<prefix>-b
     defect: >-
       A Compute Engine backend service on the default pool's instance group
-      whose connection draining timeout is 3600 seconds, six times the 600
+      whose connection draining timeout is 720 seconds, a fifth over the 600
       seconds GKE waits per node during a pool upgrade, behind a TCP health
       check and no forwarding rule, so it routes nothing and costs nothing;
-      every default-pool node recreate on this cluster waits the 600 seconds
-      on it.
+      every default-pool node recreate on this cluster waits the 720 seconds
+      on it, which stays under the 30 minutes after which GKE fails the node
+      step.
 
   - role: readiness-failclosed-webhook
     slot: b

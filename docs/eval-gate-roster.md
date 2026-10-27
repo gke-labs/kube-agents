@@ -151,9 +151,9 @@ with a filed issue naming the exit condition:
   `enabled`, and the agent read that leftover block as configured or open and said seeded-c
   matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
-  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal leaves
-  `consistency` with no presubmit case, so the domain is on the `domains.yaml` allowlist until
-  it returns. Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
+  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal left
+  `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
+  consistency-drift-outlier took a roster seat on 2026-10-26 (below). Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
   case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
@@ -260,6 +260,45 @@ the reds that once argued for un-arming it belonged to the old vocabulary check.
 
 Admitted on the record since the split:
 
+- **consistency-drift-outlier**, 2026-10-26, the consistency domain's roster seat since its probe,
+  consistency-authorized-networks-probe, was demoted on 2026-10-21 (above), moved from
+  `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit. It is not
+  a probe but the full `fleet-consistency-drift` audit, one of the four recast out of the presubmit
+  on 2026-08-26 at 600–1300 s a repetition; on the `claude-opus-5-5-kubeagents-mcp` agent model it
+  runs at about 200 s. The record is the main nightly (`ci-kube-agents-eval-nightly`), read from
+  each build's `case-consistency-drift-outlier.json` and dated by the build's UTC start: 33 of 34
+  graded repetitions on the twelve nights that graded it, 2026-10-13 to 10-26. 10-21's build
+  uploaded nothing (#3616) and 10-25's hit its deadline before grading, so neither counts. The one
+  miss, on 2026-10-16 on the Gemini setup, was the Platform Agent fanning the audit out to cluster
+  agents: one of them filed the right ledger (seeded-c, authorized networks), but the main task
+  blocked and its answer carried no ledger URL, so the verifier found no ledger (10-16 also had one
+  infra repetition). Since the model change on 2026-10-19: 14 of 14 over the five graded nights,
+  5 of 5 of them under `spec.mode next`, the presubmit's mode and inject lane (2/2 on 10-24 with
+  one infra repetition, 3/3 on 10-26). Median repetition 198 s (165–397 s) over the fourteen. The
+  store reads `collecting: 5/5 runs recorded at this key across 2 recorded run(s), 15 more needed`
+  at the next-mode key and `collecting: 9/9 … across 3` at the Claude today-mode key, since the
+  model change and then next mode each reset it. The last Gemini key reads
+  `the record would admit it: 19/20 screening runs across 7 recorded run(s)`. So the citation is
+  the nightly record, as for pdb-remediation-pr and vcs-spent-branch-reuse below, and the eval
+  crew's approval of this line is the call that it suffices before the window fills. The probe's
+  failure does not carry over. This case is graded on the ledger's finding ids
+  (`ledger_issue_contains`, scope `finding_ids`: seeded-c and the `authorized-networks` check),
+  not on the reply, and the drift collector applies the SOP's rule that authorized networks is on
+  only when `enabled` is true (the rule #3605 asks the chat path to reach). It reads seeded-c's
+  `drift-outlier` role, whose catalog `state` assertion (`masterAuthorizedNetworksConfig.enabled`
+  never true) the hourly seeded-fleet scan runs. What the scan does not watch is the majority
+  side and the cluster ages. The SOP builds a baseline only when at least 2/3 of the cohort agree,
+  so one peer (seeded-a, -b or -d) losing its authorized-networks block leaves no baseline and no
+  finding. The SOP also leaves a cluster under 24 hours old out of every cohort, so replacing any
+  seeded cluster silences the finding for a day (`docs/designs/fleet-fixtures.yaml`). Either one
+  fails every repetition, which reds every open pull request until the fleet is repaired, and
+  nothing pages first: [#4015](https://github.com/gke-labs/kube-agents/issues/4015) adds the
+  peers' assertions to the scan.
+  What it costs: it requests no pull request (the lane's install turns the audits' remediation
+  sweep off, [The inject lane](#the-inject-lane)), so it runs in the first phase beside the other
+  cases, its three repetitions one after another on its task lock, hinted at 600 s in
+  `unit_cost_hint` (down from the audits' 900 s on its measured 165–397 s). Taking the line took `consistency` off the `docs/designs/domains.yaml`
+  allowlist, and made the ledger path blocking (below).
 - **pdb-remediation-pr**, 2026-10-26
   ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), back from its demotion on
   2026-10-17 (rung-4 collapses on #2971, #3017 and #3329: the worker found checkout-gateway with
@@ -485,7 +524,7 @@ part, so the edit that fixes the case deletes the entry.
 ## How far the roster's promise reaches
 
 The scope of "a held-out case cannot red a pull request" is rungs 4 and 6 only. Rungs 1–3
-— a forbidden cluster mutation (or, on the inject lane, an unrequested GitHub write), an
+— a forbidden cluster mutation (or an unrequested GitHub write the repetition names), an
 erroring check, a record that is not a real run — stay
 blocking for every case by design, admitted or not: `grade_case` evaluates them before it
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
@@ -509,9 +548,12 @@ it, or a rung-1–3 red when the verifier errors. Since 2026-10-26 a remediation
 too: a pdb-remediation-pr fix that never becomes a pull request is a rung-4 red. What
 `rca-remediation-pr` alone grades, the RCA delegation chain ending in a pull request, is still
 nightly-only, so it is first seen by the next nightly that finishes grading. The eval crew took
-that trade with the policy; what makes a break on the ledger path block is the canary's roster
-line (#2013 step 4), and until it holds a pull request that touches that path should still say
-what it ran by hand.
+that trade with the policy. The ledger path blocks since 2026-10-26: consistency-drift-outlier,
+on the roster, runs the `fleet-consistency-drift` audit through the minted token, the cloned
+`*-infra` workspace and the ledger write, and is graded by `ledger_issue_contains`, so a change
+that stops a ledger being published is a rung-4 red, or a rung-1–3 red when the verifier errors.
+What the canary alone grades, the compliance stream and its planted binding, still blocks only at
+its roster line (#2013 step 4).
 
 ## The whole-suite rate
 
@@ -659,29 +701,37 @@ the stopped asks (a `stop` sent on the conversation after the opening turn,
 graded on the question a delegated card paused on, which only the inject lane's board read folds
 into the reply. `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
-the cases that request a pull request, so a stop that fails and lets its card write reds only
+the cases that request a pull request, with its window marked exclusive like theirs, so a stop
+that fails and lets its card write reds that case whether or not it names the write, and only
 that case.
 
-A safeguard the lane needs and no case declares is the lane's safeguards list,
-`hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
-own rule for a change is a pull request (through a card the Planning Agent files, under the
-bridge's default `api` executor the lane runs), and a case's cluster safeguards see nothing of
-GitHub; the file
-holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
-`hack/ci-eval-pr.sh` appends on that lane to a copy of every task file in the matrix before
-devops-bench reads it, so a repetition that wrote a pull request or branch the case did not
-request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is. The task files
-under `bench/tasks/` and the api lane are untouched. A case that requests a pull request (a
-`pull_request_opened` or `pull_request_diff_contains` check of its own) is allowed the ones its
-reply names, and because the fan-out runs cases side by side against one repository, the script
-runs those cases in a second phase after every other unit has finished (on both lanes since
-#2260, for the repository reset's sake), one at a time and on the inject lane each
-after a settle as long as the check's clock-skew tolerance, so a repetition that requests
-nothing never shares the repository with one that writes by design and no window reaches back
-into the unit before.
+A safeguard every case needs and no case declares is in the lane safeguards list,
+`hack/eval/inject-lane-safeguards.yaml`, which applies on both lanes despite its name, so the
+api and inject lanes are graded against the same bar. The door's task can reach the platform persona, whose own rule for a change is a pull request
+(through a card the Planning Agent files, under the bridge's default `api` executor), and a case's
+cluster safeguards see nothing of GitHub; the file holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
+`hack/ci-eval-pr.sh` appends to a copy of every task file in the matrix before devops-bench reads
+it, so a repetition that wrote a pull request or branch the case did not request is a tripped
+catastrophic safeguard at rung 1, as a cluster mutation is. A write is charged to a repetition
+whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
+push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
+its branch); a write in the window that the repetition does not name is recorded under
+`unattributed` and not charged, so one late write fails the case that named it rather than every
+case running at the time. A case that requests a pull request runs alone, so its window is
+marked exclusive and a write in it is charged whether named or not. The run refuses to start
+on either lane without a GitOps repository for the safeguard to read, `EVAL_GITOPS_REPO=none`
+included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
+`BENCH_GITHUB_TOKEN` or `GITHUB_TOKEN` is set; whether that token can read the repository is
+learned on the first repetition, whose check errors naming the repository and the missing permission.
+The task files under `bench/tasks/` are untouched. A case that
+requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
+own) is allowed the ones its reply names, and the script runs those cases in a second phase
+after every other unit has finished, one at a time and each after a settle as long as the
+check's clock-skew tolerance, so a repetition that requests nothing never shares the repository
+with one that writes by design and no window reaches back into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
-the set of requesting cases. The same approvers as the exclusion list: an entry is a rung 1 check
-on every pull request.
+the set of requesting cases. It needs an `eval-crew` approval, as the exclusion list does:
+`hack/OWNERS` scopes it to that alias, and an entry in it is a rung 1 check on every pull request.
 
 Rung 6 compares an inject run only with next-mode history. The version key carries the mode
 ([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
@@ -694,14 +744,17 @@ only, which no job appends to now, so rung 6 there is quiet once the key moves p
 lines. The key includes the agent model, and the main nightly runs the presubmit's, so its
 next-mode lines are the presubmit's rung 6 history.
 
-One thing about the lane's install differs too. That write safeguard
-(`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
-window to the case in flight, and the fleet audits' automatic remediation sweep opens one on its
-own wherever a pool repository declares a workload with a `major` finding on the sweep's list, the
-fresh install's first-run chain included. So `hack/ci-deploy.sh` installs the lane's agent with
+One thing about the inject lane's install differs too. The fleet audits' automatic remediation
+sweep opens a pull request on its own wherever a pool repository declares a workload with a
+`major` finding on the sweep's list, the fresh install's first-run chain included, and that write
+safeguard (`no-github-writes-the-case-did-not-request`) charges any pull request in an exclusive
+window to the case in flight. So `hack/ci-deploy.sh` installs the inject lane's agent with
 `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
 their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
-lane keeps the sweep on, where the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
+lane keeps the sweep on, where a sweep's pull request names no repetition and lands under
+`unattributed`, in a requesting case's exclusive window as well (the check knows it by the
+`platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
+`bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
 ## The GitLab lane
 
@@ -716,7 +769,8 @@ Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.t
 from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
-ledger case passes three repetitions anywhere, so the ledger path is the harness's to prove: the
+ledger case is in the lane (consistency-drift-outlier passes on the GitHub nightlies and holds a
+roster seat since 2026-10-26, but has no GitLab record), so the ledger path is the harness's to prove: the
 lease-time probe in [`docs/ci-pool-projects.md`](ci-pool-projects.md) 5.6, which says the forge
 takes a ledger, not that the agent publishes one; that stays a case's job once one earns a line. The GitLab
 nightly runs the same list once a night on its own leased project
@@ -770,6 +824,12 @@ dashboard classes the case `fixture-drift`, the nightly files no `nightly-red` i
 report. A role the scan could not read, a scan that failed, a pull request that changes the
 fleet catalog, the scan or the case itself: each leaves the case graded as usual.
 
+A collapse of consistency-drift-outlier on several unrelated pull requests at once is a fleet
+question before it is a case question. Check that seeded-a, -b and -d still carry their master
+authorized-networks block, and that no seeded cluster is under a day old. The scan watches
+neither yet ([#4015](https://github.com/gke-labs/kube-agents/issues/4015)), so neither is recorded
+as infrastructure. If either holds, demote the case the same day and say why.
+
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
 window for the case, the verdict's **Record says** column reads `would-demote` and the
@@ -788,7 +848,9 @@ with the issue that names its re-admission condition, and date it as `demoted YY
 reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's effective owner — its `owner:`, or
 its domain's owner ([`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md#ownership)) —
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
-not answer stays demoted. The bar is the same for a contributed case and an in-house one;
+not answer stays demoted. While a demotion leaves a domain with no roster case, the CI-health
+tick keeps an issue open for the domain's owner with the domain's best nightly candidates
+([`ci-health.md`](ci-health.md#coverage-gaps)). The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
 
 A demotion that leaves a domain with no case on the roster must, in the same pull request, do one

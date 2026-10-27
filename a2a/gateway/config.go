@@ -47,6 +47,20 @@ const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 // route posts to; the operator renders it from slack.homeChannel.
 const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
 
+// The learned-home contract (slack_home_channel.go): the operator renders the
+// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// gateway's own image for the record's writer and reader keys, and the one
+// switch that arms the learn, which only an operator that also admits the
+// record renders.
+const (
+	envSlackHomePolicy    = "A2A_SLACK_HOME_POLICY"
+	envHomeChannelRecord  = "A2A_HOME_CHANNEL_RECORD"
+	envSelfImage          = "A2A_SELF_IMAGE"
+	envHomeChannelLearn   = "A2A_HOME_CHANNEL_LEARN"
+	slackHomePolicyManual = "manual"
+	envTrue               = "true"
+)
+
 // envSlackAnswerFeedback turns answer feedback off when "false"
 // (feedback.go); the operator renders it only from
 // slack.answerFeedback=false.
@@ -179,6 +193,16 @@ type Config struct {
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
 	SlackHomeChannel string
+	// SlackHomePolicy is slack.homeChannelPolicy as the operator renders it:
+	// "manual" keeps the home channel the CR's alone; anything else is auto.
+	SlackHomePolicy string
+	// HomeChannelRecord names the ConfigMap a learned home channel is
+	// recorded in, and SelfImage the gateway's own image reference, which it
+	// stamps into that record. HomeChannelLearn is the switch that arms the
+	// learn at all (HomeLearnArmed).
+	HomeChannelRecord string
+	SelfImage         string
+	HomeChannelLearn  bool
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
 	// rating controls are drawn and nothing is kept, whatever the feedback
 	// bucket holds.
@@ -610,6 +634,16 @@ func (c *Config) Backend() string {
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
+// HomeLearnArmed reports whether the gateway may learn the Slack home channel
+// from the first admitted channel mention and record it: the backend is
+// Slack, the CR names no home channel (a set one is the CR's, malformed or
+// not), the policy is auto, a record is named, and the operator has armed the
+// learn. Every gate holds, or nothing is read, written or posted.
+func (c *Config) HomeLearnArmed() bool {
+	return c.Backend() == slackBackend && c.SlackHomeChannel == "" &&
+		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
+}
+
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
@@ -648,6 +682,10 @@ func FromEnv() (*Config, error) {
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
+	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
+	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
+	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
+	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}

@@ -431,7 +431,7 @@
       "cluster_slot": "b",
       "namespace": null,
       "probes": ["node?cloud.google.com/gke-nodepool=default-pool"],
-      "fixture": "drain-timeout-<prefix>-b backend service on the default pool's instance group with connectionDraining.drainingTimeoutSec 3600, six times GKE's 600-second per-node deregistration wait, behind a TCP health check and no forwarding rule, so it routes nothing. The backend service is a Compute Engine object the probe and state grammars cannot address (kubectl kinds and the cluster record only), so the role probes the pool's node and asserts the pool; the readiness report's lb-connection-draining rule is what reads the service, and its case grades that line",
+      "fixture": "drain-timeout-<prefix>-b backend service on the default pool's instance group with connectionDraining.drainingTimeoutSec 720, a fifth over GKE's 600-second per-node deregistration wait and under the 30 minutes after which GKE fails the node step, behind a TCP health check and no forwarding rule, so it routes nothing. The backend service is a Compute Engine object the probe and state grammars cannot address (kubectl kinds and the cluster record only), so the role probes the pool's node and asserts the pool; the readiness report's lb-connection-draining rule is what reads the service, and its case grades that line",
       "state": [
         {
           "subject": "cluster",

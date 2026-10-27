@@ -4179,10 +4179,10 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				ResourceNames: []string{agent.Name},
 				Verbs:         []string{"get"},
 			},
-			// The home-channel record, one named ConfigMap, for a gateway that
-			// learns the home channel from the first admitted mention in a
-			// channel; no shipped gateway reads or patches it yet
-			// (platformagent_home_channel_record.go).
+			// The home-channel record, one named ConfigMap: the gateway's
+			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
+			// once an A2A_HOME_CHANNEL_LEARN this operator does not yet render
+			// arms it (platformagent_home_channel_record.go).
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"configmaps"},
@@ -4732,9 +4732,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// The learned-home contract (platformagent_home_channel_record.go),
 		// for a gateway that learns a home channel from the first admitted
 		// mention: whether it may, the record it would write, and its own
-		// image for the record's writer key. No shipped gateway reads these
-		// yet. The gateway's home env above stays the CR's: a learned value
-		// would reach the gateway through the record, not a re-render.
+		// image for the record's writer and reader keys. The gateway reads
+		// them, and learns only once A2A_HOME_CHANNEL_LEARN is rendered true,
+		// which this release does not. The gateway's home env above stays the
+		// CR's: a learned value reaches the gateway through the record, not a
+		// re-render.
 		backendEnv = append(backendEnv,
 			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
 			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},

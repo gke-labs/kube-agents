@@ -368,3 +368,29 @@ func TestSlackNotifyTextPostsDoNotUnfurl(t *testing.T) {
 
 var _ notifyPoster = (*SlackAdapter)(nil)
 var _ notifyBlocksPoster = (*SlackAdapter)(nil)
+
+func TestSlackNotifySetHomeArmsHomePosts(t *testing.T) {
+	home := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(home, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != notifyNoHome {
+		t.Fatalf("home post before SetHome = %+v, want %q", got, notifyNoHome)
+	}
+	if err := n.SetHome("D0DM"); err == nil {
+		t.Error("a DM was accepted as the home channel")
+	}
+	if err := n.SetHome(testSlackHome); err != nil {
+		t.Fatal(err)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != "" {
+		t.Fatalf("home post after SetHome = %+v", got)
+	}
+	if posts := home.all(); len(posts) != 1 || posts[0].space != testSlackHome {
+		t.Errorf("posts = %+v, want one in %s", posts, testSlackHome)
+	}
+	if !n.slackThreadOK(testSlackHome + "/1.2") {
+		t.Error("a thread of the learned home was refused")
+	}
+}

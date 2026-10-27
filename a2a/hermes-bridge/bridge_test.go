@@ -391,10 +391,21 @@ func fold(t *testing.T, c *lib.Client, taskID string) *lib.Task {
 	return task
 }
 
+// terminalWait is how long waitTerminal polls for a task's terminal; a
+// test whose task does more work than that admits passes its own budget to
+// waitTerminalFor.
+const terminalWait = 20 * time.Second
+
 func waitTerminal(t *testing.T, c *lib.Client, taskID string) *lib.Task {
 	t.Helper()
+	return waitTerminalFor(t, c, taskID, terminalWait)
+}
+
+// waitTerminalFor is waitTerminal with the caller's budget.
+func waitTerminalFor(t *testing.T, c *lib.Client, taskID string, d time.Duration) *lib.Task {
+	t.Helper()
 	var task *lib.Task
-	waitFor(t, 20*time.Second, "terminal event on "+taskID, func() bool {
+	waitFor(t, d, "terminal event on "+taskID, func() bool {
 		got, err := c.TasksGet(testCtx(t), "platform", taskID)
 		if err != nil {
 			return false
