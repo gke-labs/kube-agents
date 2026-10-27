@@ -585,6 +585,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
+     agents/platform/scripts/untrusted_text.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
@@ -685,6 +686,7 @@ COPY agents/platform/scripts/forge.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
+     agents/platform/scripts/untrusted_text.py \
      /opt/vcs/libexec/platform/
 COPY deploy/sandbox/trusted-closure-guard.py /opt/vcs/libexec/trusted-closure-guard.py
 RUN set -e; \
