@@ -982,5 +982,10 @@ async def board_action(adapter: Any, ack: Any, body: dict, action: dict) -> None
             )
             _board_edits[message_key] = (lock, blocks)
         except Exception as exc:  # noqa: BLE001 - the cards moved either way; a re-tap redraws the row
-            _board_tapped.pop(key, None)
+            # A failed tap was released already; popping again could free a newer
+            # tap's claim. The edit may have landed though its answer did not, so
+            # the next edit builds from its own tap's payload.
+            if settled:
+                _board_tapped.pop(key, None)
+            _board_edits[message_key] = (lock, None)
             logger.warning("slack_ux_clicks: could not edit the board row on %s: %s", msg_ts, exc)

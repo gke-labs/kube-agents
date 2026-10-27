@@ -204,8 +204,17 @@ func (s *SlackAdapter) runBoardTap(p slackClickPayload, key, verb string, tasks 
 	}
 	if err != nil {
 		// The cards may have moved; a second tap asks again and redraws the
-		// row ("No longer stuck." for cards already moved).
-		release()
+		// row ("No longer stuck." for cards already moved). A failed tap was
+		// released already, and releasing it again could free a newer tap's
+		// claim. The edit may have landed though Slack's answer did not, so
+		// the next edit builds from its own tap's payload.
+		if outcome != slackBoardFailed {
+			release()
+		}
+		s.mu.Lock()
+		delete(s.boardSent, msgKey)
+		forget(&s.boardSentOrder, msgKey)
+		s.mu.Unlock()
 		s.log.Warn("slack: editing a board row failed", "channel", p.Channel.ID, "ts", p.Message.TS, "err", err)
 		return
 	}
