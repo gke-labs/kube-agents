@@ -25,6 +25,7 @@ BASE_FACTOR = "base"
 COMBINED_FACTOR = "combined"
 ENV_PREFIX = "SCALE_"
 PROXY_LOAD_KIND = "proxy_load"
+TRIGGER_SOAK_KIND = "trigger_soak"
 TARGET_KEYS = (
     "project_id",
     "host_context",
@@ -55,6 +56,10 @@ class Operation:
     timeout_seconds: int = 0
     # proxy_load: the command each worker repeats, as an argv after the CLI name.
     command: tuple[str, ...] = ()
+    # trigger_soak: the cron jobs marked due at the window's start, and the home of the
+    # profile whose roster holds them.
+    jobs: tuple[str, ...] = ()
+    jobs_home: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,8 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
             window_seconds=int(spec.get("window_seconds", 0)),
             timeout_seconds=int(spec.get("timeout_seconds", 0)),
             command=tuple(spec.get("command") or ()),
+            jobs=tuple(spec.get("jobs") or ()),
+            jobs_home=str(spec.get("jobs_home") or ""),
         )
         for name, spec in (raw.get("operations") or {}).items()
     ]
@@ -146,6 +153,12 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
             and op.window_seconds > 0
         ):
             raise ValueError(f"{path}: operation {op.name} needs a command (a list of words) and window_seconds")
+        jobs = spec.get("jobs")
+        if op.kind == TRIGGER_SOAK_KIND and not (
+            isinstance(jobs, list) and jobs and all(isinstance(job, str) for job in jobs)
+            and op.jobs_home and op.window_seconds > 0
+        ):
+            raise ValueError(f"{path}: operation {op.name} needs jobs (a list of job ids), jobs_home and window_seconds")
     unknown = sorted({f for op in operations for f in op.factors} - set(factors))
     if unknown:
         raise ValueError(f"{path}: operations name unknown factors {unknown}")

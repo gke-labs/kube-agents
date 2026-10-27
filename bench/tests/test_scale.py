@@ -511,7 +511,7 @@ def test_phase2_runs_levels_in_plan_order_and_reuses_the_phase1_base():
     levels = list(dict.fromkeys((s.factor, s.level) for s in plan.matrix()))
     assert levels[0] == ("base", 0)
     assert [f for f, _ in levels[1:]] == ["proxy_concurrency"] * 4 + ["concurrent"] * 3 + ["failing_pods"] * 2 + [
-        "combined", "clusters", "clusters"]
+        "combined", "clusters"]
     assert plan.level_values("combined", 1) == {**plan.base, "clusters": 8, "objects": 4000}
     phase1 = load_plan(PHASE1, environ=ENV)
     shared = {s.operation.name for s in plan.matrix() if s.factor == "base"} & {o.name for o in phase1.operations}
@@ -778,3 +778,63 @@ def test_a_pool_that_cannot_be_emptied_does_not_stop_the_level(monkeypatch, tmp_
     run.settings["default_pool_pods"] = 0
     with pytest.raises(kube.CommandError):
         run.ensure_nodes(run.plan.level_values("clusters", 16))
+
+
+def test_trigger_jobs_marks_every_job_in_the_profiles_home(monkeypatch):
+    calls = []
+    monkeypatch.setattr(operations.kube, "kubectl_json", lambda *a, **k: {"items": [{"metadata": {"name": "gw"}}]})
+    monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: calls.append(a) or "")
+    assert operations.trigger_jobs("ctx", "ns", "/opt/data/profiles/platform", ("a-audit", "b-audit")) == []
+    args = calls[0]
+    assert args[args.index("--") + 1:args.index("--") + 3] == ("env", "HERMES_HOME=/opt/data/profiles/platform")
+    assert args[-2:] == ("a-audit", "b-audit")
+
+
+def test_a_job_that_cannot_be_marked_is_an_error(monkeypatch):
+    def fail(*a, **k):
+        raise kube.CommandError("exited 3: b-audit")
+    monkeypatch.setattr(operations.kube, "kubectl_json", lambda *a, **k: {"items": [{"metadata": {"name": "gw"}}]})
+    monkeypatch.setattr(operations.kube, "kubectl", fail)
+    [error] = operations.trigger_jobs("ctx", "ns", "/home", ("a-audit", "b-audit"))
+    assert "b-audit" in error
+
+
+def test_unfinished_jobs_names_every_run_that_did_not_complete(monkeypatch):
+    monkeypatch.setattr(operations.kube, "kubectl_json", lambda *a, **k: {"items": [{"metadata": {"name": "gw"}}]})
+    monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: (
+        "a-audit completed 2026-10-27T13:40:21+00:00\nb-audit running None\nc-audit unclaimed None\n"))
+    assert operations.unfinished_jobs("ctx", "ns", "/home", ("a-audit", "b-audit", "c-audit"), "2026-10-27T12:47:29Z") == [
+        "b-audit running at the end of the window", "c-audit unclaimed at the end of the window"]
+
+
+def test_a_trigger_soak_needs_jobs_and_their_home(tmp_path):
+    plan = PHASE2.read_text() + (
+        "  audits:\n    kind: trigger_soak\n    factors: [clusters]\n    window_seconds: 1800\n    jobs: [a-audit]\n")
+    path = tmp_path / "plan.yaml"
+    path.write_text(plan)
+    with pytest.raises(ValueError, match="jobs_home"):
+        load_plan(path, environ=ENV)
+    path.write_text(plan + "    jobs_home: /opt/data/profiles/platform\n")
+    op = next(o for o in load_plan(path, environ=ENV).operations if o.name == "audits")
+    assert op.jobs == ("a-audit",) and op.jobs_home == "/opt/data/profiles/platform"
+
+
+PHASE3 = REPO_BENCH / "scale" / "phase3.yaml"
+OOBE_SCRIPT = REPO_BENCH.parent / "agents" / "chat" / "scripts" / "oobe.py"
+
+
+def test_phase3_triggers_the_oobe_first_run_audits_in_a_window_of_their_own():
+    import ast
+
+    plan = load_plan(PHASE3, environ=ENV)
+    assert {op.window_seconds for op in plan.operations if op.kind != "prompt"} == {1800}
+    audits = next(op for op in plan.operations if op.kind == "trigger_soak")
+    tree = ast.parse(OOBE_SCRIPT.read_text())
+    first_run = next(
+        ast.literal_eval(node.value) for node in tree.body
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "FIRST_RUN_AUDITS" for t in node.targets)
+    )
+    assert audits.jobs == tuple(first_run)
+    # The fleet only shrinks: the largest level runs first.
+    assert [s.level for s in plan.matrix() if s.factor == "clusters" and s.operation.name == "onboarding_30m"] == [
+        22, 16, 8]

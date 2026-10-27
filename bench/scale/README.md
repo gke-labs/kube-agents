@@ -16,6 +16,8 @@ console's Harness limits page reads `harness-limits.json`.
   phase is another file of the same shape.
 - `phase2.yaml`: the Phase 2 plan. Its base is Phase 1's, so an install that runs the same build
   reuses the Phase 1 base runs.
+- `phase3.yaml`: the Phase 3 plan: every window 30 minutes, with the first-run audits that a new
+  install starts late moved into a window of their own.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
@@ -58,7 +60,9 @@ An operation's `kind` says what a run does: `prompt` sends the operation's `prom
 concurrency of 1, its `follow_up`) through the agent API; `soak` waits `window_seconds`;
 `restart_soak` restarts the gateway pod first; `reset_soak` resets the install's state volumes
 first; `proxy_load` runs the operation's `command` through `credential-proxy-exec` in the sandbox
-shell, from `proxy_concurrency` workers at once for `window_seconds`, with no model call. A factor
+shell, from `proxy_concurrency` workers at once for `window_seconds`, with no model call;
+`trigger_soak` marks the cron `jobs` on the roster under `jobs_home` due at the window's start, as
+the OOBE job marks its first-run audits, and notes the ones not finished when the window ends. A factor
 named `combined` has points rather than values as levels: level N applies the plan's Nth `combined`
 point, which sets several factors at once. The levels run in the order the plan lists the factors.
 In `settings`, `trigger_reconcile` runs the Cluster Agent reconcile when the profiles differ from

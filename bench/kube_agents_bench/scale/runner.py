@@ -450,6 +450,14 @@ class Runner:
             concurrency = int(values.get(PROXY_CONCURRENCY, 1))
             kubeconfig_glob = PROFILE_KUBECONFIG_GLOB.format(project=self.project, cluster=self.cluster_names(count)[0])
             outcome = operations.proxy_load(self.install.context, self.install.namespace, op, concurrency, kubeconfig_glob)
+        elif op.kind == "trigger_soak":
+            # Work the install would start later (the OOBE first-run audits) is started now, so a
+            # short window holds its peak; jobs still running at the window's end are noted.
+            outcome = operations.OperationResult()
+            outcome.errors += operations.trigger_jobs(self.install.context, self.install.namespace, op.jobs_home, op.jobs)
+            outcome.errors += operations.soak(op.window_seconds).errors
+            outcome.errors += operations.unfinished_jobs(self.install.context, self.install.namespace, op.jobs_home,
+                                                         op.jobs, started_iso)
         elif op.kind == "reset_soak":
             self.check_resettable()
             operations.reset(self.install.context, self.install.namespace)

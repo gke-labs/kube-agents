@@ -1,0 +1,78 @@
+# Phase 3 of docs/designs/agent-harness-bottlenecks.md: every window 30 minutes, with the late
+# onboarding work moved into a window of its own so a 30-minute window still holds the peak.
+#
+# After a reset, the OOBE job (agents/chat/scripts/oobe.py) runs the reconcile and the scan
+# (a card per Cluster Agent), then five first-run audits one after another, each reading every
+# cluster through the broker. The audits peak the credential proxy and the shell 40-60 minutes
+# after the reset, past a 30-minute window. Here the onboarding window holds the reset, the
+# reconcile and the scan, and a second window marks the five audits due at its start, all at
+# once, as OOBE marks them one by one: a worse case than OOBE's order, bounded for the broker by
+# its 8 command slots.
+#
+# Set the target as for phase1.yaml. Run the cluster levels first, then the base, so the fleet
+# only shrinks: `run phase3.yaml --only-factor clusters`, then `--only-factor base`.
+phase: phase3
+
+target:
+  host_cluster: scale-host
+  host_location: us-central1-c
+  namespace: kubeagents-system
+  zone: us-central1-c
+  cluster_prefix: scale-
+  cluster_label: purpose=harness-scale
+  mode: next
+  data_file: harness-limits.json
+
+base:
+  clusters: 2
+  nodes: 2
+  objects: 100
+  churn_per_minute: 10
+  failing_pods: 1
+  concurrent: 1
+  listing_pods: 100
+
+factors:
+  clusters: [2, 22, 16, 8]
+
+settings:
+  settle_seconds: 300
+  pods_per_node: 90
+  fixture_machine_type: e2-small
+  # Every cluster's default pool holds the fixture Pods, so no level needs a fixture pool: 2 nodes
+  # per cluster at every point.
+  default_pool_pods: 150
+  test_cluster_machine_type: n2-standard-2
+  churn_pod_lifetime_seconds: 30
+  cluster_registration_timeout_seconds: 5400
+  trigger_reconcile: true
+  cluster_create_parallelism: 8
+  watcher_wait_seconds: 600
+
+operations:
+  onboarding_30m:
+    kind: reset_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 1800
+  audits_30m:
+    kind: trigger_soak
+    factors: [clusters]
+    runs: 1
+    window_seconds: 1800
+    # The OOBE first-run audits (FIRST_RUN_AUDITS in agents/chat/scripts/oobe.py), on the
+    # Platform Agent's roster.
+    jobs_home: /opt/data/profiles/platform
+    jobs:
+      - fleet-wide-cost-analysis
+      - compliance-audit
+      - obtainability-audit
+      - stockout-prevention
+      - upgrade-retrospective
+  fan_out:
+    kind: prompt
+    factors: [clusters]
+    runs: 3
+    timeout_seconds: 2400
+    prompt: Which of my clusters, if any, are stressed right now? Check every cluster.
+    follow_up: Which clusters do you monitor?

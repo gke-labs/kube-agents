@@ -109,9 +109,29 @@ print(json.dumps({"completed": len(latency), "errors": sum(e for _, e, _ in resu
 KUBECONFIG_SUFFIX = ".kubeconfig"
 # The hourly Cluster Agent reconcile (agents/chat/defaults/cron/jobs.json), which the gateway's
 # agent container ticks; run at once, it scaffolds new clusters' profiles and prunes deleted ones'.
-RECONCILE_CONTAINER = "platform-agent"
+AGENT_CONTAINER = "platform-agent"
 RECONCILE_COMMAND = ("python3", "/opt/data/scripts/cluster_agent_reconcile.py")
 RECONCILE_TIMEOUT_SECONDS = 1800
+# Marks cron jobs due for the next profile-cron-tick the way the OOBE job does
+# (agents/chat/scripts/oobe.py): Hermes's cron.jobs.trigger_job, with HERMES_HOME set to the
+# home of the profile whose roster holds the jobs. It prints the jobs it could not mark.
+JOB_PYTHON = "/opt/hermes/.venv/bin/python3"
+JOB_TRIGGER_SCRIPT = (
+    "import sys\nfrom cron.jobs import trigger_job\n"
+    "missed = [job for job in sys.argv[1:] if not trigger_job(job)]\n"
+    "print(' '.join(missed))\nsys.exit(3 if missed else 0)\n"
+)
+# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished".
+JOB_RUNS_SCRIPT = (
+    "import os, sqlite3, sys\n"
+    "db = sqlite3.connect(os.path.join(os.environ['HERMES_HOME'], 'cron', 'executions.db'))\n"
+    "for job in sys.argv[2:]:\n"
+    "    row = db.execute('select status, finished_at from executions where job_id = ? and claimed_at >= ? '\n"
+    "                     'order by claimed_at desc limit 1', (job, sys.argv[1])).fetchone()\n"
+    "    print(job, *(row or ('unclaimed', None)))\n"
+)
+JOB_TIMEOUT_SECONDS = 120
+JOB_COMPLETED = "completed"
 # What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
 RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
 RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
@@ -356,8 +376,44 @@ def reconcile_profiles(context: str, namespace: str) -> None:
     pod = _gateway_pod(context, namespace)
     if not pod:
         raise kube.CommandError("no gateway pod to run the reconcile in")
-    kube.kubectl(context, "exec", "-n", namespace, pod, "-c", RECONCILE_CONTAINER, "--", *RECONCILE_COMMAND,
+    kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", *RECONCILE_COMMAND,
                  timeout=RECONCILE_TIMEOUT_SECONDS)
+
+
+def trigger_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...]) -> list[str]:
+    """Mark cron jobs due for the next tick, as the OOBE job marks its first-run audits.
+
+    Returns one error per job that could not be marked; the next profile-cron-tick,
+    within a minute, runs the rest.
+    """
+    pod = _gateway_pod(context, namespace)
+    if not pod:
+        return [f"no gateway pod to mark {', '.join(jobs)} due in"]
+    try:
+        kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env", f"HERMES_HOME={home}",
+                     JOB_PYTHON, "-c", JOB_TRIGGER_SCRIPT, *jobs, timeout=JOB_TIMEOUT_SECONDS)
+    except kube.CommandError as exc:
+        return [f"could not mark every job due: {exc}"]
+    return []
+
+
+def unfinished_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> list[str]:
+    """The jobs whose run since ``since`` (ISO, UTC) had not finished: still running, failed or never claimed."""
+    pod = _gateway_pod(context, namespace)
+    if not pod:
+        return [f"no gateway pod to read the runs of {', '.join(jobs)} in"]
+    try:
+        out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env",
+                           f"HERMES_HOME={home}", JOB_PYTHON, "-c", JOB_RUNS_SCRIPT, since.replace("Z", ""), *jobs,
+                           timeout=JOB_TIMEOUT_SECONDS)
+    except kube.CommandError as exc:
+        return [f"could not read the job runs: {exc}"]
+    notes = []
+    for line in out.splitlines():
+        job, status, *_ = line.split() + [""]
+        if status != JOB_COMPLETED:
+            notes.append(f"{job} {status or 'unclaimed'} at the end of the window")
+    return notes
 
 
 def wait_gateway_ready(context: str, namespace: str, timeout: float = RESET_TIMEOUT_SECONDS) -> None:
