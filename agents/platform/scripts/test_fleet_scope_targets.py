@@ -399,6 +399,23 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self._write(_snapshot(self.EXCLUDE_ROWS, present=True))
         self.assertNotIn("--scope-exclude-clusters", fst.declared_scope_targets(self.home).collector_args())
 
+    def test_management_project_id_reads_the_management_row_regardless_of_boundary(self):
+        self.assertIsNone(fst.management_project_id(self.home))
+        (self.home / fst.SNAPSHOT_FILE).write_text("<not json>", encoding="utf-8")
+        self.assertIsNone(fst.management_project_id(self.home))
+        empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
+        self._write(_snapshot(
+            [{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+            declared=empty, present=False, boundary=False,
+        ))
+        self.assertEqual(fst.management_project_id(self.home), "ops-mgmt")
+        self._write(_snapshot(
+            [{"id": "old-mgmt", "via": ["management"], "outcome": "ok", "state": "retiring"},
+             {"id": "123456789012", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+            present=True,
+        ))
+        self.assertIsNone(fst.management_project_id(self.home))
+
 
 class CollectorArgvTest(unittest.TestCase):
     def test_the_argv_form_is_the_pasted_line_tokenised(self):

@@ -22,7 +22,8 @@ the harness already relies on for artifacts and session stores:
   one Hermes session filed, from that session's ``kanban_create`` results in
   the session store or the board's subscriptions addressed to it, and reads
   each card's status and deliverable (``tasks.result``, the newest
-  ``task_runs.summary``). The wait polls it alone and sends no turn.
+  ``task_runs.summary``, and for a blocked card its newest block's kind and
+  reason). The wait polls it alone and sends no turn.
 
 Best effort in the same sense as the artifact read-back: a pod that cannot
 be reached or a store that cannot be opened returns ``None`` for that read,
@@ -115,7 +116,7 @@ API_CONTEXT_ID_MAX_LEN = 128
 _API_SAFE_CONTEXT_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 # The default profile's session store under DATA_ROOT, the store the API server
-# writes (worker_trajectory.state_db("default")).
+# writes (worker_transcript.profile_state_db_path for the default profile).
 STORE_FILE = "state.db"
 
 # Line the session-cards script prints before its JSON.
@@ -149,6 +150,12 @@ WANT = [a for a in sys.argv[10:] if a][:MAX_WANT]
 SQLITE_BUSY_TIMEOUT = 10
 # Rows per IN (...) query, under every sqlite's bound-parameter limit.
 CHUNK = 500
+# A blocked card's question is the payload of its newest stop when that stop
+# is a ``blocked`` event: a card answered (``unblocked``) and then parked by the
+# breaker (``gave_up``) is blocked too, on no question. The image's own readers
+# take the newest of the three the same way (kanban_progress_lines.GAVE_UP_SQL).
+BLOCKED = "blocked"
+STOP_KINDS = ("blocked", "unblocked", "gave_up")
 JSON_PREFIX = "\x00json:"
 out = {"session": False, "sessions": [], "created": [], "created_total": 0,
        "subscribed": [], "subscribed_total": 0, "cards": {}, "error": None}
@@ -285,7 +292,8 @@ if out["error"] is None:
             for tid, status in board.execute(
                 "SELECT id, status FROM tasks WHERE id IN (%s)" % marks(part), part
             ):
-                out["cards"][str(tid)] = {"status": str(status), "result": None, "summary": None}
+                out["cards"][str(tid)] = {"status": str(status), "result": None, "summary": None,
+                                          "block": None}
         wanted = [t for t in WANT if t in out["cards"]]
         if wanted:
             if "result" in columns(board, "tasks"):
@@ -300,6 +308,20 @@ if out["error"] is None:
                         "AND summary != '' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                     if row:
                         out["cards"][tid]["summary"] = row[0]
+            if has_table(board, "task_events"):
+                for tid in wanted:
+                    if out["cards"][tid]["status"] != BLOCKED:
+                        continue
+                    row = board.execute(
+                        "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN (%s) "
+                        "ORDER BY id DESC LIMIT 1" % marks(STOP_KINDS), (tid, *STOP_KINDS)).fetchone()
+                    try:
+                        block = json.loads(row[1]) if row and row[0] == BLOCKED and row[1] else None
+                    except ValueError:
+                        block = None
+                    if isinstance(block, dict):
+                        out["cards"][tid]["block"] = {"kind": block.get("kind"),
+                                                      "reason": block.get("reason")}
         board.close()
     except sqlite3.Error as exc:
         out["error"] = "kanban board: %s" % exc
@@ -384,9 +406,10 @@ class SessionCards:
     the board's subscriptions addressed to it (``"kanban_notify_subs"``).
     ``cards`` maps each id the board knows to its ``status``, and, for the
     ids the read was asked for (``want``), its ``result`` (``tasks.result``)
-    and ``summary`` (the newest non-empty ``task_runs.summary``); ``None``
-    for the rest. An id in ``card_ids`` and not in ``cards`` is one the board
-    has no row for.
+    and ``summary`` (the newest non-empty ``task_runs.summary``), and for a
+    blocked one its ``block`` (the newest stop event's ``kind`` and
+    ``reason`` when that stop is a ``blocked`` one); ``None`` for the rest. An id in ``card_ids`` and not in
+    ``cards`` is one the board has no row for.
     """
 
     session_found: bool
@@ -410,8 +433,11 @@ class SessionCards:
         card = self.cards.get(task_id)
         if card is None:
             return None
+        task: dict[str, Any] = {"id": task_id, "status": card.get("status"), "result": card.get("result")}
+        if card.get("block"):
+            task["block"] = card["block"]
         payload: dict[str, Any] = {
-            "task": {"id": task_id, "status": card.get("status"), "result": card.get("result")},
+            "task": task,
             "runs": [{"summary": card["summary"]}] if card.get("summary") else [],
         }
         return {
@@ -443,6 +469,17 @@ def session_cards_command(session_id: str, want: Sequence[str] = (), max_want: i
         f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
         f'"$PY" -c {shlex.quote(_SESSION_CARDS_SCRIPT)} {args}'
     )
+
+
+def _block(raw: Any) -> dict[str, str] | None:
+    """A blocked card's newest block as the read reported it, or ``None``."""
+    if not isinstance(raw, dict):
+        return None
+    kind, reason = raw.get("kind"), raw.get("reason")
+    return {
+        "kind": kind if isinstance(kind, str) else "",
+        "reason": reason if isinstance(reason, str) else "",
+    }
 
 
 def read_session_cards(
@@ -509,6 +546,7 @@ def read_session_cards(
                     "summary": card.get("summary")
                     if isinstance(card.get("summary"), str)
                     else None,
+                    "block": _block(card.get("block")),
                 }
     return SessionCards(
         session_found=bool(payload.get("session")),

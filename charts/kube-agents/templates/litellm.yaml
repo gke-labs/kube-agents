@@ -3,25 +3,9 @@
 {{- if eq $provider "chatgpt" }}
 {{- fail "litellm.modelProvider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store this chart does not ship. Use 'openai' with an API key, or see examples/litellm-chatgpt-subscription for a hand-applied subscription proxy." }}
 {{- end }}
-{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
-       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
-{{- /*
-  openai_compatible has no default model, so it is allowed beside the table
-  rather than in it. Any other value is taken as a LiteLLM provider slug
-  (azure, bedrock, databricks, ...) whose credentials arrive through
-  envFromSecret: the chart knows no default model for it, so modelDefaultName
-  is required, and the slug's shape is checked here so a typo fails the render
-  rather than the first model call.
-*/}}
-{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
-{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
-{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
-{{- end }}
-{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
-{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
-{{- end }}
+{{- /* The model resolution, and the per-provider defaults it falls back to, live in
+       kube-agents.litellmModel so the web console shows the model this serves. */}}
+{{- $model := include "kube-agents.litellmModel" . }}
 {{- /*
   A Secret the operator creates, mounted whole into the gateway container as
   environment variables (envFrom, below). Its name is checked here so a typo
@@ -34,7 +18,6 @@
 {{- fail (printf "litellm.envFromSecret %q is not a valid Secret name (a lowercase DNS subdomain of at most %d characters)." $envFromSecret $secretNameMaxLength) }}
 {{- end }}
 {{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml }}
-{{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
 {{- $vertex := .Values.litellm.vertex | default dict }}
 {{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
 {{- $vertexProject := $vertex.projectId | default .Values.platformAgent.harness.projectId }}

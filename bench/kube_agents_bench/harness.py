@@ -42,9 +42,11 @@ Environment:
     AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the default)
         generates a fresh id per invocation so each task's trajectory is
         isolated on this stateful endpoint. A card-wake replay (a prompt
-        opening with one of :mod:`card_wake`'s directives) pins its own id
-        for its turns, plants its card with a ``kubectl exec`` first, and is
-        refused under ``AGENT_TRANSPORT=inject``.
+        opening with :mod:`card_wake`'s directive) pins its own id
+        for its turns and plants its card with a ``kubectl exec`` first. Its
+        turns go to this endpoint under ``AGENT_TRANSPORT=inject`` as well:
+        under ``spec.mode: next`` a card's wake reaches the front door here
+        too, not through the gateway, though its reply is posted nowhere.
     AGENT_HTTP_TIMEOUT: Per-request timeout in seconds (default ``600``).
     AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
         all status turns (default ``1800``). ``0`` disables waiting, restoring
@@ -155,7 +157,7 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, gitops, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, gitops, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
@@ -164,6 +166,7 @@ from kube_agents_bench.parsing import (
     merge_new,
     new_calls,
     parse_response,
+    paused_questions,
     reported_statuses,
 )
 
@@ -207,6 +210,17 @@ _INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a cre
 # follow-up apart -- and so the door's dedupe on the message id cannot fold a
 # second status turn into the first one's task.
 _INJECT_STATUS_TURN_SUFFIX = "/status-"
+
+# How the final message opens each delegated card's part: a finished card's
+# result, and the question a card paused on (``kanban_block``, ``needs_input``),
+# which is what the conversation shows for it. ``verifiers._DELIVERED_HEADER``
+# reads both headers back; change them together.
+_RESULT_SECTION = "Result of delegated task {tid}:\n{text}"
+_QUESTION_SECTION = "Question from delegated task {tid}:\n{text}"
+
+# Appended to the opening turn's message id for the stop a stopped ask sends
+# (stop_hook), so the door's dedupe never answers it with the opening task.
+_INJECT_STOP_SUFFIX = "/stop"
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -750,7 +764,7 @@ def _append_final(result: AgentResult, sections: list[str]) -> None:
 def _append_delivered(
     result: AgentResult, observed: list[dict[str, Any]], task_ids: list[str]
 ) -> None:
-    """Append each finished card's own result to the text the judge grades.
+    """Append each finished card's own result, or the question a paused one asks, to the text the judge grades.
 
     The worker runs as a separate hermes session, so its card result is the
     part of its work that crosses back through the conversation (its tool
@@ -760,10 +774,15 @@ def _append_delivered(
     rather than ``result.trajectory``, so the polls inform the answer without
     being graded as the agent's tool use.
     """
+    # A worker's block closes its run with the reason as the run's summary,
+    # which delivered_results would read as the card's result: a card paused
+    # on a question is delivered as that question instead.
+    questions = paused_questions(observed, task_ids)
     all_sections = [
-        f"Result of delegated task {tid}:\n{text}"
+        _RESULT_SECTION.format(tid=tid, text=text)
         for tid, text in delivered_results(observed, task_ids).items()
-    ]
+        if tid not in questions
+    ] + [_QUESTION_SECTION.format(tid=tid, text=text) for tid, text in questions.items()]
     sections = [s for s in all_sections if s.split("\n", 1)[1].strip() not in result.output]
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
@@ -1302,7 +1321,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited):
+    if not delivered_results(observed, awaited) and not paused_questions(observed, awaited):
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -1696,7 +1715,25 @@ class KubeAgentsHarness(AgentHarness):
             )
         if transport == TRANSPORT_INJECT:
             return self._execute_inject(prompt)
+        if stop_hook.is_stopped_ask(prompt):
+            return AgentResult.errored(
+                f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
+        return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
 
+    def _execute_api(
+        self,
+        prompt: str,
+        workspace_path: Path | None = None,
+        *,
+        opening_turn: bool = True,
+    ) -> AgentResult:
+        """The api transport: one turn on the agent's API server, then the delegation wait.
+
+        :meth:`_execute` sends an ask here under ``AGENT_TRANSPORT=api``, and
+        :meth:`_execute_card_wake` sends a card's wake here on either
+        transport.
+        """
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
         try:
             local_port = _numeric_env("AGENT_LOCAL_PORT", str(SERVICE_API_PORT), int)
@@ -1900,10 +1937,8 @@ class KubeAgentsHarness(AgentHarness):
         _fold_worker_tokens(result.tokens)
         return result
 
-    def _execute_card_wake(
-        self, replay: card_wake.Replay | card_wake.Failure, workspace_path: Path | None
-    ) -> AgentResult:
-        """Send a planted card's wake and, for a question, the user's answer.
+    def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
+        """Send a planted card's wake and the user's answer.
 
         The answer goes on the wake's conversation, or on a new one for a
         ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
@@ -1914,24 +1949,28 @@ class KubeAgentsHarness(AgentHarness):
         See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the
         plant fails: a script that never ran to completion is infrastructure,
         and one that ran and failed in the image is an error. The card is read
-        and archived whatever the turns did, so a parked card does not outlive
+        and archived whatever the turns did, so a blocked card does not outlive
         the run.
         """
-        failure = isinstance(replay, card_wake.Failure)
         transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
-        if transport != TRANSPORT_API:
-            directive = card_wake.FAILURE_DIRECTIVE if failure else card_wake.QUESTION_DIRECTIVE
+        if transport not in _TRANSPORTS:
             return AgentResult.errored(
-                f"{directive} needs AGENT_TRANSPORT={TRANSPORT_API}, got {transport!r}"
+                f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
             )
+        # Every turn goes to the API server on either transport. A card's wake
+        # is not a door message under spec.mode next either: the notifier
+        # self-posts it into the conversation's bridge session through the
+        # in-pod API server (kanban_chat_notify.ConversationNotifyAdapter),
+        # and its reply is posted nowhere, so a case grading that reply grades
+        # what no next user sees. The answer turn is a door message under
+        # next; here it runs as the bridge's api executor would run it,
+        # without the door. For an ordinary label the click turn the plant
+        # builds (slack_ux_clicks._turn_text) is the text next's gateway sends
+        # for a click (chat_message.NEEDS_YOU_REPLY, slack_interactive.go); a
+        # session: fresh answer carries today's Slack thread context, which
+        # next's door does not send.
         try:
             planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
-        except card_wake.ReplayMismatch as exc:
-            # Not infrastructure: the image no longer retries as the case
-            # asserts, and an excluded run would leave the case silent. One
-            # such repetition is an absolute red at the gate (empty
-            # trajectory, null tokens); the error names the mismatch.
-            return AgentResult.errored(str(exc))
         except card_wake.ReplayUnavailable as exc:
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
@@ -1939,11 +1978,11 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
-            if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
+            wake_turn = self._execute_api(planted.wake, workspace_path, opening_turn=True)
+            if not card_wake.no_reply(wake_turn) and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
-            elif not card_wake.no_reply(wake_turn) and not failure:
-                answer_turn = self._execute(planted.answer(replay), workspace_path, opening_turn=False)
+            elif not card_wake.no_reply(wake_turn):
+                answer_turn = self._execute_api(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
             settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
@@ -1951,11 +1990,10 @@ class KubeAgentsHarness(AgentHarness):
                 _log.warning("card wake: card %s could not be read", planted.card)
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
-        # A failure wake has no answer turn, nor has a wake turn that errored;
-        # both are tagged, since an errored run is the one whose card and wake
-        # are wanted.
+        # A wake turn that errored has no answer turn; it is tagged, since an
+        # errored run is the one whose card and wake are wanted.
         if answer_turn is None:
-            return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
+            return card_wake.tag(planted, wake_turn, settled)
         return card_wake.merge(planted, wake_turn, answer_turn, settled)
 
     def _execute_fresh_answer(
@@ -1983,7 +2021,7 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
-            return self._execute(prompt, workspace_path, opening_turn=False)
+            return self._execute_api(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
 
@@ -2040,8 +2078,11 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
+            stop = stop_hook.parse(prompt)
         except ValueError as exc:
             return AgentResult.errored(str(exc))
+        if stop is not None:
+            prompt = stop.prompt
 
         agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
         service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
@@ -2435,6 +2476,65 @@ class KubeAgentsHarness(AgentHarness):
                 f"task {exchange.task_id} ended {exchange.fold.terminal} (reason: {reason})"
             )
 
+        if stop is not None:
+            # A stopped ask waits on nothing it filed: the stop is the point.
+            def _send_stop() -> tuple[bool, str]:
+                stopper = inject.InjectTask(
+                    base_url=base_url,
+                    conversation=exchange.conversation,
+                    prompt=stop_hook.STOP_WORD,
+                    token=token,
+                    author=author,
+                    message_id=f"{message_id}{_INJECT_STOP_SUFFIX}",
+                )
+                failures = 0
+                while True:
+                    try:
+                        started = stopper.submit()
+                        break
+                    except inject.InjectUnavailable as exc:
+                        # Retried as the opening exchange is; the door
+                        # dedupes on the message id, so a repeat of a POST
+                        # it took gets the first answer.
+                        failures += 1
+                        _log.warning(
+                            "inject: stop on %s failed in transport (%d/%d): %s",
+                            exchange.conversation,
+                            failures,
+                            _MAX_TRANSPORT_FAILURES,
+                            exc,
+                        )
+                        if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                            # The door, not the agent: infrastructure, never graded.
+                            raise _TransportError(
+                                f"the stop could not reach the gateway: {exc}"
+                            ) from exc
+                        try:
+                            _tunnel(reset=True)
+                        except RuntimeError as pf_exc:
+                            _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
+                if started:
+                    # A task means the gateway read the word as an ask, not a
+                    # stop; bound it like any stray.
+                    stopper.cancel(started, settle=0)
+                    return False, f"the gateway started task {started} for the stop instead of stopping"
+                if stopper.refusal != inject.REFUSAL_NO_TASK:
+                    return False, f"{inject.refusal_detail(stopper.refusal)}: {stopper.note}"
+                return True, stopper.note
+
+            context_id = exchange.probe.context_id if exchange.probe else ""
+            try:
+                self._stop_after_first_card(
+                    result,
+                    board.api_session_id(context_id) if context_id else "",
+                    stop,
+                    send_stop=_send_stop,
+                    poll_interval=poll_interval,
+                )
+            except _TransportError as exc:
+                return _infra_failure(str(exc))
+            return result
+
         if delegation_timeout > 0:
             # The seam for delegated work, and it is the case runner's rather
             # than the transport's on purpose (the A2A owner's instruction on
@@ -2523,6 +2623,133 @@ class KubeAgentsHarness(AgentHarness):
             except _DelegationTransportExhausted as exc:
                 return _infra_failure(str(exc))
         return result
+
+    def _stop_after_first_card(
+        self,
+        result: AgentResult,
+        session_id: str,
+        stop: stop_hook.Stop,
+        *,
+        send_stop: Callable[[], tuple[bool, str]],
+        poll_interval: float,
+    ) -> None:
+        """Stop the work a stopped ask filed, then watch it for the window (:mod:`stop_hook`).
+
+        The opening turn has ended. ``send_stop`` sends ``stop`` on the
+        conversation first: the gateway finds the conversation's cards
+        itself, so the stop needs no card ids and reaches a card the turn
+        saved a moment late. A stop the gateway took is then watched for the
+        observation window with no further turn, polling the board, and graded
+        on where each card stood at the window's last read. A stop that did
+        not go is not watched: its cards are read once and archived at once.
+        Either way the finish archives any card still not terminal, so it
+        holds no dispatcher slot into the next unit, and purges every card's
+        state off the pod. A board the harness cannot read, a session the
+        store does not know, or a stop that never reached the gateway makes
+        the run infrastructure. :data:`stop_hook.STOP_ENTRY` goes on the
+        trajectory either way, ``completed`` only when a card was filed and
+        the gateway took the word as a stop.
+        """
+        entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
+        result.trajectory.append(entry)
+
+        # 1. The stop.
+        unreachable: _TransportError | None = None
+        try:
+            sent, detail = send_stop()
+        except _TransportError as exc:
+            sent, detail, unreachable = False, str(exc), exc
+        entry.update(status="completed" if sent else "error", result=detail)
+
+        # 2. One read loop. Each read is retried as the delegation wait's is,
+        # because the exec fails transiently. The verdict is the window's last
+        # read, never an earlier one: the archive lands after the door answers
+        # the stop, so a read from the window's start shows a card the stop
+        # then archived as running.
+        def _read() -> board.SessionCards | None:
+            if not session_id:
+                return None
+            for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+                got = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+                if got is not None:
+                    return got
+                _log.warning("session cards read failed (%d/%d)", attempt, _MAX_TRANSPORT_FAILURES)
+                if attempt < _MAX_TRANSPORT_FAILURES:
+                    time.sleep(max(0.0, poll_interval))
+            return None
+
+        # Every card id any trusted read showed, so a failed last read still
+        # leaves the finish something to archive and purge.
+        known: list[str] = []
+
+        def _note(got: board.SessionCards | None) -> None:
+            if got is not None and got.session_found:
+                known.extend(t for t in got.card_ids if t not in known)
+
+        seen: board.SessionCards | None = None
+        if sent:
+            # The deadline is set before the first read, so a slow read does
+            # not start the window late; the loop's last read is the verdict.
+            deadline = time.monotonic() + stop.observe_seconds
+            while True:
+                seen = _read()
+                _note(seen)
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(left, max(poll_interval, 1.0)))
+        else:
+            seen = _read()
+            _note(seen)
+
+        # 3. One finish.
+        cards = list(seen.card_ids) if seen is not None and seen.session_found else []
+        entry["args"]["cards"] = cards
+        statuses = {t: str(seen.cards.get(t, {}).get("status") or "unknown") for t in cards} if seen else {}
+        result.metadata["stop_card_statuses"] = statuses
+        # A card the last read did not show (it failed, or lost the session)
+        # but an earlier one did is archived too: nothing says it ended.
+        still = [t for t in known if statuses.get(t) not in _TERMINAL_STATUSES]
+        if still:
+            _archive_stalled_cards(still, _EXEC_TIMEOUT)
+        # As every other path that learns card ids ends: the pod outlives the
+        # run, and a worker log left on it is there for the next run to find.
+        _purge_card_state(known, _EXEC_TIMEOUT)
+
+        if unreachable is not None:
+            # The door, not the agent: infrastructure, never graded.
+            raise unreachable
+        if seen is None or not seen.session_found:
+            # The harness cannot tell what the turn filed: infrastructure.
+            if not session_id:
+                why = "no session to read"
+            elif seen is None:
+                why = f"the session store for {session_id} could not be read {_MAX_TRANSPORT_FAILURES} times running"
+            else:
+                why = "the session is not in the store"
+            entry.update(status="error", result=f"{why}; stop sent: {sent} ({detail})")
+            raise _TransportError(f"{stop_hook.STOP_ENTRY}: {why}; stop sent: {sent} ({detail})")
+        if not cards:
+            # The session is known and filed nothing: the agent's miss, graded.
+            entry.update(status="error", result="nothing was stopped: the turn filed no card")
+            result.errors.append(f"{stop_hook.STOP_ENTRY}: the turn filed no card")
+            return
+        if not sent:
+            result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")
+        # What the stop did, read before the harness archived any leftover:
+        # every card it filed archived, or the stop did not reach them all.
+        stopped = all(statuses.get(t) == stop_hook.STOPPED_STATUS for t in cards)
+        result.trajectory.append({
+            "name": stop_hook.CARDS_STOPPED_ENTRY,
+            "args": {"statuses": statuses},
+            "status": "completed" if sent and stopped else "error",
+            "result": "every card archived" if stopped else "not every card was archived by the stop",
+        })
+        if still:
+            when = f"{stop.observe_seconds:.0f}s after the stop" if sent else "when the stop did not go"
+            result.errors.append(
+                f"{stop_hook.STOP_ENTRY}: card(s) {', '.join(still)} were not terminal {when}; archived now"
+            )
 
     def _await_delegated_cards(
         self,

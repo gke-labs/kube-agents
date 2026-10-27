@@ -520,6 +520,28 @@ sets, and the restart a new or rotated CA Secret needs, are in
 [GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
 in the token minter guide.
 
+### Web console
+
+`webConsole.*` renders the web console's Deployment, a ClusterIP Service and a
+deny-all ingress NetworkPolicy. `enabled` defaults to `false`;
+`install.sh --enable-web-console` turns it on, and the render fails if it is set
+without `platformAgent.enabled`. The Service type is not configurable,
+because the console holds the agent's API key and has no login of its own:
+`kubectl port-forward` is the only way in. When `litellm.enabled`, the chart
+also renders a headless Service, `<release>-web-console-litellm-peers`, that
+selects the LiteLLM pods so the console can read each replica's token and spend
+counters. `webConsole.agentIdentity.gcpServiceAccount` and `.roles` record the
+agent's Google Cloud identity for the console's About panel; the Terraform
+composition fills them from the IAM module, and the console never reads IAM
+itself. With `webConsole.environment.enabled` (the default) the chart also
+renders the console's ServiceAccount, a ClusterRole that lists nodes,
+namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
+gets/patches the `PlatformAgent` resource (for repository topology, preferred
+model annotations, and applied PR annotations). `values.yaml` describes
+each toggle. The
+[Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
+is canonical for what it does and how it is reached.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -596,6 +618,25 @@ policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and fr
 `platformAgent.monitoringScraperNamespace` when set, and nothing else; the health port, and
 the webhook port when the webhooks render, stay open. A `helm upgrade --reuse-values` from
 a release that predates `operator.metrics` renders with the listener off until the value is set.
+
+### Health-cohort rules (`platformAgent.healthRules`)
+
+`platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
+`Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
+operator's gauges, and the recording rules for their ratios; the alerts are listed on
+[Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
+Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
+into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
+in `gmp-public`; configure that first, since a Cloud Monitoring alerting policy does not read a
+`Rules` object. `true` fails at apply time where the `Rules` CRD is absent. Every threshold and
+sample floor is a value under `platformAgent.healthRules.thresholds`, with its default in
+`values.yaml`; set a ratio through a values file or `--set-json` (`helm --set` keeps a decimal as a
+string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
+the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
+defaults and keeps the release's values, or every threshold set; the schema requires the whole
+block and the template says so when it is missing. The rules read the operator's scrape, so
+enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
+render with a message.
 
 ### Turning telemetry off
 
@@ -1014,7 +1055,8 @@ creation. `--set quotaPreflight.enabled=false` skips it.
 What it sums: the chart's own workloads from `values.yaml` — the operator, LiteLLM and
 the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, which
 have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
-`platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
+`platformAgent.cleanupHook.enabled` is true) and the web console (one pod, when
+`webConsole.enabled` is true) — plus the pods the operator renders, whose
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas` (an over-count above one,
 since the operator runs the gateway as a single replica whatever the value); the shell sandbox, the

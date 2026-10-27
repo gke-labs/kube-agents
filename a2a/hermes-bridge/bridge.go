@@ -1541,7 +1541,8 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	switch {
 	case err == nil:
 		// A canceled task that finished anyway won the race: completed wins,
-		// per the payload spec's cancel mapping. The CLI reports no tokens,
+		// per the payload spec's cancel mapping, unless its answer is
+		// withheld below, which ends it failed. The CLI reports no tokens,
 		// so the turn's usage is its wall time alone.
 		run.mu.Lock()
 		if run.state == stateRunning {
@@ -1549,6 +1550,14 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		}
 		run.mu.Unlock()
 		out := stdout.String()
+		if opensWithUnstructuredReasoning(out) {
+			// The model's reasoning, not an answer (#3206): withheld, as on
+			// the API executor, with the session hermes printed if any.
+			session := hermesSessionID(stderr.String())
+			b.withholdUnstructuredReasoning(run, session, 1, out)
+			b.finalize(run, lib.StateFailed, unstructuredReasoningReason(session, 1), nil)
+			return
+		}
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
 		b.finalize(run, lib.StateFailed,
@@ -1639,14 +1648,23 @@ func failureReason(err error, stdout, stderr string) string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "reason: %s - %v", token, err)
-	// The last match: the CLI prints its own line last, after anything a
-	// tool's nested run echoed; a label with nothing after it matches
-	// nothing, so no id is reported rather than the next line's first word.
-	if all := sessionIDLine.FindAllStringSubmatch(stderr, -1); len(all) > 0 {
-		fmt.Fprintf(&sb, "; session: %s", all[len(all)-1][1])
+	if session := hermesSessionID(stderr); session != "" {
+		fmt.Fprintf(&sb, "; session: %s", session)
 	}
 	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
 	return sb.String()
+}
+
+// hermesSessionID is the session id `hermes chat -Q` printed on stderr, or
+// "". The last match: the CLI prints its own line last, after anything a
+// tool's nested run echoed; a label with nothing after it matches nothing, so
+// no id is reported rather than the next line's first word.
+func hermesSessionID(stderr string) string {
+	all := sessionIDLine.FindAllStringSubmatch(stderr, -1)
+	if len(all) == 0 {
+		return ""
+	}
+	return all[len(all)-1][1]
 }
 
 // resultPublishFailedReason is the terminal message for a result artifact

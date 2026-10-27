@@ -6,9 +6,11 @@ Two kinds of test here, and the split is deliberate.
 The synthetic ones build a miniature git repository in a temporary directory
 and point the checker at it. They prove each rule *fires*: a lint nobody has
 watched fail is a lint nobody knows is wired up. That covers the broken-link
-and broken-citation rules and the reachability rule: each shape a reader
+and broken-citation rules, the anchor rule (each shape of heading a fragment
+may name, the anchors a fence, a span or a comment hides, and the targets
+whose fragments are not read), and the reachability rule: each shape a reader
 starts from, the sidebar read from a planted site config, reach through
-links and its dead ends, and every way an allowlist entry goes stale.
+links and its dead ends, and every way either allowlist's entry goes stale.
 
 The rest run against the real repository. They do not re-run the lint over the
 tree -- `make docs-check-links` already does that in CI, and a second copy of
@@ -428,6 +430,129 @@ SITE_INDEX_COMMENTED_CARD_LINES = (
     f' <LinkCard title="Carded" href="{cdl.SITE_ROUTE_PREFIX}install/carded/" />',
 )
 
+# The anchor rule. A root file (reached by shape) links sections of itself, of
+# a sibling and of a site page, by every form the rule reads and a few it does
+# not. The sibling carries a heading of each shape the slugger has to get
+# right, a heading inside a generated region, explicit `id` and `name`
+# anchors, and three anchors no reader can reach: a heading inside a fence,
+# one inside a comment, and an `id` quoted in a code span. The site page's
+# frontmatter holds a `#` line that is not a heading, its title is `_top`, and
+# a heading whose GitHub slug ends in a hyphen loses it, as Astro trims one.
+ANCHORS = "anchors.md"
+ANCHORED = "docs/anchored.md"
+SITE_ANCHORED = SITE + "concepts/anchored.md"
+ANCHORED_LINES = (
+    "# Anchored",
+    "",
+    "## Measure how far `main` moved",
+    "## When a card _is_ right: snake_case!",
+    "## Repeated",
+    "## Repeated",
+    f"### [Linked]({DESIGNS.removeprefix('docs/')}present.md) ##",
+    "",
+    "<!-- BEGIN GENERATED -->",
+    "",
+    "## Generated heading",
+    "",
+    "<!-- END GENERATED -->",
+    "",
+    '<a id="explicit"></a>',
+    '<a name="named"></a>',
+    '<a href="/x" data-name="not-an-anchor">x</a>',
+    '<span data-id="not-an-anchor-either"></span>',
+    "",
+    "```",
+    "## Fenced heading",
+    "```",
+    "",
+    'A specimen: `<a id="quoted">`.',
+    "",
+    "<!--",
+    "## Commented heading",
+    "-->",
+)
+ANCHORED_ANCHORS = frozenset(
+    {
+        "anchored",
+        "measure-how-far-main-moved",
+        "when-a-card-is-right-snake_case",
+        "repeated",
+        "repeated-1",
+        "linked",
+        "generated-heading",
+        "explicit",
+        "named",
+    }
+)
+SITE_ANCHORED_LINES = (
+    "---",
+    "title: Anchored page",
+    "# not a heading",
+    "---",
+    "",
+    "## On the site",
+    "## What next ?",
+    "",
+    "[same page, on the site](#what-next)",
+    "[same page, the title](#_top)",
+)
+RULED = "docs/ruled.md"
+RULED_LINES = (
+    "---",
+    "",
+    "# Ruled",
+    "",
+    "## Section",
+)
+ANCHORS_SAME_GONE = "[same, gone](#gone)"
+ANCHORS_FENCED = f"[fenced]({ANCHORED}#fenced-heading)"
+ANCHORS_COMMENTED = f"[commented]({ANCHORED}#commented-heading)"
+ANCHORS_QUOTED = f"[quoted]({ANCHORED}#quoted)"
+ANCHORS_SITE_GONE = f"[site, gone]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#gone)"
+ANCHORS_SITE_TITLE_ON_GITHUB = f"[site title, read on GitHub]({SITE_ANCHORED}#_top)"
+ANCHORS_SITE_TRIMMED_ON_GITHUB = f"[site slug trimmed, read on GitHub]({SITE_ANCHORED}#what-next)"
+ANCHORS_MISSING_FILE = f"[missing file]({MISSING_PLAIN}#gone)"
+ANCHORS_LINES = (
+    "# Anchors",
+    "",
+    "## Here",
+    "",
+    "[same](#here)",
+    ANCHORS_SAME_GONE,
+    f"[code span]({ANCHORED}#measure-how-far-main-moved)",
+    f"[emphasis and underscore]({ANCHORED}#when-a-card-is-right-snake_case)",
+    f"[repeat]({ANCHORED}#repeated-1)",
+    f"[link in heading]({ANCHORED}#linked)",
+    f"[generated]({ANCHORED}#generated-heading)",
+    f"[explicit]({ANCHORED}#explicit)",
+    f"[named]({ANCHORED}#named)",
+    ANCHORS_FENCED,
+    ANCHORS_COMMENTED,
+    ANCHORS_QUOTED,
+    f"[percent-encoded]({ANCHORED}#measure-how-far-%6Dain-moved)",
+    f"[after a query]({ANCHORED}?plain=1#explicit)",
+    f"[empty fragment]({ANCHORED}#)",
+    f"[site title]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#_top)",
+    f"[site section]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#on-the-site)",
+    f"[site slug trimmed]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#what-next)",
+    f"[site slug, read on GitHub]({SITE_ANCHORED}#what-next-)",
+    ANCHORS_SITE_GONE,
+    ANCHORS_SITE_TITLE_ON_GITHUB,
+    ANCHORS_SITE_TRIMMED_ON_GITHUB,
+    "[directory](docs#gone)",
+    f"[blob]({cdl.REPO_BLOB_URL_PREFIXES[0]}{ANCHORED}#gone)",
+    ANCHORS_MISSING_FILE,
+)
+ANCHORS_BROKEN = (
+    ANCHORS_SAME_GONE,
+    ANCHORS_FENCED,
+    ANCHORS_COMMENTED,
+    ANCHORS_QUOTED,
+    ANCHORS_SITE_GONE,
+    ANCHORS_SITE_TITLE_ON_GITHUB,
+    ANCHORS_SITE_TRIMMED_ON_GITHUB,
+)
+
 # Files the scan has to keep reaching: the two #992 was filed against, and one
 # of each other kind CODE_GLOBS names, each of which cites a design document.
 MUST_REACH = (
@@ -479,7 +604,11 @@ class SyntheticRepoTest(unittest.TestCase):
         self.readme = _write(self.root, "README.md", "\n".join(README_LINES) + "\n")
         self.tool = _write(self.root, "tool.py", "\n".join(TOOL_LINES) + "\n")
         _git(self.root, "add", PRESENT, "README.md", "tool.py")
-        for target, value in (("REPO", self.root), ("UNLINKED_ALLOWLIST", frozenset())):
+        for target, value in (
+            ("REPO", self.root),
+            ("UNLINKED_ALLOWLIST", frozenset()),
+            ("BROKEN_ANCHOR_ALLOWLIST", frozenset()),
+        ):
             patcher = mock.patch.object(cdl, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -497,6 +626,17 @@ class SyntheticRepoTest(unittest.TestCase):
     def _unlinked(self) -> list[str]:
         markdown = cdl.tracked_markdown()
         return cdl.check_unlinked(markdown, cdl.reached_files(markdown, cdl.tracked_code()))
+
+    def _track_anchor_fixtures(self) -> Path:
+        self._track(ANCHORS, ANCHORED, SITE_ANCHORED)
+        _write(self.root, ANCHORED, "\n".join(ANCHORED_LINES) + "\n")
+        _write(self.root, SITE_ANCHORED, "\n".join(SITE_ANCHORED_LINES) + "\n")
+        return _write(self.root, ANCHORS, "\n".join(ANCHORS_LINES) + "\n")
+
+    def _anchor_problem(self, line: str) -> str:
+        """The report for the link written on ``line`` of the anchors fixture."""
+        target = line[line.index("(") + 1 : -1]
+        return f"{ANCHORS}:{ANCHORS_LINES.index(line) + 1}: broken anchor -> {target}"
 
     def test_reports_a_dangling_citation_with_its_line(self) -> None:
         problems = cdl.check_code_file(self.tool, cdl.tracked_paths())
@@ -745,6 +885,74 @@ class SyntheticRepoTest(unittest.TestCase):
                 ],
             )
 
+    def test_a_page_yields_each_heading_shape_and_explicit_anchor_and_hides_the_rest(self) -> None:
+        self._track_anchor_fixtures()
+        self.assertEqual(cdl.page_anchors(self.root / ANCHORED), ANCHORED_ANCHORS)
+        self.assertEqual(cdl.page_anchors(self.root / ANCHORED, site=True), ANCHORED_ANCHORS | {cdl.SITE_TITLE_ANCHOR})
+
+    def test_a_site_page_has_astros_anchors_on_the_site_and_githubs_on_github(self) -> None:
+        self._track_anchor_fixtures()
+        on_github = cdl.page_anchors(self.root / SITE_ANCHORED)
+        on_site = cdl.page_anchors(self.root / SITE_ANCHORED, site=True)
+        self.assertEqual(on_github, {"on-the-site", "what-next-"})
+        self.assertEqual(on_site, {cdl.SITE_TITLE_ANCHOR, "on-the-site", "what-next"})
+        self.assertEqual(cdl.check_file(self.root / SITE_ANCHORED, cdl.tracked_paths()), [])
+
+    def test_a_leading_rule_with_no_closing_fence_is_a_thematic_break_not_frontmatter(self) -> None:
+        ruled = _write(self.root, RULED, "\n".join(RULED_LINES) + "\n")
+        self.assertEqual(cdl.page_anchors(ruled), {"ruled", "section"})
+
+    def test_a_fragment_its_page_lacks_is_reported_with_its_line(self) -> None:
+        anchors = self._track_anchor_fixtures()
+        problems = cdl.check_file(anchors, cdl.tracked_paths())
+        missing = f"{ANCHORS}:{ANCHORS_LINES.index(ANCHORS_MISSING_FILE) + 1}: broken link -> {MISSING_PLAIN}#gone"
+        self.assertEqual(problems, [self._anchor_problem(line) for line in ANCHORS_BROKEN] + [missing])
+
+    def test_an_allowlisted_broken_anchor_passes_until_its_entry_is_stale(self) -> None:
+        anchors = self._track_anchor_fixtures()
+        tracked = cdl.tracked_paths()
+        links = {anchors.resolve(): tuple(cdl.markdown_links(anchors))}
+        allowlisted = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#gone"
+        with mock.patch.object(cdl, "BROKEN_ANCHOR_ALLOWLIST", frozenset({allowlisted})):
+            self.assertNotIn(self._anchor_problem(ANCHORS_SAME_GONE), cdl.check_file(anchors, tracked))
+            self.assertEqual(cdl.check_anchor_allowlist(tracked, links), [])
+        resolves = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#here"
+        never_written = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#never-written"
+        page_gone = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}{MISSING_PLAIN}#gone"
+        untracked = f"docs/nowhere.md{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#gone"
+        stale = frozenset({resolves, never_written, page_gone, untracked})
+        with mock.patch.object(cdl, "BROKEN_ANCHOR_ALLOWLIST", stale):
+            self.assertEqual(
+                cdl.check_anchor_allowlist(tracked, links),
+                [
+                    f"{resolves}: {cdl.ANCHOR_ALLOWLIST_RESOLVES_MESSAGE}",
+                    f"{never_written}: {cdl.ANCHOR_ALLOWLIST_GONE_MESSAGE}",
+                    f"{page_gone}: {cdl.ANCHOR_ALLOWLIST_UNREAD_MESSAGE}",
+                    f"{untracked}: {cdl.ANCHOR_ALLOWLIST_GONE_MESSAGE}",
+                ],
+            )
+
+    def test_main_reports_broken_anchors_and_reads_each_linked_page_once(self) -> None:
+        self._track_anchor_fixtures()
+        reads: Counter[Path] = Counter()
+        real = cdl.body_text
+
+        def counted(path: Path) -> str:
+            reads[path] += 1
+            return real(path)
+
+        err = io.StringIO()
+        with (
+            mock.patch.object(cdl, "body_text", counted),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(err),
+        ):
+            rc = cdl.main()
+        self.assertEqual(rc, 1)
+        self.assertEqual(err.getvalue().count("broken anchor ->"), len(ANCHORS_BROKEN))
+        self.assertEqual({path: n for path, n in reads.items() if n != 1}, {}, reads)
+        self.assertEqual(set(reads), {(self.root / rel).resolve() for rel in (ANCHORS, ANCHORED, SITE_ANCHORED)})
+
     def test_main_reports_every_kind_and_exits_one(self) -> None:
         self._track(UNLINKED)
         out, err = io.StringIO(), io.StringIO()
@@ -793,6 +1001,40 @@ class SyntheticRepoTest(unittest.TestCase):
             rc = cdl.main()
         self.assertEqual(rc, 0, out.getvalue())
         self.assertIn("a reader reaches every document.", out.getvalue())
+
+
+class HeadingSlugTest(unittest.TestCase):
+    def test_the_slug_is_what_github_and_starlight_give_the_heading(self) -> None:
+        for text, slug in (
+            ("Where Tests Go", "where-tests-go"),
+            ("Measure how far a branch has drifted from `main`", "measure-how-far-a-branch-has-drifted-from-main"),
+            ("What's not here?", "whats-not-here"),
+            ("Audit (`cluster-<profile>`)", "audit-cluster-profile"),
+            ("When a card _is_ the right shape", "when-a-card-is-the-right-shape"),
+            ("`snake_case` and __init__", "snake_case-and-init"),
+            ("Set FOO_ to bar", "set-foo_-to-bar"),
+            ("__dirname and friends", "__dirname-and-friends"),
+            ("\\_private and \\_not\\_ emphasis", "_private-and-_not_-emphasis"),
+            ("_see [a link](docs/x.md)_ now", "see-a-link-now"),
+            ("A <code>tag</code> and [a link](docs/x.md) and [a ref][r]", "a-tag-and-a-link-and-a-ref"),
+            ("Step 1: `kubectl get` -- then", "step-1-kubectl-get----then"),
+            ("What next ?", "what-next-"),
+            ("Ünïcödé 日本語 123", "ünïcödé-日本語-123"),
+            ("", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(cdl.heading_slug(text), slug)
+
+    def test_a_repeated_slug_is_suffixed_in_order(self) -> None:
+        occurrences: dict[str, int] = {}
+        self.assertEqual([cdl.unique_slug("a", occurrences) for _ in range(3)], ["a", "a-1", "a-2"])
+        self.assertEqual(cdl.unique_slug("b", occurrences), "b")
+
+    def test_a_fragment_is_what_follows_the_mark_decoded(self) -> None:
+        self.assertEqual(cdl.fragment_part("x.md?plain=1#a%20b"), "a b")
+        self.assertEqual(cdl.fragment_part("#top"), "top")
+        self.assertEqual(cdl.fragment_part("x.md"), "")
+        self.assertEqual(cdl.fragment_part("x.md#"), "")
 
 
 class CitationPatternTest(unittest.TestCase):
@@ -862,6 +1104,16 @@ class RealRepoTest(unittest.TestCase):
             with self.subTest(glob=glob):
                 pattern = cdl.glob_to_regex(glob)
                 self.assertTrue(any(pattern.match(rel) for rel in markdown))
+
+    def test_the_slugger_agrees_with_a_heading_the_front_door_links(self) -> None:
+        """A slugger that drifted from GitHub's would report every section link as broken; pin one of each kind."""
+        self.assertIn(
+            "measure-how-far-a-branch-has-drifted-from-main",
+            cdl.page_anchors(REPO / "docs/pull-request-workflow.md"),
+        )
+        chatops = REPO / SITE / "concepts/chatops.md"
+        self.assertIn(cdl.SITE_TITLE_ANCHOR, cdl.page_anchors(chatops, site=True))
+        self.assertIn("what-carries-over-from-today", cdl.page_anchors(chatops))
 
     def test_this_module_contains_no_literal_citation(self) -> None:
         """The guard behind the module docstring: a literal here would fail docs-check."""

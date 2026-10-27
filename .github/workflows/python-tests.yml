@@ -65,23 +65,11 @@ jobs:
   # coverage.py writing its own data, which are the two things that should.
   test:
     name: Run Python Unit Tests
-    # Pinned to ubuntu-24.04, not ubuntu-latest, since 2026-10-26. GitHub is
-    # moving `ubuntu-latest` from Ubuntu 24.04 to 26.04 between 2026-10-19 and
-    # 2026-11-19, and from the morning of the 26th every run of this job
-    # landed on 26.04 and went red with no change in the tree. Two of the
-    # suites read the runner's own shell and coreutils rather than a Python
-    # module, and 26.04 changes both: its coreutils are uutils (rust-coreutils
-    # 0.8.0 in release, 0.10.0 in updates), whose `tail -c N` on a pipe prints
-    # more than N bytes after short reads (uutils/coreutils#15804), which is
-    # the byte cap hack/ci-env.sh's collectors apply and scripts/test_ci_env_*.py
-    # pin; and its bash is 5.3, which names a stdin script's frames after $0
-    # in BASH_SOURCE, which tests/test_install_script.py reads through the
-    # three front doors' abort banner. The bash half is fixed in install.sh,
-    # upgrade.sh and uninstall.sh beside this pin; the tail half is the
-    # change that bounds the captures without `tail -c` on a pipe (#3960),
-    # and that change lifts this pin when it lands. bench-tests below is not
-    # pinned: nothing it runs reads the runner's shell or coreutils, and its
-    # job on the first red run (121454252239, image ubuntu-26.04) was green.
+    # Pinned, not ubuntu-latest: on 2026-10-26 ubuntu-latest moved to 26.04,
+    # where hack/ci-env.sh's `tail -c` byte caps let more than the cap
+    # through and bash names a piped script's frame "bash" rather than
+    # install.sh, so the four tests that hold those behaviours fail. Move off the pin once they pass
+    # there (#3952).
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -266,9 +254,7 @@ jobs:
   # runs every directory in PYTHON_TEST_DIRS on it.
   test-agent-python:
     name: Run Python Unit Tests on the agent image's Python
-    # Same suites, same runner-level reads: pinned for the reason given on
-    # `test` above.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # pinned, as the test job above says
     timeout-minutes: 35
     permissions:
       contents: read
@@ -323,7 +309,7 @@ jobs:
   # git SHA pinned in bench/pyproject.toml.
   bench-tests:
     name: Run Bench Harness Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, as the test job above says
     timeout-minutes: 15
 
     steps:

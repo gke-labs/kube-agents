@@ -75,7 +75,7 @@ page under "Why there is no `gke-admin` set".
 - `generate_release_sbom.sh`: Generates Software Bill of Materials (SBOM) in SPDX 2.3 JSON (`.spdx.json`) and CycloneDX 1.5 JSON (`.cdx.json`) formats using Syft for the staged filesystem bundle (both formats) and each release container image in `REQUIRED_RELEASE_IMAGES` as `common.sh` lists it at the release tag's commit (SPDX only). Staged in an isolated temporary directory and moved atomically into `DIST_DIR`. The `syft` CLI is mandatory in CI (exits 1 if missing or if image SBOM generation fails) and optional locally (warns and skips).
 - `package_release_bundle.sh`: Assembles self-contained offline distribution archives (`kube-agents-<version>.tar.gz` and `.zip`) for air-gapped environments. Extracts tracked files directly from the resolved release commit via `extract_commit_tree` to ensure dirty or untracked files are never packaged. Stamps `BAKED_RELEASE_VERSION` into root installer scripts, Helm `Chart.yaml`, and Terraform example defaults, writes the `.release-bundle` provenance marker, packages Helm charts, invokes `generate_release_sbom.sh`, sanitizes sensitive files (tokens, credentials, keys, real tfvars while preserving `terraform.tfvars.example`), computes SHA256 checksums into `checksums.txt`, and promotes verified assets atomically into `DIST_DIR`.
 - `sign_release_artifacts.sh`: Signs `checksums.txt` in `DIST_DIR` using Keyless Cosign OIDC, producing `checksums.txt.bundle` to provide verifiable cryptographic supply-chain provenance for all offline distribution archives and SBOMs. The `cosign` CLI is mandatory in CI (exits 1 if missing or signing fails) and skipped with a dry-run warning locally.
-- `publish_github_release.sh`: Publishes official GitHub Releases with notes GitHub generates (`gh release create --generate-notes`) from the pull requests merged since the release commit's own previous GA tag (`get_base_ga_tag_for_commit` below the release: `0.7.1`'s notes start at `0.7.0`, and `0.8.0`'s at `0.7.0` even when `0.7.2` exists on the line), grouped by the label categories in `.github/release.yml` and excluding Dependabot's and anything labelled `duplicate`, `invalid` or `wontfix`; discovers and attaches all distribution artifacts (`.tar.gz`, `.zip`, `.tgz`, `*.spdx.json`, `*.cdx.json`, `checksums.txt`, `checksums.txt.bundle`) from `DIST_DIR`; and handles idempotent re-runs via `gh release upload --clobber`. Those notes and the compare view, not a milestone, are where a release's contents are: `.github/workflows/auto-assign-milestone.yml` still runs after every merge to `main`, but exits without assigning anything when no milestone is open, and none is kept. The notes start from the previous GA tag, passed explicitly as `--notes-start-tag`: GA tags sit on stamped commits that never return to `main`, and left to pick the start tag itself GitHub started 0.4.0's notes from 0.2.0 and 0.5.0's from the first commit. The tag is `get_base_ga_tag_for_commit` from `common.sh` with the release as its ceiling, or `PREVIOUS_VERSION` from the environment for a hand run (`release-publish.yml` sets none). With no lower GA tag the flag is omitted and the script warns: that is the first release, or a checkout that did not fetch its tags, and the script cannot tell them apart locally, so the banner's `Notes Start Tag` line and the warning are the check. It does not call `release_fetch_tags`; like `resolve_release_commit`, it relies on the publish job's `fetch-depth: 0` checkout.
+- `publish_github_release.sh`: Publishes official GitHub Releases with notes GitHub generates (`gh release create --generate-notes`) from the pull requests merged since the release commit's own previous GA tag (`get_base_ga_tag_for_commit` below the release: `0.7.1`'s notes start at `0.7.0`, and `0.8.0`'s at `0.7.0` even when `0.7.2` exists on the line), grouped by the label categories in `.github/release.yml` and excluding Dependabot's and anything labelled `duplicate`, `invalid` or `wontfix`; discovers and attaches all distribution artifacts (`.tar.gz`, `.zip`, `.tgz`, `*.spdx.json`, `*.cdx.json`, `checksums.txt`, `checksums.txt.bundle`) from `DIST_DIR`; and handles idempotent re-runs via `gh release upload --clobber`. Those notes and the compare view, not a milestone, are where a release's contents are; no milestones are kept. The notes start from the previous GA tag, passed explicitly as `--notes-start-tag`: GA tags sit on stamped commits that never return to `main`, and left to pick the start tag itself GitHub started 0.4.0's notes from 0.2.0 and 0.5.0's from the first commit. The tag is `get_base_ga_tag_for_commit` from `common.sh` with the release as its ceiling, or `PREVIOUS_VERSION` from the environment for a hand run (`release-publish.yml` sets none). With no lower GA tag the flag is omitted and the script warns: that is the first release, or a checkout that did not fetch its tags, and the script cannot tell them apart locally, so the banner's `Notes Start Tag` line and the warning are the check. It does not call `release_fetch_tags`; like `resolve_release_commit`, it relies on the publish job's `fetch-depth: 0` checkout.
 
 ## Pipeline Cadence & Execution Flow
 
@@ -361,10 +361,8 @@ Before dispatching:
 2. It carries a `staging_<ts>_<sha>` tag from the staging promotion. An `rc_*_validated` tag is
    not checked alongside it: a staging tag is only ever derived from a candidate that already
    carries one.
-3. The release images in `REQUIRED_RELEASE_IMAGES`, as `common.sh` lists them at that commit
-   (on `main` today `k8s-operator`, `platform-agent`, `credential-proxy`, `agent-sandbox`,
-   `replay-proxy`, `pubsub-platform`, `gke-stockout-investigator`, `a2a-gateway`, `a2a-worker`,
-   `a2a-authcallout`, `a2a-console`, `hermes-bridge`), exist in GHCR under that commit. The gate reads the
+3. The release images in `REQUIRED_RELEASE_IMAGES`, as `common.sh` lists them at that commit,
+   exist in GHCR under that commit. The gate reads the
    candidate's list, not the checkout's (`required_release_images_at`), so a commit or a
    release line from before the list grew needs only the images it was published with.
 4. `gh`, authenticated with `repo` and `workflow` permissions (`gh auth status`).
@@ -386,7 +384,11 @@ gh workflow run release-publish.yml --repo gke-labs/kube-agents \
 
 A dispatch runs with `schedule_gate=bypass` unless told otherwise, so it publishes without the
 scheduled gate's verdict; `verify_release_eligibility.sh` still enforces staging promotion in the
-publish job. `dry-run` reports the verdict in the job summary and publishes nothing.
+publish job. `dry-run` reports the verdict in the job summary and publishes nothing. After
+`Publish GitHub Release` succeeds, `release-publish.yml` dispatches `docs-deploy.yml` on `main`
+(warning rather than failing the completed release if the dispatch call errors) so the GitHub Pages
+installer scripts stage the numerically highest published `X.Y.Z` GA release (see
+[`docs/site/README.md`](../../docs/site/README.md)).
 
 ### Emergency hotfix
 
@@ -520,8 +522,8 @@ line; a patch is validated by the RC pipeline and released by hand.
 4. **Check.** The tag `X.Y.Z` on a stamped commit whose parent is the line's previous head,
    `release/<X.Y>` fast-forwarded to it, the images promoted from that parent's SHA tags, and
    release notes starting at the line's previous release. A patch below the newest minor is
-   published without GitHub's `latest` mark, so `releases/latest` keeps pointing at the newest
-   version.
+   published without GitHub's `latest` mark, so `releases/latest` — and the GitHub Pages installer
+   scripts staged by `docs-deploy.yml` — keep pointing at the newest minor.
 
 If the release job fails with "Release line 'release/<X.Y>' already exists ... but points to
 commit", or earlier with "Release line X.Y resolves to its own head ..., not to ...", the line

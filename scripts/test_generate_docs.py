@@ -1,4 +1,4 @@
-"""The cron-job example region, and a region spliced into more than one page.
+"""The cron-job example region, a region spliced into more than one page, and the CRD field pages.
 
 ``generate_docs.py`` renders one Platform Agent roster entry as the fenced JSON
 three site pages show as the job schema's worked example. The three used to be
@@ -14,8 +14,11 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -284,6 +287,137 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertIn(
             "[`Odd-Name_SOP.md`](agents/platform/governance/Odd-Name_SOP.md)", body
         )
+
+
+class CRDFieldBlocksTest(unittest.TestCase):
+    """The three CRD field pages are registered, rendered as tables, and selectable."""
+
+    def test_each_kind_has_a_block_on_its_own_page(self):
+        for kind, page in generate_docs.CRD_KINDS.items():
+            block_id = f"{generate_docs.CRD_BLOCK_PREFIX}{kind.lower()}"
+            paths, generator = generate_docs.BLOCKS[block_id]
+            self.assertEqual(paths, (page,))
+            self.assertEqual(generator.func, generate_docs.gen_crd_fields)
+            self.assertEqual(generator.args, (kind,))
+            self.assertTrue(page.exists(), page)
+
+    def test_select_blocks_keeps_registry_order_and_rejects_unknown_ids(self):
+        blocks = {"a": 1, "b": 2, "crd-fields-x": 3, "crd-fields-y": 4}
+        self.assertEqual(generate_docs.select_blocks([], [], blocks), blocks)
+        self.assertEqual(list(generate_docs.select_blocks(["crd-fields-x", "a"], [], blocks)), ["a", "crd-fields-x"])
+        # A prefix covers a family, so the operator Makefile names it once.
+        self.assertEqual(
+            list(generate_docs.select_blocks([], ["crd-fields-"], blocks)), ["crd-fields-x", "crd-fields-y"]
+        )
+        self.assertEqual(list(generate_docs.select_blocks(["a"], ["crd-"], blocks)), ["a", "crd-fields-x", "crd-fields-y"])
+        with self.assertRaises(SystemExit) as caught:
+            generate_docs.select_blocks(["a", "nope"], [], blocks)
+        self.assertIn("nope", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            generate_docs.select_blocks([], ["zzz-"], blocks)
+        self.assertIn("zzz-", str(caught.exception))
+
+    def test_without_go_a_write_run_skips_the_crd_pages_and_a_check_fails(self):
+        def crd_generator() -> str:
+            return generate_docs.run_crd_generator(generate_docs.CRD_API_DIR, ("AgentPlugin",))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "plain.md"
+            crd = Path(tmp) / "crd.md"
+            for page, block_id in ((plain, "plain"), (crd, "crd-fields-x")):
+                page.write_text(
+                    f"<!-- BEGIN GENERATED: {block_id} -->\nstale\n<!-- END GENERATED: {block_id} -->\n",
+                    encoding="utf-8",
+                )
+            blocks = {"plain": ((plain,), lambda: "FRESH"), "crd-fields-x": ((crd,), crd_generator)}
+            out = io.StringIO()
+            with mock.patch.object(generate_docs.shutil, "which", return_value=None):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(generate_docs.main([], blocks), 0)
+                    self.assertIn("FRESH", plain.read_text(encoding="utf-8"))
+                    self.assertIn("stale", crd.read_text(encoding="utf-8"))
+                    self.assertIn("skipped  [crd-fields-x]", out.getvalue())
+                    with self.assertRaises(SystemExit):
+                        generate_docs.main(["--check"], blocks)
+                    with self.assertRaises(SystemExit):
+                        generate_docs.main(["crd-fields-x"], blocks)
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_the_page_body_is_a_spec_and_a_status_table(self):
+        body = generate_docs.gen_crd_fields("AgentPlugin")
+        intro, tables = body.split("\n\n", 1)
+        self.assertTrue(intro.startswith("Every field of the `AgentPlugin` resource's"), intro)
+        self.assertIn("[AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/)", intro)
+        self.assertIn("`kubectl explain agentplugin.spec.<field>`", intro)
+        self.assertIn("(`agentplugin.status.<field>` for a row of the Status table)", intro)
+        # The Constraints column leaves the CEL rules out, and the intro says so
+        # and where they are listed.
+        self.assertIn("`kubectl get crd agentplugins.kubeagents.x-k8s.io -o yaml`", intro)
+        self.assertIn("`x-kubernetes-validations`", intro)
+        self.assertTrue(tables.startswith("## Spec\n\n" + "\n".join(generate_docs.CRD_TABLE_HEADER)))
+        self.assertIn("\n## Status\n", body)
+        self.assertIn("| `agentRef` | `string` | yes |  |  | ", body)
+        self.assertIn("one of `Always`, `Never`, `IfNotPresent`", body)
+        self.assertIn("| `env` | `[]corev1.EnvVar` |", body)
+        self.assertNotIn("| `env[]", body)
+
+    def test_a_row_is_rendered_from_the_model(self):
+        with mock.patch.object(
+            generate_docs,
+            "crd_model",
+            return_value={
+                "AgentPlugin": {
+                    "spec": [
+                        {
+                            "path": "parts[].name",
+                            "name": "name",
+                            "type": "string",
+                            "kind": "scalar",
+                            "external": False,
+                            "required": True,
+                            "default": "a|b",
+                            "constraints": [
+                                {"name": "MaxLength", "value": "63"},
+                                {"name": "items:Pattern", "value": "^(a|b)$"},
+                                {"name": "Enum", "value": "x;y"},
+                                {"name": "MultipleOf", "value": "5"},
+                                {"name": "values:Enum", "value": "p;q"},
+                            ],
+                            "description": "Name of the <part>, see `kind: <k>`.",
+                        }
+                    ],
+                    "status": [],
+                }
+            },
+        ):
+            body = generate_docs.gen_crd_fields("AgentPlugin")
+        self.assertIn(
+            "| `parts[].name` | `string` | yes | `a\\|b` | max length `63`; items pattern `^(a\\|b)$`; "
+            "one of `x`, `y`; multiple of `5`; values one of `p`, `q` | Name of the &lt;part&gt;, see `kind: <k>`. |",
+            body,
+        )
+        self.assertTrue(body.endswith("## Status\n\n" + generate_docs.CRD_EMPTY_TREE))
+
+    def test_escape_cell_leaves_code_spans_alone(self):
+        self.assertEqual(generate_docs.escape_cell("a <b> `<c>` d|e `f|g`"), "a &lt;b&gt; `<c>` d\\|e `f\\|g`")
+
+    def test_an_edited_region_makes_check_exit_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "page.md"
+            page.write_text(
+                "<!-- BEGIN GENERATED: example -->\n"
+                "edited by hand\n"
+                "<!-- END GENERATED: example -->\n",
+                encoding="utf-8",
+            )
+            blocks = {"example": ((page,), lambda: "FRESH")}
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(generate_docs.main(["--check"], blocks), 1)
+                self.assertIn("edited by hand", page.read_text(encoding="utf-8"))
+                self.assertEqual(generate_docs.main([], blocks), 0)
+                self.assertIn("FRESH", page.read_text(encoding="utf-8"))
+                self.assertEqual(generate_docs.main(["--check"], blocks), 0)
+                self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
 
 
 if __name__ == "__main__":

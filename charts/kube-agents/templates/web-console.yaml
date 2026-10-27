@@ -1,0 +1,361 @@
+{{- /*
+The web console: a browser chat page for the Platform Agent, for installs with
+no chat platform configured. docs/site/src/content/docs/deploy/web-console.md
+is the user-facing page.
+
+Access is `kubectl port-forward` and nothing else, and three things here hold
+that line. The Service is ClusterIP with no way to change its type. The
+NetworkPolicy refuses all ingress from the pod network, so no other workload
+can reach the console and borrow the agent API key it holds — port-forwards
+enter from the node, which NetworkPolicy does not govern, and so do kubelet
+probes. And the binary refuses any Host that is not loopback, so a forwarded
+port cannot be reached through a rebinding DNS name in the operator's browser.
+
+One replica on purpose: a port-forward lands on one pod, and the console keeps
+which sessions have a turn in flight in memory.
+
+The metrics banner reads LiteLLM's Prometheus counters from every replica. The
+headless Service below gives the console their pod IPs through DNS.
+litellm-policy (this chart's copy, and the operator's) admits every pod in the
+namespace on 8080, and the console's own NetworkPolicy governs ingress only, so
+the fetch is allowed both ways. Install-time model and agent identity defaults
+are passed in as env; when `webConsole.environment.enabled` is true, the
+console also reads and patches the `PlatformAgent` resource (for repository
+topology, preferred model annotations, and applied PR annotations). The console
+has no credentials to read cloud IAM.
+*/ -}}
+{{- if .Values.webConsole.enabled }}
+{{- if not .Values.platformAgent.enabled }}
+{{- fail "webConsole.enabled is set but platformAgent.enabled is false; the web console is a chat page for the Platform Agent and has nothing to talk to without it" }}
+{{- end }}
+{{- $agentName := .Values.platformAgent.name | default "platform-agent" }}
+{{- $secretName := .Values.platformAgent.credentials.secretName | default "platform-agent-secrets" }}
+{{- /* Same tag resolution as the plugin images: an install pinned to an agent image of one commit gets the console of that commit. */ -}}
+{{- $tag := .Values.webConsole.image.tag | default .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion | toString }}
+{{- $repo := include "kube-agents.imageRepository" (dict "repository" .Values.webConsole.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}
+{{- $identity := .Values.webConsole.agentIdentity | default dict }}
+{{- $integ := .Values.platformAgent.integration | default dict }}
+{{- $chatPlatforms := list }}
+{{- if ($integ.slack | default dict).enabled }}{{- $chatPlatforms = append $chatPlatforms "Slack" }}{{- end }}
+{{- if ($integ.googleChat | default dict).enabled }}{{- $chatPlatforms = append $chatPlatforms "Google Chat" }}{{- end }}
+{{- /* A Service name is a DNS label: 63 characters at most, and distinct from <release>-web-console. LITELLM_PEERS_HOST uses the same value. */ -}}
+{{- $name := printf "%s-web-console" (.Release.Name | trunc 51 | trimSuffix "-") }}
+{{- $peersName := printf "%s-web-console-litellm-peers" (.Release.Name | trunc 37 | trimSuffix "-") }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web-console
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web-console
+        app.kubernetes.io/component: web-console
+        {{- include "kube-agents.labels" . | nindent 8 }}
+    spec:
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      {{- if .Values.webConsole.environment.enabled }}
+      serviceAccountName: {{ .Release.Name }}-web-console
+      automountServiceAccountToken: true
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web-console
+          image: {{ printf "%s:%s" $repo $tag | quote }}
+          {{- /* A cached `latest` never picks up a new build, so pull it every time. */}}
+          imagePullPolicy: {{ .Values.webConsole.image.pullPolicy | default (ternary "Always" "IfNotPresent" (eq $tag "latest")) }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HERMES_URL
+              value: {{ printf "http://%s.%s.svc.cluster.local:8642" $agentName .Release.Namespace | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.platformAgent.harness.clusterName | default "" | quote }}
+            - name: PROJECT_ID
+              value: {{ .Values.platformAgent.harness.projectId | default "" | quote }}
+            - name: LOCATION
+              value: {{ .Values.platformAgent.harness.location | default "" | quote }}
+            {{- if .Values.litellm.enabled }}
+            - name: MODEL_NAME
+              value: {{ include "kube-agents.litellmModel" . | quote }}
+            - name: MODEL_PROVIDER
+              value: {{ .Values.litellm.modelProvider | quote }}
+            - name: LITELLM_PEERS_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" $peersName .Release.Namespace | quote }}
+            {{- end }}
+            - name: AGENT_KSA
+              value: {{ .Values.platformAgent.security.serviceAccountName | default "" | quote }}
+            - name: AGENT_GSA
+              value: {{ $identity.gcpServiceAccount | default "" | quote }}
+            - name: AGENT_ROLES
+              value: {{ join "," ($identity.roles | default list) | quote }}
+            {{- if $chatPlatforms }}
+            - name: CHAT_PLATFORM
+              value: {{ join " / " $chatPlatforms | quote }}
+            {{- end }}
+            {{- /*
+            The repositories the agent may open pull requests on or read,
+            as declared under platformAgent.integration, so the page can
+            list them. Informational only: access comes from the credential
+            proxy, never from this list. The deprecated github.gitRepo alias
+            renders as one gitops repository on the github forge.
+            */}}
+            {{- $forgeByName := dict }}
+            {{- range ($integ.forges | default list) }}
+            {{- $_ := set $forgeByName .name (dict "provider" (.provider | default "github") "host" (.host | default "") "namespace" (.namespace | default "")) }}
+            {{- end }}
+            {{- $repoList := list }}
+            {{- range ($integ.repositories | default list) }}
+            {{- $f := get $forgeByName (.forge | default "github") | default (dict "provider" "github" "host" "" "namespace" "") }}
+            {{- $name := .repository | default "" }}
+            {{- $ns := .namespace | default $f.namespace }}
+            {{- if and $ns (not (contains "/" $name)) (not (contains "://" $name)) }}
+            {{- $name = printf "%s/%s" $ns $name }}
+            {{- end }}
+            {{- $repoList = append $repoList (dict "forge" (.forge | default "github") "provider" $f.provider "host" $f.host "repository" $name "role" (.role | default "gitops") "baseBranch" (.baseBranch | default "")) }}
+            {{- end }}
+            {{- if and (not $repoList) $integ.github $integ.github.gitRepo }}
+            {{- $repoList = append $repoList (dict "forge" "github" "provider" "github" "host" "" "repository" $integ.github.gitRepo "role" "gitops") }}
+            {{- end }}
+            - name: GITOPS_REPOS
+              value: {{ toJson $repoList | quote }}
+            {{- /*
+            What GET /api/environment reports as the kube-agents version and
+            release: versions and a revision number, nothing that names the
+            install. The dates come from the API at read time.
+            */}}
+            - name: KUBE_AGENTS_CHART_VERSION
+              value: {{ .Chart.Version | quote }}
+            - name: KUBE_AGENTS_APP_VERSION
+              value: {{ .Chart.AppVersion | quote }}
+            - name: KUBE_AGENTS_IMAGE_TAG
+              value: {{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion | quote }}
+            - name: HELM_RELEASE_REVISION
+              value: {{ .Release.Revision | quote }}
+            {{- /*
+            Drafting help in the feedback form goes to the install's own
+            inference gateway; the console gets no key because the gateway
+            takes none from pods in its namespace. Unset, the route answers
+            501 and the page hides nothing but says the help is off.
+            */}}
+            {{- $assist := .Values.webConsole.assist | default dict }}
+            {{- $assistURL := $assist.url | default "" }}
+            {{- if and (not $assistURL) .Values.litellm.enabled }}
+            {{- $assistURL = printf "http://inference-gateway.%s.svc.cluster.local" .Release.Namespace }}
+            {{- end }}
+            {{- if and ($assist.enabled | default false) $assistURL }}
+            - name: LITELLM_URL
+              value: {{ $assistURL | quote }}
+            - name: ASSIST_MODEL
+              value: {{ $assist.model | default "model-default" | quote }}
+            {{- end }}
+            {{- $releaseCheck := .Values.webConsole.releaseCheck | default dict }}
+            - name: RELEASE_CHECK
+              value: {{ ($releaseCheck.enabled | default false) | ternary "true" "false" | quote }}
+            - name: RELEASE_REPO
+              value: {{ $releaseCheck.repo | default "gke-labs/kube-agents" | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PLATFORM_AGENT_NAME
+              value: {{ $agentName | quote }}
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName | quote }}
+                  key: API_SERVER_KEY
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.webConsole.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.webConsole.securityContext | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web-console
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress: []
+{{- if .Values.litellm.enabled }}
+---
+{{- /* Headless: DNS answers with one A record per ready LiteLLM pod, which is
+       how the console finds every replica to read. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $peersName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/component: web-console
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: litellm
+{{- end }}
+{{- if .Values.webConsole.environment.enabled }}
+---
+{{- /*
+Kubernetes API access for GET /api/environment and PlatformAgent state: the
+ClusterRole counts nodes, namespaces, pods and controllers with list calls and
+discards the items; the namespaced Role lists ReplicaSets for the last rollout
+and gets/patches the named PlatformAgent resource (recording repository
+topology, preferred model annotations, and applied PR annotations). No secrets
+or configmaps are read or modified.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-web-console
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-web-console-environment
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces", "pods"]
+    verbs: ["list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["list"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-web-console-environment
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-web-console-environment
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-web-console
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-web-console-environment
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["platformagents"]
+    resourceNames: [{{ $agentName | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-web-console-environment
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: web-console
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-web-console-environment
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-web-console
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
