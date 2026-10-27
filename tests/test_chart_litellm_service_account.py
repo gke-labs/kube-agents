@@ -73,6 +73,16 @@ class LitellmTemplateStructureTest(unittest.TestCase):
             "to prevent Kubernetes from resurrecting the deleted KSA (#3878).",
         )
 
+    def test_kustomize_base_explicitly_sets_default_service_account(self) -> None:
+        base_path = REPO_ROOT / "k8s-operator" / "config" / "integrations" / "litellm" / "base" / "deployment.yaml"
+        doc = yaml.safe_load(base_path.read_text())
+        self.assertEqual(
+            doc["spec"]["template"]["spec"].get("serviceAccountName"),
+            "default",
+            "k8s-operator/config/integrations/litellm/base/deployment.yaml must "
+            "explicitly set serviceAccountName: default to match the chart (#3878).",
+        )
+
 
 @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
 class LitellmServiceAccountRenderTest(unittest.TestCase):
