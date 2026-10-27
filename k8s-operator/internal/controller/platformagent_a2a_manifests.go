@@ -3623,18 +3623,90 @@ func a2aProvisionTerminationMessage(pods []corev1.Pod) (string, bool) {
 // playground path).
 const defaultA2AMaxSessions = 10
 
+// The namespace pod quota adds headroom above the gateway's cap, because the
+// quota is namespace-wide: that is the only shape a hostile pod-creator cannot
+// dodge (ResourceQuota scopes select on fields the creator writes), so it must
+// leave room for everything else that legitimately runs here. The headroom is
+// derived rather than a constant (#3848): a fixed 16, sized for "roughly ten
+// standing pods plus surge", stopped covering the release once the callouts,
+// verifiers and console arrived and an install could add Hindsight and the
+// GitHub minter, and the gateway's tenth session was refused by admission.
+// a2aQuotaHeadroom is the sum of three parts:
+//
+//   - a2aStandingPods: what this operator keeps running for the agent;
+//   - the chart's standing pods (the operator, LiteLLM, Hindsight, the GitHub
+//     minter), which only the chart knows: it stamps them on the PlatformAgent
+//     as a2aChartPodsAnnotation. The CR is in the namespace those pods run in,
+//     and the chart renders it whether or not it renders the operator;
+//   - a2aQuotaTransientMargin for what comes and goes.
+const (
+	// a2aChartPodsAnnotation carries the chart's standing-pod count
+	// (charts/kube-agents/templates/platform-agent-cr.yaml, from
+	// kube-agents.chartStandingPods).
+	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
+	// a2aDefaultChartPods stands in when that annotation is absent (a
+	// PlatformAgent written without the chart) or unreadable: the chart's
+	// default release, the operator and two LiteLLM replicas. It errs high for
+	// a CR in a namespace with no chart pods, which only loosens the bound.
+	// tests/test_quota_preflight.py ties it to a default chart render.
+	a2aDefaultChartPods = 3
+	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
+	// enforcement half of the session bound, and anyone who can annotate the
+	// CR could otherwise lift it as far as an int64 goes (or wrap it); the
+	// chart's own count is a handful of pods, so a figure past this is not one
+	// it wrote, and the default stands in for it.
+	a2aMaxChartPods = 64
+	// a2aQuotaTransientMargin is room for pods that come and go beside the
+	// standing ones, at their worst moment, a helm upgrade: three rollout
+	// surge pods at once (the callouts and verifiers roll together on the new
+	// operator's reconcile while LiteLLM rolls on the chart's side; each rolls
+	// surge-first), one provisioning Job pod (at install, on any spec change
+	// and about daily after its TTL), and three for the gateway's
+	// count-then-create overshoot (a2a/gateway/spawn.go, refuseAtSessionCap).
+	a2aQuotaTransientMargin = 3 + 1 + 3
+)
+
 // a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's
-// cap. The quota is namespace-wide because that is the only shape a hostile
-// pod-creator cannot dodge (ResourceQuota scopes select on fields the
-// creator writes), so it must leave room for everything else that
-// legitimately runs here: the rendered stack and its neighbors (operator,
-// agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
-// rollout surge doubling a Deployment for a moment, and the gateway's
-// count-then-create overshoot. Fifteen covered roughly ten standing pods plus
-// surge; the console server made it eleven, hence sixteen. If the base
-// install grows again, raise this before anything user-visible starts failing
-// admission.
-const a2aQuotaHeadroom = 16
+// cap for agent.
+func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
+	return a2aStandingPods(agent) + a2aChartPods(agent) + a2aQuotaTransientMargin
+}
+
+// a2aChartPods is the chart's standing pods in agent's namespace, as the chart
+// stamped them on the CR, or the default when it did not or stamped a figure
+// outside [0, a2aMaxChartPods].
+func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	raw := strings.TrimSpace(agent.GetAnnotations()[a2aChartPodsAnnotation])
+	if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 && v <= a2aMaxChartPods {
+		return v
+	}
+	return a2aDefaultChartPods
+}
+
+// a2aStandingPods is every pod the operator keeps running for agent in next
+// mode, summed from the builders that render them, so a resized workload is
+// counted at its new size. A new standing workload has to be added here;
+// TestA2AStandingPodsMatchTheNextModeGolden fails until it is.
+func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	agentReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	n := int64(agentReplicas)
+	for _, dep := range []*appsv1.Deployment{
+		buildCredentialProxyDeployment(agent, ""),
+		buildA2ACalloutDeployment(agent),
+		buildA2AVerifierDeployment(agent),
+		buildA2AConsoleDeployment(agent),
+		buildA2AGatewayDeployment(agent),
+	} {
+		n += int64(ptr.Deref(dep.Spec.Replicas, 1))
+	}
+	for _, sts := range []*appsv1.StatefulSet{
+		buildShellSandboxStatefulSet(agent, "", "", ""),
+		buildA2ANATSStatefulSet(agent, ""),
+	} {
+		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
+	}
+	return n
+}
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -4094,7 +4166,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	limit := int64(resolveA2AMaxSessions(agent)) + a2aQuotaHeadroom(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
