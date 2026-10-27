@@ -1508,8 +1508,8 @@ class SanitizerCoverageTest(unittest.TestCase):
         The cases are read out of that file rather than restated here. An
         earlier version of this test asserted a hardcoded list of eight
         framings, which made its name a promise it did not keep: a marker added
-        to the canonical copy tomorrow left it green. `SanitizerMirrorDriftTest`
-        below does the same job for `_is_safe_char`.
+        to the canonical copy tomorrow left it green. `SharedTextFilterTest`
+        below checks that the character filter is the shared module's.
 
         Asserted as "the sanitizer changed it" rather than as a specific
         replacement: `<untrusted_pod_diagnostics>` is covered by the boundary-tag
