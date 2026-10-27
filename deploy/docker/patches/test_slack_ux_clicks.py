@@ -454,6 +454,14 @@ class BoardActionTest(unittest.TestCase):
         updates = self.tap(adapter, "kage_board.drop", row=1, value="t_2,t_3")
         ids = self.ids(updates[1][1])
         self.assertEqual(ids, [None, "kage_board.text.0", "kage_board.row.0.note", "kage_board.text.1", "kage_board.row.1.note"])
+    def test_a_row_whose_edit_failed_can_be_tapped_again(self):
+        adapter = _Adapter(fail=("chat_update",))
+        self.tap(adapter)
+        self.answer = [{"id": "t_1", "outcome": "moved"}]
+        adapter.fail = ()
+        (update,) = self.tap(adapter)
+        self.assertEqual(len(self.requests), 2)
+        self.assertTrue(update[1]["blocks"][2]["elements"][0]["text"].startswith("No longer stuck. Jayanti, "))
     def test_mixed_outcomes(self):
         # A row is settled only when every card is: a failed one keeps the buttons for a second tap.
         self.assertEqual(runtime.board_outcome([{"outcome": "done"}, {"outcome": "failed"}]), "failed")

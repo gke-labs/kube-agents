@@ -4725,7 +4725,7 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
     if not (chat_id or _slack_home_channel()):
         return None
     try:
-        return board_health_card.load(gitops_workspace.agent_home(), report)
+        return board_health_card.load(kanban_board_health.agent_home(), report)
     except Exception as exc:  # noqa: BLE001 - the report still posts, as text
         logger.warning(f"Relay for {job_id}: board-health card unreadable, posting text: {exc!r}")
         return None

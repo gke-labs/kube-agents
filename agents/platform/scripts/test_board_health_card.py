@@ -69,6 +69,19 @@ class LoadTest(unittest.TestCase):
                 self.write(bad)
                 self.assertIsNone(card_mod.load(Path("/unused"), TEXT, self.env))
 
+    def test_a_row_the_builders_cannot_lay_out_is_none(self):
+        base = mock_card()["rows"][0]
+        for bad in ({**base, "count": "two"}, {**base, "count": True}, {**base, "tasks": "t_7c2e91ab"},
+                    {**base, "tasks": [1]}, {**base, "status": None}):
+            with self.subTest(row=bad):
+                self.write(mock_card(rows=[bad]))
+                self.assertIsNone(card_mod.load(Path("/unused"), TEXT, self.env))
+        self.write(mock_card(more=None))
+        self.assertIsNone(card_mod.load(Path("/unused"), TEXT, self.env))
+
+    def test_a_home_given_as_a_string_is_read(self):
+        self.write(mock_card())
+        self.assertEqual(card_mod.load("/unused", TEXT, self.env), mock_card())
     def test_what_kanban_board_health_writes_is_what_load_reads(self):
         tasks = [
             {"task_id": "t_7c2e91ab", "title": "Investigate payments-api crash-loop on seeded-a", "person": False,

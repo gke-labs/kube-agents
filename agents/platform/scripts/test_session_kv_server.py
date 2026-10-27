@@ -5242,6 +5242,20 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
         self.assertEqual(text, self.REPORT)
 
+    def test_the_card_is_found_under_the_agent_home_with_no_override(self):
+        """Production: no KANBAN_HEALTH_STATE, the card beside the record under PLATFORM_AGENT_HOME."""
+        os.environ.pop("KANBAN_HEALTH_STATE", None)
+        os.environ.pop("KANBAN_HEALTH_HOME", None)
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        cron = Path(home.name, "profiles", "platform", "cron")
+        cron.mkdir(parents=True)
+        (cron / "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        os.environ["PLATFORM_AGENT_HOME"] = home.name
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.posts), 1)
     def test_a_refused_card_posts_the_report(self):
         os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
 

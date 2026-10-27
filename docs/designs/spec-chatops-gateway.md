@@ -2126,7 +2126,7 @@ to session-kv's `POST /v1/board/actions`; that unblocks (Retry) or archives (Dro
 while they are still `blocked`, and answers each card's outcome. The row is then edited in place:
 its buttons give way to "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>", or "No longer
 stuck. <name>, <time>" when the cards had already moved, the time as Slack's date token; a tap that did not land
-keeps the buttons under a line saying so. One tap per row at a time, in this process.
+keeps the buttons under a line saying so, and so does a row whose edit Slack refused, so a second tap asks again. One tap per row at a time, and one edit of a card at a time, each from the blocks the last one sent, in this process. A message whose rows carry buttons is drawn without its side bar, so every row stays in the message's own blocks where the edit finds it.
 
 ### Answer feedback (added 10/16)
 

@@ -254,6 +254,52 @@ func TestSlackSecondRowsTapKeepsTheFirstRowsEdit(t *testing.T) {
 	}
 }
 
+// TestSlackBoardRowWhoseEditFailedCanBeTappedAgain: a tap that landed but
+// could not edit its row (here, a message without the row) leaves the row
+// open, so a second tap asks again.
+func TestSlackBoardRowWhoseEditFailedCanBeTappedAgain(t *testing.T) {
+	a, api, actor := newBoardSlackAdapter()
+	withoutRow := func(raw json.RawMessage) json.RawMessage {
+		var p map[string]any
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		p["message"].(map[string]any)["blocks"] = []any{}
+		out, _ := json.Marshal(p)
+		return out
+	}
+	a.interactive(withoutRow(boardTap(t, "U1", "kage_board.retry", 0, "61.0")))
+	if len(api.updated) != 0 {
+		t.Fatalf("updates = %+v", api.updated)
+	}
+	actor.outcome = lib.BoardOutcomeMoved
+	a.interactive(boardTap(t, "U1", "kage_board.retry", 0, "62.0"))
+	if len(actor.got) != 2 || len(api.updated) != 1 {
+		t.Fatalf("actions %d updates %d, want the second tap to act and edit", len(actor.got), len(api.updated))
+	}
+}
+
+func TestSlackRowsWithButtonsTakeNoSideBar(t *testing.T) {
+	m := boardCard()
+	m.Tone = chatmsg.ToneAttention
+	layout, err := renderSlackChat(m, "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(layout.Attachments) != 0 {
+		t.Fatalf("attachments = %v, want the acting rows top-level", layout.Attachments)
+	}
+	acts := 0
+	for _, b := range layout.Blocks {
+		if b["type"] == "actions" {
+			acts++
+		}
+	}
+	if acts != 2 {
+		t.Errorf("top-level actions blocks = %d, want 2", acts)
+	}
+}
+
 func TestSlackBoardTapIsNotRepeated(t *testing.T) {
 	a, _, actor := newBoardSlackAdapter()
 	a.interactive(boardTap(t, "U1", "kage_board.retry", 0, "61.0"))

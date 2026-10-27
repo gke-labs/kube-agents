@@ -42,13 +42,7 @@ const (
 	stepMax        = 300
 	itemNoteMax    = 300
 	itemResultMax  = 256
-	// rowTasksMax is session-kv's cap on the cards one Retry or Drop acts
-	// on (BOARD_ACTION_MAX_TASKS), and rowTasksJoinedMax Slack's on a
-	// button's value, which carries the ids joined by rowTaskSeparator.
-	rowTasksMax       = 50
-	rowTasksJoinedMax = 2000
-	rowTaskSeparator  = ","
-	urlSchemeHTTP     = "http"
+	urlSchemeHTTP  = "http"
 	urlSchemeHTTPS = "https"
 	authorityStart = "://"
 	authorityEnds  = "/?#"
@@ -62,6 +56,15 @@ const (
 
 // tokenRE is a severity or a mark's ask: 1-16 characters of [a-z0-9-].
 var tokenRE = regexp.MustCompile(`^[a-z0-9-]{1,16}$`)
+
+// rowTasksMax is session-kv's cap on the cards one Retry or Drop acts on
+// (BOARD_ACTION_MAX_TASKS), and rowTasksJoinedMax Slack's on a button's
+// value, which carries the ids joined by rowTaskSeparator.
+const (
+	rowTasksMax       = 50
+	rowTasksJoinedMax = 2000
+	rowTaskSeparator  = ","
+)
 
 // taskIDRE is a board card id a row may carry: 1-64 characters of
 // [A-Za-z0-9_-], so the ids join into a button's value unambiguously.

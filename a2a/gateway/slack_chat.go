@@ -152,7 +152,9 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 		// what follows it.
 		barFrom = max(barFrom, foldAt+1)
 	}
-	if color, ok := slackChatColors[m.Tone]; ok && len(blocks) > barFrom {
+	// Rows with buttons stay top-level, no side bar: a tap edits the row in
+	// the message's own blocks (slack_board.go).
+	if color, ok := slackChatColors[m.Tone]; ok && len(blocks) > barFrom && !slackChatRowsAct(m.Rows) {
 		layout.Blocks = blocks[:barFrom]
 		layout.Attachments = []map[string]any{{
 			"color":    color,
@@ -276,11 +278,7 @@ func slackChatRows(rows []chatmsg.Row) map[string]any {
 // slack_board.go), when each row is a block of its own keyed by its index,
 // with its buttons' actions block under it.
 func slackChatRowBlocks(rows []chatmsg.Row) []map[string]any {
-	acting := false
-	for _, r := range rows {
-		acting = acting || len(r.Actions) > 0
-	}
-	if !acting {
+	if !slackChatRowsAct(rows) {
 		if block := slackChatRows(rows); block != nil {
 			return []map[string]any{block}
 		}
@@ -299,6 +297,16 @@ func slackChatRowBlocks(rows []chatmsg.Row) []map[string]any {
 		}
 	}
 	return blocks
+}
+
+// slackChatRowsAct reports whether a row carries buttons.
+func slackChatRowsAct(rows []chatmsg.Row) bool {
+	for _, r := range rows {
+		if len(r.Actions) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // slackChatAfter is the lines after the rows, one section each.

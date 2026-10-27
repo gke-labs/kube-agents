@@ -278,12 +278,15 @@ type SlackAdapter struct {
 	// boardActor acts on a board-health row's Retry or Drop, and boardTaps
 	// holds each row whose tap is running or landed, under s.mu
 	// (slack_board.go).
-	boardActor BoardActor
-	boardTaps  map[string]bool
+	boardActor     BoardActor
+	boardTaps      map[string]bool
+	boardTapsOrder []string
 	// boardSent is the blocks each board card's last edit sent, by
-	// channel/ts, under s.mu; boardEditMu runs one board edit at a time.
-	boardSent   map[string]json.RawMessage
-	boardEditMu sync.Mutex
+	// channel/ts, under s.mu, bounded oldest first like boardTaps
+	// (remember); boardEditMu runs one board edit at a time.
+	boardSent      map[string]json.RawMessage
+	boardSentOrder []string
+	boardEditMu    sync.Mutex
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.

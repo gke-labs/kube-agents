@@ -147,10 +147,11 @@ func (s *SlackAdapter) boardClick(p slackClickPayload, actionID, blockID, value 
 		s.log.Info("slack: dropping a second tap on a board row", "channel", p.Channel.ID, "ts", p.Message.TS, "blockId", blockID)
 		return
 	}
-	if s.boardTaps == nil || len(s.boardTaps) >= slackUXCap {
+	if s.boardTaps == nil {
 		s.boardTaps = map[string]bool{}
 	}
 	s.boardTaps[key] = true
+	remember(&s.boardTapsOrder, key, func(k string) { delete(s.boardTaps, k) })
 	s.mu.Unlock()
 	s.goSession(func() { s.runBoardTap(p, key, verb, tasks, blockID, actor) })
 }
@@ -160,6 +161,7 @@ func (s *SlackAdapter) runBoardTap(p slackClickPayload, key, verb string, tasks 
 	release := func() {
 		s.mu.Lock()
 		delete(s.boardTaps, key)
+		forget(&s.boardTapsOrder, key)
 		s.mu.Unlock()
 	}
 	if admitted, decided := s.homeAdmitted(p.User.ID); !admitted || !decided {
@@ -201,14 +203,18 @@ func (s *SlackAdapter) runBoardTap(p slackClickPayload, key, verb string, tasks 
 			slack.MsgOptionText(p.Message.Text, false), slack.MsgOptionBlocks(blocks...))
 	}
 	if err != nil {
+		// The cards may have moved; a second tap asks again and redraws the
+		// row ("No longer stuck." for cards already moved).
+		release()
 		s.log.Warn("slack: editing a board row failed", "channel", p.Channel.ID, "ts", p.Message.TS, "err", err)
 		return
 	}
 	s.mu.Lock()
-	if s.boardSent == nil || len(s.boardSent) >= slackUXCap {
+	if s.boardSent == nil {
 		s.boardSent = map[string]json.RawMessage{}
 	}
 	s.boardSent[msgKey] = sent
+	remember(&s.boardSentOrder, msgKey, func(k string) { delete(s.boardSent, k) })
 	s.mu.Unlock()
 }
 

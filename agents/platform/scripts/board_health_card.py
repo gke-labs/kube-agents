@@ -47,10 +47,11 @@ VALUE_MAX = 2000
 ROW_TASKS_MAX = 50
 
 
-def load(home: Path, report: str, env=None) -> dict | None:
-    """The card file for ``report``, or None: missing, unreadable, another version, or said with other text."""
+def load(home: Path | str, report: str, env=None) -> dict | None:
+    """The card file for ``report``, or None: missing, unreadable, another version, said with
+    other text, or a row the builders cannot lay out (``_row_ok``)."""
     try:
-        card = json.loads(_health.card_path(home, env).read_text(encoding="utf-8"))
+        card = json.loads(_health.card_path(Path(home), env).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(card, dict) or card.get(_health.STATE_VERSION_KEY) != _health.CARD_SCHEMA_VERSION:
@@ -58,11 +59,27 @@ def load(home: Path, report: str, env=None) -> dict | None:
     if str(card.get("text") or "").strip() != (report or "").strip():
         return None
     rows = card.get("rows")
-    if not str(card.get("headline") or "").strip() or not isinstance(rows, list) or not rows:
+    if not isinstance(card.get("headline"), str) or not card["headline"].strip():
         return None
-    if not all(isinstance(row, dict) and str(row.get("title") or "").strip() for row in rows):
+    if not isinstance(rows, list) or not rows or not all(_row_ok(row) for row in rows):
+        return None
+    if not isinstance(card.get("more", ""), str):
         return None
     return card
+
+
+def _row_ok(row) -> bool:
+    """A row as ``kanban_board_health.stuck_rows`` writes it: a titled dict, a whole
+    count, text lines, and a list of ids."""
+    if not isinstance(row, dict) or not isinstance(row.get("title"), str) or not row["title"].strip():
+        return False
+    count = row.get("count", 1)
+    if isinstance(count, bool) or not isinstance(count, int):
+        return False
+    if not all(isinstance(row.get(key, ""), str) for key in ("status", "held")):
+        return False
+    tasks = row.get("tasks", [])
+    return isinstance(tasks, list) and all(isinstance(task, str) for task in tasks)
 
 
 def row_value(row: dict) -> str:
