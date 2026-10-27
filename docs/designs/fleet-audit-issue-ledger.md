@@ -803,15 +803,22 @@ into a controller that applied nothing. `finish` reads no cluster. The collector
 cluster entry, the Config Connector objects whose `Ready` condition is `False`
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §2, `kcc_unready`), and
 `finish` parses the fix's file as the Config Connector index parses a clone and matches each object
-it declares on kind, `metadata.name`, and `metadata.namespace` when the file sets one. The note is
+it declares on kind, `metadata.name`, `metadata.namespace` when the file sets one, and `clusterRef`
+when the file object and the recorded object both set one. A match that is not certain gives no
+note: the same object not ready on more than one host cluster with nothing to tell them apart
+(Config Controller puts the objects of each instance in `config-control`), or, when the file sets
+no namespace, more than one object that fits. The collectors leave out the transient reasons
+`Updating` and `Deleting`, which Config Connector sets while it still applies the object. The note is
 the last paragraph of the remediation note, starts "**Config Connector is not applying this
 file.**", and names each matched object and the controller's reason in code spans; when the reason
 is `DependencyNotReady`, it also names the object that the message references when that object is
-not ready either, and so on down the chain. It names two objects at most and counts the rest. The
+not ready on the same host cluster, and so on down the chain. It names at most two objects in the
+file, each with the unready objects it waits on, and counts the rest. The
 fix keeps `kind: manifest`: the change is correct and belongs in that file, the stall usually clears
 before anyone reads the ledger, and degrading the fix would drop a correct pull request. The note
-fits the note cap the way the route notes do: the worker's note is cut, and the text `finish` wrote
-at its start stays whole. The pass first removes an earlier copy of the note from every remediation,
+fits the note cap: the worker's note is cut, and the text `finish` wrote at its start stays whole.
+Unlike a route note, it saves no `uncut_note`, so the carry removes the note but does not bring
+back the text it cut. The pass first removes an earlier copy of the note from every remediation,
 and the carry removes it too, so a note never shows a stall that this run's manifest does not. A
 cluster whose read failed (`kcc_unread`) gives no stall and a warning in the log: the absence of the
 note never says that Config Connector applies a file. The same match, or a `Cluster/` or `NodePool/`
