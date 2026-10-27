@@ -423,6 +423,8 @@ check "python3 exists (execute_code probes for it)" "python3" \
   "$("${SSH[@]}" 'command -v python3' 2>&1)"
 check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
+check "leeway exists (topology drift CLI)" "v0.1.3" \
+  "$("${SSH[@]}" 'leeway version' 2>&1)"
 # Not SSH_OPTS: sftp spells the port -P, and -p means something else entirely.
 check "no sftp subsystem is advertised" "subsystem request failed" \
   "$(sftp -i "$WORK/id" -P "$PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
@@ -831,6 +833,8 @@ check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/cre
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
 check "the wrapper dispatches rather than refusing to start" "credential proxy" \
   "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
+check "leeway report dispatches cluster reads through the kubectl wrapper" "credential proxy" \
+  "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is

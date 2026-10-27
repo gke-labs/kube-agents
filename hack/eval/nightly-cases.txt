@@ -183,6 +183,12 @@
 ./tasks/ai-security-planted-model-audit/task.yaml
 ./tasks/autoops-crashloop-config-triage/task.yaml
 
+# gke-labs#3078 (2026-10-15): autoops-missing-service-triage, the same tofu
+# pipeline with a missing-Service plant, grading that a triage worker reports
+# a found cause instead of hunting for the workload's GitOps source. Takes
+# the incumbent's 900s band (~45min at three) until it has a record.
+./tasks/autoops-missing-service-triage/task.yaml
+
 # The drift stream's second full audit, nightly from the start (2026-09-18):
 # the same SOP-faithful shape and 900s band as consistency-drift-outlier
 # (registered above until its roster seat of 2026-10-26), grading the

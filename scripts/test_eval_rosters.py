@@ -114,6 +114,7 @@ ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625; promoted 2026-09-22
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
+    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917

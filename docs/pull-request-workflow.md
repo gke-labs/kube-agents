@@ -596,8 +596,9 @@ The two labels are the two people:
   (GoogleCloudPlatform/oss-test-infra#2748). An `lgtm` given before that change reached Prow
   (2026-10-22 14:43Z) has no stored tree, and a push still strips it.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
-  the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
-  presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
+  the changed paths — [`OWNERS`](../OWNERS) at the root,
+  [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
+  [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
   and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs or what blocks; the nightly file and the case directories under

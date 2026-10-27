@@ -109,7 +109,7 @@ def answering(context, status, message, operations):
 
 class DrainTimeoutReplays(unittest.TestCase):
     def test_2025_06_26_drain_timeout_on_the_default_pool_holds_every_node_removal(self):
-        """A node pool upgrade spent the whole 600 s deregistration wait on every node behind a TCP backend service draining for 36,000 s; read before the window, the service is a blocker with the one command that sets its timeout under the wait."""
+        """A node pool upgrade had its node step fail while the instance group held old VMs for the full 36,000 s backend service connection drain; read before the window, the service is a blocker with the one command that sets its timeout under the wait."""
         record = seeded_b()
         service = backend_service("tcp-edge-ingest", [instance_group(record, "default-pool")])
         folded = fold(lb_connection_draining, record, seeded_b_read(), reads=services_read(service))

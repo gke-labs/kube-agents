@@ -3271,7 +3271,7 @@ unit_cost_hint() {
     # Not measured yet: the same stream and stack shape as the case above, so
     # it takes that case's hint until its nightly record says otherwise.
     fleet-audit-clean-close-reads-clean) echo 1450 ;;
-    autoops-crashloop-config-triage) echo 900 ;;
+    autoops-crashloop-config-triage | autoops-missing-service-triage) echo 900 ;;
     # Nightly-only since 2026-10-21 (demoted on #3598).
     consistency-authorized-networks-probe) echo 300 ;;
     # Median of its 1155 presubmit repetitions 2026-09-04 to 09-15 (p10 248s,

@@ -1121,11 +1121,12 @@ kubectl wait platformagent/platform-agent -n kubeagents-system --for=jsonpath='{
 kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system
 kubectl rollout status statefulset/platform-agent-shell -n kubeagents-system
 kubectl rollout status deployment/platform-agent-credential-proxy -n kubeagents-system
-# under `mode: next` only, and the gateway only once a chat backend is
-# configured. The verifier is not part of `Ready` — a rollout of it should not
-# flip a serving install to Provisioning — but a submission arriving while no
-# verifier is ready is refused terminally, so an install that stays down
-# reports it as the `A2AVerifier` condition, which a Ready CR can carry.
+# under `mode: next` only; the gateway runs on every next install, on the
+# console door alone when no chat backend is configured. The verifier is not
+# part of `Ready` — a rollout of it should not flip a serving install to
+# Provisioning — but a submission arriving while no verifier is ready is
+# refused terminally, so an install that stays down reports it as the
+# `A2AVerifier` condition, which a Ready CR can carry.
 kubectl rollout status deployment/platform-agent-a2a-gateway -n kubeagents-system
 kubectl rollout status deployment/platform-agent-a2a-verifier -n kubeagents-system
 kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready

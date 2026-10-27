@@ -227,7 +227,7 @@ When configuring GitOps repositories, pin companion Terraform modules using the 
 
 ```hcl
 module "gke_cluster" {
-  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=0.3.0"
+  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=0.19.0"
   project_id   = var.project_id
   cluster_name = "production-host-01"
   location     = "us-central1"

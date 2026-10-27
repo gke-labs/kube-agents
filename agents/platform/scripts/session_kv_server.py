@@ -443,6 +443,24 @@ MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
 )
 
+# How a Cluster Agent describes a fix on an event or stall triage card. (The
+# drift card keeps its own wording: its report compares the live object with
+# the declared state, which it reads from the object's field ownership.) A
+# Cluster Agent has no GitOps repository: the Platform Agent finds the file
+# when it opens the Pull Request. Without this, "precisely
+# enough that someone can open the Pull Request from your report alone" sent a
+# worker that had its cause in the first minute on a 21-minute hunt for the
+# workload's source, and it never answered (gke-labs#3078).
+TRIAGE_FIX_AGAINST_LIVE_OBJECT = (
+    "Describe each change against the live object you read: its kind, namespace and name, the field, and the "
+    "current and proposed value, or for a missing object, what to create and the fields it needs. You have no "
+    "GitOps repository and need none, because the agent that opens the Pull Request finds the file. Do not look "
+    "for the workload's source, whether in this pod's files, with git, or through any repository tool: a source "
+    "file you haven't seen is not a gap in the report. The cause is the evidenced dependency or setting the failure "
+    "points to, not the command or log line that reports it, so check that it exists before you call the "
+    "investigation done. Then complete the card. "
+)
+
 
 # The report a fleet-audit run's `finish` leaves for the relay, in the
 # directory the run's shell writes to (`audit_report.SCRATCH_DIR`, in the shell
@@ -2712,7 +2730,8 @@ def _triage_who_acts(open_pull_request: bool) -> str:
     if not open_pull_request:
         return (
             "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-            "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
             "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
             "(no `kubectl scale`, `patch`, or `apply`)."
         )
@@ -2722,8 +2741,10 @@ def _triage_who_acts(open_pull_request: bool) -> str:
         "complete this card (`done`), reads your report, and opens the Pull Request for the option you marked ✅ Recommended, or for "
         "the single Proposed fix — not you, and not from this card (if this card ends `blocked`, the follow-up card stays held in "
         "`todo` until this card is unblocked and completed or archived). "
-        "Your job is to make that possible: name the manifest change each option needs precisely enough that the Pull Request can be "
-        "opened from your report alone, and with two or more options mark exactly one Recommended. Keep the `- **To authorize:**` bullet "
+        "Your job is to make that possible: name the change each option needs precisely enough that the Pull Request can be "
+        "opened from your report alone, and with two or more options mark exactly one Recommended. "
+        f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        "Keep the `- **To authorize:**` bullet "
         "label as the template above writes it (the notifier keys on that label to store your report for thread follow-ups), telling "
         f"the reader that a GitOps Pull Request for the recommended fix {TRIAGE_OPEN_PR_MARKER} (and with two or more options, "
         "that they can reply **'apply Option B'** to request an alternative option instead) — do not tell the reader to reply "
@@ -3566,8 +3587,9 @@ def _stall_task_body(payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**Who acts on this:**\n"
         f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not "
-        f"you, and not from this card. Name the manifest change each option needs precisely enough that someone can "
-        f"open the Pull Request from your report alone: the object, the field, and the value. Two things are true "
+        f"you, and not from this card. Name the change each option needs precisely enough that someone can "
+        f"open the Pull Request from your report alone. {TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        f"Two things are true "
         f"whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written "
         f"to the live cluster directly (no `kubectl create`, `patch`, or `apply`)."
     )

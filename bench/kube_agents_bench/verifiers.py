@@ -83,6 +83,7 @@ from devops_bench.verification.base import (
     single_call_timeout,
 )
 from devops_bench.verification.verifiers import ResourcePropertyVerifier
+from devops_bench.verification.verifiers import resource_property as _upstream_resource_property
 
 from kube_agents_bench import (
     card_wake,
@@ -3656,7 +3657,7 @@ def _squeezed(text: str) -> str:
     """``text`` with ``\\uXXXX`` escapes undone, addresses masked, whitespace collapsed, and none around ``,:{}[]``.
 
     The pod re-serialises a JSON output with ``", "`` and ``": "`` separators
-    (``worker_trajectory.supplement``), so compact JSON the worker saw and
+    (the in-pod script's ``scrub``, through ``worker_transcript``), so compact JSON the worker saw and
     copied differs from the stored text in those spaces and in escapes. Other
     whitespace is kept as one space, so a word edge still reads as one.
     """
@@ -6693,13 +6694,77 @@ class FleetResourcePropertyVerifier(ResourcePropertyVerifier):
         # It matched objects on the resolved cluster, so whatever it concluded
         # is an observation about the fixture and needs no help. This is the
         # ordinary path, and it costs exactly one kubectl call -- the same as
-        # an upstream check. Only an absence, or an inability to look, is worth
-        # two more round trips to explain.
+        # an upstream check -- plus one re-read for a pass under `every`
+        # (_objects_without_a_match). Only an absence, or an inability to look,
+        # is worth two more round trips to explain.
         if status != "error" and delegate_raw and delegate_raw.get("matched"):
+            if status == "pass" and self.across_matches == "every" and self.path:
+                missing = self._objects_without_a_match(
+                    kubeconfig, timeout_sec, delegate_raw.get("names") or []
+                )
+                if missing is not None:
+                    status, reason = missing
+                    merged["object_level_every"] = reason
             return status, reason, merged
 
         classified = self._classify_absence(kubeconfig, timeout_sec, merged, confirmed)
         return classified if classified is not None else (status, reason, merged)
+
+    def _objects_without_a_match(
+        self, kubeconfig: str, timeout_sec: float, matched_names: list[str]
+    ) -> tuple[VerificationStatus, str] | None:
+        """Under ``every``, fail a matched object that contributes nothing (#4038).
+
+        Upstream quantifies ``every`` over the elements of the path's last
+        wildcard or filter segment, so an object where that segment selects
+        nothing is never evaluated: a node whose ``seeded-role`` taint was
+        removed drops out, and the check passes on the nodes that kept it. For
+        a path with no such segment, an object where the path resolves to
+        nothing drops out the same way. Here every matched object must
+        contribute at least one element (or value), or the check fails naming
+        it. ``none`` is unchanged: an object with nothing trivially conforms.
+
+        Runs only after upstream passed, so it can turn a pass into a fail and
+        never the reverse. It reads the objects again, since upstream's raw
+        keeps names only: a read that fails, or that matches a different set of
+        objects than the comparison did, is an ``error`` and the poll reads
+        again. ``None`` when every object contributes. The two reads are not one
+        snapshot: an object that changes between them from "nothing at the path"
+        to "a value that fails the operator" passes here; that needs a write
+        within the gap between two reads of the same post-run state.
+        """
+        assert self.path is not None
+        compiled = _upstream_resource_property._compile(self.path)  # noqa: SLF001
+        split = _upstream_resource_property._split_at_last_wildcard(compiled)  # noqa: SLF001
+        selects = split[0] if split is not None else compiled
+        try:
+            payload = get_resource(
+                self.kind,
+                self.resource_name,
+                selector=self.selector,
+                namespace=self.namespace,
+                kubeconfig=kubeconfig,
+                timeout=single_call_timeout(timeout_sec),
+            )
+        except Exception as exc:  # noqa: BLE001 - a kubectl failure is a check error
+            return "error", f"kubectl get {self.kind} failed re-reading the matched objects: {exc}"
+        items = payload.get("items")
+        objects = items if isinstance(items, list) else [payload]
+        names = [_upstream_resource_property._object_name(obj) for obj in objects]  # noqa: SLF001
+        if sorted(names) != sorted(matched_names):
+            return (
+                "error",
+                f"the matched {self.kind} objects changed between reads "
+                f"({sorted(matched_names)} then {sorted(names)})",
+            )
+        missing = [name for name, obj in zip(names, objects, strict=True) if not selects.find(obj)]
+        if not missing:
+            return None
+        return (
+            "fail",
+            f"across_matches=every: {missing} matched but have nothing at {self.path!r}, "
+            f"so the check does not hold on every matched {self.kind}",
+        )
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()

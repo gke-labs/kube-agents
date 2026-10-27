@@ -8785,7 +8785,7 @@ def test_every_forbidden_pattern_has_a_contradiction_row(case):
 
 # verified_claims_backed: the reply's evidence blocks against the workers' calls.
 _PODS_CMD = "kubectl get pod -n seeded-debug -l app=payments-api -o jsonpath='{.items[0].status.containerStatuses[0].lastState}'"
-# As the pod stores it: worker_trajectory.supplement re-serialises a JSON output with spaces.
+# As the pod stores it: the in-pod script's scrub re-serialises a JSON output with spaces.
 _PODS_OUT = json.dumps({"output": json.dumps({"terminated": {"exitCode": 137, "reason": "OOMKilled"}}), "exit_code": 0})
 # What the worker saw and copied: kubectl's compact JSON.
 _PODS_EXCERPT = '"exitCode":137,"reason":"OOMKilled"'

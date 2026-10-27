@@ -3,32 +3,32 @@
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 """
 
+import copy
+import json
 import os
 import pathlib
 import sqlite3
 import tempfile
 import unittest
 
-from apply_kanban_rightsizing_checks import ANCHOR, KANBAN_RELATIVE, MARKER, apply
-
 import kanban_rightsizing_checks as krc
 import kanban_verified_claims as kvc
+from apply_kanban_rightsizing_checks import ANCHOR, KANBAN_RELATIVE, MARKER, apply
 
 PARENT = "t_platform"
 CHILD = "t_seeded_a"
 SKILL_BODY = "Lower the requests of api-server. Run the `gke-rightsizing-checks` skill first."
-
-GOOD_CARD_RESULT = """**No cut is safe for either workload.**
-
-api-server: an HPA scales it on CPU, so a lower request adds replicas
-queue-worker: Guaranteed QoS, so a lower request is also a lower limit
-
-- HPA: `kubectl get hpa -n web` shows api-server at 60% CPU.
-- QoS: queue-worker is Guaranteed, requests equal limits.
-- Shared: one PDB selects api-server; no PVC.
-- Source: meta.helm.sh/release-name=web, so a Helm values file may render other clusters.
-- Packing: 940m allocatable per node; nodes needed = max(ceil(1.2/0.94), ceil(2.1/2.8)) = 2.
-"""
+CHECKS = {
+    "hpa": "HPA api-server targets 60% CPU (kubectl get hpa -n web)",
+    "qos": "Burstable: req 400m, lim 500m",
+    "sharing": "PDB api-server selects it; no PVC",
+    "source": "meta.helm.sh/release-name=web",
+    "packing": "940m allocatable per node; nodes needed = 2",
+}
+HPA_ENTRY = {"workload": "api-server", "dependency_kind": "hpa",
+             "dependency": "A lower request adds replicas.", "checks": CHECKS}
+QOS_ENTRY = {"workload": "queue-worker", "dependency_kind": "guaranteed_qos",
+             "dependency": "A lower request is also a lower limit.", "checks": CHECKS}
 
 
 class RuleTestCase(unittest.TestCase):
@@ -38,7 +38,8 @@ class RuleTestCase(unittest.TestCase):
         fd, self.path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         conn = sqlite3.connect(self.path)
-        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, body TEXT)")
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, body TEXT, assignee TEXT, title TEXT)")
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, outcome TEXT, metadata TEXT)")
         conn.execute(
             "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL, created_at INTEGER NOT NULL)"
         )
@@ -48,238 +49,310 @@ class RuleTestCase(unittest.TestCase):
     def tearDown(self):
         os.unlink(self.path)
 
-    def card(self, task_id, body="", status="running", result=None, creator=None):
+    def card(self, task_id, body="", creator=None, stored=None, outcome="completed", assignee="cluster-a", title=""):
         conn = sqlite3.connect(self.path)
-        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?)", (task_id, status, result, body))
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+                     (task_id, "done" if stored else "running", "", body, assignee, title))
         if creator:
             conn.execute("INSERT INTO kanban_worker_children VALUES (?, ?, 0)", (task_id, creator))
+        if stored is not None:
+            conn.execute("INSERT INTO task_runs (task_id, outcome, metadata) VALUES (?, ?, ?)",
+                         (task_id, outcome, json.dumps({krc.METADATA_KEY: stored})))
         conn.commit()
         conn.close()
 
     def connect(self):
         return sqlite3.connect(self.path)
 
-    def rule(self, task_id, result, retry=False, connect="default"):
+    def rule(self, task_id, entries=None, result="**Answer.**", retry=False, connect="default", metadata=None):
+        args = {} if entries is None else {krc.PARAM: entries}
         return krc.rightsizing_rule(
-            task_id=task_id,
-            args={},
-            result=result,
-            metadata={"a": 1},
-            calls=[],
-            retry=retry,
-            redact=lambda value: value,
-            connect=self.connect if connect == "default" else connect,
+            task_id=task_id, args=args, result=result, metadata=metadata, calls=[], retry=retry,
+            redact=lambda value: value, connect=self.connect if connect == "default" else connect,
         )
 
 
 class RegistrationTest(unittest.TestCase):
-    def test_importing_the_module_registers_the_rule_once(self):
+    def test_importing_the_module_registers_the_rule_once_and_first(self):
         self.assertEqual(kvc.RULES.count(krc.rightsizing_rule), 1)
+        self.assertIs(kvc.RULES[0], krc.rightsizing_rule)
+
+    def test_the_schema_gets_the_parameter_once(self):
+        schema = {"parameters": {"properties": {}}}
+        krc.apply_schema(schema)
+        self.assertIn(krc.PARAM, schema["parameters"]["properties"])
+        with self.assertRaises(RuntimeError):
+            krc.apply_schema(schema)
 
 
 class UntriggeredTest(RuleTestCase):
-    def test_a_card_the_skill_was_not_asked_for_passes(self):
+    def test_a_card_the_skill_was_not_asked_for_passes_unchanged(self):
         self.card(CHILD, body="Why is payments-api crashlooping?")
-        self.assertEqual(self.rule(CHILD, "It is OOMKilled."), ([], "It is OOMKilled.", {"a": 1}))
+        self.assertEqual(self.rule(CHILD, result="It is OOMKilled."), ([], "It is OOMKilled.", None))
 
     def test_no_board_connection_passes(self):
-        self.assertEqual(self.rule(CHILD, "anything", connect=None)[0], [])
+        self.assertEqual(self.rule(CHILD, connect=None), ([], "**Answer.**", None))
 
-    def test_a_board_that_cannot_be_read_passes(self):
+    def test_a_board_that_cannot_be_read_passes_and_keeps_own_entries(self):
         def broken():
             raise sqlite3.OperationalError("database is locked")
 
         with self.assertLogs(krc.logger, "WARNING"):
-            self.assertEqual(self.rule(CHILD, "anything", connect=broken)[0], [])
+            self.assertEqual(self.rule(CHILD, connect=broken)[0], [])
+        with self.assertLogs(krc.logger, "WARNING"):
+            _, result, metadata = self.rule(CHILD, [HPA_ENTRY], connect=broken)
+        self.assertIn("- `api-server`: dependency: HPA.", result)
+        self.assertEqual(metadata[krc.METADATA_KEY][0]["workload"], "api-server")
+
+    def test_a_model_written_metadata_key_is_dropped(self):
+        self.card(CHILD, body="Check pods.")
+        _, _, metadata = self.rule(CHILD, metadata={krc.METADATA_KEY: [HPA_ENTRY], "a": 1})
+        self.assertEqual(metadata, {"a": 1})
 
 
-class OwnResultTest(RuleTestCase):
+class OwnEntriesTest(RuleTestCase):
     def setUp(self):
         super().setUp()
         self.card(CHILD, body=SKILL_BODY)
 
-    def test_a_result_with_the_lines_and_the_checks_passes(self):
-        self.assertEqual(self.rule(CHILD, GOOD_CARD_RESULT)[0], [])
+    def test_no_entries_is_refused(self):
+        [reason] = self.rule(CHILD)[0]
+        self.assertIn(f"pass `{krc.PARAM}`", reason)
 
-    def test_no_dependency_line_is_refused(self):
-        result = GOOD_CARD_RESULT.replace("api-server: an HPA", "The HPA").replace("queue-worker: Guaranteed", "Guaranteed")
-        [reason] = self.rule(CHILD, result)[0]
-        self.assertIn("<workload>: <dependency>", reason)
+    def test_valid_entries_are_stored_and_rendered(self):
+        reasons, result, metadata = self.rule(CHILD, [HPA_ENTRY, QOS_ENTRY], metadata={"a": 1})
+        self.assertEqual(reasons, [])
+        self.assertEqual([e["workload"] for e in metadata[krc.METADATA_KEY]], ["api-server", "queue-worker"])
+        self.assertEqual(metadata["a"], 1)
+        self.assertTrue(result.startswith("**Answer.**\n\n" + krc.HEADING))
+        self.assertIn("- `api-server`: dependency: HPA. A lower request adds replicas.", result)
+        self.assertIn("- `queue-worker`: dependency: Guaranteed QoS. A lower request is also a lower limit.", result)
+        self.assertIn("  - Per-node packing: 940m allocatable per node; nodes needed = 2", result)
 
-    def test_no_dependency_found_counts_as_a_line(self):
-        result = "batch-worker: no dependency found\n\nHPA none. QoS Burstable. No PDB. Helm. 2 nodes needed."
-        self.assertEqual(self.rule(CHILD, result)[0], [])
+    def test_an_unknown_kind_or_a_missing_check_is_refused(self):
+        bad_kind = {**HPA_ENTRY, "dependency_kind": "autoscaler"}
+        no_packing = copy.deepcopy(QOS_ENTRY)
+        del no_packing["checks"]["packing"]
+        reasons = self.rule(CHILD, [bad_kind, no_packing])[0]
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("dependency_kind 'autoscaler'", reasons[0])
+        self.assertIn("no finding for packing", reasons[1])
 
-    def test_a_line_below_the_opening_does_not_count(self):
-        filler = "\n".join(f"Paragraph {i}." for i in range(krc.OPENING_LINES))
-        result = f"{filler}\napi-server: an HPA scales it\nQoS Guaranteed. PDB. Helm. nodes needed."
-        [reason] = self.rule(CHILD, result)[0]
-        self.assertIn("open `result`", reason)
-
-    def test_a_missing_check_is_named(self):
-        result = GOOD_CARD_RESULT.replace("- Packing: 940m allocatable per node; nodes needed = max(ceil(1.2/0.94), ceil(2.1/2.8)) = 2.\n", "")
-        [reason] = self.rule(CHILD, result)[0]
-        self.assertIn("per-node packing", reason)
-        self.assertNotIn("HPA or KEDA", reason)
-
-    def test_markdown_around_the_line_still_counts(self):
-        result = GOOD_CARD_RESULT.replace("api-server: an HPA", "- **`api-server`**: an HPA")
-        self.assertEqual(self.rule(CHILD, result)[0], [])
-
-    def test_the_retry_is_accepted_unchanged(self):
+    def test_the_retry_keeps_the_valid_entries_and_drops_the_rest(self):
+        bad = {**HPA_ENTRY, "dependency": " "}
         with self.assertLogs(krc.logger, "WARNING"):
-            self.assertEqual(self.rule(CHILD, "No figures.", retry=True), ([], "No figures.", {"a": 1}))
+            reasons, result, metadata = self.rule(CHILD, [bad, QOS_ENTRY], retry=True)
+        self.assertEqual(reasons, [])
+        self.assertEqual([e["workload"] for e in metadata[krc.METADATA_KEY]], ["queue-worker"])
+        self.assertNotIn("`api-server`", result)
+
+    def test_not_on_cluster_needs_no_checks(self):
+        gone = {"workload": "api-server", "dependency_kind": "not_on_cluster", "dependency": "No such deployment here."}
+        reasons, result, _ = self.rule(CHILD, [gone])
+        self.assertEqual(reasons, [])
+        self.assertIn("dependency: not on this cluster", result)
+
+    def test_a_field_is_one_line_and_holds_no_fence(self):
+        spread = {**HPA_ENTRY, "dependency": "A lower request\n\n  adds replicas."}
+        fenced = copy.deepcopy(QOS_ENTRY)
+        fenced["checks"]["packing"] = "~~~\nnodes needed = 2"
+        ticked = {**HPA_ENTRY, "workload": "api`-server"}
+        reasons = self.rule(CHILD, [spread, fenced, ticked])[0]
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("code fence", reasons[0])
+        self.assertIn("backtick", reasons[1])
+        result = self.rule(CHILD, [spread])[1]
+        self.assertIn("dependency: HPA. A lower request adds replicas.", result)
+
+    def test_stored_fields_are_redacted(self):
+        _, result, metadata = krc.rightsizing_rule(
+            task_id=CHILD, args={krc.PARAM: [HPA_ENTRY]}, result="**Answer.**", metadata=None, calls=[],
+            retry=False, redact=lambda value: value.replace("api-server", "[x]"), connect=self.connect,
+        )
+        entry = metadata[krc.METADATA_KEY][0]
+        self.assertEqual((entry["workload"], entry["checks"]["hpa"]), ("[x]", "HPA [x] targets 60% CPU (kubectl get hpa -n web)"))
+        self.assertNotIn("api-server", result)
+
+    def test_the_section_goes_before_the_evidence_section(self):
+        kvc._calls[CHILD] = [{"command": "kubectl get hpa -n web", "exit_code": 0, "output": "api-server 60%", "ran_at": "t"}]
+        claim = {"claim": "An HPA targets it.", "command": "kubectl get hpa -n web", "excerpt": "api-server 60%"}
+        err, result, _ = kvc.apply_completion_rules(
+            CHILD, {krc.PARAM: [HPA_ENTRY], kvc.PARAM: [claim]}, "**Answer.**", {}, connect=self.connect)
+        self.assertIsNone(err)
+        self.assertLess(result.index(krc.HEADING), result.index(kvc.EVIDENCE_HEADING))
+
+    def test_a_field_past_the_cap_is_refused(self):
+        long = {**HPA_ENTRY, "dependency": "x" * (krc.MAX_FIELD_CHARS + 1)}
+        [reason] = self.rule(CHILD, [long])[0]
+        self.assertIn("longer than", reason)
 
 
-class ChildLinesTest(RuleTestCase):
+class InheritedEntriesTest(RuleTestCase):
     def setUp(self):
         super().setUp()
         self.card(PARENT, body="Lower the requests of api-server and queue-worker.")
-        self.card(CHILD, body=SKILL_BODY, status="done", result=GOOD_CARD_RESULT, creator=PARENT)
+        self.card(CHILD, body=SKILL_BODY, creator=PARENT, stored=[HPA_ENTRY, QOS_ENTRY])
 
-    def test_a_summary_that_carries_every_line_passes(self):
-        summary = (
-            "**No cut is safe.**\n\n"
-            "- **api-server**: an HPA scales it on CPU, so a lower request adds replicas\n"
-            "- `queue-worker: Guaranteed QoS, so a lower request is also a lower limit`\n"
-        )
-        self.assertEqual(self.rule(PARENT, summary)[0], [])
-
-    def test_a_summary_that_drops_a_line_is_refused_with_the_line(self):
-        summary = "**No cut is safe.** api-server: an HPA scales it on CPU, so a lower request adds replicas"
-        [reason] = self.rule(PARENT, summary)[0]
-        self.assertIn(CHILD, reason)
-        self.assertIn("queue-worker: guaranteed qos", reason)
+    def test_a_parent_gets_its_childrens_entries_rendered(self):
+        reasons, result, metadata = self.rule(PARENT, result="**No cut is safe.**")
+        self.assertEqual(reasons, [])
+        self.assertIn(f"- `api-server` (card {CHILD}): dependency: HPA.", result)
+        self.assertIn(f"- `queue-worker` (card {CHILD}): dependency: Guaranteed QoS.", result)
+        self.assertIsNone(metadata)
 
     def test_a_grandchild_counts_too(self):
-        self.card("t_grandchild", body=SKILL_BODY, status="done", result="db: no dependency found\nHPA QoS PDB Helm nodes needed", creator=CHILD)
-        summary = "api-server: an HPA scales it on CPU, so a lower request adds replicas\nqueue-worker: Guaranteed QoS, so a lower request is also a lower limit"
-        [reason] = self.rule(PARENT, summary)[0]
-        self.assertIn("t_grandchild", reason)
+        self.card("t_grandchild", body=SKILL_BODY, creator=CHILD,
+                  stored=[{**HPA_ENTRY, "workload": "db", "dependency_kind": "none", "dependency": "Nothing blocks it."}])
+        result = self.rule(PARENT)[1]
+        self.assertIn("- `db` (card t_grandchild): dependency: none.", result)
 
-    def test_a_child_still_running_or_without_the_skill_is_skipped(self):
-        self.card("t_running", body=SKILL_BODY, status="running", result="x: y", creator=PARENT)
-        self.card("t_other", body="Check pods.", status="done", result="pods: all running", creator=PARENT)
-        summary = "api-server: an HPA scales it on CPU, so a lower request adds replicas\nqueue-worker: Guaranteed QoS, so a lower request is also a lower limit"
-        self.assertEqual(self.rule(PARENT, summary)[0], [])
+    def test_a_run_that_did_not_complete_is_skipped(self):
+        self.card("t_crashed", body=SKILL_BODY, creator=PARENT, stored=[{**HPA_ENTRY, "workload": "crashed"}], outcome="crashed")
+        self.assertNotIn("crashed", self.rule(PARENT)[1])
+
+    def test_a_card_that_already_quotes_the_section_gets_no_second_copy(self):
+        quoted = "Result of delegated task:\n\n" + krc.render([{**HPA_ENTRY, "card": CHILD}, {**QOS_ENTRY, "card": CHILD}])
+        reasons, result, _ = self.rule(PARENT, result=quoted)
+        self.assertEqual((reasons, result), ([], quoted))
+
+    def test_a_copy_that_drops_an_entry_gets_the_dropped_one_rendered(self):
+        copied = "**No cut is safe.**\n\n" + krc.render([HPA_ENTRY])
+        result = self.rule(PARENT, result=copied)[1]
+        self.assertEqual(result.count("`api-server`"), 1)
+        self.assertIn(f"- `queue-worker` (card {CHILD}): dependency: Guaranteed QoS.", result)
+
+    def test_only_the_latest_completed_run_counts(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("INSERT INTO task_runs (task_id, outcome, metadata) VALUES (?, ?, ?)",
+                     (CHILD, "completed", json.dumps({krc.METADATA_KEY: [{**HPA_ENTRY, "dependency_kind": "none"}]})))
+        conn.commit()
+        conn.close()
+        result = self.rule(PARENT)[1]
+        self.assertIn("- `api-server` (card t_seeded_a): dependency: none.", result)
+        self.assertNotIn("queue-worker", result)
+
+    def test_own_entries_and_the_same_inherited_ones_render_once(self):
+        result = self.rule(PARENT, [HPA_ENTRY])[1]
+        self.assertEqual(result.count("`api-server`"), 1)
+        self.assertIn("- `api-server`: dependency: HPA.", result)
+        self.assertIn(f"- `queue-worker` (card {CHILD})", result)
+
+    def test_the_cap_drops_not_on_cluster_and_none_first_and_says_so(self):
+        gone = {"workload": "x", "dependency_kind": "not_on_cluster", "dependency": "Not here."}
+        legs = [{**gone, "workload": f"gone{i}"} for i in range(krc.MAX_SHOWN)]
+        self.card("t_aaaa", body=SKILL_BODY, creator=PARENT, stored=legs)
+        self.card("t_zzzz", body=SKILL_BODY, creator=PARENT, stored=[{**HPA_ENTRY, "workload": "late-hpa"}])
+        with self.assertLogs(krc.logger, "WARNING"):
+            result = self.rule(PARENT)[1]
+        self.assertIn("`late-hpa` (card t_zzzz): dependency: HPA.", result)
+        self.assertIn("`queue-worker`", result)
+        self.assertEqual(result.count(": dependency: "), krc.MAX_SHOWN)
+        self.assertIn("- 3 more entries not shown;", result)
+
+    def test_the_shown_entries_are_capped(self):
+        many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_SHOWN + 2)]
+        self.card("t_many", body=SKILL_BODY, creator=PARENT, stored=many)
+        with self.assertLogs(krc.logger, "WARNING"):
+            self.assertEqual(self.rule(PARENT)[1].count(": dependency: "), krc.MAX_SHOWN)
+
+    def test_an_invalid_stored_entry_is_not_rendered(self):
+        self.card("t_odd", body=SKILL_BODY, creator=PARENT, stored=[{"workload": "odd", "dependency_kind": "maybe", "dependency": "?"}])
+        self.assertNotIn("odd", self.rule(PARENT)[1])
 
 
-class ReviewShapesTest(RuleTestCase):
-    """The shapes a correct answer takes that the first matcher refused."""
+CUT_ASK = (
+    "Find the `inference-server` deployment and the `ledger-writer` deployment across the fleet.\n\n"
+    "- Recommend new lower CPU and memory requests for each.\n\n"
+    f"{krc.FORMAT_MARKER}\n\nPut the full answer in `result`."
+)
 
-    def setUp(self):
-        super().setUp()
-        self.card(PARENT, body="Lower the requests of api-server and queue-worker.")
 
-    def child(self, result, task_id=CHILD):
-        self.card(task_id, body=SKILL_BODY, status="done", result=result, creator=PARENT)
+class PlatformCutRequestTest(RuleTestCase):
+    def test_the_marker_matches_the_report_format_patch(self):
+        import kanban_report_format
 
-    def test_a_bulleted_child_line_carried_without_the_bullet_passes(self):
-        self.child("- api-server: an HPA scales it on CPU\n\nHPA QoS PDB Helm nodes needed")
-        self.assertEqual(self.rule(PARENT, "**No cut.**\n\napi-server: an HPA scales it on CPU")[0], [])
+        self.assertEqual(krc.FORMAT_MARKER, kanban_report_format.FORMAT_MARKER)
 
-    def test_a_child_line_carried_in_a_table_row_passes(self):
-        self.child("api-server: an HPA scales it on CPU\n\nHPA QoS PDB Helm nodes needed")
-        summary = "| Cluster | Finding |\n| --- | --- |\n| seeded-a | api-server: an HPA scales it on CPU |"
-        self.assertEqual(self.rule(PARENT, summary)[0], [])
-
-    def test_check_lines_right_under_the_block_are_not_dependency_lines(self):
-        self.child("api-server: an HPA scales it on CPU\n- PDB: none selects it\n- Helm: release web\n- Limits: cpu=10m\nQoS nodes needed")
-        self.assertEqual(self.rule(PARENT, "api-server: an HPA scales it on CPU")[0], [])
-
-    def test_linked_namespaced_numbered_and_kind_openings_count(self):
-        self.card("t_own", body=SKILL_BODY)
-        tail = "\n\nHPA: yes. QoS Burstable. PDB none. Helm none. 2 nodes needed."
-        for opening in (
-            "[inference-server](https://console.example/x): an HPA scales it on CPU",
-            "seeded-capacity/inference-server: an HPA scales it on CPU",
-            "1. inference-server: an HPA scales it on CPU",
-            "+ inference-server: an HPA scales it on CPU",
-            "Deployment inference-server: an HPA scales it on CPU",
+    def test_requests_that_ask_for_a_cut(self):
+        for ask in (
+            "Lower the CPU and memory requests of the inference-server deployment.",
+            "Recommend new lower CPU and memory requests for each.",
+            "Propose resource request reductions for inference-server.",
+            "Can we reduce the memory limit on api-server?",
+            "Shrink the pool's machine type to e2-standard-2.",
         ):
-            with self.subTest(opening=opening):
-                self.assertEqual(self.rule("t_own", opening + tail)[0], [])
+            self.assertTrue(krc.asks_for_cut("", ask), ask)
+        self.assertTrue(krc.asks_for_cut("Calculate resource request reductions for api-server",
+                                         "Propose new CPU and memory requests for each."))
 
-    def test_a_status_line_is_not_a_dependency_line(self):
-        self.card("t_own", body=SKILL_BODY)
-        reasons = self.rule("t_own", "Status: done\n\nHPA QoS PDB Helm nodes needed")[0]
-        self.assertTrue(any("open `result`" in r for r in reasons), reasons)
+    def test_requests_that_do_not(self):
+        for ask in (
+            "Perform a cost optimization analysis of the fleet. Don't change anything.",
+            "Raise the memory limit of payments-api; it is OOMKilled.",
+            "Why is checkout throttled? Its CPU limit looks too low.",
+            "Reduce cost where you can.",
+            "Cut a pull request that bumps the chart.",
+            "Investigate why checkout sees reduced requests since Monday.",
+            "We are hitting reduced API limits on the ingress.",
+            "Lower the request latency of checkout.",
+            f"Why is payments-api crashlooping?\n\n{krc.FORMAT_MARKER}\n\nLower the requests if needed.",
+            "A report of cost opportunities (e.g., underutilized nodes, right-sizing recommendations, idle resources).",
+        ):
+            self.assertFalse(krc.asks_for_cut("Fleet-wide cost optimization analysis", ask), ask)
 
-    def test_a_not_found_leg_is_not_refused_and_not_carried(self):
-        self.card("t_own", body=SKILL_BODY)
-        self.assertEqual(self.rule("t_own", "Neither workload is on seeded-b: the namespaces do not exist.")[0], [])
-        self.child("inference-server: not on this cluster")
-        self.assertEqual(self.rule(PARENT, "**Found on seeded-a only.**")[0], [])
+    def test_a_platform_card_that_checked_nothing_is_refused_once(self):
+        self.card(PARENT, body=CUT_ASK, assignee="platform")
+        [reason] = self.rule(PARENT, result="**No cut is safe.**")[0]
+        self.assertIn("asks to cut requests or limits", reason)
+        self.assertIn("not_on_cluster", reason)
+        with self.assertLogs(krc.logger, "WARNING"):
+            self.assertEqual(self.rule(PARENT, result="**No cut is safe.**", retry=True)[0], [])
 
-    def test_checks_named_only_in_the_evidence_section_do_not_count(self):
-        self.card("t_own", body=SKILL_BODY)
-        result = "api-server: no dependency found\n\n" + kvc.EVIDENCE_HEADING + "\n$ kubectl get hpa,pdb\nqos helm allocatable"
-        reasons = self.rule("t_own", result)[0]
-        self.assertTrue(any("does not show these checks" in r for r in reasons), reasons)
+    def test_a_platform_card_with_its_own_entries_passes(self):
+        self.card(PARENT, body=CUT_ASK, assignee="platform")
+        reasons, result, _ = self.rule(PARENT, [HPA_ENTRY])
+        self.assertEqual(reasons, [])
+        self.assertIn("- `api-server`: dependency: HPA.", result)
 
+    def test_a_platform_card_with_a_childs_entries_passes(self):
+        self.card(PARENT, body=CUT_ASK, assignee="Platform")
+        self.card(CHILD, body=SKILL_BODY, creator=PARENT, stored=[HPA_ENTRY])
+        self.assertEqual(self.rule(PARENT)[0], [])
 
-class BotRoundOneShapesTest(RuleTestCase):
-    """The shapes the first bot review of #3507 named."""
+    def test_a_platform_card_that_delegated_is_not_refused_without_entries(self):
+        self.card(PARENT, body=CUT_ASK, assignee="platform")
+        self.card("t_whereis", body="Is inference-server on this cluster?", creator=PARENT, stored=[])
+        self.assertEqual(self.rule(PARENT, result="**inference-server runs on no cluster.**")[0], [])
 
-    CHECKS_TAIL = "\n\n- HPA or KEDA: see above\n- QoS: shown\n- PDB: none\n- Helm: none\n- Packing: 2 nodes needed"
+    def test_a_card_naming_the_skill_with_a_childs_entries_is_not_refused(self):
+        self.card(PARENT, body=f"Run {krc.SKILL_NAME} on api-server.", assignee="platform")
+        self.card(CHILD, body=SKILL_BODY, creator=PARENT, stored=[HPA_ENTRY])
+        reasons, result, _ = self.rule(PARENT)
+        self.assertEqual(reasons, [])
+        self.assertIn(f"- `api-server` (card {CHILD}): dependency: HPA.", result)
 
-    def setUp(self):
-        super().setUp()
-        self.card(PARENT, body="Lower the requests of api-server and queue-worker.")
-
-    def child(self, result, task_id=CHILD):
-        self.card(task_id, body=SKILL_BODY, status="done", result=result, creator=PARENT)
-
-    def test_one_workload_per_paragraph_is_one_block(self):
-        self.child("api-server: an HPA scales it on CPU\n\nqueue-worker: Guaranteed QoS, so a lower request is a lower limit" + self.CHECKS_TAIL)
-        [reason] = self.rule(PARENT, "api-server: an HPA scales it on CPU")[0]
-        self.assertIn("queue-worker: guaranteed qos", reason)
-
-    def test_a_bold_opener_shaped_like_a_line_is_skipped(self):
-        self.child("**ledger-writer: no safe cut.**\n\nledger-writer: Guaranteed QoS, so a lower request is a lower limit" + self.CHECKS_TAIL)
-        self.assertEqual(self.rule(PARENT, "ledger-writer: Guaranteed QoS, so a lower request is a lower limit")[0], [])
-        [reason] = self.rule(PARENT, "**ledger-writer: no safe cut.**")[0]
-        self.assertIn("ledger-writer: guaranteed qos", reason)
-
-    def test_figures_and_metadata_lines_are_not_dependency_lines(self):
-        self.card("t_own", body=SKILL_BODY)
-        reasons = self.rule("t_own", "cpu: 400m\nmemory: 64Mi\nseeded-a: both workloads found" + self.CHECKS_TAIL)[0]
-        self.assertTrue(any("open `result`" in r for r in reasons), reasons)
-        self.child("Namespace: seeded-capacity\nDeployment: inference-server\n\ninference-server: an HPA scales it on CPU" + self.CHECKS_TAIL)
-        self.assertEqual(self.rule(PARENT, "inference-server: an HPA scales it on CPU")[0], [])
-
-    def test_a_check_saying_not_found_does_not_exempt_the_card(self):
-        self.card("t_own", body=SKILL_BODY)
-        reasons = self.rule("t_own", "- HPA: not found\n- KEDA: no such resource type on this cluster")[0]
-        self.assertTrue(any("open `result`" in r for r in reasons), reasons)
-
-    def test_a_real_line_with_a_negation_is_carried(self):
-        self.child("inference-server: an HPA scales it on CPU; the replicas it wants are not running" + self.CHECKS_TAIL)
-        [reason] = self.rule(PARENT, "**No cut.**")[0]
-        self.assertIn("inference-server: an hpa", reason)
-
-    def test_a_two_column_table_row_carries_the_line(self):
-        self.child("ledger-writer: Guaranteed QoS, so a lower request is a lower limit" + self.CHECKS_TAIL)
-        summary = "| Workload | Dependency |\n| --- | --- |\n| ledger-writer | Guaranteed QoS, so a lower request is a lower limit |"
-        self.assertEqual(self.rule(PARENT, summary)[0], [])
-
-    def test_plural_check_words_count(self):
-        self.card("t_own", body=SKILL_BODY)
-        result = ("api-server: no dependency found\n\nNo HPAs or ScaledObjects target either workload. "
-                  "QoS Burstable. No PDB. Helm none. Both machine types fit.")
-        self.assertEqual(self.rule("t_own", result)[0], [])
+    def test_a_cluster_card_with_the_same_words_is_not_refused(self):
+        self.card(CHILD, body=CUT_ASK)
+        self.assertEqual(self.rule(CHILD)[0], [])
 
 
 class SharedRefusalTest(RuleTestCase):
     def test_the_gate_refuses_once_then_accepts(self):
         self.card(CHILD, body=SKILL_BODY)
         err, result, _ = kvc.apply_completion_rules(CHILD, {}, "No figures.", None, connect=self.connect)
-        self.assertIn("gke-rightsizing-checks", err)
+        self.assertIn(krc.PARAM, err)
         self.assertEqual(result, "No figures.")
         with self.assertLogs(krc.logger, "WARNING"):
             err, result, _ = kvc.apply_completion_rules(CHILD, {}, "No figures.", None, connect=self.connect)
         self.assertIsNone(err)
         self.assertEqual(result, "No figures.")
+
+    def test_a_valid_completion_passes_the_whole_gate(self):
+        self.card(CHILD, body=SKILL_BODY)
+        err, result, metadata = kvc.apply_completion_rules(CHILD, {krc.PARAM: [HPA_ENTRY]}, "**Hold.**", {}, connect=self.connect)
+        self.assertIsNone(err)
+        self.assertIn(krc.HEADING, result)
+        self.assertEqual(metadata[krc.METADATA_KEY][0]["dependency_kind"], "hpa")
 
 
 class ApplierTest(unittest.TestCase):
@@ -290,11 +363,12 @@ class ApplierTest(unittest.TestCase):
         path.write_text(text)
         return root, path
 
-    def test_the_import_follows_the_verified_claims_preamble(self):
+    def test_the_import_and_schema_call_follow_the_verified_claims_preamble(self):
         root, path = self.kanban_tools(f"KANBAN_COMPLETE_SCHEMA = {{}}\n{ANCHOR}_TOOLS = []\n")
         apply(root)
         patched = path.read_text()
-        self.assertLess(patched.index(ANCHOR), patched.index("import tools.kanban_rightsizing_checks"))
+        self.assertLess(patched.index(ANCHOR), patched.index("from tools import kanban_rightsizing_checks"))
+        self.assertIn("_kanban_rightsizing_checks.apply_schema(KANBAN_COMPLETE_SCHEMA)", patched)
         self.assertIn(MARKER, patched)
 
     def test_a_second_run_is_refused(self):
