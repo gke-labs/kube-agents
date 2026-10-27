@@ -79,8 +79,8 @@ const (
 	// A paragraph after the first that opens this way is operative for a
 	// reader deciding whether to use the field, so it stays on the page.
 	deprecatedParagraphPrefix = "Deprecated:"
-	// Validation markers that shape a value rather than constrain it: CEL
-	// rules carry a message for the API server, not a bound a table can show.
+	// CEL rules stay out of the Constraints column: one rule can span several
+	// fields or a whole type, and the page's intro says where they are listed.
 	xValidationMarker = "XValidation"
 
 	// Path suffixes for the element of a list and the value of a map, so a

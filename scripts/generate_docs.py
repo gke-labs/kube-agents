@@ -122,7 +122,9 @@ CRD_BLOCK_PREFIX = "crd-fields-"
 # The paragraph above the tables, rendered once here rather than kept by hand
 # on each page, so the three pages cannot drift apart. It states what the
 # tables leave out: standard metadata, the inside of upstream Kubernetes
-# types, and every paragraph of a field's documentation after the first.
+# types, every paragraph of a field's documentation after the first, and the
+# CEL rules the Constraints column does not carry.
+CRD_GROUP = "kubeagents.x-k8s.io"
 CRD_INTRO = (
     "Every field of the `{kind}` resource's `spec` and `status`, generated from the "
     "operator's Go API types. The standard Kubernetes `apiVersion`, `kind` and "
@@ -133,8 +135,13 @@ CRD_INTRO = (
     "map. Each description is the opening paragraph of the field's documentation, "
     "plus its deprecation notice when it has one, and names other fields in their Go "
     "spelling (`MaxSessions` for `maxSessions`); `kubectl explain "
-    "{resource}.spec.<field>` prints the whole text. For what the fields do together, "
-    "read the [{kind} CRD]({guide}) guide."
+    "{resource}.spec.<field>` prints the whole text. The Constraints column lists the "
+    "schema bounds on a field: allowed values, ranges, lengths and patterns. The API "
+    "server also enforces CEL rules on these fields and on whole sections, which the "
+    "column does not show; `kubectl get crd {resource}s.{group} -o yaml` lists them "
+    "under `x-kubernetes-validations`, each with the message the API server returns "
+    "when a value breaks it. For what the fields do together, read the "
+    "[{kind} CRD]({guide}) guide."
 )
 # The two trees each page carries, with the heading each is rendered under.
 CRD_TREES = (("spec", "Spec"), ("status", "Status"))
@@ -701,7 +708,9 @@ def gen_crd_fields(kind: str) -> str:
     """Render one kind's page body: the intro paragraph, then a spec and a status table."""
     entry = crd_model()[kind]
     out: list[str] = [
-        CRD_INTRO.format(kind=kind, resource=kind.lower(), guide=CRD_GUIDES[kind]),
+        CRD_INTRO.format(
+            kind=kind, resource=kind.lower(), group=CRD_GROUP, guide=CRD_GUIDES[kind]
+        ),
         "",
     ]
     for key, heading in CRD_TREES:
