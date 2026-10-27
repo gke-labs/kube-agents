@@ -496,6 +496,18 @@ class DeliveryToConversationTest(unittest.TestCase):
                 self.assertFalse((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
                 self.assertEqual(self._attempts()["attempts"], 1)
 
+    def test_the_text_note_is_logged_once_by_the_run_that_keeps_the_claim(self):
+        # The run whose text post failed released the claim and delivered nothing;
+        # the attempt that posts writes the one line an operator reads.
+        self._answer(1, REFUSED)
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertNotIn("went as text", stage_log(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink()
+        self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(stage_log(self.d).count("the first report went as text: KAGE_SLACK_UX is off"), 1)
+
     def test_a_text_post_that_may_have_landed_keeps_the_claim(self):
         for answer in (subprocess.TimeoutExpired(["a2a"], 105), chat_notify.NOTIFY_OUTCOME_UNKNOWN, 2):
             with self.subTest(answer=answer):

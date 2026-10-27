@@ -1510,12 +1510,12 @@ def _record_outcome(data_dir: Path, outcome: str) -> None:
 
 def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
                              note: str, suppressed: set[str], files: SweepFiles,
-                             card: inventory_card.Card | None) -> None:
+                             card: inventory_card.Card | None) -> bool:
     """After the claim: post into the conversation, and release the claim unless the report is out.
 
-    The findings are marked shown only once the claim is kept (posted, or on
-    the text path most likely posted), so a released claim leaves none counted
-    against the day's limit.
+    True when the claim is kept. The findings are marked shown only once it is
+    (posted, or on the text path most likely posted), so a released claim
+    leaves none counted against the day's limit.
     """
     outcome, reason, shown = _post_to_conversation(
         data_dir, conversation, content, note, lambda: _mark_shown(files, suppressed), card
@@ -1524,10 +1524,11 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
         # Recorded first, so the released claim is retried only after the wait.
         _record_attempt(data_dir, reason, counted=True)
         _release_claim(data_dir)
-        return
+        return False
     if outcome != POSTED:
         _record_attempt(data_dir, reason, counted=False)
     _cleanup(data_dir, in_sandbox, shown)
+    return True
 
 
 def main(data_dir: Path | None = None) -> int:
@@ -1610,27 +1611,29 @@ def main(data_dir: Path | None = None) -> int:
     if not _claim_delivery(data_dir):
         return 0  # another run is delivering this report — stay silent
 
-    # Logged by the run that delivers, which a racing loser is not.
-    if card is None:
-        _stage_note(data_dir, TEXT_REPORT_NOTE.format(reason=text_reason))
-
     if conversation is not None:
-        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, note, suppressed, files, card)
-        return 0
-
-    # Right after the claim, which ends the nudge's hold, so a nudge run has
-    # the shortest window in which to announce these findings as new.
-    shown = _mark_shown(files, suppressed)
-
-    if _posted_as_blocks(data_dir, card):
-        sys.stdout.write(note + "\n")
+        kept = _deliver_to_conversation(data_dir, in_sandbox, conversation, content, note, suppressed, files, card)
     else:
-        sys.stdout.write(_with_note(_presented(content, platform), note))
-    sys.stdout.flush()
+        # The origin path keeps every claim: stdout is the scheduler's.
+        kept = True
+        # Right after the claim, which ends the nudge's hold, so a nudge run has
+        # the shortest window in which to announce these findings as new.
+        shown = _mark_shown(files, suppressed)
 
-    # Cleanup runs only after the report is posted or safely on stdout (already
-    # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
-    _cleanup(data_dir, in_sandbox, shown)
+        if _posted_as_blocks(data_dir, card):
+            sys.stdout.write(note + "\n")
+        else:
+            sys.stdout.write(_with_note(_presented(content, platform), note))
+        sys.stdout.flush()
+
+        # Cleanup runs only after the report is posted or safely on stdout (already
+        # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
+        _cleanup(data_dir, in_sandbox, shown)
+
+    # Logged by the run that keeps the claim, so a text post that failed and
+    # released it leaves no line; the attempt that posts writes the one.
+    if kept and card is None:
+        _stage_note(data_dir, TEXT_REPORT_NOTE.format(reason=text_reason))
     return 0
 
 

@@ -1551,8 +1551,8 @@ class DeliveryFlagTest(unittest.TestCase):
         self.assertEqual(self._run("1"), delivered(PRESENTED))
         self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
-    def test_flag_on_without_a_relay_prints_the_text(self):
-        # A Slack origin with a chat id, so only the missing relay stops the blocks.
+    def test_flag_on_with_no_card_prints_the_text(self):
+        # No files beside the report, so no card: the reshaped text goes and no blocks are posted.
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
