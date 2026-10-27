@@ -179,11 +179,16 @@ EDITED_MAX = 512
 #: restatement of the reply-wanted clause (``a Pull Request will be opened``, ``is being opened for
 #: review``) keeps its buttons, because stripping them would leave a report that asks for ``apply``
 #: with no button for it. The words may wrap onto continuation lines of the bullet. The label
-#: may carry underscore emphasis (``__To authorize__``), and a continuation line may open with
-#: bold (``**is being opened automatically**``): only a list marker followed by whitespace, a
-#: heading, or a blank line ends the clause.
+#: and the marker words may carry ``*`` or ``_`` emphasis (``__To authorize__``,
+#: ``_is being opened automatically_``), so the marker's boundaries exclude ``_`` where ``\b``
+#: would count it as a letter; a continuation line may open with bold
+#: (``**is being opened automatically**``). Only an unordered list marker (``-``, ``*``, ``+``)
+#: followed by whitespace, a thematic break (``---``, ``***``, ``___``), a ``#`` line, or a blank
+#: line ends the clause.
 OPENING_PULL_REQUEST = re.compile(
-    r"^[^\w\n]*[*_]*To authorize[*_]*:?(?:[^\n]|\n(?![ \t]*(?:[-*+][ \t]|#)|\s*$))*?\bis\s+being\s+opened\s+automatically\b",
+    r"^[^\w\n]*[*_]*To authorize[*_]*:?"
+    r"(?:[^\n]|\n(?![ \t]*(?:[-*+][ \t]|#|(?P<hr>[-*_])(?:[ \t]*(?P=hr)){2,}[ \t]*$)|\s*$))*?"
+    r"(?<![^\W_])is\s+being\s+opened\s+automatically(?![^\W_])",
     re.IGNORECASE | re.MULTILINE,
 )
 

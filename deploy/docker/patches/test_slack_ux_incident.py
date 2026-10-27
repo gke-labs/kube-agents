@@ -751,9 +751,10 @@ class RuntimeTest(unittest.TestCase):
             "  opened automatically, or reply **'apply Option A'** to open another option.",
         )
         self.assertEqual(len(runtime.parse_triage(wrapped_report)["choices"]), 1)
-        # Two other Markdown renderings of the same clause: underscore emphasis on the label, and a
-        # wrapped bullet whose continuation line opens with bold. Each yields the same filtered
-        # choices and the same action block as the bold form above.
+        # Three other Markdown renderings of the same clause: underscore emphasis on the label, a
+        # wrapped bullet whose continuation line opens with bold, and underscore emphasis on the
+        # marker words. Each yields the same filtered choices and the same action block as the
+        # bold form above.
         for label, rendering_multi, rendering_single in (
             (
                 "underscore",
@@ -767,6 +768,12 @@ class RuntimeTest(unittest.TestCase):
                 "  **is being opened automatically**, or reply **'apply Option A'** / **'apply Option B'** "
                 "to open a Pull Request for a different option.",
                 "- **To authorize:** a GitOps Pull Request for this fix\n  **is being opened automatically**.",
+            ),
+            (
+                "underscore marker",
+                "- **To authorize:** a GitOps Pull Request for the recommended fix _is being opened automatically_, "
+                "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+                "- **To authorize:** a GitOps Pull Request for this fix __is being opened automatically__.",
             ),
         ):
             with self.subTest(rendering=label):
@@ -802,12 +809,19 @@ class RuntimeTest(unittest.TestCase):
                 )
         # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
         # continuation line, keeps every button: stripping one would leave a report that asks for
-        # `apply` with no button for it, on an install that is not opening anything.
+        # `apply` with no button for it, on an install that is not opening anything. Nor do the
+        # marker words count once the bullet has ended: on a sibling bullet, after a blank line, or
+        # past a thematic break (a heading line never reaches the pattern; `_sections` drops it).
         for clause in (
             "- **To authorize:** reply **'apply'** and a GitOps Pull Request will be opened with this fix.",
             "- **To authorize:** reply **'apply'** and a GitOps Pull Request is being opened for review.",
             "- **To authorize:** reply **'apply'** to choose a fix.\n  Once you reply, a Pull Request will be opened for review.",
             "- **To authorize:** a GitOps Pull Request for the recommended fix will be opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n- **Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n* **Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n---\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n***\nA Pull Request for the drift finding is being opened automatically.",
         ):
             with self.subTest(clause=clause):
                 off_report = REPORT.replace(

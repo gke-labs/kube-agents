@@ -3096,7 +3096,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
         self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
         slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
-        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        self.assertIn(r"is\s+being\s+opened\s+automatically", slack)
         task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
         self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
         off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
