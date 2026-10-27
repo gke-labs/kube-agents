@@ -77,6 +77,14 @@ type NotifyRequest struct {
 	// out the same way; it ignores Update.
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
+	// AnswerTo, on a conversation request, says the post answers an ask:
+	// it is the delivered report of the card whose completion settled every
+	// card of the ask's plan, and its value is that plan's Update key, which
+	// names the ask (the chain the key's first mark bound). A backend that
+	// draws rating controls draws them on it (answer feedback). The CLI
+	// refuses it on a home channel request, and the gateway ignores it with
+	// Update, which names a message edited in place rather than an answer.
+	AnswerTo string `json:"answer_to,omitempty"`
 	// ReplyTo, on a request aimed at a conversation, is the id of the
 	// gateway task whose turn filed the work this reports on, when the
 	// sender knows it. Only the console passes it on (its frame's replyTo),

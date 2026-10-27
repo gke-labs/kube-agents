@@ -150,7 +150,7 @@ sends **no prompt** — it sends facts. Noise control lives here too: namespace 
 flapping guard, a two-minute settle period for the crash-loop family (a back-off that clears sooner
 is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
 is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
-watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread.
+watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread and on its triage card (the card alone on an install without chat).
 
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
