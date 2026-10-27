@@ -177,9 +177,6 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-click-answer-stays-silent",  # SOUL §1.5 Unblock: silent after a button answer
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
     "autoops-controller-stall-triage",  # the stall watch on the inject path
-    "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
-    "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
-    "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
     "chat-voice-answer-first",  # a delegated answer opens on its verdict
@@ -218,7 +215,6 @@ ADDED_AFTER_THE_MOVE = [
     "cluster-agent-security-audit-script",  # a Cluster Agent runs its audit script from the path its skill names, #3402
     "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
     "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
-    "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
@@ -579,30 +575,22 @@ class SplitLostNothingTest(unittest.TestCase):
 # are pinned.
 INJECT_LANE_EXCLUDED = [
     "agent-kanban-smoke",  # #2039: grades kanban_create by the front door and the specialist's answer folded back, which the door's thread never gets
-    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; a card-wake replay runs on the api transport only
-    "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
-    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same reason
-    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same reason
+    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; a card-wake replay runs on the api transport only
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
     "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
     "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
-    "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
-    "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
     "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
-    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
-    "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
-    "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
     "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
     "chat-answer-tangent-offer-declares-no-step",  # the same
     "fleet-audit-request-line",  # #2619: grades the worker's answer the api lane folds into the reply; the door's thread never gets it
 ]
-# The directives a case's prompt opens with to replay a wake into the chat
+# The directive a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
 # a run on any transport but api.
-FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
+FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:slack-question-wake]",)
 # Check types that read what only the chat front door's card round trip
 # delivers; on the inject lane there is no card, so the check fails rather
 # than being set aside (bench/README.md, the transport table).
@@ -611,22 +599,14 @@ FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first", "report_store_reply
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
     "agent-kanban-smoke": "presubmit",
-    "chat-voice-retry-says-it-is-retried": "nightly",
-    "chat-voice-final-attempt-is-not-retried": "nightly",
-    "chat-voice-failure-leads-with-fact": "nightly",
     "chat-question-wake-stays-silent": "nightly",
     "chat-question-typed-answer-fresh-session": "nightly",
     "chat-question-click-answer-stays-silent": "nightly",
     "chat-voice-ack-names-target": "nightly",
-    "chat-reset-history-names-the-command": "nightly",
-    "chat-routing-board-read": "nightly",
     "chat-routing-fleet-question": "nightly",
-    "first-install-hello-running": "nightly",
-    "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
     "chat-question-asked-to-choose-pauses": "nightly",
-    "chat-failure-reply-declares-next-step": "nightly",
     "chat-answer-declares-next-step": "nightly",
     "chat-answer-tangent-offer-declares-no-step": "nightly",
     "fleet-audit-request-line": "nightly",
@@ -795,10 +775,10 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
-    def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's roster is untouched by an entry here: an excluded
-        # presubmit case still runs on every pull request and can still red
-        # one, and an excluded nightly case still runs every night.
+    def test_an_exclusion_keeps_the_case_on_its_roster(self):
+        # An entry here leaves the case on its roster: the today lane still
+        # grades an excluded presubmit case, and an excluded nightly case runs
+        # nowhere in CI until it can go through the inject door.
         self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
         for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
             with self.subTest(case=case, tier=tier):

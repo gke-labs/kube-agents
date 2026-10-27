@@ -1051,8 +1051,7 @@ export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
 the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
-so record under the version key's `next` mode; `ci-kube-agents-eval-nightly-today` in the same file
-is the same recorder on a `today` install, and keeps today's window.
+so record under the version key's `next` mode. No job in the file records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the

@@ -528,8 +528,8 @@ the today lane's `today` only with today's; a case with no line at its key contr
 `main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
 `-main-b` half and its `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
-back, for this number only, to its today-mode lines at the same key otherwise, which
-`ci-kube-agents-eval-nightly-today` records, and the verdict names those cases in a note; rung 6
+back, for this number only, to its today-mode lines at the same key otherwise, which the store
+already holds (no job appends them now), and the verdict names those cases in a note; rung 6
 never falls back. The verdict prints it on every
 run:
 
@@ -560,7 +560,8 @@ periodic does not get the line: it records `main` and grades itself against a wi
 holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
 window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
 sample contains); the eval dashboard's Trend page draws today's window from the same store, per case
-and per domain. It does not draw the `next` series yet, which is the window the presubmit is compared
+and per domain, and since no job appends that window now, the view empties as its lines age out of
+the page's window. It does not draw the `next` series yet, which is the window the presubmit is compared
 with since the nightly grades `next`; the `next` block of the published `trend.json` holds it.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
@@ -633,21 +634,20 @@ default `api` executor the default profile answers the door's task and can file 
 card's completion never reaches the A2A thread. The lane's delegation wait reads the card's
 result from the pod and appends it to the graded answer, but that is the harness's view, not the
 thread's, so grading it would pass a premise the case does not have there. The card-wake
-cases replay a wake the harness sends on the api transport only, and error on this lane. A case
-excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
-listed until a run on `api` grades it.
+cases replay a wake the harness sends on the api transport only, and error on this lane.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
-fixture to an issue. An entry is not a demotion: the case keeps its seat in
-`presubmit-cases.txt` or `nightly-cases.txt` and on the blocking roster, and runs over the api
-transport on the today lane and in the nightlies. It does leave what can red a pull request,
-though, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
+fixture to an issue. The case keeps its seat in `presubmit-cases.txt` or `nightly-cases.txt` and
+on the blocking roster, but it stops running wherever the inject lane runs, the nightlies
+included. The only api-transport job on `main` is the today lane, which runs the presubmit
+matrix: a listed presubmit case still runs there, and a listed nightly case runs nowhere in CI.
+An entry also leaves what can red a pull request, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. `agent-kanban-smoke` is the one roster case
 listed, so until the lane's delegation wait reads card ids on this path, or the case is rewritten
 for a premise both transports have, no merge-blocking run grades delegation through the chat
-front door; the today lane and the nightlies do. `scripts/test_eval_rosters.py` pins
+front door; the today lane does. `scripts/test_eval_rosters.py` pins
 that set, so listing a second roster case is a decision made in that test and on this page, not a
 side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
@@ -685,12 +685,13 @@ on every pull request.
 Rung 6 compares an inject run only with next-mode history. The version key carries the mode
 ([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
 `AGENT_TRANSPORT=inject` as `next`, so an inject run's judged mean is set against the means a
-next-mode run on `main` recorded at the same key, never against the today-mode nightly's: that
+next-mode run on `main` recorded at the same key, never against today-mode history: that
 comparison measured the lane rather than the pull request, and redded four admitted cases at once
 on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
 is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
-only. The key includes the agent model, and the main nightly runs the presubmit's, so its next-mode
-lines are the presubmit's rung 6 history.
+only, which no job appends to now, so rung 6 there is quiet once the key moves past the stored
+lines. The key includes the agent model, and the main nightly runs the presubmit's, so its
+next-mode lines are the presubmit's rung 6 history.
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
@@ -788,6 +789,23 @@ its domain's owner ([`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md#ownership
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
 not answer stays demoted. The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
+
+A demotion that leaves a domain with no case on the roster must, in the same pull request, do one
+of three things: seat a stand-in case from that domain on the roster; keep the demoted case on the
+presubmit as a held-out seat (its line in the last section of `hack/eval/presubmit-cases.txt` and
+its `HELD_OUT_IN_PRESUBMIT` entry), which keeps the domain exercised but does not cover it; or add
+a record to the `allowlist` in [`docs/designs/domains.yaml`](designs/domains.yaml) with `since`,
+`issue`, `owner` and `expires`, the expiry at most 14 days after `since` unless a `why:` says why.
+The issue is the one that says how the domain gets a roster case back. A held-out seat still needs
+the record, with the case named in its `held_out:` field. `scripts/test_domain_coverage.py`
+enforces this: it fails on an uncovered domain with no record, and on a record that is missing a
+field or runs past the 14-day cap without a `why:`.
+
+Once a record's `expires` date has passed (by the UTC date), pull requests are not blocked: a date
+passing would red contributors who do not own the gap. Instead the CI-health bot escalates to the
+record's owner on its issue, and the daily digest says how many days ago the exception expired.
+`scripts/domain_allowlist.py` is the expiry rule it reads. The owner either covers the domain or
+moves the date in a pull request that says why.
 
 ## Switching to `record`
 

@@ -1731,7 +1731,21 @@ adds that if the agent filed a card, that card keeps working until it finishes, 
 `stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
 stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
-A bare `/session` asks for the next message in its thread.
+A bare `/session` asks for the next message in its thread. Slack's Stop button on an Agent
+Session's Working… line sends `agent_session_stopped`, which the adapter turns into a cancel that
+names no task, keyed on the thread's conversation, with `IntentCancel`, which no chat message
+carries, so the gateway tells the button from the word. The event names no team for the presser, so
+the adapter checks the workspace itself: a member the allowed-users list names passes, anyone else
+must be in this workspace by `users.info` (cached per member for five minutes), and a lookup that
+fails, or a workspace auth.test never named, drops the press. Only a requester the conversation's record
+holds (a task's requester or steer author, or a session author) may press it; anyone else's press
+cancels nothing and posts nothing (`stopgate.go`), while typed `stop` keeps its rule. A record that
+cannot tell who asked gates nobody: nothing ran, a requester was cleared past `AskTTL`, a steer or
+session author was dropped past its cap, or the history is at its cap (`cannotTellWhoAsked`). With
+the card
+stop armed the button cancels the turn without the `🛑` lines and sends the same control, and the
+gateway words the result as the Slack Stop's one reply (`slack_stop.go`); unarmed, it is a typed
+`stop`.
 
 The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
 is keyed that way. It is the form a DM record from before DMs threaded carries, so such
@@ -1940,7 +1954,7 @@ otherwise leaves the old process's Working… on it; the thread is renamed once 
 verified ask that is not a gateway command, with today's title rules: the ask up to its first
 question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
-three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
+three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses

@@ -645,7 +645,9 @@ terminal. No Hermes turn runs. Instead the bridge:
    worker; this sidecar shares the hostname but not the pid namespace.
 3. ends the task `completed`. The `result` artifact holds a short text and the cardStop result
    part:
-   `{"cardStop":{"v":1,"stopped":[{"id","title","priorStatus"}],"settled":[{"id","title"}],"failed":N,"pending":N,"unresolved":N,"truncated":bool,"deadline":bool,"listsCut":bool}}`.
+   `{"cardStop":{"v":1,"stopped":[{"id","title","priorStatus"}],"settled":[{"id","title"}],"failed":N,"pending":N,"unresolved":N,"truncated":bool,"deadline":bool,"listsCut":bool,"notStopped":[{"id","title"}]}}`.
+   `notStopped` names the cards the three counts count, session-kv's failed, then pending, then
+   unresolved ones, and is left out when every card stopped.
    The text counts what session-kv answered, and says plainly what the stop could not promise:
    `unresolved` cards were stopped just after a worker was claimed for them, so a worker may
    still start; `pending` archives were still running when session-kv ran out of time;

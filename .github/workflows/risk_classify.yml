@@ -52,7 +52,9 @@ jobs:
     # sharing it with the script's check run put two same-named runs on every
     # head SHA. The script's run carries the verdict; this one is plumbing.
     name: classify
+    if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read # check out the default branch: the script and its rules
       checks: write # post the Risk Classification check run

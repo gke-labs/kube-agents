@@ -94,7 +94,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-six fixtures: thirty-three across the four cluster slots and three project-scoped. Most in-cluster
+Thirty-six fixtures: thirty-three across the four cluster slots and three project-scoped. Three
+more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
+majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the twelve seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
@@ -128,6 +130,9 @@ its roles are never published.
 | `world-open-ingress`            | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                   |
 | `version-laggard`               | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                        |
 | `drift-outlier`                 | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                           |
+| `drift-peer-a`                  | a       | 1   | Nothing planted: slot `a`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                 |
+| `drift-peer-b`                  | b       | 1   | Nothing planted: slot `b`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                 |
+| `drift-peer-d`                  | d       | 1   | Nothing planted: slot `d`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                 |
 | `readiness-surge-blocked`       | b       | 0   | `no-surge-pool`, `maxSurge 0` / `maxUnavailable 1`, tainted `seeded-role=no-surge`                                                                                                                                                |
 | `readiness-pinned-workload`     | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                                                             |
 | `readiness-drain-blocked`       | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                                                      |
@@ -282,6 +287,12 @@ members — and §2.4's floor, a cohort of fewer than three clusters produces no
 ever, would floor it out with any two of the four still new. Adding slot `d` to a project whose
 other three clusters are already a day old costs nothing: `d` sits out its first day and the
 other three vote as before.
+
+The hourly seeded-fleet scan watches both halves of that arithmetic: `drift-outlier` asserts
+`seeded-c`'s `createTime` is at least 24 hours old (`age_hours_ge` in `fixtures.json`), and each
+`drift-peer-*` role that its slot still carries the open block. A re-apply restores a removed
+block; only time clears the age. A new peer's age is not asserted, because it leaves `seeded-c`
+outvoted 2/3 by the other two.
 
 `idle-nodepool` waits seven, and the GKE node pool has no creation timestamp to read:
 `gcloud container node-pools describe` returns no `createTime` and neither does the REST
