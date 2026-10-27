@@ -431,10 +431,17 @@ def no_reapply_op(line: str) -> str | None:
 
 def age_gate_clears_at(line: str) -> datetime | None:
     """When an age-gate line's assertion passes: the timestamp it read plus
-    the hours it wants. None for any other line."""
+    the hours it wants. None for any other line, and for hours too large for
+    a date (a catalog value no clock reaches), so the advice reads it as
+    unparseable rather than the tick failing."""
     match = AGE_GATE_LINE_RE.match(line)
     when = parse_iso(match["when"]) if match else None
-    return when + timedelta(hours=float(match["hours"])) if when else None
+    if not when:
+        return None
+    try:
+        return when + timedelta(hours=float(match["hours"]))
+    except OverflowError:
+        return None
 
 
 def reapply_clears_nothing(lines) -> bool:

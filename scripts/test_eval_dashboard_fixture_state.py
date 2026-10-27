@@ -449,6 +449,9 @@ class NoReapplyDrift(unittest.TestCase):
         self.assertIsNone(fixture_state.no_reapply_op("cluster currentMasterVersion not_ahead_of_channel: observed nothing"))
         # A createTime ahead of the scanning host's clock reads as a negative age: still the age gate.
         self.assertEqual(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "2026-10-27T12:00:00+00:00", -0.3 hours old'), fixture_state.OP_AGE_GATE)
+        # Hours past any date: no clear time, and no exception to take the tick down.
+        for huge in ("70000000", "30000000000"):
+            self.assertIsNone(fixture_state.age_gate_clears_at(f'cluster createTime age_hours_ge {huge}: observed "2026-10-27T12:00:00+00:00", 1.0 hours old'), huge)
         # An unparseable timestamp is no age the clock will reach.
         self.assertIsNone(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "soon", not one RFC 3339 timestamp'))
 

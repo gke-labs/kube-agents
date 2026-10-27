@@ -624,7 +624,9 @@ class MainTest(unittest.TestCase):
             rc, _ = self._main(["--drifted"], _Boskos(free=[P8]), tofu, scan=scan)
         self.assertEqual(rc, reconcile.EXIT_OK)
         self.assertEqual(tofu.verbs(), [], "an apply there changes nothing")
-        self.assertIn("skipped, no re-apply clears their drift: %s" % P8, [c.args[0] for c in printed.call_args_list if c.args])
+        lines = [c.args[0] for c in printed.call_args_list if c.args]
+        self.assertIn("skipped, no re-apply clears their drift: %s" % P8, lines)
+        self.assertIn("1 project(s) drifted in %s, 0 to re-apply" % reconcile.DEFAULT_FIXTURE_STATE, lines)
 
     def test_all_asks_for_every_mapped_project_after_resetting_strands_and_applies_each(self):
         # The full-pass arm: every mapped project is asked for by name, held
