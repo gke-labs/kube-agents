@@ -1030,6 +1030,17 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
+    def test_a_handed_off_lost_job_issue_clears_on_a_clean_night_inside_the_window(self):
+        # Lost on the 15th, clean on the 16th, lost on the 17th; the job's
+        # issue was handed off (not planned) on the 15th after that night
+        # started. The clean 16th finished after the close, so the hand-off
+        # has cleared and the 17th's loss files fresh.
+        lost = data(night(15, [], lost=True), night(16, [green()]), night(17, [], lost=True))
+        handed_off = {"number": 3716, "title": "t", "closed_at": "2026-10-15T12:00:00Z", "state_reason": "not_planned",
+                      "body": nightly_bugs.BOT_MARKER.format(kind=nightly_bugs.KIND_LOST, field=nightly_bugs.KEY_JOB, key=JOB)}
+        gh, _, _ = self.run_once(lost, FakeGh(closed_issues=[handed_off]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+
     def test_a_case_that_changed_parts_is_read_from_the_part_that_ran_it(self):
         # Graded by the writers part on the 11th-16th, then moved to main,
         # whose 17th was cut off after recording it: never kept from running.

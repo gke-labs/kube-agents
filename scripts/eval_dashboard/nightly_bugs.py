@@ -562,10 +562,10 @@ HANDED_OFF_REASONS = frozenset({"not_planned", "duplicate"})
 
 def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None, oldest: dict | None = None) -> bool:
     """Whether a closed issue still tracks a streak ending at ``newest``.
-    One closed after that night finished has seen it (``closed_after``), and
-    so has one closed after ``oldest``, the first of the case's last
-    STREAK_NIGHTS graded nights, started (``closed_after_start``): fewer than
-    STREAK_NIGHTS nights tested the code after the close. One
+    One closed after that night finished has seen it (``closed_after``). A
+    completed close after ``oldest``, the first of the streak's nights,
+    started (``closed_after_start``) has too: fewer than STREAK_NIGHTS nights
+    tested the code after the close. One
     handed off (HANDED_OFF_REASONS) tracks the problem until a good night --
     a pass, a clean run, a graded case -- finishes after the close: the
     problem is the other issue's until it clears, and a new one after that
@@ -573,10 +573,10 @@ def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None, olde
     STREAK_NIGHTS failing nights all started after it. A hand-off closed before ``horizon`` (the start of the
     window's first night) cannot be confirmed -- the record no longer shows
     whether the case cleared since -- so it does not hold a new streak back."""
-    if closed_after(issue, newest) or (oldest and closed_after_start(issue, oldest)):
+    if closed_after(issue, newest):
         return True
     if issue.get("state_reason") not in HANDED_OFF_REASONS:
-        return False
+        return bool(oldest and closed_after_start(issue, oldest))
     closed = nightly.parse_iso(issue.get("closed_at"))
     if not closed or not horizon or closed < horizon:
         return False
