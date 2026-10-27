@@ -8,7 +8,7 @@ The same contract `test_providers_contract.py` holds every forge to, and the sam
 
 Recorded against gitlab.com's v4 API from a private throwaway project, below the transport, so no token or `PRIVATE-TOKEN` header was ever recorded. Then edited three ways:
 
-- **Trimmed.** A merge request answers with about sixty fields. What's left is what the translation reads plus neighbours it should _not_ read (`id` beside `iid`, `merge_commit_sha` beside `sha`, `closed_at` beside `merged_at`), so a translation that reached for the wrong one has something to get wrong.
+- **Trimmed.** A merge request answers with about sixty fields. What's left is what the translation reads plus neighbours it should _not_ read (`id` beside `iid`, `closed_at` beside `merged_at`), so a translation that reached for the wrong one has something to get wrong. `merge_commit_sha` is read only once a merge request has merged.
 - **Redacted.** Every username, name, email, avatar URL, project path and numeric id is replaced. The project is `acme/infra`; its encoded form `acme%2Finfra` is what every path carries.
 - **Composed.**
   - `proposal-list.json` carries three merge requests in the three states the contract asserts: open, merged, and closed and draft.

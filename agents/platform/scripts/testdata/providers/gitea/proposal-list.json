@@ -211,7 +211,7 @@
         "mergeable": true,
         "merged": false,
         "merged_at": null,
-        "merge_commit_sha": null,
+        "merge_commit_sha": "d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5",
         "merged_by": null,
         "allow_maintainer_edit": false,
         "base": {

@@ -60,6 +60,10 @@ CONCEPTS = {"proposal": "proposal", "issue": "issue", "label": "label"}
 SHAPES: dict[str, frozenset[str]] = {
     # `sourceRepo` and `sourceRevision` sit beside `source` because a branch
     # name alone answers neither "whose branch is this" nor "what is on it now".
+    # `mergeCommit` is null unless merged; then it is the merge or squash
+    # commit, or after a rebase or fast-forward merge the target's tip, which
+    # may not hold the whole change -- a revert must check. GitLab answers null
+    # for a fast-forward merge.
     "proposal": frozenset(
         {
             "number",
@@ -76,6 +80,7 @@ SHAPES: dict[str, frozenset[str]] = {
             "created",
             "updated",
             "closed",
+            "mergeCommit",
             "body",
         }
     ),
@@ -300,6 +305,36 @@ class ContractTest(unittest.TestCase):
                     items = answer.get("proposals") or [answer["proposal"]]
                     for item in items:
                         self.assertIn(item["state"], PROPOSAL_STATES)
+
+    def test_only_a_merged_proposal_names_its_merge_commit(self):
+        # GitHub answers `merge_commit_sha` on an open pull request too, with a
+        # test merge nobody can revert; a caller that read it would act on a
+        # commit that is on no branch. The listings carry a merged proposal
+        # on every forge, so each one is checked in both directions.
+        for name, forge, directory in self.instances():
+            if "proposal-list" not in forge.verbs:
+                continue
+            fixture = self.load(directory, "proposal-list")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-list", fixture)
+                states = {item["state"] for item in answer["proposals"]}
+                self.assertIn("merged", states)
+                for item in answer["proposals"]:
+                    if item["state"] == "merged":
+                        self.assertRegex(item["mergeCommit"], r"^[0-9a-f]{40}$")
+                    else:
+                        self.assertIsNone(item["mergeCommit"])
+
+    def test_an_open_proposal_view_names_no_merge_commit(self):
+        # The recorded open pull request carries GitHub's test-merge sha.
+        for name, forge, directory in self.instances():
+            if "proposal-view" not in forge.verbs:
+                continue
+            fixture = self.load(directory, "proposal-view")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-view", fixture)
+                self.assertEqual(answer["proposal"]["state"], "open")
+                self.assertIsNone(answer["proposal"]["mergeCommit"])
 
     def test_a_listing_declares_itself_truncated_against_the_limit(self):
         for name, forge, directory in self.instances():
