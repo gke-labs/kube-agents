@@ -6593,17 +6593,21 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn("no declared state to revert to", card)
         # A delete leaves no live object, so no markers proves nothing and the
         # revert has to survive: gitops-drift-deleted-policy-triage expects it.
-        # No pull request can delete an object git never held, so the delete
-        # option is a manual step the 'apply' line never names (observed:
-        # "apply Option B" on a "Delete unmanaged namespace" option).
-        self.assertIn("or to delete it", card)
-        self.assertIn("manual step a person runs", card)
-        self.assertIn("never name it in the 'apply' line", card)
+        # No pull request can delete an object git never held, and chat turns
+        # every lettered option into an 'apply' button, so deletion is an
+        # unlettered Manual step (observed: a lettered "Delete unmanaged
+        # namespace" option with "apply Option B" beside it).
+        self.assertIn("never a lettered option, never the recommendation", card)
+        self.assertIn("- **Manual step (<title>):**", card)
+        # Only a person's kubectl subcommands read as "not in git"; a manager
+        # the card cannot name may be a pipeline's and keeps the revert.
+        self.assertIn("its only field managers are a person's `kubectl` subcommands", card)
+        self.assertIn("a field manager you do not recognise", card)
         self.assertIn("A deleted object carries nothing to read", card)
         self.assertIn("keep the revert", card)
         done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
         self.assertIn("for an object git does not declare", done_when)
-        self.assertIn("deleting it by hand", done_when)
+        self.assertIn("proposes codifying it", done_when)
 
         skill = (
             Path(__file__).resolve().parents[3]

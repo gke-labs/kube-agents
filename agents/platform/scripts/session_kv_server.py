@@ -3280,9 +3280,11 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     (docs/designs/drift-detection.md, "Resources not in Git at all"). The
     worker has no repository to check, so the body tells it to read that off
     the live object's GitOps markers, which the skill lists, and widens the
-    options and the **Done when** line to codifying it or deleting it by hand
-    (no pull request can delete what git does not hold, so the delete option
-    is a manual step the 'apply' line never names). bench/tasks/gitops-drift-unmanaged-object-triage grades it.
+    options and the **Done when** line to codifying it. Deleting it is sound
+    too, but no pull request can delete what git does not hold, so it is an
+    unlettered **Manual step** bullet: slack_ux_incident.parse_triage turns
+    every lettered option into an 'apply Option X' button, and a lettered
+    delete would become a button for a pull request that cannot exist. bench/tasks/gitops-drift-unmanaged-object-triage grades it.
 
     On an install with no usable GitOps repository the card is
     :func:`_drift_task_body_without_gitops` instead: an explanation with no
@@ -3307,14 +3309,17 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"whichever way it comes out belongs in the report.\n\n"
         f"**Before any of that, establish whether git declares this object at all.** You have no access to the "
         f"repository; the live object tells you. A GitOps tool marks what it applies — its field manager, or its "
-        f"tracking label or annotation — and the skill lists them. If the object still exists and carries none, "
-        f"say it is probably not in git and what you checked. There is then no declared state to revert to, so do "
-        f"not offer one: the options are to codify it in git, saying whether the manifest keeps the change or "
-        f"undoes it, or to delete it. Deleting brings the cluster in line with git, which declares nothing, but no "
-        f"pull request can do it: say in that option that it is a manual step a person runs, give the command, and "
-        f"never name it in the 'apply' line. If deleting is the only option, it gets no 'apply' line at all. "
-        f"If its only markers are ones the skill calls ambiguous, which a person's `kubectl apply` or "
-        f"`helm install` leaves too, keep the revert beside those options and say what would decide between them. "
+        f"tracking label or annotation — and the skill lists them. If the object still exists, carries none of "
+        f"them, and its only field managers are a person's `kubectl` subcommands (`kubectl-create`, "
+        f"`kubectl-edit`, `kubectl-label`, `kubectl-patch` and the like), say it is probably not in git and what "
+        f"you checked. There is then no declared state to revert to, so do not offer one: codify it in git, saying "
+        f"whether the manifest keeps the change or undoes it — that is the option, or the two options, to letter. "
+        f"Deleting it is also sound, since git declares nothing, but no pull request can do it, so it is never a "
+        f"lettered option, never the recommendation, and never named in the 'apply' line: where it is worth "
+        f"naming, add one bullet after the lettered options, `- **Manual step (<title>):** <why, and the command a "
+        f"person runs>`, and do not call it an option. If its only markers are ones the skill calls ambiguous, "
+        f"which a person's `kubectl apply` or `helm install` leaves too, or a field manager you do not recognise, "
+        f"which may be a pipeline's, keep the revert beside those options and say what would decide between them. "
         f"A deleted object carries nothing to read, so its absence of markers is no evidence: say whether git "
         f"declares it could not be read off the cluster, and keep the revert.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
@@ -3325,8 +3330,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
         f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
         f"revert's consequence being whether the state git declares would still run, read off this cluster or "
-        f"reported as not established — or, for an object git does not declare, proposes codifying it or "
-        f"deleting it by hand. "
+        f"reported as not established — or, for an object git does not declare, proposes codifying it, naming "
+        f"deletion by hand as a manual step where it is worth naming. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -3347,7 +3352,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"else, replacing the ones in the template below:\n"
         f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
-        f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action. The one exception is the "
+        f"**Manual step** bullet for an object git does not declare, which may follow them.\n\n"
         f"**If the change was already reconciled away and nothing is left to do,** make 'What to do' this one "
         f"bullet: '- **No action needed:** the object already matches the declared state.' No Proposed fix, and "
         f"keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
