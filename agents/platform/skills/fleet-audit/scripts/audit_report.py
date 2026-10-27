@@ -2148,6 +2148,10 @@ KCC_DEPENDENCY_NOT_READY_REASON = "DependencyNotReady"
 # `TRANSIENT_REASONS` leaves them out of `kcc_unready`; a manifest from an
 # older collector can still carry them.
 KCC_TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
+# The annotation that names the GCP project a Config Connector object manages.
+KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
+# How many segments a `project/location/name` cluster target has.
+CLUSTER_TARGET_SEGMENTS = 3
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
@@ -18253,7 +18257,8 @@ class KccDeclaration(NamedTuple):
     `metadata.namespace` (empty when the file leaves the namespace to the
     tool that applies it): the names Config Connector lists the live object
     by, which `disclose_stalled_kcc_remediations` matches the collector's
-    `kcc_unready` objects on.
+    `kcc_unready` objects on. `project` is the declaration's
+    `cnrm.cloud.google.com/project-id` annotation, or empty.
     """
 
     repo: str
@@ -18261,6 +18266,7 @@ class KccDeclaration(NamedTuple):
     fields: frozenset[str]
     name: str = ""
     namespace: str = ""
+    project: str = ""
 
 
 # `(kind, name, cluster, location)`: `cluster` is the bare GKE name the resource
@@ -18365,6 +18371,7 @@ def _index_kcc_text(
                 frozenset(str(k) for k in spec),
                 str(meta.get("name") or ""),
                 str(meta.get("namespace") or ""),
+                str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or ""),
             ),
         )
 
@@ -18623,6 +18630,8 @@ class KccStall(NamedTuple):
     name, and `cluster` a `ContainerNodePool`'s `clusterRef`; both are `""`
     when the collector did not record them. `host` is the manifest entry the
     object was read on: the cluster that runs that Config Connector.
+    `project` is the GCP project the object manages (its
+    `cnrm.cloud.google.com/project-id` annotation), `""` when not known.
     """
 
     kind: str
@@ -18632,6 +18641,7 @@ class KccStall(NamedTuple):
     resource: str
     cluster: str
     host: str = ""
+    project: str = ""
 
 
 class KccHealth(NamedTuple):
@@ -18640,22 +18650,29 @@ class KccHealth(NamedTuple):
     `stalled` holds every unready object the collector recorded, and `unread`
     the targets whose read gave no answer. An object on an unread cluster is
     in neither list, so an empty `stalled` is never "everything is applying".
+    `hosts` counts the entries that ran Config Connector (that carry
+    `kcc_unready`, also empty): with more than one, the same object name can
+    be ready on one host and not ready on another.
     """
 
     stalled: list[KccStall]
     unread: list[str]
+    hosts: int = 0
 
 
 def kcc_health(manifest: dict | None) -> KccHealth:
     """The `kcc_unready` and `kcc_unread` keys of every entry in `manifest`."""
     stalled: list[KccStall] = []
     unread: list[str] = []
+    hosts = 0
     for entry in (manifest or {}).get("clusters") or []:
         if not isinstance(entry, dict):
             continue
         host = str(entry.get("name") or "")
         if entry.get(KCC_UNREAD_FIELD):
             unread.append(host)
+        if isinstance(entry.get(KCC_UNREADY_FIELD), list):
+            hosts += 1
         for record in entry.get(KCC_UNREADY_FIELD) or []:
             if not isinstance(record, dict) or not record.get("kind") or not record.get("name"):
                 continue
@@ -18669,9 +18686,10 @@ def kcc_health(manifest: dict | None) -> KccHealth:
                     str(record.get("resource") or ""),
                     str(record.get("cluster") or ""),
                     host,
+                    str(record.get("project") or ""),
                 )
             )
-    return KccHealth(stalled, unread)
+    return KccHealth(stalled, unread, hosts)
 
 
 def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall]:
@@ -18706,45 +18724,75 @@ def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall
     return found
 
 
-def _remediation_file_stalls(
-    finding: dict, root: Path, stalled: list[KccStall]
-) -> list[KccStall]:
-    """The unready objects the file of `finding`'s `manifest` fix declares.
-
-    The file is parsed as the Config Connector index parses a clone
-    (`_index_kcc_text`), and an object matches on its kind, its
-    `metadata.name`, and its namespace when the file sets one. Where the file
-    object and the recorded object both name a `clusterRef`, the two must be
-    equal. A match that is not certain names nothing: objects that fit on
-    more than one host cluster (Config Controller puts every instance's
-    objects in one namespace), or, when the file sets no namespace, more than
-    one object that fits. A file the audit cannot read or parse declares
-    nothing.
-    """
+def _remediation_file_index(finding: dict, root: Path) -> dict[KccKey, KccDeclaration]:
+    """The Config Connector objects the file of `finding`'s `manifest` fix
+    declares, parsed as the Config Connector index parses a clone
+    (`_index_kcc_text`). Empty for another kind of fix, and for a file the
+    audit cannot read or parse."""
     remediation = finding.get("remediation") or {}
     if remediation.get("kind") != MANIFEST_REMEDIATION_KIND:
-        return []
+        return {}
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the note
     except ImportError:
-        return []
+        return {}
     relative = str(remediation.get("path") or "")
     if not relative:
-        return []
+        return {}
     try:
         target = (root / relative).resolve()
         if root.resolve() not in target.parents:
-            return []
+            return {}
         text = target.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return []
+        return {}
     index: dict[KccKey, KccDeclaration] = {}
     _index_kcc_text(index, yaml, text, "", relative)
+    return index
+
+
+def _finding_project(finding: dict) -> str:
+    """The project of `finding`'s `project/location/name` cluster, or `""`."""
+    parts = str(finding.get("cluster") or "").split("/")
+    return parts[0] if len(parts) == CLUSTER_TARGET_SEGMENTS else ""
+
+
+def _project_certain(stall: KccStall, project: str, kcc_hosts: int) -> bool:
+    """Whether `stall` is certainly the object of `project`.
+
+    With one host that runs Config Connector, the name decides. With more,
+    the same name can be ready on one host and not ready on another, and the
+    list of unready objects cannot show that. Then only a known project that
+    agrees makes the match certain.
+    """
+    if kcc_hosts <= 1:
+        return True
+    return bool(stall.project) and stall.project == project
+
+
+def _remediation_file_stalls(
+    finding: dict, index: dict[KccKey, KccDeclaration], stalled: list[KccStall], kcc_hosts: int
+) -> list[KccStall]:
+    """The unready objects that the file of `finding`'s `manifest` fix
+    declares (`index`, from `_remediation_file_index`).
+
+    An object matches on its kind, its `metadata.name`, and its namespace
+    when the file sets one. Where the file object and the recorded object
+    both name a `clusterRef`, the two must be equal. A match that is not
+    certain names nothing: objects that fit on more than one host cluster
+    (Config Controller puts every instance's objects in one namespace), or,
+    when the file sets no namespace, more than one object that fits. With
+    more than one host that runs Config Connector (`kcc_hosts`), the
+    recorded object's project must be known and agree with the file
+    object's project annotation, or with the finding's project when the
+    file has none (`_project_certain`).
+    """
     matched: list[KccStall] = []
     for (kind, _, cluster_ref, _), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
         file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
+        project = declaration.project or _finding_project(finding)
         fits = [
             stall
             for stall in stalled
@@ -18752,6 +18800,7 @@ def _remediation_file_stalls(
             and stall.name == declaration.name
             and (not declaration.namespace or stall.namespace == declaration.namespace)
             and not (file_ref and stall.cluster and stall.cluster != file_ref)
+            and _project_certain(stall, project, kcc_hosts)
         ]
         if len({stall.host for stall in fits}) > 1:
             continue
@@ -18761,17 +18810,21 @@ def _remediation_file_stalls(
     return matched
 
 
-def _object_stalls(finding: dict, stalled: list[KccStall]) -> list[KccStall]:
+def _object_stalls(finding: dict, stalled: list[KccStall], kcc_hosts: int) -> list[KccStall]:
     """The unready objects that are `finding`'s own object: a `Cluster/` or
     `NodePool/` finding, matched on the name GKE reports (the object's
     `resourceID`, else its name) and, for a node pool, on its cluster.
-    Objects that fit on more than one host cluster name nothing, as in
-    `_remediation_file_stalls`: the match is not certain."""
+    An object whose project is known must manage the finding's project, and
+    with more than one host that runs Config Connector the project must be
+    known (`_project_certain`). Objects that fit on more than one host
+    cluster name nothing, as in `_remediation_file_stalls`: the match is not
+    certain."""
     prefix, _, name = str(finding.get("object") or "").partition("/")
     kinds = _KCC_OBJECT_KINDS.get(prefix)
     if not kinds or not name:
         return []
     cluster = str(finding.get("cluster") or "").rpartition("/")[2]
+    project = _finding_project(finding)
     pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
     fits = [
         stall
@@ -18779,6 +18832,8 @@ def _object_stalls(finding: dict, stalled: list[KccStall]) -> list[KccStall]:
         if stall.kind in kinds
         and (stall.resource or stall.name) == name
         and (stall.kind not in pool_kinds or stall.cluster == cluster)
+        and not (stall.project and stall.project != project)
+        and _project_certain(stall, project, kcc_hosts)
     ]
     return fits if len({stall.host for stall in fits}) <= 1 else []
 
@@ -18883,9 +18938,13 @@ def disclose_stalled_kcc_remediations(
     It also writes `KCC_STALLED_FINDING_FIELD` on each finding whose fix file
     or own `Cluster/` or `NodePool/` object (`_object_stalls`) is unready, for
     the merged-but-persisting line and comment, which then state the stall
-    in place of their guess at a cause.
+    in place of their guess at a cause. A `manifest` fix uses its own object
+    only when its file declares a Config Connector object: a fix to another
+    file (a `ComputeClass`, say) did not change a declaration Config
+    Connector applies, so no Config Connector text goes on it.
     """
-    stalled = kcc_health(manifest).stalled
+    health = kcc_health(manifest)
+    stalled = health.stalled
     changed: list[str] = []
     for finding in findings:
         fid = str(finding.get("id", ""))
@@ -18893,8 +18952,11 @@ def disclose_stalled_kcc_remediations(
         before = remediation.get("note") if isinstance(remediation, dict) else None
         _strip_kcc_stalled_note(remediation)
         finding.pop(KCC_STALLED_FINDING_FIELD, None)
-        in_file = _remediation_file_stalls(finding, root, stalled) if stalled else []
-        matched = in_file or (_object_stalls(finding, stalled) if stalled else [])
+        index = _remediation_file_index(finding, root) if stalled else {}
+        in_file = _remediation_file_stalls(finding, index, stalled, health.hosts) if index else []
+        is_manifest = isinstance(remediation, dict) and remediation.get("kind") == MANIFEST_REMEDIATION_KIND
+        object_fallback = bool(stalled) and (bool(index) or not is_manifest)
+        matched = in_file or (_object_stalls(finding, stalled, health.hosts) if object_fallback else [])
         if matched:
             finding[KCC_STALLED_FINDING_FIELD] = kcc_stalled_objects(matched, stalled)
         if in_file and isinstance(remediation, dict):

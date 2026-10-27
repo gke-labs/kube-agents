@@ -22902,7 +22902,7 @@ class TestStalledKccRemediations(unittest.TestCase):
     def test_a_pool_stalled_for_its_own_cluster_gives_the_note(self):
         finding = self.gpu_pool_fix()
         prod = {"kind": "ContainerNodePool", "namespace": "config-control", "name": "gpu-pool",
-                "why": "UpdateFailed: quota", "cluster": "prod-a"}
+                "why": "UpdateFailed: quota", "cluster": "prod-a", "project": "acme"}
         staging = dict(prod, cluster="staging-a")
         manifest = self.two_hosts(("acme/us-central1/cc-prod", [prod]), ("acme/us-central1/cc-staging", [staging]))
         self.assertEqual(self.disclose([finding], manifest), ["release-channel"])
@@ -22925,11 +22925,82 @@ class TestStalledKccRemediations(unittest.TestCase):
 
     def test_a_dependency_is_followed_only_on_the_host_that_recorded_the_stall(self):
         finding = kcc_finding()
-        manifest = self.two_hosts(("acme/us-central1/hub", [KCC_CLUSTER]), ("acme/us-east1/hub2", [KCC_TOPIC]))
+        manifest = self.two_hosts(("acme/us-central1/hub", [dict(KCC_CLUSTER, project="acme")]), ("acme/us-east1/hub2", [KCC_TOPIC]))
         self.disclose([finding], manifest)
         note = finding["remediation"]["note"]
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, note)
         self.assertNotIn("which waits on", note)
+
+    CONFIG_CONTROL_PROD = """\
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: prod
+  namespace: config-control
+{annotations}spec:
+  location: us-central1
+"""
+
+    def config_control_fix(self, annotations=""):
+        self.write("clusters/prod/cluster.yaml", self.CONFIG_CONTROL_PROD.format(annotations=annotations))
+        finding = kcc_finding(path="clusters/prod/cluster.yaml")
+        finding.update(cluster="pa/us-central1/prod", object="Cluster/prod")
+        return finding
+
+    def test_a_name_unready_on_one_host_and_ready_on_another_is_not_certain(self):
+        """Host A runs Config Connector and its `config-control/prod` is
+        ready, so A lists nothing; host B's object of the same name is not
+        ready. Without a project, nothing tells the fix which one it edits."""
+        finding = self.config_control_fix()
+        stalled = {"kind": "ContainerCluster", "namespace": "config-control", "name": "prod", "why": "UpdateFailed: quota"}
+        manifest = self.two_hosts(("pa/us-central1/cc-a", []), ("pb/us-central1/cc-b", [stalled]))
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        # The finding's own object, with the fix file gone: no stall either.
+        own = kcc_finding(note="x", kind="gcloud")
+        own.update(cluster="pa/us-central1/prod", object="Cluster/prod")
+        self.disclose([own], manifest)
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+
+    def test_with_two_hosts_a_known_project_decides(self):
+        stalled = {"kind": "ContainerCluster", "namespace": "config-control", "name": "prod", "why": "UpdateFailed: quota"}
+        for record_project, annotations, expected in (
+            ("pb", "", False),  # B's object manages pb; the finding is in pa.
+            ("pa", "", True),  # it manages the finding's project.
+            ("pa", "  annotations:\n    cnrm.cloud.google.com/project-id: pb\n", False),  # the file names pb.
+            ("pb", "  annotations:\n    cnrm.cloud.google.com/project-id: pb\n", True),
+        ):
+            with self.subTest(record=record_project, annotations=bool(annotations)):
+                finding = self.config_control_fix(annotations)
+                manifest = self.two_hosts(("pa/us-central1/cc-a", []), ("pb/us-central1/cc-b", [dict(stalled, project=record_project)]))
+                self.disclose([finding], manifest)
+                self.assertEqual(audit_report.KCC_STALLED_NOTE_MARK in finding["remediation"]["note"], expected)
+
+    def test_a_cluster_finding_never_takes_a_stall_of_another_project(self):
+        """With one host, a known project still has to agree."""
+        own = kcc_finding(note="x", kind="gcloud")
+        own.update(cluster="pa/us-central1/prod", object="Cluster/prod")
+        record = {"kind": "ContainerCluster", "namespace": "config-control", "name": "prod", "why": "UpdateFailed", "project": "pb"}
+        self.disclose([own], kcc_manifest(record))
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+        self.disclose([own], kcc_manifest(dict(record, project="pa")))
+        self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+
+    def test_a_fix_to_a_file_with_no_config_connector_object_gets_no_config_connector_text(self):
+        """The finding's node pool is unready, but the fix edits a
+        `ComputeClass`: the merged fix did not change a Config Connector
+        declaration, so the persists texts must not say it did."""
+        self.write("classes/gpu.yaml", "apiVersion: cloud.google.com/v1\nkind: ComputeClass\nmetadata:\n  name: gpu\n")
+        finding = make_finding(
+            fid="p", cluster="acme/us-central1/prod-usc1", obj="NodePool/gpu-pool",
+            remediation={"kind": "manifest", "path": "classes/gpu.yaml", "note": "Add a fallback."},
+        )
+        pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "gpu-pool", "why": "UpdateFailed", "cluster": "prod-usc1"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(pool)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.assertEqual(finding["remediation"]["note"], "Add a fallback.")
+        comment = audit_report.render_persists_comment(AUDIT, finding, NOW)
+        self.assertNotIn("Config Connector", comment)
 
     def test_a_transient_reason_is_not_a_stall(self):
         """Config Connector sets `Updating` and `Deleting` while it still

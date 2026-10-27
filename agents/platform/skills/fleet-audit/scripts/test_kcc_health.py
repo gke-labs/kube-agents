@@ -103,6 +103,14 @@ class UnreadyObjectsTest(unittest.TestCase):
             ],
         )
 
+    def test_the_target_project_comes_from_the_objects_annotation(self):
+        annotated = kcc_object("ContainerCluster", "prod", namespace="config-control", status="False", reason="UpdateFailed")
+        annotated["metadata"]["annotations"] = {"cnrm.cloud.google.com/project-id": "pa"}
+        bare = kcc_object("ContainerCluster", "other", namespace="config-control", status="False", reason="UpdateFailed")
+        found = {r["name"]: r for r in kcc_health.unready_objects([annotated, bare])}
+        self.assertEqual(found["prod"]["project"], "pa")
+        self.assertNotIn("project", found["other"])
+
     def test_a_transient_reason_is_not_unready(self):
         """`Updating` and `Deleting` mean Config Connector still applies the
         object; the note must not say it is not applying."""

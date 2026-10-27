@@ -17,8 +17,11 @@ the result on that cluster's manifest entry:
   other than a transient one (`TRANSIENT_REASONS`: Config Connector is still
   applying or deleting the object), each as
   `{kind, namespace, name, why}`, plus `resource` (the object's
-  `spec.resourceID`) and `cluster` (a `ContainerNodePool`'s `clusterRef`) where
-  they are set. An empty list means the cluster runs Config Connector and every
+  `spec.resourceID`), `cluster` (a `ContainerNodePool`'s `clusterRef`) and
+  `project` (the GCP project the object manages, from its
+  `cnrm.cloud.google.com/project-id` annotation) where they are set. An object
+  without the annotation has no `project`: the namespace's annotation is not
+  read. An empty list means the cluster runs Config Connector and every
   object it holds is ready or not yet reached.
 - `kcc_unread`: why the read did not give an answer (a timeout, a forbidden
   read, output that is not a list). This is "unknown", never "healthy".
@@ -61,6 +64,8 @@ KCC_READY_CONDITION = "Ready"
 TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
 # The kind whose identity needs its cluster: every cluster has a `default-pool`.
 KCC_NODE_POOL_KIND = "ContainerNodePool"
+# The annotation that names the GCP project a Config Connector object manages.
+KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
 # The manifest keys this module writes on a cluster entry.
 UNREADY_FIELD = "kcc_unready"
 UNREAD_FIELD = "kcc_unread"
@@ -194,6 +199,10 @@ def unready_objects(items: list) -> list[dict]:
             record["resource"] = resource
         if kind == KCC_NODE_POOL_KIND and _cluster_ref(spec):
             record["cluster"] = _cluster_ref(spec)
+        annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+        project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
+        if project:
+            record["project"] = project
         found.append(record)
     return sorted(found, key=lambda r: (r["kind"], r["namespace"], r["name"]))
 
