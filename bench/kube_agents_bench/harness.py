@@ -3246,15 +3246,34 @@ class KubeAgentsHarness(AgentHarness):
         # Final board messages for cards whose terminal status is blocked
         # (matching the guardrail's transient block); cards that completed or
         # unblocked retries that failed on other grounds are not infra.
-        board_messages = [
-            last_board_summaries[t]
-            for t in awaited
-            if latest.get(t) == "blocked" and t in last_board_summaries
-        ] + [
-            last_board_errors[t]
-            for t in awaited
-            if latest.get(t) == "blocked" and t in last_board_errors
-        ]
+        # If any card was recorded with a blocked summary/error, read final board state
+        # for awaited cards to ensure unblocked retries have fresh board state.
+        if last_board_summaries or last_board_errors:
+            final_bstate = board.read_board_state(_agent_shell, awaited, _EXEC_TIMEOUT)
+            if final_bstate is not None:
+                f_statuses, f_summaries, f_errors = final_bstate
+                latest.update(f_statuses)
+                board_messages = [
+                    f_summaries[t]
+                    for t in awaited
+                    if latest.get(t) == "blocked" and t in f_summaries
+                ] + [
+                    f_errors[t]
+                    for t in awaited
+                    if latest.get(t) == "blocked" and t in f_errors
+                ]
+            else:
+                board_messages = [
+                    last_board_summaries[t]
+                    for t in awaited
+                    if latest.get(t) == "blocked" and t in last_board_summaries
+                ] + [
+                    last_board_errors[t]
+                    for t in awaited
+                    if latest.get(t) == "blocked" and t in last_board_errors
+                ]
+        else:
+            board_messages = []
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.

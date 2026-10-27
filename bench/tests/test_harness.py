@@ -2295,6 +2295,72 @@ def test_delegated_worker_board_rate_limit_errors_cleared_on_retry_stays_graded(
     assert read_count >= 2
 
 
+def test_delegated_worker_board_rate_limit_multi_card_unblocked_retry_stays_graded(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In a multi-card wait, if t_1 was blocked on rate limit and retired, but unblocked/retried while t_2 kept the wait open, t_1's stale rate limit is not filed as infra."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                # Poll 1: t_1 blocked with 429, t_2 running
+                payload = {
+                    "statuses": {"t_1": "blocked", "t_2": "running"},
+                    "summaries": {"t_1": rate_limit_msg, "t_2": ""},
+                    "errors": {},
+                }
+            elif read_count == 2:
+                # Poll 2: only outstanding (t_2) is polled; t_2 running
+                payload = {
+                    "statuses": {"t_2": "running"},
+                    "summaries": {"t_2": ""},
+                    "errors": {},
+                }
+            else:
+                # Final read for awaited (t_1, t_2): t_1 was unblocked/retried without 429, t_2 blocked without 429
+                payload = {
+                    "statuses": {"t_1": "ready", "t_2": "blocked"},
+                    "summaries": {"t_1": "", "t_2": ""},
+                    "errors": {},
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} t_1 0\n{harness._LOG_PRESENT} t_2 0\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    # Turn 1: create cards t_1 and t_2
+    turn_1 = _turn(
+        *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": "t_1", "status": "ready"}, "c1"),
+        *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": "t_2", "status": "ready"}, "c2"),
+        _text("Created tasks"),
+    )
+    # Turn 2: status turn reporting t_1 blocked, t_2 running (t_1 leaves outstanding)
+    turn_2 = _turn(
+        *_call("kanban_show", {"task_id": "t_1"}, {"task": {"id": "t_1", "status": "blocked"}}, "s1"),
+        *_call("kanban_show", {"task_id": "t_2"}, {"task": {"id": "t_2", "status": "running"}}, "s2"),
+        _text("Status update"),
+    )
+    # Turn 3: status turn reporting t_2 blocked (both terminal now)
+    turn_3 = _turn(
+        *_call("kanban_show", {"task_id": "t_2"}, {"task": {"id": "t_2", "status": "blocked"}}, "s3"),
+        _text("Status update 2"),
+    )
+    stub_agent.turns = [turn_1, turn_2, turn_3]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 3
+
+
 def test_delegated_worker_board_rate_limit_cleared_on_status_turn_unblock_even_if_next_board_exec_fails(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
