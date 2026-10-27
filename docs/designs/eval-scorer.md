@@ -152,7 +152,7 @@ can carry the delegated workers' tagged entries and token counts. The scorer sti
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
-door showed no trace or a trace that lost calls: the first matrix run through the door (#2007, 2026-09-25) collapsed
+door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`, a stopped ask's) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
@@ -240,6 +240,14 @@ not grade is neither: it ran and was read, so it is not a wiped case for the flo
 arms nor disarms the all-cases guard, which reads the gradable cases alone. It is listed under
 its own key, `not_graded`, and named in a note; a run whose every case was not graded is
 `not_evaluated` with a reason saying the suite graded nothing, not that infrastructure took it.
+A case not run because the lease-time seeded-fleet scan saw a fixture it needs drifted
+(`hack/ci-eval-pr.sh` records every repetition under `fixture-drift:<role>`;
+`kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
+not a wiped case for the floor either: a role is excused only when the lease-time read, after
+the pool verifier's convergence wait, and the hourly scan's last two passes all show it drifted,
+so it is not weather a rerun clears, and nothing in the change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+named in a note. It still counts toward the all-cases guard, and a case with even one repetition
+lost some other way is weather as before.
 A blocking case outranks the
 weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
 the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
@@ -1043,8 +1051,7 @@ export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
 the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
-so record under the version key's `next` mode; `ci-kube-agents-eval-nightly-today` in the same file
-is the same recorder on a `today` install, and keeps today's window.
+so record under the version key's `next` mode. No job in the file records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the

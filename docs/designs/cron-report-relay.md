@@ -241,15 +241,19 @@ run saves the previous run's finding ids on the entry before it touches the ledg
 that run filed, rendered or not, so a finding a body over budget cut is not the run's new; a later
 `finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
 whole run, and its line states the run's new and resolved findings, or says the change is unknown
-when the first `finish` had no trusted memory of the previous run. Its JSON line still counts
-against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
+when the first `finish` had no trusted memory of the previous run. With the ids, the first
+`finish` saves what it read about the last scheduled run, so the line on that chat report that
+says the change since the last scheduled run also covers the whole run (`run_since_scheduled`).
+The JSON line of the later `finish` still counts against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
 `finish` does not save the mid-run memory it reads after an earlier one filled the entry without
 them. A no-forge or HELD report, or an entry without those
 ids, keeps a label that says its counts are against the earlier `finish`: the report above, or
 what it published. The earlier `finish` saves its
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
-it writes the report store. When that was `false` the later one is not silent either and its automatic
-sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
+it writes the report store. With it, it saves `news`: true when it reported news or opened a pull
+request. When `news` was true the later one is not silent either and its automatic
+sweep opens no pull request (`earlier_finish`, `silent_floor`). The floor does not read `silent_ok`,
+because an on-demand `finish` always gets `silent_ok: false`, also when it reported nothing new. A `finish` with no `start` fills no entry,
 but while a current record holds this repository's entry with a saved verdict it is taken for a
 later `finish` of that run, and the
 relay posts that run's report again with its own under it. The relay
@@ -707,6 +711,10 @@ carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
 scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
 sender and carries no such guard; no roster job uses `"all"`.
+
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+That sentence controls silence, not delivery: a prompt without it only makes the job noisier
+([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 
 ## How the switch is wired: `chat` is a platform
 

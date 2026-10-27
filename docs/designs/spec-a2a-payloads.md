@@ -345,7 +345,7 @@ calls and become properties of the stream:
 | `message/send` (new task)        | Publish `kind: message` to `a2a.tasks.{addressee}.{taskId}.in`, or for a profile to `a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit` (10/22). The publisher mints `taskId` - a deviation from HTTP A2A, where the server mints it, but the subject has to exist before anyone can answer on it.                                                                                                                              |
 | `message/stream`                 | The same publish, plus subscribe to BOTH the `events` and `supervisor` subjects - which a session pod cannot do today under its derived grants; see spec-chatops-gateway.md. Streaming is not an optional capability here; it is how the bus works. A subscriber to `events` alone is not wrong about anything it sees, but it never sees the terminal a supervisor declares, so it waits out a task the bus has already ended. |
 | `tasks/get`                      | Replay the `events` and `supervisor` subjects from sequence 1, in stream order, and fold them into a `Task`. No live executor required - this is the durability payoff. The two subjects share the stream sequence, so the fold needs no merge; whichever terminal the stream holds first is the task's, and the other is a post-final drop.                                                                                    |
-| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first; both orders are legal and the terminal event wins.                                                                                                                                                                                                                                |
+| `tasks/cancel`                   | Publish `kind: cancel` to the `in` subject. The executor emits a terminal `canceled`. A task racing to completion may emit `completed` first (or `failed` with `reason: hermes-unstructured-reasoning` when the bridge withholds the answer, assertion 13); both orders are legal and the terminal event wins.                                                                                                                  |
 | `tasks/resubscribe`              | JetStream consumer resume from the last delivered sequence. Comes with the transport.                                                                                                                                                                                                                                                                                                                                           |
 | push notification config methods | Not mapped. The bus is push; the library reports these as unsupported.                                                                                                                                                                                                                                                                                                                                                          |
 
@@ -882,7 +882,9 @@ counts are what it could not promise: `failed` cards it could not archive, `pend
 archives still running when it ran out of time, and `unresolved` cards claimed just before
 the stop, for which a worker may still start. `truncated` says more cards were open than one
 stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
-cut to fit the part. A stop that failed carries no part and ends `failed` with
+cut to fit the part. An optional list rides beside them for the Slack Stop button's reply
+(spec-chatops-gateway, the Slack adapter): `notStopped`, the cards the three counts count, by id
+and title. An executor that sends none leaves it out, which reads as none named. A stop that failed carries no part and ends `failed` with
 `reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
 bus refuses the result with the part, the text goes alone, so a `completed` control can
 arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.
@@ -1059,7 +1061,10 @@ Lifecycle:
     next status event is `working`. A follow-up during `working` is delivered to the
     executor and does not by itself change task state.
 13. A cancel always results in a terminal event - `canceled`, or `completed` if the race
-    was lost - never a silent stop.
+    was lost - never a silent stop. Amended 10/22: when the answer that won the race opens
+    with the model's own reasoning (#3206), the Hermes bridge withholds it and the
+    terminal is `failed` with `reason: hermes-unstructured-reasoning` instead of
+    `completed`.
 
 Correlation:
 

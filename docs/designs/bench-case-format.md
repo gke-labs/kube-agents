@@ -54,11 +54,17 @@ references.
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
 than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner.
-A first line of `[bench:card-failure-wake]` or `[bench:slack-question-wake]` makes the run a
-replay of a card's wake rather than an ask
+A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
+on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
-needs an entry in `hack/eval/inject-lane-exclusions.txt`.
+needs an entry in `hack/eval/inject-lane-exclusions.txt`. A first line of
+`[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
+prompt an ask the harness stops once it has filed a card
+([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
+only over the inject transport, so the case needs an entry in
+`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
+`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -246,7 +252,7 @@ the workers' included; a report that states none passes), `tool_called` (calls i
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
+repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
@@ -445,7 +451,7 @@ declares a domain.
 There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
 the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
 one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
-fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist, as a record with `since`, `issue` and an `expires` date (the comment above `allowlist:` describes the fields).
 
 ## Every case declares a verification spec
 
@@ -491,7 +497,9 @@ test checks both, so two case pull requests don't edit the same lines). It lands
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
-the night it merges, its record accrues in the evidence store, and a presubmit seat is a
+the night it merges, its record accrues in the evidence store (for a case in
+`hack/eval/api-lane-exclusions.txt`, which runs only over the inject transport, under the
+version key's `next` mode), and a presubmit seat is a
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as

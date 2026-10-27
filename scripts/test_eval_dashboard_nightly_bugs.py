@@ -27,6 +27,7 @@ from eval_dashboard import nightly_bugs
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 JOB = "ci-kube-agents-eval-nightly"
 WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
+MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 REPO = "gke-labs/kube-agents"
 ISSUES = f"repos/{REPO}/issues"
 FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: required phrases absent"
@@ -807,6 +808,23 @@ class InfraCaseTest(Harness):
         self.assertIn("`3 of 3 repetitions infrastructure: agent run failed: http 429 RESOURCE_EXHAUSTED`", body)
         self.assertIn("eval_case-red_rep1.log", body)
 
+    def test_a_drifted_fixture_files_no_domain_bug_and_one_infra_issue_naming_the_role(self):
+        # hack/ci-eval-pr.sh recorded every repetition without running it:
+        # the lease-time scan saw version-laggard drifted on each night.
+        reason = (
+            "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade "
+            "(fixture-drift:version-laggard: cluster currentMasterVersion minor_behind_channel_default: observed the default)"
+        )
+
+        def drifted():
+            return {"name": "case-red", "result": "infra", "reps": [rep(i + 1, "infra", reason) for i in range(3)]}
+
+        gh, _, _ = self.run_once(data(*(night(d, [drifted()]) for d in (15, 16, 17))))
+        self.assertEqual(self.filed(gh), [], "never a nightly-red bug against the case")
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("3 of 3 repetitions infrastructure: ", issue["body"])
+        self.assertIn("fixture-drift:version-laggard", issue["body"])
+
     def test_a_case_with_no_line_on_clean_nights_files(self):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
         [issue] = self.filed(gh, infra=True)
@@ -1021,6 +1039,17 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*runs, night(18, [green("case-red")])), FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
         self.assertIn("`case-red` was graded on the 2026-10-18 nightly", comment)
+
+    def test_an_open_issue_naming_the_main_b_job_is_read_on_the_main_b_part(self):
+        # As above, but main-b ran the case: the note cites main-b's build.
+        issue = {"number": 3976, "title": "t", "body": f"<!-- kube-agents-bot:nightly-infra case=case-red --> (`{MAIN_B_JOB}`)", "created_at": "2026-10-04T12:00:00Z"}
+        main = [night(d, []) for d in range(1, 18)]
+        main_b = [night(1, [green("case-red")], job=MAIN_B_JOB, hour="09")] + [night(d, [], job=MAIN_B_JOB, hour="09") for d in range(2, 18)]
+        gh, _, _ = self.run_once(data(*sorted(main + main_b, key=lambda r: r["build_id"])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly", comment)
+        self.assertIn("the main-b part ran to its verdict", comment)
+        self.assertIn(f"/logs/{MAIN_B_JOB}/30000000000000170902)", comment)
 
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the

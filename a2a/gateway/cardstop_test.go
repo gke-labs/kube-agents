@@ -707,7 +707,7 @@ func TestCardStopFollowUpSkippedWhenTheRouteMoved(t *testing.T) {
 func TestCardStopFollowUpSkippedWhenTheStopIsOff(t *testing.T) {
 	r := startRigWith(t, func(c *Config) { c.CardStop = false })
 	rec := &SessionRecord{Key: "discord:g1/thread-cardstop-again-off", Addressee: "platform", ContextID: "ctx-off"}
-	r.g.followUpCardStop(context.Background(), rec, Authority{})
+	r.g.followUpCardStop(context.Background(), rec, Authority{}, CardStopRun{})
 	waitFor(t, "the off line", shown(r, cardStopOffNotice))
 	if shown(r, cardStopSkippedNotice)() || rec.CardStop != nil {
 		t.Fatalf("posts %q, control %+v: want the off line and no control", r.adapter.postTexts(), rec.CardStop)

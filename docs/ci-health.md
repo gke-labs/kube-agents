@@ -41,8 +41,9 @@ a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
 the section was skipped. A night can be the builds of up to three periodics
 (the main job, the main-b job when the main part runs as two halves, and the
 writers job), reported as one night: the line names a part that is missing,
-still running or cut short, and the night counts as cut short when its main or
-main-b part is. `scripts/eval_dashboard/nightly.py` derives that line
+still running or cut short, the night counts as cut short when its main or
+main-b part is, and a night without its main or main-b part gives no verdict on
+what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
@@ -71,7 +72,9 @@ OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
 pool-project drift owes its owner (`gate_issue.py`), files a bug for a case
 the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
-([Nightly bugs](#nightly-bugs)), and appends `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
+([Nightly bugs](#nightly-bugs)), renders the weekly health email beside
+`data.json` ([The weekly health email](#the-weekly-health-email)), and appends
+`health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
 publishing `fixture-state.json` and `pool-state.json` beside `health.json`
@@ -170,8 +173,9 @@ jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
-spare again) — a red on a case that depends on the drifted fixture, from a run
-that leased one of those projects, is the fixture's, not the change's; for pool
+spare again) — a case whose grade depends on the drifted fixture is recorded as
+infrastructure on a run whose own lease-time scan saw the drift, and a red on such a
+case from a run whose scan could not read the role is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries. Who the
 fleet owner, the pool owner and the person who owns the gate are is recorded
 in [`docs/ownership.md`](ownership.md).
@@ -910,6 +914,66 @@ point into this repository). Links are checked for form, not fetched: the
 dashboard's links sit behind a Google login a fetch from the job cannot pass.
 It never posts partial numbers.
 
+## The weekly health email
+
+`scripts/eval_dashboard/weekly_email.py` renders a one-page summary of the
+nightly tier for leadership and the team. Its step runs after the bug filer, so
+a bug filed that tick counts, and publishes it as `health-email.html` beside
+`data.json`. Nothing sends it yet: the mail route,
+the sending account and the chat line that links to it are still to be decided.
+
+The week is the seven nightly dates ending on the Sunday before the tick
+(`--week-end` overrides it), compared with the seven before. A night counts
+when none of its parts was cut off at the job deadline, it has a main part, and
+it is not a night on which nearly every graded case failed; two counted nights
+on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
+(infrastructure repetitions are never graded), over the scenarios graded in both
+weeks; a scenario graded in only one week is left out and counted in the
+closing note.
+
+The page carries the robot from the docs site, a one-paragraph intro, three
+tiles (pass rate and its change, scenarios compared, the median `agent_s` of
+the compared scenarios' graded repetitions), a "Needs attention" box, one row per area with
+its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
+owners), how failures become bugs, and a footer naming the dates and the model
+the evidence store records for the counted nights' builds (`store.json`).
+
+The page is written only when every check passes; otherwise the script prints
+each reason and exits 1, the step logs a warning, and the last published copy
+stays. The checks:
+
+- **Same cases.** Both weeks' numbers are over one set of scenarios, and the
+  counts shown add up to it.
+- **Truncated nights.** No counted night was cut off.
+- **Not enough data.** With fewer than 4 counted nights in either week, the
+  intro says so and nothing is called up, down or steady.
+- **Few scenarios.** An area with fewer than 3 scenarios is marked "few
+  scenarios" and gets no trend.
+- **Claims.** Every sentence comes from a template with a rule: "in great
+  shape" needs 85% or more and not down; "less than half the time" needs below
+  50%; "down N pts" needs a drop of 3 points or more over 3 or more scenarios.
+  A change under 3 points is "steady".
+- **Needs attention.** Exactly the areas below 65% or down 5 points or more.
+  Each links to its open `nightly-red` + `domain:<slug>` issues with the count.
+- **Bugs exist.** The `nightly-red` issues are read from GitHub (GraphQL,
+  checked against its total count). A case the bug filer files for right now
+  (failing every graded repetition on its last 3 graded nights, on the nightly
+  matrix, not `expected_fail`) with no issue tracking it blocks the render: no
+  open issue names it, and no closed one still tracks it by the filer's rule
+  ([Nightly bugs](#nightly-bugs)). While the filer runs in dry run, every such
+  case blocks.
+- **Links.** Every `href` and `src` is a well-formed https URL. They are not
+  fetched: the dashboard link answers a login redirect, not a 200.
+- **Domains.** Every domain in the data is a row in `domains.yaml`, and every
+  row has nightly data that week unless it carries `new: true`.
+- **Footer.** Every counted night has a model in the evidence store, and the
+  footer names those models and the two weeks' dates; a week that changed model
+  says so in the intro.
+
+Locally,
+`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html`
+renders against any downloaded pair (it reads the issues with `gh`).
+
 ## The seeded-fleet scan
 
 Presence probes passed on 2026-09-07 while every slot-a fixture sat Pending on
@@ -982,10 +1046,11 @@ crashloop fixture lagged the node repair by about 40 minutes on one project (it
 needs its first restart before OOMKilled evidence exists), and one hourly scan
 can land inside that window. Three projects at once is the fleet-wide shape
 (#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
-run-based condition (nothing in the presubmit runs this check or acts on a
-drift, so a drifted fixture reds only the cases that depend on it, on the runs that
-lease those projects; the run-based conditions see that red as it happens, and
-this one names the cause and its owner), and it ends the hour a scan that could
+run-based condition (the presubmit runs the same check on its own lease and
+records the cases that need a drifted role as infrastructure under
+`fixture-drift:<role>` rather than running them, so a fixture the lease's own
+scan saw drifted reds no pull request; this condition names the cause and its
+owner), and it ends the hour a scan that could
 read the incident's roles on the incident's projects no longer shows it — three
 green runs could all have leased healthy projects and say nothing about the
 fixture, and a scan that is missing, stale, blind, or that could not read one of

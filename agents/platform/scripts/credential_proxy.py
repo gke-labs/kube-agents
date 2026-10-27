@@ -600,13 +600,26 @@ ADMISSION_BOUNDS = frozenset(
 # and is counted by ADMISSION_REFUSALS_METRIC instead. The top bucket holds
 # the waits that were answered just under it.
 ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
-# The version-control route's counter, by verb and outcome: the series the
-# operator reads `status.usage.remediationsProposedTotal` from, as
-# `verb="proposal-create",status="success"`. The verb label is the route
-# table's vocabulary (vcs_broker.VCS_VERBS) or LABEL_OTHER; the status label
-# reuses the exec route's outcome words.
+# The version-control route's counter, by verb, outcome and provider: the
+# series the operator reads `status.usage.remediationsProposedTotal` from, as
+# `verb="proposal-create",status="success"` summed over the provider. The verb
+# label is the route table's vocabulary (vcs_broker.VCS_VERBS) or LABEL_OTHER;
+# the status label reuses the exec route's outcome words; the provider label
+# is the built forge the route resolved the repository to (VCS_PROVIDERS, else
+# LABEL_OTHER) or VCS_PROVIDER_NONE when the route resolved no built forge:
+# every `capabilities` request (ungated; its route resolves a forge this
+# counter never sees), a host this
+# install serves no forge for (a registry stub, or no entry at all), and any
+# exit before the resolve (a verb refused, failed, busy or abandoned ahead of
+# the managed-repository resolve).
 VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
+VCS_PROVIDER_LABEL = "provider"
+VCS_PROVIDER_NONE = "none"
+# The provider label's closed set: the names of the forge classes this image
+# ships (providers.AVAILABLE), which is also the set the registry admits a
+# configured forge from, so a configured forge's name is always in it.
+VCS_PROVIDERS = frozenset(cls.name for cls in providers.AVAILABLE)
 # Proposals this install opened that the forge reports merged, counted once
 # each per broker process as the broker's reads show them
 # (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
@@ -8767,7 +8780,7 @@ class ProxyMetrics:
         self._lock = threading.Lock()
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
-        self._vcs: dict[tuple[str, str], int] = {}
+        self._vcs: dict[tuple[str, str, str], int] = {}
         self._merged = 0
         self._closed_unmerged = 0
         self._failures: dict[tuple[str, str], int] = {}
@@ -8855,8 +8868,15 @@ class ProxyMetrics:
         with self._lock:
             self._requests[key] = self._requests.get(key, 0) + 1
 
-    def record_vcs(self, verb: str, status: str) -> None:
-        key = (verb, status)
+    def record_vcs(self, verb: str, status: str, provider: str = VCS_PROVIDER_NONE) -> None:
+        # An exit that named no outcome, or a word outside VCS_STATUSES, is a
+        # fault of the broker's own and counts as one; a None here used to
+        # break every later render, taking the whole exposition down.
+        if status not in VCS_STATUSES:
+            status = TOOL_STATUS_ERROR
+        if provider != VCS_PROVIDER_NONE and provider not in VCS_PROVIDERS:
+            provider = LABEL_OTHER
+        key = (verb, status, provider)
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
@@ -8948,13 +8968,14 @@ class ProxyMetrics:
                     f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
                 ]
         lines += [
-            f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb and outcome.",
+            f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb, outcome and provider (the forge the request resolved to; {VCS_PROVIDER_NONE} when the route resolved no built forge: every capabilities request, a host this install serves no forge for, and any exit before the resolve).",
             f"# TYPE {VCS_REQUESTS_METRIC} counter",
         ]
-        for (verb, status), count in vcs:
+        for (verb, status, provider), count in vcs:
             lines.append(
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
-                f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
+                f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
+                f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
             )
         lines += [
             f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
@@ -10984,16 +11005,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
 
-        Counts the request under its verb and outcome once the dispatch has
-        answered, whichever exit it took; the verb label is the route table's
-        vocabulary or LABEL_OTHER, never the path.
+        Counts the request under its verb, outcome and provider once the
+        dispatch has answered, whichever exit it took; the verb label is the
+        route table's vocabulary or LABEL_OTHER, never the path, and the
+        provider is the forge the dispatch resolved, or VCS_PROVIDER_NONE for
+        every exit it took before one resolved.
         """
         # Hyphens and underscores reach the same route. A caller that guessed
         # the punctuation wrong should not get a 404 that reads as though the
         # verb does not exist.
         verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+        self.vcs_provider = VCS_PROVIDER_NONE
         status = self._dispatch_vcs_post(verb)
-        self.metrics.record_vcs(_vcs_verb_label(verb), status)
+        self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
 
     def _dispatch_vcs_post(self, verb: str) -> str:
         """Answer one version-control request and return its outcome label.
@@ -11002,6 +11026,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         they are a different protocol: every route here stands alone, holds
         nothing across calls and leaves nothing behind, so there is no handle
         argument for any of them to carry.
+
+        Sets `self.vcs_provider` to the resolved forge's name the moment the
+        managed-repository resolve succeeds on a built forge, so the counter
+        names the forge on every exit after that point (a refused managed
+        list, a forge fault) and the fixed word on every exit before it. A
+        registry stub (a host this install has no forge for, kept in the
+        table to name the gap) is not a forge the request reached, so it
+        leaves the fixed word in place.
         """
         # The per-verb half of the caller split, ahead of everything that
         # spends anything: the route table, the request slot, the body read,
@@ -11096,6 +11128,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
                         refused = exc.status == HTTPStatus.FORBIDDEN or isinstance(exc, providers.ForgeUnsupported)
                         return TOOL_STATUS_BLOCKED if refused else TOOL_STATUS_ERROR
+                    if not isinstance(forge, providers.StubForge):
+                        self.vcs_provider = forge.name
                     if not self._repository_is_permitted(repository, forge):
                         # Refused on the managed list, or the list itself could
                         # not be read: the first is a refusal, the second a fault.
@@ -11142,7 +11176,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             refusal = self.executor.tls_refusal(str(exc.stderr or "")) if self.executor else None
             if refusal is not None:
                 self._json(HTTPStatus(refusal.status), _redacted_fields(refusal))
-                return
+                # A 502 like the git failure below it: the forge's certificate
+                # did not verify, a fault of the upstream, not a refusal here.
+                return TOOL_STATUS_ERROR
             self._json(
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
