@@ -114,12 +114,12 @@ RECONCILE_COMMAND = ("python3", "/opt/data/scripts/cluster_agent_reconcile.py")
 RECONCILE_TIMEOUT_SECONDS = 1800
 # Marks cron jobs due for the next profile-cron-tick the way the OOBE job does
 # (agents/chat/scripts/oobe.py): Hermes's cron.jobs.trigger_job, with HERMES_HOME set to the
-# home of the profile whose roster holds the jobs. It prints the jobs it could not mark.
+# home of the profile whose roster holds the jobs. It names the jobs it could not mark on stderr.
 JOB_PYTHON = "/opt/hermes/.venv/bin/python3"
 JOB_TRIGGER_SCRIPT = (
     "import sys\nfrom cron.jobs import trigger_job\n"
     "missed = [job for job in sys.argv[1:] if not trigger_job(job)]\n"
-    "print(' '.join(missed))\nsys.exit(3 if missed else 0)\n"
+    "if missed:\n    sys.exit('not marked: ' + ' '.join(missed))\n"
 )
 # Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished".
 JOB_RUNS_SCRIPT = (
