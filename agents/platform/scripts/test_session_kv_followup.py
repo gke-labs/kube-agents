@@ -119,14 +119,21 @@ class FollowupInjectTest(unittest.TestCase):
         # The watcher re-sends when its 10s client gives up while the first
         # handler still waits on the board's write lock; the second is told to
         # come back rather than queue a second line behind the first.
-        def slow_comment(session_id, text, card=None):
+        def retry_now():
             again = self.client.post("/sessions/k8s-evt-slow/inject", json={"message": json.dumps(FOLLOWUP)})
             self.assertEqual(again.status_code, 503)
+
+        def slow_read(session_id):
+            retry_now()  # a retry during the board read, the handler's longest wait
+            return "t_card1"
+
+        def slow_comment(session_id, text, card=None):
+            retry_now()  # and one during the write
             return True
-        with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1"), \
+        with patch.object(session_kv_server, "_card_for_alert_session", side_effect=slow_read) as lookup, \
              patch.object(session_kv_server, "_comment_alert_card", side_effect=slow_comment) as comment:
             first = self.client.post("/sessions/k8s-evt-slow/inject", json={"message": json.dumps(FOLLOWUP)})
-        self.assertEqual((first.json(), comment.call_count), ({"status": "followup"}, 1))
+        self.assertEqual((first.json(), lookup.call_count, comment.call_count), ({"status": "followup"}, 1, 1))
         self.assertNotIn("k8s-evt-slow", session_kv_server._FOLLOWUP_CARD_IN_FLIGHT)
 
     def test_no_card_yet_waits_an_hour_from_the_first_attempt_and_is_unrouted_after(self):

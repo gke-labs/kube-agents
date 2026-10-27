@@ -6524,16 +6524,19 @@ def _inject_followup(
             return {"status": "followup"}  # the watcher's retry of a line already on the card
         if session_id in _FOLLOWUP_CARD_IN_FLIGHT:
             raise HTTPException(status_code=503, detail="no chat thread, and the card comment is still being written; retry")
-        can_wait = _followup_can_wait_for_card(session_id)
-        card = _card_for_alert_session(session_id)
-        if not card or card == BOARD_UNREADABLE:
-            if can_wait:
-                why = "the board cannot say whether the alert has a card" if card == BOARD_UNREADABLE else "the alert's card is not on the board yet"
-                raise HTTPException(status_code=503, detail=f"no chat thread, and {why}; retry")
-            logger.info(f"Follow-up for session {session_id}: no chat thread and no card found within the hour; nothing posted")
-            return {"status": "unrouted"}
+        # In flight from the board read on, not from the write: the read is the
+        # handler's longest wait, and a retry arriving during it must not read
+        # and write a second line of its own.
         _FOLLOWUP_CARD_IN_FLIGHT.add(session_id)
         try:
+            can_wait = _followup_can_wait_for_card(session_id)
+            card = _card_for_alert_session(session_id)
+            if not card or card == BOARD_UNREADABLE:
+                why = "the board cannot say whether the alert has a card" if card == BOARD_UNREADABLE else "the alert's card is not on the board yet"
+                if can_wait:
+                    raise HTTPException(status_code=503, detail=f"no chat thread, and {why}; retry")
+                logger.info(f"Follow-up for session {session_id}: no chat thread, and {why}, an hour after the first attempt; nothing posted")
+                return {"status": "unrouted"}
             landed = _comment_alert_card(session_id, text, card=card)
         finally:
             _FOLLOWUP_CARD_IN_FLIGHT.discard(session_id)
