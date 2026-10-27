@@ -1673,6 +1673,55 @@ def _minutes(record: Record) -> float:
     return max((ended - started).total_seconds(), 1.0) / SECONDS_PER_MINUTE
 
 
+@dataclass(frozen=True)
+class CpuRun:
+    """The CPU of one container in an operation's runs at one cluster count and one CPU limit:
+    the highest peak, whether the limit capped any run, and the mean average."""
+
+    operation: str
+    clusters: float
+    limit: float | None
+    runs: int
+    peak: float | None
+    capped: bool
+    # CPU-seconds over the window divided by the window: the work, which keeps growing after the
+    # peak stops at the limit.
+    average: float | None
+
+
+def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
+    """``container``'s CPU, grouped by operation, cluster count and CPU limit."""
+    groups: dict[tuple[str, float, float], list[Record]] = {}
+    for record in records:
+        clusters = record.totals.get(CLUSTERS)
+        if record.value(CPU_PEAK, container) is None and record.value(CPU_SECONDS, container) is None:
+            continue
+        if not clusters:
+            continue
+        limit = record.limits.get(container, {}).get(LIMIT_CPU) or 0.0
+        groups.setdefault((record.operation, clusters, limit), []).append(record)
+    rows = []
+    for (operation, clusters, limit), runs in sorted(groups.items()):
+        peaks = [value for run in runs if (value := run.value(CPU_PEAK, container)) is not None]
+        averages = [
+            seconds / (_minutes(run) * SECONDS_PER_MINUTE)
+            for run in runs
+            if (seconds := run.value(CPU_SECONDS, container)) is not None
+        ]
+        rows.append(
+            CpuRun(
+                operation,
+                clusters,
+                limit or None,
+                len(runs),
+                max(peaks) if peaks else None,
+                any(capped(run, CPU_PEAK, container) for run in runs),
+                _mean(averages) if averages else None,
+            )
+        )
+    return rows
+
+
 def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
     """The proxy load runs, one row per worker count, in rising order."""
     groups: dict[float, list[Record]] = {}

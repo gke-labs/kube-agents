@@ -123,6 +123,21 @@ def proxy_section(records: Sequence[hl.Record]) -> str:
                 rows,
             )
         )
+    cpu = hl.cpu_runs(records, hl.PROXY_CONTAINER)
+    if cpu:
+        parts.append(
+            "The broker's CPU per run. A peak at its limit is the limit, not the need, and stays out of the "
+            "CPU line; the average over the window is the work, which keeps growing.\n\n"
+            + _table(
+                ("Operation", "Clusters", "CPU limit", "Runs", "Highest peak (cores)", "Capped",
+                 "Average over the window (cores)"),
+                (
+                    (run.operation, _count(run.clusters), _number(run.limit), str(run.runs), _number(run.peak),
+                     "yes" if run.capped else "no", _number(run.average))
+                    for run in cpu
+                ),
+            )
+        )
     if not parts:
         return "No run recorded the credential proxy's commands."
     return "\n\n".join(parts)
