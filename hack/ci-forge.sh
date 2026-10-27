@@ -367,7 +367,7 @@ check_from_cluster() {
     --restart=Never --rm -i --quiet --pod-running-timeout="${FORGE_CLUSTER_CHECK_TIMEOUT}" \
     --env="FORGE_CA=$(cat "${FORGE_CERT_DIR}/ca.crt")" --env="FORGE_URL=https://${EVAL_FORGE_HOST}${GHES_READY_PATH}" \
     --command -- sh -c 'printf "%s\n" "$FORGE_CA" > /tmp/ca.crt && curl -sS --cacert /tmp/ca.crt --max-time 20 -o /dev/null -w "%{http_code}" "$FORGE_URL"' \
-    | tr -d '\r\n' | tail -c 3)" || code=""
+    | tr -d '\r\n' | tail -c 3)" || true # curl exits non-zero with its 000 on a connection failure; keep what stdout held
   if [ "${code}" != "200" ]; then
     echo "ERROR: a pod in ${CLUSTER_NAME} could not reach https://${EVAL_FORGE_HOST}${GHES_READY_PATH} with the CA (got '${code:-nothing}'); the zone, the firewall rule or the VM is wrong, and the deploy would fail after the build." >&2
     return 1

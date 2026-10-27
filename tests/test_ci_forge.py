@@ -35,8 +35,7 @@ STUB_GCLOUD = textwrap.dedent(
       *"compute addresses describe"*)
         [ -e "$state/address" ] && { cat "$state/address"; exit 0; } || { echo "not found" >&2; exit 1; } ;;
       *"dns record-sets describe"*)
-        host="$(cat "$state/record-host" 2>/dev/null || echo ghes.eval.internal)"
-        case "$*" in *"describe ${host}. "*) ;; *) echo "not found" >&2; exit 1 ;; esac
+        case "$*" in *"describe ghes.eval.internal. "*) ;; *) echo "not found" >&2; exit 1 ;; esac
         [ -e "$state/record" ] && { cat "$state/record"; exit 0; } || { echo "not found" >&2; exit 1; } ;;
       *"compute firewall-rules describe"*)
         [ -e "$state/firewall" ] && { echo allow-forge-443; exit 0; } || exit 1 ;;
@@ -65,15 +64,18 @@ STUB_GCLOUD = textwrap.dedent(
 FORGE_KNOBS_ABSENT = (
     "JOB_NAME", "EVAL_GHES_HOST", "EVAL_GITLAB_CE_HOST", "FORGE_SKIP_CLUSTER_CHECK", "FORGE_VM_ZONE", "AR_REPO",
     "FORGE_IMAGE_TAG", "GHES_READY_TIMEOUT_SECONDS", "FORGE_BUILD_TIMEOUT_SECONDS", "FORGE_BUILD_CLIENT_BOUND_SECONDS",
-    "FORGE_READY_POLL_SECONDS", "KUBECTL_CODE", "MAKE_CERTS_LEAF_ONLY",
+    "FORGE_READY_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "MAKE_CERTS_LEAF_ONLY",
 )
 
-# kubectl: the in-cluster check; answers the code the test puts in KUBECTL_CODE.
+# kubectl: the in-cluster check; answers the code the test puts in KUBECTL_CODE
+# and exits as the pod's curl would (KUBECTL_EXIT; curl exits 7 with its 000
+# on a refused connection).
 STUB_KUBECTL = textwrap.dedent(
     """\
     #!/usr/bin/env bash
     printf 'kubectl %s\\n' "$*" >> "${STUB_CALLS}"
     printf '%s' "${KUBECTL_CODE:-200}"
+    exit "${KUBECTL_EXIT:-0}"
     """
 )
 
@@ -315,7 +317,7 @@ class ForgeScriptTest(unittest.TestCase):
 
     def test_up_takes_the_vm_down_when_the_cluster_cannot_reach_it(self):
         self.provision()
-        proc = self.run_forge("up", KUBECTL_CODE="000")
+        proc = self.run_forge("up", KUBECTL_CODE="000", KUBECTL_EXIT="7")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("could not reach https://ghes.eval.internal/api/v3/meta with the CA (got '000')", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-ghes"))

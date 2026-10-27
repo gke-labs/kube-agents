@@ -3564,6 +3564,8 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
         f"the private zone {FORGE_DNS_ZONE}",
     )
     expected_zone = [FORGE_DNS_NAME, "private", FORGE_NETWORK]
+    zone_checked = ok
+    addresses_checked = records_checked = True
     if ok and not zone:
         missing(FINDING_FORGE_ZONE_MISSING, f"The private zone {FORGE_DNS_ZONE} ({FORGE_DNS_NAME}) is missing in {project_id}, so no self-managed forge host resolves from the host cluster")
     elif ok and zone.split("\t") != expected_zone:
@@ -3573,9 +3575,11 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
     for row, host in FORGE_ROW_HOSTS.items():
         address = FORGE_ADDRESS_TEMPLATE.format(row=row)
         ip, ok_ip = read(["gcloud", "compute", "addresses", "describe", address, f"--region={location}", f"--project={project_id}", "--format=value(address)"], f"the reserved address {address}")
+        addresses_checked = addresses_checked and ok_ip
         if ok_ip and not ip:
             missing(FINDING_FORGE_ADDRESS_MISSING.format(row=row), f"The reserved address {address} is missing in {project_id} ({location}); the {row} forge VM has no address to take")
         record, ok_rr = read(["gcloud", "dns", "record-sets", "describe", f"{host}.", f"--zone={FORGE_DNS_ZONE}", "--type=A", f"--project={project_id}", "--format=value(rrdatas[0])"], f"the A record {host}.")
+        records_checked = records_checked and ok_rr
         if ok_rr and not record:
             missing(FINDING_FORGE_RECORD_MISSING.format(host=host), f"The A record {host}. is missing from zone {FORGE_DNS_ZONE} in {project_id}")
         elif ok_rr and ok_ip and ip and record != ip:
@@ -3583,12 +3587,14 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
         elif ok_rr and ok_ip and ip:
             details.append(f"✓ {host} -> {ip} ({address})")
     rule, ok = read(["gcloud", "compute", "firewall-rules", "describe", FORGE_FIREWALL_RULE, f"--project={project_id}", "--format=value(name)"], f"the firewall rule {FORGE_FIREWALL_RULE}")
+    firewall_checked = ok
     if ok and not rule:
         missing(FINDING_FORGE_FIREWALL_MISSING, f"The firewall rule {FORGE_FIREWALL_RULE} is missing in {project_id}; the host cluster's pods could not reach a forge VM on 443")
     elif ok:
         details.append(f"✓ Firewall rule {FORGE_FIREWALL_RULE}")
     sa_email = f"{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com"
     sa, ok = read(["gcloud", "iam", "service-accounts", "describe", sa_email, f"--project={project_id}", "--format=value(email)"], f"the VM identity {sa_email}")
+    identity_checked = ok
     if ok and not sa:
         missing(FINDING_FORGE_VM_SA_MISSING, f"The VM identity {sa_email} is missing; a forge VM could not pull its image from the project's registry")
     elif ok:
@@ -3596,6 +3602,7 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
             ["gcloud", "projects", "get-iam-policy", project_id, "--flatten=bindings[].members", f"--filter=bindings.members:serviceAccount:{sa_email}", "--format=value(bindings.role)"],
             f"the roles of {sa_email}",
         )
+        identity_checked = ok_roles
         if ok_roles:
             held = set(roles.split()) if roles else set()
             for role in sorted(FORGE_VM_SA_ROLES - held):
@@ -3604,7 +3611,24 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
                 details.append(f"✓ VM identity {sa_email} holds {', '.join(sorted(FORGE_VM_SA_ROLES))}")
     if not read_any:
         return CheckResult(name, True, "Not checked", details, warnings, findings, read=False)
-    message = "Zone, addresses, records, firewall rule and VM identity present" if passed else f"{len(findings)} forge piece(s) missing or wrong (docs/ci-pool-projects.md 5.8)"
+    # The summary must not assert an item a warning above retracts: with the
+    # DNS API disabled the zone and record reads are refused while the compute
+    # and IAM reads go ahead.
+    partial = _partial_summary(
+        [
+            ("the private zone", zone_checked),
+            ("the reserved addresses", addresses_checked),
+            ("the A records", records_checked),
+            ("the firewall rule", firewall_checked),
+            ("the VM identity and its role", identity_checked),
+        ]
+    )
+    if not passed:
+        message = f"{len(findings)} forge piece(s) missing or wrong (docs/ci-pool-projects.md 5.8)"
+    elif partial:
+        message = partial
+    else:
+        message = "Zone, addresses, records, firewall rule and VM identity present"
     return CheckResult(name, passed, message, details, warnings, findings, read=True)
 
 

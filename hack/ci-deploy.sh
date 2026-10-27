@@ -1067,8 +1067,9 @@ fi
 # self-managed (a private host with a private CA the run supplies). A lane is a
 # row; a new forge is a new row, nothing else here changes. The self-managed
 # hosts can be overridden for a developer's own instance. hack/ci-eval-pr.sh
-# lifts this function, as it lifts the project tables, so both scripts read one
-# table; tests/test_ci_gitops_repo.py pins the rows.
+# and hack/ci-forge.sh lift this function, as the first lifts the project
+# tables, so the three scripts read one table; tests/test_ci_gitops_repo.py
+# pins the rows.
 EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
 EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
 forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override

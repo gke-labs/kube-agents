@@ -470,8 +470,9 @@ EVAL_FORGE="${EVAL_FORGE:-github}"
 # The forge table is hack/ci-deploy.sh's forge_profile (kube-agents#3682), one
 # row per EVAL_FORGE value: the kind (github or gitlab), the host, and whether
 # the forge is self-managed (a private host whose CA the run supplies). Lifted
-# rather than sourced, as the project tables are, so the two scripts read one
-# table and the eval refuses exactly what the deploy refuses.
+# rather than sourced, as the project tables are, so the three scripts (this
+# one, the deploy and hack/ci-forge.sh) read one table and the eval refuses
+# exactly what the deploy refuses.
 eval_forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no>"
   local body
   body="$(sed -n '/^forge_profile() {/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"

@@ -5765,6 +5765,9 @@ class ForgePiecesTest(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.findings, [])
         self.assertTrue(any("Could not read the private zone eval-internal" in w for w in result.warnings), result.warnings)
+        # The summary names what was not read instead of asserting it present.
+        self.assertEqual(result.message, "the reserved addresses, the A records, the firewall rule, the VM identity and its role verified; the private zone not checked")
+        self.assertNotIn("present", result.message)
 
     def test_the_forge_findings_pass_a_lease_and_the_check_is_a_default(self):
         self.assertTrue(checker.FORGE_FINDINGS <= checker.LEASE_SILENT_FINDINGS)
