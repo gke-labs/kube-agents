@@ -2133,6 +2133,65 @@ DEGRADED_REMEDIATION_TAIL = "Apply the recommendation above by hand, or re-run t
 # The sentence `degrade_reverted_gcloud_remediations` writes over a `gcloud`
 # fix that Config Connector reverts.
 KCC_REVERTED_NOTE_MARK = "Config Connector holds that field against out-of-band changes"
+# The keys `kcc_health.py` writes on a manifest cluster entry, copied because
+# this script does not import the collectors: the Config Connector objects
+# whose `Ready` condition is `False` on that cluster, and why a read of that
+# cluster gave no answer.
+KCC_UNREADY_FIELD = "kcc_unready"
+KCC_UNREAD_FIELD = "kcc_unread"
+# The `Ready=False` reason of an object that waits on another object, and the
+# reference its message names (`reference PubSubTopic infra/events is not
+# ready`). collect.py's `KCC_DEPENDENCY_NOT_READY_REASON` spells the reason.
+KCC_DEPENDENCY_NOT_READY_REASON = "DependencyNotReady"
+KCC_DEPENDENCY_PATTERN = re.compile(
+    r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
+)
+# The note `disclose_stalled_kcc_remediations` adds after a `manifest` fix
+# whose file declares an object Config Connector does not apply. One line, so
+# `KCC_STALLED_NOTE_PATTERN` removes all of it.
+KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
+KCC_STALLED_NOTE = (
+    KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}. "
+    "The change in this file is correct, but the cloud resource does not change after the merge "
+    "until Config Connector applies the object again, and this finding comes back on each run until then."
+)
+# An earlier copy of that note, which a worker can copy from the previous
+# ledger. The pass removes it from every note and writes it again when the
+# stall is still there, as the route-note pass does with its notes.
+KCC_STALLED_NOTE_PATTERN = re.compile(r"[ \t]*" + re.escape(KCC_STALLED_NOTE_MARK) + r"[^\n]*")
+# What the merged-but-persisting line and comment say in place of the two
+# causes they guess at, when the finding's object is one of those objects.
+KCC_STALLED_PERSISTS_LINE = (
+    "  The proposed fix was merged and this finding still reproduces. "
+    "Config Connector is not applying the declaration: it reported {objects} — the merged {noun} is not reopened."
+)
+KCC_STALLED_PERSISTS_COMMENT = (
+    "Config Connector is not applying the declaration this fix changed: when the audit ran, it "
+    "reported {objects}. The change stays in the repository and takes effect when Config Connector "
+    "applies the object again. This {noun} is **not** reopened: it merged, and reopening it would "
+    "misrepresent history. The finding stays on the ledger, flagged, until it stops reproducing."
+)
+# The finding field `disclose_stalled_kcc_remediations` writes for the two
+# texts above: the objects, as the note names them. Only `finish` writes it:
+# `validate_findings` removes it from the worker's document.
+KCC_STALLED_FINDING_FIELD = "kcc_stalled"
+# How many unready objects the note names before it counts the rest, how
+# many characters of a controller message each keeps, and the most characters
+# the list of objects takes, so the note leaves room in `MAX_NOTE_CHARS` for
+# the start of the worker's note.
+KCC_STALLED_NAMED = 2
+# How the list names one object, joins two, names what one waits on, and
+# counts the ones it leaves out.
+KCC_STALLED_OBJECT = "`Ready=False` on {name} ({why})"
+KCC_STALLED_SEPARATOR = "; "
+KCC_STALLED_WAITS_ON = ", which waits on "
+KCC_STALLED_MORE = "; and {rest} more unready object(s) in this file"
+KCC_STALLED_WHY_CHARS = 160
+KCC_STALLED_OBJECTS_MAX_CHARS = 900
+# The characters a name in the note keeps, so a name cannot close its code
+# span; anything else becomes `KCC_NAME_REPLACEMENT`.
+KCC_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_./-]")
+KCC_NAME_REPLACEMENT = "?"
 # The sentence every note of `degrade_unlisted_kustomize_additions` holds.
 KUSTOMIZE_NOTE_MARK = "A new file in a Kustomize root renders only if its kustomization lists it."
 # The start of a note of `degrade_unlisted_kustomize_additions`: its own text
@@ -5554,6 +5613,9 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
     for i, finding in enumerate(findings):
         if not isinstance(finding, dict):
             raise ValidationError(f"findings[{i}]: expected an object")
+        # Only `finish` writes this field, from the collector's manifest; a
+        # worker's copy would state a Config Connector stall nobody read.
+        finding.pop(KCC_STALLED_FINDING_FIELD, None)
 
         # Which check produced this. Was implicit in the id's first segment,
         # which meant it was only ever as reliable as the id — and the id was
@@ -7365,7 +7427,8 @@ def _strip_route_notes(remediation: object) -> None:
 
     `disclose_manual_remediation_routes` writes them again from this run's
     manifest after the carry, and calls this for a finding in its `skip` set,
-    which gets no route note. When the previous run cut the worker's note to give the route notes room,
+    which gets no route note. The Config Connector note of
+    `disclose_stalled_kcc_remediations` goes too, for the same reason. When the previous run cut the worker's note to give the route notes room,
     the note before the cut (`ROUTE_UNCUT_NOTE_FIELD`) comes back in its place.
     """
     if not isinstance(remediation, dict):
@@ -7374,6 +7437,11 @@ def _strip_route_notes(remediation: object) -> None:
     note = uncut if isinstance(uncut, str) else str(remediation.get("note") or "")
     if ROUTE_NOTE_PATTERN.search(note):
         note = ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
+    # The Config Connector note is stripped and written again the same way
+    # (`disclose_stalled_kcc_remediations`), so a carried note never keeps a
+    # stall that this run's manifest does not show.
+    if KCC_STALLED_NOTE_MARK in note:
+        note = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     if isinstance(uncut, str) or note != remediation.get("note"):
         remediation["note"] = note
 
@@ -11383,11 +11451,17 @@ def render_finding(
         suffix = f" — {pr_url}" if pr_url else ""
         lines.append(f"- **State:** {label}{suffix}")
         if state == STATE_PR_MERGED_PERSISTS:
-            lines.append(
-                "  The proposed fix was merged and this finding still reproduces. "
-                "The remediation was incomplete, or something outside this "
-                f"repository reverted it — the merged {noun} is not reopened."
-            )
+            stalled = kcc_stalled_text(finding)
+            if stalled:
+                # The cause, when the collector saw it: a guess at two others
+                # sends the reader to look at the fix.
+                lines.append(KCC_STALLED_PERSISTS_LINE.format(objects=stalled, noun=noun))
+            else:
+                lines.append(
+                    "  The proposed fix was merged and this finding still reproduces. "
+                    "The remediation was incomplete, or something outside this "
+                    f"repository reverted it — the merged {noun} is not reopened."
+                )
         if blocked_by:
             lines.append(_blocked_note(fid, blocked_by, noun))
     lines.append("")
@@ -13690,17 +13764,26 @@ def render_stale_close_comment(
     return "\n".join(out)
 
 
+def kcc_stalled_text(finding: dict) -> str:
+    """The unready Config Connector objects `finish` matched to `finding`
+    (`KCC_STALLED_FINDING_FIELD`), redacted for a published body, or `""`."""
+    return clip_text(str(finding.get(KCC_STALLED_FINDING_FIELD) or ""), MAX_TEXT_CHARS)
+
+
 def render_persists_comment(
     audit_id: str, finding: dict, generated_at: datetime, noun: str = DEFAULT_PROPOSAL_NOUN
 ) -> str:
     """Said once, on a merged pull request whose finding still reproduces."""
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     evidence = finding.get("evidence") or {}
+    stalled = kcc_stalled_text(finding)
     out = [
         f"This fix merged, but as of {stamp} the `{audit_id}` audit still "
         f"reproduces `{finding.get('id', '')}` — {_cell(finding.get('title', ''))}.",
         "",
-        "Either the remediation was incomplete, or something outside this "
+        KCC_STALLED_PERSISTS_COMMENT.format(objects=stalled, noun=noun)
+        if stalled
+        else "Either the remediation was incomplete, or something outside this "
         f"repository reverted it. This {noun} is **not** reopened: it "
         "merged, and reopening it would misrepresent history. The finding "
         "stays on the ledger, flagged, until it stops reproducing.",
@@ -18161,11 +18244,18 @@ class KccDeclaration(NamedTuple):
     `repo` is empty for the GitOps repository and the slug for a context
     repository; `fields` is the set of top-level `spec` keys, the only part of
     the declaration Config Connector holds against out-of-band changes.
+    `name` and `namespace` are the declaration's `metadata.name` and
+    `metadata.namespace` (empty when the file leaves the namespace to the
+    tool that applies it): the names Config Connector lists the live object
+    by, which `disclose_stalled_kcc_remediations` matches the collector's
+    `kcc_unready` objects on.
     """
 
     repo: str
     path: str
     fields: frozenset[str]
+    name: str = ""
+    namespace: str = ""
 
 
 # `(kind, name, cluster, location)`: `cluster` is the bare GKE name the resource
@@ -18264,7 +18354,13 @@ def _index_kcc_text(
         location = str(spec.get("location") or "")
         index.setdefault(
             (kind, name, cluster, location),
-            KccDeclaration(repo, path, frozenset(str(k) for k in spec)),
+            KccDeclaration(
+                repo,
+                path,
+                frozenset(str(k) for k in spec),
+                str(meta.get("name") or ""),
+                str(meta.get("namespace") or ""),
+            ),
         )
 
 
@@ -18512,6 +18608,292 @@ def degrade_reverted_gcloud_remediations(
         remediation["note"] = f"{prose}\n\n```bash\n{note}\n```"
         degraded.append(str(finding.get("id", "")))
     return degraded
+
+
+class KccStall(NamedTuple):
+    """One Config Connector object whose `Ready` condition is `False`, as a
+    collector recorded it in `kcc_unready` (`kcc_health.py`).
+
+    `resource` is the object's `spec.resourceID` when it differs from its
+    name, and `cluster` a `ContainerNodePool`'s `clusterRef`; both are `""`
+    when the collector did not record them.
+    """
+
+    kind: str
+    namespace: str
+    name: str
+    why: str
+    resource: str
+    cluster: str
+
+
+class KccHealth(NamedTuple):
+    """What this run's manifest says about Config Connector.
+
+    `stalled` holds every unready object the collector recorded, and `unread`
+    the targets whose read gave no answer. An object on an unread cluster is
+    in neither list, so an empty `stalled` is never "everything is applying".
+    """
+
+    stalled: list[KccStall]
+    unread: list[str]
+
+
+def kcc_health(manifest: dict | None) -> KccHealth:
+    """The `kcc_unready` and `kcc_unread` keys of every entry in `manifest`."""
+    stalled: list[KccStall] = []
+    unread: list[str] = []
+    for entry in (manifest or {}).get("clusters") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get(KCC_UNREAD_FIELD):
+            unread.append(str(entry.get("name") or ""))
+        for record in entry.get(KCC_UNREADY_FIELD) or []:
+            if not isinstance(record, dict) or not record.get("kind") or not record.get("name"):
+                continue
+            stalled.append(
+                KccStall(
+                    *(str(record.get(field) or "") for field in ("kind", "namespace", "name")),
+                    " ".join(str(record.get("why") or "").split()),
+                    str(record.get("resource") or ""),
+                    str(record.get("cluster") or ""),
+                )
+            )
+    return KccHealth(stalled, unread)
+
+
+def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall]:
+    """The unready objects `stall` waits on, following each reference a
+    `DependencyNotReady` message names, and the ones those wait on in turn.
+
+    Only an object the collector also recorded counts: a reference to an
+    object that is ready, or on another cluster, is not named.
+    """
+    found: list[KccStall] = []
+    current = stall
+    while current.why.startswith(KCC_DEPENDENCY_NOT_READY_REASON):
+        reference = KCC_DEPENDENCY_PATTERN.search(current.why)
+        if reference is None:
+            break
+        nxt = next(
+            (
+                other
+                for other in stalled
+                if other.kind == reference.group("kind")
+                and other.name == reference.group("name")
+                and other.namespace == (reference.group("namespace") or current.namespace)
+            ),
+            None,
+        )
+        if nxt is None or nxt == stall or nxt in found:
+            break
+        found.append(nxt)
+        current = nxt
+    return found
+
+
+def _remediation_file_stalls(
+    finding: dict, root: Path, stalled: list[KccStall]
+) -> list[KccStall]:
+    """The unready objects the file of `finding`'s `manifest` fix declares.
+
+    The file is parsed as the Config Connector index parses a clone
+    (`_index_kcc_text`), and an object matches on its kind, its
+    `metadata.name`, and its namespace when the file sets one. A file the
+    audit cannot read or parse declares nothing.
+    """
+    remediation = finding.get("remediation") or {}
+    if remediation.get("kind") != MANIFEST_REMEDIATION_KIND:
+        return []
+    try:
+        import yaml  # noqa: PLC0415 -- optional; absence disables the note
+    except ImportError:
+        return []
+    relative = str(remediation.get("path") or "")
+    if not relative:
+        return []
+    try:
+        target = (root / relative).resolve()
+        if root.resolve() not in target.parents:
+            return []
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    index: dict[KccKey, KccDeclaration] = {}
+    _index_kcc_text(index, yaml, text, "", relative)
+    matched: list[KccStall] = []
+    for (kind, _, _, _), declaration in index.items():
+        for stall in stalled:
+            if (
+                stall.kind == kind
+                and stall.name == declaration.name
+                and (not declaration.namespace or stall.namespace == declaration.namespace)
+                and stall not in matched
+            ):
+                matched.append(stall)
+    return matched
+
+
+def _object_stalls(finding: dict, stalled: list[KccStall]) -> list[KccStall]:
+    """The unready objects that are `finding`'s own object: a `Cluster/` or
+    `NodePool/` finding, matched on the name GKE reports (the object's
+    `resourceID`, else its name) and, for a node pool, on its cluster."""
+    prefix, _, name = str(finding.get("object") or "").partition("/")
+    kinds = _KCC_OBJECT_KINDS.get(prefix)
+    if not kinds or not name:
+        return []
+    cluster = str(finding.get("cluster") or "").rpartition("/")[2]
+    pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
+    return [
+        stall
+        for stall in stalled
+        if stall.kind in kinds
+        and (stall.resource or stall.name) == name
+        and (stall.kind not in pool_kinds or stall.cluster == cluster)
+    ]
+
+
+def _kcc_name(stall: KccStall) -> str:
+    """`<kind> <namespace>/<name>`, in a code span, with only safe characters."""
+    kind = KCC_NAME_UNSAFE.sub(KCC_NAME_REPLACEMENT, stall.kind)
+    name = KCC_NAME_UNSAFE.sub(KCC_NAME_REPLACEMENT, "/".join(p for p in (stall.namespace, stall.name) if p))
+    return f"`{kind} {name}`"
+
+
+def _kcc_why(stall: KccStall) -> str:
+    """The controller's reason, clipped, in a code span it cannot close."""
+    why = stall.why.replace("`", "'")
+    if len(why) > KCC_STALLED_WHY_CHARS:
+        why = why[:KCC_STALLED_WHY_CHARS].rstrip() + _KCC_COMMAND_TRUNCATED
+    return f"`{why}`"
+
+
+def kcc_stalled_objects(matched: list[KccStall], stalled: list[KccStall]) -> str:
+    """The objects a note or a comment names, with what each waits on.
+
+    `Ready=False` on the first `KCC_STALLED_NAMED` matched objects, each with
+    the unready objects it waits on (`_kcc_dependencies`), within
+    `KCC_STALLED_OBJECTS_MAX_CHARS`; the rest are counted. The first object is
+    always named.
+    """
+    parts: list[str] = []
+    for count, stall in enumerate(matched):
+        text = KCC_STALLED_OBJECT.format(name=_kcc_name(stall), why=_kcc_why(stall))
+        text += "".join(
+            f"{KCC_STALLED_WAITS_ON}{_kcc_name(cause)} ({_kcc_why(cause)})"
+            for cause in _kcc_dependencies(stall, stalled)
+        )
+        joined = KCC_STALLED_SEPARATOR.join([*parts, text])
+        if parts and (count >= KCC_STALLED_NAMED or len(joined) > KCC_STALLED_OBJECTS_MAX_CHARS):
+            break
+        parts.append(text)
+    rest = len(matched) - len(parts)
+    return KCC_STALLED_SEPARATOR.join(parts) + (KCC_STALLED_MORE.format(rest=rest) if rest > 0 else "")
+
+
+def _strip_kcc_stalled_note(remediation: object) -> None:
+    """Remove the note of `disclose_stalled_kcc_remediations` from a
+    remediation note. The pass writes it again from this run's manifest."""
+    if not isinstance(remediation, dict):
+        return
+    note = str(remediation.get("note") or "")
+    if KCC_STALLED_NOTE_MARK in note:
+        remediation["note"] = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
+
+
+def _with_kcc_stalled_note(note: str, stalled_note: str) -> str:
+    """`note` with `stalled_note` as its last paragraph, inside `MAX_NOTE_CHARS`.
+
+    The renderer clips a note from the end, which would take this note first.
+    So the worker's note is cut instead (`_cut_worker_note`), and the text
+    `finish` wrote at its start (`GENERATED_FIX_NOTE`, which the renderer
+    reads with `startswith`) is kept whole.
+    """
+    head = GENERATED_FIX_NOTE if note.startswith(GENERATED_FIX_NOTE) else ""
+    body = note[len(head) :].strip()
+    fitted = _cut_worker_note(body, "", stalled_note, head)
+    if fitted is None:
+        fitted = head
+    return ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, stalled_note) if part)
+
+
+def disclose_stalled_kcc_remediations(
+    findings: list[dict], manifest: dict | None, root: Path
+) -> list[str]:
+    """Say so when a `manifest` fix edits a declaration Config Connector does
+    not apply. Returns the ids whose note changed.
+
+    The mirror of `degrade_reverted_gcloud_remediations`. That pass catches a
+    fix Config Connector will undo; this one catches a fix Config Connector
+    does not apply at all. The pull request merges, the file says what it
+    should, and the cloud resource does not change. On 2026-09-05 one
+    `PubSubTopic` failed with `UpdateFailed` on an IAM role and put fifteen
+    `ContainerCluster`s into `DependencyNotReady`; every manifest fix against
+    them would have merged into a controller that applied nothing.
+
+    The collectors read Config Connector (`kcc_health.py`) and record its
+    unready objects in the manifest as `kcc_unready`; this pass reads no
+    cluster. A fix matches when its file declares one of those objects
+    (`_remediation_file_stalls`). The note names the object, the reason the
+    controller gave, and the unready objects it waits on when the reason is
+    `DependencyNotReady` (`_kcc_dependencies`).
+
+    Discloses, never degrades: the fix is correct and belongs in that file.
+    What is wrong is the reader's inference that the merge changes something,
+    and the stall is usually gone by the time someone reads the ledger. The
+    `kind` stays `manifest`, and the sweep and `/remediate` treat the fix as
+    before.
+
+    The pass first removes an earlier copy of its note from every
+    remediation, which a worker that copies the previous ledger brings back,
+    then writes it again where this run's manifest still shows the stall. A
+    cluster whose read failed (`kcc_unread`) gives no stall, so no note: the
+    pass never says that Config Connector applies a file.
+
+    It also writes `KCC_STALLED_FINDING_FIELD` on each finding whose fix file
+    or own `Cluster/` or `NodePool/` object (`_object_stalls`) is unready, for
+    the merged-but-persisting line and comment, which then state the stall
+    in place of their guess at a cause.
+    """
+    stalled = kcc_health(manifest).stalled
+    changed: list[str] = []
+    for finding in findings:
+        fid = str(finding.get("id", ""))
+        remediation = finding.get("remediation")
+        before = remediation.get("note") if isinstance(remediation, dict) else None
+        _strip_kcc_stalled_note(remediation)
+        finding.pop(KCC_STALLED_FINDING_FIELD, None)
+        in_file = _remediation_file_stalls(finding, root, stalled) if stalled else []
+        matched = in_file or (_object_stalls(finding, stalled) if stalled else [])
+        if matched:
+            finding[KCC_STALLED_FINDING_FIELD] = kcc_stalled_objects(matched, stalled)
+        if in_file and isinstance(remediation, dict):
+            stalled_note = KCC_STALLED_NOTE.format(objects=finding[KCC_STALLED_FINDING_FIELD])
+            remediation["note"] = _with_kcc_stalled_note(str(remediation.get("note") or "").strip(), stalled_note)
+        if isinstance(remediation, dict) and remediation.get("note") != before:
+            changed.append(fid)
+    return changed
+
+
+def disclose_stalled_kcc_and_log(
+    findings: list[dict], manifest: dict | None, root: Path, prefix: str = ""
+) -> None:
+    """Add the Config Connector stall notes, and log what changed and what
+    the manifest could not tell."""
+    health = kcc_health(manifest)
+    if health.unread:
+        log(
+            f"{prefix}WARNING: the collector could not read Config Connector on "
+            f"{', '.join(sorted(health.unread))}; a manifest fix against an object there "
+            "publishes with no note about whether Config Connector applies it."
+        )
+    by_id = {str(finding.get("id", "")): finding for finding in findings}
+    for fid in disclose_stalled_kcc_remediations(findings, manifest, root):
+        note = str((by_id[fid].get("remediation") or {}).get("note") or "")
+        if KCC_STALLED_NOTE_MARK in note:
+            log(f"{prefix}{fid}: its manifest fix edits a declaration Config Connector is not applying; the note says so.")
+        else:
+            log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")
 
 
 # --------------------------------------------------------------------------- #
@@ -19668,6 +20050,7 @@ def _handle_finish_dry_run(
         else set(),
         prefix="DRY RUN: ",
     )
+    disclose_stalled_kcc_and_log(findings, manifest, root, prefix="DRY RUN: ")
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -21045,7 +21428,9 @@ def _plan_remediation_files(
     store ledger asks for this: its store write is the only record of the run.
 
     Last, it adds the route notes to each `manual` remediation
-    (`disclose_manual_routes_and_log`), because both ledgers publish them.
+    (`disclose_manual_routes_and_log`) and the Config Connector note to each
+    `manifest` fix whose file declares an object Config Connector does not
+    apply (`disclose_stalled_kcc_and_log`), because both ledgers publish them.
     """
     listing_refusal = None
     try:
@@ -21134,6 +21519,10 @@ def _plan_remediation_files(
         manifest,
         route_note_skip(unwritten, declines, planned, pr_carried_fixes(promised, degraded, audit_id, remediation_prs)),
     )
+    # The same place, for the same reason: a `manifest` fix whose file
+    # declares an object Config Connector does not apply says so on both
+    # ledgers and in its pull request.
+    disclose_stalled_kcc_and_log(findings, manifest, root)
     return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
 
 

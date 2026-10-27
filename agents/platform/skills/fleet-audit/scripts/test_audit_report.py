@@ -22703,6 +22703,329 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
         self.assertFalse(audit_report.RECONCILED_NOTE_LEDE in body)
 
 
+# The Config Connector objects `kcc_health.py` records, as one manifest entry
+# carries them: a topic short of an IAM role, and a cluster waiting on it.
+KCC_TOPIC = {
+    "kind": "PubSubTopic",
+    "namespace": "infra",
+    "name": "fleet-events",
+    "why": "UpdateFailed: Error 403: roles/pubsub.editor is missing",
+}
+KCC_CLUSTER = {
+    "kind": "ContainerCluster",
+    "namespace": "infra",
+    "name": "prod-usc1",
+    "why": "DependencyNotReady: reference PubSubTopic infra/fleet-events is not ready",
+}
+KCC_CLUSTER_FILE = "clusters/prod-usc1/cluster.yaml"
+KCC_CLUSTER_DECLARATION = """\
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: prod-usc1
+  namespace: infra
+spec:
+  location: us-central1
+  releaseChannel:
+    channel: REGULAR
+"""
+
+
+def kcc_manifest(*unready, unread=None):
+    """A manifest whose first entry carries `kcc_unready`, and `kcc_unread` when given."""
+    entry = {"name": "acme/us-central1/hub", "outcome": "collected", "commands": [], "candidates": []}
+    if unready:
+        entry["kcc_unready"] = [dict(record) for record in unready]
+    if unread:
+        entry["kcc_unread"] = unread
+    return {"clusters": [entry]}
+
+
+def kcc_finding(note="Set the release channel to REGULAR.", path=KCC_CLUSTER_FILE, kind="manifest", **fields):
+    remediation = {"kind": kind, "note": note}
+    if kind == "manifest":
+        remediation["path"] = path
+    return make_finding(
+        fid="release-channel",
+        check="release-channel-unenrolled",
+        cluster="acme/us-central1/prod-usc1",
+        namespace="",
+        obj="Cluster/prod-usc1",
+        remediation=remediation,
+        **fields,
+    )
+
+
+class TestStalledKccRemediations(unittest.TestCase):
+    """`disclose_stalled_kcc_remediations`: a `manifest` fix whose file
+    declares an object Config Connector does not apply says so."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.write(KCC_CLUSTER_FILE, KCC_CLUSTER_DECLARATION)
+
+    def write(self, relative, text):
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def disclose(self, findings, manifest):
+        return audit_report.disclose_stalled_kcc_remediations(findings, manifest, self.root)
+
+    def test_a_fix_whose_file_declares_an_unready_object_says_so_and_stays_manifest(self):
+        finding = kcc_finding()
+        changed = self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, why="UpdateFailed: Error 403")))
+        self.assertEqual(changed, ["release-channel"])
+        remediation = finding["remediation"]
+        self.assertEqual(remediation["kind"], "manifest")
+        self.assertEqual(remediation["path"], KCC_CLUSTER_FILE)
+        note = remediation["note"]
+        self.assertTrue(note.startswith("Set the release channel to REGULAR.\n\n"), note)
+        last = note.split("\n\n")[-1]
+        self.assertTrue(last.startswith("**Config Connector is not applying this file.**"), last)
+        self.assertIn("`Ready=False` on `ContainerCluster infra/prod-usc1` (`UpdateFailed: Error 403`)", last)
+        self.assertIn("does not change after the merge", last)
+        self.assertIn("ContainerCluster infra/prod-usc1", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_fix_whose_file_declares_nothing_unready_gets_no_note(self):
+        self.write("clusters/prod-use1/cluster.yaml", KCC_CLUSTER_DECLARATION.replace("prod-usc1", "prod-use1"))
+        finding = kcc_finding(path="clusters/prod-use1/cluster.yaml")
+        finding.update(cluster="acme/us-east1/prod-use1", object="Cluster/prod-use1")
+        self.assertEqual(self.disclose([finding], kcc_manifest(KCC_CLUSTER, KCC_TOPIC)), [])
+        self.assertEqual(finding["remediation"]["note"], "Set the release channel to REGULAR.")
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_workload_fix_gets_no_note(self):
+        self.write("clusters/prod-usc1/netpol.yaml", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: prod-usc1\n")
+        finding = make_finding(remediation={"kind": "manifest", "path": "clusters/prod-usc1/netpol.yaml", "note": "x"})
+        self.assertEqual(self.disclose([finding], kcc_manifest(KCC_CLUSTER)), [])
+
+    def test_the_note_names_the_unready_object_the_declaration_waits_on(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(KCC_CLUSTER, KCC_TOPIC))
+        note = finding["remediation"]["note"]
+        self.assertIn(
+            "`Ready=False` on `ContainerCluster infra/prod-usc1` (`DependencyNotReady: reference PubSubTopic "
+            "infra/fleet-events is not ready`), which waits on `PubSubTopic infra/fleet-events` "
+            "(`UpdateFailed: Error 403: roles/pubsub.editor is missing`)",
+            note,
+        )
+
+    def test_a_dependency_on_an_object_that_is_ready_names_only_the_declaration(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(KCC_CLUSTER))
+        self.assertNotIn("which waits on", finding["remediation"]["note"])
+        self.assertIn("DependencyNotReady", finding["remediation"]["note"])
+
+    def test_the_namespace_must_agree_when_the_file_sets_one(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, namespace="other")))
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+        self.write(KCC_CLUSTER_FILE, KCC_CLUSTER_DECLARATION.replace("  namespace: infra\n", ""))
+        self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, namespace="other")))
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+
+    def test_an_unread_cluster_gives_no_note_and_says_why_in_the_log(self):
+        finding = kcc_finding()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(unread="timed out"), self.root)
+        self.assertEqual(finding["remediation"]["note"], "Set the release channel to REGULAR.")
+        self.assertIn("could not read Config Connector on acme/us-central1/hub", err.getvalue())
+
+    def test_a_copied_note_is_removed_and_written_once(self):
+        finding = kcc_finding()
+        manifest = kcc_manifest(KCC_CLUSTER)
+        self.disclose([finding], manifest)
+        once = finding["remediation"]["note"]
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(once.count(audit_report.KCC_STALLED_NOTE_MARK), 1)
+        # The stall has cleared; the worker copied the old note.
+        self.assertEqual(self.disclose([finding], kcc_manifest()), ["release-channel"])
+        self.assertEqual(finding["remediation"]["note"], "Set the release channel to REGULAR.")
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_only_a_manifest_fix_gets_the_note(self):
+        for kind in ("gcloud", "manual"):
+            with self.subTest(kind=kind):
+                finding = kcc_finding(note="gcloud container clusters update prod-usc1", kind=kind)
+                self.disclose([finding], kcc_manifest(KCC_CLUSTER))
+                self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+                # The finding's own object is unready, which the persists texts read.
+                self.assertIn("prod-usc1", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_node_pool_matches_only_on_its_own_cluster(self):
+        pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "c1-default", "why": "UpdateFailed",
+                "resource": "default-pool", "cluster": "prod-usc1"}
+        mine = make_finding(fid="p", cluster="acme/us-central1/prod-usc1", obj="NodePool/default-pool",
+                            remediation={"kind": "gcloud", "note": "x"})
+        other = make_finding(fid="q", cluster="acme/us-east1/prod-use1", obj="NodePool/default-pool",
+                             remediation={"kind": "gcloud", "note": "x"})
+        self.disclose([mine, other], kcc_manifest(pool))
+        self.assertIn("c1-default", mine[audit_report.KCC_STALLED_FINDING_FIELD])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, other)
+
+    def test_the_note_fits_the_cap_by_cutting_the_workers_note_and_keeps_harness_text(self):
+        long_note = "Raise the channel. " * 300
+        for head in ("", audit_report.GENERATED_FIX_NOTE + " "):
+            with self.subTest(head=bool(head)):
+                finding = kcc_finding(note=head + long_note)
+                self.disclose([finding], kcc_manifest(KCC_CLUSTER, KCC_TOPIC))
+                note = finding["remediation"]["note"]
+                self.assertLessEqual(len(audit_report.publishable_text(note)), audit_report.MAX_NOTE_CHARS)
+                self.assertIn(audit_report.ROUTE_NOTE_TRUNCATED, note)
+                self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+                self.assertTrue(note.endswith("until then."), note[-80:])
+                if head:
+                    self.assertTrue(note.startswith(audit_report.GENERATED_FIX_NOTE))
+                # The renderer's clip then leaves the note whole.
+                self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+
+    def test_a_file_of_many_unready_objects_names_two_and_counts_the_rest(self):
+        names = ("a", "b", "c")
+        self.write(KCC_CLUSTER_FILE, "\n---\n".join(KCC_CLUSTER_DECLARATION.replace("prod-usc1", n) for n in names))
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(*(dict(KCC_CLUSTER, name=n, why="UpdateFailed") for n in names)))
+        last = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertIn("`ContainerCluster infra/a`", last)
+        self.assertIn("`ContainerCluster infra/b`", last)
+        self.assertNotIn("infra/c`", last)
+        self.assertIn("and 1 more unready object(s) in this file", last)
+
+    def test_a_controller_message_cannot_break_out_of_its_code_span(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, why="UpdateFailed: `@team` <!-- x --> [l](http://e)")))
+        last = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertIn("(`UpdateFailed: '@team' <!-- x --> [l](http://e)`)", last)
+
+    def test_the_carry_strips_a_copied_note(self):
+        remediation = {"kind": "manual", "note": "Do it.\n\n" + audit_report.KCC_STALLED_NOTE.format(objects="x")}
+        audit_report._strip_route_notes(remediation)
+        self.assertEqual(remediation["note"], "Do it.")
+
+    def test_a_carried_note_loses_a_stall_this_run_does_not_show(self):
+        stale = kcc_finding(note="gcloud container clusters update prod-usc1 --release-channel=regular", kind="gcloud")
+        stale["remediation"]["note"] += "\n\n" + audit_report.KCC_STALLED_NOTE.format(objects="x")
+        previous = {"findings": [audit_report._redact_document(copy.deepcopy(stale))]}
+        now = kcc_finding(note="Run the update.", kind="manual")
+        self.assertEqual(audit_report.carry_unchanged_findings([now], previous), ["release-channel"])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, now["remediation"]["note"])
+
+    def test_a_workers_copy_of_the_finding_field_is_dropped(self):
+        finding = make_finding()
+        finding[audit_report.KCC_STALLED_FINDING_FIELD] = "`Ready=False` on something"
+        validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, validated["findings"][0])
+
+
+class TestStalledKccPersists(unittest.TestCase):
+    """The merged-but-persisting line and comment state a stall in place of
+    their guess at a cause."""
+
+    GUESS = "remediation was incomplete"
+
+    def stalled_finding(self):
+        finding = make_finding(fid="a")
+        finding[audit_report.KCC_STALLED_FINDING_FIELD] = "`Ready=False` on `ContainerCluster infra/prod-usc1` (`UpdateFailed: Error 403`)"
+        return finding
+
+    def test_the_ledger_row_states_the_stall(self):
+        lines = "\n".join(
+            audit_report.render_finding(self.stalled_finding(), state=audit_report.STATE_PR_MERGED_PERSISTS)
+        )
+        self.assertIn("Config Connector is not applying the declaration", lines)
+        self.assertIn("`ContainerCluster infra/prod-usc1`", lines)
+        self.assertNotIn(self.GUESS, lines)
+
+    def test_the_ledger_row_keeps_the_guess_without_a_stall(self):
+        lines = "\n".join(audit_report.render_finding(make_finding(fid="a"), state=audit_report.STATE_PR_MERGED_PERSISTS))
+        self.assertIn(self.GUESS, lines)
+        self.assertNotIn("Config Connector", lines)
+
+    def test_the_comment_states_the_stall(self):
+        text = audit_report.render_persists_comment(AUDIT, self.stalled_finding(), NOW)
+        self.assertIn("Config Connector is not applying the declaration this fix changed", text)
+        self.assertIn("**not** reopened", text)
+        self.assertNotIn(self.GUESS, text)
+        self.assertIn(audit_report.persists_marker("a"), text)
+
+    def test_the_comment_keeps_the_guess_without_a_stall(self):
+        text = audit_report.render_persists_comment(AUDIT, make_finding(fid="a"), NOW)
+        self.assertIn(self.GUESS, text)
+
+
+class TestStalledKccInFinish(HarnessTestCase):
+    """The wiring: the note reaches the ledger, the pull request and the
+    merged-but-persisting comment on the forge path."""
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def stalled_manifest(self):
+        # The candidate the sweep needs to open the fix on its own.
+        candidate = {
+            "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
+            "object": "Namespace/no-network-policy", "severity": "critical",
+            "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
+        }
+        manifest = _full_manifest(candidates=[candidate])
+        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
+        return manifest
+
+    def doc_and_file(self):
+        target = self.workspace / KCC_CLUSTER_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
+        finding = make_finding(
+            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."}
+        )
+        return make_doc(findings=[finding])
+
+    def test_the_ledger_and_the_pull_request_carry_the_note(self):
+        rc = self.run_finish(self.doc_and_file(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, body)
+        self.assertIn("which waits on `PubSubTopic infra/fleet-events`", body)
+        self.assertIn("Config Connector is not applying", self.err)
+        proposals = self.harness.forge_calls("proposal-create")
+        self.assertTrue(proposals, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
+
+    def test_the_dry_run_previews_the_note(self):
+        rc = self.run_finish(
+            self.doc_and_file(), ["--dry-run", "--manifest-file", self.manifest_file(self.stalled_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
+        self.assertIn("DRY RUN: ", self.err)
+
+    def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
+        doc = self.doc_and_file()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        merged = pr(5, branch, state="MERGED", merged_at="2026-07-01T00:00:00Z")
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-list": proposals_view([merged]),
+            "*-view comments": comments_view({"comments": []}),
+        }
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        comments = [c["body"] for c in self.harness.forge_calls("proposal-comment")]
+        persists = [c for c in comments if "still reproduces" in c]
+        self.assertTrue(persists, comments)
+        self.assertIn("Config Connector is not applying the declaration this fix changed", persists[0])
+        self.assertNotIn("remediation was incomplete", persists[0])
+        body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn("Config Connector is not applying the declaration: it reported", body)
+
+
 class TestTriageMarkedFindings(BaseTestCase):
     """A finding the collector stands behind whose *fix* it cannot vouch for.
 
@@ -33162,6 +33485,33 @@ class TestStoreLedger(HarnessTestCase):
         """A merged fix whose finding still reproduces did not fix it."""
         body = self.finish_manual_with_reconciler(proposals=[(8, "merged")])
         self.assertIn(audit_report.RECONCILED_NOTE_LEDE, body)
+
+    def test_the_stored_ledger_and_the_fix_carry_the_config_connector_note(self):
+        """The store ledger plans its fixes through the same step as the forge
+        path, so a fix whose file declares an object Config Connector does not
+        apply says so in the stored ledger and in its pull request."""
+        self.claim()
+        target = self.workspace / KCC_CLUSTER_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
+        finding = make_finding(
+            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."}
+        )
+        manifest = _full_manifest(candidates=[{**self.netpol_candidate(), "severity": "critical"}])
+        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[finding])), encoding="utf-8")
+        self.new_process()
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.latest()["ledger_body"])
+        [create] = self.harness.forge_calls("proposal-create")
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, create["body"])
 
     # -- not re-checked ------------------------------------------------------------
 
