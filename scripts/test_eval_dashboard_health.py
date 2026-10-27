@@ -2787,7 +2787,7 @@ class FixtureDrift(unittest.TestCase):
     def test_drift_no_re_apply_clears_names_the_remedy_not_the_re_apply(self):
         # #4005: keyed on the op in the drift lines. DRIFT_ROLE stands in for the role carrying them.
         age = 'cluster createTime age_hours_ge 24: observed "2026-09-07T22:00:00+00:00", 2.0 hours old (why: Clears itself)'
-        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000" (why: seeded_b_pin.py holds it)'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (why: seeded_b_pin.py holds it)'
 
         def with_lines(lines, drifted=(DRIFT_ROLE,)):
             doc = scan(drifted={project(1): list(drifted)}, previous={project(1): list(drifted)})

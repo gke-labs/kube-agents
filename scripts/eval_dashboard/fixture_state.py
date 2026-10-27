@@ -147,7 +147,9 @@ OP_AHEAD_OF_CHANNEL = "not_ahead_of_channel"
 # An age-gate line that read one timestamp. An unparseable one ends "not one
 # RFC 3339 timestamp" instead, and no clock clears that.
 AGE_GATE_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AGE_GATE} (?P<hours>\d+(?:\.\d+)?): observed "(?P<when>[^"]+)", [\d.]+ hours old')
-AHEAD_OF_CHANNEL_LINE_RE = re.compile(rf"^\S+ \S+ {OP_AHEAD_OF_CHANNEL}: ")
+# A master-ahead line, the one shape of that op meaning the channel offers
+# nothing as new; an unset channel or an unreadable version is other drift.
+AHEAD_OF_CHANNEL_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AHEAD_OF_CHANNEL}: observed "[^"]+", newer than every ')
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"

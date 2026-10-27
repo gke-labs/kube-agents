@@ -1964,7 +1964,7 @@ class FixtureDrift(RunHarness):
     def test_drift_no_re_apply_clears_names_the_remedy_not_the_re_apply(self):
         # #4005, keyed on the op in the drift lines: the age gate's time, the channel's next patch.
         age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old (why: Clears itself)'
-        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000" (why: seeded_b_pin.py holds it)'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (why: seeded_b_pin.py holds it)'
 
         def advice(*lines):
             doc = fixture_drift()

@@ -173,7 +173,8 @@ jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
-spare again; for drift no re-apply clears, at the time or event the message names) — a case whose grade depends on the drifted fixture is recorded as
+spare again; for drift no re-apply clears, at the time or event the message
+names) — a case whose grade depends on the drifted fixture is recorded as
 infrastructure on a run whose own lease-time scan saw the drift, and a red on such a
 case from a run whose scan could not read the role is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries. Who the
@@ -1091,11 +1092,11 @@ applied changes nothing; and when every drift line on the incident is one no re-
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
-to retest after, and a `version-laggard` line reading `not_ahead_of_channel` clears when
-REGULAR ships a newer patch of the minor `seeded_b_pin.py` holds, or sooner when seeded-b is
+to retest after, and a `version-laggard` line reading `not_ahead_of_channel` with "newer than
+every", a master ahead of its channel, clears when REGULAR ships a newer patch of the minor `seeded_b_pin.py` holds, or sooner when seeded-b is
 re-created under a lease; one ordinary drift line beside them keeps the re-apply advice, the
-issue lists both as exceptions, and `hack/fleet_reconcile.py --drifted` skips a project whose
-only drift is these) — and the
+issue lists both as exceptions, and a hand run of `hack/fleet_reconcile.py --drifted` skips a
+project whose only drift is these) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
 them healthy; the bot closes it when the condition clears." An open issue that already names

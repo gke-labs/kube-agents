@@ -348,7 +348,7 @@ class TargetsTest(unittest.TestCase):
     def test_a_project_whose_only_drift_no_re_apply_clears_is_skipped(self):
         # #4005: the age gate and a master ahead of its channel; one ordinary line beside them keeps the project.
         age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old'
-        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers'
         document = {
             "projects": {
                 P7: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age]}, "version-laggard": {"state": "drifted", "detail": [ahead]}}},

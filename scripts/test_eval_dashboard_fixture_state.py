@@ -431,7 +431,7 @@ class ScanHarness(unittest.TestCase):
 
 
 AGE_GATE_LINE = 'cluster createTime age_hours_ge 24: observed "2026-09-14T14:00:00+00:00", 6.0 hours old (why: Clears itself; no re-apply helps)'
-AHEAD_LINE = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000" (why: seeded_b_pin.py holds it)'
+AHEAD_LINE = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000) (why: seeded_b_pin.py holds it)'
 ORDINARY_LINE = "pod?app=payments-api status.phase eq \"Running\": observed \"Pending\" (why: a planted object a re-apply restores)"
 
 
@@ -443,6 +443,8 @@ class NoReapplyDrift(unittest.TestCase):
         self.assertEqual(fixture_state.no_reapply_op(AHEAD_LINE), fixture_state.OP_AHEAD_OF_CHANNEL)
         self.assertIsNone(fixture_state.no_reapply_op(ORDINARY_LINE))
         self.assertIsNone(fixture_state.no_reapply_op("pod?app=x status.phase eq 1: observed 2 (why: unlike age_hours_ge or not_ahead_of_channel)"))
+        # An unset channel is the stack's to restore; only "newer than every" is the channel's to clear.
+        self.assertIsNone(fixture_state.no_reapply_op('cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset'))
         # An unparseable timestamp is no age the clock will reach.
         self.assertIsNone(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "soon", not one RFC 3339 timestamp'))
 
