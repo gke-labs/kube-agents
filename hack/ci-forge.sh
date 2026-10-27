@@ -59,6 +59,8 @@ readonly FORGE_VM_ZONE_SUFFIX="-a"
 readonly FORGE_CERT_DAYS=1
 readonly FORGE_READY_POLL_SECONDS="${FORGE_READY_POLL_SECONDS:-5}"
 readonly FORGE_SERIAL_TAIL_LINES=40
+# The metadata item the server key rides in to the VM, removed once it is up.
+readonly FORGE_KEY_METADATA_KEY="tls-key"
 readonly FORGE_BUILD_TIMEOUT_SECONDS="${FORGE_BUILD_TIMEOUT_SECONDS:-900}"
 # The submit's own bound: Cloud Build's --timeout ends the build, not a client
 # whose log stream stalled after it (kube-agents#3129), so the client gets the
@@ -181,8 +183,11 @@ forge_down() {
       || echo "Forge down: ${name} was already gone"
   fi
   delete_forge_vms "forge" "${EVAL_FORGE}"
-  rm -rf "${EVAL_FORGE_STATE_DIR}"
-  echo "✓ Forge down finished in $((SECONDS - started))s; ${EVAL_FORGE_STATE_DIR} removed"
+  # Only what `up` wrote: the directory is the caller's (EVAL_FORGE_STATE_DIR=/tmp
+  # would otherwise go with it); it is removed when nothing else is in it.
+  rm -f "${FORGE_CA_FILE}" "${FORGE_RECORD_FILE}"
+  rmdir "${EVAL_FORGE_STATE_DIR}" 2>/dev/null || true
+  echo "✓ Forge down finished in $((SECONDS - started))s; the forge's files are gone from ${EVAL_FORGE_STATE_DIR}"
 }
 
 # ─── up: the project's once-per-project pieces, read, never written ──────────
@@ -251,7 +256,11 @@ md() { curl -sf -H 'Metadata-Flavor: Google' "http://metadata.google.internal/co
 T0=$(date +%s); mark() { echo "FORGE $1 t=$(( $(date +%s) - T0 ))s"; }
 HOST=$(md host); IMAGE=$(md image); VERSION=$(md enterprise-version)
 mkdir -p /var/ghes/tls
-md tls-crt > /var/ghes/tls/tls.crt; md tls-key > /var/ghes/tls/tls.key; md ca-crt > /var/ghes/ca.crt
+# First boot copies the certificates out of metadata; `up` then removes the key
+# from metadata, so a reboot keeps the copies on disk.
+[ -s /var/ghes/tls/tls.crt ] || md tls-crt > /var/ghes/tls/tls.crt
+[ -s /var/ghes/tls/tls.key ] || md tls-key > /var/ghes/tls/tls.key
+[ -s /var/ghes/ca.crt ] || md ca-crt > /var/ghes/ca.crt
 chmod 600 /var/ghes/tls/tls.key; chown -R 65532:65532 /var/ghes/tls  # the image runs as the distroless nonroot user
 mark script-start
 docker-credential-gcr configure-docker --registries "${IMAGE%%/*}" >/dev/null 2>&1
@@ -291,12 +300,11 @@ create_ghes_vm() {
     --tags="${FORGE_NETWORK_TAG}" \
     --labels="${FORGE_VM_LABEL_KEY}=${EVAL_FORGE},${FORGE_VM_BUILD_LABEL_KEY}=${BUILD_ID:-local}" \
     --metadata="host=${EVAL_FORGE_HOST},image=${GHES_PROXY_IMAGE},enterprise-version=${GHES_PROXY_ENTERPRISE_VERSION}" \
-    --metadata-from-file="startup-script=${startup},tls-crt=${FORGE_CERT_DIR}/tls.crt,tls-key=${FORGE_CERT_DIR}/tls.key,ca-crt=${FORGE_CERT_DIR}/ca.crt" \
+    --metadata-from-file="startup-script=${startup},tls-crt=${FORGE_CERT_DIR}/tls.crt,${FORGE_KEY_METADATA_KEY}=${FORGE_CERT_DIR}/tls.key,ca-crt=${FORGE_CERT_DIR}/ca.crt" \
     --quiet >/dev/null
   rm -f "${startup}"
   # The record first: a wait that fails runs `down`, which reads it.
-  mkdir -p "${EVAL_FORGE_STATE_DIR}"
-  chmod 700 "${EVAL_FORGE_STATE_DIR}"
+  [ -d "${EVAL_FORGE_STATE_DIR}" ] || install -d -m 700 "${EVAL_FORGE_STATE_DIR}"
   printf '%s %s\n' "${FORGE_VM_NAME}" "${FORGE_VM_ZONE}" > "${FORGE_RECORD_FILE}"
   echo "✓ ${FORGE_VM_NAME} created"
 }
@@ -325,6 +333,19 @@ wait_for_serial_ready() { # <timeout seconds>
   return 1
 }
 
+# The server key reached the VM through instance metadata, which
+# compute.instances.get returns and the agent under test holds (compute.viewer
+# in the leased project). Once the proxy is up the key lives on the VM's disk
+# alone; this runs before the deploy, so no agent exists while it is there.
+remove_key_from_metadata() {
+  gcloud compute instances remove-metadata "${FORGE_VM_NAME}" --zone="${FORGE_VM_ZONE}" --project="${PROJECT_ID}" \
+    --keys="${FORGE_KEY_METADATA_KEY}" >/dev/null || {
+    echo "ERROR: could not remove ${FORGE_KEY_METADATA_KEY} from ${FORGE_VM_NAME}'s metadata; the key must not stay readable there." >&2
+    return 1
+  }
+  echo "✓ ${FORGE_KEY_METADATA_KEY} removed from ${FORGE_VM_NAME}'s metadata; the key is on the VM's disk alone"
+}
+
 # The path the run depends on: a pod in the host cluster resolves the host
 # through the private zone, crosses the firewall rule and verifies the proxy
 # with the CA. One curl, one disposable pod. FORGE_SKIP_CLUSTER_CHECK=1 for a
@@ -339,7 +360,10 @@ check_from_cluster() {
   gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}"
   # shellcheck disable=SC2086
   gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet \
-    ${GKE_DNS_ENDPOINT_FLAG} >/dev/null
+    ${GKE_DNS_ENDPOINT_FLAG} >/dev/null || {
+    echo "ERROR: could not fetch credentials for ${CLUSTER_NAME} in ${PROJECT_ID}; not running the in-cluster check against another context (FORGE_SKIP_CLUSTER_CHECK=1 for a project with no host cluster yet)." >&2
+    return 1
+  }
   code="$(kubectl run "${pod}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --image="${FORGE_CLUSTER_CHECK_IMAGE}" \
     --restart=Never --rm -i --quiet --pod-running-timeout="${FORGE_CLUSTER_CHECK_TIMEOUT}" \
     --env="FORGE_CA=$(cat "${FORGE_CERT_DIR}/ca.crt")" --env="FORGE_URL=https://${EVAL_FORGE_HOST}${GHES_READY_PATH}" \
@@ -378,7 +402,7 @@ forge_up() {
   create_ghes_vm
   # From here a failure takes the VM down again: the job's trap calls `down`
   # too, but a refusal here must not depend on it.
-  if ! wait_for_serial_ready "${GHES_READY_TIMEOUT_SECONDS}" || ! check_from_cluster; then
+  if ! wait_for_serial_ready "${GHES_READY_TIMEOUT_SECONDS}" || ! remove_key_from_metadata || ! check_from_cluster; then
     forge_down
     exit 1
   fi

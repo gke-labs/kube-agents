@@ -439,7 +439,7 @@ class GkeAndCmekTest(unittest.TestCase):
         # missing grant fails only the hourly sweep.
         self.assertEqual(
             checker.LEASE_SILENT_FINDINGS,
-            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING}) | checker.FORGE_FINDINGS,
+            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING, checker.FINDING_DNS_API}) | checker.FORGE_FINDINGS,
         )
         # The forge pieces serve the self-managed lanes alone (docs 5.8): the two
         # public lanes read none of them, so a leased run passes with any of them.
@@ -5632,7 +5632,6 @@ def _without_hcl_comments(text):
     return "".join(out)
 
 
-
 class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
     """POOL_STATE_READER_ROLES and the bot member must equal bench/tf/fleet's
     pool_state_readers default and pool_state_reader_roles local: the verifier
@@ -5660,7 +5659,6 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         self.assertEqual(re.search(r"x\s*=\s*\[(.*?)\]", stripped, re.S).group(1).count('"'), 8, "the bracket in the comment did not end the list")
 
 
-
 class DrainTimeoutWindowTest(unittest.TestCase):
     """seeded-b's planted backend drain stays inside the window the patch roll
     survives. Above GKE's 600-second per-node wait, or the readiness rule's
@@ -5682,9 +5680,6 @@ class DrainTimeoutWindowTest(unittest.TestCase):
         seconds = int(value.group(1))
         self.assertGreater(seconds, self.GKE_NODE_WAIT_SECONDS, "at or under GKE's wait the fixture's defect is gone")
         self.assertLess(seconds, self.NODE_POOL_UPDATE_TIMEOUT_SECONDS, "the pool's patch roll would outlast the update timeout and fail")
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ForgePiecesTest(unittest.TestCase):
@@ -5794,3 +5789,7 @@ class ForgePiecesTest(unittest.TestCase):
         forge = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-forge.sh").read_text()
         for name, value in (("FORGE_FIREWALL_RULE", checker.FORGE_FIREWALL_RULE), ("FORGE_DNS_ZONE", checker.FORGE_DNS_ZONE), ("FORGE_VM_SERVICE_ACCOUNT_ID", checker.FORGE_VM_SA_ID), ("FORGE_NETWORK_TAG", checker.FORGE_NETWORK_TAG), ("FORGE_VM_NETWORK", checker.FORGE_NETWORK)):
             self.assertIn(f'readonly {name}="{value}"', forge, name)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -442,7 +442,10 @@ FORGE_FINDINGS = frozenset(
     | {FINDING_FORGE_RECORD_MISMATCH.format(host=host) for host in FORGE_ROW_HOSTS.values()}
     | {FINDING_FORGE_VM_SA_ROLE_MISSING.format(role=role) for role in FORGE_VM_SA_ROLES}
 )
-LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS
+# The DNS API serves the private zone alone, so its finding is in the same
+# position as the pieces: nothing on the public lanes resolves eval.internal.
+FINDING_DNS_API = "apis/dns.googleapis.com"
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS | {FINDING_DNS_API}
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -3500,7 +3503,7 @@ def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | No
 
 
 def _forge_repair(project_id: str, location: str) -> str:
-    """The provisioning commands for every forge piece, idempotent, as docs 5.8 prints them."""
+    """The provisioning commands for every forge piece, as docs 5.8 prints them."""
     lines = [
         f"gcloud dns managed-zones create {FORGE_DNS_ZONE} --dns-name={FORGE_DNS_NAME} --visibility=private --networks={FORGE_NETWORK} --project={project_id}",
     ]
@@ -3518,7 +3521,7 @@ def _forge_repair(project_id: str, location: str) -> str:
     lines.append(f"gcloud iam service-accounts create {FORGE_VM_SA_ID} --display-name='kube-agents forge VM' --project={project_id}")
     for role in sorted(FORGE_VM_SA_ROLES):
         lines.append(_project_binding(project_id, f"serviceAccount:{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com", role))
-    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; each command is skipped when its resource exists)"
+    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; a create on a piece already there fails with ALREADY_EXISTS and is the skip; a record that points elsewhere takes `gcloud dns record-sets update` with the same flags; the bindings are idempotent)"
 
 
 def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckResult:

@@ -51,8 +51,9 @@ STUB_GCLOUD = textwrap.dedent(
         [ -e "$state/build-hangs" ] && sleep 5
         [ -e "$state/build-fails" ] && exit 1; exit 0 ;;
       *"compute instances create"*) exit 0 ;;
+      *"compute instances remove-metadata"*) exit 0 ;;
       *"compute instances delete"*) exit 0 ;;
-      *"container clusters get-credentials"*) exit 0 ;;
+      *"container clusters get-credentials"*) [ -e "$state/no-credentials" ] && exit 1; exit 0 ;;
     esac
     exit 0
     """
@@ -195,8 +196,12 @@ class ForgeScriptTest(unittest.TestCase):
             "host=ghes.eval.internal", "enterprise-version=3.17.0", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
         ):
             self.assertIn(flag, create)
-        # Readiness from the serial console, then one curl from a pod in the host cluster, with the CA.
+        # Readiness from the serial console, the key out of metadata, then one curl from a pod in the host cluster, with the CA.
         self.assertTrue(self.calls_of("get-serial-port-output forge-ghes"))
+        self.assertTrue(self.calls_of("compute instances remove-metadata forge-ghes --zone=us-central1-a"))
+        self.assertIn("--keys=tls-key", self.calls_of("remove-metadata")[0])
+        calls = self.calls.read_text()
+        self.assertLess(calls.index("remove-metadata"), calls.index("kubectl run"), "the key leaves metadata before anything else runs")
         self.assertTrue(self.calls_of("container clusters get-credentials platform-agent-host"))
         # The CA is passed as a multi-line value, so the call spans lines in the log.
         log = self.calls.read_text()
@@ -290,6 +295,15 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertTrue(self.calls_of("compute instances delete forge-ghes"))
         self.assertFalse(self.state_dir.exists())
 
+    def test_up_stops_when_the_host_clusters_credentials_cannot_be_fetched(self):
+        self.provision()
+        (self.gstate / "no-credentials").write_text("")
+        proc = self.run_forge("up")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not fetch credentials for platform-agent-host", proc.stderr)
+        self.assertFalse(self.calls_of("kubectl run"), "no probe against whatever context the kubeconfig names")
+        self.assertTrue(self.calls_of("compute instances delete forge-ghes"))
+
     def test_up_can_skip_the_cluster_check(self):
         self.provision()
         proc = self.run_forge("up", FORGE_SKIP_CLUSTER_CHECK="1")
@@ -326,6 +340,17 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn("could not list the forge VMs", proc.stderr)
         self.assertNotIn("VM(s) deleted", proc.stdout)
         self.assertFalse(self.calls_of("compute instances delete"))
+
+    def test_down_leaves_the_callers_other_files_and_the_directory(self):
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "forge-vm").write_text("forge-ghes us-central1-a\n")
+        (self.state_dir / "ca.crt").write_text("x\n")
+        (self.state_dir / "unrelated.txt").write_text("the caller's\n")
+        proc = self.run_forge("down")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a"))
+        self.assertFalse((self.state_dir / "ca.crt").exists() or (self.state_dir / "forge-vm").exists())
+        self.assertEqual((self.state_dir / "unrelated.txt").read_text(), "the caller's\n")
 
     def test_down_with_nothing_to_delete_is_clean(self):
         proc = self.run_forge("down")
