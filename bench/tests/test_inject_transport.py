@@ -34,6 +34,7 @@ message id, as the door does.
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sqlite3
 import threading
@@ -2809,9 +2810,13 @@ def test_inject_transport_delegated_worker_mid_wait_rate_limit_triage_marks_run_
 
 
 def test_inject_transport_delegated_worker_triage_and_running_card_does_not_flap(
-    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A triage card carrying rate limit alongside a running card does not flap back into outstanding."""
+    caplog.set_level(logging.INFO)
     build_session_store(tmp_path, created=[CARD_A, CARD_B])
     rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
     set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
@@ -2847,6 +2852,35 @@ def test_inject_transport_delegated_worker_triage_and_running_card_does_not_flap
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+
+    # CARD_A must not flap back into outstanding during polling.
+    # While CARD_B is still running, log output must not wait on CARD_A.
+    wait_logs = [
+        r.message
+        for r in caplog.records
+        if "waiting" in r.message and "delegated tasks" in r.message
+    ]
+    assert wait_logs, "expected delegation wait log entries"
+    assert all(CARD_A not in msg for msg in wait_logs), (
+        f"CARD_A flapped into outstanding waiting logs: {wait_logs}"
+    )
+    assert all(CARD_B in msg for msg in wait_logs)
+
+    # In-loop polling reads (read index 2) must only want CARD_B, never re-requesting CARD_A.
+    # Read 0: initial read
+    # Read 1: triage_initial fetch for CARD_A
+    # Read 2: loop poll for outstanding (CARD_B only)
+    # Read 3: post-loop final read for settled
+    reads: list[str] = getattr(real_shell, "reads", [])
+    assert len(reads) == 4, (
+        f"expected 4 reads (initial, triage_initial, loop poll, final), got {len(reads)}"
+    )
+    loop_poll_script = reads[2]
+    # Check that CARD_A was not requested in want args of the loop poll
+    assert f"'{CARD_B}'" in loop_poll_script or f'"{CARD_B}"' in loop_poll_script or CARD_B in loop_poll_script
+    # In session_cards_command: ... max_want MAX_CHAIN_STEPS *want
+    # want arguments appear at the end after MAX_CHAIN_STEPS (9)
+    assert CARD_A not in loop_poll_script.split()[10:]
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

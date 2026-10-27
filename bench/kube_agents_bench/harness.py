@@ -2951,6 +2951,8 @@ class KubeAgentsHarness(AgentHarness):
                     {t: c for t, c in fresh_triage.cards.items() if t in triage_initial}
                 )
 
+        rate_limited: set[str] = set()
+
         def _status(task_id: str) -> str:
             return str(read.cards.get(task_id, {}).get("status") or "unknown")
 
@@ -2959,13 +2961,19 @@ class KubeAgentsHarness(AgentHarness):
             if st in _TERMINAL_STATUSES:
                 return True
             if st == "triage":
+                if task_id in rate_limited:
+                    return True
                 card = read.cards.get(task_id, {}) if read is not None else {}
                 summary = str(card.get("summary") or "")
                 result_val = str(card.get("result") or "")
-                return bool(
+                if (
                     _extract_infra_failure_reason(summary)
                     or _extract_infra_failure_reason(result_val)
-                )
+                ):
+                    rate_limited.add(task_id)
+                    return True
+            else:
+                rate_limited.discard(task_id)
             return False
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
@@ -3014,6 +3022,16 @@ class KubeAgentsHarness(AgentHarness):
             fresh = _read(outstanding)
             if fresh is None:
                 raise _exhausted(outstanding)
+            for t in rate_limited:
+                if (
+                    t in read.cards
+                    and t in fresh.cards
+                    and str(fresh.cards[t].get("status") or "") == "triage"
+                ):
+                    if not fresh.cards[t].get("summary"):
+                        fresh.cards[t]["summary"] = read.cards[t].get("summary")
+                    if not fresh.cards[t].get("result"):
+                        fresh.cards[t]["result"] = read.cards[t].get("result")
             read = fresh
             outstanding = _merge()
 
