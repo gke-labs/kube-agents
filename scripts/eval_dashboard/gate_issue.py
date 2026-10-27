@@ -54,7 +54,7 @@ passing mention of a role or node elsewhere is not the tracker; case names
 never match an unlabelled body (a roster tracker lists them all), and the
 deadline pair, having no identifier, needs the label. The bot's own
 `nightly-red` issues are never adopted: a case's bug is not the gate's
-tracker. The four infrastructure shapes -- lost pods, fixture drift,
+tracker; nor are its coverage-gap issues (coverage_gaps.py), a domain's. The four infrastructure shapes -- lost pods, fixture drift,
 pool drift, deadline kills -- are assigned to `infra_owner` in
 docs/designs/domains.yaml and end with a line mentioning `infra_backup`; an
 OUTAGE's issue (a shared break, which may be any case's code) is not.
@@ -115,6 +115,10 @@ LABELS_PATH = "issues/{number}/labels"
 # The bot's other issue family (nightly_bugs.py): a case's bug, never the
 # gate's tracker.
 NEVER_ADOPT_LABELS = frozenset({"nightly-red"})
+# The coverage-gap filer's issues share the `presubmit-gate` label and name
+# nightly cases in their bodies; one is a domain's, never an outage's
+# (coverage_gaps.py).
+NEVER_ADOPT_MARKER = "<!-- kube-agents-bot:coverage-gap "
 # Who the bot's own issues are filed as (the workflow's GITHUB_TOKEN). Only
 # these are closed; anyone else's is adopted and left open.
 BOT_LOGINS = frozenset({"github-actions[bot]"})
@@ -650,9 +654,9 @@ class Tracker:
         kind, matched on the ids its marker carries and nothing else."""
         for issue in self.open_issues():
             labelled = LABEL in label_names(issue)
-            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue) or (labelled_only and not labelled):
-                continue
             title, body = issue.get("title", ""), issue.get("body") or ""
+            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue) or NEVER_ADOPT_MARKER in body or (labelled_only and not labelled):
+                continue
             if marker is not None:
                 found = marker.search(body)
                 if found and set(names) <= set(found.group(1).split(",")):

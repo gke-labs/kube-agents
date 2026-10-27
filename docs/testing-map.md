@@ -24,8 +24,9 @@ misplaced test look fine.
 
 Some of those rows carry a footnote that matters more than the row.
 
-**`make test-python` runs twice in CI, on two interpreters.** `python-tests.yml`'s required job runs
-it under coverage on `.python-version`, CI's Python, and a second, non-required job runs it plain on
+**`make test-python` runs twice in CI, on two interpreters.** `python-tests.yml` runs it under
+coverage on `.python-version`, CI's Python, as three shard jobs whose results the required job
+joins (`PYTHON_TEST_SHARD`, `make coverage-merge`), and a second, non-required job runs it plain on
 `.agent-python-version`, the Python inside the platform agent image, where `agents/platform/scripts`,
 `deploy/shared` and the agent plugins execute. A suite that passes on one and not the other is the
 second job's whole purpose; it replaced two workflows that ran only `tests/` and the plugin suites

@@ -419,11 +419,14 @@ func (r *PlatformAgentReconciler) removeA2AMCP(ctx context.Context, agent *agent
 	return nil
 }
 
-// deleteA2AObjectIfOwned is deleteOwnedA2AObject for a removal that runs
-// whether or not the object was ever rendered: it reads obj once, and an
-// object that is absent, or that this agent does not control, is left alone
-// without an error. ready, when set, is asked only of an object that is
-// ours, and holds the delete for a later pass when it says not yet.
+// deleteA2AObjectIfOwned removes one A2A object this agent owns, for a
+// removal that runs whether or not the object was ever rendered: it reads
+// obj once through reader (the cache for kinds the manager watches, a2aReader
+// for a Secret; see removeA2AInjectBackend), and an object that is absent,
+// or that this agent does not control, is left alone without an error --
+// not ours to delete, and not a reason to stop the reconcile (#3871). ready,
+// when set, is asked only of an object that is ours, and holds the delete
+// for a later pass when it says not yet.
 func (r *PlatformAgentReconciler) deleteA2AObjectIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, reader client.Reader, ready func() (bool, error)) error {
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 		return client.IgnoreNotFound(err)

@@ -203,6 +203,32 @@ def test_a_paused_specialist_also_follows_the_ack() -> None:
     assert _ack_passes("checking checkout-gateway.\n\n" + question)
 
 
+CONFIRM_FIRST = "chat-real-report-fix-files-confirm-first"
+ACK_ASKS_NOTHING = "the-ack-asks-nothing"
+
+
+def _confirm_first_ack_passes(final_message: str) -> bool:
+    """Only the ack check: the case's other checks need the report's own content."""
+    spec = yaml.safe_load((TASKS / CONFIRM_FIRST / "task.yaml").read_text(encoding="utf-8"))
+    checks = [e["check"] for e in spec["verification_spec"] if e["name"] == ACK_ASKS_NOTHING]
+    assert checks, f"{CONFIRM_FIRST} no longer has {ACK_ASKS_NOTHING}"
+    transcript.set(final_message, [], final_message=final_message)
+    return all(ReportContainsVerifier(**c).verify(timeout_sec=1.0).success for c in checks)
+
+
+def test_a_paused_specialists_question_is_not_the_front_doors_ask() -> None:
+    """After #4012 a card paused on a question is delivered as a `Question from
+    delegated task` section. Its `?` belongs to the specialist, so the ack check
+    stops at that header as it stops at the result and artifact headers."""
+    ack = "On it: fixing the three files the report names."
+    question = QUESTION + "The report names payments-api and checkout. Which should go first?"
+    assert _confirm_first_ack_passes(f"{ack}\n\n{question}")
+    # The second pattern forbids `sample` and `demo` over the same span; a specialist may say either.
+    assert _confirm_first_ack_passes(f"{ack}\n\n{QUESTION}The report reads like a sample. Should I still start?")
+    assert _confirm_first_ack_passes(f"{ack}\n\n{RESULT}Fixed all three files.")
+    assert not _confirm_first_ack_passes("Shall I fix the three files the report names?")
+
+
 NEXT_STEP = "chat-answer-declares-next-step"
 
 

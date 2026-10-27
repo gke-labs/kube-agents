@@ -1,0 +1,22 @@
+# Pages under docs/site/src/content/docs/ that carried a finding when its shape
+# arrived in scripts/check_docs_audience.py, pinned at the count they had that
+# day. One entry per line: `<page> <count> <shape>`, the page relative to the
+# site root, the count above zero, the shape exactly as the check reports it.
+#
+# The list only shrinks. The check fails when a page has more findings than
+# its entry (a rise), when it has fewer (lower the count, or remove the entry
+# once the page is clean), when an entry names a page that is gone, and when
+# a line is not an entry. A page with no entry is held at zero, so a new
+# finding anywhere is a failure, never a new line here. Only the two shapes
+# that arrived with a backlog can be pinned (PINNABLE_SHAPES in the check):
+# an entry for any other shape is refused.
+#
+# Pull-request and issue numbers are history, not reasons
+# (.agents/rules/documentation.md): state the reason in prose and drop the
+# number. Maintainer release-pipeline markers belong in scripts/release/README.md.
+
+deploy/gitops-argocd.md 1 pull-request or issue citation
+deploy/release-versioning.md 4 denylist: evalcand_
+install/gitlab.md 1 pull-request or issue citation
+install/upgrade.md 11 pull-request or issue citation
+operator/platformagent-crd.md 1 pull-request or issue citation

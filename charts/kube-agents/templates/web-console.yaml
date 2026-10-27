@@ -70,6 +70,7 @@ spec:
       serviceAccountName: {{ .Release.Name }}-web-console
       automountServiceAccountToken: true
       {{- else }}
+      serviceAccountName: "default"
       automountServiceAccountToken: false
       {{- end }}
       securityContext:

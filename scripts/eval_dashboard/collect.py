@@ -464,8 +464,9 @@ _REP_REPORT_LINE = re.compile(r"^\s+rep (?P<n>\d+) report: (?P<text>.*)$")
 # grading line, printed by `bench-gate case` with each of two values it knows,
 # one decimal each -- `agent_s` the agent run's wall clock (results.json's
 # `latency`: no provisioning, verification or judge in it),
-# `turn1_s` the opening chat turn on the api transport. Its own shape, `rep N
-# timing:`, so `_REP_LINE` never matches it.
+# `turn1_s` the opening chat turn (on the inject transport, the opening task
+# to its terminal). Its own shape, `rep N timing:`, so `_REP_LINE` never
+# matches it.
 #   rep 2 timing: agent_s=143.2 turn1_s=6.4
 _REP_TIMING_LINE = re.compile(r"^\s+rep (?P<n>\d+) timing: (?P<fields>.*)$")
 _REP_TIMING_KEYS = ("agent_s", "turn1_s")

@@ -4,9 +4,9 @@
 on green and red exits alike (scripts/test_ci_eval_trap.py pins that), so a
 passing nightly whose repetitions ran to the delegation ceiling keeps the log
 that says what the dispatcher and the workers were doing. These tests run the
-real function, lifted from the real file with the constants it reads, under
-bash with a `kubectl` stub on PATH, so the bounds it applies and the exit
-status it leaves behind are the ones the script has.
+real function, lifted from the real file with the byte-cap helper and
+constants it reads, under bash with a `kubectl` stub on PATH, so the bounds it
+applies and the exit status it leaves behind are the ones the script has.
 """
 
 import os
@@ -20,6 +20,8 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 FUNCTION = "collect_gateway_log"
+# The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
+HELPER = "last_bytes"
 ARTIFACT = "platform-agent-gateway.log"
 
 # A kubectl that prints its arguments once, then the number of lines the
@@ -35,17 +37,34 @@ line=$(head -c "${STUB_LINE_BYTES:-100}" /dev/zero | tr '\\0' 'a')
 for _ in $(seq 1 "${STUB_LINES:-3}"); do echo "$line"; done
 """
 
+# uutils tail -c N on a pipe ($# -eq 2) over-prints after short reads
+# (uutils/coreutils#15804); on a regular file ($# -ge 3) both GNU and uutils
+# seek and take N. Mimic the pipe overrun so the cap test fails on a GNU
+# runner too if the collector reverts to `| tail -c`.
+TAIL_STUB = """#!/usr/bin/env bash
+if [ "${1:-}" = "-c" ] && [ "$#" -eq 2 ]; then
+  /usr/bin/tail "$@"
+  printf 'uutils-pipe-overrun'
+  exit 0
+fi
+exec /usr/bin/tail "$@"
+"""
+
 
 def lifted() -> str:
-    """The function and the constants it reads, as written in ci-env.sh."""
+    """The function, the byte-cap helper it bounds the log with, and the
+    constants it reads, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly GATEWAY_LOG_[A-Z_]+=.*$", src, re.MULTILINE)
     if len(constants) != 2:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"expected two GATEWAY_LOG_ constants in {ENV_SCRIPT}, found {constants}")
-    match = re.search(rf"^{FUNCTION}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
-    if match is None:  # pragma: no cover
-        raise AssertionError(f"{FUNCTION}() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in (HELPER, FUNCTION):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def constant(name: str) -> int:
@@ -66,6 +85,9 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    tail = stubs / "tail"
+    tail.write_text(TAIL_STUB, encoding="utf-8")
+    tail.chmod(tail.stat().st_mode | stat.S_IXUSR)
     artifacts = tmp / "artifacts"
     script = "\n".join(
         [
@@ -76,13 +98,14 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
             *then,
         ]
     )
-    env = dict(
-        os.environ,
-        PATH=f"{stubs}:{os.environ['PATH']}",
-        ARTIFACTS=str(artifacts),
-        TARGET_NAMESPACE="test-ns",
+    env = {
+        **os.environ,
+        "PATH": f"{stubs}:{os.environ['PATH']}",
+        "ARTIFACTS": str(artifacts),
+        "TARGET_NAMESPACE": "test-ns",
+        "TMPDIR": str(tmp),
         **stub_env,
-    )
+    }
     proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False, env=env)
     return proc, artifacts / ARTIFACT
 
@@ -104,6 +127,18 @@ class GatewayLogCollectionTest(unittest.TestCase):
         proc, log = run_collect(STUB_LINES="200", STUB_LINE_BYTES=str(cap // 100))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(log.stat().st_size, cap)
+        self.assertEqual(list(log.parent.parent.glob("**/last-bytes.*")), [])
+        self.assertEqual(list(log.parent.glob("*.spool")), [])
+        # When mktemp cannot create a file in TMPDIR, last_bytes falls back to
+        # ${out}.spool and still removes the spool once the cap is taken.
+        proc, log = run_collect(
+            STUB_LINES="200",
+            STUB_LINE_BYTES=str(cap // 100),
+            TMPDIR="/nonexistent-last-bytes-tmpdir",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.stat().st_size, cap)
+        self.assertEqual(list(log.parent.glob("*.spool")), [])
 
     def test_a_kubectl_that_fails_leaves_the_status_alone(self):
         """The trap reads `$?` for the dumper after this runs, and a cluster

@@ -3053,8 +3053,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self.assertIn(
                 "**Who acts on this:**\n"
                 "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
-                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                + session_kv_server.TRIAGE_FIX_AGAINST_LIVE_OBJECT
+                + "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
                 "(no `kubectl scale`, `patch`, or `apply`).",
                 body,
             )
@@ -3096,7 +3097,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
         self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
         slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
-        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        self.assertIn(r"is\s+being\s+opened\s+automatically", slack)
         task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
         self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
         off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
@@ -6579,6 +6580,47 @@ class TestDriftInject(unittest.TestCase):
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
 
+    def test_the_card_handles_an_object_git_does_not_declare(self):
+        """No declared state means no revert, and the card has to say so twice.
+
+        Once as the instruction, and once in **Done when**, which otherwise
+        demands revert-or-codify and so makes a report that correctly offers no
+        revert unfinishable. The card defers the list of GitOps markers to the
+        skill ("the skill lists them"), so the skill has to carry one: the
+        worker has no repository to check, and the markers are all it has.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("establish whether git declares this object at all", card)
+        self.assertIn("no declared state to revert to", card)
+        # A delete leaves no live object, so no markers proves nothing and the
+        # revert has to survive: gitops-drift-deleted-policy-triage expects it.
+        # No pull request can delete an object git never held, and chat turns
+        # every lettered option into an 'apply' button, so deletion is an
+        # unlettered Manual step (observed: a lettered "Delete unmanaged
+        # namespace" option with "apply Option B" beside it).
+        self.assertIn("never a lettered option, never the recommendation", card)
+        self.assertIn("- **Manual step (<title>):**", card)
+        # Only a person's kubectl subcommands read as "not in git"; a manager
+        # the card cannot name may be a pipeline's and keeps the revert.
+        self.assertIn("its only field managers are a person's `kubectl` subcommands", card)
+        self.assertIn("a field manager you do not recognise", card)
+        self.assertIn("A deleted object carries nothing to read", card)
+        self.assertIn("keep the revert", card)
+        done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("for an object git does not declare", done_when)
+        self.assertIn("proposes codifying it", done_when)
+
+        skill = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for marker in ("argocd-controller", "kustomize-controller", "configsync.gke.io"):
+            self.assertIn(marker, skill, f"the skill the card defers to no longer names {marker}")
+
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
         """Capped, and capped on its own budget."""
@@ -8305,8 +8347,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(cleaned, crafted_line)
 
     def test_secret_read_command_detector_covers_every_output_form(self):
-        # The detector keys on "get secret" plus any output shaping or pipe,
-        # not on an enumerated list of formatters an agent may not pick.
+        # The detector fails closed: a `kubectl get` of a secret is served only
+        # as the bare list, a store's command only as one of its named lists,
+        # and a form no list named withholds (the grammar's own cases live in
+        # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
@@ -8343,9 +8387,23 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "sops --decrypt secrets.enc.yaml",
             "kubectl exec deploy/api -- cat /etc/db-creds/password",
             "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+            # a form no list named fails closed (the grammar's own cases
+            # live in test_worker_transcript.py)
+            "kubectl get secret db -n prod --some-flag-added-next-release",
+            "kubectl get secrets -n $NS",
+            "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
+            "printf secret/db | xargs kubectl get -n prod -o yaml",
+            "aws secretsmanager batch-get-secret-value --secret-id-list db",
+            "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
         ]
         served = [
             "kubectl get secrets -n kube-system",
+            "kubectl get secret db -n prod --ignore-not-found",
+            "kubectl get secrets -A 2>/dev/null",
+            "kubectl get secrets -n prod | wc -l",
+            "kubectl get pods -n external-secrets",
+            "kubectl get pods -n prod -l app=kubectl-proxy",
+            "kubectl get pods -n vault",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
             "kubectl get secrets -n kube-system --show-labels",

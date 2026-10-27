@@ -100,8 +100,8 @@ _Note: Retrieve the sorted events list and manually inspect the event timestamps
   - Wrong image tag, missing image registry authentication (e.g., ImagePullBackOff).
   - **Resolution Steps for Wrong Image Tag**:
     1. Identify the failing container image name and the invalid tag.
-    2. Check the Git repository history for the last known working image tag for this workload. Run `git log -p -S "<image_name>" -- <manifest_file_path>` (or use `git log` on the folder containing manifests) to identify the previous working tag in Git.
-    3. If the invalid tag is a recent change in git history, compare it to the tag from the last successful commit.
+    2. Find the last image tag that ran, from the cluster: `kubectl rollout history deployment/<name> -n <namespace>` lists the revisions, and `kubectl rollout history deployment/<name> -n <namespace> --revision=<N>` shows each one's image. You have no GitOps repository; don't look for one.
+    3. If the invalid tag arrived with the newest revision, compare it to the image of the revision just before it, the last one whose pods ran.
     4. Propose reverting the image tag to the last working version, or correcting the tag version in the manifest patch.
 
 ---

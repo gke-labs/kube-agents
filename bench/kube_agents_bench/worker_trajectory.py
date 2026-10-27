@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -104,7 +105,7 @@ from typing import Any
 
 from kube_agents_bench.parsing import _call_args
 
-__all__ = ["WorkerCapture", "capture"]
+__all__ = ["WorkerCapture", "capture", "TOOL_CALL_WRAPPER", "wrapped_tool_names"]
 
 _log = logging.getLogger("kube_agents_bench.worker_trajectory")
 
@@ -112,6 +113,27 @@ _log = logging.getLogger("kube_agents_bench.worker_trajectory")
 # script never ran to completion (no kubectl, no python, an unreachable pod),
 # which is a capture failure rather than an empty capture.
 CAPTURE_PRESENT = "__WORKER_TRAJECTORY__"
+
+# Dispatch wrapper name Hermes uses when recording MCP tool calls
+TOOL_CALL_WRAPPER = "tool_call"
+
+
+def wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
+    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
+    if entry.get("name") != TOOL_CALL_WRAPPER:
+        return set()
+    args = entry.get("args")
+    if not isinstance(args, dict):
+        return set()
+    names: set[str] = set()
+    if args.get("name"):
+        names.add(str(args["name"]))
+    calls = args.get("calls")
+    if isinstance(calls, list):
+        for c in calls:
+            if isinstance(c, dict) and c.get("name"):
+                names.add(str(c["name"]))
+    return names
 
 # The hermes data volume, the root ``harness._ATTACHMENTS_DIR`` and
 # ``harness._LOGS_DIR`` hang off: ``kanban.db`` and the ``default`` profile's

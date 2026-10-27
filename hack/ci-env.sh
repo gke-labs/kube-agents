@@ -258,6 +258,29 @@ collect_bench_results() {
   cp results_*.json "${artifact_dir}/" 2>/dev/null || true
 }
 
+# ─── Byte caps ───────────────────────────────────────────────────────────────
+# Every container log the `collect_*` functions below keep is bounded twice:
+# kubectl's line tail, then a byte cap, the last N bytes of what kubectl
+# printed. The cap used to be `| tail -c N` on the pipe. GNU tail takes
+# exactly N there; uutils tail, the coreutils of Ubuntu 26.04 (rust-coreutils
+# 0.8.0 and 0.10.0, and upstream 0.12.0), keeps whole read chunks after a
+# short read and prints more than N (uutils/coreutils#15804), so a capture on
+# such a runner ran past its cap and the tests that pin the cap read
+# 8851062 != 8388608. On a regular file both implementations seek and take
+# exactly N, so the stream is spooled to a file first and the cap is taken
+# from that; the watch tails in _stop_agent_pod_watch already read files and
+# are unchanged. Same contract as the collectors: every command ends in
+# `|| true`, a read that fails leaves what it printed (or the last N bytes of
+# what reached the spool if the disk fills mid-stream), and the spool is
+# removed either way.
+last_bytes() {
+  local max="$1" out="$2" spool
+  spool="$(mktemp "${TMPDIR:-/tmp}/last-bytes.XXXXXX" 2>/dev/null)" || spool="${out}.spool"
+  cat > "${spool}" || true
+  tail -c "${max}" "${spool}" > "${out}" || true
+  rm -f -- "${spool}" || true
+}
+
 # ─── Gateway Log Collection (runs on PASS as well as on failure) ──────────────
 # The bounded tail of the platform-agent-gateway log, written on every exit
 # (GATEWAY_LOG_TAIL_LINES / GATEWAY_LOG_MAX_BYTES above say why and how much).
@@ -287,7 +310,7 @@ collect_gateway_log() {
   # shellcheck disable=SC2086
   kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} logs deployment/platform-agent-gateway \
     -n "${ns}" --tail="${GATEWAY_LOG_TAIL_LINES}" 2>&1 \
-    | tail -c "${GATEWAY_LOG_MAX_BYTES}" > "${artifact_dir}/platform-agent-gateway.log" || true
+    | last_bytes "${GATEWAY_LOG_MAX_BYTES}" "${artifact_dir}/platform-agent-gateway.log" || true
 }
 
 # ─── LiteLLM Log Collection (runs on PASS as well as on failure) ──────────────
@@ -322,7 +345,7 @@ collect_litellm_log() {
   fi
   "${kctl[@]}" logs -l "${LITELLM_LOG_POD_SELECTOR}" -c "${LITELLM_LOG_CONTAINER}" -n "${ns}" \
     --prefix --ignore-errors --tail="${LITELLM_LOG_TAIL_LINES}" 2>&1 \
-    | tail -c "${LITELLM_LOG_MAX_BYTES}" > "${log}" || true
+    | last_bytes "${LITELLM_LOG_MAX_BYTES}" "${log}" || true
 }
 
 # ─── Credential-proxy evidence (runs on PASS as well as on failure) ──────────
@@ -355,7 +378,7 @@ collect_credential_proxy_evidence() {
   fi
   "${kctl[@]}" logs "${CREDENTIAL_PROXY_DEPLOYMENT}" -c "${CREDENTIAL_PROXY_CONTAINER}" -n "${ns}" \
     --tail="${CREDENTIAL_PROXY_LOG_TAIL_LINES}" 2>&1 \
-    | tail -c "${CREDENTIAL_PROXY_LOG_MAX_BYTES}" > "${log}" || true
+    | last_bytes "${CREDENTIAL_PROXY_LOG_MAX_BYTES}" "${log}" || true
   local bound=(timeout --foreground "${CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
   local scrape_status=0
@@ -494,7 +517,7 @@ collect_agent_pod_diagnostics() {
 
   "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_AGENT_CONTAINER}" -n "${ns}" \
     --previous --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
-    | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}platform-agent-previous.log" || true
+    | last_bytes "${AGENT_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}platform-agent-previous.log" || true
 
   local containers=""
   if ! containers=$("${kctl[@]}" get "${AGENT_DIAG_DEPLOYMENT}" -n "${ns}" \
@@ -507,10 +530,10 @@ collect_agent_pod_diagnostics() {
     *" ${AGENT_DIAG_BRIDGE_CONTAINER} "*)
       "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
         --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
-        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}hermes-bridge.log" || true
+        | last_bytes "${AGENT_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}hermes-bridge.log" || true
       "${kctl[@]}" logs "${AGENT_DIAG_DEPLOYMENT}" -c "${AGENT_DIAG_BRIDGE_CONTAINER}" -n "${ns}" \
         --previous --tail="${AGENT_DIAG_LOG_TAIL_LINES}" 2>&1 \
-        | tail -c "${AGENT_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}hermes-bridge-previous.log" || true
+        | last_bytes "${AGENT_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}hermes-bridge-previous.log" || true
       ;;
   esac
 
@@ -566,12 +589,12 @@ collect_a2a_component_logs() {
     base="a2a-${component//[^A-Za-z0-9._-]/_}-${pod//[^A-Za-z0-9._-]/_}"
     "${kctl[@]}" logs "pod/${pod}" -n "${ns}" --all-containers --prefix --ignore-errors \
       --tail="${A2A_DIAG_LOG_TAIL_LINES}" 2>&1 \
-      | tail -c "${A2A_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}${base}.log" || true
+      | last_bytes "${A2A_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}${base}.log" || true
     case "${restarts}" in
       *[1-9]*)
         "${kctl[@]}" logs "pod/${pod}" -n "${ns}" --all-containers --prefix --ignore-errors \
           --previous --tail="${A2A_DIAG_LOG_TAIL_LINES}" 2>&1 \
-          | tail -c "${A2A_DIAG_LOG_MAX_BYTES}" > "${artifact_dir}/${prefix}${base}-previous.log" || true
+          | last_bytes "${A2A_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-previous.log" || true
         ;;
     esac
   done < <(cat "${listing}" 2>/dev/null || true)

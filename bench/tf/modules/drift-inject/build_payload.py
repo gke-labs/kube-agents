@@ -21,8 +21,8 @@ stacks did, through an unquoted heredoc that had to expand `$project` and
 `$insert_id` and therefore could not be quoted.
 
 A tracked file rather than an inline `python3 -c`, so that
-`bench/tests/test_drift_inject_payload.py` can pin what each stack builds. All
-three stacks are nightly-only, so a silently wrong payload would otherwise
+`bench/tests/test_drift_inject_payload.py` can pin what each stack builds. Every
+stack is nightly-only, so a silently wrong payload would otherwise
 surface a night later as a judge disagreeing with a correct agent, rather than
 on the pull request that wrote it.
 

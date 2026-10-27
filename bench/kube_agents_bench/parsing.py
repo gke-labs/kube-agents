@@ -326,10 +326,12 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
         if delivered.get(task_id, "").strip():
             continue
         runs = payload.get("runs")
-        for run in runs if isinstance(runs, list) else []:
-            summary = run.get("summary") if isinstance(run, dict) else None
-            if isinstance(summary, str) and summary.strip():
-                delivered[task_id] = summary
+        if isinstance(runs, list) and runs:
+            last_run = runs[-1]
+            if isinstance(last_run, dict):
+                summary = last_run.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    delivered[task_id] = summary
     return delivered
 
 

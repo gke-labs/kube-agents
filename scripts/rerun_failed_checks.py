@@ -12,12 +12,12 @@ owner, member or collaborator, with a token that can re-run workflows. The same
 comment reaches Prow, which re-runs its own failed jobs, so one word covers
 both kinds of check.
 
-What is re-run is what Tide sees red, read the way Tide reads it. Tide takes
-the check runs at the head commit -- the latest attempt of each check suite,
+What is re-run is what reads red at the head, read the way Tide read it when
+this script was written. The script takes the check runs at the head commit -- the latest attempt of each check suite,
 which is what GitHub's commit rollup lists -- and keeps the best state per
 check name: success (`success`, `neutral`, `skipped`) over pending (not
 completed) over failure (any other completed conclusion). A name whose best
-state is failure blocks the merge, a pending one holds it, and only a success
+state is failure is red, a pending one is still running, and only a success
 clears it. So the script lists the same check runs, finds the names whose
 best state is failure, takes the newest red check run of each, and re-runs
 the GitHub Actions workflow run that produced it: through its
@@ -64,17 +64,18 @@ USER_AGENT = "kube-agents-rerun-failed-checks"
 # The pull request state the command acts on; a closed or merged one is declined.
 PULL_REQUEST_OPEN = "open"
 
-# How Tide reads a check run (prow `tide`, `checkRunToContext`): not completed
-# is pending; these conclusions are success; every other completed conclusion
-# (`failure`, `cancelled`, `timed_out`, `action_required`, `stale`) is failure.
+# How Tide read a check run (prow `tide`, `checkRunToContext`), kept here: not
+# completed is pending; these conclusions are success; every other completed
+# conclusion (`failure`, `cancelled`, `timed_out`, `action_required`, `stale`)
+# is failure.
 COMPLETED_STATUS = "completed"
 SUCCESS_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
-# The per-name order Tide keeps (`isStateBetter`): one success clears the name,
+# The per-name order Tide kept (`isStateBetter`): one success clears the name,
 # one pending holds it, failure only when every check run of the name failed.
 STATE_SUCCESS, STATE_PENDING, STATE_FAILURE = "success", "pending", "failure"
 
 # Which check runs the commit endpoint lists: the latest attempt per check
-# suite, as the rollup Tide reads does (`list_check_runs` says why not `all`).
+# suite, as the commit rollup does (`list_check_runs` says why not `all`).
 CHECK_RUNS_FILTER = "latest"
 
 # Check runs GitHub Actions itself posts carry this app slug. Any other app's
@@ -151,11 +152,11 @@ def list_runs(api, repo: str, head_sha: str) -> list:
 
 
 def list_check_runs(api, repo: str, head_sha: str) -> list:
-    """The check runs at `head_sha` as Tide sees them: the latest attempt of
-    each check suite. `latest` is the endpoint's default, named here because
-    `all` would also return the attempts a re-run replaced, which the commit
-    rollup Tide reads does not list -- so a check that passed once and failed
-    on a later re-run would read green here and red to Tide. A run a newer
+    """The check runs at `head_sha` as the commit rollup lists them: the latest
+    attempt of each check suite. `latest` is the endpoint's default, named here
+    because `all` would also return the attempts a re-run replaced, which the
+    rollup does not list -- so a check that passed once and failed on a later
+    re-run would read green here and red on the pull request. A run a newer
     event superseded is a check suite of its own and is listed either way."""
     return api.get_object_pages(f"/repos/{repo}/commits/{head_sha}/check-runs", "check_runs", {"filter": CHECK_RUNS_FILTER})
 

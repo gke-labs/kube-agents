@@ -82,4 +82,32 @@ decides.
 - **A new cluster**: follow the repository's existing cluster block or
   module call. With none, the kube-agents `gke-cluster` module pinned to a
   release tag is the reference layout's example; ask before introducing a
-  module the repository does not already use.
+  module the repository does not already use. Its `deletion_protection` is
+  `true`, written as the existing clusters write it; a sibling's `false` is
+  not copied (Step 3).
+
+## Shared resources beside a cluster
+
+A sibling cluster's files often declare resources that exist once per
+project or fleet, not once per cluster. A new cluster references these or
+leaves them alone; it never declares a second one:
+
+- `google_gke_hub_feature` (Config Management, multi-cluster ingress or
+  services, service mesh, policy controller, fleet observability): one per
+  feature per project. A cluster joins it through its membership and a
+  `google_gke_hub_feature_membership`, which is per cluster and names the
+  feature by its string (`feature = "configmanagement"`), since a separate
+  root cannot address the sibling's resource.
+- `google_gke_hub_fleet`: one per project.
+- `google_project_service`: one per API per project.
+- A shared node or workload service account, and its
+  `google_project_iam_member` bindings.
+- Artifact Registry repositories, and Cloud KMS key rings and keys.
+- The network and subnetwork, unless the request asks for new ones. A
+  shared subnetwork is fine, but the new cluster needs its own secondary
+  ranges: reusing the sibling's `cluster_secondary_range_name` or
+  `services_secondary_range_name` is refused or collides.
+
+Per cluster, and so new with the cluster: `google_container_cluster`, its
+`google_container_node_pool`s, `google_gke_hub_membership`, and that
+membership's `google_gke_hub_feature_membership` entries.

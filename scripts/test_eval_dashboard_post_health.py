@@ -18,6 +18,7 @@ import re
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -292,6 +293,11 @@ class RunHarness(unittest.TestCase):
         self.state = self.dir / "state.json"
         self.opener = FakeOpener()
         self.gh = FakeGh()
+        # The coverage-gap lines read this checkout's roster, which moves;
+        # tests that want them patch their own (CoverageLines below).
+        coverage = unittest.mock.patch.object(post_health, "coverage_lines", return_value=[])
+        self.coverage = coverage.start()
+        self.addCleanup(coverage.stop)
 
     def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None):
         path = self.dir / "health.json"
@@ -656,6 +662,33 @@ class Digest(RunHarness):
         self.assertIn("warning:", err)
         self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
         self.assertIn("\n🌙 Nightly section skipped: data.json could not be read.\n", self.opener.texts[4])
+
+    def test_the_coverage_gap_lines_go_in_after_the_nightly_part_on_the_digest_only(self):
+        gap = "🚧 Coverage gap: remediation uncovered 9 days (owner: someone); best candidate pdb-remediation-pr, 37/41 on the nightly (90%, meets 90%)."
+        self.coverage.return_value = [gap]
+        self.tick(outage(), self.at(DIGEST_UTC - 2, 5))
+        self.tick(health(), self.at(DIGEST_UTC, 5), data={"schema_version": 1, "runs": [], "cases": []})
+        self.assertEqual(self.coverage.call_count, 1, "computed on the digest tick alone")
+        self.assertNotIn(gap, self.opener.texts[0], "not in a state-change message")
+        digest = self.opener.texts[-1]
+        self.assertIn(f"\n🌙 Nightly: no run on record yet\n{post_health.NIGHTLY_URL}\n", digest)
+        self.assertLess(digest.index("🌙 Nightly"), digest.index(gap))
+        self.assertLess(digest.index(gap), digest.index(URL))
+        # Every domain covered: no line, and nothing in its place.
+        self.coverage.return_value = []
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), data={"schema_version": 1, "runs": [], "cases": []})
+        self.assertNotIn("Coverage gap", self.opener.texts[-1])
+
+    def test_the_coverage_gap_lines_pass_the_store_through(self):
+        store = self.dir / "store.json"
+        store.write_text("{}")
+        path = self.dir / "health.json"
+        path.write_text(json.dumps(health()))
+        argv = ["--health", str(path), "--state", str(self.state), "--now", self.at(DIGEST_UTC, 5).isoformat(), "--store", str(store)]
+        with contextlib.redirect_stderr(io.StringIO()):
+            post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
+        [(args, _)] = self.coverage.call_args_list
+        self.assertEqual(args[2], store)
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))
@@ -3001,6 +3034,12 @@ class IssueLifecycle(RunHarness):
         self.tick(self.drifting(), T14, environ=self.environ())
         self.assertEqual(self.recorded()["issue"]["number"], 1291)
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1291/labels")])
+
+    def test_a_coverage_gap_issue_naming_the_cases_is_never_adopted(self):
+        body = "<!-- kube-agents-bot:coverage-gap domain=cluster-debugging -->\n" + "\n".join(f"| `{case}` | 21/21 |" for case in TRIO)
+        self.gh.open_issues = [human(1295, "Presubmit coverage: cluster-debugging has no blocking roster seat", body=body, labels=("presubmit-gate", "domain:cluster-debugging"))]
+        self.tick(outage(), T0.replace(day=8, hour=9, minute=5), environ=self.environ())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")], "filed, not adopted")
 
     def test_a_closed_lost_nodes_issue_is_refiled_only_on_a_later_loss(self):
         doc = lost_pods()

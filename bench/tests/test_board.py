@@ -409,6 +409,160 @@ def test_a_session_past_the_scan_bound_reports_its_total(
     assert (read.card_ids, read.total) == (cards[:3], 5)
 
 
+def test_read_board_state_extracts_statuses_summaries_and_errors(tmp_path: Path) -> None:
+    board_path = tmp_path / board.BOARD_FILE
+    with sqlite3.connect(board_path) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            ("t_failed", "blocked", "provider rate limit: API retries exhausted"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            ("t_failed", "provider rate limit: API retries exhausted (failure_reason=rate_limit)", "some error"),
+        )
+
+    def shell(script: str, timeout: float) -> str:
+        return _run_script(tmp_path, ["t_failed"])
+
+    state = board.read_board_state(shell, ["t_failed"], 5.0)
+    assert state is not None
+    statuses, summaries, errors = state
+    assert statuses == {"t_failed": "blocked"}
+    assert summaries == {"t_failed": "provider rate limit: API retries exhausted (failure_reason=rate_limit)"}
+    assert errors == {"t_failed": "provider rate limit: API retries exhausted"}
+
+    just_statuses = board.read_statuses(shell, ["t_failed"], 5.0)
+    assert just_statuses == {"t_failed": "blocked"}
+
+
+def test_read_board_state_newest_run_empty_summary_does_not_fall_back_to_older_run(
+    tmp_path: Path,
+) -> None:
+    board_path = tmp_path / board.BOARD_FILE
+    with sqlite3.connect(board_path) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            ("t_failed", "blocked", "model replied in text and made no terminal kanban call"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, summary, error) VALUES (?, ?, ?, ?)",
+            (1, "t_failed", "provider rate limit: API retries exhausted (failure_reason=rate_limit)", "some error"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, summary, error) VALUES (?, ?, ?, ?)",
+            (2, "t_failed", "", "model replied in text and made no terminal kanban call"),
+        )
+
+    def shell(script: str, timeout: float) -> str:
+        return _run_script(tmp_path, ["t_failed"])
+
+    state = board.read_board_state(shell, ["t_failed"], 5.0)
+    assert state is not None
+    statuses, summaries, errors = state
+    assert statuses == {"t_failed": "blocked"}
+    assert "t_failed" not in summaries
+    assert errors == {"t_failed": "model replied in text and made no terminal kanban call"}
+
+
+def test_read_board_state_task_runs_error_fallback_when_last_failure_error_null(
+    tmp_path: Path,
+) -> None:
+    board_path = tmp_path / board.BOARD_FILE
+    with sqlite3.connect(board_path) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            ("t_failed", "blocked", None),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            ("t_failed", "", "provider rate limit: API retries exhausted (failure_reason=rate_limit)"),
+        )
+
+    def shell(script: str, timeout: float) -> str:
+        return _run_script(tmp_path, ["t_failed"])
+
+    state = board.read_board_state(shell, ["t_failed"], 5.0)
+    assert state is not None
+    statuses, summaries, errors = state
+    assert statuses == {"t_failed": "blocked"}
+    assert "t_failed" not in summaries
+    assert errors == {"t_failed": "provider rate limit: API retries exhausted (failure_reason=rate_limit)"}
+
+
+def test_read_board_state_task_runs_error_newest_run_empty_does_not_fall_back_to_older_run(
+    tmp_path: Path,
+) -> None:
+    board_path = tmp_path / board.BOARD_FILE
+    with sqlite3.connect(board_path) as conn:
+        conn.execute(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            ("t_failed", "blocked", None),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, summary, error) VALUES (?, ?, ?, ?)",
+            (1, "t_failed", "", "provider rate limit: API retries exhausted (failure_reason=rate_limit)"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (id, task_id, summary, error) VALUES (?, ?, ?, ?)",
+            (2, "t_failed", "", ""),
+        )
+
+    def shell(script: str, timeout: float) -> str:
+        return _run_script(tmp_path, ["t_failed"])
+
+    state = board.read_board_state(shell, ["t_failed"], 5.0)
+    assert state is not None
+    statuses, summaries, errors = state
+    assert statuses == {"t_failed": "blocked"}
+    assert "t_failed" not in summaries
+    assert "t_failed" not in errors
+
+
+def test_read_session_cards_newest_run_empty_summary_does_not_fall_back_to_older_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    set_card(
+        tmp_path,
+        FRONT,
+        "blocked",
+        summary="provider rate limit: API retries exhausted (failure_reason=rate_limit)",
+    )
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', '')",
+            (FRONT,),
+        )
+    shell = local_shell(tmp_path, monkeypatch)
+    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT])
+    assert read is not None
+    assert read.cards[FRONT]["summary"] is None
+
+
 # --- a card paused on a question (#4004) ----------------------------------------
 
 QUESTION = "payments-api is OOMKilled against its 64Mi limit. Which fix?\n- raise the limit\n- set a request"

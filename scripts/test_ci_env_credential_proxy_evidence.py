@@ -6,9 +6,9 @@ and `collect_litellm_log`. The broker's admission queue is in its log and its
 Prometheus listener alone: the log used to be taken by the failure dump only
 and nothing in the job read the listener, so a green run kept no record of the
 queue it built up. These tests run the real function, lifted from the real file
-with the constants it reads, under bash with `kubectl` and `timeout` stubs on
-PATH, so the bounds it applies and the exit status it leaves behind are the
-ones the script has.
+with the byte-cap helper and constants it reads, under bash with `kubectl` and
+`timeout` stubs on PATH, so the bounds it applies and the exit status it leaves
+behind are the ones the script has.
 """
 
 import os
@@ -23,6 +23,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 FUNCTION = "collect_credential_proxy_evidence"
+# The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
+HELPER = "last_bytes"
 LOG_ARTIFACT = "envoy-credential-proxy.log"
 METRICS_ARTIFACT = "credential-proxy-metrics.prom"
 DEPLOYMENT = "deployment/platform-agent-credential-proxy"
@@ -93,15 +95,19 @@ exec "$@"
 
 
 def lifted() -> str:
-    """The function and the constants it reads, as written in ci-env.sh."""
+    """The function, the byte-cap helper it bounds the log with, and the
+    constants it reads, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly CREDENTIAL_PROXY_[A-Z_]+=.*$", src, re.MULTILINE)
     if len(constants) < 8:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"expected the CREDENTIAL_PROXY_ constants in {ENV_SCRIPT}, found {constants}")
-    match = re.search(rf"^{FUNCTION}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
-    if match is None:  # pragma: no cover
-        raise AssertionError(f"{FUNCTION}() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in (HELPER, FUNCTION):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def constant(name: str) -> int:
@@ -125,6 +131,12 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
     timeout_stub = stubs / "timeout"
     timeout_stub.write_text(TIMEOUT_STUB, encoding="utf-8")
     timeout_stub.chmod(timeout_stub.stat().st_mode | stat.S_IXUSR)
+    tail = stubs / "tail"
+    tail.write_text(
+        '#!/usr/bin/env bash\nif [ "${1:-}" = "-c" ] && [ "$#" -eq 2 ]; then /usr/bin/tail "$@"; printf "uutils-pipe-overrun"; exit 0; fi\nexec /usr/bin/tail "$@"\n',
+        encoding="utf-8",
+    )
+    tail.chmod(tail.stat().st_mode | stat.S_IXUSR)
     artifacts = tmp / "artifacts"
     script = "\n".join(
         [
