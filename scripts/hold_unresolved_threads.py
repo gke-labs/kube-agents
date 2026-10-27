@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Keep a pull request with unresolved review threads out of Tide's merge pool.
+"""Keep a pull request with unresolved review threads out of the merge queue.
 
-`main` requires every review conversation resolved before a merge, and Tide
-does not read that rule. A pull request carrying `lgtm` and `approved` is in
-its pool whatever its threads say; Tide picks the lowest-numbered one, GitHub
-refuses the merge ("Repository rule violations found"), and Tide retries the
-same pull request every ~85 seconds -- ahead of every other pull request in
-the pool, which wait behind it. #608 and #1197 held the whole queue that way
-for an hour on 2026-09-05 until an admin `/hold`ed them by hand; #1122 sat
-5h46m and 231 attempts the same way (#1202).
+`main` requires every review conversation resolved before a merge. The pool is
+the pull requests the enqueue sweep (`merge_gate.py sweep`) turns auto-merge on
+for: not a draft, carrying `lgtm` and `approved`. The script was written for
+Tide, which did not read the conversation rule: it picked the lowest-numbered
+pull request in its pool, GitHub refused the merge, and Tide retried it every
+~85 seconds ahead of every other one. #608 and #1197 held the whole queue that
+way for an hour on 2026-09-05; #1122 sat 5h46m and 231 attempts (#1202). Under
+the merge queue the label still keeps such a pull request out, and its comment
+tells the author why.
 
-Tide's query for this repository excludes four labels. `do-not-merge` -- the
-bare one, not `do-not-merge/hold` -- is the one no Prow plugin writes, so this
-script owns it. Each sweep lists the open pull requests carrying both pool
+The enqueue sweep reads four labels as a hold. `do-not-merge` -- the bare one,
+not `do-not-merge/hold` -- is the one no Prow plugin writes, so this script
+owns it. Each sweep lists the open pull requests carrying both pool
 labels and puts `do-not-merge` on any whose review threads are not all
 resolved, with one comment saying why; and takes it off any pull request whose
 threads are now all resolved -- but only when the label's most recent
@@ -40,12 +41,12 @@ if str(_HERE) not in sys.path:
 
 from github_api import GitHubAPI, log  # noqa: E402
 
-#: Excluded by Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) and
-#: written by no Prow plugin, which is what lets this script own it outright.
+#: A hold label for the enqueue sweep (`HOLD_LABELS` in `merge_gate.py`) and written by no Prow
+#: plugin, which is what lets this script own it outright.
 LABEL = "do-not-merge"
 LABEL_COLOR = "b60205"
 LABEL_DESCRIPTION = "Review threads are unresolved; removed automatically once they all are"
-#: Tide's pool wants both. A pull request without them is not one Tide will try to merge.
+#: The enqueue sweep wants both. A pull request without them does not go in the merge queue.
 POOL_LABELS = frozenset({"lgtm", "approved"})
 #: The login a GITHUB_TOKEN acts as; a `labeled` event by anyone else is a person's decision.
 BOT_LOGIN = "github-actions[bot]"
@@ -76,10 +77,9 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
 """ % PAGE
 
 COMMENT = f"""{COMMENT_MARKER}
-Tide would try to merge this pull request and fail: **{{count}} review thread{{plural}} unresolved**, \
-and `main` requires every conversation resolved before a merge. Tide retries a failed merge every \
-~85 seconds ahead of every other pull request in the pool, so the `{LABEL}` label keeps this one out \
-of the pool until the threads are resolved.
+This pull request has **{{count}} review thread{{plural}} unresolved**, and `main` requires every \
+conversation resolved before a merge. The `{LABEL}` label keeps it out of the merge queue until the \
+threads are resolved.
 
 Reply to each thread naming what changed, then resolve it \
 ([`docs/pull-request-workflow.md`, "Resolving conversations"](https://github.com/{{repo}}/blob/main/docs/pull-request-workflow.md#resolving-conversations)). \

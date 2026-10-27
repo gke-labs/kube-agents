@@ -172,7 +172,7 @@ def test_a_partially_passing_case_is_unstable(kanban_task, tmp_path):
 
 
 def test_an_inject_record_grades_on_the_check_its_transport_can_see(
-    kanban_task, tmp_path, monkeypatch, capsys
+    measured_kanban_task, tmp_path, monkeypatch, capsys
 ):
     """The measurement run's agent-kanban-smoke (#2039): a correct answer and
     a tool_called check blind on the inject transport. Admitted, three such
@@ -180,7 +180,7 @@ def test_an_inject_record_grades_on_the_check_its_transport_can_see(
     grading line says so."""
     monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
     out = tmp_path / "case.json"
-    assert run_case(kanban_task, [FIXTURE_RUNS / INJECT_RUN] * 3, out) == 0
+    assert run_case(measured_kanban_task, [FIXTURE_RUNS / INJECT_RUN] * 3, out) == 0
     printed = capsys.readouterr().out
     assert "Task agent-kanban-smoke Result: [PASSED]" in printed
     assert "rep 1: pass -- VerificationCorrectness=1.0 [1 check(s) not applicable on this transport" in printed

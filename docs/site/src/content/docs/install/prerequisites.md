@@ -132,7 +132,9 @@ Run the installer with `--dry-run` to see the plan against the cluster without c
 ### Installing without NetworkPolicy enforcement
 
 `--accept-no-network-policy` installs onto a cluster that has neither Dataplane V2 nor the Calico addon
-without modifying it. The install works: every NetworkPolicy it ships is accepted by the API server
+without modifying it (unavailable when `--enable-web-console` / `WEB_CONSOLE_ENABLED=true` is enabled,
+because the web console requires NetworkPolicy enforcement to confine access to `kubectl port-forward`).
+The install works: every NetworkPolicy it ships is accepted by the API server
 and enforced by nothing, so nothing crashes and nothing degrades functionally. What is lost is
 confinement, and it is the confinement of kube-agents' own workloads rather than yours:
 

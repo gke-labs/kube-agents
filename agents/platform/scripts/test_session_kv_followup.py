@@ -47,6 +47,8 @@ class FollowupInjectTest(unittest.TestCase):
     def setUp(self):
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         session_kv_server.init_db()
+        session_kv_server._FOLLOWUP_FIRST_ATTEMPT_AT.clear()
+        session_kv_server._FOLLOWUP_CARD_POSTED.clear()
         self.client = _client()
 
     def tearDown(self):
@@ -91,13 +93,74 @@ class FollowupInjectTest(unittest.TestCase):
         self.assertIn("was not re-read", text)
         self.assertEqual(comment.call_args.args, ("k8s-evt-quiet", text))
 
-    def test_an_unrouted_session_posts_nothing(self):
-        with patch.object(session_kv_server, "_send_to_chat") as send, \
-             patch.object(session_kv_server, "_comment_alert_card") as comment:
-            resp = self.client.post("/sessions/k8s-evt-nowhere/inject", json={"message": json.dumps(FOLLOWUP)})
-        self.assertEqual(resp.json(), {"status": "unrouted"})
+    def test_a_session_with_no_thread_gets_the_card_comment_before_the_answer(self):
+        # An install with no chat surface routes no session anywhere; the card
+        # is the one place its reader looks, so the line lands there alone,
+        # and before the daemon answers, since nothing else carries it.
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1"), \
+             patch.object(session_kv_server, "_send_to_chat") as send, \
+             patch.object(session_kv_server, "_comment_alert_card", return_value=True) as comment:
+            resp = self.client.post("/sessions/k8s-evt-nochat/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual(resp.json(), {"status": "followup"})
         send.assert_not_called()
-        comment.assert_not_called()
+        session_id, text = comment.call_args.args
+        self.assertEqual((session_id, comment.call_args.kwargs), ("k8s-evt-nochat", {"card": "t_card1"}))
+        self.assertIn("Quiet since 15:28 UTC", text)
+
+    def test_a_card_comment_that_does_not_land_asks_the_watcher_to_retry_for_the_hour(self):
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1"), \
+             patch.object(session_kv_server, "_comment_alert_card", return_value=False):
+            resp = self.client.post("/sessions/k8s-evt-nochat/inject", json={"message": json.dumps(FOLLOWUP)})
+            session_kv_server._FOLLOWUP_FIRST_ATTEMPT_AT["k8s-evt-nochat"] -= session_kv_server.FOLLOWUP_CARD_WAIT_SECONDS
+            later = self.client.post("/sessions/k8s-evt-nochat/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual((resp.status_code, later.json()), (503, {"status": "unrouted"}))
+
+    def test_a_second_request_while_the_comment_is_being_written_does_not_post_again(self):
+        # The watcher re-sends when its 10s client gives up while the first
+        # handler still waits on the board's write lock; the second is told to
+        # come back rather than queue a second line behind the first.
+        def retry_now():
+            again = self.client.post("/sessions/k8s-evt-slow/inject", json={"message": json.dumps(FOLLOWUP)})
+            self.assertEqual(again.status_code, 503)
+
+        def slow_read(session_id):
+            retry_now()  # a retry during the board read, the handler's longest wait
+            return "t_card1"
+
+        def slow_comment(session_id, text, card=None):
+            retry_now()  # and one during the write
+            return True
+        with patch.object(session_kv_server, "_card_for_alert_session", side_effect=slow_read) as lookup, \
+             patch.object(session_kv_server, "_comment_alert_card", side_effect=slow_comment) as comment:
+            first = self.client.post("/sessions/k8s-evt-slow/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual((first.json(), lookup.call_count, comment.call_count), ({"status": "followup"}, 1, 1))
+        self.assertNotIn("k8s-evt-slow", session_kv_server._FOLLOWUP_CARD_IN_FLIGHT)
+
+    def test_no_card_yet_waits_an_hour_from_the_first_attempt_and_is_unrouted_after(self):
+        # The card may still be coming (triage queued, retried, running), or the
+        # board may not answer; the watcher is told to come back each sweep for
+        # an hour from the daemon's first attempt, then the incident is let go.
+        for board, label in ((None, "no card"), (session_kv_server.BOARD_UNREADABLE, "unreadable board")):
+            with self.subTest(label):
+                sid = f"k8s-evt-pending-{label[:2]}"
+                with patch.object(session_kv_server, "_card_for_alert_session", return_value=board), \
+                     patch.object(session_kv_server, "_comment_alert_card") as comment:
+                    waiting = self.client.post(f"/sessions/{sid}/inject", json={"message": json.dumps(FOLLOWUP)})
+                    session_kv_server._FOLLOWUP_FIRST_ATTEMPT_AT[sid] -= session_kv_server.FOLLOWUP_CARD_WAIT_SECONDS
+                    gone = self.client.post(f"/sessions/{sid}/inject", json={"message": json.dumps(FOLLOWUP)})
+                self.assertEqual(waiting.status_code, 503)
+                self.assertEqual(gone.json(), {"status": "unrouted"})
+                comment.assert_not_called()
+
+    def test_a_retry_of_a_line_already_on_the_card_touches_the_board_no_more(self):
+        # The watcher retries when its client gave up on a slow board after the
+        # comment had landed; the daemon answers from memory, no second line.
+        with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_card1") as lookup, \
+             patch.object(session_kv_server, "_comment_alert_card", return_value=True) as comment:
+            first = self.client.post("/sessions/k8s-evt-again/inject", json={"message": json.dumps(FOLLOWUP)})
+            again = self.client.post("/sessions/k8s-evt-again/inject", json={"message": json.dumps(FOLLOWUP)})
+        self.assertEqual((first.json(), again.json()), ({"status": "followup"}, {"status": "followup"}))
+        self.assertEqual((lookup.call_count, comment.call_count), (1, 1))
 
     def test_the_message_reads_without_stamps_or_object(self):
         bare = {"kind": "k8s-event-followup", "namespace": "payments", "name": "api", "cluster": "prod-a",

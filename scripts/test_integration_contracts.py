@@ -839,9 +839,9 @@ class WorkflowNameJoinTest(unittest.TestCase):
 
         `make coverage` tolerates a failing test directory by design -- it is a
         meter, and one red directory must not hide the number for the rest. The
-        job that reports the required `Run Python Unit Tests` context runs that
-        target, so COVERAGE_STRICT=1 is the only thing making a red suite a red
-        check. Drop it in a reformat and CI reports success on failing tests:
+        job that reports the required `Run Python Unit Tests` context joins the
+        shards' results with `make coverage-merge`, so COVERAGE_STRICT=1 there
+        is what makes a red file in any shard a red check. Drop it in a reformat and CI reports success on failing tests:
         the suite still runs, the log still shows the failures, and the context
         still goes green. Nothing else in the repository asserts this.
         """
@@ -856,6 +856,43 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "COVERAGE_STRICT=1, so a failing test directory would be reported "
             "but would not fail the check",
         )
+
+    def test_the_required_python_check_fails_closed_on_its_shards(self):
+        """The required check is a join of three shards, and a skip is a pass.
+
+        A job skipped because a job it needs failed reports success to a
+        required check. So the join must run whatever the shards did, a
+        cancelled run included (`always()`), and must itself fail unless every
+        shard succeeded. Each shard runs strict as well, so its own red is
+        visible on its row, and the shard count is written once in the matrix
+        and must match everywhere else it appears, or files drop out of every
+        shard with the check still green.
+        """
+        yaml = _yaml()
+        jobs = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())["jobs"]
+        join, shards = jobs["test"], jobs["test-shard"]
+        self.assertEqual(join.get("name"), "Run Python Unit Tests", "the join no longer carries the required check's name")
+        self.assertEqual(join.get("needs"), "test-shard")
+        self.assertEqual(str(join.get("if", "")).replace(" ", ""), "${{always()}}")
+        guard = [step for step in join["steps"] if "SHARDS" in (step.get("env") or {})]
+        self.assertEqual(len(guard), 1, "the join has no single shard-result step")
+        self.assertEqual(str(guard[0].get("if", "")).replace(" ", ""), "${{always()}}")
+        envs = " ".join(str((step.get("env") or {}).get("SHARDS", "")) for step in join["steps"])
+        runs = " ".join(step.get("run", "") for step in join["steps"])
+        self.assertIn("needs.test-shard.result", envs, "the join does not read the shards' result")
+        self.assertIn('!= "success"', runs, "the join does not fail on a shard that did not succeed")
+        self.assertIn("coverage-merge", runs)
+        shard_runs = " ".join(step.get("run", "") for step in shards["steps"])
+        self.assertIn("COVERAGE_STRICT=1", shard_runs)
+        # In the environment, not on make's command line, where it would also
+        # travel in MAKEFLAGS into every make the tests start.
+        self.assertNotIn("PYTHON_TEST_SHARD", shard_runs)
+        count = len(shards["strategy"]["matrix"]["shard"])
+        self.assertEqual(shards["strategy"]["matrix"]["shard"], list(range(1, count + 1)))
+        shard_env = " ".join(str((step.get("env") or {}).get("PYTHON_TEST_SHARD", "")) for step in shards["steps"])
+        self.assertIn(f"/{count}", shard_env, "a shard divides the sweep by another count than the matrix has")
+        self.assertIn(f"COVERAGE_SHARD_COUNT={count}", runs, "the join expects another shard count than the matrix has")
+        self.assertFalse(shards["strategy"].get("fail-fast", True), "one red shard would cancel the others")
 
     def test_the_coverage_artifact_name_join_holds(self):
         producer = (WORKFLOWS / "python-tests.yml").read_text()

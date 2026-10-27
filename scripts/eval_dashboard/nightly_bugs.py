@@ -10,8 +10,9 @@ is the nightly's counterpart of ``gate_issue.py``::
     a case failed every graded repetition on its last STREAK_NIGHTS graded nights
     and its task.yaml does not carry `expected_fail: true`
     and no OPEN issue labelled `nightly-red` already names it,
-    and none was closed after the streak's newest night, or closed as
-        not planned with no pass since (``still_tracks``)
+    and none was closed after the streak's oldest night started
+        (``closed_after_start``), or closed as not planned with no pass
+        since (``still_tracks``)
     -> file one, labelled `nightly-red`, `domain:<slug>` and `needs-triage`,
        assigned per the rule below
 
@@ -133,11 +134,12 @@ INFRA_LABEL = "Infra"
 DOMAIN_LABEL = "domain:{slug}"
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
 # Closed ones too, updated since the window's first night: a bug closed
-# after the streak's newest night has seen this streak, so it is not filed
-# again until a newer failing night (a fix that merged before the next
-# nightly closes its issue, and the streak on record is still red); one
-# handed off as not planned counts only while its close is on record
-# (``still_tracks``), so nothing older is needed.
+# after any of the streak's nights started has seen this streak, so it is
+# not filed again until STREAK_NIGHTS failing nights all started after the
+# close (``closed_after_start``: a fix that merges closes its issue, and the
+# nights on record, even one running when it merged, tested the code before
+# it); one handed off as not planned counts only while its close is on
+# record (``still_tracks``), so nothing older is needed.
 CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
 # The cross-check on both listings: the same issues read through GraphQL.
 # On 2026-10-22 the REST issue listing (any filter) and the search API both
@@ -540,26 +542,41 @@ def closed_after(issue: dict | None, night: dict) -> bool:
     return bool(closed and ended and closed > ended)
 
 
+def closed_after_start(issue: dict | None, night: dict) -> bool:
+    """Whether a closed issue was closed after ``night``'s run started. That
+    run checked out ``main`` before the close, so it tested the code before
+    a fix that closed it: on 2026-10-27 a night that started at 00:01 and
+    finished after #3863's fix merged at 02:00 re-filed the case as #4039
+    (#4041). Its nights count only from the first run started after the
+    close."""
+    closed = nightly.parse_iso((issue or {}).get("closed_at"))
+    started = nightly.parse_iso(night.get("started"))
+    return bool(closed and started and closed > started)
+
+
 # GitHub's state_reason for a close that hands the issue off rather than
 # fixing it: "not planned" (or "duplicate") is what a triager picks when
 # closing in favour of another issue, a `Fixes #N` merge sets "completed".
 HANDED_OFF_REASONS = frozenset({"not_planned", "duplicate"})
 
 
-def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None) -> bool:
+def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None, oldest: dict | None = None) -> bool:
     """Whether a closed issue still tracks a streak ending at ``newest``.
-    One closed after that night finished has seen it (``closed_after``). One
+    One closed after that night finished has seen it (``closed_after``). A
+    completed close after ``oldest``, the first of the streak's nights,
+    started (``closed_after_start``) has too: fewer than STREAK_NIGHTS nights
+    tested the code after the close. One
     handed off (HANDED_OFF_REASONS) tracks the problem until a good night --
     a pass, a clean run, a graded case -- finishes after the close: the
     problem is the other issue's until it clears, and a new one after that
-    files fresh. A "completed" close that did not fix it files again on the
-    next bad night. A hand-off closed before ``horizon`` (the start of the
+    files fresh. A "completed" close that did not fix it files again once
+    STREAK_NIGHTS failing nights all started after it. A hand-off closed before ``horizon`` (the start of the
     window's first night) cannot be confirmed -- the record no longer shows
     whether the case cleared since -- so it does not hold a new streak back."""
     if closed_after(issue, newest):
         return True
     if issue.get("state_reason") not in HANDED_OFF_REASONS:
-        return False
+        return bool(oldest and closed_after_start(issue, oldest))
     closed = nightly.parse_iso(issue.get("closed_at"))
     if not closed or not horizon or closed < horizon:
         return False
@@ -675,7 +692,7 @@ class Filer:
             streak = red_streak(verdicts)
             if streak:
                 passes = [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]
-                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes, self.horizon)], case)
+                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes, self.horizon, streak[0])], case)
                 if fields is None:
                     result["skipped"].append({"case": case, "why": "no readable task.yaml on this checkout"})
                 elif case not in active:
@@ -795,10 +812,10 @@ class Filer:
 
     def file_infra(self, kind, key, newest, title, body, nights, good, closed_issues, result) -> None:
         """File the infra issue for ``key`` unless a closed one still tracks
-        this streak (``still_tracks``; ``good`` are the clean or graded
-        nights). ``body(addressee=...)`` renders it with the assignment
+        this streak (``still_tracks``, from the streak's oldest night
+        ``nights[0]``; ``good`` are the clean or graded nights). ``body(addressee=...)`` renders it with the assignment
         line."""
-        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon)], key, kind)
+        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon, nights[0])], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})
             return

@@ -1497,6 +1497,75 @@ plugins:
       thresholdCount: 1
       thresholdWindowSeconds: 300
 
+# Web console: a browser chat page for the Platform Agent, for installs with no
+# Slack or Google Chat configured. It talks to the Hermes gateway on the agent
+# Service with the agent's API_SERVER_KEY, which stays in the pod. It is
+# reachable only through `kubectl port-forward`: the Service is always
+# ClusterIP and a NetworkPolicy refuses ingress from every other pod. See
+# docs/site/src/content/docs/deploy/web-console.md.
+webConsole:
+  enabled: false
+  # GET /api/environment and PlatformAgent state: versions, install and
+  # last-rollout dates, and counts of nodes, namespaces, pods and controllers
+  # for feedback reports, plus reading and patching the PlatformAgent resource
+  # for repository topology, preferred model annotations, and applied PR
+  # annotations. Needs a service account with list on those kinds and get/patch
+  # on the PlatformAgent, which the chart creates. The console discards the
+  # listed items; the only names GET /api/environment returns are the
+  # kube-agents Helm release, its namespace and the owning Argo CD Application.
+  environment:
+    enabled: true
+  # "Polish with Gemini" in the feedback form: POST /api/assist sends the
+  # user's draft title and details to the install's own inference gateway
+  # (the LiteLLM Service the agent uses) with an editing prompt, and puts
+  # the edited text back in the form. One completion per click, no tools,
+  # nothing stored. Off when litellm.enabled is false, or set url to another
+  # OpenAI-compatible endpoint reachable from the console pod. The
+  # environment block of a report is generated and is never sent.
+  assist:
+    enabled: true
+    # The model name LiteLLM routes; empty means the gateway's default alias.
+    model: model-default
+    # Overrides the in-cluster inference-gateway URL.
+    url: ""
+  # GET /api/release: the version this install runs (from the image tag:
+  # a release tag, or a commit for a build from source) and the newest
+  # release on GitHub. One anonymous read of
+  # api.github.com/repos/<repo>/releases per hour from the console
+  # pod; set enabled to false on a cluster without egress to GitHub.
+  releaseCheck:
+    enabled: true
+    repo: gke-labs/kube-agents
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/web-console
+    tag: "" # defaults to platformAgent.deployment.image.tag, then Chart.appVersion
+    pullPolicy: "" # defaults to Always for the latest tag, IfNotPresent otherwise
+  # The agent's Google identity, shown in the console's identity box. The
+  # console holds no credentials to read IAM, so these are recorded at
+  # install: the Terraform composition fills them from the kube-agents-iam
+  # module. A role granted later is not shown until the next install.
+  agentIdentity:
+    # The Google service account the agent's KSA maps to through Workload
+    # Identity.
+    gcpServiceAccount: ""
+    # Project-level IAM roles granted to that service account.
+    roles: []
+  resources:
+    limits:
+      cpu: 200m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 32Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
 # Optional built-in specialist AgentProfiles deployed into the cluster (`spec.mode: next`).
 # When `profiles.tse.enabled` is true, the operator reconciles the `tse` AgentProfile's
 # ServiceAccount, NATS auth-callout identity, and agent card (`a2a.agents.tse`), and

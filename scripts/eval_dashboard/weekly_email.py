@@ -563,14 +563,15 @@ def week_models(counted: dict, days: list[datetime.date], models: dict[str, set[
 
 
 def streak_cases(data: dict, repo_root: pathlib.Path) -> dict[str, dict]:
-    """``{case: {domain, newest, passes}}``: the cases on a red streak the
-    bug filer files for right now -- failed every graded repetition on their
+    """``{case: {domain, oldest, newest, passes}}``: the cases on a red
+    streak the bug filer files for right now -- failed every graded repetition on their
     last STREAK_NIGHTS graded nights on record (``nightly_bugs.graded_nights``),
     on this checkout's nightly matrix, not ``expected_fail`` -- with the
     domain their task.yaml claims (the label the filer puts on the bug), the
-    streak's newest night and the passing nights, which ``owed_bugs`` reads
-    as the filer does. Judged on every night on record, not only the week's:
-    a case red through Sunday that passed Monday's night is owed nothing."""
+    streak's oldest and newest nights and the passing nights, which
+    ``owed_bugs`` reads as the filer does. Judged on every night on record,
+    not only the week's: a case red through Sunday that passed Monday's
+    night is owed nothing."""
     active = set(nightly.expected_cases(data))
     out: dict[str, dict] = {}
     for case, verdicts in nightly_bugs.graded_nights(data).items():
@@ -578,7 +579,7 @@ def streak_cases(data: dict, repo_root: pathlib.Path) -> dict[str, dict]:
         fields = nightly_bugs.task_fields(case, repo_root)
         if not streak or fields is None or case not in active or fields["expected_fail"]:
             continue
-        out[case] = {"domain": fields["domain"] or nightly.DOMAIN_UNKNOWN, "newest": streak[-1],
+        out[case] = {"domain": fields["domain"] or nightly.DOMAIN_UNKNOWN, "oldest": streak[0], "newest": streak[-1],
                      "passes": [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]}
     return out
 
@@ -586,14 +587,14 @@ def streak_cases(data: dict, repo_root: pathlib.Path) -> dict[str, dict]:
 def owed_bugs(streaks: dict[str, dict], bugs: dict, horizon: datetime.datetime | None) -> dict[str, list[str]]:
     """``{domain: [case, ...]}``: streak cases no issue tracks -- no open
     ``nightly-red`` issue names the case, and no closed one still tracks it
-    (``nightly_bugs.still_tracks``: closed after the streak's newest night,
-    or handed off as not planned with no pass since). These are the bugs
-    the filer should have filed and has not."""
+    (``nightly_bugs.still_tracks``: closed after the streak's oldest night
+    started, or handed off as not planned with no pass since). These are
+    the bugs the filer should have filed and has not."""
     out: dict[str, list[str]] = {}
     for case, info in sorted(streaks.items()):
         if nightly_bugs.tracking_issue(bugs["open"], case):
             continue
-        closed = [i for i in bugs["closed"] if nightly_bugs.still_tracks(i, info["newest"], info["passes"], horizon)]
+        closed = [i for i in bugs["closed"] if nightly_bugs.still_tracks(i, info["newest"], info["passes"], horizon, info["oldest"])]
         if nightly_bugs.tracking_issue(closed, case):
             continue
         out.setdefault(info["domain"], []).append(case)

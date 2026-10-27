@@ -772,11 +772,12 @@ An open `nightly-red` issue that carries the case's marker, or (for an issue
 without a marker, a human's) names the case as a whole word in its title or
 body, in any letter case (or links its transcript, `eval_<case>_rep1.log`), is
 adopted instead, so a case is filed once and a human's issue wins. A
-`nightly-red` issue for the case closed after the streak's newest night counts
-too: a fix that merged before the next nightly closes its issue while the
-nights on record are still red, so the case is filed again only after a newer
-failing night. An issue closed as not planned (or a duplicate), the close a
-triager picks when handing an infra failure to the infra issue, keeps
+`nightly-red` issue for the case closed after any of the streak's nights
+started counts too: a fix that merges closes its issue while the nights on
+record, even one still running when it merged, tested the code from before it,
+so the case is filed again only after 3 failing nights whose runs all started
+after the close. An issue closed as not planned (or a duplicate), the
+close a triager picks when handing an infra failure to the infra issue, keeps
 tracking the case until it passes on a night after the close; a red streak
 after that pass files a new issue. A hand-off closed before the 14 nights on
 record holds nothing back: the record can no longer show whether the case
@@ -855,9 +856,9 @@ bugs](#nightly-bugs) files by: a case's verdict for a night is the bug filer's
 where nearly every case failed give none), and cases marked `expected_fail`,
 off the nightly matrix, or with no `task.yaml` on the checkout are left out. An
 issue tracks a case as the filer reads it: an open `nightly-red` issue naming
-it, or a closed one that still tracks the streak (closed after its newest
-night, or handed off as not planned). The issue listings are cross-checked
-against GraphQL and read again exactly as the filer reads them. The lists follow the filer's classifier,
+it, or a closed one that still tracks the streak (closed after the first of
+its last 3 graded nights started, or handed off as not planned). The issue
+listings are cross-checked against GraphQL and read again exactly as the filer reads them. The lists follow the filer's classifier,
 which drops repetitions it reads as infrastructure even when the collector
 recorded them as failures; the header's counts do not, so they match the
 Nightly report's.

@@ -58,15 +58,20 @@ import bootstrap_scan_gate  # noqa: E402
 import chat_notify  # noqa: E402
 import cluster_agent_profile  # noqa: E402
 import findings_queue  # noqa: E402
+import inventory_card  # noqa: E402
 import inventory_findings  # noqa: E402
+import inventory_presenter  # noqa: E402
 import oobe  # noqa: E402
 import profile_scaffold  # noqa: E402
 import sandbox_exec  # noqa: E402
+import test_inventory_card as card_fixtures  # noqa: E402 - the planted stack's items and scores, and the shown file select writes
 from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
 
 INVENTORY = "INVENTORY.md"
 DELIVERED = "INVENTORY.delivered.md"
 ALIGNED = ".user_aligned"
+# The plugin's hold on the report while the greeting is on its way (bootstrap_onboarding).
+HOLD_PREFIX = ".bootstrap_greeting_pending."
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
 SHOWN = "INVENTORY.shown.json"
@@ -79,6 +84,8 @@ SHOWN_RECORD = {
 }
 ITEMS = "INVENTORY.items.json"
 SCORES = "INVENTORY.scores.json"
+LIMITS = "INVENTORY.limits.json"
+RELAY_URL = "http://127.0.0.1:8765"
 SCORE = {
     "rubric": {"B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0},
     "recommendation": {"action": "add a readinessProbe", "rationale": "traffic", "risk": "5xx"},
@@ -99,10 +106,39 @@ EXTRACTED = {
 SCORED = {"scores": {"f001": SCORE, "f002": SCORE, "f003": SCORE}, "complete_clusters": ["acme/prod"]}
 
 
+# The audits note with no oobe marker: the chain's sentence, then where the summaries go.
+RUNNING_NOTE = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+
+
 def delivered(report: str) -> str:
     """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
-    note = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
-    return report.rstrip("\n") + "\n\n" + note + "\n"
+    return report.rstrip("\n") + "\n\n" + RUNNING_NOTE + "\n"
+
+
+def plant_card_files(d: Path, items=None, scores=None, shown=None, limits=None, suppressed=()) -> inventory_card.Card:
+    """Write the stage's files beside the report, the planted two-criticals fixture unless given, and
+    return the card they build.
+
+    ``scores`` None with ``items`` given writes no scores file, as a clean fleet has none. ``limits``
+    is the limits file's record, written when given; the shown file and the card follow its limit.
+    """
+    if items is None:
+        items, scores = card_fixtures.criticals_items(), card_fixtures.criticals_scores()
+    pacing = inventory_findings.limits_from(limits or {})
+    if shown is None:
+        shown = card_fixtures.shown_for(items, scores or {"scores": {}}, pacing.first_report_criticals)
+    (d / ITEMS).write_text(json.dumps({"items": items}), encoding="utf-8")
+    if scores is not None:
+        (d / SCORES).write_text(json.dumps(scores), encoding="utf-8")
+    if limits is not None:
+        (d / LIMITS).write_text(json.dumps(limits), encoding="utf-8")
+    (d / SHOWN).write_text(json.dumps(shown), encoding="utf-8")
+    return inventory_card.build({"items": items}, scores, pacing, shown, frozenset(suppressed))
+
+
+def stage_log(d: Path) -> str:
+    path = d / oobe.STAGE_LOG
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -125,6 +161,112 @@ class DeliveryDecisionTest(unittest.TestCase):
         # another pod, and main() reads it only after this says yes.
         (self.d / ALIGNED).touch()
         self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    # --- the greeting hold (bootstrap_onboarding's .bootstrap_greeting_pending.<turn>) ---
+
+    def _hold(self, turn="turn-1", age=0.0):
+        path = self.d / f"{HOLD_PREFIX}{turn}"
+        path.touch()
+        if age:
+            at = time.time() - age
+            os.utime(path, (at, at))
+        return path
+
+    def _stage_log(self):
+        path = self.d / oobe.STAGE_LOG
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_a_young_hold_keeps_the_report_behind_the_greeting(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(hold.exists())
+        self.assertEqual(self._stage_log(), "")
+
+    def test_the_hold_holds_on_the_conversation_path_too(self):
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self._hold()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_a_hold_past_the_wait_is_dropped_once_with_a_log_line(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(
+            self._stage_log(),
+            f"bootstrap_delivery: the greeting did not finish within {bootstrap_delivery.GREETING_WAIT_SECONDS} s; "
+            "delivering the report\n",
+        )
+        # The next tick finds no hold and writes nothing more.
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertEqual(self._stage_log().count("\n"), 1)
+
+    def test_the_newest_hold_decides(self):
+        (self.d / ALIGNED).touch()
+        old = self._hold("turn-old", age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        young = self._hold("turn-new")
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(old.exists() and young.exists())
+
+    def test_a_hold_without_a_human_present_is_left_alone(self):
+        # Aligned first: a touch of the marker that failed leaves this hold, and the
+        # report waits for a turn that binds, as on the path before the hold. The
+        # hold ages out on the first tick after that turn binds.
+        hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(hold.exists())
+        self.assertEqual(self._stage_log(), "")
+        (self.d / ALIGNED).touch()
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(self._stage_log().count("\n"), 1)
+
+    def test_a_directory_in_place_of_the_hold_never_raises(self):
+        (self.d / ALIGNED).touch()
+        (self.d / f"{HOLD_PREFIX}dir").mkdir()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        at = time.time() - bootstrap_delivery.GREETING_WAIT_SECONDS - 1
+        os.utime(self.d / f"{HOLD_PREFIX}dir", (at, at))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_an_unreadable_hold_never_raises(self):
+        # Only the unreadable hold's stat raises: Python 3.12's Path.exists() goes
+        # through Path.stat(), so a raise on every path would hit the aligned check.
+        (self.d / ALIGNED).touch()
+        unreadable = self._hold("turn-unreadable")
+        real_stat = Path.stat
+
+        def stat_except_the_unreadable_hold(path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError("no")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=stat_except_the_unreadable_hold):
+            self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+            # An unreadable hold is skipped, not fatal: a readable young one still holds.
+            self._hold("turn-readable")
+            self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        with mock.patch.object(Path, "glob", side_effect=OSError("no")):
+            self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_a_hold_from_a_clock_that_moved_back_is_dropped(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold(age=-(bootstrap_delivery.GREETING_WAIT_SECONDS + 1))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+
+    def test_main_stays_silent_under_a_young_hold(self):
+        (self.d / ALIGNED).touch()
+        (self.d / INVENTORY).write_text("# report\n", encoding="utf-8")
+        self._hold()
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+                mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
 
 
 class DeliveryMainTest(unittest.TestCase):
@@ -261,9 +403,13 @@ class DeliveryToConversationTest(unittest.TestCase):
             mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
             mock.patch.dict(os.environ, NEXT_ENV),
             mock.patch.object(bootstrap_delivery.time, "sleep"),
+            mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        marks = mock.patch.object(bootstrap_delivery, "_post_surfaced")
+        self.marks = marks.start()
+        self.addCleanup(marks.stop)
         self.calls = []
         self.answers = []
 
@@ -348,29 +494,68 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE))
 
     def test_the_card_posts_with_its_update_key_then_the_note(self):
-        import inventory_presenter
-
-        card = ({"schema": "kube-agents.chat/v1", "headline": "2 findings"}, "2 findings")
-        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
-                mock.patch.object(inventory_presenter, "chat", return_value=card):
+        with self._card():
             self._run()
         report, note = self.calls
         self.assertEqual(report[report.index("--update") + 1], bootstrap_delivery.CONVERSATION_REPORT_UPDATE)
         self.assertIn("--chat-file", report)
-        self.assertEqual(self.card, card[0])
-        self.assertEqual(report[report.index("--") + 1], "2 findings")
+        chat, text = inventory_card.chat(self.expected)
+        self.assertEqual(self.card, chat)
+        self.assertEqual(report[report.index("--") + 1], text)
         self.assertNotIn("--chat-file", note)
         self.assertNotIn("--update", note)
         self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
+        self.assertNotIn("went as text", stage_log(self.d))
+
+    def test_the_card_is_built_from_the_stored_files_not_the_report(self):
+        with self._card():
+            self._run()
+        self.assertEqual(self.card["headline"], "First look at your fleet: two things to fix first")
+        self.assertEqual(self.card["rows"][0]["text"][:14], "invoice-worker")
+        self.assertNotIn("Two things need you", json.dumps(self.card))
+        # Marked shown from the same shown file, not from a second read of it.
+        self.assertEqual([c.args[1] for c in self.marks.call_args_list], [row for line in json.loads(
+            (self.d / SHOWN_DELIVERED).read_text(encoding="utf-8"))["items"] for row in line["ids"]])
+
+    def test_the_text_path_logs_why_there_was_no_card(self):
+        # NEXT_ENV has the flag off.
+        plant_card_files(self.d)
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("the first report went as text: KAGE_SLACK_UX is off", stage_log(self.d))
+
+    def test_the_text_path_reshapes_the_report_for_slack_with_the_flag_on(self):
+        # No files beside the report, so no card: the text is the presenter's reshape, as before.
+        report = (
+            "# GKE Environment Scan\n\nI scanned 3 clusters and 41 workloads.\n\n"
+            "1. **[critical] seeded-b admits privileged pods**\n   Enforce baseline Pod Security.\n\n"
+            "Also found: 20 more items, tracked in the findings queue.\n"
+        )
+        (self.d / INVENTORY).write_text(report, encoding="utf-8")
+        reshaped = inventory_presenter.present(report)
+        self.assertNotEqual(reshaped, report)
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}):
+            self._run()
+        (argv,) = self.calls
+        self.assertNotIn("--chat-file", argv)
+        self.assertTrue(argv[argv.index("--") + 1].startswith(reshaped.rstrip("\n")))
+        self.assertIn("no INVENTORY.items.json", stage_log(self.d))
+
+    def test_a_google_chat_conversation_gets_the_text_and_the_log_says_why(self):
+        conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
+        plant_card_files(self.d)
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self._run()
+        (argv,) = self.calls
+        self.assertNotIn("--chat-file", argv)
+        self.assertTrue(argv[argv.index("--") + 1].startswith(self.REPORT.rstrip("\n")))
+        self.assertIn("the report goes to google_chat, which takes text", stage_log(self.d))
 
     def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
-        import inventory_presenter
-
-        card = ({"schema": "kube-agents.chat/v1"}, "2 findings")
         self._answer()
         self._answer(1, REFUSED)
-        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
-                mock.patch.object(inventory_presenter, "chat", return_value=card):
+        with self._card():
             self._run()
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertEqual(self._attempts(), {})
@@ -419,6 +604,18 @@ class DeliveryToConversationTest(unittest.TestCase):
                 self.assertFalse((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
                 self.assertEqual(self._attempts()["attempts"], 1)
 
+    def test_the_text_note_is_logged_once_by_the_run_that_keeps_the_claim(self):
+        # The run whose text post failed released the claim and delivered nothing;
+        # the attempt that posts writes the one line an operator reads.
+        self._answer(1, REFUSED)
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertNotIn("went as text", stage_log(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink()
+        self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(stage_log(self.d).count("the first report went as text: KAGE_SLACK_UX is off"), 1)
+
     def test_a_text_post_that_may_have_landed_keeps_the_claim(self):
         for answer in (subprocess.TimeoutExpired(["a2a"], 105), chat_notify.NOTIFY_OUTCOME_UNKNOWN, 2):
             with self.subTest(answer=answer):
@@ -438,16 +635,13 @@ class DeliveryToConversationTest(unittest.TestCase):
                     bootstrap_delivery.MAYBE_POSTED,
                 )
 
-    def _card(self):
-        import inventory_presenter
-
-        card = ({"schema": "kube-agents.chat/v1", "headline": "2 findings"}, "2 findings")
-        return mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
-            mock.patch.object(inventory_presenter, "chat", return_value=card)
+    def _card(self, **files):
+        """The flag on and the stage's files beside the report, so the card goes; ``self.expected`` is that card."""
+        self.expected = plant_card_files(self.d, **files)
+        return mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"})
 
     def test_a_card_that_may_have_landed_is_sent_again_with_its_key(self):
-        flag, chat = self._card()
-        with flag, chat:
+        with self._card():
             for answer in (chat_notify.NOTIFY_OUTCOME_UNKNOWN, subprocess.TimeoutExpired(["a2a"], 105),
                            1):
                 with self.subTest(answer=answer):
@@ -470,9 +664,8 @@ class DeliveryToConversationTest(unittest.TestCase):
 
     def test_an_edit_that_failed_counts_as_posted(self):
         # The gateway holds the key, so the card from an earlier attempt is in the chat.
-        flag, chat = self._card()
         self._answer(1, json.dumps({"error": "edit failed: message_not_found"}) + "\n")
-        with flag, chat:
+        with self._card():
             self._run()
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertFalse((self.d / INVENTORY).exists())
@@ -563,7 +756,6 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual(self._attempts()["attempts"], 2)
 
     def test_the_outcome_is_recorded_before_the_note_goes(self):
-        flag, chat = self._card()
         seen = []
 
         def run(argv, **kwargs):
@@ -571,7 +763,7 @@ class DeliveryToConversationTest(unittest.TestCase):
                 seen.append((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
             return self._fake_run(argv, **kwargs)
 
-        with flag, chat, mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+        with self._card(), mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
                 contextlib.redirect_stdout(io.StringIO()):
             bootstrap_delivery.main(self.d)
         self.assertEqual(seen, [True])
@@ -587,7 +779,6 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual(self._attempts()["attempts"], 1)
 
     def test_the_card_marks_findings_before_the_note_goes(self):
-        flag, chat = self._card()
         order = []
         real = self._fake_run
 
@@ -595,7 +786,7 @@ class DeliveryToConversationTest(unittest.TestCase):
             order.append("card" if "--chat-file" in argv else "note")
             return real(argv, **kwargs)
 
-        with flag, chat, mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+        with self._card(), mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
                 mock.patch.object(bootstrap_delivery, "_mark_shown", side_effect=lambda *a: order.append("mark") or True), \
                 contextlib.redirect_stdout(io.StringIO()):
             bootstrap_delivery.main(self.d)
@@ -1108,6 +1299,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
     SANDBOX_SHOWN = "/opt/data/INVENTORY.shown.json"
     SANDBOX_ITEMS = "/opt/data/INVENTORY.items.json"
     SANDBOX_SCORES = "/opt/data/INVENTORY.scores.json"
+    SANDBOX_LIMITS = "/opt/data/INVENTORY.limits.json"
     _REAL_READ_BYTES = staticmethod(sandbox_exec.read_bytes)
 
     def setUp(self):
@@ -1148,10 +1340,12 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, delivered("# Sandbox report\n"))
         self.assertTrue((self.d / COMPLETED).exists())
-        report_read, items_read, shown_read = self.read.call_args_list
+        report_read, items_read, scores_read, limits_read, shown_read = self.read.call_args_list
         self.assertEqual(report_read.args, (self.SANDBOX_REPORT,))
         self.assertEqual(report_read.kwargs["max_bytes"], bootstrap_delivery.REPORT_MAX_BYTES + 1)
         self.assertEqual(items_read.args, (self.SANDBOX_ITEMS,))
+        self.assertEqual(scores_read.args, (self.SANDBOX_SCORES,))
+        self.assertEqual(limits_read.args, (self.SANDBOX_LIMITS,))
         self.assertEqual(shown_read.args, (self.SANDBOX_SHOWN,))
         # The read runs as read_bytes' own default login; the rename as the
         # terminal's, which owns the sandbox's /opt/data.
@@ -1198,16 +1392,61 @@ class DeliveryFromSandboxTest(unittest.TestCase):
             {c.kwargs["max_bytes"] for c in self.read.call_args_list[1:3]}, {bootstrap_delivery.BATCH_MAX_BYTES + 1}
         )
 
-    def test_an_unreachable_sandbox_after_the_claim_still_delivers(self):
+    def test_the_files_beside_the_report_are_read_once_before_the_claim(self):
+        items, scores = card_fixtures.criticals_items(), card_fixtures.criticals_scores()
+        self.beside = {
+            self.SANDBOX_ITEMS: json.dumps({"items": items}).encode("utf-8"),
+            self.SANDBOX_SCORES: json.dumps(scores).encode("utf-8"),
+            self.SANDBOX_LIMITS: b'{"first_report_criticals": 2}',
+        }
+        self.shown = json.dumps(card_fixtures.shown_for(items, scores)).encode("utf-8")
+        reads = []
+        real = self._read
+
+        def read(path, **kwargs):
+            reads.append((path, (self.d / COMPLETED).exists()))
+            return real(path, **kwargs)
+
+        self.read.side_effect = read
+        with mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}), \
+                mock.patch.object(bootstrap_delivery, "_post_surfaced") as mark:
+            rc, out, _ = self._run()
+        self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
+        self.assertEqual(reads, [(path, False) for path in (
+            self.SANDBOX_REPORT, self.SANDBOX_ITEMS, self.SANDBOX_SCORES, self.SANDBOX_LIMITS, self.SANDBOX_SHOWN)])
+        # The shown file's two rows, marked from that one read.
+        self.assertEqual(mark.call_count, 2)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_unreachable_sandbox_on_a_file_beside_the_report_is_a_silent_retry(self):
+        # Read before the claim, like the report, so a sandbox that stops answering
+        # between the two leaves no claim behind.
+        for path in (self.SANDBOX_ITEMS, self.SANDBOX_SCORES, self.SANDBOX_LIMITS, self.SANDBOX_SHOWN):
+            for exc in (sandbox_exec.SandboxUnavailable("gone"), subprocess.TimeoutExpired(["ssh"], 30)):
+                with self.subTest(path=path, exc=type(exc).__name__):
+                    def read(p, _path=path, _exc=exc, **_kw):
+                        if p == _path:
+                            raise _exc
+                        return b"# Sandbox report\n"
+
+                    self.read.side_effect = read
+                    rc, out, err = self._run()
+                    self.assertEqual((rc, out), (0, ""))
+                    self.assertIn("did not answer", err)
+                    self.assertFalse((self.d / COMPLETED).exists())
+                    self.run_.assert_not_called()
+
+    def test_a_file_beside_the_report_that_cannot_be_read_still_delivers(self):
+        # Short of an unreachable sandbox, a read that failed is that file's problem, not the report's.
         def read(path, **_kw):
             if path == self.SANDBOX_SHOWN:
-                raise sandbox_exec.SandboxUnavailable("gone")
+                raise sandbox_exec.SandboxReadFailed("no space")
             return b"# Sandbox report\n"
 
         self.read.side_effect = read
         rc, out, err = self._run()
         self.assertEqual((rc, out), (0, delivered("# Sandbox report\n")))
-        self.assertIn("could not read INVENTORY.shown.json", err)
+        self.assertIn("could not read INVENTORY.shown.json; marking nothing: no space", err)
 
     def test_no_human_means_no_sandbox_read(self):
         (self.d / ALIGNED).unlink()
@@ -1319,6 +1558,234 @@ class DeliveryFromSandboxTest(unittest.TestCase):
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
         self.run_.assert_not_called()
+
+
+class DeliveryCardTest(unittest.TestCase):
+    """On the origin path, the card built from the stage's files goes through the Slack door the install
+    has; the text goes, and the stage log says why, when it cannot."""
+
+    REPORT = "# GKE Environment Scan\n\nTwo things need you.\n"
+    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
+
+    def setUp(self):
+        import slack_blocks_post
+
+        self.sbp = slack_blocks_post
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        # What the text path posts for this report with the flag on and a Slack origin.
+        self.text = inventory_presenter.present(self.REPORT)
+        self._reset()
+        for patcher in (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}),
+            mock.patch.object(bootstrap_delivery, "_post_surfaced"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _reset(self):
+        for path in self.d.iterdir():
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+        (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        self.card = plant_card_files(self.d)
+
+    def _run(self, post=lambda *a: "9.9", origin=ORIGIN, gateway=None, relay=RELAY_URL, **env):
+        """One tick. ``post`` answers the relay; ``gateway`` (an exit code) answers ``a2a notify`` under next."""
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM")}
+        environ.update({"KAGE_SLACK_UX": "1", **env})
+        if relay is not None:
+            environ["SLACK_RELAY_URL"] = relay
+        if gateway is not None:
+            environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        self.notifies = []
+
+        def run(argv, **_kwargs):
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.notifies.append((argv, json.load(handle)))
+            return subprocess.CompletedProcess(argv, gateway, "{}", "refused")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post", side_effect=post) as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.posts = poster.call_args_list
+        self.err = err.getvalue()
+        return out.getvalue()
+
+    def test_the_names_are_the_ones_the_hand_off_writes_and_select_reads(self):
+        self.assertEqual(bootstrap_delivery.LIMITS_NAME, Path(inventory_findings.DEFAULT_LIMITS_PATH).name)
+        self.assertEqual(bootstrap_delivery.LIMITS_NAME, Path(bootstrap_handoff.LIMITS_PATH).name)
+
+    def test_the_card_posts_as_blocks_into_the_origin_and_only_the_note_is_printed(self):
+        self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+        (post,) = self.posts
+        blocks, text = inventory_card.blocks(self.card)
+        self.assertEqual(post.args, ("C1", text, blocks, "1.5"))
+        self.assertEqual(blocks[-1]["elements"][0]["text"]["text"], "Fix the first one")
+        self.assertIn("First look at your fleet: two things to fix first", text)
+        # The report's prose is not read.
+        self.assertNotIn("Two things need you", json.dumps(blocks))
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual((self.d / DELIVERED).read_text(encoding="utf-8"), self.REPORT)
+        self.assertNotIn("went as text", stage_log(self.d))
+
+    def test_the_card_goes_through_the_gateway_under_next(self):
+        self.assertEqual(self._run(gateway=0), RUNNING_NOTE + "\n")
+        self.assertEqual(self.posts, [])
+        ((argv, chat),) = self.notifies
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "slack"])
+        self.assertEqual(argv[argv.index("--thread") + 1], "C1/1.5")
+        expected, text = inventory_card.chat(self.card)
+        self.assertEqual(chat, expected)
+        self.assertEqual(argv[-1], text)
+        self.assertEqual(chat["choices"][0]["text"], "Fix the first one")
+        self.assertFalse(os.path.exists(argv[argv.index("--chat-file") + 1]))
+
+    def test_a_skip_goes_out_as_its_own_message_after_the_card(self):
+        (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            oobe.skip(self.d, oobe.SKIP_NOT_NEW, 1000.0)
+        self.assertEqual(
+            self._run(),
+            f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
+        )
+        self.assertEqual(len(self.posts), 1)
+
+    def test_the_done_card_posts_for_a_clean_fleet(self):
+        card = plant_card_files(self.d, items=[], scores=None, shown={"items": []})
+        self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+        (post,) = self.posts
+        blocks, text = inventory_card.blocks(card)
+        self.assertEqual(post.args[1:3], (text, blocks))
+        self.assertIn("First look at your fleet: done", text)
+
+    def test_an_unreadable_scores_file_beside_an_empty_item_list_still_builds_the_done_card(self):
+        # Nothing reads the scores file for an empty item list, so a truncated write or an earlier
+        # sweep's file left beside a clean sweep's items must not hold the one-time done card back.
+        for body in (b'{"scores": {', b"[1]", b"\xff"):
+            with self.subTest(body=body):
+                self._reset()
+                card = plant_card_files(self.d, items=[], scores=None, shown={"items": []})
+                (self.d / SCORES).write_bytes(body)
+                self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+                (post,) = self.posts
+                blocks, text = inventory_card.blocks(card)
+                self.assertEqual(post.args[1:3], (text, blocks))
+                self.assertIn("First look at your fleet: done", text)
+                self.assertNotIn("went as text", stage_log(self.d))
+                self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_the_limits_file_sets_the_rows(self):
+        card = plant_card_files(self.d, limits={"first_report_criticals": 1})
+        self.assertEqual(len(card.rows), 1)
+        self._run()
+        (post,) = self.posts
+        self.assertEqual(post.args[2], inventory_card.blocks(card)[0])
+        self.assertEqual(post.args[2][-1]["elements"][0]["text"]["text"], "Fix it")
+
+    def test_an_unusable_limits_file_means_the_defaults(self):
+        for body in ("nope", "[1]", '{"first_report_criticals": "many"}'):
+            with self.subTest(body=body):
+                self._reset()
+                (self.d / LIMITS).write_text(body, encoding="utf-8")
+                # select ran under the defaults too, so the recompute matches and the card goes.
+                self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+                self.assertEqual(self.posts[0].args[2], inventory_card.blocks(self.card)[0])
+                self.assertIn("using the default", self.err)
+
+    def test_a_dismissed_row_leaves_the_card(self):
+        first = json.loads((self.d / SHOWN).read_text(encoding="utf-8"))["items"][0]["ids"][0]
+        expected = plant_card_files(self.d, suppressed={first})
+        with mock.patch.object(
+            inventory_findings, "post_batch", return_value={"results": [{"id": first, "outcome": "suppressed"}]}
+        ):
+            self._run()
+        (post,) = self.posts
+        self.assertEqual(post.args[2], inventory_card.blocks(expected)[0])
+        self.assertIn("First look at your fleet: one thing to fix first", post.args[1])
+
+    def test_every_reason_the_card_falls_to_text_is_logged(self):
+        def unlink(name):
+            return lambda: (self.d / name).unlink()
+
+        def write(name, body):
+            return lambda: (self.d / name).write_text(body, encoding="utf-8")
+
+        marker = bootstrap_handoff.HANDOFF_MARKER
+        google = {"platform": "google_chat", "chat_id": "spaces/A"}
+        cases = (
+            ("the flag is off", lambda: None, self.ORIGIN, {"KAGE_SLACK_UX": "0"}, "KAGE_SLACK_UX is off", self.REPORT),
+            ("a Google Chat origin", lambda: None, google, {}, "goes to google_chat, which takes text", self.REPORT),
+            ("no origin", lambda: None, {}, {}, "a chat whose platform is not recorded", self.REPORT),
+            ("no ranking card", write(marker, f"sweep=t\ntask_id={bootstrap_handoff.NO_RANKING}\nfiled_at=1\n"),
+             self.ORIGIN, {}, "filed no prioritization card", self.text),
+            ("an unreadable marker", lambda: (self.d / marker).write_bytes(b"task_id=\xff\n"),
+             self.ORIGIN, {}, "marker could not be read", self.text),
+            ("no items file", unlink(ITEMS), self.ORIGIN, {}, "no INVENTORY.items.json", self.text),
+            ("no shown file", unlink(SHOWN), self.ORIGIN, {}, "no INVENTORY.shown.json", self.text),
+            ("no scores file beside items", unlink(SCORES), self.ORIGIN, {}, "no scores file beside the items", self.text),
+            ("an unreadable scores file beside items", write(SCORES, "[1]"), self.ORIGIN, {},
+             "INVENTORY.scores.json could not be read: INVENTORY.scores.json is not a JSON object", self.text),
+            ("an items file that is not an object", write(ITEMS, "[1]"), self.ORIGIN, {},
+             "INVENTORY.items.json could not be read: INVENTORY.items.json is not a JSON object", self.text),
+            ("a shown file that is not JSON", write(SHOWN, "{not json"), self.ORIGIN, {},
+             "INVENTORY.shown.json could not be read: ", self.text),
+            ("a shown file past the cap", write(SHOWN, "x" * (bootstrap_delivery.SHOWN_MAX_BYTES + 1)), self.ORIGIN, {},
+             f"INVENTORY.shown.json could not be read: larger than {bootstrap_delivery.SHOWN_MAX_BYTES} bytes", self.text),
+            ("a shown file that differs", write(SHOWN, json.dumps({"items": [{"class": "critical", "ids": ["x"]}]})),
+             self.ORIGIN, {}, "differ from the shown file", self.text),
+            ("a score the selection refuses", lambda: (self.d / SCORES).write_text(json.dumps(
+                {**card_fixtures.criticals_scores(), "scores": {k: {**v, "recommendation": {**v["recommendation"], "risk": ""}}
+                 for k, v in card_fixtures.criticals_scores()["scores"].items()}}), encoding="utf-8"),
+             self.ORIGIN, {}, "the selection could not be recomputed", self.text),
+        )
+        for name, arrange, origin, env, reason, text in cases:
+            with self.subTest(name):
+                self._reset()
+                arrange()
+                self.assertEqual(self._run(origin=origin, **env), delivered(text))
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.notifies, [])
+                log = stage_log(self.d)
+                self.assertIn("the first report went as text: ", log)
+                self.assertIn(reason, log)
+                self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_a_card_no_door_could_post_goes_as_text_and_the_log_says_why(self):
+        ok = lambda *a: "9.9"  # noqa: E731
+        cases = (
+            ("no chat id", {"platform": "slack"}, ok, None, RELAY_URL, "not a Slack chat with a chat id", 0, 0),
+            ("no relay", self.ORIGIN, ok, None, None, "no Slack relay is configured", 0, 0),
+            ("Slack refused the blocks", self.ORIGIN, self.sbp.Refused("invalid_blocks"), None, RELAY_URL,
+             "Slack refused the blocks: invalid_blocks", 1, 0),
+            ("a refusal that is not about the blocks", self.ORIGIN, self.sbp.Refused("channel_not_found"), None, RELAY_URL,
+             "Slack refused the blocks: channel_not_found", 1, 0),
+            ("the relay failed", self.ORIGIN, OSError("connection refused"), None, RELAY_URL,
+             "OSError('connection refused')", 1, 0),
+            # The first inventory is sent once, so a second copy beats none.
+            ("the post may have landed", self.ORIGIN, TimeoutError("timed out"), None, RELAY_URL,
+             "TimeoutError('timed out')", 1, 0),
+            ("the gateway refused", self.ORIGIN, ok, 1, RELAY_URL, "the gateway did not post it: refused", 0, 1),
+            ("no thread for the gateway", {"platform": "slack", "chat_id": "C1"}, ok, 0, RELAY_URL,
+             "no thread for the gateway", 0, 0),
+        )
+        for name, origin, post, gateway, relay, reason, posts, notifies in cases:
+            with self.subTest(name):
+                self._reset()
+                self.assertEqual(self._run(post=post, origin=origin, gateway=gateway, relay=relay), delivered(self.text))
+                self.assertEqual((len(self.posts), len(self.notifies)), (posts, notifies))
+                log = stage_log(self.d)
+                self.assertIn("the report card was not posted, so the text goes: ", log)
+                self.assertIn(reason, log)
 
 
 class ScanGateTest(unittest.TestCase):

@@ -24,8 +24,9 @@ misplaced test look fine.
 
 Some of those rows carry a footnote that matters more than the row.
 
-**`make test-python` runs twice in CI, on two interpreters.** `python-tests.yml`'s required job runs
-it under coverage on `.python-version`, CI's Python, and a second, non-required job runs it plain on
+**`make test-python` runs twice in CI, on two interpreters.** `python-tests.yml` runs it under
+coverage on `.python-version`, CI's Python, as three shard jobs whose results the required job
+joins (`PYTHON_TEST_SHARD`, `make coverage-merge`), and a second, non-required job runs it plain on
 `.agent-python-version`, the Python inside the platform agent image, where `agents/platform/scripts`,
 `deploy/shared` and the agent plugins execute. A suite that passes on one and not the other is the
 second job's whole purpose; it replaced two workflows that ran only `tests/` and the plugin suites
@@ -129,7 +130,7 @@ When diagnosing failures or reporting incidents, name the specific job rather th
 
 `staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
 
-`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions (`agent-kanban-smoke` among them; [`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
+`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions ([`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
 
 ## Running on a pull request is not gating a merge
 

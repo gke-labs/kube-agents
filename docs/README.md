@@ -115,6 +115,9 @@ hand-written. Never edit inside the markers — edit the source and regenerate.
 | `docs/site/src/content/docs/concepts/autonomous-watchdogs.md`, `docs/site/src/content/docs/concepts/skills.md`, `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-job-example -->` | The `compliance-audit` entry of `agents/platform/cron/jobs.json`, rendered as fenced JSON |
 | `docs/site/src/content/docs/skills/index.mdx` | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
 | `docs/site/src/content/docs/deploy/docker-images.md` | `<!-- BEGIN GENERATED: container-images -->` | `images.json` |
+| `docs/site/src/content/docs/operator/platformagent-fields.md` | `<!-- BEGIN GENERATED: crd-fields-platformagent -->` | The `PlatformAgent` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
+| `docs/site/src/content/docs/operator/agentprofile-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentprofile -->` | The `AgentProfile` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
+| `docs/site/src/content/docs/operator/agentplugin-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentplugin -->` | The `AgentPlugin` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `README.md` | `<!-- BEGIN GENERATED: capabilities -->` | The enabled entries of `agents/platform/cron/jobs.json` that carry the `fleet-audit` skill, with the SOP each prompt names, and the skill directories under `agents/platform/skills/` and `agents/cluster/skills/` |
 | `agents/platform/cron/jobs.json` — the SOP length and checks-section line range each governance prompt cites | none: `scripts/generate_sop_geography.py` rewrites the digits in place (`make docs-generate` runs it first) | The `agents/platform/governance/*_sop.md` each prompt names |
 
@@ -123,7 +126,8 @@ CI enforcement: `make docs-check` runs the same checks as
 
 - `docs-check-generated` — `scripts/generate_sop_geography.py --check` and
   `scripts/generate_docs.py --check`; fails if a generated region or prompt
-  line pin no longer matches its source.
+  line pin no longer matches its source. Needs `go` on `PATH` for the CRD
+  field pages, which `scripts/gen_crd_docs.go` reads from the Go API types.
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
   resolve to **git-tracked** targets; a `#fragment` on a relative link, a
   same-page link or a site route whose target is a tracked Markdown file must
@@ -162,11 +166,19 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-audience` — `scripts/check_docs_audience.py`; no page under
   `docs/site/src/content/docs/` may match a shape in
   `scripts/docs_audience_denylist.txt` (workflow secret and variable names, App
-  and installation IDs, the maintainers' Prow project, internal repositories),
-  name a project ID `hack/ci-env.sh` exports (the evaluation pool), or name a
-  service-account email in a non-placeholder project; it also fails when it
-  finds no site page or derives no project ID. The rule is
-  `.agents/rules/documentation.md`.
+  and installation IDs, the maintainers' Prow project, internal repositories,
+  release-pipeline tag and workflow names), name a project ID `hack/ci-env.sh`
+  exports (the evaluation pool), name a service-account email in a
+  non-placeholder project, or cite a pull request or issue in prose (a bare
+  `#NNN`, this repository's `pull/` or `issues/` URL, or a link carrying both;
+  fenced code, inline code and comments are not read, nor is prose on the line
+  a multi-line HTML comment closes on; a number counts once per line, so a
+  reference-style link or a link wrapped after its number counts twice;
+  `contributing.md` is exempt). The pages that carried findings when a shape arrived are pinned per
+  page and shape in `scripts/docs_audience_allowlist.txt`, which only shrinks
+  and pins only those shapes: a count that rises fails, and so does one left
+  higher than the page. It also fails when it finds no site page or derives no
+  project ID. The rule is `.agents/rules/documentation.md`.
 - `docs-check-prose` — `scripts/check_docs_prose.py`; the prose on each page
   under `docs/site/src/content/docs/` (frontmatter, fences, comments, generated
   regions, component tags, code spans and link URLs set aside) may not carry

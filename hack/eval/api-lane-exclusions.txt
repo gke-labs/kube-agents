@@ -23,3 +23,11 @@
 # the card stop that the next lane arms. Leaves this list when the api lane can
 # send a second message on the same conversation.
 chat-stop-halts-delegated-remediation
+
+# #4004: grades the question a delegated card paused on, which only the inject
+# lane's board read folds into the reply ("Question from delegated task
+# <id>:", bench/kube_agents_bench/harness.py); the api transport's status-turn
+# wait reads the card's run summary as its result instead. No api-transport
+# job runs a nightly case today; the entry keeps one from grading it on that
+# wait. Leaves this list when the api lane's wait reads a paused card's block.
+chat-question-asked-to-choose-pauses

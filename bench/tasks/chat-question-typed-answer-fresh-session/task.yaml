@@ -29,6 +29,13 @@
 #
 # `fixtures: []`: the case plants and archives its own cards and reads no
 # cluster.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the thread's
+# card carries the answer and is unblocked, and the decoy is untouched. It does
+# not grade how the agent got there (kanban_comment or kanban_unblock called).
+# It stays off the inject lane (hack/eval/inject-lane-exclusions.txt): its
+# answer turn carries today's Slack thread context, which next's door does
+# not send.
 id: chat-question-typed-answer-fresh-session
 name: A typed answer from a new thread session reaches the card whose question the thread shows
 prompt: |-
@@ -54,21 +61,7 @@ domain: chat-and-routing
 owner: jayantid
 
 verification_spec:
-  - name: the-answer-was-recorded-on-a-card
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_comment"]
-      require_success: true
-  - name: a-card-was-released
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_unblock"]
-      require_success: true
-  # The two above pass on the decoy; this pins them to the thread's card.
+  # The answer reached the thread's card, and not the decoy.
   - name: the-threads-card-carries-the-answer-and-the-decoy-is-untouched
     role: objective
     mode: assert

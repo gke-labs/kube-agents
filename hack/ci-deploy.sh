@@ -310,7 +310,7 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
-# merge-blocking presubmit in a Tide batch (it grades next since next became
+# merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the today lane's
 # six-hourly periodic on main, which deploys next and rolls it back to today
 # before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
@@ -320,11 +320,11 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
-# is optional, so Tide never batches it, and a pull request's run of it
+# is optional, so Tide never batched it, and a pull request's run of it
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
-# one by the first on a Tide batch, the periodic, the nightlies and the RC
+# one by the first on a batch Tide ran, the periodic, the nightlies and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
@@ -982,7 +982,7 @@ fi
 # The mode flip exists for the runs that grade next or roll it back: a pull
 # request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
 # lane's periodic and the main and GitLab nightlies on main, the blocking presubmit
-# in a Tide batch, and the release-candidate eval).
+# in a batch Tide ran, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
 # keeps the today lane out of the recorder, and bench-gate separately refuses
