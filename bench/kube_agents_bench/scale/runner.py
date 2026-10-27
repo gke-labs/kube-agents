@@ -177,8 +177,9 @@ class Runner:
         for attempt in range(1, CLUSTER_CREATE_ATTEMPTS + 1):
             LOG.info("creating test cluster %s (attempt %s)", name, attempt)
             try:
-                kube.create_cluster(self.project, self.zone, name, TEST_CLUSTER_MACHINE_TYPE,
-                                    DEFAULT_POOL_NODES, self.label)
+                # A plan can name another machine type, for a zone that runs out of the default one.
+                machine_type = self.settings.get("test_cluster_machine_type", TEST_CLUSTER_MACHINE_TYPE)
+                kube.create_cluster(self.project, self.zone, name, machine_type, DEFAULT_POOL_NODES, self.label)
                 return
             except kube.CommandError:
                 if attempt == CLUSTER_CREATE_ATTEMPTS:
