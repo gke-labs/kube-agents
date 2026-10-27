@@ -434,7 +434,8 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
   morning forever.
 
 `pr-merged-persists` is the state the current design cannot express and is a primary reason for the
-change. It must be visually distinct in the ledger.
+change. It must be visually distinct in the ledger. Its row and its comment give the cause when the
+collector saw it: Config Connector not applying the declaration (§6, `finish`).
 
 The two "once" obligations in the last column — the comment on a merged PR and the reply to a
 refused command — are enforced by the hidden `audit-persists` / `audit-refused` markers of §3.1,
@@ -793,6 +794,30 @@ shorter by whole lines, with its fences closed, to make room for the reconciler 
 remediation's `uncut_note`, and the carry of an unchanged finding puts that note back, so the cut
 does not stay on a later run that has room. The dry run can leave out notes the real run adds, because it reads no
 pull request and no `--decline-fix`, and so skips every fix the refusal would list.
+
+In the same place, `finish` adds a note to each `manifest` fix whose file declares an object that
+Config Connector does not apply. A merged fix of that kind changes nothing on the cloud resource: on
+2026-09-05 one `PubSubTopic` failed with `UpdateFailed` on an IAM role and put fifteen
+`ContainerCluster`s into `DependencyNotReady`, and every manifest fix against them would have merged
+into a controller that applied nothing. `finish` reads no cluster. The collectors record, on each
+cluster entry, the Config Connector objects whose `Ready` condition is `False`
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §2, `kcc_unready`), and
+`finish` parses the fix's file as the Config Connector index parses a clone and matches each object
+it declares on kind, `metadata.name`, and `metadata.namespace` when the file sets one. The note is
+the last paragraph of the remediation note, starts "**Config Connector is not applying this
+file.**", and names each matched object and the controller's reason in code spans; when the reason
+is `DependencyNotReady`, it also names the object that the message references when that object is
+not ready either, and so on down the chain. It names two objects at most and counts the rest. The
+fix keeps `kind: manifest`: the change is correct and belongs in that file, the stall usually clears
+before anyone reads the ledger, and degrading the fix would drop a correct pull request. The note
+fits the note cap the way the route notes do: the worker's note is cut, and the text `finish` wrote
+at its start stays whole. The pass first removes an earlier copy of the note from every remediation,
+and the carry removes it too, so a note never shows a stall that this run's manifest does not. A
+cluster whose read failed (`kcc_unread`) gives no stall and a warning in the log: the absence of the
+note never says that Config Connector applies a file. The same match, or a `Cluster/` or `NodePool/`
+finding whose own object is not ready, makes the `pr-merged-persists` row and the comment on the
+merged pull request state the stall in place of "the remediation was incomplete, or something
+outside this repository reverted it".
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 
