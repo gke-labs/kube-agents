@@ -14,12 +14,12 @@ kubectl get all,configmap,pvc,serviceaccount,secret -A \
   -l 'app.kubernetes.io/part-of in (kube-agents,a2a-next)'
 ```
 
-The set has two values by design: controller output rendered under `mode: next`, the mode a first
-install runs, carries `part-of: a2a-next` instead of `kube-agents`, plus a
-`kubeagents.x-k8s.io/a2a-component` label, so the A2A stack is one query of its own
-(`-l app.kubernetes.io/part-of=a2a-next`) and `-l app.kubernetes.io/part-of=kube-agents` keeps
-meaning the components every mode shares. On an install `install.sh` created, the second
-selector alone misses the bus, the callout, the verifier, the console and the gateway.
+The set has two values by design. Controller output rendered under `mode: next`, a first
+install's default, carries `part-of: a2a-next` instead of `kube-agents`, plus a
+`kubeagents.x-k8s.io/a2a-component` label. So the A2A stack is one query of its own
+(`-l app.kubernetes.io/part-of=a2a-next`), and `-l app.kubernetes.io/part-of=kube-agents` keeps
+meaning the components every mode shares. On a `next` install, the second selector alone misses
+the bus, the callout, the verifier, the console and the gateway.
 
 ## The label contract
 
@@ -46,8 +46,8 @@ database are all built from them. Do not add `component` anywhere else on the st
 
 One more source stamps labels at runtime rather than at install: the a2a chatops gateway
 (`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
-`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns, and it spawns them only
-under `spec.mode: next`, the mode a first install runs, where the operator renders
+`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns. It spawns them only
+under `spec.mode: next`, a first install's default, where the operator renders
 `A2A_SPAWN_SESSIONS`. The values are
 load-bearing the same way Hindsight's are, and for more consumers: the gateway's
 session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
@@ -56,7 +56,7 @@ operator's `A2A_SESSION_CLUSTER_VIEW` flag the credential broker's ingress polic
 NetworkPolicy that selects nothing looks exactly like one that is
 working. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
 runtime rather than installed, so the `kube-agents` half of the footprint query above does not
-list it, and it is reaped by its ownerReference to the gateway Deployment, not by uninstall.
+list it. It is reaped by its ownerReference to the gateway Deployment, not by uninstall.
 
 `version` is set only by the Helm chart, which fills it from `Chart.AppVersion` — a chart release
 is pinned to exactly one application release, so there is a correct value to write. See

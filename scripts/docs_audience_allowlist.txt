@@ -18,5 +18,5 @@
 deploy/gitops-argocd.md 1 pull-request or issue citation
 deploy/release-versioning.md 4 denylist: evalcand_
 install/gitlab.md 1 pull-request or issue citation
-install/upgrade.md 12 pull-request or issue citation
+install/upgrade.md 11 pull-request or issue citation
 operator/platformagent-crd.md 1 pull-request or issue citation
