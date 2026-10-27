@@ -837,4 +837,30 @@ def test_phase3_triggers_the_oobe_first_run_audits_in_a_window_of_their_own():
     assert audits.jobs == tuple(first_run)
     # The fleet only shrinks: the largest level runs first.
     assert [s.level for s in plan.matrix() if s.factor == "clusters" and s.operation.name == "onboarding_30m"] == [
-        22, 16, 8]
+        16, 8]
+
+
+def test_a_plan_without_a_required_setting_is_refused_at_load(tmp_path):
+    text = PHASE3.read_text().replace("  fixture_pool: scale-pool\n", "")
+    path = tmp_path / "plan.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="fixture_pool"):
+        load_plan(path, environ=ENV)
+
+
+def test_a_level_that_cannot_be_applied_stops_the_run(monkeypatch, tmp_path):
+    plan = load_plan(PHASE3, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    applied = []
+
+    def apply_level(factor, level):
+        applied.append(level)
+        raise kube.CommandError("stockout")
+    monkeypatch.setattr(run, "apply_level", apply_level)
+    monkeypatch.setattr(run, "backfill_peaks", lambda *a, **k: None)
+    monkeypatch.setattr(run, "pending", lambda specs: specs)
+    monkeypatch.setattr(runner.operations.Relay, "start", lambda self: None)
+    monkeypatch.setattr(runner.operations.Relay, "stop", lambda self: None)
+    run.run([s for s in plan.matrix() if s.factor == "clusters"], force=False)
+    # The 8-cluster level, which would delete the clusters the 16-cluster level holds, never starts.
+    assert applied == [16]

@@ -541,9 +541,12 @@ class Runner:
             for (factor, level), group in itertools.groupby(todo, key=lambda s: (s.factor, s.level)):
                 try:
                     values = self.apply_level(factor, level)
-                except Exception:  # a level that cannot be applied is skipped; a resume retries it
-                    LOG.exception("could not apply %s=%s; skipping its runs", factor, level)
-                    continue
+                except Exception:
+                    # Stop: the next level would reshape the fleet on top of a half-applied one (delete
+                    # the clusters this level made, or create more in a zone that just refused some).
+                    # A resume starts again at this level.
+                    LOG.exception("could not apply %s=%s; stopping the run", factor, level)
+                    break
                 for spec in group:
                     try:
                         self.preflight()

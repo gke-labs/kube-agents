@@ -42,6 +42,9 @@ TARGET_KEYS = (
 REQUIRED_TARGET_KEYS = ("project_id", "host_cluster", "host_location", "namespace", "zone", "cluster_prefix", "cluster_label", "mode")
 
 DEFAULT_RUNS = 1
+# Settings the runner reads without a default; a plan that lacks one is refused at load, before
+# any level touches a cluster.
+REQUIRED_SETTINGS = ("churn_pod_lifetime_seconds", "fixture_machine_type", "fixture_pool", "pods_per_node")
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,10 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
     unknown = sorted({f for op in operations for f in op.factors} - set(factors))
     if unknown:
         raise ValueError(f"{path}: operations name unknown factors {unknown}")
+    settings = raw.get("settings") or {}
+    absent = [name for name in REQUIRED_SETTINGS if name not in settings]
+    if absent:
+        raise ValueError(f"{path}: settings is missing {', '.join(absent)}")
     combined = [{name: float(value) for name, value in point.items()} for point in raw.get("combined") or []]
     points = range(1, len(combined) + 1)
     bad = [level for level in factors.get(COMBINED_FACTOR, []) if level not in points]
@@ -176,6 +183,6 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
         base={name: float(value) for name, value in raw["base"].items()},
         factors=factors,
         operations=operations,
-        settings=raw.get("settings") or {},
+        settings=settings,
         combined=combined,
     )

@@ -10,7 +10,9 @@
 # its 8 command slots.
 #
 # Set the target as for phase1.yaml. Run the cluster levels first, then the base, so the fleet
-# only shrinks: `run phase3.yaml --only-factor clusters`, then `--only-factor base`.
+# only shrinks: `run phase3.yaml --only-factor clusters`, then `--only-factor base`. The 22-cluster
+# fleet was deleted before Phase 3 measured it (a plan that lacked a setting, which the runner now
+# refuses at load); the 22-cluster point is Phase 2's 2-hour window.
 phase: phase3
 
 target:
@@ -33,11 +35,12 @@ base:
   listing_pods: 100
 
 factors:
-  clusters: [2, 22, 16, 8]
+  clusters: [2, 16, 8]
 
 settings:
   settle_seconds: 300
   pods_per_node: 90
+  fixture_pool: scale-pool
   fixture_machine_type: e2-small
   # Every cluster's default pool holds the fixture Pods, so no level needs a fixture pool: 2 nodes
   # per cluster at every point.
