@@ -711,6 +711,38 @@ Takes a dict of field name to value.
 {{- end }}
 
 {{/*
+The model LiteLLM serves as model-default: litellm.modelDefaultName, or the
+provider's default when that is empty. litellm.yaml renders it into the gateway
+config and web-console.yaml shows it in the console banner, so the two cannot
+name different models. Fails on a provider the table does not know.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.litellmModel" -}}
+{{- $provider := .Values.litellm.modelProvider }}
+{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
+       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
+{{- /*
+  openai_compatible has no default model, so it is allowed beside the table
+  rather than in it. Any other value is taken as a LiteLLM provider slug
+  (azure, bedrock, databricks, ...) whose credentials arrive through
+  envFromSecret: the chart knows no default model for it, so modelDefaultName
+  is required, and the slug's shape is checked here so a typo fails the render
+  rather than the first model call.
+*/}}
+{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
+{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
+{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
+{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
+{{- end }}
+{{- .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- end }}
+
+{{/*
 The LiteLLM gateway config, mirroring
 k8s-operator/config/integrations/litellm/base/config.yaml and its provider
 overlays.
@@ -2057,6 +2089,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end -}}
 {{- if .Values.githubMinter.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
 {{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall

@@ -6726,17 +6726,21 @@ def test_reply_is_silent_on_the_answer_without_one_is_an_error():
         assert check.verify(5).status == "error"
 
 
-def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
-    spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
-    entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
-    assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]
+def _silence_checks(case: str) -> list[dict]:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text())
+    return [e["check"] for e in spec["verification_spec"] if e["check"]["type"] == "reply_is_silent"]
 
 
-def test_the_click_case_grades_the_answer_turns_reply_and_the_wakes():
-    spec = yaml.safe_load((TASKS / "chat-question-click-answer-stays-silent" / "task.yaml").read_text())
-    checks = {e["name"]: e["check"] for e in spec["verification_spec"]}
-    assert checks["the-click-reply-is-silent"] == {"type": "reply_is_silent", "reply": "answer"}
-    assert checks["the-wake-reply-is-silent"] == {"type": "reply_is_silent"}
+def test_the_question_wake_case_grades_the_answers_reply_with_the_gateway_predicate():
+    # Under spec.mode next the reply to the wake is posted nowhere, so only the
+    # reply to the user's answer is graded (#4004).
+    assert _silence_checks("chat-question-wake-stays-silent") == [{"type": "reply_is_silent", "reply": "answer"}]
+
+
+def test_the_click_case_grades_the_click_turns_reply_and_not_the_wakes():
+    assert _silence_checks("chat-question-click-answer-stays-silent") == [
+        {"type": "reply_is_silent", "reply": "answer"}
+    ]
 
 
 # ------------------------- the recorded cluster is the slot, not the name's shape

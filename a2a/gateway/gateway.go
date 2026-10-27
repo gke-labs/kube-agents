@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -179,6 +180,9 @@ type Gateway struct {
 	usage usageSource
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
+	// feedback is the answer-feedback recorder, set by Run once the
+	// feedback bucket is found (startFeedback); nil leaves answers unmarked.
+	feedback atomic.Pointer[feedbackDesk]
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
@@ -574,6 +578,9 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Its first try before the relay starts, so on an install with the
+	// bucket every answer the relay posts is marked alike.
+	g.startFeedback(ctx)
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
@@ -1378,11 +1385,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
 		// that ran the heal then routes against the wake as its active task.
+		// As the relay does: a task, a human turn or a child, that handed
+		// the ask to cards leaves the answer, and its rating, to the card's
+		// report (AnswerFeedbackTarget rates only such a chain).
+		toCards := healedTask != nil &&
+			(cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask)))
+		if toCards {
+			rec.markCardsAnswer(active.TaskID)
+		}
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:

@@ -34,10 +34,12 @@
 # hack/eval/presubmit-cases.txt), leaves its domain uncovered until its
 # roster line lands.
 #
-# `allowlist` names the domains that are known-uncovered today. Delete entries
-# as Phase 2 ACTIVATES scenarios; the lint refuses both an uncovered domain that
-# is not listed (a regression) and a listed domain that is covered (a stale
-# entry hiding progress). The shrinking allowlist is the tier-2 progress
+# `allowlist` names the domains that are known-uncovered today, one record
+# each with an owner, an issue and an expiry date (the fields are described
+# above the list). Delete entries as Phase 2 ACTIVATES scenarios; the lint
+# refuses an uncovered domain that is not listed (a regression), a listed
+# domain that is covered (a stale entry hiding progress), and a record
+# missing a field or running past the expiry cap. The shrinking allowlist is the tier-2 progress
 # metric of the testing implementation plan, as line coverage is the tier-1
 # one.
 #
@@ -166,28 +168,64 @@ domains:
 # roster seat on its nightly record.
 #
 # An entry goes back on here only alongside a scenario that stopped running,
-# or arrives with a new row whose cases have no roster line yet.
+# or arrives with a new row whose cases have no roster line yet. A roster
+# edit that leaves a domain with no blocking case must, in the same pull
+# request, seat a stand-in case from that domain on the roster, keep the
+# demoted case on the presubmit as a held-out seat (which still covers
+# nothing here), or add a record below (docs/eval-gate-roster.md,
+# "Demoting a flaky case").
+#
+# Each record carries:
+#   slug      the domain, as in its row above.
+#   since     the date (YYYY-MM-DD) the domain lost its last blocking case.
+#   issue     the number of the open issue that says how coverage comes back.
+#   owner     the GitHub login who brings it back; the domain row's owner
+#             unless someone else took it. Must be in the root OWNERS file.
+#   expires   the date the record stops excusing the gap: at most 14 days
+#             after `since`, unless `why` says why it is longer. Past
+#             `expires` (by the UTC date) pull requests are not blocked; the
+#             CI-health bot escalates to the owner on the record's issue
+#             (scripts/domain_allowlist.py finds expired records). Moving the
+#             date is an edit to this line in a pull request, so the record
+#             shows who moved it and why.
+#   why       required only when `expires` is more than 14 days after
+#             `since`: one sentence saying why.
+#   held_out  optional: a case of this domain still running on the presubmit
+#             as a held-out seat (the last section of
+#             hack/eval/presubmit-cases.txt). It runs on every pull request
+#             but cannot red one, so it does not cover the domain.
 allowlist:
-  # fleet-audits, since 2026-09-22 (#1023): the domain's one case, the
-  # compliance-rbac-overgrant canary, was never admitted (demoted 2026-09-02
-  # on #1171) and moved to the nightly that day. Since 2026-09-29 it is seated
-  # held out in hack/eval/presubmit-cases.txt (#2013 step 2, the documented
-  # exception to the blocking-only rule): it runs on every pull request,
-  # cannot red one on a graded failure, and covers nothing here. Delete this
-  # entry in the pull request that adds its roster line (#2013 step 4, after
-  # three clean days), or when the coverage contract formally recognizes the
-  # nightly tier (#1175). incident-triage sat here from 2026-09-03 to
-  # 2026-09-22 for the same shape of reason.
-  - fleet-audits
-  # consistency, since 2026-10-21 (#3598): the domain's one presubmit case,
-  # consistency-authorized-networks-probe, was demoted to the nightly that day
-  # after it failed about 30% of repetitions on the Gemini setup on unrelated
-  # pull requests: Vertex 429s (#3399, #3448) and real misses where the agent
-  # read seeded-c's leftover authorized-networks block as configured.
-  # Delete this entry in the pull request that restores it to the roster.
-  - consistency
-  # observability, since the row was added: every case claiming it is a
-  # nightly case, so it has no blocking-roster case. Delete the entry in the
-  # pull request that gives the domain a roster line. source-control sat here
-  # beside it until vcs-spent-branch-reuse took its roster line on 2026-10-23.
-  - observability
+  # fleet-audits: the domain's one case, the compliance-rbac-overgrant
+  # canary, was never admitted (demoted 2026-09-02 on #1171) and moved to the
+  # nightly on 2026-09-22 (#1023). Since 2026-09-29 it is seated held out in
+  # hack/eval/presubmit-cases.txt (#2013 step 2, the documented exception to
+  # the blocking-only rule). Delete this record in the pull request that adds
+  # its roster line (#2013 step 4, after three clean days). incident-triage
+  # sat here from 2026-09-03 to 2026-09-22 for the same shape of reason.
+  - slug: fleet-audits
+    since: 2026-09-22
+    issue: 2013
+    expires: 2026-11-09
+    why: "Uncovered before records expired; the first dated expiry, set on 2026-10-26, is 14 days from that day, and #2013 lists four product defects to fix before the canary can take a roster line."
+    held_out: compliance-rbac-overgrant
+  # consistency: the domain's one presubmit case,
+  # consistency-authorized-networks-probe, was demoted to the nightly on
+  # 2026-10-21 (#3604) after it failed about 30% of repetitions on the Gemini
+  # setup on unrelated pull requests: Vertex 429s (#3399, #3448) and real
+  # misses where the agent read seeded-c's leftover authorized-networks block
+  # as configured. Delete this record in the pull request that restores it,
+  # or a stand-in such as consistency-drift-outlier, to the roster.
+  - slug: consistency
+    since: 2026-10-21
+    issue: 3598
+    expires: 2026-11-04
+  # observability: every case claiming it has been a nightly case since the
+  # row was added (#3437), so it has never had a roster case. Delete this
+  # record in the pull request that gives the domain a roster line.
+  # source-control sat here beside it until vcs-spent-branch-reuse took its
+  # roster line on 2026-10-23.
+  - slug: observability
+    since: 2026-10-19
+    issue: 3980
+    expires: 2026-11-09
+    why: "Uncovered before records expired; the first dated expiry, set on 2026-10-26, is 14 days from that day, and no observability case is near the admission bar yet, so #3980 asks for a fixed or new case."

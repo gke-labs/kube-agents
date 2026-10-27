@@ -57,8 +57,11 @@ than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the
 A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
-runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
-needs an entry in `hack/eval/inject-lane-exclusions.txt`. A first line of
+sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
+the front door there under `spec.mode: next` too. Under next the reply to that wake is posted
+nowhere, and a `session: fresh` answer carries today's Slack thread context, which next's door
+does not send, so a case that grades either stays in `hack/eval/inject-lane-exclusions.txt`. A
+first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
@@ -451,7 +454,7 @@ declares a domain.
 There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
 the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
 one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
-fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist, as a record with `since`, `issue` and an `expires` date (the comment above `allowlist:` describes the fields).
 
 ## Every case declares a verification spec
 
