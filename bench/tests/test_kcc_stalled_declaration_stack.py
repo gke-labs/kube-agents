@@ -48,6 +48,7 @@ spec = importlib.util.spec_from_file_location("kcc_stalled_plant", STACK / "plan
 plant = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plant)
 
+DELETE_NAMESPACE = ["kubectl", "delete", "namespace", "eval-kcc-stalled", "--ignore-not-found", "--wait=false"]
 SEEDED = [{"name": "acme-seeded-a", "location": "us-central1-a"}, {"name": "acme-seeded-b", "location": "us-central1-a"}]
 DECLARATION = "clusters/acme-seeded-a/provisioning/pinned-inference-pool.yaml"
 
@@ -79,10 +80,12 @@ class Cluster:
         self.ready = ready
         self.fail_on = fail_on
         self.calls = []
+        self.timeouts = []
         self.applied = []
 
-    def __call__(self, argv, *, env=None, stdin=None):
+    def __call__(self, argv, *, env=None, stdin=None, timeout=None):
         self.calls.append(list(argv))
+        self.timeouts.append(timeout)
         joined = " ".join(argv)
         if self.fail_on and self.fail_on in joined:
             return done(1, stderr="refused")
@@ -114,7 +117,15 @@ class Cluster:
 
 
 class Forge:
-    """The GitHub REST calls plant.py makes, against an in-memory repository."""
+    """The GitHub REST calls plant.py makes, against an in-memory repository.
+
+    A pull request is `(number, files)`, from the audit's branch for
+    `DECLARATION`, or `(number, files, head branch)`.
+    """
+
+    @staticmethod
+    def ref(pull):
+        return pull[2] if len(pull) > 2 else plant.stack_branch(DECLARATION)
 
     def __init__(self, files=None, pulls=None):
         self.files = dict(files or {})
@@ -140,10 +151,13 @@ class Forge:
                 self.files.pop(name)
                 return 200, {}
         if method == "GET" and route == "/repos/acme/fleet/pulls":
-            return 200, [{"number": number} for number, _ in self.pulls]
+            # GitHub's `head=owner:branch` filter.
+            query = dict(part.split("=", 1) for part in path.split("?", 1)[1].split("&"))
+            head = query.get("head", "").partition(":")[2]
+            return 200, [{"number": pull[0], "head": {"ref": self.ref(pull)}} for pull in self.pulls if not head or self.ref(pull) == head]
         if method == "GET" and route.endswith("/files"):
             number = int(route.split("/")[-2])
-            return 200, [{"filename": f} for n, files in self.pulls if n == number for f in files]
+            return 200, [{"filename": f} for pull in self.pulls if pull[0] == number for f in pull[1]]
         if method == "PATCH" and route.startswith("/repos/acme/fleet/pulls/"):
             self.closed.append(int(route.rsplit("/", 1)[1]))
             return 200, {}
@@ -209,7 +223,7 @@ def test_a_failed_plant_removes_what_it_wrote():
     def refusing(method, path, body):
         return (403, None) if method == "PUT" else forge_call(method, path, body)
 
-    delete_namespace = ["kubectl", "delete", "namespace", "eval-kcc-stalled", "--ignore-not-found", "--wait=false"]
+    delete_namespace = DELETE_NAMESPACE
     cluster = Cluster()
     with pytest.raises(RuntimeError, match="cannot commit"):
         new_plant(cluster, refusing).plant()
@@ -239,8 +253,81 @@ def test_the_teardown_closes_the_runs_pull_request_and_removes_only_its_own_file
     assert new_plant(cluster, forge).teardown()
     assert forge.closed == [5]
     assert DECLARATION not in forge.files
-    assert ["kubectl", "delete", "namespace", "eval-kcc-stalled", "--ignore-not-found", "--wait=false"] in cluster.calls
+    assert DELETE_NAMESPACE in cluster.calls
     # A file of the same name that a person wrote stays.
     forge = Forge(files={DECLARATION: "kind: ContainerNodePool\n"})
     assert new_plant(Cluster(), forge).teardown()
     assert DECLARATION in forge.files
+
+
+def ours():
+    return plant.declaration_text(plant.node_pool_manifest(settings(), plant.Target("acme-seeded-a", "z")))
+
+
+def test_the_stack_branch_is_the_branch_the_audit_opens_for_the_declaration():
+    finding = {"id": "pool-single-zone", "remediation": {"kind": "manifest", "path": DECLARATION}}
+    assert plant.stack_branch(DECLARATION) == audit_report.group_branch_for(plant.AUDIT_ID, [finding])
+
+
+def test_the_teardown_closes_only_the_pull_request_from_the_stacks_branch():
+    forge = Forge(
+        files={DECLARATION: ours()},
+        pulls=[(5, [DECLARATION]), (7, [DECLARATION], "someone/edits-the-same-file")],
+    )
+    assert new_plant(Cluster(namespace_owner="kube-agents-bench"), forge).teardown()
+    assert forge.closed == [5]
+
+
+def test_the_teardown_closes_nothing_on_a_path_the_stack_does_not_own():
+    """A plant that refused a file it did not own, or that failed before it
+    wrote one, runs teardown; neither may close a pull request on that path."""
+    for files in ({DECLARATION: "kind: ContainerNodePool\n"}, {}):
+        forge = Forge(files=files, pulls=[(5, [DECLARATION])])
+        assert new_plant(Cluster(), forge).teardown()
+        assert forge.closed == []
+    # The plant itself refuses the person's file, and its teardown closes nothing.
+    forge = Forge(files={DECLARATION: "kind: ContainerNodePool\n"}, pulls=[(5, [DECLARATION])])
+    with pytest.raises(RuntimeError, match="not this stack's"):
+        new_plant(Cluster(), forge).plant()
+    assert forge.closed == []
+
+
+def test_the_object_delete_has_a_time_limit_and_the_namespace_delete_runs_after_it_fails():
+    cluster = Cluster(namespace_owner="kube-agents-bench", fail_on="delete containernodepool")
+    assert not new_plant(cluster, Forge()).teardown()
+    [object_delete] = [c for c in cluster.calls if c[:3] == ["kubectl", "delete", "containernodepool"]]
+    assert f"--timeout={plant.DELETE_TIMEOUT_S}s" in object_delete
+    assert cluster.timeouts[cluster.calls.index(object_delete)] == plant.DELETE_PROCESS_TIMEOUT_S
+    assert DELETE_NAMESPACE in cluster.calls
+    assert cluster.calls.index(object_delete) < cluster.calls.index(DELETE_NAMESPACE)
+
+
+def test_a_command_that_runs_out_of_time_is_a_failed_command():
+    result = plant.default_run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.1)
+    assert result.returncode == plant.TIMEOUT_RC
+
+
+def test_a_missing_token_file_stops_only_the_github_half(tmp_path, monkeypatch):
+    env = {
+        "KCC_EVAL_PROJECT": "acme", "KCC_EVAL_CLUSTER": "hub", "KCC_EVAL_LOCATION": "us-central1",
+        "KCC_EVAL_NAMESPACE": "eval-kcc-stalled", "KCC_EVAL_SLOT": "a", "KCC_EVAL_POOL": "pinned-inference-pool",
+        "KCC_EVAL_GITOPS_REPO": "acme/fleet", "KCC_EVAL_GITOPS_TOKEN_FILE": str(tmp_path / "gone"),
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    loaded = plant.Settings.from_env()
+    with pytest.raises(OSError):
+        loaded.github_token()
+    cluster = Cluster(namespace_owner="kube-agents-bench")
+    teardown = plant.Plant(loaded, run=cluster, sleep=lambda _s: None)
+    assert not teardown.teardown()
+    assert DELETE_NAMESPACE in cluster.calls
+
+
+def test_a_failed_cluster_list_still_runs_the_kubernetes_half_and_fails_the_teardown(capsys):
+    cluster = Cluster(namespace_owner="kube-agents-bench", fail_on="clusters list")
+    forge = Forge(files={DECLARATION: ours()}, pulls=[(5, [DECLARATION])])
+    assert not new_plant(cluster, forge).teardown()
+    assert DELETE_NAMESPACE in cluster.calls
+    assert forge.closed == [] and DECLARATION in forge.files
+    assert "ERROR: cannot resolve the seeded cluster" in capsys.readouterr().err

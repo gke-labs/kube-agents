@@ -42,19 +42,30 @@ the destroy provisioner of a resource whose create failed.
 
 teardown, every step independent of the others:
 
-1. Closes each open pull request in the GitOps repository that changes the
-   declaration's path: the remediation the audit opened against the plant.
+1. Closes the open pull request that the audit opened against the plant: the
+   one whose head is the remediation branch the audit names for the
+   declaration's path (`stack_branch`) and that changes that path. It does
+   this only when the file on the default branch is this stack's, so a plant
+   that refused a file it did not own, or that failed before it wrote one,
+   closes nothing.
 2. Deletes the declaration from the default branch, when the file there is
    this stack's (it carries the stack's label).
 3. Deletes the `ContainerNodePool` and the namespace, when the namespace is
-   this stack's.
+   this stack's. The object delete has a time limit, and the namespace delete
+   runs when the object delete fails.
+
+Steps 1 and 2 need the seeded cluster's name from `gcloud container clusters
+list`, and the GitHub token. When either is not available, the teardown logs
+an error that names what stays, and still does step 3.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,7 +73,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, NamedTuple
 
 # The label every object and file this stack writes carries, and the value
@@ -83,6 +94,17 @@ DECLARATION_PATH = "clusters/{cluster}/provisioning/{pool}.yaml"
 COMMIT_PLANT = "test(bench): plant a Config Connector declaration for {case}"
 COMMIT_REMOVE = "test(bench): remove the Config Connector declaration of {case}"
 CASE = "fleet-audit-manifest-fix-names-stalled-config-connector"
+# The remediation branch the audit opens for a fix of one file:
+# audit_report.group_branch_for, copied because the stack does not import the
+# skill. bench/tests/test_kcc_stalled_declaration_stack.py holds the two equal.
+AUDIT_ID = "stockout-prevention"
+STACK_BRANCH = "platform-agent/fix-{audit}-{slug}-{digest}"
+BRANCH_SLUG_CHARS = 24
+BRANCH_DIGEST_CHARS = 10
+# How long `kubectl delete` waits for the object to go, and the hard limit on
+# the process around it.
+DELETE_TIMEOUT_S = 120
+DELETE_PROCESS_TIMEOUT_S = DELETE_TIMEOUT_S + 30
 # How long Config Connector gets to write `Ready=False`, and how often the
 # plant reads it. A reference it cannot resolve is its first check.
 READY_WAIT_S = 300
@@ -99,6 +121,8 @@ POOL_MACHINE_TYPE = "e2-small"
 POOL_NODE_COUNT = 1
 POOL_MAX_NODES = 1
 PLANT_USAGE = "usage: plant.py plant|teardown"
+# What `default_run` returns for a command it killed, as `timeout(1)` does.
+TIMEOUT_RC = 124
 
 
 class Settings(NamedTuple):
@@ -109,12 +133,21 @@ class Settings(NamedTuple):
     slot: str
     pool: str
     gitops_repo: str
-    token: str
+    token: str = ""
+    token_file: str = ""
+
+    def github_token(self) -> str:
+        """The GitHub token, read from `token_file` when one is set.
+
+        Read when the first GitHub call is made, not in `from_env`: a token
+        file that is gone at teardown must stop only the GitHub half.
+        """
+        if self.token_file:
+            return Path(self.token_file).read_text(encoding="utf-8").strip()
+        return self.token
 
     @classmethod
     def from_env(cls) -> "Settings":
-        token_file = os.environ.get("KCC_EVAL_GITOPS_TOKEN_FILE", "")
-        token = Path(token_file).read_text(encoding="utf-8").strip() if token_file else os.environ.get("BENCH_GITHUB_TOKEN", "")
         return cls(
             project=os.environ["KCC_EVAL_PROJECT"],
             kcc_cluster=os.environ["KCC_EVAL_CLUSTER"],
@@ -123,7 +156,8 @@ class Settings(NamedTuple):
             slot=os.environ["KCC_EVAL_SLOT"],
             pool=os.environ["KCC_EVAL_POOL"],
             gitops_repo=os.environ["KCC_EVAL_GITOPS_REPO"],
-            token=token,
+            token=os.environ.get("BENCH_GITHUB_TOKEN", ""),
+            token_file=os.environ.get("KCC_EVAL_GITOPS_TOKEN_FILE", ""),
         )
 
 
@@ -140,12 +174,22 @@ def log(message: str) -> None:
     print(f"[kcc-stalled-declaration] {message}", file=sys.stderr, flush=True)
 
 
-def default_run(argv: list[str], *, env: dict | None = None, stdin: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, env=env, input=stdin, capture_output=True, text=True, check=False)
+def default_run(
+    argv: list[str], *, env: dict | None = None, stdin: str | None = None, timeout: float | None = None
+) -> subprocess.CompletedProcess:
+    """Run `argv`. A timeout is a failed command, never an exception."""
+    try:
+        return subprocess.run(argv, env=env, input=stdin, capture_output=True, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, TIMEOUT_RC, "", f"killed after {timeout}s")
 
 
-def github_http(token: str) -> HttpFn:
-    """A GitHub REST call: `(method, path, body)` to `(status, parsed body)`."""
+def github_http(token: Callable[[], str]) -> HttpFn:
+    """A GitHub REST call: `(method, path, body)` to `(status, parsed body)`.
+
+    `token` is called on each request, so a missing token stops only the
+    calls that need it.
+    """
 
     def call(method: str, path: str, body: dict | None) -> tuple[int, object]:
         request = urllib.request.Request(
@@ -153,7 +197,7 @@ def github_http(token: str) -> HttpFn:
             data=json.dumps(body).encode() if body is not None else None,
             method=method,
             headers={
-                "Authorization": f"Bearer {token}",
+                "Authorization": f"Bearer {token()}",
                 "Accept": "application/vnd.github+json",
                 "Content-Type": "application/json",
             },
@@ -211,11 +255,18 @@ def is_ours(text: str) -> bool:
     return f'"{MANAGED_BY_KEY}": "{MANAGED_BY}"' in text
 
 
+def stack_branch(path: str) -> str:
+    """The branch the audit opens for a fix of `path` alone."""
+    digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:BRANCH_DIGEST_CHARS]
+    slug = re.sub(r"[^a-z0-9]+", "-", PurePosixPath(path).stem.lower()).strip("-")[:BRANCH_SLUG_CHARS].strip("-")
+    return STACK_BRANCH.format(audit=AUDIT_ID, slug=slug, digest=digest) if slug else f"platform-agent/fix-{AUDIT_ID}-{digest}"
+
+
 class Plant:
     def __init__(self, settings: Settings, run: RunFn = default_run, http: HttpFn | None = None, sleep=time.sleep):
         self.settings = settings
         self.run = run
-        self.http = http or github_http(settings.token)
+        self.http = http or github_http(settings.github_token)
         self.sleep = sleep
         self.kubeconfig_dir = tempfile.mkdtemp(prefix="kcc-stalled-")
         self.env = {**os.environ, "KUBECONFIG": str(Path(self.kubeconfig_dir) / "config")}
@@ -358,8 +409,13 @@ class Plant:
         try:
             target = self.target()
         except Exception as exc:  # noqa: BLE001 -- the Kubernetes half needs no target
-            log(f"cannot resolve the seeded cluster ({exc}); the GitOps half is skipped")
+            log(
+                f"ERROR: cannot resolve the seeded cluster of slot {self.settings.slot} ({exc}). The GitOps half "
+                f"is not done: close the audit's pull request on {DECLARATION_PATH.format(cluster='<cluster>', pool=self.settings.pool)} "
+                f"in {self.settings.gitops_repo} and delete that file by hand. The Kubernetes half runs."
+            )
             target = None
+            ok = False
         if target is not None:
             for step in (self.close_pull_requests, self.delete_declaration):
                 try:
@@ -377,12 +433,27 @@ class Plant:
         return ok
 
     def close_pull_requests(self, target: Target) -> None:
+        """Close the audit's open pull request on the declaration's path.
+
+        Only a pull request from `stack_branch`, and only when the file on
+        the default branch is this stack's: another pull request on that path,
+        or one on a file the stack does not own, is not the stack's to close.
+        """
         path = declaration_path(self.settings, target)
         repo = self.settings.gitops_repo
-        status, pulls = self.http("GET", f"/repos/{repo}/pulls?state=open&per_page={GITHUB_PAGE}", None)
+        existing = self.remote_file(path, self.default_branch())
+        if existing is None or not is_ours(existing[0]):
+            log(f"{path} is not this stack's on the default branch; no pull request is closed")
+            return
+        branch = stack_branch(path)
+        owner = repo.partition("/")[0]
+        status, pulls = self.http("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}&per_page={GITHUB_PAGE}", None)
         if status != 200 or not isinstance(pulls, list):
             raise RuntimeError(f"cannot list pull requests (HTTP {status})")
         for pull in pulls:
+            head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+            if head.get("ref") != branch:
+                continue
             number = pull.get("number")
             status, files = self.http("GET", f"/repos/{repo}/pulls/{number}/files?per_page={GITHUB_PAGE}", None)
             if status != 200 or not isinstance(files, list):
@@ -408,8 +479,19 @@ class Plant:
             raise RuntimeError(f"cannot delete {path} (HTTP {status})")
 
     def delete_kubernetes(self) -> None:
-        self.must(["kubectl", "delete", KIND.lower(), self.settings.pool, "-n", self.settings.namespace, "--ignore-not-found"])
+        """Delete the object, then the namespace, also when the object delete
+        fails or runs out of time: the namespace delete removes the object
+        with it."""
+        object_delete = [
+            "kubectl", "delete", KIND.lower(), self.settings.pool, "-n", self.settings.namespace,
+            "--ignore-not-found", "--wait=true", f"--timeout={DELETE_TIMEOUT_S}s",
+        ]
+        result = self.run(object_delete, env=self.env, timeout=DELETE_PROCESS_TIMEOUT_S)
+        if result.returncode != 0:
+            log(f"the {KIND} delete exited {result.returncode} ({result.stderr.strip()}); deleting the namespace")
         self.must(["kubectl", "delete", "namespace", self.settings.namespace, "--ignore-not-found", "--wait=false"])
+        if result.returncode != 0:
+            raise RuntimeError(f"the {KIND} delete exited {result.returncode}: {result.stderr.strip()}")
 
 
 def main(argv: list[str]) -> int:
