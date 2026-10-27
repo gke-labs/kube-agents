@@ -160,11 +160,15 @@ from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import board, card_wake, gitops, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
+    BOARD_INFRA_STATUSES as _BOARD_INFRA_STATUSES,
     DELEGATION_TOOL,
+    RATE_LIMIT_REASON_PREFIX as _RATE_LIMIT_REASON_PREFIX,
     STATUS_TOOL,
+    _INFRA_FAILURE_REASONS,
     _json_object,
     delegated_task_ids,
     delivered_results,
+    extract_infra_failure_reason as _extract_infra_failure_reason,
     merge_new,
     new_calls,
     parse_response,
@@ -714,22 +718,6 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
-_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
-_RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
-_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
-
-
-def _extract_infra_failure_reason(text: str | None) -> str | None:
-    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
-    if not text:
-        return None
-    text = text.strip()
-    if text.startswith(_RATE_LIMIT_REASON_PREFIX):
-        match = _FAILURE_REASON_PATTERN.search(text)
-        if match:
-            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
-        return "rate_limit"
-    return None
 
 
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
@@ -809,13 +797,19 @@ def _is_rate_limited_triage(
     task_id: str,
     summaries: dict[str, str],
     errors: dict[str, str],
+    results: dict[str, str] | None = None,
 ) -> bool:
     """Whether a card in triage carries an infrastructure rate limit failure reason."""
     if status != "triage":
         return False
     summary = summaries.get(task_id) or ""
     error = errors.get(task_id) or ""
-    return bool(_extract_infra_failure_reason(summary) or _extract_infra_failure_reason(error))
+    result_text = (results.get(task_id) if results else None) or ""
+    return bool(
+        _extract_infra_failure_reason(summary)
+        or _extract_infra_failure_reason(error)
+        or _extract_infra_failure_reason(result_text)
+    )
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
 # can file a card can always read one back.
@@ -2938,21 +2932,6 @@ class KubeAgentsHarness(AgentHarness):
                 f"{len(read.card_ids)}"
             )
 
-        triage_initial = [
-            t
-            for t in read.card_ids
-            if str(read.cards.get(t, {}).get("status") or "") == "triage"
-            and not read.cards.get(t, {}).get("summary")
-        ]
-        if triage_initial:
-            fresh_triage = _read(triage_initial)
-            if fresh_triage is not None:
-                read.cards.update(
-                    {t: c for t, c in fresh_triage.cards.items() if t in triage_initial}
-                )
-
-        rate_limited: set[str] = set()
-
         def _status(task_id: str) -> str:
             return str(read.cards.get(task_id, {}).get("status") or "unknown")
 
@@ -2960,28 +2939,43 @@ class KubeAgentsHarness(AgentHarness):
             st = _status(task_id)
             if st in _TERMINAL_STATUSES:
                 return True
-            if st == "triage":
-                if task_id in rate_limited:
-                    return True
-                card = read.cards.get(task_id, {}) if read is not None else {}
-                summary = str(card.get("summary") or "")
-                result_val = str(card.get("result") or "")
-                if (
-                    _extract_infra_failure_reason(summary)
-                    or _extract_infra_failure_reason(result_val)
-                ):
-                    rate_limited.add(task_id)
-                    return True
-            else:
-                rate_limited.discard(task_id)
-            return False
+            card = read.cards.get(task_id, {}) if read is not None else {}
+            summary = str(card.get("summary") or "")
+            error = str(card.get("error") or "")
+            result_val = str(card.get("result") or "")
+            return _is_rate_limited_triage(
+                st,
+                task_id,
+                {task_id: summary},
+                {task_id: error},
+                {task_id: result_val},
+            )
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
-            _purge_card_state(awaited, _EXEC_TIMEOUT)
+            _purge_card_state(read.card_ids if read is not None else [], _EXEC_TIMEOUT)
             return _DelegationTransportExhausted(
                 f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
                 "still waiting on: " + (", ".join(still) or "nothing (reading results)")
             )
+
+        def _fetch_triage(card_ids: Sequence[str]) -> None:
+            if read is None:
+                return
+            triage_need = [
+                t
+                for t in card_ids
+                if str(read.cards.get(t, {}).get("status") or "") == "triage"
+                and not read.cards.get(t, {}).get("summary")
+            ]
+            if triage_need:
+                fresh_triage = _read(triage_need)
+                if fresh_triage is None:
+                    raise _exhausted(triage_need)
+                read.cards.update(
+                    {t: c for t, c in fresh_triage.cards.items() if t in triage_need}
+                )
+
+        _fetch_triage(read.card_ids)
 
         # Cards the board has had no row for on consecutive reads, and the
         # ones dropped for it: a create on another board, or a card deleted
@@ -3019,20 +3013,11 @@ class KubeAgentsHarness(AgentHarness):
                 break
             _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
             time.sleep(max(0.0, min(poll_interval, remaining)))
-            fresh = _read(outstanding)
+            fresh = _read(awaited)
             if fresh is None:
                 raise _exhausted(outstanding)
-            for t in rate_limited:
-                if (
-                    t in read.cards
-                    and t in fresh.cards
-                    and str(fresh.cards[t].get("status") or "") == "triage"
-                ):
-                    if not fresh.cards[t].get("summary"):
-                        fresh.cards[t]["summary"] = read.cards[t].get("summary")
-                    if not fresh.cards[t].get("result"):
-                        fresh.cards[t]["result"] = read.cards[t].get("result")
             read = fresh
+            _fetch_triage(read.card_ids)
             outstanding = _merge()
 
         # Only a card the board shows terminal is read back, as the status-turn

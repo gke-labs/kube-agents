@@ -2866,21 +2866,126 @@ def test_inject_transport_delegated_worker_triage_and_running_card_does_not_flap
     )
     assert all(CARD_B in msg for msg in wait_logs)
 
-    # In-loop polling reads (read index 2) must only want CARD_B, never re-requesting CARD_A.
+    # Reads:
     # Read 0: initial read
-    # Read 1: triage_initial fetch for CARD_A
-    # Read 2: loop poll for outstanding (CARD_B only)
-    # Read 3: post-loop final read for settled
+    # Read 1: initial deliverables fetch for created cards
+    # Read 2: in-loop poll for awaited tasks
+    # Read 3: post-loop final read for settled cards
     reads: list[str] = getattr(real_shell, "reads", [])
     assert len(reads) == 4, (
-        f"expected 4 reads (initial, triage_initial, loop poll, final), got {len(reads)}"
+        f"expected 4 reads (initial, initial fetch, loop poll, final), got {len(reads)}"
     )
     loop_poll_script = reads[2]
-    # Check that CARD_A was not requested in want args of the loop poll
-    assert f"'{CARD_B}'" in loop_poll_script or f'"{CARD_B}"' in loop_poll_script or CARD_B in loop_poll_script
-    # In session_cards_command: ... max_want MAX_CHAIN_STEPS *want
-    # want arguments appear at the end after MAX_CHAIN_STEPS (9)
-    assert CARD_A not in loop_poll_script.split()[10:]
+    assert CARD_B in loop_poll_script
+
+
+def test_inject_transport_delegated_worker_triage_does_not_deliver_result_or_drop_sibling_ceiling(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited triage card's 429 summary is not delivered as a result and does not drop sibling ceiling marker."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+    set_card(tmp_path, CARD_B, "running")
+
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[{"name": "terminal", "args": {"command": "echo test"}, "result": "ok"}],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    # Sibling CARD_B outrunning the budget must receive the ceiling marker because CARD_A delivered no answer
+    assert any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    # The 429 failure reason must not be delivered into output as a task result
+    assert "Result of delegated task" not in result.output
+    assert rate_limit_msg not in result.output
+
+
+def test_inject_transport_delegated_worker_blocked_to_triage_transition_marks_infra(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card starting blocked that unblocks and enters rate-limited triage mid-wait is recognized immediately."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "blocked")
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+
+
+def test_inject_transport_fetch_triage_exhaustion_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the triage pre-read exhausts its retries, raise _exhausted and mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "triage")
+    real = local_shell(tmp_path, monkeypatch)
+    calls = []
+
+    def flaky(script: str, timeout: float) -> str:
+        if board.SESSION_CARDS_PRESENT in script:
+            calls.append(script)
+            if len(calls) > 1:
+                return "error: unable to upgrade connection"
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", flaky)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert f"the kanban board could not be read 3 times running; still waiting on: {CARD_A}" in result.errors[0]
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

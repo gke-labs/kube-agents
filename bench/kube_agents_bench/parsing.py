@@ -26,6 +26,24 @@ STATUS_TOOL = "kanban_show"
 BLOCKED_STATUS = "blocked"
 NEEDS_INPUT_KIND = "needs_input"
 
+BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
+RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
+_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
+_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
+
+
+def extract_infra_failure_reason(text: str | None) -> str | None:
+    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith(RATE_LIMIT_REASON_PREFIX):
+        match = _FAILURE_REASON_PATTERN.search(text)
+        if match:
+            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
+        return "rate_limit"
+    return None
+
 _TOOL_ERROR_PREFIX = "Error executing tool"
 
 # hermes replaces a re-emitted output with this notice when an identical one
@@ -315,6 +333,9 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
             if not isinstance(task, dict):
                 continue
             task_id, text = task.get("id"), task.get("result")
+            status = str(task.get("status") or "")
+            if status in BOARD_INFRA_STATUSES and extract_infra_failure_reason(text):
+                continue
             if task_id in task_ids and isinstance(text, str) and text.strip():
                 delivered[task_id] = text
         # ``runs`` sits beside ``task``, not inside it, so it can only be
@@ -331,6 +352,9 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
             if isinstance(last_run, dict):
                 summary = last_run.get("summary")
                 if isinstance(summary, str) and summary.strip():
+                    status = str(shown.get("status") or "")
+                    if status in BOARD_INFRA_STATUSES and extract_infra_failure_reason(summary):
+                        continue
                     delivered[task_id] = summary
     return delivered
 
