@@ -216,8 +216,7 @@ preflight_project_pieces() {
 
 # ─── up: certificates, from the repo's own helper, Linux only ────────────────
 make_certificates() {
-  FORGE_CERT_DIR="$(mktemp -d /tmp/forge-certs.XXXXXX)"
-  rmdir "${FORGE_CERT_DIR}" # make-certs.sh wants to create the directory itself
+  FORGE_CERT_DIR="$(mktemp -d /tmp/forge-certs.XXXXXX)" # 0700; make-certs.sh takes an empty directory
   # The server key lives here until write_state_dir; no exit leaves it behind.
   trap 'rm -rf "${FORGE_CERT_DIR}"' EXIT
   bash "${SCRIPT_DIR}/ghes-proxy/make-certs.sh" "${EVAL_FORGE_HOST}" "${FORGE_CERT_DIR}" "${FORGE_CERT_DAYS}"

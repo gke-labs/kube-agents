@@ -5689,7 +5689,7 @@ class ForgePiecesTest(unittest.TestCase):
     PROJECT = "kube-agents-evals-2"
     SA = f"serviceAccount:forge-vm@{PROJECT}.iam.gserviceaccount.com"
 
-    def _answers(self, zone="eval.internal.\tprivate", ips=("10.128.0.251", "10.128.0.250"), records=None, firewall="allow-forge-443", sa="forge-vm@x", roles="roles/artifactregistry.reader"):
+    def _answers(self, zone="eval.internal.\tprivate\tdefault", ips=("10.128.0.251", "10.128.0.250"), records=None, firewall="allow-forge-443", sa="forge-vm@x", roles="roles/artifactregistry.reader"):
         records = list(records) if records is not None else list(ips)
         out = [_ok(zone) if zone is not None else _fail("NOT_FOUND")]
         for ip, record in zip(ips, records):
@@ -5747,6 +5747,16 @@ class ForgePiecesTest(unittest.TestCase):
         ids = {f.id: f for f in result.findings}
         self.assertEqual(set(ids), {"forge/record/mismatch/ghes.eval.internal", "forge/vm-sa/missing/roles/artifactregistry.reader"})
         self.assertIn("resolves to 10.128.0.9", ids["forge/record/mismatch/ghes.eval.internal"].observed)
+
+    def test_a_zone_of_the_right_name_but_another_shape_is_a_mismatch(self):
+        for zone in ("other.\tprivate\tdefault", "eval.internal.\tpublic\t", "eval.internal.\tprivate\tother-net"):
+            with self.subTest(zone=zone), mock.patch.object(checker, "run_cmd") as run:
+                run.side_effect = self._answers(zone=zone)
+                result = checker.check_forge_pieces(self.PROJECT)
+            self.assertFalse(result.passed)
+            self.assertEqual([f.id for f in result.findings], ["forge/zone/mismatch"])
+            self.assertIn("delete the zone", result.findings[0].observed)
+            self.assertIn("managed-zones delete", result.findings[0].repair)
 
     def test_a_refused_read_is_unverified_not_missing(self):
         with mock.patch.object(checker, "run_cmd") as run:

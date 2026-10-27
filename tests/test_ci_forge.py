@@ -48,7 +48,7 @@ STUB_GCLOUD = textwrap.dedent(
       *"compute instances get-serial-port-output"*)
         [ -e "$state/serial" ] && cat "$state/serial"; exit 0 ;;
       *"builds submit"*)
-        [ -e "$state/build-hangs" ] && sleep 5
+        [ -e "$state/build-hangs" ] && exec sleep 5
         [ -e "$state/build-fails" ] && exit 1; exit 0 ;;
       *"compute instances create"*) exit 0 ;;
       *"compute instances remove-metadata"*) exit 0 ;;
@@ -286,6 +286,23 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("did not return within 1s", proc.stderr)
         self.assertFalse(self.calls_of("instances create"))
+
+    def test_up_stops_when_the_image_build_fails(self):
+        self.provision()
+        (self.gstate / "build-fails").write_text("")
+        proc = self.run_forge("up")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("failed or did not return", proc.stderr)
+        self.assertFalse(self.calls_of("instances create"))
+
+    def test_up_takes_the_vm_down_when_the_serial_console_never_reports(self):
+        self.provision(serial="startup-script: FORGE script-start t=1s\n")
+        proc = self.run_forge("up", GHES_READY_TIMEOUT_SECONDS="1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("did not report ready within 1s", proc.stderr)
+        self.assertTrue(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a"))
+        self.assertFalse(self.state_dir.exists())
+        self.assertFalse(self.calls_of("kubectl run"))
 
     def test_up_takes_the_vm_down_when_the_serial_console_reports_a_failure(self):
         self.provision(serial="startup-script: FORGE script-start t=1s\nstartup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n")

@@ -426,6 +426,9 @@ FORGE_VM_SA_ID = "forge-vm"
 FORGE_VM_SA_ROLES = frozenset({"roles/artifactregistry.reader"})
 FORGE_RECORD_TTL = 60
 FINDING_FORGE_ZONE_MISSING = "forge/zone/missing"
+# A zone of the right name but another dnsName, visibility or network: the
+# records the lane needs cannot live in it, and a create by name skips it.
+FINDING_FORGE_ZONE_MISMATCH = "forge/zone/mismatch"
 FINDING_FORGE_FIREWALL_MISSING = "forge/firewall/missing"
 FINDING_FORGE_VM_SA_MISSING = "forge/vm-sa/missing"
 FINDING_FORGE_ADDRESS_MISSING = "forge/address/missing/{row}"
@@ -436,7 +439,7 @@ FINDING_FORGE_VM_SA_ROLE_MISSING = "forge/vm-sa/missing/{role}"
 # these pieces, so a leased run passes with any of them; only the self-managed
 # lanes (#3683, #3684) refuse the lease, at second zero and by name.
 FORGE_FINDINGS = frozenset(
-    {FINDING_FORGE_ZONE_MISSING, FINDING_FORGE_FIREWALL_MISSING, FINDING_FORGE_VM_SA_MISSING}
+    {FINDING_FORGE_ZONE_MISSING, FINDING_FORGE_ZONE_MISMATCH, FINDING_FORGE_FIREWALL_MISSING, FINDING_FORGE_VM_SA_MISSING}
     | {FINDING_FORGE_ADDRESS_MISSING.format(row=row) for row in FORGE_ROW_HOSTS}
     | {FINDING_FORGE_RECORD_MISSING.format(host=host) for host in FORGE_ROW_HOSTS.values()}
     | {FINDING_FORGE_RECORD_MISMATCH.format(host=host) for host in FORGE_ROW_HOSTS.values()}
@@ -3521,7 +3524,7 @@ def _forge_repair(project_id: str, location: str) -> str:
     lines.append(f"gcloud iam service-accounts create {FORGE_VM_SA_ID} --display-name='kube-agents forge VM' --project={project_id}")
     for role in sorted(FORGE_VM_SA_ROLES):
         lines.append(_project_binding(project_id, f"serviceAccount:{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com", role))
-    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; a create on a piece already there fails with ALREADY_EXISTS and is the skip; a record that points elsewhere takes `gcloud dns record-sets update` with the same flags; the bindings are idempotent)"
+    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; a create on a piece already there fails with ALREADY_EXISTS and is the skip; a record that points elsewhere takes `gcloud dns record-sets update` with the same flags; a zone of another name, visibility or network is deleted first (`gcloud dns managed-zones delete`); the bindings are idempotent)"
 
 
 def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckResult:
@@ -3556,9 +3559,15 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
         passed = False
         _drift(details, findings, finding_id, observed, repair)
 
-    zone, ok = read(["gcloud", "dns", "managed-zones", "describe", FORGE_DNS_ZONE, f"--project={project_id}", "--format=value(dnsName,visibility)"], f"the private zone {FORGE_DNS_ZONE}")
+    zone, ok = read(
+        ["gcloud", "dns", "managed-zones", "describe", FORGE_DNS_ZONE, f"--project={project_id}", "--format=value(dnsName,visibility,privateVisibilityConfig.networks[0].networkUrl.basename())"],
+        f"the private zone {FORGE_DNS_ZONE}",
+    )
+    expected_zone = [FORGE_DNS_NAME, "private", FORGE_NETWORK]
     if ok and not zone:
         missing(FINDING_FORGE_ZONE_MISSING, f"The private zone {FORGE_DNS_ZONE} ({FORGE_DNS_NAME}) is missing in {project_id}, so no self-managed forge host resolves from the host cluster")
+    elif ok and zone.split("\t") != expected_zone:
+        missing(FINDING_FORGE_ZONE_MISMATCH, f"Zone {FORGE_DNS_ZONE} in {project_id} is {zone!r}, not {FORGE_DNS_NAME} private on {FORGE_NETWORK}; the forge records cannot live in it, and a create by name skips it: delete the zone and run the provisioning commands")
     elif ok:
         details.append(f"✓ Private zone {FORGE_DNS_ZONE}: {zone}")
     for row, host in FORGE_ROW_HOSTS.items():
