@@ -58,9 +58,9 @@ night is a marker naming the components that changed. Pooling (the
 trailing window, the spread) never crosses a key: a baseline measured on
 other software is not evidence about this one.
 
-ONE SERIES PER MODE. The main nightly (next) and the today-mode nightly
-(``ci-kube-agents-eval-nightly-today``) both record every night, so one
-series per case would change key twice a night.
+ONE SERIES PER MODE. The store holds next-mode records from the main
+nightly and today-mode records from before it moved to next, so one series
+per case would change key at every mode boundary.
 The top-level document is today's records alone (a record with no ``mode``
 is today, as every record before the component existed is), exactly what
 it was before next-mode records existed; ``next`` holds the same per-case

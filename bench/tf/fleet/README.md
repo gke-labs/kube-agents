@@ -27,7 +27,9 @@ then runs `hack/fleet-fixture-state.py` and requires each of them to be in its *
 state** — the `state` assertions beside each role in `fixtures.json` (the crashloop has a
 recorded OOMKilled termination, `checkout-gateway` has two Ready replicas and no PDB in its
 namespace, `seeded-b`'s master is still one minor behind its channel with the exclusion
-window ahead of now). Presence alone passed on 2026-09-07 while every slot-a fixture sat
+window ahead of now, `seeded-c` at least a day old). That last one means a project applied
+today fails the check until tomorrow, the drift SOP's age gate below. Presence alone passed
+on 2026-09-07 while every slot-a fixture sat
 Pending (#1278); the state pass is what would have failed that project. A role on a cluster
 it could not reach usually reports as unchecked rather than absent; the warnings that
 override that default are in `docs/ci-pool-projects.md` §6.
@@ -196,7 +198,14 @@ fleet, so `consistency-drift-outlier` goes red on every open pull request for a 
 is a clean, self-clearing outage rather than a wrong answer (under the floor each member
 records it in its `limitations`, and no finding is invented), but it is a day of red:
 schedule such a replacement when the drift scenario can be quiet, or expect and announce
-the gap.
+the gap. The hourly scan reports the case-breaking half: `drift-outlier` asserts `seeded-c`'s
+`createTime` is at least 24 hours old, so a replaced `seeded-c` reads as drifted until the
+gate passes, and no re-apply clears it. A replaced peer is not asserted, since it leaves the
+finding standing. `drift-peer-a`, `-b` and `-d` assert that those three still carry the
+authorized-networks block, without which the vote falls to 2/4 and there is no finding
+either; a re-apply restores that one. A drifted `drift-outlier` excuses the case from a
+lease on that project; a drifted peer does not, because the case lists only `drift-outlier`
+in `fixtures:`, so it fails there until the block is back.
 
 ## The defects
 

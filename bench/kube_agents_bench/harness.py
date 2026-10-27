@@ -42,7 +42,7 @@ Environment:
     AGENT_CONVERSATION_ID: Pins the ``conversation`` field. Unset (the default)
         generates a fresh id per invocation so each task's trajectory is
         isolated on this stateful endpoint. A card-wake replay (a prompt
-        opening with one of :mod:`card_wake`'s directives) pins its own id
+        opening with :mod:`card_wake`'s directive) pins its own id
         for its turns, plants its card with a ``kubectl exec`` first, and is
         refused under ``AGENT_TRANSPORT=inject``.
     AGENT_HTTP_TIMEOUT: Per-request timeout in seconds (default ``600``).
@@ -1907,10 +1907,8 @@ class KubeAgentsHarness(AgentHarness):
         _fold_worker_tokens(result.tokens)
         return result
 
-    def _execute_card_wake(
-        self, replay: card_wake.Replay | card_wake.Failure, workspace_path: Path | None
-    ) -> AgentResult:
-        """Send a planted card's wake and, for a question, the user's answer.
+    def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
+        """Send a planted card's wake and the user's answer.
 
         The answer goes on the wake's conversation, or on a new one for a
         ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
@@ -1921,24 +1919,16 @@ class KubeAgentsHarness(AgentHarness):
         See :mod:`kube_agents_bench.card_wake`. No agent sees anything when the
         plant fails: a script that never ran to completion is infrastructure,
         and one that ran and failed in the image is an error. The card is read
-        and archived whatever the turns did, so a parked card does not outlive
+        and archived whatever the turns did, so a blocked card does not outlive
         the run.
         """
-        failure = isinstance(replay, card_wake.Failure)
         transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
         if transport != TRANSPORT_API:
-            directive = card_wake.FAILURE_DIRECTIVE if failure else card_wake.QUESTION_DIRECTIVE
             return AgentResult.errored(
-                f"{directive} needs AGENT_TRANSPORT={TRANSPORT_API}, got {transport!r}"
+                f"{card_wake.QUESTION_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_API}, got {transport!r}"
             )
         try:
             planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
-        except card_wake.ReplayMismatch as exc:
-            # Not infrastructure: the image no longer retries as the case
-            # asserts, and an excluded run would leave the case silent. One
-            # such repetition is an absolute red at the gate (empty
-            # trajectory, null tokens); the error names the mismatch.
-            return AgentResult.errored(str(exc))
         except card_wake.ReplayUnavailable as exc:
             return _infra_failure(str(exc))
         except card_wake.ReplayBroken as exc:
@@ -1947,9 +1937,9 @@ class KubeAgentsHarness(AgentHarness):
         answer_turn = None
         try:
             wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
-            if not card_wake.no_reply(wake_turn) and not failure and replay.fresh:
+            if not card_wake.no_reply(wake_turn) and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
-            elif not card_wake.no_reply(wake_turn) and not failure:
+            elif not card_wake.no_reply(wake_turn):
                 answer_turn = self._execute(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
@@ -1958,11 +1948,10 @@ class KubeAgentsHarness(AgentHarness):
                 _log.warning("card wake: card %s could not be read", planted.card)
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
-        # A failure wake has no answer turn, nor has a wake turn that errored;
-        # both are tagged, since an errored run is the one whose card and wake
-        # are wanted.
+        # A wake turn that errored has no answer turn; it is tagged, since an
+        # errored run is the one whose card and wake are wanted.
         if answer_turn is None:
-            return card_wake.tag(planted, wake_turn, settled, "failure_wake" if failure else "question_wake")
+            return card_wake.tag(planted, wake_turn, settled)
         return card_wake.merge(planted, wake_turn, answer_turn, settled)
 
     def _execute_fresh_answer(

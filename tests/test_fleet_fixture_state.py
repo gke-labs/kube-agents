@@ -16,12 +16,16 @@ these tests pin, with ``kubectl`` and ``gcloud`` stubbed on ``PATH``:
   failed beside an unread one is still drift;
 * the ``cluster`` subject reads the slot's recorded name and location, and the
   minor-behind operator compares against the cluster's own channel default;
+* the drift peers (slots a, b, d) keep the authorized-networks block and the
+  outlier (slot c) is past the drift SOP's 24-hour age gate, which never
+  holds a ``--wait``;
 * a re-run that finds a role converged removes a stale ``.drift`` file;
 * a malformed catalog or a directory the runner did not write is exit 1.
 
 The stubs answer from a JSON "world" file so each test names only its own
-defect; a key whose value is a list is answered in order, once per call, which
-is how a fixture that converges between passes is expressed.
+defect; a key whose value is a list (a kubectl subject or a describe) is
+answered in order, once per call, which is how a fixture that converges between
+passes is expressed.
 """
 
 from __future__ import annotations
@@ -109,6 +113,13 @@ with open(os.environ["STUB_LOG"], "a") as fh:
 world = json.load(open(os.environ["STUB_WORLD"]))
 if args[:3] == ["container", "clusters", "describe"]:
     doc = world.get("describe", {}).get(args[3])
+    if isinstance(doc, list):
+        counter = os.environ["STUB_LOG"] + ".describes"
+        counts = json.load(open(counter)) if os.path.exists(counter) else {}
+        n = counts.get(args[3], 0)
+        counts[args[3]] = n + 1
+        json.dump(counts, open(counter, "w"))
+        doc = doc[min(n, len(doc) - 1)]
     if doc is None:
         print(f"ERROR: (gcloud.container.clusters.describe) Not found: {args[3]}", file=sys.stderr)
         sys.exit(1)
@@ -195,12 +206,31 @@ def _future(days: int = 30) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _created(hours: float = 24 * 30) -> str:
+    """A `createTime` `hours` ago, in the offset form GKE prints."""
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+# The block slots a, b and d carry (bench/tf/fleet/main.tf), as `clusters describe` prints it.
+_OPEN_BLOCK = {"enabled": True, "cidrBlocks": [{"displayName": "open-for-eval", "cidrBlock": "0.0.0.0/0"}]}
+
+
+def _peer(*, block: dict | None = _OPEN_BLOCK, created: str | None = None) -> dict:
+    """A drift-cohort peer's cluster document (slot a or d)."""
+    doc = {"currentMasterVersion": "1.34.1-gke.1", "createTime": created or _created()}
+    if block is not None:
+        doc["masterAuthorizedNetworksConfig"] = block
+    return doc
+
+
 def _cluster_b(*, master: str = "1.33.4-gke.1134000", channel: str | None = "REGULAR", end=None, scope="NO_MINOR_UPGRADES", surge: int | None = None) -> dict:
     no_surge = {"maxUnavailable": 1}
     if surge is not None:
         no_surge["maxSurge"] = surge
     doc = {
         "currentMasterVersion": master,
+        "createTime": _created(),
+        "masterAuthorizedNetworksConfig": _OPEN_BLOCK,
         # The pools as `clusters describe` reports them. The
         # readiness-surge-blocked role asserts the no-surge pool's
         # maxUnavailable is 1 and maxSurge is absent, because the API omits
@@ -378,8 +408,10 @@ def _healthy_world() -> dict:
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
         },
         "describe": {
+            "seeded-a": _peer(),
             "seeded-b": _cluster_b(),
-            "seeded-c": {"currentMasterVersion": "1.34.1-gke.1"},
+            "seeded-c": {"currentMasterVersion": "1.34.1-gke.1", "createTime": _created()},
+            "seeded-d": _peer(),
         },
         "server_config": {
             "channels": [
@@ -423,7 +455,7 @@ class _Harness(unittest.TestCase):
         self.fleet.mkdir()
         (self.fleet / ".kube-agents-fleet-kubeconfigs").write_text("")
         lines = ["project=kube-agents-evals"]
-        for slot in ("a", "b", "c"):
+        for slot in ("a", "b", "c", "d"):
             lines += [f"cluster.{slot}=seeded-{slot}", f"location.{slot}=us-central1-a"]
         (self.fleet / ".fleet-context").write_text("\n".join(lines) + "\n")
         for role in roles if roles is not None else self.catalog["roles"]:
@@ -512,6 +544,10 @@ class CatalogTest(unittest.TestCase):
             {"subject": "deployment/x", "op": "node_cpu_spare_ge", "value": 100},
             {"subject": "node?cloud.google.com/gke-nodepool=default-pool", "path": "status", "op": "node_cpu_spare_ge", "value": 100},
             {"subject": "node?cloud.google.com/gke-nodepool=default-pool", "op": "node_cpu_spare_ge"},
+            # age_hours_ge takes a number of hours.
+            {"subject": "cluster", "path": "createTime", "op": "age_hours_ge"},
+            {"subject": "cluster", "path": "createTime", "op": "age_hours_ge", "value": "a day"},
+            {"subject": "cluster", "path": "createTime", "op": "age_hours_ge", "value": "nan"},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             for entry in cases:
@@ -558,6 +594,25 @@ class EvaluateTest(unittest.TestCase):
         assert ffs.evaluate(self._entry("after_now"), [{"v": "2020-01-01T00:00:00Z"}]) is not None
         assert ffs.evaluate(self._entry("after_now"), [{"v": "not a time"}]) is not None
         assert ffs.evaluate(self._entry("after_now"), []) is not None
+
+    def test_age_hours_ge_wants_a_timestamp_old_enough(self):
+        entry = self._entry("age_hours_ge", 24, path="createTime", subject="cluster")
+        assert ffs.evaluate(entry, [{"createTime": _created(25)}]) is None
+        assert ffs.evaluate(entry, [{"createTime": "2026-01-01T00:00:00Z"}]) is None
+        # Defensive: a timestamp without an offset is read as UTC.
+        naive = (datetime.now(timezone.utc) - timedelta(hours=30)).replace(tzinfo=None).isoformat()
+        assert ffs.evaluate(entry, [{"createTime": naive}]) is None
+        problem = ffs.evaluate(entry, [{"createTime": _created(3)}])
+        assert problem is not None and "hours old" in problem, problem
+        assert "not one RFC 3339 timestamp" in ffs.evaluate(entry, [{"createTime": "yesterday"}])
+        assert "not one RFC 3339 timestamp" in ffs.evaluate(entry, [{}])
+        # The offset counts: 20:00-04:00 is midnight UTC.
+        then = datetime.now(timezone.utc) - timedelta(hours=25)
+        eastern = then.astimezone(timezone(timedelta(hours=-4))).isoformat(timespec="seconds")
+        assert ffs.evaluate(entry, [{"createTime": eastern}]) is None
+        assert ffs.evaluate(self._entry("age_hours_ge", 26, path="createTime", subject="cluster"), [{"createTime": eastern}]) is not None
+        # A creation time ahead of now is no age at all.
+        assert ffs.evaluate(entry, [{"createTime": _future(1)}]) is not None
 
     def test_minor_behind_compares_against_the_clusters_own_channel(self):
         entry = self._entry("minor_behind_channel_default", 1, path="currentMasterVersion", subject="cluster")
@@ -648,7 +703,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 33 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 36 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -678,7 +733,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "33 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "36 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -699,7 +754,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "32 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "35 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -725,7 +780,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "33 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "36 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -749,7 +804,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "33 role(s) in their designed state" in done.stderr, done.stderr
+        assert "36 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -763,7 +818,7 @@ class PassTest(_Harness):
     def test_the_default_pool_needs_room_for_the_next_fixture(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "33 role(s) in their designed state" in done.stderr, done.stderr
+        assert "36 role(s) in their designed state" in done.stderr, done.stderr
         # The pods are read once, across every namespace, not once per node.
         assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
         # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
@@ -779,7 +834,7 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["kubectl"]["pod?"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "32 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "35 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
         assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
         assert "default-pool-headroom" not in self.drift_files()
 
@@ -792,7 +847,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "33 role(s) in their designed state" in done.stderr, done.stderr
+        assert "36 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -824,7 +879,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "33 role(s) in their designed state" in done.stderr, done.stderr
+        assert "36 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -1015,7 +1070,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "33 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "36 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -1025,6 +1080,76 @@ class PassTest(_Harness):
         assert "drift-outlier" in self.drift_files(), done.stderr
         assert "masterAuthorizedNetworksConfig.enabled none_eq true: observed true" in self.drift_files()["drift-outlier"]
         assert "clusters describe seeded-c --location us-central1-a --project kube-agents-evals" in self.log.read_text()
+
+    def test_the_drift_peers_assert_the_same_thing_on_each_slot(self):
+        roles = ffs.load_assertions(_CATALOG)
+        peers = {slot: roles[f"drift-peer-{slot}"] for slot in ("a", "b", "d")}
+        assert {slot: spec["cluster_slot"] for slot, spec in peers.items()} == {"a": "a", "b": "b", "d": "d"}
+        shapes = {slot: [(e["subject"], e["path"], e["op"], e["value"]) for e in spec["state"]] for slot, spec in peers.items()}
+        assert shapes["a"] == shapes["b"] == shapes["d"], shapes
+
+    def test_the_drift_peers_read_their_own_slots_cluster(self):
+        done = self.run_script(_healthy_world())
+        assert self.drift_files() == {}, done.stderr
+        log = self.log.read_text()
+        for slot in ("a", "d"):
+            assert f"clusters describe seeded-{slot} --location us-central1-a --project kube-agents-evals" in log
+
+    def test_a_peer_without_its_authorized_networks_block_is_drift(self):
+        # The vote that makes seeded-c the outlier is 3/4; one peer OFF makes
+        # it 2/4, under the SOP's 2/3, and the case has no finding to grade.
+        for block, observed in (
+            ({"enabled": False}, "masterAuthorizedNetworksConfig.enabled eq true: observed false"),
+            (None, "masterAuthorizedNetworksConfig.enabled eq true: observed nothing"),
+            ({"enabled": True, "cidrBlocks": []}, "cidrBlocks[*].displayName any_eq \"open-for-eval\": observed nothing"),
+        ):
+            with self.subTest(block=block):
+                world = _healthy_world()
+                world["describe"]["seeded-a"] = _peer(block=block)
+                done = self.run_script(world)
+                files = self.drift_files()
+                assert set(files) == {"drift-peer-a"}, (files, done.stderr)
+                assert observed in files["drift-peer-a"], files["drift-peer-a"]
+                assert "1 drifted" in done.stderr
+
+    def test_an_outlier_too_young_for_the_drift_cohort_is_drift(self):
+        # A seeded-c under a day old sits out its own audit: no finding.
+        # A new peer is not drift, since seeded-c stays outvoted 2/3.
+        world = _healthy_world()
+        world["describe"]["seeded-c"]["createTime"] = _created(2)
+        world["describe"]["seeded-d"] = _peer(created=_created(5))
+        done = self.run_script(world)
+        files = self.drift_files()
+        assert set(files) == {"drift-outlier"}, (files, done.stderr)
+        assert "cluster createTime age_hours_ge 24: observed" in files["drift-outlier"], files["drift-outlier"]
+        assert "2.0 hours old" in files["drift-outlier"]
+
+    def test_an_age_failure_does_not_hold_the_wait(self):
+        # Only the clock clears it, so a five-minute wait would be spent for
+        # nothing: one pass, then drift.
+        world = _healthy_world()
+        world["describe"]["seeded-c"]["createTime"] = _created(2)
+        started = datetime.now(timezone.utc)
+        done = self.run_script(world, "--wait", "60", "--interval", "1")
+        assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
+        assert self.log.read_text().count("clusters describe seeded-c") == 1
+        assert set(self.drift_files()) == {"drift-outlier"}
+
+    def test_a_block_lost_beside_a_young_outlier_still_holds_the_wait(self):
+        world = _healthy_world()
+        world["describe"]["seeded-c"]["createTime"] = _created(2)
+        world["describe"]["seeded-a"] = [_peer(block={"enabled": False}), _peer()]
+        done = self.run_script(world, "--wait", "60", "--interval", "1")
+        assert set(self.drift_files()) == {"drift-outlier"}, done.stderr
+        assert self.log.read_text().count("clusters describe seeded-a") == 2
+
+    def test_an_unreadable_peer_is_not_checked(self):
+        world = _healthy_world()
+        world["describe"]["seeded-d"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert "0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "fixture role 'drift-peer-d' could not be checked" in done.stderr
+        assert self.drift_files() == {}
 
     def test_the_laggard_is_drift_once_the_master_catches_up(self):
         world = _healthy_world()
@@ -1058,9 +1183,9 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["describe"]["seeded-b"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "3 not checked" in done.stderr
-        # Three, not one: readiness-surge-blocked and readiness-lb-drain-timeout
-        # read the same cluster document for their pools, so an unreadable
+        assert "4 not checked" in done.stderr
+        # Four, not one: readiness-surge-blocked, readiness-lb-drain-timeout
+        # and drift-peer-b read the same cluster document, so an unreadable
         # cluster takes them out of the run rather than drifting them.
         assert "version-laggard" not in self.drift_files()
         assert "readiness-surge-blocked" not in self.drift_files()
@@ -1068,7 +1193,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "29 role(s) in their designed state, 0 drifted, 4 not checked" in done.stderr
+        assert "29 role(s) in their designed state, 0 drifted, 7 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1113,7 +1238,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "33 role(s) in their designed state" in done.stderr
+        assert "36 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -1215,6 +1340,9 @@ class ReportTest(_Harness):
                 "deprecated-api-caller": "converged",
                 "deprecated-label-selector": "converged",
                 "drift-outlier": "unchecked",
+                "drift-peer-a": "converged",
+                "drift-peer-b": "converged",
+                "drift-peer-d": "converged",
                 "hpa-saturated": "converged",
                 "idle-nodepool": "unpublished",
                 "intree-pd-volume": "converged",
@@ -1242,7 +1370,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 30, "drifted": 1, "unchecked": 1})
+        self.assertEqual(doc["summary"], {"converged": 33, "drifted": 1, "unchecked": 1})
         self.assertIn("1 drifted, 1 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):
