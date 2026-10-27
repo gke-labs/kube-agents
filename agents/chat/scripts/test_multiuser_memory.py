@@ -1122,6 +1122,9 @@ class TextFilterPinTest(unittest.TestCase):
         ]
         self.assertEqual(disagreements, [])
 
+    def test_the_ansi_pattern_is_the_shared_definition(self):
+        self.assertEqual(mum.ANSI_ESCAPE_RE.pattern, self.untrusted_text.ANSI_ESCAPE_RE.pattern)
+
     def test_strip_unsafe_chars_agrees_with_the_shared_filter(self):
         dirty = "line\r\n\x1b[31mred\x1b[0m \x9b1mcsi\u200bzero\u2028sep\U000e0041tag\x00"
         self.assertEqual(mum._strip_unsafe_chars(dirty), self.untrusted_text.strip_unsafe(dirty))
