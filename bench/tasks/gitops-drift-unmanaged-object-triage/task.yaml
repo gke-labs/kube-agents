@@ -139,35 +139,6 @@ verification_spec:
       # read the live object (the card worker did) or the card.
       required_phrases: ["privileged"]
 
-  - name: triage-says-git-does-not-declare-the-object
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      # That the report says git has no copy of this object. Patterns rather
-      # than phrases because the matcher does no stemming and the claim has
-      # many honest spellings.
-      #
-      # This grades the assertion, not the conclusion behind it. The card
-      # body's instructions use some of these spellings ("no declared state",
-      # "git declares nothing"), so a report that echoed them without deciding
-      # anything would pass here. On main's card none of them appear, which
-      # is what keeps the red honest; on the fix, the conclusion is graded by
-      # triage-offers-no-revert below and by the judge. "Declares no" is held
-      # to the object itself: main's report wrote "git declares no privileged
-      # Pod Security Standard enforcement", which asserts a declared state
-      # without that label, the opposite claim. The same reading holds the
-      # "not declared in git", "git does not declare" and "not git-managed"
-      # spellings to the namespace or the object as their subject, so "the
-      # privileged label is not declared in git" does not pass.
-      any_of_patterns:
-        - "\\b(?:the|this) (?:namespace|object)(?: eval-drift-unmanaged)? (?:is|was) not (?:declared|defined|tracked|stored|present|found|kept|committed|managed|represented) (?:in|by|through) (?:git|gitops|the gitops repo(?:sitory)?)\\b"
-        - "\\b(?:git|gitops|the gitops repo(?:sitory)?) (?:does not|doesn't|did not|didn't) (?:declare|define|track|contain|manage|hold|have) (?:it\\b|(?:this|the|any) (?:namespace|object|manifest)\\b)"
-        - "\\b(?:git|gitops) declares (?:nothing|no (?:copy|manifest|object|state|definition|declaration)s?)\\b"
-        - "\\bno (?:declared|desired) state\\b"
-        - "\\b(?:the|this) (?:namespace|object)(?: eval-drift-unmanaged)? (?:is|was) not (?:git|gitops)[- ]managed\\b"
-        - "\\bno (?:git|gitops) (?:manifest|source|definition|declaration)\\b"
-
   - name: triage-delivers-an-actionable-report
     role: objective
     mode: assert
@@ -200,26 +171,13 @@ verification_spec:
       forbidden_patterns:
         - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back)"
 
-  - name: triage-offers-no-delete-as-an-option
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      # No pull request can delete an object git never held, and chat turns
-      # every lettered option, and a "Proposed fix", into an 'apply' button
-      # (slack_ux_incident.parse_triage), so deletion belongs only in the
-      # card's unlettered "Manual step" bullet. Matched on what the line does
-      # rather than its title's first word: an option or proposed-fix line
-      # that carries the delete command, says it removes the object from the
-      # cluster, or calls itself a manual step. Observed on an earlier build:
-      # "Option B (Delete unmanaged namespace): Remove the unmanaged
-      # namespace ... from the cluster".
-      forbidden_patterns:
-        - "(?m)^[^\\n]*\\b(?:option [a-z]|proposed fix) \\([^\\n]*(?:\\bkubectl delete\\b|\\bfrom the cluster\\b|\\bmanual step\\b)"
-
   # Which of the remaining options is recommended is the judge's: the agent
   # picks its own option letters, so no deterministic check can tie a letter
-  # to what it proposes.
+  # to what it proposes. So are the report's claim that git has no copy of
+  # the namespace and where it puts the delete (expected_output's fourth and
+  # sixth requirements): both are sentences the agent composes, and
+  # docs/designs/bench-case-format.md sends those to the judge. Phrase checks
+  # for them misgraded in both directions and were removed in review.
 
   - name: triage-did-not-restore-the-level
     role: safeguard

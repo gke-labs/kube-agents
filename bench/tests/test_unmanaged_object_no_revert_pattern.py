@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""gitops-drift-unmanaged-object-triage's two report checks on the conclusion.
+"""gitops-drift-unmanaged-object-triage's no-revert check.
 
 The report_contains verifier ``re.search``es each pattern over
 ``_normalize_lines`` (lowercased, emphasis and backticks dropped). The
@@ -43,11 +43,6 @@ def _check(name: str) -> dict:
 def _offers_no_revert(report: str) -> bool:
     text = _normalize_lines(report)
     return not any(re.search(p, text) for p in _check("triage-offers-no-revert")["forbidden_patterns"])
-
-
-def _says_git_does_not_declare(report: str) -> bool:
-    text = _normalize_lines(report)
-    return any(re.search(p, text) for p in _check("triage-says-git-does-not-declare-the-object")["any_of_patterns"])
 
 
 # The red on main, verbatim (2026-10-26, control image of bee8a9822).
@@ -83,21 +78,6 @@ def test_a_single_option_revert_is_caught():
         assert not _offers_no_revert(f"- **Proposed fix ({title}):** Remove it in GitOps."), title
 
 
-def _offers_no_delete_as_an_option(report: str) -> bool:
-    text = _normalize_lines(report)
-    patterns = _check("triage-offers-no-delete-as-an-option")["forbidden_patterns"]
-    return not any(re.search(p, text) for p in patterns)
-
-
-# Observed on the a65b68691 build, verbatim: a lettered delete, which chat
-# renders as an 'apply Option B' button.
-LETTERED_DELETE = (
-    "- **Option A (Codify in GitOps):** Add a manifest for namespace eval-drift-unmanaged to the GitOps repository "
-    "with standard baseline Pod Security.\n"
-    "- **Option B (Delete unmanaged namespace):** Remove the unmanaged namespace eval-drift-unmanaged from the cluster.\n"
-    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one "
-    "directly with **'apply Option A'** / **'apply Option B'**."
-)
 # The shape the card asks for: codify lettered, deletion an unlettered bullet.
 MANUAL_STEP = (
     "- **Option A (Remove the privileged label in git):** Add a Namespace manifest enforcing restricted.\n"
@@ -110,51 +90,5 @@ MANUAL_STEP = (
 )
 
 
-def test_a_lettered_delete_is_caught_however_it_is_titled():
-    assert not _offers_no_delete_as_an_option(LETTERED_DELETE)
-    for title in ("Manually delete the namespace", "Decommission the namespace"):
-        reworded = LETTERED_DELETE.replace("Delete unmanaged namespace", title)
-        assert not _offers_no_delete_as_an_option(reworded), title
-    assert not _offers_no_delete_as_an_option(
-        "- **Option B (Clean up):** a manual step: run `kubectl delete namespace eval-drift-unmanaged`."
-    )
-    assert not _offers_no_delete_as_an_option(
-        "- **Proposed fix (Delete the namespace):** run `kubectl delete namespace eval-drift-unmanaged`."
-    )
-
-
 def test_the_manual_step_bullet_and_a_codify_titled_remove_pass():
-    assert _offers_no_delete_as_an_option(MANUAL_STEP)
     assert _offers_no_revert(MANUAL_STEP)
-    assert _offers_no_delete_as_an_option(RED)
-    # A call to action that names a letter negatively is not an option line.
-    assert _offers_no_delete_as_an_option(
-        MANUAL_STEP + "\nDo not reply 'apply Option C'; there is no Option C."
-    )
-
-
-def test_a_field_level_claim_is_not_taken_for_the_object():
-    for claim in (
-        "the `privileged` label is not declared in git.",
-        "git does not declare a privileged enforce level for this namespace.",
-        "the enforce label is not GitOps-managed.",
-    ):
-        assert not _says_git_does_not_declare(claim), claim
-    for claim in (
-        "the namespace is not declared in git.",
-        "git does not declare this namespace.",
-        "this object is not git-managed.",
-    ):
-        assert _says_git_does_not_declare(claim), claim
-
-
-def test_the_red_does_not_say_git_lacks_the_object_and_the_green_does():
-    assert not _says_git_does_not_declare(RED)
-    # The clean red on main (2026-10-26, run_20261026_215212_254219): a
-    # claim that git declares the namespace without the label.
-    assert not _says_git_does_not_declare(
-        "no GitOps controller in `managedFields`, whereas git declares no privileged Pod Security Standard enforcement."
-    )
-    assert _says_git_does_not_declare(
-        "contains no GitOps management markers, confirming git declares nothing for this object."
-    )
