@@ -2979,7 +2979,7 @@ class KubeAgentsHarness(AgentHarness):
                 break
             _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
             time.sleep(max(0.0, min(poll_interval, remaining)))
-            fresh = _read(outstanding)
+            fresh = _read(awaited)
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
@@ -3395,9 +3395,15 @@ class KubeAgentsHarness(AgentHarness):
         worker_acted = (
             any(
                 isinstance(e, dict)
-                and any(
-                    _is_substantive_worker_action(n)
-                    for n in ({e.get("name")} | worker_trajectory.wrapped_tool_names(e))
+                and (
+                    (
+                        e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER
+                        and not worker_trajectory.wrapped_tool_names(e)
+                    )
+                    or any(
+                        _is_substantive_worker_action(n)
+                        for n in ({e.get("name")} | worker_trajectory.wrapped_tool_names(e))
+                    )
                 )
                 for e in (captured.entries if captured else [])
             )

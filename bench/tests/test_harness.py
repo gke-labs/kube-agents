@@ -2506,6 +2506,7 @@ def test_delegated_worker_board_rate_limit_triage_marks_run_infra(
             return f"{harness._LOG_PRESENT} {_TASK_ID} 0\n"
         return ""
 
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.3")
     monkeypatch.setattr(harness, "_agent_shell", _shell)
     stub_agent.turns = [_create_turn(), _show_turn("triage")]
 
@@ -2514,6 +2515,8 @@ def test_delegated_worker_board_rate_limit_triage_marks_run_infra(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "rate_limit" in result.errors[0]
+    assert not any(harness.DELEGATION_CEILING_MARKER in e or "did not finish within" in e for e in result.errors)
+    assert len(result.errors) == 1
 
 
 def test_a_mute_agent_leaves_no_transcript_behind(
@@ -4809,6 +4812,14 @@ def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra
         {"name": "mcp__platform_control__apply", "args": {}},
         {"name": "tool_call", "args": {"name": "mcp__gke__delete_k8s_resource"}},
         {"name": "tool_call", "args": {"calls": [{"name": "mcp__platform_control__get_cluster_profile_name"}]}},
+        {
+            "name": "tool_call",
+            "args": {
+                "raw": '{"calls": [{"name": "mcp__platform_control__send_notification", "arguments": {"message": "'
+                + "a" * 2100
+                + ' ...[clipped 300 chars]"}}]}'
+            },
+        },
     ],
     ids=[
         "kanban_complete",
@@ -4822,6 +4833,7 @@ def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra
         "mcp_platform_control_direct",
         "mcp_gke_wrapped",
         "mcp_platform_control_wrapped",
+        "mcp_platform_control_wrapped_clipped",
     ],
 )
 def test_settle_delegated_worker_rate_limit_after_kanban_show_and_substantive_tool_stays_graded(

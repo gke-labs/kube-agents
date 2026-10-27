@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -120,6 +121,14 @@ def wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
         for c in calls:
             if isinstance(c, dict) and c.get("name"):
                 names.add(str(c["name"]))
+    if isinstance(args.get("raw"), str):
+        for match in re.finditer(r'"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', args["raw"]):
+            try:
+                name = json.loads('"' + match.group(1) + '"')
+            except ValueError:
+                name = match.group(1)
+            if name:
+                names.add(str(name))
     return names
 
 # The hermes data volume, the root ``harness._ATTACHMENTS_DIR`` and
