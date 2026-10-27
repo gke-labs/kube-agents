@@ -317,7 +317,8 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # main (the main part's two halves, main-a and main-b, and the writers part),
 # which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
-# hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
+# hack/eval/gitlab-cases.txt) and the GHES lane's (EVAL_FORGE=ghes,
+# hack/eval/ghes-cases.txt), each beside its today-mode nightly; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it

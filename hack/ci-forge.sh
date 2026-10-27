@@ -16,7 +16,7 @@
 #                           the deploy and the eval refuse to run without.
 #   hack/ci-forge.sh down   after hack/ci-eval-pr.sh, from the job's cleanup
 #                           trap whatever the eval's exit code: deletes the
-#                           VM and the state directory. Idempotent.
+#                           VM and the files `up` wrote. Idempotent.
 #
 # The project carries the once-per-project pieces this script only reads:
 # the private zone `eval-internal` with the host's record, the reserved

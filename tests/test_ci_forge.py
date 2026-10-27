@@ -59,6 +59,15 @@ STUB_GCLOUD = textwrap.dedent(
     """
 )
 
+# The knobs the script and its stubs read with a default: popped from the child
+# environment, so a developer's own exports (a dev host, a skipped check) do
+# not reach the suite.
+FORGE_KNOBS_ABSENT = (
+    "JOB_NAME", "EVAL_GHES_HOST", "EVAL_GITLAB_CE_HOST", "FORGE_SKIP_CLUSTER_CHECK", "FORGE_VM_ZONE", "AR_REPO",
+    "FORGE_IMAGE_TAG", "GHES_READY_TIMEOUT_SECONDS", "FORGE_BUILD_TIMEOUT_SECONDS", "FORGE_BUILD_CLIENT_BOUND_SECONDS",
+    "FORGE_READY_POLL_SECONDS", "KUBECTL_CODE", "MAKE_CERTS_LEAF_ONLY",
+)
+
 # kubectl: the in-cluster check; answers the code the test puts in KUBECTL_CODE.
 STUB_KUBECTL = textwrap.dedent(
     """\
@@ -148,7 +157,7 @@ class ForgeScriptTest(unittest.TestCase):
                 "PULL_NUMBER": "99",
                 **env,
             },
-            absent=("JOB_NAME",),
+            absent=FORGE_KNOBS_ABSENT,
         )
         return subprocess.run(["bash", str(self.hack / "ci-forge.sh"), action], capture_output=True, text=True, env=environment, check=False)
 
@@ -183,7 +192,7 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertFalse(self.calls_of("addresses create") or self.calls_of("record-sets create") or self.calls_of("firewall-rules create"))
         # Certificates for the host, one day, then the proxy image in the project's registry.
         self.assertTrue(self.calls_of("make-certs ghes.eval.internal"))
-        self.assertIn(" 1", self.calls_of("make-certs")[0])
+        self.assertRegex(self.calls_of("make-certs")[0], r" 1$")
         build = self.calls_of("builds submit")[0]
         self.assertIn(f"--tag=us-central1-docker.pkg.dev/{PROJECT}/kube-agents/ghes-proxy:pr-99-1234", build)
         self.assertIn(f"--project={PROJECT}", build)
@@ -341,8 +350,20 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertNotIn("VM(s) deleted", proc.stdout)
         self.assertFalse(self.calls_of("compute instances delete"))
 
+    def test_up_leaves_a_pre_made_state_directorys_mode_and_other_files(self):
+        self.provision()
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.chmod(0o755)
+        (self.state_dir / "unrelated.txt").write_text("the caller's\n")
+        proc = self.run_forge("up")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertEqual(oct(self.state_dir.stat().st_mode & 0o777), "0o755", "an existing directory keeps its mode")
+        self.assertEqual((self.state_dir / "unrelated.txt").read_text(), "the caller's\n")
+        self.assertTrue((self.state_dir / "ca.crt").exists())
+
     def test_down_leaves_the_callers_other_files_and_the_directory(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir.chmod(0o755)
         (self.state_dir / "forge-vm").write_text("forge-ghes us-central1-a\n")
         (self.state_dir / "ca.crt").write_text("x\n")
         (self.state_dir / "unrelated.txt").write_text("the caller's\n")
@@ -351,6 +372,7 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertTrue(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a"))
         self.assertFalse((self.state_dir / "ca.crt").exists() or (self.state_dir / "forge-vm").exists())
         self.assertEqual((self.state_dir / "unrelated.txt").read_text(), "the caller's\n")
+        self.assertEqual(oct(self.state_dir.stat().st_mode & 0o777), "0o755")
 
     def test_down_with_nothing_to_delete_is_clean(self):
         proc = self.run_forge("down")
