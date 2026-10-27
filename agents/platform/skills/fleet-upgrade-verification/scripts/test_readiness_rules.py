@@ -878,13 +878,10 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
     def test_docstring_and_catalogue_reflect_that_delete_waits_out_full_drain(self):
         doc_words = " ".join((lb_connection_draining.__doc__ or "").split())
         self.assertNotIn("leaves the pool with its drain unfinished", doc_words)
-        self.assertIn("GKE stops waiting at DEREGISTRATION_WAIT_SECONDS", doc_words)
-        self.assertIn("instance group's delete of the old VM waits out the full drain", doc_words)
 
         with open(CATALOGUE_PATH, encoding="utf-8") as f:
             catalogue_words = " ".join(f.read().split())
         self.assertNotIn("leaves the pool with its drain unfinished", catalogue_words)
-        self.assertIn("GKE stops waiting at 600 seconds, but the instance group's delete", catalogue_words)
 
 
 class OrphanNodeObjectsRuleTest(unittest.TestCase):

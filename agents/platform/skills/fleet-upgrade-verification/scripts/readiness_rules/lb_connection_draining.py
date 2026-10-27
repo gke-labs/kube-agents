@@ -42,7 +42,7 @@ CAN_BLOCK = True
 HOLDS = (HOLDS_NODE_POOL,)  # the drain holds a node's removal; a control-plane move removes none
 
 # GKE's per-node deregistration wait during a pool upgrade: the longest it waits for a backend
-# service's connection draining before it deletes the node.
+# service's connection draining before stopping its wait (while Compute Engine waits out the full drain).
 DEREGISTRATION_WAIT_SECONDS = 600
 # Where a backend's group and a pool's manager URL carry the zone and the group name:
 # `.../zones/<zone>/instanceGroups/<name>` and `.../zones/<zone>/instanceGroupManagers/<name>`;
