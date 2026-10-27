@@ -350,8 +350,12 @@ Admitted on the record since the split:
   measurement in its place; #3448 (the 429s graded as infra) was closed unmerged on 2026-10-26, to be recut.
   The route objective has no inject-lane record by design: the blocking presubmit (#3156) and
   the main nightly (#3783) set `worker_commands` checks aside, so it grades on the api lane
-  alone. `consistency` had already left the `domains.yaml` allowlist on 2026-10-26 with
-  consistency-drift-outlier's seat (above); this line puts the probe beside it.
+  alone. The first nightlies to grade the case after the fix landed while this line was in review:
+  the today lane of 2026-10-26 (build 2114597963832496128, api, the route objective graded) and
+  `ci-kube-agents-eval-nightly-main-b` of 2026-10-27 (build 2114869926308089856, inject, the
+  first night the main part ran as two halves), 3/3 each. `consistency` had already left the
+  `domains.yaml` allowlist on 2026-10-26 with consistency-drift-outlier's seat (above); this
+  line puts the probe beside it.
 - **vcs-spent-branch-reuse**, 2026-10-23, the source-control domain's first roster seat, moved
   from `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
   the record the writers nightly built: 42 of 42 graded repetitions over the fourteen nights
