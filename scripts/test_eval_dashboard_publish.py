@@ -232,8 +232,8 @@ class PublishHookFailSafeTest(unittest.TestCase):
 
     def test_a_next_mode_periodic_publishes(self):
         """A next-mode run on main records under the version key's next mode,
-        so it is main's history like the today nightly's and the publisher
-        lets it through, mirroring the recorder."""
+        so it is main's history and the publisher lets it through, mirroring
+        the recorder."""
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack = dashboard_stubs(
                 pathlib.Path(tmp),

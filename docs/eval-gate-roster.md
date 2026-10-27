@@ -86,7 +86,9 @@ are admitted (`python3 scripts/eval_rosters.py --summary` counts
 `hack/eval/presubmit-cases.txt` and `blocking-roster.txt`; this page writes no count, so a seat
 change doesn't edit it). The bar a case clears to
 get there: its recent record shows failures only on its own regressions or on infra classes
-the harness already excludes from the verdict.
+the harness already excludes from the verdict. Every seat can red any pull request in the
+repository, so five more rules sit on top of that record, under "The five rules a seat
+meets" at the end of this section.
 
 Every other case but those seats runs in the nightly only — one data point a night, at three
 repetitions — and its admission is one pull request that adds its line to both presubmit files
@@ -405,6 +407,81 @@ Admitted on the record since the split:
   to its return on 2026-10-26). Same watch as the case above: a collapse on an unrelated pull
   request in its first days, and the demotion lever below.
 
+### The five rules a seat meets
+
+Decided on [#3968](https://github.com/gke-labs/kube-agents/issues/3968), section 5. A case
+holds a line in `hack/eval/blocking-roster.txt` only when all five hold. Rules (a) and (b) are
+judgments on the record, so the admission pull request shows them, in the roster-admission
+block of [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md). Rules (c),
+(d) and (e) can be read from the files, so `scripts/test_eval_rosters.py` checks them on every
+pull request.
+
+- **(a) A recorded red.** The case has failed for the right reason before: against `main`
+  without the fix it guards, the red half of the loop in
+  [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md). A
+  case nobody has seen fail may be unable to fail. The pull request links that red run: the
+  build or artifact, the check that failed and why, and one line of the agent's report. For an
+  `expected_fail` case, the run that recorded it red counts.
+- **(b) Every miss explained.** In the case's last 20 runs at the current version key, every
+  failed repetition is classified. Either it is an agent regression with an issue, or it is an
+  infra class the harness already sets aside (`rep_kind` in
+  [`scripts/eval_dashboard/classify.py`](../scripts/eval_dashboard/classify.py)). This is on
+  top of the `would-admit` reading at 90 % or better. The pull request lists each miss with its
+  class and, for a regression, its issue. "None" is a complete answer when the window has no
+  miss.
+- **(c) A guarded fixture.** The seeded fleet stays, because it saves the presubmit from
+  building clusters. But a case that reads it qualifies only when the precondition it grades is
+  asserted by the hourly seeded-fleet scan (`scripts/eval_dashboard/fixture_state.py` running
+  [`hack/fleet-fixture-state.py`](../hack/fleet-fixture-state.py)). The same goes for a case
+  that writes to a pool `*-infra` repository. The test reads the case's `task.yaml` and fails
+  when:
+  - a `fixtures:` role has no `state` assertion in `bench/tf/fleet/fixtures.json`. A
+    project-scoped role (`slot: null` in
+    [`docs/designs/fleet-fixtures.yaml`](designs/fleet-fixtures.yaml)) is not on a cluster, so
+    the scan never reads it;
+  - a check names a seeded cluster (`seeded-b`, or `{cluster:b}`) and the case declares no
+    fixture role on that slot;
+  - the case requests a pull request, which writes to the pool's GitOps repository, and the scan
+    asserts nothing there that the case depends on. A repository assertion is a `state` entry
+    on the subject that `hack/fleet-fixture-state.py` names in its `REPOSITORY_SUBJECT`
+    constant, so it counts only once the scan really reads pool repositories. It must sit on
+    one of the case's roles, or anywhere in the catalog for a case that lists no role
+    (`repository_asserted_roles` in the test).
+
+  The admission pull request names the assertion that guards the case. If none exists, it adds
+  one to the scan first.
+
+- **(d) Deterministic grading.** At least one `objective` in the case's `verification_spec`
+  is an exact check, not under a negating `none`. A case graded only by the judge does not
+  qualify. The test catches the judge-only case. Whether the exact checks name the planted
+  defect (the object the fleet's Terraform wrote, as
+  [`docs/designs/bench-case-format.md`](designs/bench-case-format.md) "Exact check or judged
+  score" asks) is for the reviewer.
+- **(e) A wall-time budget.** `python3 scripts/eval_rosters.py --summary` prints an estimated
+  presubmit wall time, priced from `unit_cost_hint` in `hack/ci-eval-pr.sh`. Phase one runs the
+  cases that request nothing, four lanes at a time (`EVAL_TASK_PARALLELISM`), and one case's
+  repetitions run one after another on its task lock. Phase two runs the cases that request a
+  pull request, and the stopped asks, one unit at a time, after phase one is done, each after
+  the 120 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
+  Held-out seats count, because they run. Locks shared between cases are not counted, so a
+  seat with its own Terraform stack would cost more than the estimate says. The test fails
+  when the estimate passes
+  `PRESUBMIT_WALL_BUDGET_MINUTES` in `scripts/eval_rosters.py`, which is 200. The hints are
+  launch-order prices and run long: on 2026-10-26 the roster estimated 122 minutes, while
+  recent green presubmits took 88 to 108. So 200 leaves room for one more seat that requests a
+  pull request (a 1250 s hint costs about 69 minutes in phase two), and it stays well inside
+  the 360-minute Prow deadline. That seat went to pdb-remediation-pr the same day
+  ([#3964](https://github.com/gke-labs/kube-agents/pull/3964), hinted at 1250 s), which took the
+  estimate to 190 minutes. An admission that goes over the budget either re-measures the hints
+  it relies on or raises the budget in the same pull request, with the reason.
+
+A seat that breaks (c) or (d) today is listed in `SEAT_BAR_EXEMPT` in
+`scripts/test_eval_rosters.py`, each with an issue that says what would clear it. An entry names
+the one part of the rule it covers (`c-role`, `c-slot`, `c-repository` or `d`), so a second
+problem on the same seat still fails the test. That list is kept the way `HELD_OUT_IN_PRESUBMIT`
+is: it does not grow to seat a new case, and the test fails an entry whose case now meets that
+part, so the edit that fixes the case deletes the entry.
+
 ## How far the roster's promise reaches
 
 The scope of "a held-out case cannot red a pull request" is rungs 4 and 6 only. Rungs 1–3
@@ -451,8 +528,8 @@ the today lane's `today` only with today's; a case with no line at its key contr
 `main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
 `-main-b` half and its `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
-back, for this number only, to its today-mode lines at the same key otherwise, which
-`ci-kube-agents-eval-nightly-today` records, and the verdict names those cases in a note; rung 6
+back, for this number only, to its today-mode lines at the same key otherwise, which the store
+already holds (no job appends them now), and the verdict names those cases in a note; rung 6
 never falls back. The verdict prints it on every
 run:
 
@@ -483,7 +560,8 @@ periodic does not get the line: it records `main` and grades itself against a wi
 holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
 window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
 sample contains); the eval dashboard's Trend page draws today's window from the same store, per case
-and per domain. It does not draw the `next` series yet, which is the window the presubmit is compared
+and per domain, and since no job appends that window now, the view empties as its lines age out of
+the page's window. It does not draw the `next` series yet, which is the window the presubmit is compared
 with since the nightly grades `next`; the `next` block of the published `trend.json` holds it.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
@@ -556,21 +634,20 @@ default `api` executor the default profile answers the door's task and can file 
 card's completion never reaches the A2A thread. The lane's delegation wait reads the card's
 result from the pod and appends it to the graded answer, but that is the harness's view, not the
 thread's, so grading it would pass a premise the case does not have there. The card-wake
-cases replay a wake the harness sends on the api transport only, and error on this lane. A case
-excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
-listed until a run on `api` grades it.
+cases replay a wake the harness sends on the api transport only, and error on this lane.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
-fixture to an issue. An entry is not a demotion: the case keeps its seat in
-`presubmit-cases.txt` or `nightly-cases.txt` and on the blocking roster, and runs over the api
-transport on the today lane and in the nightlies. It does leave what can red a pull request,
-though, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
+fixture to an issue. The case keeps its seat in `presubmit-cases.txt` or `nightly-cases.txt` and
+on the blocking roster, but it stops running wherever the inject lane runs, the nightlies
+included. The only api-transport job on `main` is the today lane, which runs the presubmit
+matrix: a listed presubmit case still runs there, and a listed nightly case runs nowhere in CI.
+An entry also leaves what can red a pull request, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. `agent-kanban-smoke` is the one roster case
 listed, so until the lane's delegation wait reads card ids on this path, or the case is rewritten
 for a premise both transports have, no merge-blocking run grades delegation through the chat
-front door; the today lane and the nightlies do. `scripts/test_eval_rosters.py` pins
+front door; the today lane does. `scripts/test_eval_rosters.py` pins
 that set, so listing a second roster case is a decision made in that test and on this page, not a
 side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
@@ -608,12 +685,13 @@ on every pull request.
 Rung 6 compares an inject run only with next-mode history. The version key carries the mode
 ([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
 `AGENT_TRANSPORT=inject` as `next`, so an inject run's judged mean is set against the means a
-next-mode run on `main` recorded at the same key, never against the today-mode nightly's: that
+next-mode run on `main` recorded at the same key, never against today-mode history: that
 comparison measured the lane rather than the pull request, and redded four admitted cases at once
 on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
 is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
-only. The key includes the agent model, and the main nightly runs the presubmit's, so its next-mode
-lines are the presubmit's rung 6 history.
+only, which no job appends to now, so rung 6 there is quiet once the key moves past the stored
+lines. The key includes the agent model, and the main nightly runs the presubmit's, so its
+next-mode lines are the presubmit's rung 6 history.
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
@@ -679,6 +757,18 @@ erroring verifier, an empty record on a task that provisions nothing — a recor
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
 case leaves the list.
 
+A broken seeded-fleet fixture is not a reason to demote. After it writes the fleet kubeconfigs,
+`hack/ci-eval-pr.sh` runs `hack/fleet-fixture-state.py` against the leased project. A case
+whose grade depends on a role that scan read and found out of its designed state, after the pool
+verifier's convergence wait and on the hourly scan's last two passes too (a role a
+`fixture_role:` check reads, or the case's only `fixtures:` role) is not run. Each of its repetitions is recorded as infrastructure under `fixture-drift:<role>` and
+the scan's own words, and the suite leaves the case out of its coverage floor, so it cannot
+red or hold a pull request ([the scorer](designs/eval-scorer.md#the-verdict-ladder)). The
+dashboard classes the case `fixture-drift`, the nightly files no `nightly-red` issue for it
+(three such nights in a row file the infra owner's kept-from-running issue, one per case), and the fixture itself is the [seeded-fleet scan](ci-health.md#the-seeded-fleet-scan)'s to
+report. A role the scan could not read, a scan that failed, a pull request that changes the
+fleet catalog, the scan or the case itself: each leaves the case graded as usual.
+
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
 window for the case, the verdict's **Record says** column reads `would-demote` and the
@@ -701,6 +791,23 @@ not answer stays demoted. While a demotion leaves a domain with no roster case, 
 tick keeps an issue open for the domain's owner with the domain's best nightly candidates
 ([`ci-health.md`](ci-health.md#coverage-gaps)). The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
+
+A demotion that leaves a domain with no case on the roster must, in the same pull request, do one
+of three things: seat a stand-in case from that domain on the roster; keep the demoted case on the
+presubmit as a held-out seat (its line in the last section of `hack/eval/presubmit-cases.txt` and
+its `HELD_OUT_IN_PRESUBMIT` entry), which keeps the domain exercised but does not cover it; or add
+a record to the `allowlist` in [`docs/designs/domains.yaml`](designs/domains.yaml) with `since`,
+`issue`, `owner` and `expires`, the expiry at most 14 days after `since` unless a `why:` says why.
+The issue is the one that says how the domain gets a roster case back. A held-out seat still needs
+the record, with the case named in its `held_out:` field. `scripts/test_domain_coverage.py`
+enforces this: it fails on an uncovered domain with no record, and on a record that is missing a
+field or runs past the 14-day cap without a `why:`.
+
+Once a record's `expires` date has passed (by the UTC date), pull requests are not blocked: a date
+passing would red contributors who do not own the gap. Instead the CI-health bot escalates to the
+record's owner on its issue, and the daily digest says how many days ago the exception expired.
+`scripts/domain_allowlist.py` is the expiry rule it reads. The owner either covers the domain or
+moves the date in a pull request that says why.
 
 ## Switching to `record`
 

@@ -3111,6 +3111,16 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             r"^platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled-[0-9a-f]{8}$",
         )
         self.assertIn("**submit-suggestion**", body)
+        self.assertIn("Implement ONLY that recommended option", body)
+        self.assertIn("changing only the file(s) that option calls for", body)
+        self.assertIn("edit only the synced workload manifest(s)", body)
+        self.assertIn("never bundle any non-recommended option", body)
+        self.assertIn(
+            "never touch unrelated manifests or infrastructure definitions that the recommended option does not target",
+            body,
+        )
+        self.assertNotIn("ArgoCD", body)
+        self.assertNotIn("unapplied Terraform", body)
         self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
@@ -8181,6 +8191,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             self.assertNotIn(leaked, sess_serialized)
         self.assertIn("[REDACTED_SECRET]", serialized)
         self.assertIn("[REDACTED_PRIVATE_KEY]", serialized)
+        # A manifest's `data` is blanked by shape, a ConfigMap's as a Secret's.
+        self.assertNotIn("kept_plain_value", serialized)
+        self.assertIn("plain_field", serialized)
         for preserved in (
             "app-tls-secret",
             "/var/run/secrets/token",
@@ -8194,7 +8207,6 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "tls.crt:  1679 bytes",
             "cert.pem: OK",
             "cert.pem: PEM certificate",
-            "kept_plain_value",
             "/etc/creds/mounted-path",
             "deployment-controller mounts them",
             "/opt/data/gitops/x",
@@ -8254,7 +8266,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", benign), benign)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
-        # `_CLI_USERPASS_FLAG_RE` and `_CLI_SHORT_P_RE` end a command's segment
+        # `worker_transcript.CLI_USERPASS_FLAG_RE` and `CLI_SHORT_P_RE` end a command's segment
         # at `&`, `;` or `|`; inside a quoted argument those are data.
         for cmd, cred, kept in (
             (

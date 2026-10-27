@@ -860,5 +860,74 @@ class NotEvaluatedTest(unittest.TestCase):
         self.assertTrue(verdict["headline"].startswith("Nothing was graded"))
 
 
+
+# The bench module's label, read out of its source like the ceiling marker.
+FIXTURE_DRIFT_MODULE = SCORER.parent / "fixture_drift.py"
+
+
+def _bench_fixture_drift_label() -> str:
+    for line in FIXTURE_DRIFT_MODULE.read_text(encoding="utf-8").splitlines():
+        if line.startswith("FIXTURE_DRIFT_LABEL = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise AssertionError(f"FIXTURE_DRIFT_LABEL not found in {FIXTURE_DRIFT_MODULE}")
+
+
+# A repetition hack/ci-eval-pr.sh recorded without running it, as the scorer
+# words it and the collector carries it (`result: infra`).
+DRIFTED = (
+    "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade "
+    f"({_bench_fixture_drift_label()}:version-laggard: cluster currentMasterVersion minor_behind_channel_default: "
+    "observed 1.34.1-gke.100, the REGULAR default (seeded-fleet scan of kube-agents-evals-7 at lease time; "
+    "the case was not run against a fixture out of its designed state))"
+)
+
+
+def drifted_task(name, n=3):
+    return {"name": name, "result": "infra", "reps": [{"n": i + 1, "result": "infra", "reason": DRIFTED} for i in range(n)]}
+
+
+class FixtureDriftTest(unittest.TestCase):
+    """A case not run because the lease-time scan saw its fixture drifted is
+    infrastructure, never a failure, and is not the storm's."""
+
+    def test_the_label_is_the_bench_modules(self):
+        self.assertEqual(classify.FIXTURE_DRIFT_LABEL, _bench_fixture_drift_label())
+
+    def test_a_drifted_rep_is_its_own_kind(self):
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": DRIFTED}), "fixture")
+        self.assertEqual(classify.rep_kind({"result": "infra", "reason": NEVER_RAN}), "storm")
+
+    def test_a_drifted_case_is_infra_and_outside_the_storm_count(self):
+        counts = classify.rep_counts(drifted_task("upgrades-lagging-master-probe"))
+        self.assertEqual((counts["pass"], counts["fail"], counts["infra"], counts["fixture"]), (0, 0, 0, 3))
+        self.assertEqual(classify.outcome_of(counts), "infra")
+        target = run(1, 1, T0, tasks=[drifted_task("upgrades-lagging-master-probe"), drifted_task("x")] + gate_tasks())
+        self.assertEqual(classify.storm_reps(target), 0, "six drifted reps are not a storm's signature")
+        self.assertNotIn("upgrades-lagging-master-probe", classify.collapsed_cases(target))
+
+    def test_the_case_row_names_the_role_and_says_it_is_not_the_prs(self):
+        tasks = [t for t in gate_tasks() if t["name"] != "upgrades-lagging-master-probe"] + [drifted_task("upgrades-lagging-master-probe")]
+        target = run(1, 1, T0, tasks=tasks, result="SUCCESS")
+        verdict = classify_run(target, [target], health_at=STORM)
+        row = case(verdict, "upgrades-lagging-master-probe")
+        self.assertEqual((row["outcome"], row["cls"], row["do"]), ("infra", classify.CLS_FIXTURE_DRIFT, classify.DO_FIXTURE_DRIFT))
+        self.assertIn("fixture-drift:version-laggard", row["reason"])
+        self.assertEqual(row["reps"]["fixture"], 3)
+        self.assertEqual(verdict["verdict"], "green")
+        # An unrelated case on the same run is graded as before.
+        self.assertEqual(case(verdict, "reliability-pdb-probe")["outcome"], "passed")
+
+    def test_drift_beside_a_storm_rep_is_the_storms(self):
+        mixed = {"name": "x", "result": "infra", "reps": [{"n": 1, "result": "infra", "reason": DRIFTED}, {"n": 2, "result": "infra", "reason": NEVER_RAN}]}
+        target = run(1, 1, T0, tasks=gate_tasks() + [mixed], result="SUCCESS")
+        self.assertEqual(case(classify_run(target, [target], health_at=STORM), "x")["cls"], "storm")
+
+    def test_nothing_graded_because_every_fixture_drifted_says_so(self):
+        target = run(1, 1, T0, tasks=[drifted_task(n) for n in sorted(ADMITTED)], result="FAILURE")
+        verdict = classify_run(target, [target])
+        self.assertIn("drifted", verdict["headline"])
+        self.assertEqual(verdict["verdict"], "infra")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -215,9 +215,7 @@ SCHEMA_VERSION = 1
 
 # The nightly periodic (oss-test-infra: ci-kube-agents-eval-nightly, the
 # EVAL_TIER=nightly companion of the presubmit, on spec.mode next like it)
-# and where Prow archives it. The today-mode nightly kept as the rollback
-# check (ci-kube-agents-eval-nightly-today) logs to the same bucket and is
-# not collected.
+# and where Prow archives it.
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
@@ -1182,23 +1180,23 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
     and the unit tests here assert this parse agrees with it.
     """
     text = (repo_root / "docs" / "designs" / "domains.yaml").read_text()
-    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.MULTILINE)
-    uncovered = []
-    in_allowlist = False
+    # Each top-level list's `- slug: x` items: the domain rows under
+    # `domains:`, the allowlist records under `allowlist:`. A record's other
+    # keys (since, issue, owner, expires, ...) are indented lines and skipped;
+    # a new top-level key ends the list it follows.
+    slugs: list[str] = []
+    uncovered: list[str] = []
+    section = None
     for line in text.splitlines():
-        if re.match(r"^allowlist:\s*(#.*)?$", line):
-            in_allowlist = True
+        top = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):", line)
+        if top:
+            section = top.group(1)
             continue
-        if not in_allowlist:
-            continue
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        m = re.match(r"^\s+-\s+([A-Za-z0-9_-]+)\s*$", line)
-        if m:
+        m = re.match(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", line)
+        if m and section == "domains":
+            slugs.append(m.group(1))
+        elif m and section == "allowlist":
             uncovered.append(m.group(1))
-        else:
-            break  # a new top-level key ends the allowlist
     return {
         "domains_total": len(slugs),
         "domains_covered": len(slugs) - len(uncovered),

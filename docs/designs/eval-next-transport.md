@@ -305,7 +305,8 @@ transport gives an exhausted transport retry, because they say the executor lost
 than the persona failing it, the same line the profiles spec draws with `worker-evicted`; the
 persona's reasons, `hermes-exited-nonzero` and `deadline-exceeded`, the API server's 5xx or failed turn,
 unparseable, broken-off or oversize answers (`hermes-api-failed`, `hermes-api-unreadable`,
-`hermes-api-read-failed`, `hermes-api-oversize`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
+`hermes-api-read-failed`, `hermes-api-oversize`), an answer the bridge withheld as the model's own
+reasoning (`hermes-unstructured-reasoning`), and any reason the harness does not know, are graded failures. A `rejected` terminal, which both executors publish for a
 submission with no text parts, is infrastructure and never graded, because it is the harness's
 own defect. A `canceled` terminal after the harness's own cancel is the graded timeout above, and
 `canceled-before-start` the infrastructure outcome above. The rule is the same on both
@@ -718,19 +719,17 @@ its Tide batch runs, the today lane's periodic, the main nightly's three parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
 `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
 under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode nightly
-`ci-kube-agents-eval-nightly-today` or another postsubmit still stops the deploy before anything is
-built. A next-mode run has a record of its own: the baseline version key carries the mode, which
+install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
+postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the
 inject lane compares only with next-mode history at its own key (agent model included; the main
-nightly and the presubmit run the same one). `ci-kube-agents-eval-nightly-today` grades the full
-catalogue on a fresh `today` install over the agent API once a night and records today's window,
-which is what the rollback to `today` is measured against. The today lane stays out of the
-recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`, but it grades
-a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; its
-Nightly page reads the main nightly's runs, so it shows `next`, and the today-mode nightly's Prow
-runs are not collected onto the run pages.
+nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
+out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
+but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
+keeps a series per mode, drawing today's from the lines the store already holds until they age
+out of its window; its Nightly page
+reads the main nightly's runs, so it shows `next`.
 
 ## Open questions
 

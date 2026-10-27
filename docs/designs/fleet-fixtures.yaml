@@ -253,7 +253,41 @@ fixtures:
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
       under 24 hours old from every cohort, and its cohort floor is three
       clusters: replacing c silences the finding for a day, and so does
-      replacing any cluster on a project whose fleet predates slot d.
+      replacing any cluster on a project whose fleet predates slot d. The
+      hourly scan reports a c under a day old as drift.
+
+  - role: drift-peer-a
+    slot: a
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot a's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-b
+    slot: b
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot b's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-d
+    slot: d
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot d's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
 
   - role: readiness-surge-blocked
     slot: b

@@ -29,11 +29,19 @@ holds by its properties, so a case pull request edits no list here.
 
 scripts/test_ci_eval_nightly.py runs the real shell over the real files and
 asserts it builds the arrays this module reads.
+
+The seat bar (#3968, section 5; docs/eval-gate-roster.md, "The five rules a
+seat meets") is held here too: SeatBarTest reads every blocking-roster case's
+task.yaml for rules (c), a fixture the hourly seeded-fleet scan asserts, and
+(d), a deterministic objective, with SEAT_BAR_EXEMPT the seats that break one
+today, each on its issue; PresubmitWallTimeTest holds rule (e), the estimated
+presubmit wall time under eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES.
 """
 
 import contextlib
 import io
 import pathlib
+import re
 import subprocess
 import sys
 import unittest
@@ -169,9 +177,6 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-click-answer-stays-silent",  # SOUL §1.5 Unblock: silent after a button answer
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
     "autoops-controller-stall-triage",  # the stall watch on the inject path
-    "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
-    "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
-    "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
     "chat-voice-answer-first",  # a delegated answer opens on its verdict
@@ -210,7 +215,6 @@ ADDED_AFTER_THE_MOVE = [
     "cluster-agent-security-audit-script",  # a Cluster Agent runs its audit script from the path its skill names, #3402
     "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
     "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
-    "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
@@ -571,30 +575,22 @@ class SplitLostNothingTest(unittest.TestCase):
 # are pinned.
 INJECT_LANE_EXCLUDED = [
     "agent-kanban-smoke",  # #2039: grades kanban_create by the front door and the specialist's answer folded back, which the door's thread never gets
-    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; a card-wake replay runs on the api transport only
-    "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
-    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same reason
-    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same reason
+    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; a card-wake replay runs on the api transport only
     "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
     "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
     "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
-    "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
-    "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
     "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
-    "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
-    "first-install-hello-done",  # the same once the first-look scan has finished
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
-    "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
     "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
     "chat-answer-tangent-offer-declares-no-step",  # the same
     "fleet-audit-request-line",  # #2619: grades the worker's answer the api lane folds into the reply; the door's thread never gets it
 ]
-# The directives a case's prompt opens with to replay a wake into the chat
+# The directive a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
 # a run on any transport but api.
-FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
+FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:slack-question-wake]",)
 # Check types that read what only the chat front door's card round trip
 # delivers; on the inject lane there is no card, so the check fails rather
 # than being set aside (bench/README.md, the transport table).
@@ -603,22 +599,14 @@ FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first", "report_store_reply
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
     "agent-kanban-smoke": "presubmit",
-    "chat-voice-retry-says-it-is-retried": "nightly",
-    "chat-voice-final-attempt-is-not-retried": "nightly",
-    "chat-voice-failure-leads-with-fact": "nightly",
     "chat-question-wake-stays-silent": "nightly",
     "chat-question-typed-answer-fresh-session": "nightly",
     "chat-question-click-answer-stays-silent": "nightly",
     "chat-voice-ack-names-target": "nightly",
-    "chat-reset-history-names-the-command": "nightly",
-    "chat-routing-board-read": "nightly",
     "chat-routing-fleet-question": "nightly",
-    "first-install-hello-running": "nightly",
-    "first-install-hello-done": "nightly",
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
     "chat-question-asked-to-choose-pauses": "nightly",
-    "chat-failure-reply-declares-next-step": "nightly",
     "chat-answer-declares-next-step": "nightly",
     "chat-answer-tangent-offer-declares-no-step": "nightly",
     "fleet-audit-request-line": "nightly",
@@ -787,10 +775,10 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
-    def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's roster is untouched by an entry here: an excluded
-        # presubmit case still runs on every pull request and can still red
-        # one, and an excluded nightly case still runs every night.
+    def test_an_exclusion_keeps_the_case_on_its_roster(self):
+        # An entry here leaves the case on its roster: the today lane still
+        # grades an excluded presubmit case, and an excluded nightly case runs
+        # nowhere in CI until it can go through the inject door.
         self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
         for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
             with self.subTest(case=case, tier=tier):
@@ -1010,6 +998,362 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         # exactly as before this file existed.
         self.assertTrue(self.lane_cases())
         self.assertNotIn("agent-kanban-smoke", self.lane_cases())
+
+
+
+# ─── The seat bar (#3968, section 5) ──────────────────────────────────────────
+# docs/eval-gate-roster.md, "The five rules a seat meets". Rules (a)
+# and (b) are judgments on the record, asked for by the pull request
+# template; (c), (d) and (e) are read from the files and held here.
+#
+# The blocking-roster seats that break rule (c) or (d), as (case, rule, issue,
+# what is missing). The issue says what would clear the rule; the edit that
+# clears it deletes the entry here, and SeatBarTest fails an entry whose case
+# no longer breaks its rule. Kept the way HELD_OUT_IN_PRESUBMIT is: a short
+# written list, each line with its issue, never a way to seat a new case.
+SEAT_BAR_EXEMPT = [
+    ("agent-kanban-smoke", "c-slot", 3984, "names seeded-a, seeded-b and seeded-c in its check and declares no fixture role for any of them"),
+    ("vcs-spent-branch-reuse", "c-repository", 3985, "opens pull requests in the pool's GitOps repository, and the scan asserts nothing about that repository"),
+    ("pdb-remediation-pr", "c-repository", 3994, "opens a pull request in the pool's GitOps repository and needs checkout-gateway's manifest there, and the scan asserts nothing about that repository"),
+]
+FLEET_FIXTURE_STATE_SCRIPT = REPO_ROOT / "hack" / "fleet-fixture-state.py"
+FLEET_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
+FLEET_OVERLAY = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
+# A seeded cluster named in a check's text, `seeded-a`, or by placeholder,
+# `{cluster:a}`: a read of that slot whatever the case's `fixtures:` says.
+# Bounded so seeded-a-canary and the seeded-debug namespace are not slot a or
+# d; only a slot the overlay declares counts, so a deliberately absent
+# `seeded-z` is not a read.
+SEEDED_CLUSTER_NAME_RE = re.compile(r"(?<![\w-])seeded-([a-z])(?![\w-])")
+CLUSTER_PLACEHOLDER_RE = re.compile(r"\{cluster:([a-z])\}")
+# A pattern that names several slots at once -- `{cluster:any}`, or a regex
+# spelling such as `seeded-(b|c)`, `seeded-[bc]` or `seeded-\w` -- reads every
+# slot the overlay declares, so the case lists a role on each (the case
+# format's rule for a case that depends on every slot).
+EVERY_SLOT_RE = re.compile(r"\{cluster:any\}|(?<![\w-])seeded-[(\[\\]")
+# The rule ids a finding carries: rule (c)'s three mechanisms apart, so an
+# exemption covers the one its issue is about and nothing else.
+SEAT_BAR_RULES = frozenset({"c-role", "c-slot", "c-repository", "d"})
+# The subject constant hack/fleet-fixture-state.py defines once it reads a
+# pool `*-infra` repository, the way CLUSTER_SUBJECT names the GKE cluster.
+# Until the scan defines it, no role has a repository assertion, so nothing a
+# catalog edit alone writes can clear that part of rule (c): the scan has to
+# run it. The one place that lookup lives, so the pool-repository assertions
+# the scan learns (the checkout-gateway manifest every pool repository must
+# hold, #3120) clear rule (c) for the cases on that role the day they land.
+SCAN_REPOSITORY_SUBJECT_ATTR = "REPOSITORY_SUBJECT"
+
+
+def load_scan():
+    """hack/fleet-fixture-state.py as a module: the hourly scan's own code."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("fleet_fixture_state", FLEET_FIXTURE_STATE_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_scan_assertions(scan) -> dict[str, list]:
+    """{role: its validated `state` entries}, read by the scan's own loader:
+    what the hourly scan (scripts/eval_dashboard/fixture_state.py) asserts,
+    and nothing it would refuse."""
+    return {role: entry["state"] for role, entry in scan.load_assertions(FLEET_CATALOG).items()}
+
+
+def repository_asserted_roles(assertions: dict[str, list], repository_subject: str | None) -> set[str]:
+    """The roles with a `state` entry on the scan's repository subject; none
+    while the scan defines no such subject."""
+    if not repository_subject:
+        return set()
+    return {role for role, state in assertions.items()
+            if any(str(e.get("subject", "")).split("/", 1)[0].split("?", 1)[0] == repository_subject for e in state)}
+
+
+def overlay_role_slots() -> dict[str, str | None]:
+    """{role: slot} from docs/designs/fleet-fixtures.yaml: every seeded-fleet
+    role, the project-scoped ones (slot None) included."""
+    import yaml
+
+    doc = yaml.safe_load(FLEET_OVERLAY.read_text(encoding="utf-8"))
+    return {f["role"]: f.get("slot") for f in doc["fixtures"]}
+
+
+def deterministic_leaves(node, negations: int = 0) -> list[str]:
+    """The check leaves that grade something the run must show: every leaf
+    under an even number of `none` compounds. Unlike positive_check_types, an
+    `any` counts, since each alternative is still an exact check."""
+    if isinstance(node, list):
+        return [t for item in node for t in deterministic_leaves(item, negations)]
+    if not isinstance(node, dict):
+        return []
+    children = [node.get(k) for k in ("checks", "check") if node.get(k) is not None]
+    if not children:
+        return [str(node["type"])] if node.get("type") and negations % 2 == 0 else []
+    inner = negations + (1 if node.get("type") == "none" else 0)
+    return [t for child in children for t in deterministic_leaves(child, inner)]
+
+
+def seat_bar_findings(doc: dict, *, requests_pull_request: bool, scan: dict[str, list],
+                      repository_roles: set[str], role_slots: dict[str, str | None]) -> list[tuple[str, str]]:
+    """What a case's task.yaml breaks of rules (c) and (d), as (rule id, why);
+    the ids are SEAT_BAR_RULES."""
+    found = []
+    spec = doc.get("verification_spec") or []
+    objectives = [e for e in spec if isinstance(e, dict) and e.get("role") == "objective"]
+    if not any(deterministic_leaves(e.get("check")) for e in objectives):
+        found.append(("d", "no objective carries a deterministic check: graded by the judge alone"))
+    roles = list(doc.get("fixtures") or [])
+    for role in roles:
+        if not scan.get(role):
+            found.append(("c-role", f"fixture role {role} has no `state` assertion the seeded-fleet scan runs"))
+    declared_slots = {role_slots.get(r) for r in roles}
+    known_slots = {slot for slot in role_slots.values() if slot}
+    spec_text = repr(spec)
+    named = set(SEEDED_CLUSTER_NAME_RE.findall(spec_text)) | set(CLUSTER_PLACEHOLDER_RE.findall(spec_text))
+    if EVERY_SLOT_RE.search(spec_text):
+        named |= known_slots
+    for slot in sorted((named & known_slots) - declared_slots):
+        found.append(("c-slot", f"its checks read seeded slot {slot} and it declares no fixture role there"))
+    # A case with roles writes about them (pdb-remediation-pr's manifest for
+    # checkout-gateway), so the assertion sits on one of its roles; a case
+    # with none needs the scan to read the pool repository at all.
+    if requests_pull_request and not (set(roles) & repository_roles if roles else repository_roles):
+        found.append(("c-repository", "it writes to the pool's GitOps repository, and the scan asserts nothing there it depends on"))
+    return found
+
+
+class SeatBarTest(unittest.TestCase):
+    """Rules (c) and (d) of docs/eval-gate-roster.md, "The admission bar", on
+    every blocking-roster case, read from its task.yaml."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench import lane
+
+        scan = load_scan()
+        cls.scan = load_scan_assertions(scan)
+        cls.repository_roles = repository_asserted_roles(cls.scan, getattr(scan, SCAN_REPOSITORY_SUBJECT_ATTR, None))
+        cls.role_slots = overlay_role_slots()
+        cls.lane_requesting = eval_rosters.parse_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
+        cls.lane = lane
+
+    def findings(self, case: str) -> list[tuple[str, str]]:
+        import yaml
+
+        doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+        return self.findings_for(doc, eval_rosters.requests_a_pull_request(case, self.lane_requesting))
+
+    def findings_for(self, doc: dict, requests: bool = False, **override) -> list[tuple[str, str]]:
+        kwargs = {"scan": self.scan, "repository_roles": self.repository_roles, "role_slots": self.role_slots}
+        kwargs.update(override)
+        return seat_bar_findings(doc, requests_pull_request=requests, **kwargs)
+
+    def test_every_roster_case_clears_c_and_d_or_is_exempt(self):
+        exempt = {(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT}
+        for case in eval_rosters.blocking_roster():
+            with self.subTest(case=case):
+                broken = [(rule, why) for rule, why in self.findings(case) if (case, rule) not in exempt]
+                self.assertEqual(broken, [], f"{case} does not clear the seat bar (docs/eval-gate-roster.md, \"The five rules a seat meets\")")
+
+    def test_every_exemption_is_a_roster_seat_that_still_breaks_its_rule(self):
+        roster = eval_rosters.blocking_roster()
+        for case, rule, issue, why in SEAT_BAR_EXEMPT:
+            with self.subTest(case=case, rule=rule):
+                self.assertIn(rule, SEAT_BAR_RULES)
+                self.assertIn(case, roster, "an exemption is for a seat; a case off the roster drops its entry")
+                self.assertGreater(issue, 0)
+                self.assertTrue(why)
+                self.assertIn(rule, {r for r, _ in self.findings(case)}, f"{case} clears rule ({rule}) now; delete its exemption (#{issue})")
+
+    def test_the_exemption_list_names_each_seat_and_rule_once(self):
+        pairs = [(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT]
+        self.assertEqual(len(pairs), len(set(pairs)))
+
+    def test_a_judge_only_spec_breaks_rule_d(self):
+        report = {"type": "report_contains", "required_phrases": ["debug-binding"]}
+        self.assertIn("d", {r for r, _ in self.findings_for({"verification_spec": []})})
+        # Safeguards alone grade what must not happen, never the defect.
+        self.assertIn("d", {r for r, _ in self.findings_for({"verification_spec": [
+            {"name": "s", "role": "safeguard", "severity": "catastrophic", "check": report}]})})
+        # An objective whose only leaf sits under `none` names nothing the run found.
+        self.assertIn("d", {r for r, _ in self.findings_for({"verification_spec": [
+            {"name": "o", "role": "objective", "check": {"type": "none", "checks": [report]}}]})})
+        for check in (report, {"type": "any", "checks": [report, {"type": "tool_called"}]},
+                      {"type": "none", "checks": [{"type": "none", "checks": [report]}]}):
+            with self.subTest(check=check):
+                self.assertNotIn("d", {r for r, _ in self.findings_for({"verification_spec": [
+                    {"name": "o", "role": "objective", "check": check}]})})
+
+    def test_an_unasserted_seeded_role_breaks_rule_c(self):
+        objective = [{"name": "o", "role": "objective", "check": {"type": "report_contains"}}]
+        doc = {"fixtures": ["version-laggard"], "verification_spec": objective}
+        self.assertEqual(self.findings_for(doc), [])
+        unasserted = dict(self.scan, **{"version-laggard": []})
+        self.assertEqual([r for r, _ in self.findings_for(doc, scan=unasserted)], ["c-role"])
+        # A project-scoped role is not on a cluster the scan reads at all.
+        self.assertEqual([r for r, _ in self.findings_for({"fixtures": ["orphan-disks"], "verification_spec": objective})], ["c-role"])
+
+    def test_a_seeded_cluster_named_without_its_role_breaks_rule_c(self):
+        def doc(phrase, fixtures=None):
+            return {"fixtures": fixtures, "verification_spec": [
+                {"name": "o", "role": "objective", "check": {"type": "report_contains", "required_phrases": [phrase]}}]}
+
+        self.assertEqual([r for r, _ in self.findings_for(doc("seeded-b"))], ["c-slot"])
+        self.assertEqual([r for r, _ in self.findings_for(doc("{cluster:b}"))], ["c-slot"])
+        self.assertEqual(self.findings_for(doc("seeded-b", ["version-laggard"])), [])
+        self.assertEqual(self.findings_for(doc("seeded-debug")), [], "a namespace is not slot d")
+        self.assertEqual(self.findings_for(doc("seeded-a-canary")), [])
+        self.assertEqual(self.findings_for(doc("seeded-z")), [], "no slot z: a cluster named as absent is not a read")
+        # A pattern naming several slots at once reads every declared slot.
+        every = {slot for slot in self.role_slots.values() if slot}
+        for phrase in ("{cluster:any}", "seeded-(b|c)", "seeded-[bc]", r"seeded-\w"):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(sorted(why.split("slot ")[1].split()[0] for _, why in self.findings_for(doc(phrase))), sorted(every))
+        one_per_slot = {}
+        for role, slot in self.role_slots.items():
+            if slot and self.scan.get(role):
+                one_per_slot.setdefault(slot, role)
+        self.assertEqual(self.findings_for(doc("{cluster:any}", sorted(one_per_slot.values()))), [])
+
+    def test_a_role_in_the_catalog_alone_is_still_held_to_its_assertions(self):
+        objective = [{"name": "o", "role": "objective", "check": {"type": "report_contains"}}]
+        doc = {"fixtures": ["catalog-only-role"], "verification_spec": objective}
+        self.assertEqual([r for r, _ in self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": []}))], ["c-role"])
+        self.assertEqual(self.findings_for(doc, scan=dict(self.scan, **{"catalog-only-role": [{"op": "absent"}]})), [])
+
+    def test_an_exemption_covers_its_own_mechanism_only(self):
+        # vcs-spent-branch-reuse is exempt for its pool-repository write; a
+        # slot read added to it would be a c-slot finding the entry does not cover.
+        exempt = {(case, rule) for case, rule, _, _ in SEAT_BAR_EXEMPT}
+        self.assertIn(("vcs-spent-branch-reuse", "c-repository"), exempt)
+        self.assertNotIn(("vcs-spent-branch-reuse", "c-slot"), exempt)
+        doc = {"verification_spec": [{"name": "o", "role": "objective", "check": {
+            "type": "report_contains", "required_phrases": ["seeded-b"]}}]}
+        self.assertEqual(sorted(r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())), ["c-repository", "c-slot"])
+
+    def test_a_pull_request_into_the_pool_repository_needs_a_repository_assertion(self):
+        doc = {"fixtures": ["no-pdb-workload"], "verification_spec": [
+            {"name": "o", "role": "objective", "check": {"type": "pull_request_opened"}}]}
+        self.assertEqual([r for r, _ in self.findings_for(doc, requests=True, repository_roles=set())], ["c-repository"])
+        self.assertEqual(self.findings_for(doc, requests=True, repository_roles={"no-pdb-workload"}), [])
+        self.assertEqual([r for r, _ in self.findings_for(doc, requests=True, repository_roles={"crashloop-workload"})], ["c-repository"],
+                         "another role's repository assertion does not guard this case's")
+        roleless = {"verification_spec": doc["verification_spec"]}
+        self.assertEqual([r for r, _ in self.findings_for(roleless, requests=True, repository_roles=set())], ["c-repository"])
+        self.assertEqual(self.findings_for(roleless, requests=True, repository_roles={"no-pdb-workload"}), [])
+        assertions = {
+            "no-pdb-workload": [{"subject": "gitrepo/infra", "op": "absent"}],
+            "hpa-saturated": [{"subject": "deployment/inference-server", "op": "absent"}],
+        }
+        self.assertEqual(repository_asserted_roles(assertions, "gitrepo"), {"no-pdb-workload"})
+        # Until the scan defines its repository subject, a catalog entry alone clears nothing.
+        self.assertEqual(repository_asserted_roles(assertions, None), set())
+
+    def test_the_text_read_of_requesting_agrees_with_the_lane_module(self):
+        """eval_rosters is stdlib-only, so it reads a requesting check out of
+        the text; hold it to lane.py's YAML read on every registered case."""
+        import yaml
+
+        listed = self.lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
+        self.assertEqual(self.lane_requesting, listed)
+        self.assertEqual(eval_rosters.REQUESTING_CHECK_RE.pattern.count("|") + 1, len(self.lane.REQUESTING_CHECK_TYPES))
+        for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertEqual(eval_rosters.requests_a_pull_request(case, self.lane_requesting),
+                                 self.lane.requested_for(doc.get("verification_spec") or [], listed.get(case, 0)) > 0)
+
+
+class PresubmitWallTimeTest(unittest.TestCase):
+    """Rule (e): the presubmit's estimated wall time stays under the budget
+    eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES names."""
+
+    def test_the_estimate_is_within_the_budget(self):
+        wall = eval_rosters.presubmit_wall_estimate()
+        minutes = -(-wall["total"] // 60)
+        self.assertLessEqual(
+            minutes, eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES,
+            f"the presubmit is estimated at {minutes} min ({wall}), over the "
+            f"{eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES}-min budget: re-measure the hints this "
+            "roster edit relies on, or raise the budget on purpose (docs/eval-gate-roster.md, rule (e))")
+
+    def test_the_hint_parser_reads_what_the_shell_answers(self):
+        """unit_cost_hint run by bash and read by the parser agree on every
+        registered case and on an unknown one."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        function = re.search(r"^unit_cost_hint\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
+        cases = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases() + ["no-such-case"]
+        out = subprocess.run(["bash", "-c", function + '\nfor c in "$@"; do unit_cost_hint "$c"; done', "_", *cases],
+                             check=True, capture_output=True, text=True).stdout.split()
+        hints, default = eval_rosters.parse_cost_hints(src)
+        self.assertEqual([int(n) for n in out], [hints.get(c, default) for c in cases])
+
+    def test_the_text_read_of_a_stopped_ask_agrees_with_stop_hook(self):
+        """A stopped ask runs in the serial phase too (unit_phase reads
+        STOPPED_ASK_CASES); hold the stdlib read to stop_hook's on every
+        registered case, and price one in phase two."""
+        import yaml
+        from unittest import mock
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench import stop_hook
+
+        self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
+        stopped = []
+        for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertEqual(eval_rosters.is_stopped_ask(case), stop_hook.is_stopped_ask(str(doc.get("prompt") or "")))
+                if eval_rosters.is_stopped_ask(case):
+                    stopped.append(case)
+        self.assertTrue(stopped, "no registered stopped ask left to price")
+        base = eval_rosters.presubmit_wall_estimate()
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + stopped[:1]):
+            grown = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(grown["phase one"], base["phase one"])
+        self.assertIn(stopped[0], grown["requesting"])
+
+    def test_a_requesting_case_adds_its_serial_chain_and_settles(self):
+        from unittest import mock
+
+        base = eval_rosters.presubmit_wall_estimate()
+        listed = eval_rosters.parse_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
+        extra = next(c for c in eval_rosters.nightly_cases() if eval_rosters.requests_a_pull_request(c, listed))
+        src = SCRIPT.read_text(encoding="utf-8")
+        hints, default = eval_rosters.parse_cost_hints(src)
+        settle = int(re.search(r"EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)", src).group(1))
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + [extra]):
+            grown = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(grown["phase one"], base["phase one"])
+        self.assertEqual(grown["phase two"] - base["phase two"], grown["repetitions"] * (hints.get(extra, default) + settle))
+        self.assertIn(extra, grown["requesting"])
+
+    def test_phase_one_is_the_longer_of_the_lanes_and_the_longest_chain(self):
+        from unittest import mock
+
+        # One case alone: its three repetitions serialize on the task lock,
+        # so four lanes do not divide its chain.
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=["compliance-rbac-overgrant"]):
+            alone = eval_rosters.presubmit_wall_estimate()
+        hints, _ = eval_rosters.parse_cost_hints(SCRIPT.read_text(encoding="utf-8"))
+        self.assertEqual(alone["phase one"], 3 * hints["compliance-rbac-overgrant"])
+        self.assertEqual(alone["phase two"], 0)
+        # Many short chains: the lanes, not any one chain, set phase one.
+        cheap = [c for c in eval_rosters.nightly_cases() if hints.get(c) is None][:12]
+        self.assertEqual(len(cheap), 12)
+        _, default = eval_rosters.parse_cost_hints(SCRIPT.read_text(encoding="utf-8"))
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=cheap), \
+                mock.patch.object(eval_rosters, "requests_a_pull_request", return_value=False):
+            spread = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(spread["phase one"], -(-12 * 3 * default // spread["parallelism"]))
+        self.assertGreater(spread["phase one"], 3 * default)
+
+    def test_the_summary_prints_the_estimate_and_the_budget(self):
+        got = eval_rosters.summary()
+        self.assertEqual(got["presubmit wall budget, minutes"], eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES)
+        self.assertEqual(got["presubmit wall estimate, minutes"], -(-eval_rosters.presubmit_wall_estimate()["total"] // 60))
 
 
 if __name__ == "__main__":
