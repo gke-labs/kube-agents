@@ -136,6 +136,24 @@ for the mechanics.
 
 -
 
+## Roster Admission
+
+<!--
+Only when this PR adds a case to hack/eval/blocking-roster.txt. Otherwise delete this section.
+The rules are in docs/eval-gate-roster.md, "The five rules a seat meets". Rules (c), (d) and (e)
+are checked by scripts/test_eval_rosters.py; these two are yours to show.
+
+- (a) The red run: the case failing for the right reason against `main` without the fix it
+  guards. Link the build or artifact, name the check that failed and why, and quote one line
+  of the agent's report.
+- (b) The misses: every failed repetition in the case's last 20 runs at the current version
+  key, each classified as an agent regression (with its issue) or an infra class the harness
+  excludes. "None" is a complete answer when there were none.
+-->
+
+- Red run:
+- Classified misses:
+
 ## Risk & Rollout
 
 <!--

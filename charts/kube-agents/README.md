@@ -597,6 +597,25 @@ policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and fr
 the webhook port when the webhooks render, stay open. A `helm upgrade --reuse-values` from
 a release that predates `operator.metrics` renders with the listener off until the value is set.
 
+### Health-cohort rules (`platformAgent.healthRules`)
+
+`platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
+`Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
+operator's gauges, and the recording rules for their ratios; the alerts are listed on
+[Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
+Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
+into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
+in `gmp-public`; configure that first, since a Cloud Monitoring alerting policy does not read a
+`Rules` object. `true` fails at apply time where the `Rules` CRD is absent. Every threshold and
+sample floor is a value under `platformAgent.healthRules.thresholds`, with its default in
+`values.yaml`; set a ratio through a values file or `--set-json` (`helm --set` keeps a decimal as a
+string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
+the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
+defaults and keeps the release's values, or every threshold set; the schema requires the whole
+block and the template says so when it is missing. The rules read the operator's scrape, so
+enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
+render with a message.
+
 ### Turning telemetry off
 
 A cluster with no collector needs nothing done: when discovery completes and

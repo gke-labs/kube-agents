@@ -421,6 +421,13 @@ Unit tests cover the deterministic pieces of the flow (they mock the Hermes
   `KAGE_SLACK_UX`: what `inventory_presenter.py` parses and how it lays the
   report out as text and as Block Kit, and the delivery script's flag gate,
   Block Kit post and fallbacks.
+- `../../../scripts/test_inventory_card.py` — `inventory_card.py`, the first
+  report's card built from the stored findings (the items, scores, limits and
+  shown files) rather than the report's text; not yet wired into the delivery
+  stage, which still posts `inventory_presenter.py`'s card. Covers the selection
+  recomputed and checked against the shown file, both card shapes, the row cap,
+  dismissed rows, every reason it gives up, and the shared conformance cases
+  `tests/conformance/chat/first-report-*.json` it writes.
 
 Each once-only step is covered twice: once for acting, once for refusing to act
 again (Rule 8).
@@ -431,4 +438,5 @@ Run from the repository root:
 python3 -m unittest discover -s agents/chat/defaults/plugins/bootstrap_onboarding -p 'test_*.py'
 python3 -m unittest agents.chat.scripts.test_bootstrap_onboarding_scripts
 python3 -m unittest agents.chat.scripts.test_inventory_presenter
+python3 -m unittest agents.chat.scripts.test_inventory_card
 ```

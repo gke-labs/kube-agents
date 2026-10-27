@@ -159,9 +159,13 @@ the verdict's **Record says** column once the store holds a full window (`would-
 before that the nightly runs, what failed and why each failure was the case's own regression
 or an infrastructure class the harness already excludes. The roster page's hold-out entries
 are the shape of the evidence a reviewer expects, and its "Admitted on the record since the
-split" entries are the shape of the admission itself.
+split" entries are the shape of the admission itself. A seat also meets the five rules under
+"The five rules a seat meets" on that page; the pull request shows the red run and the
+classified misses in the template's roster-admission block.
 
-**Check:** none mechanical, but the approver is: a roster edit, and a presubmit-seat edit,
+**Check:** `scripts/test_eval_rosters.py` checks three of those rules: a guarded fixture, an
+exact objective check, and the presubmit's wall-time budget. The approver checks the rest: a
+roster edit, and a presubmit-seat edit,
 needs an `approved` from the `eval-crew` alias ([`hack/OWNERS`](../hack/OWNERS) scopes
 `hack/eval/blocking-roster.txt` and `presubmit-cases.txt` to it), and a root approver
 alone cannot merge either. The nightly file and the case directory itself need only the

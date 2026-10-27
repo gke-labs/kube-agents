@@ -52,6 +52,12 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if args := os.Args[1:]; isFeedbackCommand(args) {
+		if err := feedbackMain(ctx, args, os.Stdout, os.Stderr, log); err != nil {
+			return exitFailure
+		}
+		return 0
+	}
 	if err := realMain(ctx, log); err != nil {
 		return exitFailure
 	}
@@ -127,15 +133,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	natsOpts := []nats.Option{
-		// The gateway user may only subscribe under its own inbox prefix
-		// (per-user _INBOX prefixes, deployment spec); the JS API replies
-		// every publish and consume depends on land there.
-		nats.CustomInboxPrefix("_INBOX.gateway"),
-	}
-	if cfg.NATSUser != "" {
-		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
-	}
+	natsOpts := gatewayNATSOptions(cfg)
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
@@ -262,6 +260,21 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
 	return serve(ctx, cfg, gw.Metrics(), log, gw.Run)
+}
+
+// gatewayNATSOptions is how the gateway's user dials, the gateway's own
+// connection and the feedback export's alike.
+func gatewayNATSOptions(cfg *gateway.Config) []nats.Option {
+	natsOpts := []nats.Option{
+		// The gateway user may only subscribe under its own inbox prefix
+		// (per-user _INBOX prefixes, deployment spec); the JS API replies
+		// every publish and consume depends on land there.
+		nats.CustomInboxPrefix("_INBOX.gateway"),
+	}
+	if cfg.NATSUser != "" {
+		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
+	}
+	return natsOpts
 }
 
 // chatNotifier builds the chat.notify route for the backend adapter, or nil

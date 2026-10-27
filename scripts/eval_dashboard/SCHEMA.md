@@ -168,6 +168,13 @@ layout and are collected from the moment they start running.
       `delegation-ceiling`. The run page, the PR view and the PR comment's
       result cell count it in a case's total and name it apart; the Cases
       page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      An `infra` rep whose `reason` carries `fixture-drift:<role>` is a
+      **fixture** rep: `hack/ci-eval-pr.sh` recorded it without running it
+      because the lease-time seeded-fleet scan saw a fixture the case needs
+      out of its designed state (`bench/kube_agents_bench/fixture_drift.py`).
+      The same readers count it apart from the storm and the ceiling, and
+      `classify.py` classes a case whose ungraded reps are all of this kind
+      `fixture-drift`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -551,8 +558,9 @@ what the renderer does with them.
 ### `coverage` — from `docs/designs/domains.yaml`
 
 - `domains_total` — number of entries under `domains:`.
-- `uncovered` — the `allowlist` entries (the domains known-uncovered
-  today).
+- `uncovered` — the `slug` of each `allowlist` record (the domains
+  known-uncovered today), in file order. The records' other fields (`since`,
+  `issue`, `owner`, `expires`) are not carried.
 - `domains_covered` — `domains_total − len(uncovered)`.
 
 ## Sources
@@ -820,7 +828,7 @@ recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
 the suite could not evaluate; empty on every other verdict), `cases[]`
 (`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
 do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
-ceiling}`) and `health_at` (the verdict in force when it finished, from
+ceiling, fixture}`) and `health_at` (the verdict in force when it finished, from
 history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -877,8 +885,8 @@ when none is on record),
 each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
-previous_build, parts[], missing_parts[], running_parts[], turn1_p50_s,
-turn1_p95_s, cases[]}`. A
+previous_build, parts[], missing_parts[], running_parts[],
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, cases[]}`. A
 night is one nightly run, or the main, main-b and writers parts' runs of
 one date:
 a run's date is the UTC date of its start plus 15 minutes
@@ -919,6 +927,12 @@ run is on record no night names main-b; once the main job runs the whole
 matrix again, a night short of a main case is incomplete without naming a
 part, and one short of a former main-b or writers case reports that part
 missing.
+`verdict_withheld_by` is the first of `main` and `main-b` the night lacks
+— in `missing_parts[]` or `running_parts[]`, or, for `main`, absent from
+`parts[]` — and `null` otherwise: that half's cases were never compared, so
+neither the digest nor the Nightly page and the Brief give a newly-failing
+verdict for the night, though `newly_failing` still lists what the parts on
+record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
 infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s}` with `state` in `pass|partial|fail|infra`

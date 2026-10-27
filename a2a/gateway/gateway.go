@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -179,6 +180,9 @@ type Gateway struct {
 	usage usageSource
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
+	// feedback is the answer-feedback recorder, set by Run once the
+	// feedback bucket is found (startFeedback); nil leaves answers unmarked.
+	feedback atomic.Pointer[feedbackDesk]
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
@@ -574,6 +578,9 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Its first try before the relay starts, so on an install with the
+	// bucket every answer the relay posts is marked alike.
+	g.startFeedback(ctx)
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
@@ -819,7 +826,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// Nor for a shortcut: the conversation is a thread under someone
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
-		notified := msg.Unaddressed || msg.Shortcut
+		//
+		// Nor for a press of Slack's Stop button: it asked the bot for
+		// nothing, and the notice would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
@@ -1002,6 +1012,14 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
+	case stopping && isSlackStop(msg, backend) &&
+		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
+		// Only the people who asked for work in a Slack thread may press
+		// its Stop button (stopgate.go). Anyone else's press cancels
+		// nothing and posts nothing. A typed `stop` keeps the rule below.
+		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
+	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
+		g.slackStop(ctx, rec, authority, backend)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -1367,11 +1385,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
 		// that ran the heal then routes against the wake as its active task.
+		// As the relay does: a task, a human turn or a child, that handed
+		// the ask to cards leaves the answer, and its rating, to the card's
+		// report (AnswerFeedbackTarget rates only such a chain).
+		toCards := healedTask != nil &&
+			(cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask)))
+		if toCards {
+			rec.markCardsAnswer(active.TaskID)
+		}
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -2699,6 +2725,14 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // terminal event for a task it doesn't supervise; it just stops letting that
 // task serialize new ones. It reports whether the cancel reached the bus.
 func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority Authority) bool {
+	return g.cancelTaskVoiced(ctx, rec, authority, false)
+}
+
+// cancelTaskVoiced is cancelTask, and quiet posts neither of its lines: the
+// Slack Stop button's path (slack_stop.go) answers with one reply of its own,
+// and marks the task so the relay posts no "canceled" for it either
+// (TaskRef.QuietCancel).
+func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, authority Authority, quiet bool) bool {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
@@ -2709,7 +2743,9 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("cancel publish failed", "taskId", active.TaskID, "err", err)
-		g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+		if !quiet {
+			g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+		}
 		return false
 	}
 	active.Detached = true
@@ -2722,10 +2758,14 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// residue; replaying the in subject for the cancel envelope is the
 	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
-	// The post before the signal: a waiter woken by the signal snapshots the
-	// conversation's entries, and the line saying the cancel went belongs in
-	// what it reads.
-	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	if quiet {
+		rec.markQuietCancel(active.TaskID)
+	} else {
+		// The post before the signal: a waiter woken by the signal snapshots
+		// the conversation's entries, and the line saying the cancel went
+		// belongs in what it reads.
+		g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	}
 	g.observeCancel(rec, active.TaskID)
 	return true
 }

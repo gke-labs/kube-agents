@@ -258,9 +258,9 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # What the flag has to do, and where:
 #   - section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the jobs
-#     named below (a mis-set variable on the nightly or another postsubmit would
-#     otherwise run that job in next mode, so today's window and dashboard
-#     would silently miss it), and refuses a
+#     named below (a mis-set variable on any other periodic or postsubmit
+#     would otherwise run that job in next mode, so its today-mode record
+#     would silently go missing), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout, worker and console
@@ -316,9 +316,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
 # main (the main part's two halves, main-a and main-b, and the writers part),
 # which grade the full catalog under next (the nightly the dashboard and
-# the digest read; ci-kube-agents-eval-nightly-today, the today-mode nightly
-# kept as the rollback check, is not listed and so is refused the flag); the
-# GitLab lane's nightly under next (EVAL_FORGE=gitlab,
+# the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
@@ -328,7 +326,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # -- a presubmit is admitted by the second on a pull request and the blocking
 # one by the first on a Tide batch, the periodic, the nightlies and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
-# the flag leaking into the today nightly's or another postsubmit's environment
+# the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. Admitting a job here never lets it write today's window:
@@ -386,6 +384,12 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
+# The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
+# `stop` sent through the inject door stops the conversation's kanban cards,
+# which chat-stop-halts-delegated-remediation grades. The operator renders
+# it onto the gateway from its own environment; only an exact "true" arms it.
+readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
+readonly A2A_CARD_STOP_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -983,10 +987,10 @@ fi
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
 # keeps the today lane out of the recorder, and bench-gate separately refuses
 # a pull request's sample, bench/baselines/README.md), so what the flag
-# mis-set on a job that is not the lane's -- the today nightly, another
-# postsubmit -- would do is run that job in next mode and leave today's
-# window and dashboard silently missing it, its verdict measuring the wrong
-# stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
+# mis-set on a job that is not the lane's -- the today-mode GitLab nightly, another
+# postsubmit -- would do is run that job in next mode and leave the
+# dashboard silently missing its today-mode run, its verdict measuring the
+# wrong stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
 # scheduled jobs are admitted by being named and every other Prow run without
 # a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
@@ -1006,7 +1010,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     echo "       The flag is for a pull request's presubmit or a job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
     echo "       postsubmit under it would run in next mode instead of today's, leaving" >&2
-    echo "       today's baseline and dashboard silently missing that run." >&2
+    echo "       its today-mode dashboard record silently missing." >&2
     exit 1
   fi
 fi
@@ -1460,6 +1464,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
     --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
     --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
+    --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
+    --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
   )
 fi
 

@@ -773,7 +773,7 @@ only the gateway's grant reaches (the 9/9 split), never on its `…events`. The 
 every task this rule reaches is detached, and detached means a `stop` already
 published a cancel, so the gateway is finishing the cancel the requester asked for
 rather than reporting an error. That keeps assertion 13's enumeration intact
-(`canceled`, or `completed` if the race was lost) and keeps replay able to tell a
+(`canceled`, or the race-lost outcomes it lists) and keeps replay able to tell a
 stopped task from one that broke. Deleting first strands the task
 non-terminal for the whole retention window - the adapter's deadline dies with the
 process, and a deleted pod never reaches the terminal phase Sweep watches for - which
@@ -1083,8 +1083,9 @@ not be silent about it.
   with `inject:` and delivers an `InboundMessage`; from there the turn is indistinguishable from
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
-  the persona. The harness sends none of them, and a case whose prompt opens with one is the
-  case's defect. The reply carries the task id, so the caller can await a named task rather
+  the persona. The harness sends none of them as a prompt, and a case whose prompt opens with
+  one is the case's defect; a stopped ask's `stop`, sent after the opening turn, is the one it
+  sends itself. The reply carries the task id, so the caller can await a named task rather
   than guessing which post belongs to its submission, and the gateway's first-event grace, so the
   caller can set its own deadline above the window the gateway already owns.
 
@@ -1223,7 +1224,7 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
-`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`) and any reason it does not
+`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
 runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
 renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
@@ -1601,10 +1602,12 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
-escaped text instead. The gateway answers clicks only on the choice buttons it draws itself
-from a chat message (the Slack adapter section), so a button on such a card would be clicked
-into nothing: the gateway refuses any interactive block or element in raw blocks (an `actions`
-or `input` block, a button, a select, a date or time picker, a text input). The blocks are decoded into slack-go's types and sent again,
+escaped text instead. The gateway answers clicks only on the choice buttons and rating controls
+it draws itself (the Slack adapter section), so a button on such a card would be clicked into
+nothing, or, as a rating block, rate under a task id the sender chose: the gateway refuses any
+interactive block or element in raw blocks (an `actions` or `input` block, a button, a select, a
+date or time picker, a text input, a `context_actions` block and its `feedback_buttons` and
+`icon_button` elements). The blocks are decoded into slack-go's types and sent again,
 so a block type it does not know travels as written and a field it does not model may not. A
 home channel that is not a channel id leaves the route unarmed; the gateway logs
 "chat.notify route not armed" at start.
@@ -1730,7 +1733,21 @@ adds that if the agent filed a card, that card keeps working until it finishes, 
 `stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
 stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
-A bare `/session` asks for the next message in its thread.
+A bare `/session` asks for the next message in its thread. Slack's Stop button on an Agent
+Session's Working… line sends `agent_session_stopped`, which the adapter turns into a cancel that
+names no task, keyed on the thread's conversation, with `IntentCancel`, which no chat message
+carries, so the gateway tells the button from the word. The event names no team for the presser, so
+the adapter checks the workspace itself: a member the allowed-users list names passes, anyone else
+must be in this workspace by `users.info` (cached per member for five minutes), and a lookup that
+fails, or a workspace auth.test never named, drops the press. Only a requester the conversation's record
+holds (a task's requester or steer author, or a session author) may press it; anyone else's press
+cancels nothing and posts nothing (`stopgate.go`), while typed `stop` keeps its rule. A record that
+cannot tell who asked gates nobody: nothing ran, a requester was cleared past `AskTTL`, a steer or
+session author was dropped past its cap, or the history is at its cap (`cannotTellWhoAsked`). With
+the card
+stop armed the button cancels the turn without the `🛑` lines and sends the same control, and the
+gateway words the result as the Slack Stop's one reply (`slack_stop.go`); unarmed, it is a typed
+`stop`.
 
 The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
 is keyed that way. It is the form a DM record from before DMs threaded carries, so such
@@ -1939,7 +1956,7 @@ otherwise leaves the old process's Working… on it; the thread is renamed once 
 verified ask that is not a gateway command, with today's title rules: the ask up to its first
 question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
-three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
+three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses
@@ -2097,6 +2114,108 @@ answered recomputes who is waiting and reads the board only once the snapshot ha
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
 A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+
+### Answer feedback (added 10/16)
+
+A chat user rates the final answer of an ask 👍 or 👎, and the rating keeps the exchange so an
+operator can turn it into an eval case: a 👎 one the answer should fail, a 👍 one it should pass. The gateway marks the one message that answers the ask
+(`OutMessage.Feedback`, the root task id of the ask's chain), and it is one of two. When the
+Planning Agent answers itself, it is the completed result of the task whose end is the chain's
+(`observedAs`), never a hand-off line (`handOffEnd`), the same message the `DeliverableObserver`
+is handed. When a task of the chain hands the ask to kanban cards (its terminal mark keeps the
+ask's kind, `cardsPending`, or it published `handoff`; a delegated child's counts), the chain's
+root records it (`CardsAnswer`) and no relay answer in the chain is marked, the acknowledgement
+and a wake's reply included. The answer is then the card report the kanban notifier flags with
+`answer_to` on its conversation notify: the report of the card whose settle finished the ask's
+plan (so one per ask; a fan-out's children fold into their rows and post nothing, so it is the
+creator's), naming that plan's `update` key. The notify route marks it under the ask the key is
+bound to (`notifyChainIndex`, bound by the plan's first mark), laid out or, for a report that
+posts as text (an actionable one), on its last chunk; a key no ask holds is not marked rather than
+guessed at; so is a key bound to a chain that did not hand its ask to cards, and a second card
+answer for an ask that already has a rated one (an ask's follow-up cards can settle a second plan),
+which the gateway remembers per process. Some asks go unrated rather than rated wrongly: the notifier keeps the plan in
+memory, so a card that settles an ask after the agent restarted is not flagged (one that sent a progress note since the restart opened a new plan, whose key binds to the conversation's latest ask, and is rated only if that ask was handed to cards too, taking that ask's one rated card answer, so its own report then posts unrated); a last card that
+gives up without a hard-wall reason posts no answer to flag; a plan whose first post Slack refused has no key, so its ask's answer is not flagged; a plan records one answer, at the settle that first finished it, so a card unblocked after it gave up adds no second rated report; the flag is read once, so a report
+whose send is retried goes out unflagged; and a plan's key binds to the conversation's latest ask
+at the plan's first mark, so a follow-up asked before that mark takes the card's answer. Plan rows, progress, a question waiting on the
+user, notices, any other report, a card failure the wake explains and a keyed notify are not
+marked. A text answer chunked under the cap
+carries the mark on its last chunk. A card answer that also offers a next step or options keeps
+them as its buttons, with the rating controls under them as the last block.
+
+The Slack adapter draws the mark as Slack's own feedback buttons: a `context_actions` block holding
+one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the message's last
+block, inside its side bar when it has one (an attachment draws after every top-level block, and
+Slack draws the block there too, seen live). The block's id carries the task id
+(`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. Every other backend ignores the mark. A tap is never a turn,
+and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
+another workspace's member, changes nothing.
+
+A 👍 is counted and kept with the ask and the rated answer, and nothing is posted (Slack fills the
+tapped icon itself); a rater has one rating per answer, so it replaces that rater's 👎 on the same
+answer and drops its note, which said what went wrong. A 👎 is
+counted and kept with the rated answer first, one KV write, and only once it is kept opens a modal
+on the tap's trigger, which lapses three seconds after the tap ("What went wrong?" over one
+optional field, "Anything else?", of up to 500 characters, and a line telling the rater how long
+their question and the answer are kept, read from the bucket's max age, or, when the kept record
+holds no ask (past `AskTTL`, a reaped session), how long the answer is kept: "This answer is kept on
+your install for 30 days so an operator can turn it into a test."); a write that fails opens
+nothing. The gateway takes the ask from the session record: the human message that started the
+rated chain (`TaskRef.Request` on the root entry, as written and held to its 1 KiB cap, until
+`AskTTL` clears it), so a later message in the thread, or another person's, is never taken for
+it, and the adapter reads nothing of the thread; a draft whose ask was no longer on record says so
+in its `prompt` rather than shipping an empty one. The answer is the rated message's text, which for a text answer longer than one chunk is
+its last chunk. Send writes the note into the kept 👎 and posts "Thanks. I kept this answer for
+your team to review." to the rater alone, followed by a link to the project's feedback form
+(`https://gke-labs.github.io/kube-agents/feedback`, nothing pre-filled) and a warning that it opens
+a public issue, so the install's details stay out of it (`chat.postEphemeral`, in the thread); with no 👎 kept (its
+write failed, or a 👍 replaced it) it keeps nothing and posts nothing. Cancel keeps the 👎 without a note. A note and
+a re-rating merge under the record's revision (`mergeFeedback`), so neither loses the other's part,
+and the ratings on one answer by one rater run one at a time, so a 👍 tapped while the 👎 is still
+being written replaces it. A redelivered Send (Socket Mode is at-least-once) is handled once.
+No new scope: `chat:write` covers the ephemeral line, and `views.open` takes only the trigger.
+
+A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
+(`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
+member id, the conversation and rated message, the task and context ids, the ask and the answer.
+It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
+creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
+the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
+unmarked otherwise (an install whose operator predates the bucket, or a bucket someone recreated
+without one), looking again every minute for 30 minutes so that a provision Job finishing after an
+upgraded gateway started still turns it on, then stopping, so a NATS server that never grants the
+gateway the bucket does not log a refused request every minute; and the gateway's user is the only reader and writer of its
+records by grant (provision and seed hold STREAM.INFO on it, which can list the keys: task id and rater). It is capped at 64MiB, past which a rating is counted but not kept. Logs carry the task id, the
+conversation and the rating, never the text; `answer_feedback_total` carries only the platform and
+the rating.
+
+An answer whose layout is already at Slack's 50-block cap posts laid out without the controls. The
+answered line a click or typed reply leaves on an answer's question goes above the controls, which
+stay the last block.
+
+An operator reads the bucket through the gateway's own binary, in its pod, since nothing else holds
+the bucket's credentials:
+`kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- /gateway feedback export [--since 7d] > feedback.tar`.
+Each kept rating becomes a directory `feedback-<date>-<hash>/` (more digits when two would share one)
+holding `task.yaml`, a draft case per [`bench-case-format.md`](bench-case-format.md) (the ask as its
+`prompt`, `deployer: noop`, and TODOs for `domain`, `owner` and the `verification_spec`; a 👎's
+header comment and `expected_output` carry its note, a 👍's say the rated answer was good and the
+checks should pass on it), and `transcript.md`, the ask, the answer and any note with their ids. The draft is for a person to finish and submit; `transcript.md` holds the
+install's data and stays out of the pull request. The install never writes to this repository, and
+no sink files the drafts anywhere: nothing is filed automatically into the public kube-agents
+repository, and a rating leaves the install only if the customer chooses to send it.
+
+The Slack Home tab ends, under a divider, with "This week: N 👍, M 👎", the kept ratings given in
+the last seven days (`FeedbackRecorder.Tally`, every current record read over one watcher),
+reused for five minutes (one minute after a failed read) and left out when feedback is off or the
+tally cannot be read; a new rating shows once the count is read again.
+
+An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
+operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an
+install that never set the field keeps its gateway pod unchanged; the gateway then never looks for
+the bucket, marks no answer and hands the adapter no recorder, so a tap on a button already posted
+is acked and changes nothing (Slack still fills the tapped icon; no box opens).
 
 ## The console adapter (added 9/23)
 
@@ -2373,6 +2492,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_messages_inbound_total`      | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                 | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                                   |
+| `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`                                                | Each rating a verified sender gave an answer ("Answer feedback" under the Slack adapter), counted before the 👎's record is written, so a rating the bucket could not keep still counts; a rating changed counts again.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter

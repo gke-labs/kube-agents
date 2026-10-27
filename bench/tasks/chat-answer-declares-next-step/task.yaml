@@ -9,8 +9,7 @@
 # The report-format stanza every card carries
 # (deploy/docker/patches/kanban_report_format.py) tells the worker to;
 # before it, a worker ended on an offer in prose ("Want me to raise the
-# limit?") and nothing could be clicked. chat-failure-reply-declares-next-step
-# grades the front door's half; this case grades the worker's.
+# limit?") and nothing could be clicked. This case grades the worker's half.
 #
 # The ask is a diagnosis with an obvious follow-up: payments-api crash-loops
 # on an OOM against its 64Mi limit, so the next step is the fix (or a closer
