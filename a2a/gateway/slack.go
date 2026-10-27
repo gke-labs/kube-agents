@@ -275,6 +275,11 @@ type SlackAdapter struct {
 	// pressers caches each Stop presser's workspace answer (slack_stop.go,
 	// presserInWorkspace), so a press costs at most one users.info call.
 	pressers map[string]slackPresser
+	// boardActor acts on a board-health row's Retry or Drop, and boardTaps
+	// holds each row whose tap is running or landed, under s.mu
+	// (slack_board.go).
+	boardActor BoardActor
+	boardTaps  map[string]bool
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.

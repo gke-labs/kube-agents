@@ -17,7 +17,8 @@ import (
 
 // The Slack renderer for kube-agents.chat/v1 (spec-a2a-payloads.md, "Chat
 // messages"): one validated chat message laid out as Block Kit, in the
-// spec's fixed order -- headline and note, detail, rows, after, fold, then
+// spec's fixed order -- headline and note, detail, rows (each with its own
+// buttons under it when it asks for them, slack_board.go), after, fold, then
 // the buttons, choices before links; in a progress message the plan follows
 // the headline in the rows' place. The layout is the today presenter's
 // (agents/platform/scripts/slack_presenter.py blocks_report and with_side_bar,
@@ -115,8 +116,10 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 	}
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		blocks = append(blocks, slackChatPlan(m.Plan)...)
-	} else if rows := slackChatRows(m.Rows); rows != nil {
-		blocks = append(blocks, slackChatDivider(), rows, slackChatDivider())
+	} else if rows := slackChatRowBlocks(m.Rows); rows != nil {
+		blocks = append(blocks, slackChatDivider())
+		blocks = append(blocks, rows...)
+		blocks = append(blocks, slackChatDivider())
 	}
 	if after := slackChatAfter(m.After); after != nil {
 		blocks = append(blocks, after)
@@ -168,7 +171,7 @@ func renderSlackChat(m *chatmsg.Message, text string) (slackChatLayout, error) {
 // notify route's own check, reads every mrkdwn text object, so the two Block
 // Kit paths hold one bound; and blocksInteractive finds no interactive
 // element outside the actions blocks the renderer wrote itself from the
-// message's choices and links. Either firing means a field reached Slack in
+// message's choices, links and rows' actions. Either firing means a field reached Slack in
 // a form it would act on, and the fallback is the safe answer.
 func refuseSlackChat(blocks []map[string]any) error {
 	// The checks walk decoded JSON (map[string]any, []any, string), so the
@@ -266,6 +269,36 @@ func slackChatRows(rows []chatmsg.Row) map[string]any {
 		return nil
 	}
 	return slackRichBlock(sections)
+}
+
+// slackChatRowBlocks is the rows as blocks: one rich_text block holding them
+// all (slackChatRows), unless a row carries buttons (chatmsg.Row's Actions,
+// slack_board.go), when each row is a block of its own keyed by its index,
+// with its buttons' actions block under it.
+func slackChatRowBlocks(rows []chatmsg.Row) []map[string]any {
+	acting := false
+	for _, r := range rows {
+		acting = acting || len(r.Actions) > 0
+	}
+	if !acting {
+		if block := slackChatRows(rows); block != nil {
+			return []map[string]any{block}
+		}
+		return nil
+	}
+	var blocks []map[string]any
+	for i, r := range rows {
+		block := slackChatRows([]chatmsg.Row{r})
+		if block == nil {
+			continue
+		}
+		block["block_id"] = fmt.Sprintf(slackBoardTextBlock, i)
+		blocks = append(blocks, block)
+		if buttons := slackBoardButtons(i, r); buttons != nil {
+			blocks = append(blocks, buttons)
+		}
+	}
+	return blocks
 }
 
 // slackChatAfter is the lines after the rows, one section each.
