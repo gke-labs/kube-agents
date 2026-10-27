@@ -425,7 +425,56 @@ func TestSubscribeHeldRefusalIsNotRetried(t *testing.T) {
 		t.Fatalf("the refusal consumed the whole context (%v); it was retried for the bind window", took)
 	}
 	if capture.contains("durable bind failed; retrying") {
-		t.Errorf("a refusal was retried: %q", capture.lines)
+		t.Errorf("a refusal was retried:\n%s", capture.String())
+	}
+}
+
+// The other half of the rule: a durable that does not exist yet is retried
+// for the bind window, so a worker that starts before the operator binds once
+// the operator has run EnsureHeldConsumer, instead of exiting at once.
+func TestSubscribeHeldWaitsForTheOperatorToCreateTheDurable(t *testing.T) {
+	h, _ := newHeldHarness(t, "waitsforop")
+	capture := &logCapture{}
+	nc, _ := h.req.conn()
+	worker, err := Connect(h.ctx, nc.ConnectedUrl(), WithName("worker-logged"), WithLogger(slog.New(capture)))
+	if err != nil {
+		t.Fatalf("Connect worker: %v", err)
+	}
+	t.Cleanup(worker.Close)
+
+	bound := make(chan error, 1)
+	go func() {
+		sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(context.Context, Delivery) {})
+		if err == nil {
+			sub.Stop()
+		}
+		bound <- err
+	}()
+	// The operator arrives only after the worker's first attempt has been
+	// refused for a missing durable and logged as a retry.
+	deadline := time.Now().Add(10 * time.Second)
+	for !capture.contains("durable bind failed; retrying") {
+		select {
+		case err := <-bound:
+			t.Fatalf("SubscribeHeld returned before the operator created the durable: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no retry of the missing durable was logged:\n%s", capture.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.ensure(1, 30*time.Second)
+	select {
+	case err := <-bound:
+		if err != nil {
+			t.Fatalf("SubscribeHeld after the operator created the durable = %v, want it bound", err)
+		}
+	case <-h.ctx.Done():
+		t.Fatalf("SubscribeHeld did not bind once the durable existed:\n%s", capture.String())
+	}
+	if !capture.contains("durable bound after retry") {
+		t.Errorf("the bind that followed the operator was not logged as a retry's success:\n%s", capture.String())
 	}
 }
 
