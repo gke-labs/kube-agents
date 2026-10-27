@@ -152,23 +152,32 @@ ENUM_MEMBER_SEPARATOR = ", "
 LT_ENTITY = "&lt;"
 GT_ENTITY = "&gt;"
 PIPE_ESCAPE = "\\|"
-# How a validation marker reads in the Constraints column. A marker on the
-# items of a list (`items:Pattern`) is labelled through the same table with
-# an `items:` prefix; a marker not listed here is shown as its own name.
-CONSTRAINT_LABELS = {
-    "Enum": "one of",
-    "Minimum": "min",
-    "Maximum": "max",
-    "MinLength": "min length",
-    "MaxLength": "max length",
-    "MinItems": "min items",
-    "MaxItems": "max items",
-    "MinProperties": "min properties",
-    "MaxProperties": "max properties",
-    "Pattern": "pattern",
-    "MultipleOf": "multiple of",
-    "Format": "format",
+# The validation markers the Constraints column shows: how each reads on the
+# page, and the schema keyword controller-gen writes for it, which the parity
+# test in test_gen_crd_docs.py reads back from the committed CRD YAML. One
+# table for both, so a marker cannot render on a page that the test does not
+# know. A marker on the items of a list (`items:Pattern`) goes through the
+# same table with an `items:` prefix; a marker not listed here is shown as
+# its own name, and the parity test fails on it until it is added.
+CONSTRAINT_MARKERS: dict[str, tuple[str, str]] = {
+    "Enum": ("one of", "enum"),
+    "Minimum": ("min", "minimum"),
+    "Maximum": ("max", "maximum"),
+    "MinLength": ("min length", "minLength"),
+    "MaxLength": ("max length", "maxLength"),
+    "MinItems": ("min items", "minItems"),
+    "MaxItems": ("max items", "maxItems"),
+    "MinProperties": ("min properties", "minProperties"),
+    "MaxProperties": ("max properties", "maxProperties"),
+    "Pattern": ("pattern", "pattern"),
+    "MultipleOf": ("multiple of", "multipleOf"),
+    "Format": ("format", "format"),
 }
+# Markers whose keyword controller-gen also writes with no marker present:
+# `format: int32`, `int64` or `byte` comes from the Go width of every such
+# field. The schema therefore carries these where no row does, so the parity
+# test holds a marker to its keyword, never the keyword to a marker.
+SCHEMA_IMPLIED_MARKERS = frozenset({"Format"})
 CONSTRAINT_ITEMS_PREFIX = "items:"
 CONSTRAINT_ITEMS_LABEL = "items"
 # controller-gen separates enum members with `;`.
@@ -667,7 +676,7 @@ def render_constraint(constraint: dict[str, str]) -> str:
     if name.startswith(CONSTRAINT_ITEMS_PREFIX):
         prefix = f"{CONSTRAINT_ITEMS_LABEL} "
         name = name[len(CONSTRAINT_ITEMS_PREFIX) :]
-    label = CONSTRAINT_LABELS.get(name, name)
+    label = CONSTRAINT_MARKERS[name][0] if name in CONSTRAINT_MARKERS else name
     if name == "Enum":
         shown = ENUM_MEMBER_SEPARATOR.join(f"`{member}`" for member in value.split(ENUM_SEPARATOR))
     else:

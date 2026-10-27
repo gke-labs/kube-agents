@@ -161,6 +161,23 @@ FIXTURE = textwrap.dedent(
     	// +optional
     	Speed Speed `json:"speed,omitempty"`
 
+    	// Since is when the widget started, with a format the schema also
+    	// writes for integer widths without any marker.
+    	// +kubebuilder:validation:Format=date-time
+    	// +optional
+    	Since string `json:"since,omitempty"`
+
+    	// Step is the widget's increment.
+    	// +kubebuilder:validation:MultipleOf=5
+    	// +optional
+    	Step *int32 `json:"step,omitempty"`
+
+    	// Notes are bounded in number.
+    	// +kubebuilder:validation:MinProperties=1
+    	// +kubebuilder:validation:MaxProperties=8
+    	// +optional
+    	Notes map[string]string `json:"notes,omitempty"`
+
     	Extra Part `json:"extra"`
     }
 
@@ -305,6 +322,26 @@ class FixturePackageTest(unittest.TestCase):
         )
         self.assertEqual(self.spec["name"]["default"], "")
         self.assertEqual(self.spec["name"]["constraints"], [])
+
+    def test_every_marker_the_generator_emits_is_one_the_page_and_the_parity_test_name(self):
+        # The page labels a marker and the parity test maps it to its schema
+        # keyword through the one table; a marker outside it would render as
+        # its bare name and fail the parity test, so the fixture carries the
+        # less common ones too.
+        self.assertEqual(self.spec["since"]["constraints"], [{"name": "Format", "value": "date-time"}])
+        self.assertEqual(self.spec["step"]["constraints"], [{"name": "MultipleOf", "value": "5"}])
+        self.assertEqual(
+            self.spec["notes"]["constraints"],
+            [{"name": "MinProperties", "value": "1"}, {"name": "MaxProperties", "value": "8"}],
+        )
+        emitted = {
+            constraint["name"].removeprefix("items:")
+            for tree in (self.spec, self.status)
+            for row in tree.values()
+            for constraint in row["constraints"]
+        }
+        self.assertEqual(sorted(emitted - set(generate_docs.CONSTRAINT_MARKERS)), [])
+        self.assertLessEqual(generate_docs.SCHEMA_IMPLIED_MARKERS, set(generate_docs.CONSTRAINT_MARKERS))
 
     def test_external_types_are_leaves_named_by_their_go_type(self):
         for path, type_name, kind in (
@@ -487,7 +524,7 @@ class CRDSchemaParityTest(unittest.TestCase):
                     collect_schemas(self.schema_tree(kind, tree), external, "", schemas)
                     for row in rows:
                         generated = sorted((c["name"], c["value"]) for c in row["constraints"])
-                        expected = sorted(schema_constraints(schemas[row["path"]]))
+                        expected = sorted(schema_constraints(schemas[row["path"]], generated))
                         if row["external"]:
                             # An upstream type brings its own validation
                             # (resource.Quantity's pattern); the page names the
@@ -508,25 +545,22 @@ class CRDSchemaParityTest(unittest.TestCase):
                     self.assertEqual(generated, defaults)
 
 
-# The schema keywords each validation marker writes, by marker name.
-SCHEMA_CONSTRAINT_KEYS = {
-    "Enum": "enum",
-    "Minimum": "minimum",
-    "Maximum": "maximum",
-    "MinLength": "minLength",
-    "MaxLength": "maxLength",
-    "MinItems": "minItems",
-    "MaxItems": "maxItems",
-    "Pattern": "pattern",
-}
+def schema_constraints(schema: dict, generated: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The constraints a schema node carries, spelled as the generator spells them.
 
-
-def schema_constraints(schema: dict) -> list[tuple[str, str]]:
-    """The constraints a schema node carries, spelled as the generator spells them."""
+    The marker table is the generator's own, so a marker the page labels is one
+    this reads back. A keyword controller-gen writes without a marker (`format`
+    from an integer's Go width) counts only where the generator emitted that
+    marker on the same node, so the schema's implied entries are not demanded
+    of the page.
+    """
+    emitted = {name for name, _ in generated}
     out: list[tuple[str, str]] = []
     for node, prefix in ((schema, ""), (schema.get("items") or {}, "items:")):
-        for marker, key in SCHEMA_CONSTRAINT_KEYS.items():
+        for marker, (_, key) in generate_docs.CONSTRAINT_MARKERS.items():
             if key not in node:
+                continue
+            if marker in generate_docs.SCHEMA_IMPLIED_MARKERS and prefix + marker not in emitted:
                 continue
             value = node[key]
             value = ";".join(value) if isinstance(value, list) else str(value)
