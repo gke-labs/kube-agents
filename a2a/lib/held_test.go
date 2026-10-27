@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -387,14 +388,44 @@ func TestSubscribeHeldLeavesTheConsumerAsTheOperatorMadeIt(t *testing.T) {
 			cc.MaxAckPending, cc.AckWait)
 	}
 
-	// Otherwise valid, so it is bind's filter check that refuses it.
+	// Otherwise valid, so it is bind's filter check that refuses it. The
+	// refusal is read from the durable's config and is not retried, so the
+	// call returns it at once under the harness's own context.
 	wrong := h.cfg()
 	wrong.Subject, wrong.Session = "a2a.tasks.someone-else.*.in", "someone-else"
-	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-	defer cancel()
-	if _, err := worker.SubscribeHeld(short, wrong, func(context.Context, Delivery) {}); err == nil ||
-		!strings.Contains(err.Error(), "filters") {
-		t.Errorf("binding a durable whose filter is not the requested intake = %v, want it refused for its filter", err)
+	if _, err := worker.SubscribeHeld(h.ctx, wrong, func(context.Context, Delivery) {}); err == nil ||
+		!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), "filters") {
+		t.Errorf("binding a durable whose filter is not the requested intake = %v, want ErrHeldBindRefused for its filter", err)
+	}
+}
+
+// A refusal read from the durable's stored config is final on the first
+// attempt: no retry, no "retrying" log line, and the caller gets the refusal
+// rather than whatever error the bind window happened to end on.
+func TestSubscribeHeldRefusalIsNotRetried(t *testing.T) {
+	h, _ := newHeldHarness(t, "norefusalretry")
+	h.ensure(1, 30*time.Second)
+	capture := &logCapture{}
+	nc, _ := h.req.conn()
+	worker, err := Connect(h.ctx, nc.ConnectedUrl(), WithName("worker-logged"), WithLogger(slog.New(capture)))
+	if err != nil {
+		t.Fatalf("Connect worker: %v", err)
+	}
+	t.Cleanup(worker.Close)
+
+	wrong := h.cfg()
+	wrong.Subject, wrong.Session = "a2a.tasks.someone-else.*.in", "someone-else"
+	started := time.Now()
+	_, err = worker.SubscribeHeld(h.ctx, wrong, func(context.Context, Delivery) {})
+	took := time.Since(started)
+	if err == nil || !errors.Is(err, ErrHeldBindRefused) {
+		t.Fatalf("SubscribeHeld on a mismatched filter = %v, want ErrHeldBindRefused", err)
+	}
+	if h.ctx.Err() != nil {
+		t.Fatalf("the refusal consumed the whole context (%v); it was retried for the bind window", took)
+	}
+	if capture.contains("durable bind failed; retrying") {
+		t.Errorf("a refusal was retried: %q", capture.lines)
 	}
 }
 
@@ -625,10 +656,8 @@ func TestSubscribeHeldRefusesADurableItCannotGate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create uncapped consumer: %v", err)
 	}
-	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-	defer cancel()
-	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
-		!strings.Contains(err.Error(), "MaxAckPending") {
+	if _, err := worker.SubscribeHeld(h.ctx, c, func(context.Context, Delivery) {}); err == nil ||
+		!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), "MaxAckPending") {
 		t.Errorf("bound a durable with no MaxAckPending cap: %v", err)
 	}
 
@@ -741,10 +770,8 @@ func TestSubscribeHeldRefusesAServerDefaultDurable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create default consumer: %v", err)
 	}
-	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-	defer cancel()
-	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
-		!strings.Contains(err.Error(), "EnsureHeldConsumer") {
+	if _, err := worker.SubscribeHeld(h.ctx, c, func(context.Context, Delivery) {}); err == nil ||
+		!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), "EnsureHeldConsumer") {
 		t.Errorf("bound a server-default durable: %v", err)
 	}
 }
