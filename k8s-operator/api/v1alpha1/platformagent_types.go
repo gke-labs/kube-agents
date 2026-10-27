@@ -325,6 +325,14 @@ type SlackSpec struct {
 	// +optional
 	HomeChannelName string `json:"homeChannelName,omitempty"`
 
+	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
+	// each final answer under spec.mode next, and keeps each rating with
+	// its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
+	// False hides the buttons and keeps nothing.
+	// +kubebuilder:default=true
+	// +optional
+	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
+
 	// HomeChannelPolicy ("auto", also absent, or "manual") is accepted and
 	// recorded in this release but has no effect yet: the A2A gateway does not
 	// learn a home channel, so HomeChannel alone decides. It is rendered to

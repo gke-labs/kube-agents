@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from kube_agents_bench import board
+from kube_agents_bench import board, parsing
 
 FRONT = "t_9f2ac41b"
 CHILD = "t_0c1d2e3f"
@@ -227,6 +227,26 @@ def set_card(
             )
 
 
+def block_card(root: Path, tid: str, reason: str, kind: str | None = "needs_input") -> None:
+    """Block ``tid`` as a worker's ``kanban_block`` does: the status, a ``blocked``
+    event carrying the block, and the worker's run closed with the reason as
+    its summary."""
+    with sqlite3.connect(root / board.BOARD_FILE) as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', ?)",
+            (tid, reason),
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT, created_at INTEGER)"
+        )
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, 0)",
+            (tid, json.dumps({"reason": reason, "kind": kind})),
+        )
+
+
 def local_shell(root: Path, monkeypatch: pytest.MonkeyPatch, on_read=None):
     """A stand-in for ``harness._agent_shell`` running the session-cards read here.
 
@@ -272,7 +292,7 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
     # Without ``want`` a read carries statuses alone.
     plain = board.read_session_cards(shell, SESSION, 5)
     assert plain is not None
-    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None}
+    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None, "block": None}
     read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
     assert read is not None and read.session_found
     assert read.total == 2
@@ -282,8 +302,14 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
         "status": "done",
         "result": "three clusters, all healthy",
         "summary": None,
+        "block": None,
     }
-    assert read.cards[CHILD] == {"status": "done", "result": None, "summary": "node pool resized"}
+    assert read.cards[CHILD] == {
+        "status": "done",
+        "result": None,
+        "summary": "node pool resized",
+        "block": None,
+    }
     shown = json.loads(read.as_shown(CHILD)["result"])
     assert shown == {
         "task": {"id": CHILD, "status": "done", "result": None},
@@ -381,3 +407,83 @@ def test_a_session_past_the_scan_bound_reports_its_total(
     read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
     assert read is not None
     assert (read.card_ids, read.total) == (cards[:3], 5)
+
+
+# --- a card paused on a question (#4004) ----------------------------------------
+
+QUESTION = "payments-api is OOMKilled against its 64Mi limit. Which fix?\n- raise the limit\n- set a request"
+
+
+def test_a_blocked_cards_newest_block_comes_back_with_its_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT, CHILD])
+    block_card(tmp_path, FRONT, "an earlier question?")
+    block_card(tmp_path, FRONT, QUESTION)
+    set_card(tmp_path, CHILD, "done", result="fine")
+    shell = local_shell(tmp_path, monkeypatch)
+    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
+    assert read is not None
+    assert read.cards[FRONT]["block"] == {"kind": "needs_input", "reason": QUESTION}
+    assert read.cards[FRONT]["summary"] == QUESTION
+    assert read.cards[CHILD]["block"] is None
+    shown = json.loads(read.as_shown(FRONT)["result"])
+    assert shown["task"] == {
+        "id": FRONT,
+        "status": "blocked",
+        "result": None,
+        "block": {"kind": "needs_input", "reason": QUESTION},
+    }
+    # Only the cards asked for are read for a block.
+    plain = board.read_session_cards(shell, SESSION, 5)
+    assert plain is not None and plain.cards[FRONT]["block"] is None
+
+
+def test_a_card_parked_after_its_question_was_answered_carries_no_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answered (``unblocked``), resumed, then parked by the breaker
+    (``gave_up``): blocked again, but on no question, so the stale ``blocked``
+    row is not read as one."""
+    build_session_store(tmp_path, created=[FRONT])
+    block_card(tmp_path, FRONT, QUESTION)
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        for kind in ("unblocked", "gave_up"):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, '{}', 0)", (FRONT, kind)
+            )
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT], max_want=32)
+    assert read is not None
+    assert read.cards[FRONT]["status"] == "blocked"
+    assert read.cards[FRONT]["block"] is None
+
+
+def test_a_board_without_events_reads_a_blocked_card_with_no_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    set_card(tmp_path, FRONT, "blocked")
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT], max_want=32)
+    assert read is not None
+    assert read.cards[FRONT] == {"status": "blocked", "result": None, "summary": None, "block": None}
+    assert "block" not in json.loads(read.as_shown(FRONT)["result"])["task"]
+
+
+def _shown(tid: str, status: str, block: object) -> dict:
+    task = {"id": tid, "status": status, "result": None}
+    if block is not None:
+        task["block"] = block
+    return {"name": "kanban_show", "result": json.dumps({"task": task, "runs": []})}
+
+
+def test_only_a_needs_input_block_on_a_blocked_card_is_a_question() -> None:
+    ask = {"kind": "needs_input", "reason": QUESTION}
+    trajectory = [
+        _shown(FRONT, "blocked", ask),
+        _shown(CHILD, "blocked", {"kind": None, "reason": "permission denied"}),
+        _shown("t_33333333", "done", ask),
+        _shown("t_44444444", "blocked", {"kind": "needs_input", "reason": "  "}),
+        _shown("t_55555555", "blocked", ask),
+    ]
+    awaited = [FRONT, CHILD, "t_33333333", "t_44444444"]
+    assert parsing.paused_questions(trajectory, awaited) == {FRONT: QUESTION}

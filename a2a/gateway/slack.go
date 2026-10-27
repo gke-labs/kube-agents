@@ -272,6 +272,9 @@ type SlackAdapter struct {
 	// sessionErrorsSeen is the setStatus error texts already logged at Warn
 	// (firstSessionError), under s.mu.
 	sessionErrorsSeen map[string]bool
+	// pressers caches each Stop presser's workspace answer (slack_stop.go,
+	// presserInWorkspace), so a press costs at most one users.info call.
+	pressers map[string]slackPresser
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
@@ -286,6 +289,13 @@ type SlackAdapter struct {
 	// the Home tab's state (slack_home.go).
 	workspaceURL string
 	home         slackHome
+
+	// feedback is the gateway's answer-feedback recorder, under s.mu; until
+	// it is handed over, no rating controls are drawn.
+	// feedbackAPI is the Web API answer feedback calls
+	// (slack_feedback.go); nil in a test that does not fake it.
+	feedback    FeedbackRecorder
+	feedbackAPI slackFeedbackAPI
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -527,6 +537,7 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 		seen:             map[string]bool{},
 		now:              time.Now,
 		sessionsAPI:      slackSessionsClient{token: botToken, apiURL: slack.APIURL, http: slackHTTPClient()},
+		feedbackAPI:      api,
 	}
 }
 
@@ -614,7 +625,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// choice buttons a chat message's layout carries
 				// (renderSlackChat), the home-channel cards the notify route
 				// lays out (the fleet audit's, the first inventory's) among
-				// them, becomes a turn (slack_interactive.go). A click on any
+				// them, becomes a turn (slack_interactive.go). A tap on an answer's
+				// feedback buttons, and the note its 👎 opens, are ratings, never
+				// turns (slack_feedback.go). A click on any
 				// other button (one on a message posted under today, a link)
 				// is acked and changes nothing. The route's raw blocks still
 				// carry none. The "ask about this" message shortcut arrives
@@ -742,6 +755,12 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
 					msg.Answer = s.answersOpenQuestion(msg)
+					handler(msg)
+				}
+			case *slackevents.AgentSessionStoppedEvent:
+				// Not notePending: a Stop is no message, so there is
+				// nothing to draw a mark or a refusal on.
+				if msg, ok := s.inboundStop(inner); ok {
 					handler(msg)
 				}
 			case *slackevents.AssistantThreadStartedEvent:
@@ -913,18 +932,26 @@ func (s *SlackAdapter) Edit(conversation, messageID, text string) error {
 // PostMessage posts a message value: a chat message laid out as Block Kit
 // (renderSlackChat) with the text, as mrkdwn, as its notification and
 // fallback, into the conversation's thread as Post does, link and media
-// previews off (its links are buttons). Without a chat message it is Post.
+// previews off (its links are buttons). Without a chat message it is Post,
+// unless it is an answer drawn with rating controls (slack_feedback.go).
 // A chat message the renderer will not send, or that Slack refuses, is an
 // error and nothing is posted; the gateway posts the text instead.
 func (s *SlackAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	if m.Chat == nil {
+	rated := s.rates(m)
+	if m.Chat == nil && !rated {
 		return s.Post(conversation, m.Text)
 	}
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok {
 		return "", fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts, err := slackMessageOptions(m)
+	var opts []slack.MsgOption
+	var err error
+	if rated {
+		opts, err = slackRatedOptions(m)
+	} else {
+		opts, err = slackMessageOptions(m)
+	}
 	if err != nil {
 		return "", err
 	}

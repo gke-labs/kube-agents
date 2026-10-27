@@ -764,6 +764,7 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "ENABLE_GKE_BACKUP_PLAN": "--enable-gke-backup-plan",
         "ENABLE_GVISOR": "--enable-gvisor",
         "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
+        "WEB_CONSOLE_ENABLED": "--enable-web-console",
     }
 
     def _install_call(self, tmp_dir):

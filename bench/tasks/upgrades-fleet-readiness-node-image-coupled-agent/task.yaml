@@ -11,61 +11,72 @@
 # node-image label, a mount of the kernel module tree or the network plugin's
 # directories, or a command that loads a kernel module. cni-shaped-agent is on
 # the node's network and mounts /etc/cni/net.d, so the report lists it under
-# the risks with the pools below the target, whose image the upgrade changes;
-# nothing here blocks, because GKE rebuilds the node and the agent fails
-# afterwards. So the declared line reads `blocks the upgrade: no`, and the
-# case grades that the agent names the DaemonSet and keeps it a risk.
+# the risks with the pools below the target, whose image the upgrade changes,
+# or says no pool is below it yet; nothing here blocks, because GKE rebuilds
+# the node and the agent fails afterwards. The case grades that the agent
+# found the rule's risk for the DaemonSet in the report and copied it as
+# printed.
 #
 # What the deterministic checks read, and what they leave to the judge. The
-# prompt asks for one fixed-form line per seeded cluster, "<cluster>:
-# node-image-coupled-agent: <object kind namespace/name|none>; blocks the
-# upgrade: <yes|no|none>; cell: <the rule's text for that cluster|none>", the
-# shape the per-cluster readiness cases use
-# (upgrades-readiness-surge-capacity), and the checks read those lines and
-# nothing else; the prose, the reason the rule gives, and the recommended
-# remedy are the judge's, against `expected_output`. The case first asked for
-# one line per object the report names ("<cluster>/<object name>: kind ...;
-# blocks the upgrade: ...; cell: ..."), anchored on the object's name, and
-# nine runs on the dev install passed none of them: the agent read
-# "<cluster>/<object name>" as "<project>/<cluster>" and wrote the object's
-# name after "; blocks the upgrade:", where the anchor could not find it, or
-# left a note-column object out of a list it built from the risks. A line per
-# cluster, anchored on the cluster's name with the object as one slot of the
-# line, has no such reading. Slot a's line must name the planted DaemonSet and
-# read `blocks the upgrade: no`, and its cell slot must carry the rule's own
-# text, wording only the rule produces (`node-image-coupled-agent: DaemonSet
-# seeded-shapes/cni-shaped-agent: on the node's network and coupled to the
-# node image: mounts /etc/cni/net.d from the node`), which the skill
-# paraphrases and a hand kubectl survey cannot supply; a report whose rule is
-# missing prints no such entry, so the slot reads `none` or another rule's
-# text and the line fails there whatever the verdict says. The other three
-# slots read `none` in every slot: the fleet's only host-network DaemonSet is
-# cni-shaped-agent (bench/tf/fleet/defects-*.tf), so the rule prints nothing
-# for them and a line naming an object, a verdict or a cell there is a wrong
-# read. The cell carries a `;`, which keeps the verifier's value-wrap fold
-# from removing a quote or angle bracket the agent kept around it, so the cell
-# patterns admit any prefix before the rule's text, a note column's other
-# entries included; a pod of the workload may stand in for it in the object
-# slot (the name plus one or two hash suffixes), as the agent sometimes
-# renders it. Every pattern is read after the harness's trail fold
+# prompt asks for one declared line per seeded cluster in the rule's own cell
+# form, "<cluster>: node-image-coupled-agent: <the rule's entry for that
+# cluster, copied as printed|none>", the form the readiness cases of #3575
+# use (upgrades-readiness-lb-drain-timeout, upgrades-readiness-orphan-node),
+# and the checks read those lines and nothing else; the prose, the reason the
+# rule gives, and the recommended remedy are the judge's, against
+# `expected_output`. Slot a's line is the rule's risk copied whole:
+# `node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the
+# node's network and coupled to the node image: mounts /etc/cni/net.d from the
+# node; pool(s) <pools> are below the target and get a new node image in this
+# upgrade` (DETAIL and POOLS_BELOW_TEXT in node_image_coupled_agent.py behind
+# the rule's describe), or, on a fleet whose pools are at the target already,
+# the same entry ending `; no pool is below the target; the next node upgrade
+# changes the image under it` (NO_POOL_BELOW_TEXT): wording only the rule
+# produces, which the skill paraphrases and a hand kubectl survey cannot
+# supply; a report whose rule is missing prints no such entry, so the line
+# reads `none` or a composed one and fails. The pool list is the fleet's and
+# is left open. The other three slots read `none`: the fleet's only
+# host-network DaemonSet is cni-shaped-agent (bench/tf/fleet/defects-*.tf), so
+# the rule prints nothing for them and any entry there is a wrong read, the
+# planted risk copied onto another cluster included. The table's
+# `node-image-coupled-agent: ` prefix is optional (the JSON carries the bare
+# text in `risks[].text`); one opener before the text (a quote or angle
+# bracket the agent kept) is admitted, since the `;` and the apostrophe inside
+# the entry keep the verifier's value-wrap fold from removing it; the whole
+# line is lower-cased. Every pattern is read after the harness's trail fold
 # (`fold_decoration`) and matches the whole line, anchored at both ends; each
 # forbid is the same frame with any other value, so a second line about a slot
 # that contradicts the first fails whatever the right line says. The patterns
 # name the slots through `{cluster:<slot>}`, which the verifier expands to the
 # cluster the runner recorded for the slot, so a fleet applied with another
-# prefix is graded on its own names; a slot the runner did not reach is an
-# `error` about the environment, never a `fail` charged to the agent, so the
-# case adds no role per slot to `fixtures:`.
+# prefix is graded on its own names.
+#
+# Why this form (ported 2026-10-23, #3722). The case first asked for
+# "<cluster>: node-image-coupled-agent: <object kind namespace/name|none>;
+# blocks the upgrade: <yes|no|none>; cell: <text|none>", whose object and
+# verdict slots graded the agent's reading of the rule's entry rather than the
+# entry. The sibling upgrades-fleet-readiness-node-local-state, in the same
+# form, went red on `main` ed906222c (2026-10-22 19:02Z, dev install) with
+# the right report in hand: the worker's one `jq` over `.members[].readiness`
+# indexed `.rule` and `.text` on `readiness.notes[]`, which are strings of the
+# form `<rule id>: <text>` (RULE_PREFIX_FORMAT in upgrade_readiness.py) while
+# `rule_blocking[]`, `risks[]` and `unknown[]` are objects, failed with
+# `Cannot index string with string`, and the worker answered `none` in every
+# slot. The line is now the rule's cell as printed, and the prompt says where
+# in the JSON it is and what shape each list has.
 #
 # Planted defect required: on slot a, the DaemonSet cni-shaped-agent in
 # seeded-shapes, on the node's network with the node's CNI configuration
 # directory mounted read-only (role `node-image-coupled-agent` in
 # bench/tf/fleet/fixtures.json). The safeguard reads that the DaemonSet is
 # still on the node's network after the run, so an agent that changed the
-# planted object fails the case whatever its answer says. No `worker_commands`
-# objective: it reads delegated workers' terminals only and errors on a run
-# the router answered itself, so the report's own output is graded through the
-# cell slot instead, as upgrades-readiness-zonal-control-plane does.
+# planted object fails the case whatever its answer says. The four roles
+# beside it, one per slot, are how the declared-line objectives tell a cluster
+# the agent missed from a cluster the project does not have. No
+# `worker_commands` objective: it reads delegated workers' terminals only and
+# errors on a run the router answered itself, so the report's own output is
+# graded through the declared lines instead, as
+# upgrades-readiness-zonal-control-plane does.
 #
 # Isolation class: read-only (chat prompt; the readiness script reads with
 # gcloud container and kubectl get and writes only its own record and
@@ -77,33 +88,37 @@ prompt: >-
   release channel's default version. For each cluster, report what blocks the
   upgrade and what is at risk. Read only: do not change, upgrade or remove
   anything. End your answer with one line per seeded cluster in exactly this
-  form, no other words on the line: "<cluster>: node-image-coupled-agent:
-  <object kind namespace/name|none>; blocks the upgrade: <yes|no|none>; cell:
-  <the rule's text for that cluster copied as printed|none>". The cell is the
-  node-image-coupled-agent rule's text for that cluster, copied from the
-  readiness report's risks column (or its other blockers or note column) or
-  from the member's row in the report's JSON (readiness.risks,
-  readiness.notes), as printed and not paraphrased; a cluster the rule prints
-  nothing for reads none in every slot. Write the object as the report names
-  it, with no brackets, quotes or parentheses around it, and put any aside on
-  a line of its own.
+  form, no other words on the line: "<cluster>: node-image-coupled-agent: <the
+  node-image-coupled-agent rule's entry for that cluster, copied as
+  printed|none>". The entry is the rule's own text for that cluster as the
+  readiness report prints it: in the readiness table, the text behind
+  `node-image-coupled-agent: ` in the risks column (or in the other blockers
+  or note column); in the report's JSON, the member's `readiness.risks[]` or
+  `readiness.rule_blocking[]` object whose `rule` is
+  `node-image-coupled-agent`, or the `readiness.notes[]` entry that starts
+  with `node-image-coupled-agent: ` (those two lists, like
+  `readiness.unknown[]`, hold objects with `rule` and `text`; the notes are
+  strings, each prefixed with its rule's id). Copy the text, not a paraphrase
+  and not values you composed from kubectl; when the rule prints several
+  entries for one cluster, keep one line and copy them in the order printed,
+  separated by "; "; a cluster the rule prints nothing for reads none.
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-a it names
   the DaemonSet cni-shaped-agent in seeded-shapes under the risks: it runs on
   the node's network and mounts /etc/cni/net.d from the node, so a node image
   change can break it; the report names the pools below the target, whose
-  image the upgrade changes. It does not call the DaemonSet a blocker. It
-  recommends a canary pool first, with service routing watched from inside the
-  cluster, and surge upgrades with maxUnavailable 0. Other clusters' blockers
-  and risks come from the same run. It ends with one declared line per seeded
-  cluster: for seeded-a "seeded-a: node-image-coupled-agent: DaemonSet
-  seeded-shapes/cni-shaped-agent; blocks the upgrade: no; cell:
+  image the upgrade changes, or says no pool is below the target yet. It does
+  not call the DaemonSet a blocker. It recommends a canary pool first, with
+  service routing watched from inside the cluster, and surge upgrades with
+  maxUnavailable 0. Other clusters' blockers and risks come from the same run.
+  It ends with one declared line per seeded cluster: for seeded-a "seeded-a:
   node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the
   node's network and coupled to the node image: mounts /etc/cni/net.d from the
   node; pool(s) <pools> are below the target and get a new node image in this
-  upgrade", the cell copied from the report's risks column, and for seeded-b,
-  seeded-c and seeded-d "node-image-coupled-agent: none; blocks the upgrade:
-  none; cell: none". It cites no CVE identifiers and changes nothing.
+  upgrade" (or ending "; no pool is below the target; the next node upgrade
+  changes the image under it"), the risk copied from the report, and for
+  seeded-b, seeded-c and seeded-d "node-image-coupled-agent: none". It cites
+  no CVE identifiers and changes nothing.
 infrastructure:
   deployer: noop
 validated: false
@@ -115,16 +130,22 @@ domain: upgrades
 owner: haoxuw
 
 # Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
-# docs/designs/bench-fleet-catalog.md is the rule.
+# docs/designs/bench-fleet-catalog.md is the rule. The planted role first,
+# then one role per slot, which is how the declared-line objectives tell a
+# cluster the agent missed from a cluster the project does not have.
 fixtures:
   - node-image-coupled-agent
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
 
 verification_spec:
   # One line per seeded cluster, fixed vocabulary, the cluster named at the
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -135,15 +156,22 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - node-image-coupled-agent
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)'
 
-  # The verdict this case exists for: slot a's line names cni-shaped-agent and
-  # reads no; the forbid is the same frame with any other object or verdict,
-  # so a line that promotes it, leaves it out or reads none fails here
-  # whatever the prose says. A pod of the workload may stand in for it (the
-  # name plus one or two hash suffixes).
-  - name: the-planted-object-is-named-and-does-not-block
+  # The entry this case exists for: slot a's line is the rule's risk for
+  # cni-shaped-agent in the rule's words, whole, with the pool list open and
+  # any of the rule's three tails admitted (the pools below the target, none below it, or no target resolved). A report whose rule is missing prints no such
+  # entry, so the line reads `none` or something the agent composed and fails
+  # here; so does the entry cut short, a paraphrase, or the DaemonSet promoted
+  # to a blocker in words of the agent's. The table's
+  # `node-image-coupled-agent: ` prefix is optional; one opener before the
+  # text is admitted; the forbid is the same frame, with the rule id on the line, with any other value.
+  - name: the-planted-clusters-line-quotes-the-rules-risk
     role: objective
     mode: assert
     check:
@@ -151,38 +179,18 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - node-image-coupled-agent
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: daemonset seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: (?!daemonset seeded-shapes/cni-shaped-agent(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: )[^\n]*$'
-
-  # The report's own wording: the entry the risks column prints for the object
-  # is the rule's text, which the skill paraphrases and a cluster listing
-  # cannot supply. A report whose rule is missing prints no such entry, so the
-  # slot reads `none` or something else and the line fails here, whatever the
-  # verdict says. Any prefix is admitted before the rule's text: a quote or
-  # angle bracket the agent kept around the cell (the `;` inside it keeps the
-  # value-wrap fold from removing one), or a note column's other entries. The
-  # required text stops before the cell's first `; `, so the pools the fleet
-  # names after it are left open.
-  - name: the-planted-objects-line-quotes-the-reports-cell
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      fold_decoration: true
-      fixture_roles:
-        - node-image-coupled-agent
-      # The `node-image-coupled-agent: ` prefix is the table's; report.json carries the bare text, so it is optional.
-      any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node[^\n]*$'
-      forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: (?!["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$)[^\n]*$'
 
   # The fleet's only host-network DaemonSet is cni-shaped-agent, so the rule
-  # prints nothing for slots b, c and d and each reads none in every slot; a
-  # line naming an object, a verdict or a cell there is a wrong read, the
-  # planted finding copied onto another cluster included.
+  # prints nothing for slots b, c and d and each reads none; any entry there
+  # is a wrong read, the planted risk copied onto another cluster included.
   - name: the-other-clusters-read-none
     role: objective
     mode: assert
@@ -191,10 +199,15 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - node-image-coupled-agent
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: none; blocks the upgrade: none; cell: none$)'
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: node-image-coupled-agent: (?!none; blocks the upgrade: none; cell: none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: node-image-coupled-agent: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

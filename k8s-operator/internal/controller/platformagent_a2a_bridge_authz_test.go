@@ -230,7 +230,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 }
 
 // a2aProvisionLikeTheScript seeds a test bus with what the provision Job
-// creates: the streams above and three KV buckets.
+// creates: the streams above and four KV buckets.
 func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	t.Helper()
 	_, js := a2aConnectAs(t, url, "seed", seedPassword)
@@ -248,6 +248,12 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 		if err != nil {
 			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
 		}
+	}
+	// `nats kv add feedback --ttl=720h`: the one bucket with a max age.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "feedback", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864, TTL: 720 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket feedback as seed: %v", err)
 	}
 }
 

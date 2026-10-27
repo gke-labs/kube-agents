@@ -69,8 +69,9 @@ under that repository's own directory, with `unreachable_repo` (`repo`, `reason`
 install with several managed repositories and no `role: gitops` repository writes under
 `no_forge/local`, with `no_repository_chosen` (`reason`). Both are reported to chat on every run, and
 their new and resolved counts are unknown. No reader takes a marked envelope as a memory: the
-no-forge path does not use one as its baseline, and the forge path reads its memory from the newest
-envelope in the ring that is not marked. A directory that holds only marked envelopes is a store
+no-forge path does not use one as its baseline, the forge path reads its memory from the newest
+envelope in the ring that is not marked, and a run with no open ledger does not read the scheduled
+baseline from one. A directory that holds only marked envelopes is a store
 that no published run wrote, so the next run that reaches the repository seeds its memory once from
 the open ledger, as in §4.
 
@@ -107,7 +108,12 @@ The no-forge path and the forge path do not read it as a memory: its `status` is
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
-`silent_floor` when set, `ledger_held_open`), the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
+`silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
+dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled
+run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
+ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
+The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an
+on-demand run copies them from the record before it. The envelope also carries the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
 the JSON line carried, the delta as id lists (`new_ids`,
 `resolved_ids`, `current_ids`, `id_scheme`), `ledger_body` — the body this run left on the issue —
 and `document`, this run's validated findings document, whole rather than clipped to the body's
@@ -258,7 +264,9 @@ close over findings the document does not account for would have nothing to chec
 document would close the ledger and its pull requests. The body's hidden block is the id set the
 last run published, so it stands in for the store this once; the run writes the store, and every
 later run reads that. The seed is the body `find_existing_issue` already listed, so it has no failure
-point of its own; `gh issue view` fetches it only when the listing brought no body.
+point of its own; `gh issue view` fetches it only when the listing brought no body. A memory seeded
+from the ledger has no scheduled baseline (`scheduled_published_ids`), so the first scheduled run
+that reads it speaks once.
 
 When no ledger is open, the run is first and everything present is new. When a ledger is open but
 its `latest.json` is missing, unreadable, written for another issue, or names a different id set from the ledger's
