@@ -853,12 +853,13 @@ GKE fails the node step (`Failed to update node pool` / `Internal error`), leavi
   the node step fails after about 30 minutes (`Failed to update node pool`), leaving the pool in
   `ERROR` while Compute Engine holds the old VM until the drain finishes.
 - Mitigate before: set the backend service's connection draining timeout at or under the wait: `gcloud compute backend-services update <name> --global|--region <region> --connection-draining-timeout=600`.
-- Mitigate after: the same command; the next node takes the shorter wait.
+- Mitigate after: the same command, then retry the upgrade; with the timeout lowered, the next
+  attempt's node delete finishes within the wait and the upgrade proceeds.
 - Read today: the readiness report's `lb-connection-draining` rule (`readiness_rules/lb_connection_draining.py`) reads the project's backend services once per project, matches each backend to the cluster's pools by instance group and to its Services by NEG, and files a blocker per backend service above the wait, with the command; the unmanaged `k8s-ig--` groups GKE creates for an instance-group Service of type LoadBalancer carry the cluster's UID hash and are not matched.
 - GKE recommender: none.
 - Why it is on the list: one production fleet's support history, read for the design's Scope
-  table: a node pool upgrade that waited the whole deregistration wait on each node behind a
-  backend service whose draining timeout exceeded it. No public story verified. The seeded fleet
+  table: a node pool upgrade that failed its node step after the instance group held old VMs for
+  the full backend service connection drain. No public story verified. The seeded fleet
   plants it on seeded-b as the `readiness-lb-drain-timeout` role, a backend service on the
   default pool's instance group with a 3600-second draining timeout and no forwarding rule.
 
