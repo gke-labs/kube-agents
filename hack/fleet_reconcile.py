@@ -1488,8 +1488,8 @@ def _run(args, outcomes, error, run):
             if args.drifted:
                 document = load_fixture_state(args.fixture_state)
                 projects = drifted_projects(document)
-                print("%d project(s) drifted in %s" % (len(projects), args.fixture_state))
                 waiting = sorted(set(fixture_state.drift_map(document)) - set(projects))
+                print("%d project(s) drifted in %s, %d to re-apply" % (len(projects) + len(waiting), args.fixture_state, len(projects)))
                 if waiting:
                     print("skipped, no re-apply clears their drift: %s" % ", ".join(waiting))
                 reconcile_named(

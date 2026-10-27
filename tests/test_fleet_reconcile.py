@@ -348,14 +348,17 @@ class TargetsTest(unittest.TestCase):
     def test_a_project_whose_only_drift_no_re_apply_clears_is_skipped(self):
         # #4005: the age gate and a master ahead of its channel; one ordinary line beside them keeps the project.
         age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old'
-        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000)'
         document = {
             "projects": {
                 P7: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age]}, "version-laggard": {"state": "drifted", "detail": [ahead]}}},
                 P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age, "cluster masterAuthorizedNetworksConfig.enabled none_eq true: observed true"]}}},
             }
         }
-        self.assertEqual(reconcile.drifted_projects(document), [P8])
+        # An unset channel on the same op is the stack's to restore, so that project is applied.
+        unset = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset'
+        document["projects"]["kube-agents-evals-9"] = {"roles": {"version-laggard": {"state": "drifted", "detail": [unset]}}}
+        self.assertEqual(reconcile.drifted_projects(document), [P8, "kube-agents-evals-9"])
 
     def test_a_scan_with_no_drift_targets_nothing(self):
         self.assertEqual(reconcile.drifted_projects({"projects": {P7: {"roles": {}}}}), [])

@@ -144,9 +144,10 @@ SCOPE_SELECTED = "selected"
 # hack/fleet_reconcile.py --drifted read these.
 OP_AGE_GATE = "age_hours_ge"
 OP_AHEAD_OF_CHANNEL = "not_ahead_of_channel"
-# An age-gate line that read one timestamp. An unparseable one ends "not one
-# RFC 3339 timestamp" instead, and no clock clears that.
-AGE_GATE_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AGE_GATE} (?P<hours>\d+(?:\.\d+)?): observed "(?P<when>[^"]+)", [\d.]+ hours old')
+# An age-gate line that read one timestamp; the age is negative when the
+# scanning host's clock lags the cluster's createTime. An unparseable one ends
+# "not one RFC 3339 timestamp" instead, and no clock clears that.
+AGE_GATE_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AGE_GATE} (?P<hours>\d+(?:\.\d+)?): observed "(?P<when>[^"]+)", -?[\d.]+ hours old')
 # A master-ahead line, the one shape of that op meaning the channel offers
 # nothing as new; an unset channel or an unreadable version is other drift.
 AHEAD_OF_CHANNEL_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AHEAD_OF_CHANNEL}: observed "[^"]+", newer than every ')

@@ -444,7 +444,11 @@ class NoReapplyDrift(unittest.TestCase):
         self.assertIsNone(fixture_state.no_reapply_op(ORDINARY_LINE))
         self.assertIsNone(fixture_state.no_reapply_op("pod?app=x status.phase eq 1: observed 2 (why: unlike age_hours_ge or not_ahead_of_channel)"))
         # An unset channel is the stack's to restore; only "newer than every" is the channel's to clear.
-        self.assertIsNone(fixture_state.no_reapply_op('cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset'))
+        for other in ('; release channel unset', '; get-server-config lists no EXTENDED channel', ', not a GKE version'):
+            self.assertIsNone(fixture_state.no_reapply_op(f'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"{other}'), other)
+        self.assertIsNone(fixture_state.no_reapply_op("cluster currentMasterVersion not_ahead_of_channel: observed nothing"))
+        # A createTime ahead of the scanning host's clock reads as a negative age: still the age gate.
+        self.assertEqual(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "2026-10-27T12:00:00+00:00", -0.3 hours old'), fixture_state.OP_AGE_GATE)
         # An unparseable timestamp is no age the clock will reach.
         self.assertIsNone(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "soon", not one RFC 3339 timestamp'))
 
