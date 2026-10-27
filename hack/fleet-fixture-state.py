@@ -25,7 +25,9 @@ each role the runner published it reads the `state` assertions the catalog
 (bench/tf/fleet/fixtures.json) declares -- the crashloop has recorded an
 OOMKilled termination, the healthy workloads are Ready, the idle pool's node is
 Ready and tainted, slot b's control plane is still one minor behind its
-channel -- and reports the roles whose fixture is there but not in the shape
+channel, slots a, b and d keep the master authorized-networks block slot c is
+the drift outlier against, and slot c's cluster is past the drift SOP's
+24-hour age gate -- and reports the roles whose fixture is there but not in the shape
 the cases depend on. One role asserts the room the others schedule into:
 `default-pool-headroom` reads seeded-a's default-pool nodes and every pod
 bound to them and fails when the busier node drops below the headroom margin
@@ -139,7 +141,8 @@ PATH_STEP_RE = re.compile(
 )
 
 # Comparison operators, applied to the LIST of values a path matched. `eq`,
-# `ge`, `after_now` and `minor_behind_channel_default` want exactly one value;
+# `ge`, `after_now`, `age_hours_ge` and `minor_behind_channel_default` want
+# exactly one value;
 # `any_*` and `none_eq` quantify over however many the path found; `absent`
 # wants none (or, with no path, no objects at all).
 OP_EQ = "eq"
@@ -150,6 +153,13 @@ OP_NONE_EQ = "none_eq"
 OP_ABSENT = "absent"
 OP_AFTER_NOW = "after_now"
 OP_MINOR_BEHIND = "minor_behind_channel_default"
+# `age_hours_ge` wants an RFC 3339 timestamp at least `value` hours in the
+# past. The drift SOP leaves a cluster whose `createTime` is under 24 hours old
+# out of every cohort (agents/platform/governance/fleet_consistency_drift_sop.md
+# §1), so a replaced seeded cluster silences the drift finding for a day.
+OP_AGE_HOURS_GE = "age_hours_ge"
+# Ops a `--wait` cannot see converge: only the clock clears them, in hours.
+OPS_ONLY_TIME_CLEARS = frozenset({OP_AGE_HOURS_GE})
 # `node_cpu_spare_ge` reads the matched nodes whole plus the pods bound to each
 # (one all-namespaces pod read per role per pass) and wants every node to keep
 # at least `value` millicores of allocatable CPU unrequested, counting a pod
@@ -159,7 +169,9 @@ OP_MINOR_BEHIND = "minor_behind_channel_default"
 # a matched node that reports no allocatable yet (still registering) leaves the
 # role not checked for the pass rather than drifted.
 OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
-OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE})
+OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE})
+# Ops whose `value` must be a number; anything else is a catalog bug.
+OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
 OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
 # Ops that read the subject's objects whole and therefore take no path.
@@ -177,6 +189,10 @@ INIT_RESTART_SIDECAR = "Always"
 # Kubernetes CPU quantity suffixes, as millicores per unit; a bare number is cores.
 CPU_SUFFIX_MILLICORES = {"m": 1.0, "u": 1e-3, "n": 1e-6}
 MILLICORES_PER_CORE = 1000.0
+SECONDS_PER_HOUR = 3600.0
+# RFC 3339's UTC designator, and the offset Python's parser wants for it.
+RFC3339_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
 # Only the cluster subject can be compared against its channel's default.
 CLUSTER_ONLY_OPS = frozenset({OP_MINOR_BEHIND})
 
@@ -326,6 +342,9 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 raise CatalogError(
                     f"{where}: op {op!r} {'takes' if op in OPS_WITH_VALUE else 'takes no'} value"
                 )
+            numeric = _number(entry.get("value")) if op in OPS_WITH_NUMERIC_VALUE else 0.0
+            if numeric is None or not math.isfinite(numeric):
+                raise CatalogError(f"{where}: op {op!r} takes a number")
             path = entry.get("path")
             if path is None:
                 if op not in OPS_WITHOUT_PATH:
@@ -525,6 +544,16 @@ def _minor(version) -> int | None:
     return int(m.group(2)) if m else None
 
 
+def _timestamp(value) -> datetime | None:
+    """An RFC 3339 timestamp as an aware datetime (UTC when it names no
+    offset); None for anything else."""
+    try:
+        when = datetime.fromisoformat(str(value).replace(RFC3339_UTC_SUFFIX, ISO_UTC_OFFSET))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
 def _millicores(quantity) -> float:
     """A Kubernetes CPU quantity in millicores; 0 for anything that is not one."""
     text = str(quantity if quantity is not None else "").strip()
@@ -630,6 +659,14 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, pods_by_node=N
                 ok = when > datetime.now(timezone.utc)
             except ValueError:
                 ok = False
+    elif op == OP_AGE_HOURS_GE:
+        when = _timestamp(values[0]) if len(values) == 1 else None
+        if when is None:
+            return f"{label}: {_describe(values)}, not one RFC 3339 timestamp"
+        hours = (datetime.now(timezone.utc) - when).total_seconds() / SECONDS_PER_HOUR
+        if hours < float(expected):
+            return f"{label}: {_describe(values)}, {hours:.1f} hours old"
+        ok = True
     elif op == OP_MINOR_BEHIND:
         ok = False
         if len(values) == 1:
@@ -721,16 +758,19 @@ class Reader:
         return lookup
 
 
-def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str]]:
-    """(drift lines, unreadable lines) for one role in one pass.
+def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str], bool]:
+    """(drift lines, unreadable lines, worth waiting for) for one role in one pass.
 
     Objects are read once per distinct subject, so two assertions on the same
     pod list cost one kubectl. An assertion whose subject could not be read
     lands in the second list; the caller decides what that means once it
-    knows whether anything else in the role was positively out of shape.
+    knows whether anything else in the role was positively out of shape. The
+    flag is true when some failed assertion could converge within a wait,
+    which an age gate cannot.
     """
     drift: list[str] = []
     unreadable: list[str] = []
+    settling = False
     cache: dict[str, list] = {}
     for entry in spec["state"]:
         subject = entry["subject"]
@@ -750,7 +790,8 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
             continue
         if problem:
             drift.append(problem + (f" (why: {entry['why']})" if entry["why"] else ""))
-    return drift, unreadable
+            settling = settling or entry["op"] not in OPS_ONLY_TIME_CLEARS
+    return drift, unreadable, settling
 
 
 def run(directory: Path, catalog: Path, project_override: str | None, wait: float, interval: float, report: Path | None = None) -> int:
@@ -781,11 +822,12 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
     }
     converged: list[str] = []
     last: dict[str, tuple[list[str], list[str]]] = {}
+    settling: dict[str, bool] = {}
     deadline = time.monotonic() + max(wait, 0.0)
     while True:
         reader = Reader(directory, project, context)
         for role in sorted(pending):
-            drift, unreadable = check_role(reader, role, pending[role])
+            drift, unreadable, settling[role] = check_role(reader, role, pending[role])
             last[role] = (drift, unreadable)
             if not drift and not unreadable:
                 converged.append(role)
@@ -804,7 +846,9 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         # it would make every scan with one unreachable API server pay the
         # full deadline for nothing. Such a role is still re-read while another
         # role keeps the loop going, so a transient failure gets its retries.
-        waiting = [role for role in pending if last[role][0]]
+        # An age gate is the same exception: a cluster under a day old is still
+        # under it when the wait runs out.
+        waiting = [role for role in pending if settling[role]]
         if not waiting or remaining <= 0:
             break
         time.sleep(min(interval, remaining))

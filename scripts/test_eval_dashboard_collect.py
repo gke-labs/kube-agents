@@ -1532,6 +1532,41 @@ class TestRepoDerivedFacts(unittest.TestCase):
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
+    def test_coverage_reads_allowlist_records_and_counts_only_domain_rows(self):
+        # The allowlist entries are records (#3968): each starts `- slug:` like
+        # a domain row and carries indented keys. Those slugs are uncovered
+        # domains, not more domains, and a record's keys do not end the list.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "docs" / "designs").mkdir(parents=True)
+            (root / "docs" / "designs" / "domains.yaml").write_text(
+                "infra_owner: ivan\n"
+                "domains:\n"
+                "  - slug: cost\n"
+                "    owner: carol\n"
+                "  - slug: security\n"
+                "    owner: sam\n"
+                "  - slug: upgrades\n"
+                "    owner: sam\n"
+                "\n"
+                "# Known-uncovered.\n"
+                "allowlist:\n"
+                "  # cost: a comment between records.\n"
+                "  - slug: cost\n"
+                "    since: 2026-10-17\n"
+                "    issue: 1\n"
+                "    owner: carol\n"
+                "    expires: 2026-10-31\n"
+                '    why: "A sentence with #2 in it."\n'
+                "    held_out: some-case\n"
+                "  - slug: upgrades\n"
+                "    since: 2026-10-20\n"
+                "    issue: 2\n"
+                "    expires: 2026-11-01\n"
+            )
+            cov = collect.coverage(root)
+        self.assertEqual(cov, {"domains_total": 3, "domains_covered": 1, "uncovered": ["cost", "upgrades"]})
+
     def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)

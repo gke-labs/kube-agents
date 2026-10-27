@@ -45,11 +45,11 @@
 # reason the seeded fleet needs THREE clusters, not two; two clusters have
 # no majority and no outlier.
 #
-# NOT date-gated, unlike fleet-cost-idle-pool. The consistency SOP has no age
-# threshold to wait out and drift-outlier is `available_from_day: 1` in
-# docs/designs/fleet-fixtures.yaml, so a replant of the fixtures does not move
-# this case's activation. Recorded here because the absence of a gate reads the
-# same as a forgotten one.
+# NOT date-gated, unlike fleet-cost-idle-pool: the only wait is the SOP's
+# 24-hour cluster age gate, which is why drift-outlier is
+# `available_from_day: 1` in docs/designs/fleet-fixtures.yaml. Replacing
+# seeded-c restarts that day, and the hourly scan reports it
+# (`createTime age_hours_ge 24` on drift-outlier).
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
@@ -85,7 +85,15 @@ domain: consistency
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in
 # bench/tf/fleet/fixtures.json; the rule is
-# docs/designs/bench-fleet-catalog.md.
+# docs/designs/bench-fleet-catalog.md. The grade also depends on the
+# drift-peer-a, drift-peer-b and drift-peer-d roles, the majority seeded-c is
+# outvoted by (the SOP files the finding only when 2/3 of the cohort agree),
+# and the hourly scan asserts each still carries its authorized-networks
+# block. They are named here and not listed below on purpose: a `fixtures:`
+# list of more than one role, with no check reading one through
+# `fixture_role:`, excuses the case from nothing when a role drifts
+# (case_roles in bench/kube_agents_bench/fixture_drift.py), and the single
+# role keeps the excuse for a drifted or under-a-day-old seeded-c.
 fixtures:
   - drift-outlier
 
