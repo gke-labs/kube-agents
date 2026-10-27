@@ -527,14 +527,19 @@ pull request.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
   seat with its own Terraform stack would cost more than the estimate says. The test fails
   when the estimate passes
-  `PRESUBMIT_WALL_BUDGET_MINUTES` in `scripts/eval_rosters.py`, which is 200. The hints are
+  `PRESUBMIT_WALL_BUDGET_MINUTES` in `scripts/eval_rosters.py`, which is 205. The hints are
   launch-order prices and run long: on 2026-10-26 the roster estimated 122 minutes, while
   recent green presubmits took 88 to 108. So 200 leaves room for one more seat that requests a
   pull request (a 1250 s hint costs about 69 minutes in phase two), and it stays well inside
   the 360-minute Prow deadline. That seat went to pdb-remediation-pr the same day
   ([#3964](https://github.com/gke-labs/kube-agents/pull/3964), hinted at 1250 s), which took the
   estimate to 190 minutes. An admission that goes over the budget either re-measures the hints
-  it relies on or raises the budget in the same pull request, with the reason.
+  it relies on or raises the budget in the same pull request, with the reason. The first raise,
+  200 to 205, came with consistency-authorized-networks-probe's return on 2026-10-27
+  ([#3975](https://github.com/gke-labs/kube-agents/pull/3975)): beside the drift audit's seat
+  of 2026-10-26 the estimate read 202, 75 seconds over, and the probe's 300 s hint is honest
+  (median 216 s, p90 334 s over 29 repetitions on that pull request), so the line moved rather
+  than the hint.
 
 A seat that breaks (c) or (d) today is listed in `SEAT_BAR_EXEMPT` in
 `scripts/test_eval_rosters.py`, each with an issue that says what would clear it. An entry names

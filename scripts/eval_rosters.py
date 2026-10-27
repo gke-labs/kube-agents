@@ -243,8 +243,11 @@ PRESUBMIT_FIXED_OVERHEAD_SECONDS = 15 * 60
 # estimate past it fails scripts/test_eval_rosters.py, and the pull request
 # either re-measures the hints it relies on or raises this number on purpose.
 # docs/eval-gate-roster.md, "The five rules a seat meets", rule (e), says why
-# it is 200. Priced at the script's default EVAL_REPETITIONS, the presubmit's.
-PRESUBMIT_WALL_BUDGET_MINUTES = 200
+# it was 200 and why it is 205: consistency-authorized-networks-probe's return
+# (#3975) put the two consistency seats at 202 against hints that run long
+# (green runs measure 88-108 min). Priced at the script's default
+# EVAL_REPETITIONS, the presubmit's.
+PRESUBMIT_WALL_BUDGET_MINUTES = 205
 
 
 def parse_cost_hints(script_text: str) -> tuple[dict[str, int], int]:
