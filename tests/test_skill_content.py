@@ -57,6 +57,9 @@ class TerraformNewClusterDefaultsTest(unittest.TestCase):
         self.assertIn("it is `deletion_protection = true`", step3)
         self.assertIn("A sibling that has it `false` is not copied", step3)
         self.assertIn("Never `false`, for a test, an evaluation or an easier teardown", step3)
+        # A false through a variable default or .tfvars is a false (#3917 review).
+        self.assertIn("through a variable's default or a `.tfvars` counts the same", step3)
+        self.assertIn("the new cluster gets the literal `true`", step3)
 
     def test_a_new_cluster_declares_only_per_cluster_resources(self):
         step3 = self._step3()
@@ -77,6 +80,8 @@ class TerraformNewClusterDefaultsTest(unittest.TestCase):
         flat = " ".join(reference.split())
         self.assertNotIn("the existing clusters' value", flat)
         self.assertIn("a sibling's `false` is not copied", flat)
+        # No free secondary ranges is a stop, not an edit to the shared subnetwork.
+        self.assertIn("has no free secondary ranges for the new cluster, stop and ask", flat)
         for resource in ("google_gke_hub_feature", "google_gke_hub_fleet", "google_project_service"):
             self.assertIn(f"`{resource}`", reference)
 

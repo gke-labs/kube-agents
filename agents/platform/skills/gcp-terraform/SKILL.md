@@ -170,8 +170,10 @@ which reads decided the edit.
   module input). With no cluster to copy, it is `deletion_protection = true`,
   the provider's default since 5.0.0. A sibling that has it `false` is not
   copied: write `true` and name that sibling in the **Deletion protection**
-  line. Never `false`, for a test, an evaluation or an easier teardown: a
-  cluster that needs it off is a human's pull request.
+  line. A `false` that reaches the sibling through a variable's default or a
+  `.tfvars` counts the same: the new cluster gets the literal `true`, not the
+  sibling's `var.` reference. Never `false`, for a test, an evaluation or an
+  easier teardown: a cluster that needs it off is a human's pull request.
 - **New resources** go where the repository keeps their siblings, in a file
   named the way the siblings are, using the same module or resource shape.
   Shape, not contents: a new cluster gets only what exists once per cluster

@@ -106,7 +106,10 @@ leaves them alone; it never declares a second one:
 - The network and subnetwork, unless the request asks for new ones. A
   shared subnetwork is fine, but the new cluster needs its own secondary
   ranges: reusing the sibling's `cluster_secondary_range_name` or
-  `services_secondary_range_name` is refused or collides.
+  `services_secondary_range_name` is refused or collides. If the subnetwork
+  has no free secondary ranges for the new cluster, stop and ask: adding
+  ranges changes the shared subnetwork, which is a separate change, and a
+  CIDR block you chose yourself breaks the Red Line on network values.
 
 Per cluster, and so new with the cluster: `google_container_cluster`, its
 `google_container_node_pool`s, `google_gke_hub_membership`, and that
