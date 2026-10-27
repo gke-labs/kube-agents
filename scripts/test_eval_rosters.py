@@ -177,9 +177,6 @@ ADDED_AFTER_THE_MOVE = [
     "chat-question-click-answer-stays-silent",  # SOUL §1.5 Unblock: silent after a button answer
     "platform-worker-shell-edit-of-shipped-skill",  # the sandbox's image trees, #2096
     "autoops-controller-stall-triage",  # the stall watch on the inject path
-    "chat-voice-retry-says-it-is-retried",  # the front door's reply to a crashed card
-    "chat-voice-final-attempt-is-not-retried",  # the front door's reply to a card's last attempt
-    "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
     "chat-voice-answer-first",  # a delegated answer opens on its verdict
@@ -218,7 +215,6 @@ ADDED_AFTER_THE_MOVE = [
     "cluster-agent-security-audit-script",  # a Cluster Agent runs its audit script from the path its skill names, #3402
     "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
     "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
-    "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
@@ -578,20 +574,12 @@ class SplitLostNothingTest(unittest.TestCase):
 # among them. An edit to the file edits this set in the same pull request, for the
 # reason the sets above are pinned.
 INJECT_LANE_EXCLUDED = [
-    "chat-voice-retry-says-it-is-retried",  # #4004: grades the front door's reply to a crashed card's wake, which under next reaches no user
-    "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
-    "chat-voice-failure-leads-with-fact",  # the same for a blocked card's wake
     "chat-question-typed-answer-fresh-session",  # #4004: its answer turn is today's Slack thread context, which next's door does not send
-    "chat-failure-reply-declares-next-step",  # #4004: the same as chat-voice-failure-leads-with-fact, for the step its reply declares
 ]
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
-    "chat-voice-retry-says-it-is-retried": "nightly",
-    "chat-voice-final-attempt-is-not-retried": "nightly",
-    "chat-voice-failure-leads-with-fact": "nightly",
     "chat-question-typed-answer-fresh-session": "nightly",
-    "chat-failure-reply-declares-next-step": "nightly",
 }
 
 
@@ -721,10 +709,10 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 self.assertTrue(reason, f"{case}: no reason in the comment block above it")
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
 
-    def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's roster is untouched by an entry here: an excluded
-        # presubmit case still runs on every pull request and can still red
-        # one, and an excluded nightly case still runs every night.
+    def test_an_exclusion_keeps_the_case_on_its_roster(self):
+        # An entry here leaves the case on its roster: the today lane still
+        # grades an excluded presubmit case, and an excluded nightly case runs
+        # nowhere in CI until it can go through the inject door.
         self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
         for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
             with self.subTest(case=case, tier=tier):

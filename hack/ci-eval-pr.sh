@@ -4441,9 +4441,8 @@ profile_begin "record + final gate"
 # EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
-# run at the same agent model (setupId) is compared with. Today's window is
-# recorded by ci-kube-agents-eval-nightly-today, the today-mode nightly kept
-# as the rollback check, over the api transport.
+# run at the same agent model (setupId) is compared with. No job records
+# today's window now: the rollback check is the today lane, refused above.
 # (ci-kube-agents-eval-nightly-gitlab-next stays out on the GitLab condition
 # above.) Whether the job's identity may append is a grant in oss-test-infra
 # this script cannot see; without it the append fails, is logged, and the

@@ -1028,7 +1028,8 @@ const (
 	// fleet_scope_targets.py, which reads it when no reconcile snapshot answers that a
 	// boundary is in force, for the platform MCP server's fleet_scope tool, the
 	// upgrade-readiness-watch, upgrade-readiness-weekly-review and sa-role-watch
-	// jobs and the onboarding inventory scan (bootstrap_scan_gate.py). Two modules
+	// jobs, the onboarding inventory scan (bootstrap_scan_gate.py) and the front
+	// door's roster (agent_roster.py, injected block and list_agents). Two modules
 	// spell the key, by design; other code reads it only through their constants, and
 	// a third spelling is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"

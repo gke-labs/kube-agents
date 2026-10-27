@@ -137,6 +137,16 @@ mcp_servers:
       - "${HERMES_HOME}/scripts/router_server.py"
     env:
       HERMES_HOME: "${HERMES_HOME}"
+      # For list_agents' Host Cluster Identity and GCP Projects in Scope
+      # sections (agent_roster.py), so the tool renders what the injected block
+      # renders. The operator sets the GKE_* and GCP_PROJECT_ID values outside
+      # kind only; an unset one arrives here as the literal "${...}"
+      # placeholder, which agent_roster.py treats as unset.
+      GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
+      GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
+      GKE_LOCATION: "${GKE_LOCATION}"
+      GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
+      KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.
