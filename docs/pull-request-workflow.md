@@ -274,6 +274,8 @@ loop while you work:
   `OK`. [`tests/integration/README.md`](../tests/integration/README.md) is the tier's contract;
   [`testing-map.md`](testing-map.md) says which suite runs where.
 - `make docs-check`, plus `cd docs/site && npm ci && npm run build` if you touched `docs/site/`.
+  `make docs-check` needs `go` on `PATH`: the CRD field pages are read from the operator's Go API
+  types, and the check fails without it.
 
 ## The automated review
 

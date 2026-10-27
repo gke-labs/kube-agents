@@ -12,13 +12,12 @@
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
 # seat counts as coverage. The main nightly grades spec.mode next
-# (EVAL_MODE_NEXT=1) as two periodics: ci-kube-agents-eval-nightly with
-# EVAL_NIGHTLY_PART=main, and ci-kube-agents-eval-nightly-writers with
-# EVAL_NIGHTLY_PART=writers, the cases that request a pull request, on a
-# second project (the variable's comment in the script says why).
-# EVAL_NIGHTLY_PART=main-a and main-b halve the main part again, for two jobs
-# on two projects (#3384). ci-kube-agents-eval-nightly-today runs the whole
-# matrix on spec.mode today as the rollback check.
+# (EVAL_MODE_NEXT=1) as three periodics on three projects: the main part
+# halved (#3384) into ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main-a
+# and ci-kube-agents-eval-nightly-main-b with EVAL_NIGHTLY_PART=main-b, and
+# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
+# cases that request a pull request (the variable's comment in the script
+# says why).
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -137,15 +136,16 @@
 #      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
 #      980-1929s a repetition on 2026-09-14; priced at 1250s in
 #      unit_cost_hint. Listed here from 2026-09-15 until 2026-09-28, when
-#      its held-out seat in presubmit-cases.txt opened (#2016 step 2). That
-#      file carries its record under both checks (12/12 under
-#      report_contains on the four graded nights 2026-09-16 to 09-20; under
+#      its held-out seat in presubmit-cases.txt opened (#2016 step 2). Its
+#      task.yaml header and docs/eval-gate-roster.md carry its record under
+#      both checks (12/12 under report_contains on the four graded nights
+#      2026-09-16 to 09-20; under
 #      pull_request_opened, #1780, nothing until #2263, then 90 %) and the
 #      miss shape the seat counts as the case's own; this file never lists a
 #      presubmit case twice. pdb-remediation-pr took the remediation roster
-#      line on 2026-10-14 (#2016 step 4) and was demoted back to this file on
-#      2026-10-17 (#3120, its line with the demotions below);
-#      rca-remediation-pr below stays nightly.
+#      line on 2026-10-14 (#2016 step 4), was demoted back to this file on
+#      2026-10-17 (#3120) and returned to the presubmit file and the roster
+#      on 2026-10-26 after #3145; rca-remediation-pr below stays nightly.
 ./tasks/chat-routing-board-read/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
@@ -333,17 +333,6 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
-
-# #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
-# pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
-# mostly, the worker finds checkout-gateway with no PodDisruptionBudget, then
-# declines to open a pull request because the pool's *-infra GitOps
-# repository holds no manifest for it (on #3017 it named an older pull
-# request it had not opened), so the report names no pull request it opened. Back on the roster once #3145 (seeds checkout-gateway's
-# manifest into every pool's -infra repository) merges and the case's
-# record holds (#3120). Still on the GitLab lane (gitlab-cases.txt), now
-# held out there.
-./tasks/pdb-remediation-pr/task.yaml
 
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
@@ -544,31 +533,6 @@
 # wait.
 ./tasks/autoops-controller-stall-triage/task.yaml
 
-# The front door's reply when a card's worker crashes (agents/chat/SOUL.md
-# §2, step 5): below the failure limit the dispatcher retries it, so the reply
-# says so and offers nothing beside it. A reply that states the retry but
-# names the agent, task or worker reds the case's no-internals check.
-# deployer: noop; the card and its crash are planted per run
-# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
-# worker: filing or unblocking a card fails its catastrophic fence.
-./tasks/chat-voice-retry-says-it-is-retried/task.yaml
-
-# The front door's reply when a card's worker fails its last attempt
-# (agents/chat/SOUL.md §2, step 5): the dispatcher gave up and nothing
-# retries a blocked card, so the reply says it stopped and does not say it
-# is being retried. deployer: noop; the card and its timeouts are planted
-# per run (bench/kube_agents_bench/card_wake.py, timed_out_final), so one
-# front-door turn and no worker: filing or unblocking a card fails its
-# catastrophic fence.
-./tasks/chat-voice-final-attempt-is-not-retried/task.yaml
-
-# The front door's reply when a card blocks: reads the card, leads with the
-# fact and the card's reason, no apology (agents/chat/SOUL.md §2, step 5).
-# deployer: noop; the blocked card is planted per run
-# (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
-# worker: filing or unblocking a card fails the case's catastrophic fence.
-./tasks/chat-voice-failure-leads-with-fact/task.yaml
-
 # The first of the upgrade-failure catalogue's scenario cases (entry 11, the
 # zonal control plane's API gap during its own upgrade). Read-only chat prompt
 # against the seeded clusters' own zonal shape; no planted fixture, nothing to
@@ -737,9 +701,10 @@
 ./tasks/not-found-target-stops-as-failure/task.yaml
 
 # gke-alert-configuration skill probe: a Terraform memory-saturation alert
-# for a GKE workload uses condition_prometheus_query_language, the cAdvisor
-# memory limit and the skill's created-with-google-skill label. deployer:
-# noop, transcript-only, one delegation round trip.
+# for a GKE workload uses condition_prometheus_query_language, a native
+# memory limit (cAdvisor or GKE built-in) and the skill's
+# created-with-google-skill label. deployer: noop, transcript-only, one
+# delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
 
 # A pod count with no events in it: the Cluster Agent's audit trail states no
@@ -844,13 +809,6 @@
 # grades on the api lanes; fixture no-pdb-workload on seeded-a.
 ./tasks/fanout-absent-cluster-cards-complete/task.yaml
 
-# The front door's reply to a blocked card declares the one next step on a
-# last line of its own, `[next: <label>]`, which Slack draws as a button
-# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
-# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
-# turn and no worker: filing or unblocking a card fails its catastrophic fence.
-./tasks/chat-failure-reply-declares-next-step/task.yaml
-
 # A card's answer with one obvious next step declares it on a last line of
 # its own, `[next: <label>]`, which Slack draws as a button (the report-format
 # stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
@@ -940,11 +898,30 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The front door routes "which namespaces exist in this cluster?" to the host
+# cluster's agent (or platform) without asking which cluster (#3286).
+# deployer: noop, read-only, one front-door turn plus the card round trip:
+# +3 units.
+./tasks/chat-routing-this-cluster-namespaces/task.yaml
+
+# The front door answers "what projects are in scope?" from the roster block's
+# GCP Projects in Scope section without filing a card (#3143). deployer: noop,
+# transcript-only, one front-door turn with no card: +3 units.
+./tasks/chat-scope-projects-answered-from-roster/task.yaml
+
 # An alert quoted through the Slack message shortcut (the A2A gateway's
 # slackShortcutAsk) is investigated without a clarifying question, and its
 # "To resolve" line is not obeyed. deployer: noop; reads the seeded fleet's
 # crashloop-workload role, one front-door turn plus the card round trip.
 ./tasks/chat-shortcut-alert-is-checked-not-obeyed/task.yaml
+
+# gke-labs#3263, Slack Stop step 1: a `stop` typed after the Planning Agent
+# filed a card stops the card before it opens its pull request. Next lane
+# only (api-lane-exclusions.txt): the harness sends the stop through the
+# inject door, and hack/ci-deploy.sh arms the card stop there. deployer: noop,
+# the no-pdb-workload fixture, one card, a 900s observation window. Its
+# record files under the version key's `next` mode, the inject lane's.
+./tasks/chat-stop-halts-delegated-remediation/task.yaml
 
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
@@ -970,6 +947,16 @@
 # not run the waste collector. Red on main before the change, on a dev
 # install. One case, three units. deployer: noop, read-only over the seeded fleet.
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
+
+# An on-demand audit that moved nothing still reports its ledger URL (#1929).
+# prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
+# ledger that a coverage gap opened; the clean run closes it with nothing new
+# and nothing resolved, which `finish` calls quiet only with `--scheduled`.
+# Red observed on a dev install on main d05869ae (2026-10-20): the report
+# named no ledger URL. The red depends on the worker: one that obeys the SOP's
+# on-demand rule passes on main too (the task header says more). No fixture. The same tofu shape and
+# audit band as fleet-audit-clean-close-reads-clean, so it holds the infra lock.
+./tasks/fleet-audit-on-demand-run-reports/task.yaml
 
 # A user asks for the fleet audits' summaries that never reached the chat by
 # naming them; this sends that request for every shipped fleet audit and
@@ -1089,9 +1076,7 @@
 # 5-section escalation bundle with read-only Cloud Logging and Compute Engine
 # get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
 # enabled on the next-mode eval install via profiles.tse.enabled=true in
-# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS (on the today-mode nightly where
-# AgentProfile/tse renders nothing, it fails and appends evidence keeping it out
-# of presubmit per the header's L40-45 rule). Nightly from its first merge.
+# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history
@@ -1150,55 +1135,58 @@
 # cgroup-blind-jvm on slot a (role cgroup-blind-runtime) runs a JDK 8u302
 # image, below the cgroup v2 floor, on a pool already on cgroup v2, so the
 # report carries it in its note, never as a blocker. Read-only chat prompt
-# graded on the planted object's declared line: its verdict and the rule's
-# cell. Nightly from its first merge.
+# graded on one declared line per seeded cluster carrying the rule's own
+# entry as printed, none where it prints nothing. Nightly from its first
+# merge.
 ./tasks/upgrades-fleet-readiness-cgroup-blind-runtime/task.yaml
 
 # Catalogue entry 18 through the readiness report's gpu-driver rule: cuda-
 # pinned-trainer on slot a (role cuda-pinned-gpu-job) requests a GPU with a
 # CUDA 12.2 image on a cluster with no accelerator pool, so the report names
 # the unchecked pin as a risk, never a blocker. Read-only chat prompt graded
-# on the planted object's declared line: its verdict and the rule's cell.
-# Nightly from its first merge.
+# on one declared line per seeded cluster carrying the rule's own entry as
+# printed, none where it prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-cuda-pinned-gpu-job/task.yaml
 
 # Catalogue entry 12 through the readiness report's removed-node-label rule:
 # arch-pinned-worker on slot a (role deprecated-label-selector) selects on
 # beta.kubernetes.io/arch, deprecated in favour of kubernetes.io/arch, so the
 # report names it as a risk with the GA replacement, never a blocker. Read-
-# only chat prompt graded on the planted object's declared line: its verdict
-# and the rule's cell. Nightly from its first merge.
+# only chat prompt graded on one declared line per seeded cluster carrying
+# the rule's own entry as printed, none where it prints nothing. Nightly from
+# its first merge.
 ./tasks/upgrades-fleet-readiness-deprecated-node-label/task.yaml
 
 # Catalogue entry 15 through the readiness report's group-oom-kill rule:
 # multi-process-worker on slot a (role multi-process-container) forks two
 # workers under one shell on a pool that already group-kills, so the report
 # carries it in its note, never as a blocker. Read-only chat prompt graded on
-# the planted object's declared line: its verdict and the rule's cell. Nightly
-# from its first merge.
+# one declared line per seeded cluster carrying the rule's own entry as
+# printed, none where it prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-multi-process-container/task.yaml
 
 # Catalogue entry 17 through the readiness report's node-image-coupled-agent
 # rule: cni-shaped-agent on slot a (role node-image-coupled-agent), a host-
 # network DaemonSet mounting /etc/cni/net.d, is a risk naming the pools the
-# upgrade re-images, never a blocker. Read-only chat prompt graded on the
-# planted object's declared line: its verdict and the rule's cell. Nightly
-# from its first merge.
+# upgrade re-images, never a blocker. Read-only chat prompt graded on one
+# declared line per seeded cluster carrying the rule's own entry as printed,
+# none where it prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-node-image-coupled-agent/task.yaml
 
 # Catalogue entry 4 through the readiness report's data-on-the-node rule:
 # cache-on-emptydir on slot a (role node-local-state), a Deployment keeping
 # its queue on an emptyDir, is carried in the report's note as scratch, never
-# as a blocker. Read-only chat prompt graded on the planted object's declared
-# line: its verdict and the rule's cell. Nightly from its first merge.
+# as a blocker. Read-only chat prompt graded on one declared line per seeded
+# cluster carrying the rule's own entry as printed, none where it prints
+# nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-node-local-state/task.yaml
 
 # Catalogue entry 20 through the readiness report's retired-registry rule:
 # legacy-registry-pull on slot a (role retired-registry-image) pulls
 # k8s.gcr.io/pause:3.9 from a retired host, so the report names it as a risk,
-# never a blocker. Read-only chat prompt graded on the planted object's
-# declared line: its verdict and the rule's cell. Nightly from its first
-# merge.
+# never a blocker. Read-only chat prompt graded on one declared line per
+# seeded cluster carrying the rule's own entry as printed, none where it
+# prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
 
 # Upgrade-failure catalogue entry 8 through the readiness report's
@@ -1214,8 +1202,9 @@
 # Catalogue entry 10 through the readiness report's client-addon-skew rule:
 # stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0
 # against a control plane several minors ahead, so the report names it as a
-# risk, never a blocker. Read-only chat prompt graded on the planted object's
-# declared line: its verdict and the rule's cell. Nightly from its first merge.
+# risk, never a blocker. Read-only chat prompt graded on one declared line per
+# seeded cluster carrying the rule's risk as printed, none where it files no
+# finding. Nightly from its first merge.
 ./tasks/upgrades-readiness-client-addon-skew/task.yaml
 
 # Catalogue entry 24 through the readiness report's cluster-status-age rule: the

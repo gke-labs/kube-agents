@@ -18,6 +18,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # upload health.json -> append history -> render -> publish -> file nightly
 # bugs -> post -> comment, so the Brief a reader opens from a message
 # already shows the verdict the message names.
+# The weekly health email renders after the bug filer and is
+# published beside data.json; nothing sends it yet.
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -730,6 +732,27 @@ jobs:
             --data work/data.json \
             --health work/health.json \
             --state "$DASHBOARD_BUCKET/gate-comment-state.json"
+
+      # The weekly health email (docs/ci-health.md, "The weekly health
+      # email"), published beside data.json as health-email.html. After the
+      # bug filer, so a streak it filed for this tick counts as tracked, and
+      # after the post, so it never delays it. It is
+      # rendered only when every integrity check passes; a refusal prints its
+      # reasons and leaves the last published copy in place. Same gate as the
+      # render: a failed collect has nothing new to publish. Best-effort, like
+      # the filer. Nothing sends it yet: TODO(#3440) the mail route and its
+      # permissions.
+      - name: Render the weekly health email
+        if: steps.collect.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          store_args=()
+          [ -f work/store.json ] && store_args+=(--store work/store.json)
+          python3 scripts/eval_dashboard/weekly_email.py --data work/data.json "${store_args[@]}" --out work/health-email.html
+          gsutil -q -h "Cache-Control: no-cache" cp work/health-email.html "$DASHBOARD_BUCKET/health-email.html"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'

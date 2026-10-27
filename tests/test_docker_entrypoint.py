@@ -1380,6 +1380,66 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             for name in names:
                 self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
+    def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
+        # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
+        # an old plugin beside the new script writes no greeting hold.
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            (pvc / name).parent.mkdir(parents=True)
+            (pvc / name).write_text("stale\n", encoding="utf-8")
+            future = time.time() + 3600
+            os.utime(pvc / name, (future, future))
+            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            subprocess.run(
+                ["bash", "-c", block],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n")
+
+    def test_a_plugins_directory_the_entrypoint_cannot_write_does_not_end_the_start(self):
+        # On a fresh volume the kubelet creates $TARGET_DIR/plugins as root when a plugin
+        # is mounted beneath it; under `set -e` an unguarded mkdir there ends the container.
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            plugins = pvc / "plugins"
+            plugins.mkdir(parents=True)
+            if os.geteuid() == 0:
+                # root writes anywhere; a file in the directory's place fails the mkdir instead.
+                (plugins / "bootstrap_onboarding").write_text("", encoding="utf-8")
+            else:
+                plugins.chmod(0o555)
+            try:
+                block = "set -e\n" + "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image)) + "\necho reached-the-next-step"
+                proc = subprocess.run(
+                    ["bash", "-c", block],
+                    env={**os.environ, "TARGET_DIR": str(pvc)},
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            finally:
+                plugins.chmod(0o755)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("reached-the-next-step", proc.stdout)
+            self.assertIn("WARN: could not refresh", proc.stderr)
+            self.assertFalse((pvc / name).exists())
+
 
 class ManagedScopeAssertionTest(unittest.TestCase):
     """Step 2d's other half: the check that the operator's pins actually arrived.
