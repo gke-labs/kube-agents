@@ -17,7 +17,11 @@ Run:
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -85,7 +89,7 @@ FIXTURE = textwrap.dedent(
     	// This second paragraph is an implementation note and stays off the page.
     	Name string `json:"name"`
 
-    	// Alias is optional by marker although its tag has no omitempty.
+    	// Alias is the widget's name in §2 of the spec — its optional spelling.
     	// +optional
     	Alias string `json:"alias"`
 
@@ -255,6 +259,22 @@ def write_fixture(root: Path) -> None:
     (root / "widget_types.go").write_text(FIXTURE, encoding="utf-8")
     (root / "widget_types_test.go").write_text(DECOY, encoding="utf-8")
     (root / "zz_generated.deepcopy.go").write_text(DECOY, encoding="utf-8")
+
+
+# The child interpreter the locale test runs: UTF-8 mode off and the C
+# locale left uncoerced, so its preferred encoding is ASCII, the codec a
+# subprocess read without an explicit encoding falls back to.
+NON_UTF8_LOCALE_ENV = {"LC_ALL": "C", "LANG": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0"}
+NON_UTF8_LOCALE_CHILD = textwrap.dedent(
+    """\
+    import json, sys
+    from pathlib import Path
+    import generate_docs
+    model = generate_docs.run_crd_generator(Path(sys.argv[1]), ("Widget",))
+    rows = {field["path"]: field["description"] for field in model["kinds"][0]["spec"]}
+    sys.stdout.buffer.write(json.dumps(rows["alias"]).encode("utf-8"))
+    """
+)
 
 
 @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
@@ -467,6 +487,29 @@ class GeneratorFailureTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 generate_docs.run_crd_generator(Path(tmp), ("Gizmo",))
         self.assertIn("Gizmo", str(caught.exception))
+
+
+@unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+class NonUTF8LocaleTest(unittest.TestCase):
+    def test_the_model_is_read_as_utf_8_whatever_the_locale_says(self):
+        # The doc comments carry section signs and em dashes, so the
+        # generator's output is multibyte UTF-8; a read that took the
+        # locale's codec would fail (ASCII) or write mojibake (latin-1)
+        # under a developer's non-UTF-8 locale.
+        with tempfile.TemporaryDirectory() as tmp:
+            write_fixture(Path(tmp))
+            result = subprocess.run(
+                [sys.executable, "-X", "utf8=0", "-c", NON_UTF8_LOCALE_CHILD, tmp],
+                cwd=Path(__file__).resolve().parent,
+                env={**os.environ, **NON_UTF8_LOCALE_ENV},
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertEqual(
+            json.loads(result.stdout.decode("utf-8")),
+            "Alias is the widget's name in §2 of the spec — its optional spelling.",
+        )
 
 
 class MissingToolchainTest(unittest.TestCase):

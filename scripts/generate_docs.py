@@ -666,7 +666,9 @@ def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
         cwd=REPO,
         env={**os.environ, **GO_RUN_ENV},
         capture_output=True,
-        text=True,
+        # The model carries the doc comments' non-ASCII (section signs, em
+        # dashes) as UTF-8 whatever the locale's codec is.
+        encoding="utf-8",
         check=False,
     )
     if result.returncode != 0:
