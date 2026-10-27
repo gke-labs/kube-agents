@@ -22868,6 +22868,78 @@ class TestStalledKccRemediations(unittest.TestCase):
         self.assertIn("c1-default", mine[audit_report.KCC_STALLED_FINDING_FIELD])
         self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, other)
 
+    def gpu_pool_fix(self):
+        """A fix whose file declares `config-control/gpu-pool` for `prod-a`."""
+        self.write(
+            "pools/gpu-pool.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+            "  name: gpu-pool\n  namespace: config-control\nspec:\n  location: us-central1\n"
+            "  clusterRef:\n    name: prod-a\n",
+        )
+        return kcc_finding(path="pools/gpu-pool.yaml")
+
+    @staticmethod
+    def two_hosts(*entries):
+        """A manifest of one entry per `(host, unready)` pair."""
+        return {
+            "clusters": [
+                {"name": host, "outcome": "collected", "commands": [], "candidates": [], "kcc_unready": list(unready)}
+                for host, unready in entries
+            ]
+        }
+
+    def test_a_pool_stalled_for_another_cluster_on_another_host_gives_no_note(self):
+        """Config Controller puts every instance's objects in `config-control`,
+        so the same name on another host is another object."""
+        finding = self.gpu_pool_fix()
+        staging = {"kind": "ContainerNodePool", "namespace": "config-control", "name": "gpu-pool",
+                   "why": "UpdateFailed: quota", "cluster": "staging-a"}
+        manifest = self.two_hosts(("acme/us-central1/cc-prod", []), ("acme/us-central1/cc-staging", [staging]))
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_pool_stalled_for_its_own_cluster_gives_the_note(self):
+        finding = self.gpu_pool_fix()
+        prod = {"kind": "ContainerNodePool", "namespace": "config-control", "name": "gpu-pool",
+                "why": "UpdateFailed: quota", "cluster": "prod-a"}
+        staging = dict(prod, cluster="staging-a")
+        manifest = self.two_hosts(("acme/us-central1/cc-prod", [prod]), ("acme/us-central1/cc-staging", [staging]))
+        self.assertEqual(self.disclose([finding], manifest), ["release-channel"])
+        self.assertIn("config-control/gpu-pool", finding["remediation"]["note"])
+
+    def test_the_same_object_unready_on_two_hosts_with_nothing_to_tell_them_apart_gives_no_note(self):
+        finding = kcc_finding()
+        manifest = self.two_hosts(
+            ("acme/us-central1/hub", [dict(KCC_CLUSTER, why="UpdateFailed")]),
+            ("acme/us-east1/hub2", [dict(KCC_CLUSTER, why="UpdateFailed")]),
+        )
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_file_with_no_namespace_matches_only_one_fitting_object(self):
+        self.write(KCC_CLUSTER_FILE, KCC_CLUSTER_DECLARATION.replace("  namespace: infra\n", ""))
+        finding = kcc_finding()
+        manifest = kcc_manifest(dict(KCC_CLUSTER, why="UpdateFailed"), dict(KCC_CLUSTER, namespace="other", why="UpdateFailed"))
+        self.assertEqual(self.disclose([finding], manifest), [])
+
+    def test_a_dependency_is_followed_only_on_the_host_that_recorded_the_stall(self):
+        finding = kcc_finding()
+        manifest = self.two_hosts(("acme/us-central1/hub", [KCC_CLUSTER]), ("acme/us-east1/hub2", [KCC_TOPIC]))
+        self.disclose([finding], manifest)
+        note = finding["remediation"]["note"]
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, note)
+        self.assertNotIn("which waits on", note)
+
+    def test_a_transient_reason_is_not_a_stall(self):
+        """Config Connector sets `Updating` and `Deleting` while it still
+        applies the object, so the note must not say it is not applying."""
+        for reason in ("Updating", "Deleting"):
+            with self.subTest(reason=reason):
+                finding = kcc_finding()
+                self.assertEqual(self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, why=f"{reason}: in progress"))), [])
+                self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
     def test_the_note_fits_the_cap_by_cutting_the_workers_note_and_keeps_harness_text(self):
         long_note = "Raise the channel. " * 300
         for head in ("", audit_report.GENERATED_FIX_NOTE + " "):

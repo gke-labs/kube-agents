@@ -2143,6 +2143,11 @@ KCC_UNREAD_FIELD = "kcc_unread"
 # reference its message names (`reference PubSubTopic infra/events is not
 # ready`). collect.py's `KCC_DEPENDENCY_NOT_READY_REASON` spells the reason.
 KCC_DEPENDENCY_NOT_READY_REASON = "DependencyNotReady"
+# The `Ready=False` reasons Config Connector sets while it still applies or
+# deletes an object: not a stall, so no note names one. `kcc_health.py`'s
+# `TRANSIENT_REASONS` leaves them out of `kcc_unready`; a manifest from an
+# older collector can still carry them.
+KCC_TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
@@ -18616,7 +18621,8 @@ class KccStall(NamedTuple):
 
     `resource` is the object's `spec.resourceID` when it differs from its
     name, and `cluster` a `ContainerNodePool`'s `clusterRef`; both are `""`
-    when the collector did not record them.
+    when the collector did not record them. `host` is the manifest entry the
+    object was read on: the cluster that runs that Config Connector.
     """
 
     kind: str
@@ -18625,6 +18631,7 @@ class KccStall(NamedTuple):
     why: str
     resource: str
     cluster: str
+    host: str = ""
 
 
 class KccHealth(NamedTuple):
@@ -18646,17 +18653,22 @@ def kcc_health(manifest: dict | None) -> KccHealth:
     for entry in (manifest or {}).get("clusters") or []:
         if not isinstance(entry, dict):
             continue
+        host = str(entry.get("name") or "")
         if entry.get(KCC_UNREAD_FIELD):
-            unread.append(str(entry.get("name") or ""))
+            unread.append(host)
         for record in entry.get(KCC_UNREADY_FIELD) or []:
             if not isinstance(record, dict) or not record.get("kind") or not record.get("name"):
+                continue
+            why = " ".join(str(record.get("why") or "").split())
+            if why.partition(":")[0].strip() in KCC_TRANSIENT_REASONS:
                 continue
             stalled.append(
                 KccStall(
                     *(str(record.get(field) or "") for field in ("kind", "namespace", "name")),
-                    " ".join(str(record.get("why") or "").split()),
+                    why,
                     str(record.get("resource") or ""),
                     str(record.get("cluster") or ""),
+                    host,
                 )
             )
     return KccHealth(stalled, unread)
@@ -18666,8 +18678,9 @@ def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall
     """The unready objects `stall` waits on, following each reference a
     `DependencyNotReady` message names, and the ones those wait on in turn.
 
-    Only an object the collector also recorded counts: a reference to an
-    object that is ready, or on another cluster, is not named.
+    Only an object the collector also recorded on the same host cluster
+    counts: a reference to an object that is ready, or to an object of the
+    same name that another host's Config Connector holds, is not named.
     """
     found: list[KccStall] = []
     current = stall
@@ -18679,7 +18692,8 @@ def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall
             (
                 other
                 for other in stalled
-                if other.kind == reference.group("kind")
+                if other.host == current.host
+                and other.kind == reference.group("kind")
                 and other.name == reference.group("name")
                 and other.namespace == (reference.group("namespace") or current.namespace)
             ),
@@ -18699,8 +18713,13 @@ def _remediation_file_stalls(
 
     The file is parsed as the Config Connector index parses a clone
     (`_index_kcc_text`), and an object matches on its kind, its
-    `metadata.name`, and its namespace when the file sets one. A file the
-    audit cannot read or parse declares nothing.
+    `metadata.name`, and its namespace when the file sets one. Where the file
+    object and the recorded object both name a `clusterRef`, the two must be
+    equal. A match that is not certain names nothing: objects that fit on
+    more than one host cluster (Config Controller puts every instance's
+    objects in one namespace), or, when the file sets no namespace, more than
+    one object that fits. A file the audit cannot read or parse declares
+    nothing.
     """
     remediation = finding.get("remediation") or {}
     if remediation.get("kind") != MANIFEST_REMEDIATION_KIND:
@@ -18722,35 +18741,46 @@ def _remediation_file_stalls(
     index: dict[KccKey, KccDeclaration] = {}
     _index_kcc_text(index, yaml, text, "", relative)
     matched: list[KccStall] = []
-    for (kind, _, _, _), declaration in index.items():
-        for stall in stalled:
-            if (
-                stall.kind == kind
-                and stall.name == declaration.name
-                and (not declaration.namespace or stall.namespace == declaration.namespace)
-                and stall not in matched
-            ):
-                matched.append(stall)
+    for (kind, _, cluster_ref, _), declaration in index.items():
+        # The index keys a node pool on its `clusterRef`, every other kind on
+        # its own name.
+        file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
+        fits = [
+            stall
+            for stall in stalled
+            if stall.kind == kind
+            and stall.name == declaration.name
+            and (not declaration.namespace or stall.namespace == declaration.namespace)
+            and not (file_ref and stall.cluster and stall.cluster != file_ref)
+        ]
+        if len({stall.host for stall in fits}) > 1:
+            continue
+        if not declaration.namespace and len(fits) != 1:
+            continue
+        matched.extend(stall for stall in fits if stall not in matched)
     return matched
 
 
 def _object_stalls(finding: dict, stalled: list[KccStall]) -> list[KccStall]:
     """The unready objects that are `finding`'s own object: a `Cluster/` or
     `NodePool/` finding, matched on the name GKE reports (the object's
-    `resourceID`, else its name) and, for a node pool, on its cluster."""
+    `resourceID`, else its name) and, for a node pool, on its cluster.
+    Objects that fit on more than one host cluster name nothing, as in
+    `_remediation_file_stalls`: the match is not certain."""
     prefix, _, name = str(finding.get("object") or "").partition("/")
     kinds = _KCC_OBJECT_KINDS.get(prefix)
     if not kinds or not name:
         return []
     cluster = str(finding.get("cluster") or "").rpartition("/")[2]
     pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
-    return [
+    fits = [
         stall
         for stall in stalled
         if stall.kind in kinds
         and (stall.resource or stall.name) == name
         and (stall.kind not in pool_kinds or stall.cluster == cluster)
     ]
+    return fits if len({stall.host for stall in fits}) <= 1 else []
 
 
 def _kcc_name(stall: KccStall) -> str:
