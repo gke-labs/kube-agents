@@ -185,6 +185,10 @@ DIGEST_NONE = "no candidate on the nightly record"
 DIGEST_NOT_READ = "candidates not read (no cases in data.json)"
 
 
+class BadRead(ValueError):
+    """The repository read cannot be trusted: a gap off the allowlist."""
+
+
 def log(message: str) -> None:
     print(message, file=sys.stderr)
 
@@ -327,7 +331,9 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
     """Every domain with no blocking seat, oldest gap first, each with its
     owner, how long, why, and its ranked candidates (None when ``data``
     holds no cases to rank). Raises ValueError when domains.yaml gives no
-    domains: an unreadable file must not read as every domain covered."""
+    domains (an unreadable file must not read as every domain covered), and
+    BadRead when a gap is off the allowlist (a bad roster or task read must
+    not file or close anything)."""
     rows, allowlist = load_domains(repo_root)
     if not rows:
         raise ValueError(f"{repo_root / case_owner.DOMAINS_PATH} gave no domains")
@@ -371,6 +377,14 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
             "expires": past[slug][0] if slug in past else None, "expired_days": past[slug][1] if slug in past else None,
             "candidates": cands,
         })
+    # scripts/test_domain_coverage.py holds every uncovered domain to the
+    # allowlist on main, so a gap off it can only come from a bad read (a
+    # truncated roster, no bench/tasks): nothing is trusted that tick.
+    off = sorted(g["slug"] for g in gaps if not g["allowlisted"])
+    if off:
+        for slug in off:
+            log(f"warning: {slug} reads as uncovered but is not on the allowlist in docs/designs/domains.yaml")
+        raise BadRead(f"{len(off)} of {len(gaps)} uncovered domains are not on the allowlist ({', '.join(off)}): a bad roster or bench/tasks read")
     return sorted(gaps, key=lambda g: (g["since"] is None, g["since"] or datetime.date.max, g["slug"]))
 
 
@@ -428,8 +442,6 @@ def store_text(store: dict | None) -> str:
 
 
 def why_text(gap: dict) -> str:
-    if not gap["allowlisted"]:
-        return "the domain is not on the `allowlist` in `docs/designs/domains.yaml`, so `scripts/test_domain_coverage.py` fails until it is listed or covered."
     parts = ["on the `allowlist` in `docs/designs/domains.yaml`"]
     if gap["issue"]:
         parts.append(f"for #{gap['issue']}")

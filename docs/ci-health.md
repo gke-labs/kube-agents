@@ -924,7 +924,11 @@ covered when a case on `hack/eval/blocking-roster.txt` claims it with
 `domain:` and carries a non-empty `verification_spec`; the step and
 `scripts/test_domain_coverage.py` both read coverage through
 `scripts/domain_coverage.py`, so the two agree. When `domains.yaml` gives no
-domains the step writes nothing.
+domains the step writes nothing, and the same when any uncovered domain is not
+on its allowlist: `scripts/test_domain_coverage.py` keeps every uncovered
+domain listed on `main`, so such a gap means a bad read (a truncated roster, no
+`bench/tasks`). The step logs each one, and the digest carries no gap line that
+tick.
 It runs every tick after the nightly bug filer and before the post, capped at
 2 minutes.
 

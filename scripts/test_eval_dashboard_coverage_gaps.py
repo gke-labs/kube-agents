@@ -232,10 +232,11 @@ class FindGapsTest(Harness):
         self.assertEqual([b["labels"][1] for b in self.posted(gh)], ["domain:beta"])
 
     def test_a_roster_case_without_a_spec_covers_nothing(self):
+        # alpha then reads as uncovered off the allowlist, which main's lint
+        # forbids: the read is not trusted.
         (self.root / "bench" / "tasks" / "alpha-seat" / "task.yaml").write_text("name: alpha-seat\ndomain: alpha\n")
-        self.assertEqual([g["slug"] for g in self.gaps()], ["beta", "gamma", "alpha"])
-        self.assertFalse(self.gaps()[-1]["allowlisted"])
-        self.assertIn("not on the `allowlist`", coverage_gaps.why_text(self.gaps()[-1]))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(coverage_gaps.BadRead, "alpha"):
+            self.gaps()
 
     def test_the_evidence_store_adds_its_verdict_and_ranks_would_admit_first(self):
         records = {"beta-flaky": {"state": "would-admit", "runs": 21, "passes": 20}, "beta-good": {"state": "collecting", "runs": 9, "passes": 9}}
@@ -380,6 +381,37 @@ class FilingTest(Harness):
         gh, _, err = self.run_once(FakeGh(open_issues=[bot_issue(4230, "zeta")]))
         self.assertEqual([(m, p) for m, p, _ in gh.writes() if p != ISSUES], [])
         self.assertIn("left open", err)
+
+    def bad_read(self):
+        """main --live against the current checkout: (rc, gh, stderr)."""
+        gh = FakeGh(open_issues=[bot_issue(4200, "beta"), bot_issue(4210, "alpha")])
+        path = self.dir / "data.json"
+        path.write_text(json.dumps(data_doc()))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = coverage_gaps.main(["--data", str(path), "--repo-root", str(self.root), "--live"], gh_runner=gh)
+        return rc, gh, err.getvalue()
+
+    def test_a_truncated_roster_read_writes_nothing(self):
+        self.roster(["no-such-case"])  # alpha's seat lost from the read
+        rc, gh, err = self.bad_read()
+        self.assertEqual(rc, 1)
+        self.assertEqual(gh.calls, [], "nothing filed, updated or closed")
+        self.assertIn("alpha reads as uncovered but is not on the allowlist", err)
+        with unittest.mock.patch.object(coverage_gaps, "REPO_ROOT", self.root), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(post_health.coverage_lines(data_doc(), datetime.datetime.fromisoformat(NOW)), [], "the digest claims no gap")
+
+    def test_a_missing_bench_tasks_writes_nothing(self):
+        import shutil
+        shutil.rmtree(self.root / "bench" / "tasks")
+        rc, gh, err = self.bad_read()
+        self.assertEqual((rc, gh.calls), (1, []))
+        self.assertIn("alpha reads as uncovered", err)
+
+    def test_a_normal_read_still_files(self):
+        rc, gh, _ = self.bad_read()
+        self.assertEqual(rc, 0)
+        self.assertEqual([b["labels"][1] for b in self.posted(gh)], ["domain:gamma"])
+        self.assertIn(("PATCH", f"{ISSUES}/4210"), [(m, p) for m, p, _ in gh.writes()], "alpha's issue closed")
 
     def test_an_unreadable_domains_yaml_writes_nothing(self):
         (self.root / "docs" / "designs" / "domains.yaml").write_text("domains: [\n")
