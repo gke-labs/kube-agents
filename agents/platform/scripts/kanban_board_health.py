@@ -121,6 +121,12 @@ says every stuck task again, which is the loud side to fail on. The other
 findings (invariant violations, the engine's other rules) are rare and stay
 stateless, under ``REPORT_HEADER``.
 
+A run whose stuck tasks are all it says also leaves the card file
+(``CARD_SUFFIX``, beside the record): the rows as said, each with the ids of
+the cards it stands for, and the text. The relay lays it out in Slack with
+Retry and Drop on each row (``board_health_card.py``); every other run removes
+it, and a card whose text is not the report is not used.
+
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 (a hand run updates the record; point ``KANBAN_HEALTH_STATE`` elsewhere to keep it)
 """
