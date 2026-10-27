@@ -43,6 +43,10 @@ DEFAULT_SHOWN_PATH = "/opt/data/INVENTORY.shown.json"
 SHOWN_ITEMS = "items"
 SHOWN_CLASS = "class"
 SHOWN_IDS = "ids"
+#: The first report is one chat message, so it lists at most the rows one carries
+#: whatever the limit says; an item past them is deferred, not listed and marked shown.
+#: Equal to `chat_message.ROWS_MAX`, which a sandbox script cannot import; the card's tests hold them equal.
+FIRST_REPORT_ROWS_MAX = 20
 TMP_SUFFIX = ".tmp"
 DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
 POST_TIMEOUT_SECONDS = 30
@@ -498,7 +502,8 @@ def select_items(
     choice does not depend on the queue being reachable and sees only this
     batch. Rows are gathered into items by `fq.item_key` and ordered by their
     best row in the queue's order; an item is critical when any of its rows
-    is. The report lists the top `limit` critical items and nothing else.
+    is. The report lists the top `limit` critical items, at most
+    `FIRST_REPORT_ROWS_MAX`, and nothing else.
     Provider-managed observations (`fq.rolled_up`) are never items and count
     once per line (`fq.item_key`) among the others; a line that also has an
     ordinary row is already counted as that item. The nudge's open count
@@ -527,7 +532,7 @@ def select_items(
             continue
         lines.setdefault(fq.item_key(row), []).append(row)
     critical = [members for members in lines.values() if any(r["severity"] == fq.SEVERITIES[0] for r in members)]
-    shown = critical[:limit]
+    shown = critical[: min(limit, FIRST_REPORT_ROWS_MAX)]
     return shown, len(critical) - len(shown), len(lines) - len(critical) + len(managed - lines.keys())
 
 

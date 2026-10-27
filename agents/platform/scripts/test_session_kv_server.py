@@ -3111,6 +3111,16 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             r"^platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled-[0-9a-f]{8}$",
         )
         self.assertIn("**submit-suggestion**", body)
+        self.assertIn("Implement ONLY that recommended option", body)
+        self.assertIn("changing only the file(s) that option calls for", body)
+        self.assertIn("edit only the synced workload manifest(s)", body)
+        self.assertIn("never bundle any non-recommended option", body)
+        self.assertIn(
+            "never touch unrelated manifests or infrastructure definitions that the recommended option does not target",
+            body,
+        )
+        self.assertNotIn("ArgoCD", body)
+        self.assertNotIn("unapplied Terraform", body)
         self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)

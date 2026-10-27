@@ -124,6 +124,10 @@ def test_a_cases_roles_are_its_fixtures_list():
     assert fixture_drift.case_roles(UPGRADES) == {"version-laggard"}
     assert fixture_drift.case_roles(RELIABILITY) == {"no-pdb-workload"}
     assert fixture_drift.case_roles(TASKS / "agent-kanban-smoke" / "task.yaml") == set()
+    # The drift audit keeps its excuse for a drifted or under-a-day-old
+    # seeded-c: listing its peer roles beside drift-outlier would make the
+    # list multi-role and excuse nothing.
+    assert fixture_drift.case_roles(TASKS / "consistency-drift-outlier" / "task.yaml") == {"drift-outlier"}
 
 
 def write_task(tmp_path: Path, name: str, body: str) -> Path:
