@@ -160,8 +160,10 @@ Two ways a check ends up grading the report:
   passed on the text alone (#3048); that case now requires the linked pull request to resolve
   (#3053).
 
-Before trusting a green, ask whether the check could fail at all: if the agent did nothing and
-wrote a confident report, would the case still pass? If so, the check is grading the report.
+Before trusting a green, ask whether the check could fail at all: if the agent did the opposite of
+what the case asks — nothing, where it should have acted; the write, where it should have held
+back — and wrote a confident report, would the case still pass? If so, the check is grading the
+report.
 
 ## When the fix is not yours
 
