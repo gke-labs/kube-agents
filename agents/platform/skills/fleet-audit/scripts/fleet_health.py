@@ -56,9 +56,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:REVIS
 
 DEFAULT_TIMEOUT_S = 60
 TIMEOUT_RC = 124
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # Project reads stop starting this long after the run starts, so a run over a
 # credential that lists many projects still prints its manifest inside the
 # chat route's 600 s terminal timeout. fleet_waste.py's PROJECT_READ_DEADLINE_S
@@ -101,6 +101,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import broker_admission  # noqa: E402
 
 declared_scope = fleet_scope_args.DeclaredScope()
 
@@ -671,8 +672,9 @@ def _session_query() -> QueryFn:
 
 
 def collect_fleet(project: str | None = None, *, run: RunFn = default_run, query: QueryFn | None = None,
-                  max_workers: int = MAX_WORKERS, project_budget_s: float = PROJECT_READ_DEADLINE_S,
+                  max_workers: int | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S,
                   run_budget_s: float = RUN_BUDGET_S) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     deadline = time.monotonic() + project_budget_s
     stop_at = time.monotonic() + run_budget_s

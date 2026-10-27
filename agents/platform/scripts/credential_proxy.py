@@ -544,6 +544,13 @@ METRICS_PORT_MIN = 1
 METRICS_PORT_MAX = 65535
 METRICS_PATH = "/metrics"
 HEALTHZ_PATH = "/healthz"
+# What the broker admits at once, for the sandbox's fleet sweeps to size their
+# worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
+# count the child memory budget fits at this container's effective limit, the
+# smaller of the two, and the session role's own cap. Only the broker knows the
+# effective limit: on GKE Autopilot without bursting it is the memory request,
+# rewritten after the operator rendered the pod.
+ADMISSION_PATH = "/v1/exec/admission"
 METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 METRICS_SERVER_HEADER = "credential-proxy-metrics"
 # The metrics listener shares the process with the credentialed handler, so a
@@ -1248,6 +1255,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
+    # The admission report sits under /v1/exec and must be matched first: the
+    # shell's fleet sweeps size their pools by it, and a session pod has no
+    # sweep to size, so it is the shell's alone rather than /v1/exec's two roles.
+    (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
     # The feedback form verb: the sandbox's one way to file a report about
     # kube-agents itself (feedback_broker.py). The shell alone: a session pod
@@ -6131,6 +6142,15 @@ class CommandExecutor:
             f"{self._slots_in_use} requests"
         )
 
+    def admitted_requests(self) -> int:
+        """How many slot-taking requests the broker admits at once: the slot cap,
+        or the child memory budget's count when that is smaller. The figure the
+        admission report gives and the startup line implies."""
+        budget = self.requests_the_budget_admits()
+        if budget is None:
+            return self.max_concurrent_commands
+        return min(self.max_concurrent_commands, budget)
+
     def requests_the_budget_admits(self) -> int | None:
         """How many slot-taking requests fit the budget at once; None when it is off.
 
@@ -9312,8 +9332,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         )
         return False
 
+    def _admission_report(self) -> dict[str, int | None]:
+        """The four numbers ADMISSION_PATH answers with, and nothing else of the
+        budget's internals."""
+        return {
+            "slot_cap": self.executor.max_concurrent_commands,
+            "budget_admits": self.executor.requests_the_budget_admits(),
+            "admitted": self.executor.admitted_requests(),
+            "session_cap": self.session_slots.limit,
+        }
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path != HEALTHZ_PATH and self._authenticated() is None:
+            return
+        if self.path == ADMISSION_PATH:
+            self._json(HTTPStatus.OK, self._admission_report())
             return
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()

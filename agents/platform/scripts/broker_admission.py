@@ -1,0 +1,85 @@
+"""How wide a fleet sweep reads, from what the credential broker admits.
+
+Every check a sweep runs is a kubectl or gcloud the broker executes, and the
+broker admits a fixed number of commands at once: its slot cap, or what its
+child memory budget fits at the container's effective memory limit, whichever is
+smaller (credential_proxy.py, `CommandExecutor.admitted_requests`). A pool wider
+than that only queues the rest at the broker, where a check still waiting at its
+60 s admission bound is refused busy. So a sweep's width follows the broker's
+admitted count, read from `GET /v1/exec/admission`, rather than a constant.
+
+The count differs by install. At the operator's default 2Gi limit the budget
+fits 9 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
+is the 1Gi memory request, and the budget fits 4. Only the broker sees the
+effective limit, so only the broker can say.
+
+`sweep_width` leaves two of the broker's slots free when it admits six or more,
+so a sweep doesn't take every slot a live chat read would queue behind, and
+otherwise reads at most four wide, today's width, so no install sweeps slower
+than it did. This doesn't coordinate sweeps that run at the same time: each
+sizes its own pool, and the broker admits in arrival order, so live reads still
+queue behind all of them. Putting live reads first takes priority admission in
+the broker, which is separate work.
+
+A broker that predates the route, or any failure to read it, gives today's
+width of four.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.request
+
+import credential_proxy_client
+
+ADMISSION_PATH = "/v1/exec/admission"
+# The width before the broker could be asked, and the answer when it can't be.
+FALLBACK_WIDTH = 4
+# How many of the broker's slots a sweep leaves free once it admits enough to
+# spare them: the session role's cap, the most one chat conversation's reads
+# take at once.
+CHAT_HEADROOM = 2
+# The admitted count at or above which the headroom is taken; below it the
+# width stays at most FALLBACK_WIDTH, so no install sweeps slower than before.
+HEADROOM_FROM = 6
+
+_cached_width: int | None = None
+
+
+def width_for(admitted: int) -> int:
+    """The sweep width for a broker that admits ``admitted`` commands at once."""
+    if admitted >= HEADROOM_FROM:
+        return admitted - CHAT_HEADROOM
+    return max(1, min(FALLBACK_WIDTH, admitted))
+
+
+def read_admitted(endpoint: str | None = None) -> int | None:
+    """The broker's admitted count, or None when it can't be read."""
+    endpoint = (endpoint if endpoint is not None else os.environ.get("CREDENTIAL_PROXY_URL", "")).strip()
+    if not endpoint:
+        return None
+    try:
+        request = urllib.request.Request(
+            endpoint.rstrip("/") + ADMISSION_PATH,
+            headers=credential_proxy_client.authorization_headers(),
+        )
+        with credential_proxy_client.open_broker_request(request) as response:
+            report = json.load(response)
+    except (urllib.error.URLError, OSError, ValueError, credential_proxy_client.TokenUnavailable):
+        return None
+    admitted = report.get("admitted") if isinstance(report, dict) else None
+    if isinstance(admitted, bool) or not isinstance(admitted, int) or admitted < 1:
+        return None
+    return admitted
+
+
+def sweep_width() -> int:
+    """How many clusters a sweep reads at once on this install. Read once per
+    process; FALLBACK_WIDTH when the broker can't say."""
+    global _cached_width
+    if _cached_width is None:
+        admitted = read_admitted()
+        _cached_width = FALLBACK_WIDTH if admitted is None else width_for(admitted)
+    return _cached_width

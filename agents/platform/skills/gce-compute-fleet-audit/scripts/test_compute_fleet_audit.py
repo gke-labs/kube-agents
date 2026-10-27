@@ -2243,14 +2243,12 @@ class ApiDisabledTest(unittest.TestCase):
 
 
 class SweepPoolTest(unittest.TestCase):
-    def test_pool_matches_the_fleet_audit_collectors_admitted_count(self):
-        # This collector sweeps projects through the same credential proxy as the
-        # fleet-audit collectors, so its pool is the same admitted count they pin
-        # (docs/designs/credential-proxy-child-memory-budget.md §2.2). Tied to
-        # collect.MAX_WORKERS rather than a lone literal so the collectors move
-        # together. Discovered by the pool it runs, like the fleet-audit scan, so a
-        # collector added to this skill under any constant name is caught too.
-        import collect  # noqa: E402 -- fleet-audit/scripts is on sys.path above
+    def test_pool_resolves_the_broker_width(self):
+        # This collector sweeps projects through the same credential broker as the
+        # fleet-audit collectors, so its pool width is the broker's, read the same
+        # way (broker_admission.sweep_width()). Discovered by the pool it runs, like
+        # the fleet-audit scan, so a collector added to this skill is caught too.
+        from test_collect import assert_resolves_the_broker_width  # noqa: E402 -- fleet-audit/scripts is on sys.path above
 
         here = Path(os.path.dirname(__file__))
         pooled = sorted(
@@ -2261,16 +2259,7 @@ class SweepPoolTest(unittest.TestCase):
         self.assertIn("compute_fleet_audit.py", [p.name for p in pooled])
         for path in pooled:
             with self.subTest(collector=path.name):
-                mod = importlib.import_module(path.stem)
-                self.assertTrue(
-                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
-                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin",
-                )
-                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
-                self.assertEqual(
-                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
-                    mod.MAX_WORKERS,
-                )
+                assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
 
 
 class DeclaredScopeFromTheToolTest(unittest.TestCase):

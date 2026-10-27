@@ -428,24 +428,20 @@ def context_of(dump=None, **overrides):
 
 
 class TestSweepPool(unittest.TestCase):
-    # The credential proxy admits four requests at once under its child memory
-    # budget at the operator's default 1Gi limit
-    # (docs/designs/credential-proxy-child-memory-budget.md §2.2). stall_watch.py and
-    # cluster_agent_reconcile.py pin the same figure for their listing pools; the
-    # broker computes the admitted count at runtime from its container limit and
-    # exposes no constant, so this pins the shared figure the pools agree on at the
-    # default limit -- four -- not the broker's running count. A non-default proxy
-    # limit is the caller's to re-sync (see collect.py and #2639).
-    DEFAULT_LIMIT_ADMITTED_COUNT = 4
+    # Every check a sweep runs is a command the credential broker executes, and
+    # the broker admits its slot cap or what its child memory budget fits at the
+    # container's effective limit (8 at the default 2Gi, 4 on Autopilot without
+    # bursting). Only the broker sees that limit, so each collector reads its
+    # width from it through broker_admission.sweep_width() rather than carrying a
+    # constant (broker_admission.py has the formula and the fallback).
 
-    def test_collector_pools_pin_the_default_limit_admitted_count(self):
-        self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
+    def test_collector_pools_resolve_the_broker_width(self):
         here = Path(__file__).resolve().parent
         # Every module in this directory that runs a worker pool is a sweep
         # collector and must be pinned. Discovered by the pool it runs
         # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
-        # a collector added under MAX_WORKERS, LIST_WORKERS, WORKERS or any other
-        # name fails this test rather than slipping through unpinned.
+        # a collector added under any name fails this test rather than slipping
+        # through unpinned.
         pooled = sorted(
             path
             for path in here.glob("*.py")
@@ -454,17 +450,23 @@ class TestSweepPool(unittest.TestCase):
         self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
         for path in pooled:
             with self.subTest(collector=path.name):
-                mod = importlib.import_module(path.stem)
-                self.assertTrue(
-                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
-                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
-                    "name its pool MAX_WORKERS and its entry collect_fleet, or widen this scan",
-                )
-                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
-                self.assertEqual(
-                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
-                    mod.MAX_WORKERS,
-                )
+                assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
+
+
+def assert_resolves_the_broker_width(case, mod, name):
+    """``mod``'s pool width is the broker's: ``collect_fleet(max_workers=None)``
+    resolves it through broker_admission, and no constant stands in for it."""
+    case.assertTrue(hasattr(mod, "collect_fleet"), f"{name} runs a worker pool but exposes no collect_fleet to pin")
+    case.assertIsNone(
+        inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+        f"{name}: collect_fleet's max_workers must default to None, resolved from the broker",
+    )
+    case.assertIn("broker_admission", vars(mod), f"{name} doesn't import broker_admission")
+    case.assertTrue(
+        "max_workers = max_workers or broker_admission.sweep_width()" in inspect.getsource(mod.collect_fleet),
+        f"{name}: collect_fleet doesn't resolve its width through broker_admission.sweep_width()",
+    )
+    case.assertFalse(hasattr(mod, "MAX_WORKERS"), f"{name} still carries a MAX_WORKERS constant")
 
 
 class TestNoRequests(unittest.TestCase):

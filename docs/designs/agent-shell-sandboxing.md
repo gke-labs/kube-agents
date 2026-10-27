@@ -2664,7 +2664,10 @@ design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that calle
 apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
 minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session)`, and
-within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. Because a
+within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
+under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
+the broker admits at once, which the shell's fleet sweeps size their pools by
+(`broker_admission.py`); a session pod has no sweep to size. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
