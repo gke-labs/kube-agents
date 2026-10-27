@@ -6185,7 +6185,8 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // are the gateway's, not the operator's: every spawned pod carries an
 // ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
 // deleting the gateway here hands any stragglers to Kubernetes GC, with no
-// operator exception to the IsControlledBy refusal below.
+// operator exception to the ownership rule below: the walk deletes only
+// what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
