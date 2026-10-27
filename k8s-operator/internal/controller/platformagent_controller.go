@@ -2567,6 +2567,12 @@ func (r *PlatformAgentReconciler) heldEnabledProfiles(ctx context.Context, agent
 // Service and the NetworkPolicy, so what the failure blocked was
 // updateStatusReady: the CR's status silently stopped tracking reality while
 // an admin followed the documented deletion path straight onto the error path.
+//
+// The guard itself no longer fails the reconcile either: an object under one
+// of the two names that this PlatformAgent does not control is skipped and
+// logged, as the A2A removals skip theirs (#3871). It is not ours to delete,
+// and this runs on every reconcile in both modes, so refusing would stop
+// everything after it until a person deleted the object.
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
@@ -2580,7 +2586,9 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 			continue
 		}
 		if !metav1.IsControlledBy(resource, agent) {
-			return fmt.Errorf("refusing to delete unowned legacy %T %s/%s", resource, resource.GetNamespace(), resource.GetName())
+			logf.FromContext(ctx).V(1).Info("skipping unowned legacy object under a reserved name",
+				"kind", fmt.Sprintf("%T", resource), "namespace", resource.GetNamespace(), "name", resource.GetName())
+			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, resource)); err != nil {
 			return err
@@ -3136,18 +3144,6 @@ func (r *PlatformAgentReconciler) reconcileCredentialBrokerTokenReviewRBAC(ctx c
 		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
 	}
 	return nil
-}
-
-// deleteIfOwned removes a namespaced object this controller created, refusing
-// to touch one it does not own.
-func (r *PlatformAgentReconciler) deleteIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, object client.Object) error {
-	if err := r.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !metav1.IsControlledBy(object, agent) {
-		return fmt.Errorf("refusing to delete unowned %T %s/%s", object, object.GetNamespace(), object.GetName())
-	}
-	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
 // deleteIfManaged removes a cluster-scoped object this controller created.
