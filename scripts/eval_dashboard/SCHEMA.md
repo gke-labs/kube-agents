@@ -558,8 +558,9 @@ what the renderer does with them.
 ### `coverage` — from `docs/designs/domains.yaml`
 
 - `domains_total` — number of entries under `domains:`.
-- `uncovered` — the `allowlist` entries (the domains known-uncovered
-  today).
+- `uncovered` — the `slug` of each `allowlist` record (the domains
+  known-uncovered today), in file order. The records' other fields (`since`,
+  `issue`, `owner`, `expires`) are not carried.
 - `domains_covered` — `domains_total − len(uncovered)`.
 
 ## Sources

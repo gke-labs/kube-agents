@@ -791,6 +791,23 @@ who investigates and either fixes the case or proposes retiring it. A case whose
 not answer stays demoted. The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
 
+A demotion that leaves a domain with no case on the roster must, in the same pull request, do one
+of three things: seat a stand-in case from that domain on the roster; keep the demoted case on the
+presubmit as a held-out seat (its line in the last section of `hack/eval/presubmit-cases.txt` and
+its `HELD_OUT_IN_PRESUBMIT` entry), which keeps the domain exercised but does not cover it; or add
+a record to the `allowlist` in [`docs/designs/domains.yaml`](designs/domains.yaml) with `since`,
+`issue`, `owner` and `expires`, the expiry at most 14 days after `since` unless a `why:` says why.
+The issue is the one that says how the domain gets a roster case back. A held-out seat still needs
+the record, with the case named in its `held_out:` field. `scripts/test_domain_coverage.py`
+enforces this: it fails on an uncovered domain with no record, and on a record that is missing a
+field or runs past the 14-day cap without a `why:`.
+
+Once a record's `expires` date has passed (by the UTC date), pull requests are not blocked: a date
+passing would red contributors who do not own the gap. Instead the CI-health bot escalates to the
+record's owner on its issue, and the daily digest says how many days ago the exception expired.
+`scripts/domain_allowlist.py` is the expiry rule it reads. The owner either covers the domain or
+moves the date in a pull request that says why.
+
 ## Switching to `record`
 
 The list is not scheduled for deletion. `EVAL_ADMISSION_MODE=record` exists so that handing
