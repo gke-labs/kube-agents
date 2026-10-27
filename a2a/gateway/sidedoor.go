@@ -406,3 +406,11 @@ func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Du
 		sink.SetSessionLookup(lookup, idleTTL)
 	}
 }
+
+// SetFeedbackRecorder hands the answer-feedback recorder to the primary, the
+// chat half that draws rating controls; a door's callers are programs.
+func (s *sideDoorAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	if sink, ok := s.primary.(FeedbackSink); ok {
+		sink.SetFeedbackRecorder(r)
+	}
+}

@@ -1,0 +1,76 @@
+# Parked: scripts/validate_bench_cases.py FIXTURE_NOT_READY names this case
+# on #2580. The fixture is a RootSync CRD and one `root-sync` object in
+# `config-management-system` whose status carries `Stalled: "True"`, reason
+# `Deployment`, message starting `Reconciler deployment failed`, planted on a
+# seeded cluster; no pool project runs Config Sync today. The third objective
+# below grades that message in the ledger body. Until the
+# fixture exists the case can go neither red nor green, so it is registered
+# in no roster. The collector's own tests
+# (agents/platform/skills/fleet-audit/scripts/test_collect.py,
+# TestConfigSyncReconcilerStalled and the §2.17 gate tests) carry the
+# red-to-green record for the check itself.
+id: compliance-configsync-stalled
+name: Security sweep finds the stalled Config Sync reconciler
+prompt: >-
+  Run the security and RBAC posture audit, following the compliance-audit SOP.
+expected_output: >-
+  The ledger issue carries one configsync-reconciler-stalled finding naming
+  RootSync/root-sync in config-management-system on the cluster that runs
+  Config Sync, quoting the reconciler's own Stalled reason, graded critical,
+  with a manual remediation that starts from `kubectl describe`. Clusters
+  without Config Sync list the check as not applicable, not as clean. The
+  closing response is the SOP's one line, carrying the ledger URL in full.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the compliance-audit stream's domain.
+domain: security
+
+# The planted object, named by ROLE (bench/tf/fleet/fixtures.json). The role
+# does not exist yet; FIXTURE_NOT_READY exempts a parked case from the
+# catalogue check, and the entry goes when the fixture lands.
+fixtures:
+  - configsync-stalled-rootsync
+
+verification_spec:
+  # Graded against the LEDGER, as compliance-rbac-overgrant is: the SOP's
+  # closing line restates nothing, so a report_contains check cannot pass on
+  # a conformant run.
+  - name: a-finding-was-filed-under-the-new-check
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: compliance-audit
+      scope: finding_ids
+      required_phrases: ["configsync-reconciler-stalled"]
+  - name: the-finding-names-the-planted-object
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: compliance-audit
+      scope: finding_ids
+      required_phrases: ["root-sync"]
+  - name: the-ledger-quotes-the-reconcilers-reason
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: compliance-audit
+      required_phrases: ["Reconciler deployment failed"]
+  # The planted object must survive the audit untouched: this stream reads
+  # and never writes.
+  - name: the-planted-object-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: configsync-stalled-rootsync
+      kind: rootsync.configsync.gke.io
+      namespace: config-management-system
+      resource_name: root-sync
+      path: metadata.name
+      op: eq
+      value: root-sync
