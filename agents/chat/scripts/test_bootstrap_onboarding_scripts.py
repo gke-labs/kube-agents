@@ -1560,6 +1560,22 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertEqual(post.args[1:3], (text, blocks))
         self.assertIn("First look at your fleet: done", text)
 
+    def test_an_unreadable_scores_file_beside_an_empty_item_list_still_builds_the_done_card(self):
+        # Nothing reads the scores file for an empty item list, so a truncated write or an earlier
+        # sweep's file left beside a clean sweep's items must not hold the one-time done card back.
+        for body in (b'{"scores": {', b"[1]", b"\xff"):
+            with self.subTest(body=body):
+                self._reset()
+                card = plant_card_files(self.d, items=[], scores=None, shown={"items": []})
+                (self.d / SCORES).write_bytes(body)
+                self.assertEqual(self._run(), RUNNING_NOTE + "\n")
+                (post,) = self.posts
+                blocks, text = inventory_card.blocks(card)
+                self.assertEqual(post.args[1:3], (text, blocks))
+                self.assertIn("First look at your fleet: done", text)
+                self.assertNotIn("went as text", stage_log(self.d))
+                self.assertTrue((self.d / COMPLETED).exists())
+
     def test_the_limits_file_sets_the_rows(self):
         card = plant_card_files(self.d, limits={"first_report_criticals": 1})
         self.assertEqual(len(card.rows), 1)
@@ -1609,6 +1625,8 @@ class DeliveryCardTest(unittest.TestCase):
             ("no items file", unlink(ITEMS), self.ORIGIN, {}, "no INVENTORY.items.json", self.text),
             ("no shown file", unlink(SHOWN), self.ORIGIN, {}, "no INVENTORY.shown.json", self.text),
             ("no scores file beside items", unlink(SCORES), self.ORIGIN, {}, "no scores file beside the items", self.text),
+            ("an unreadable scores file beside items", write(SCORES, "[1]"), self.ORIGIN, {},
+             "INVENTORY.scores.json could not be read: INVENTORY.scores.json is not a JSON object", self.text),
             ("an items file that is not an object", write(ITEMS, "[1]"), self.ORIGIN, {},
              "INVENTORY.items.json could not be read: INVENTORY.items.json is not a JSON object", self.text),
             ("a shown file that is not JSON", write(SHOWN, "{not json"), self.ORIGIN, {},

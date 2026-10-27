@@ -1302,7 +1302,7 @@ def _first_report_card(
     The card needs all of: ``KAGE_SLACK_UX`` on; a Slack destination (``platform``); a hand-off
     that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
     are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
-    and the scores file readable when there; and a card the builder accepts, which recomputes
+    and the scores file readable when an item is listed; and a card the builder accepts, which recomputes
     ``select``'s choice and checks it against the shown file. Built once per run, before the
     claim, for whichever door posts it. Never raises: a report the card cannot carry goes as text.
     """
@@ -1314,12 +1314,18 @@ def _first_report_card(
         return None, CARD_MARKER_UNREAD
     if no_ranking:
         return None, CARD_RANKING_MISSING
-    for name in (ITEMS_NAME, SCORES_NAME, SHOWN_NAME):
+    for name in (ITEMS_NAME, SHOWN_NAME):
         if name in files.problems:
             return None, CARD_FILE_UNUSABLE.format(name=name, problem=files.problems[name])
     for name, present in ((ITEMS_NAME, files.items), (SHOWN_NAME, files.shown)):
         if present is None:
             return None, CARD_FILE_MISSING.format(name=name)
+    # The builder reads the scores file only for a listed item, as ``_register_findings`` does, so
+    # one that cannot be read beside an empty item list (a clean fleet writes none) is no reason to
+    # hold the done card back.
+    item_list = files.items.get(ITEMS_KEY)
+    if SCORES_NAME in files.problems and isinstance(item_list, list) and item_list:
+        return None, CARD_FILE_UNUSABLE.format(name=SCORES_NAME, problem=files.problems[SCORES_NAME])
     try:
         shown = _parse_shown(files.shown)
     except ValueError as e:
