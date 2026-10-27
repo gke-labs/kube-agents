@@ -610,10 +610,13 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
 line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
-newest `task_runs.summary` of the cards the board shows terminal. No status turn is sent, because
+newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
+newest block's kind and reason. No status turn is sent, because
 none could carry a result back through the door. Only a terminal card reaches the settle step,
 shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
-as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
+as today's wait appends them. A card blocked on `needs_input` delivers no result: its question,
+which the conversation shows as the needs-you message, is appended under
+`Question from delegated task <id>:` instead. `ledger_issue_contains` and `report_contains` see what the worker
 returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only

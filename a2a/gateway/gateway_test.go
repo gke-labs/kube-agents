@@ -201,6 +201,10 @@ type fakeAdapter struct {
 	reactions []string
 	// verified records InboundVerified calls (verifiedCalls).
 	verified []string
+	// feedbacks records every PostMessage's feedback mark, when it has one,
+	// and markedTexts the text each marked post carried.
+	feedbacks   []string
+	markedTexts []string
 	// takesTerminals makes PostTerminal record the terminal in terminals, as
 	// the console adapter publishes a terminal frame; without it the fake
 	// answers errNoTerminalFrames, as a chat backend would.
@@ -256,6 +260,12 @@ func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 }
 
 func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Feedback != "" {
+		a.mu.Lock()
+		a.feedbacks = append(a.feedbacks, m.Feedback)
+		a.markedTexts = append(a.markedTexts, m.Text)
+		a.mu.Unlock()
+	}
 	if m.Chat == nil {
 		return a.Post(conversation, m.Text)
 	}

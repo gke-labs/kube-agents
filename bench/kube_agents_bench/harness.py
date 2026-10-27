@@ -43,8 +43,10 @@ Environment:
         generates a fresh id per invocation so each task's trajectory is
         isolated on this stateful endpoint. A card-wake replay (a prompt
         opening with :mod:`card_wake`'s directive) pins its own id
-        for its turns, plants its card with a ``kubectl exec`` first, and is
-        refused under ``AGENT_TRANSPORT=inject``.
+        for its turns and plants its card with a ``kubectl exec`` first. Its
+        turns go to this endpoint under ``AGENT_TRANSPORT=inject`` as well:
+        under ``spec.mode: next`` a card's wake reaches the front door here
+        too, not through the gateway, though its reply is posted nowhere.
     AGENT_HTTP_TIMEOUT: Per-request timeout in seconds (default ``600``).
     AGENT_DELEGATION_TIMEOUT: Total seconds to wait for delegated work across
         all status turns (default ``1800``). ``0`` disables waiting, restoring
@@ -166,6 +168,7 @@ from kube_agents_bench.parsing import (
     merge_new,
     new_calls,
     parse_response,
+    paused_questions,
     reported_statuses,
 )
 
@@ -273,6 +276,14 @@ _INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a cre
 # follow-up apart -- and so the door's dedupe on the message id cannot fold a
 # second status turn into the first one's task.
 _INJECT_STATUS_TURN_SUFFIX = "/status-"
+
+# How the final message opens each delegated card's part: a finished card's
+# result, and the question a card paused on (``kanban_block``, ``needs_input``),
+# which is what the conversation shows for it. ``verifiers._DELIVERED_HEADER``
+# reads both headers back; change them together.
+_RESULT_SECTION = "Result of delegated task {tid}:\n{text}"
+_QUESTION_SECTION = "Question from delegated task {tid}:\n{text}"
+
 # Appended to the opening turn's message id for the stop a stopped ask sends
 # (stop_hook), so the door's dedupe never answers it with the opening task.
 _INJECT_STOP_SUFFIX = "/stop"
@@ -840,7 +851,7 @@ def _append_final(result: AgentResult, sections: list[str]) -> None:
 def _append_delivered(
     result: AgentResult, observed: list[dict[str, Any]], task_ids: list[str]
 ) -> None:
-    """Append each finished card's own result to the text the judge grades.
+    """Append each finished card's own result, or the question a paused one asks, to the text the judge grades.
 
     The worker runs as a separate hermes session, so its card result is the
     part of its work that crosses back through the conversation (its tool
@@ -850,10 +861,15 @@ def _append_delivered(
     rather than ``result.trajectory``, so the polls inform the answer without
     being graded as the agent's tool use.
     """
+    # A worker's block closes its run with the reason as the run's summary,
+    # which delivered_results would read as the card's result: a card paused
+    # on a question is delivered as that question instead.
+    questions = paused_questions(observed, task_ids)
     all_sections = [
-        f"Result of delegated task {tid}:\n{text}"
+        _RESULT_SECTION.format(tid=tid, text=text)
         for tid, text in delivered_results(observed, task_ids).items()
-    ]
+        if tid not in questions
+    ] + [_QUESTION_SECTION.format(tid=tid, text=text) for tid, text in questions.items()]
     sections = [s for s in all_sections if s.split("\n", 1)[1].strip() not in result.output]
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
@@ -1392,7 +1408,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited):
+    if not delivered_results(observed, awaited) and not paused_questions(observed, awaited):
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -1790,7 +1806,21 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
 
+    def _execute_api(
+        self,
+        prompt: str,
+        workspace_path: Path | None = None,
+        *,
+        opening_turn: bool = True,
+    ) -> AgentResult:
+        """The api transport: one turn on the agent's API server, then the delegation wait.
+
+        :meth:`_execute` sends an ask here under ``AGENT_TRANSPORT=api``, and
+        :meth:`_execute_card_wake` sends a card's wake here on either
+        transport.
+        """
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
         try:
             local_port = _numeric_env("AGENT_LOCAL_PORT", str(SERVICE_API_PORT), int)
@@ -2010,10 +2040,20 @@ class KubeAgentsHarness(AgentHarness):
         the run.
         """
         transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
-        if transport != TRANSPORT_API:
+        if transport not in _TRANSPORTS:
             return AgentResult.errored(
-                f"{card_wake.QUESTION_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_API}, got {transport!r}"
+                f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
             )
+        # Every turn goes to the API server on either transport. A card's wake
+        # is not a door message under spec.mode next either: the notifier
+        # self-posts it into the conversation's bridge session through the
+        # in-pod API server (kanban_chat_notify.ConversationNotifyAdapter),
+        # and its reply is posted nowhere, so a case grading that reply grades
+        # what no next user sees. The answer turn is a door message under
+        # next; here it runs as the bridge's api executor would run it,
+        # without the door. For an ordinary label the click turn the plant
+        # builds (slack_ux_clicks._turn_text) is the text next's gateway sends
+        # for a click (chat_message.NEEDS_YOU_REPLY, slack_interactive.go).
         try:
             planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
         except card_wake.ReplayUnavailable as exc:
@@ -2023,11 +2063,11 @@ class KubeAgentsHarness(AgentHarness):
         pinned = _PINNED_RUN_ID.set(_run_id())
         answer_turn = None
         try:
-            wake_turn = self._execute(planted.wake, workspace_path, opening_turn=True)
+            wake_turn = self._execute_api(planted.wake, workspace_path, opening_turn=True)
             if not card_wake.no_reply(wake_turn) and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
             elif not card_wake.no_reply(wake_turn):
-                answer_turn = self._execute(planted.answer(replay), workspace_path, opening_turn=False)
+                answer_turn = self._execute_api(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
             settled = card_wake.archive(_agent_shell, planted.key, _EXEC_TIMEOUT)
@@ -2066,7 +2106,7 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         fresh = _PINNED_RUN_ID.set(_mint_run_id())
         try:
-            return self._execute(prompt, workspace_path, opening_turn=False)
+            return self._execute_api(prompt, workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(fresh)
 

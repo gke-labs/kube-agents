@@ -1437,11 +1437,13 @@ class ReportManifestVerifier(BaseVerifier):
         )
 
 
-# The header ``_append_delivered`` opens each card's result with in the final
-# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
-# delivered result runs from its header to the next header of either kind.
+# The headers ``_append_delivered`` opens each card's result and each paused
+# card's question with in the final message (harness.py), and the one
+# ``_append_artifacts`` opens a file with. A delivered result runs from its
+# header to the next header of any kind.
 _DELIVERED_HEADER = re.compile(
-    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    r"^(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):\n",
     re.MULTILINE,
 )
 _RESULT_HEADER_PREFIX = "Result of delegated task "

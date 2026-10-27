@@ -2547,6 +2547,7 @@ from test_board import (  # noqa: E402 -- the store builders live with the board
     FRONT as CARD_A,
     CHILD as CARD_B,
     SESSION as API_SESSION,
+    block_card,
     build_session_store,
     local_shell,
     set_card,
@@ -2625,6 +2626,34 @@ def test_two_cards_are_each_waited_for_and_graded(
     assert f"Result of delegated task {CARD_A}:\nfleet report" in final
     assert f"Result of delegated task {CARD_B}:\nnode pool resized" in final
     assert len(shell.reads) == 4
+    assert len(api_executor.submissions) == 1
+
+
+def test_a_card_paused_on_a_question_is_graded_on_the_question(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked on ``needs_input`` delivers no result; the conversation
+    shows its question, and the wait ends there (blocked is terminal)."""
+    build_session_store(tmp_path, created=[CARD_A])
+    question = "payments-api is OOMKilled. Which fix?\n- raise the limit\n- set a request"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            block_card(tmp_path, CARD_A, question)
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, advance))
+
+    result = KubeAgentsHarness().run("why does payments-api restart? give me options")
+
+    assert not result.errors, result.errors
+    final = result.metadata["final_message"]
+    assert final.startswith(ACK)
+    # The worker's run closed with the question as its summary; it is
+    # delivered once, as the question, never as the card's result.
+    assert f"Question from delegated task {CARD_A}:\n{question}" in final
+    assert "Result of delegated task" not in final
+    assert final.count(question) == 1
+    assert result.metadata["delegated_cards"] == {CARD_A: "blocked"}
     assert len(api_executor.submissions) == 1
 
 

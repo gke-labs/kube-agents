@@ -113,6 +113,14 @@ type NotifyConversations interface {
 	EditMessage(conversation, messageID string, m OutMessage) error
 }
 
+// notifyFeedbackTarget is the optional extension NotifyConversations
+// implements to name the task an answer posted on the route is rated under
+// (answer feedback, feedback.go): the root of the ask the plan key answerTo
+// is bound to, or "" when feedback is off or no ask holds the key.
+type notifyFeedbackTarget interface {
+	AnswerFeedbackTarget(conversation, answerTo string) string
+}
+
 // notifyPoster is the backend half: post text into a space, new thread or
 // reply, and say where it landed. GoogleChatAdapter and SlackAdapter
 // implement it; the Notifier, not the poster, holds the home-only bound.
@@ -612,7 +620,7 @@ func (n *Notifier) post(job notifyJob) {
 			job.mark = &MarkState{Ask: mark.Ask, Settle: mark.Settle}
 		}
 	}
-	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "") && n.postConversation(job) {
+	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "" || job.req.AnswerTo != "") && n.postConversation(job) {
 		return
 	}
 	thread := job.req.Thread
@@ -712,11 +720,24 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	m := OutMessage{Text: job.req.Text, Chat: layoutOf(reading)}
 	key := job.req.Update
 	if key == "" {
+		// The card report that settles an ask's plan is that ask's answer
+		// (the sender says so, naming the plan), and the one post on the
+		// route that is rated, laid out or as text.
+		if ft, ok := n.conv.(notifyFeedbackTarget); ok && job.req.AnswerTo != "" {
+			m.Feedback = ft.AnswerFeedbackTarget(conversation, job.req.AnswerTo)
+		}
 		if m.Chat == nil {
-			return false
+			if m.Feedback == "" {
+				return false
+			}
+			return n.postRatedText(job, m)
 		}
 		message, err := n.conv.PostMessage(conversation, m)
 		if !n.chatOutcome(conversation, err) {
+			if m.Feedback != "" {
+				// The text fallback keeps the rating, as the relay's does.
+				return n.postRatedText(job, m)
+			}
 			return false
 		}
 		n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
@@ -754,6 +775,51 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	n.updates.put(conversation, key, message)
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
 	n.log.Info("notify posted", "conversation", conversation, "message", message, "update", key)
+	return true
+}
+
+// postRatedText posts an answer as its text, chunked under the cap, the
+// rating controls on its last chunk (Gateway.postMessage does the same for
+// the relay's answers), and reports whether it answered the request. As the
+// plain text post does, it answers once the first chunk lands, so a later
+// chunk that fails is logged rather than reposting the whole report. A last
+// chunk the backend will not draw the controls on posts as plain text.
+func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
+	conversation := job.req.Conversation
+	chunks := chatChunks(m.Text, discordChunk)
+	if len(chunks) == 0 {
+		return false
+	}
+	// rated is the marked post accepted; a backend that draws no controls
+	// accepts it as text.
+	first, rated := "", false
+	for i, chunk := range chunks {
+		var message string
+		var err error
+		if i == len(chunks)-1 {
+			message, err = n.conv.PostMessage(conversation, OutMessage{Text: chunk, Feedback: m.Feedback})
+			if err == nil {
+				rated = true
+			} else {
+				n.log.Warn("notify: the rated post failed; posting it without rating controls", "conversation", conversation, "err", err)
+				message, err = n.conv.Post(conversation, chunk)
+			}
+		} else {
+			message, err = n.conv.Post(conversation, chunk)
+		}
+		if err != nil {
+			n.log.Error("notify post failed", "conversation", conversation, "err", err)
+			if i == 0 {
+				n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+			}
+			return true
+		}
+		if i == 0 {
+			first = message
+			n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
+		}
+	}
+	n.log.Info("notify posted", "conversation", conversation, "message", first, "rated", rated)
 	return true
 }
 
@@ -957,11 +1023,13 @@ func blocksMention(v any) string {
 
 // notifyInteractiveTypes are the block and element types a click or an
 // entry arrives from. The gateway answers clicks only on the choice buttons
-// it draws itself from a chat message, so a click on one of these would do
-// nothing for the user; validate refuses them rather than trusting the
+// and rating controls it draws itself, so a click on one of these would do
+// nothing for the user, or, on a rating block a sender wrote, rate under a
+// task id the sender chose; validate refuses them rather than trusting the
 // sender to strip them.
 var notifyInteractiveTypes = []string{
 	"actions", "input", "button", "overflow", "checkboxes", "radio_buttons",
+	slackContextActionsBlock, slackFeedbackButtons, "icon_button",
 	"datepicker", "timepicker", "datetimepicker", "plain_text_input",
 	"static_select", "external_select", "users_select", "conversations_select", "channels_select",
 	"multi_static_select", "multi_external_select", "multi_users_select",
@@ -1052,6 +1120,44 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 		return "", err
 	}
 	return rec.ContextID, nil
+}
+
+// AnswerFeedbackTarget is the root task of the ask the plan key answerTo is
+// bound to, when answer feedback is on (notifyFeedbackTarget). A key no ask
+// holds (a plan that never carried a mark, or one evicted) rates nothing
+// rather than guessing at the conversation's latest ask. So does a chain
+// that did not hand its ask to cards (TaskRef.CardsAnswer), which a key
+// bound after a restart can name, and a chain whose card answer was
+// already rated: an ask's follow-up cards can settle a second plan.
+func (c gatewayConversations) AnswerFeedbackTarget(conversation, answerTo string) string {
+	g := c.g
+	desk := g.feedback.Load()
+	if desk == nil {
+		return ""
+	}
+	// The notify worker's lookup bound, as post's own read of the record.
+	ctx, cancel := context.WithTimeout(g.runCtx, notifyLookupTimeout)
+	defer cancel()
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil {
+		g.log.Warn("answer feedback: the session record could not be read; the card answer posts unrated", "conversation", conversation, "err", err)
+		return ""
+	}
+	if rec == nil {
+		return ""
+	}
+	i := rec.notifyChainIndex(answerTo)
+	if i < 0 {
+		return ""
+	}
+	root := rec.Tasks[i].rootID()
+	if ref, ok := rec.TaskRefFor(root); !ok || !ref.CardsAnswer {
+		return ""
+	}
+	if !desk.claimCardAnswer(root) {
+		return ""
+	}
+	return root
 }
 
 // ReplyToRoot is the task a console client knows taskID by: the root of its

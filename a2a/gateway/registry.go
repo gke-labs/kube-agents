@@ -347,6 +347,11 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// CardsAnswer, on a chain's root entry, records that a task of the chain
+	// handed the ask to kanban cards (cardsPending or handedOff at its
+	// terminal): a card's report answers the ask, so no relay answer in the
+	// chain, the wake's included, carries rating controls (answer feedback).
+	CardsAnswer bool `json:"cardsAnswer,omitempty"`
 	// AskMessageID is the backend id of the human message that started the
 	// chain, on its root entry only: the message the chain's mark is drawn
 	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
