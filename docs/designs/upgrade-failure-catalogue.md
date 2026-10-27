@@ -839,17 +839,19 @@ stopped publishing, or an egress allowlist admits only the old hostname, only th
 
 When a node pool upgrade removes a node that is a backend of a load balancer, GKE deregisters
 the node from the backend service and waits for the service's connection draining, up to 600
-seconds per node, before it deletes the node. A backend service whose
-`connectionDraining.drainingTimeoutSec` is above that wait holds every node's removal for the
-whole wait and then times out: the upgrade spends the wait on each surge node, and the node
-leaves the pool with its drain unfinished.
+seconds per node. A backend service whose `connectionDraining.drainingTimeoutSec` is above that
+wait outlasts it: GKE stops waiting at 600 seconds, but the instance group's delete of the old VM
+waits out the full drain, so each node's removal takes the whole drain and, past about 30 minutes,
+GKE fails the node step (`Failed to update node pool` / `Internal error`), leaving the pool in
+`ERROR`.
 
 - Before: a backend service whose backends are a node pool's instance groups, or a network
   endpoint group the cluster's Services annotate, with `connectionDraining.drainingTimeoutSec`
   above 600.
 - Where to look: Compute Engine for the project's backend services (`gcloud compute backend-services list`, each backend's `group` and the service's `connectionDraining`), the GKE API for each pool's `instanceGroupUrls`, and the Kubernetes API for the Services' `cloud.google.com/neg-status` annotation.
-- After: a node pool upgrade that spends the whole wait on each node, the operation's node steps
-  timing out on the drain, and connections cut when the node goes.
+- After: GKE stops waiting at 600 seconds, but the instance group's delete waits out the full drain;
+  the node step fails after about 30 minutes (`Failed to update node pool`), leaving the pool in
+  `ERROR` while Compute Engine holds the old VM until the drain finishes.
 - Mitigate before: set the backend service's connection draining timeout at or under the wait: `gcloud compute backend-services update <name> --global|--region <region> --connection-draining-timeout=600`.
 - Mitigate after: the same command; the next node takes the shorter wait.
 - Read today: the readiness report's `lb-connection-draining` rule (`readiness_rules/lb_connection_draining.py`) reads the project's backend services once per project, matches each backend to the cluster's pools by instance group and to its Services by NEG, and files a blocker per backend service above the wait, with the command; the unmanaged `k8s-ig--` groups GKE creates for an instance-group Service of type LoadBalancer carry the cluster's UID hash and are not matched.
