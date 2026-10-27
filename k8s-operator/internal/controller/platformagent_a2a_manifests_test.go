@@ -2668,14 +2668,23 @@ func TestAFlipToTodayCompletesAroundAnUnownedDoorObject(t *testing.T) {
 	if err := cl.Get(ctx, natsSvcKey, &corev1.Service{}); err != nil {
 		t.Fatalf("precondition: the NATS Service was not rendered: %v", err)
 	}
+	quotaKey := types.NamespacedName{Name: a2aSessionQuotaName(next), Namespace: next.Namespace}
+	if err := cl.Get(ctx, quotaKey, &corev1.ResourceQuota{}); err != nil {
+		t.Fatalf("precondition: the session quota was not rendered: %v", err)
+	}
 
 	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
 		t.Fatalf("an unowned object under a reserved name stopped the flip to today: %v", err)
 	}
-	// Ours went: the Service is in the bus list, after the pre-bus list, so
-	// its absence shows the walk passed the door Secret and the MCP fence.
+	// Ours went. The Service heads the bus list, so its absence shows the
+	// walk passed the pre-bus list and the door Secret; the session quota
+	// sits after the MCP fence in the bus list, so its absence shows the
+	// walk passed that too.
 	if err := cl.Get(ctx, natsSvcKey, &corev1.Service{}); !errors.IsNotFound(err) {
 		t.Errorf("the NATS Service survived the flip: %v", err)
+	}
+	if err := cl.Get(ctx, quotaKey, &corev1.ResourceQuota{}); !errors.IsNotFound(err) {
+		t.Errorf("the session quota survived the flip: %v", err)
 	}
 	// Theirs stayed, owner-less.
 	got := &corev1.Secret{}
@@ -3056,10 +3065,14 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 //
 // The sentinel rule is: an object counts only when this CR owns it. The rows
 // below plant each fence under a stale UID and under no owner at all and
-// require the reconcile to go through and leave the object alone; the control
-// plants the same object owned by the CR and requires the walk to remove it
-// (#2197), so a change that stopped the exit seeing owned residue reds here
-// rather than passing as "nothing wedged".
+// require the reconcile to go through, leave the object alone, and never
+// start the walk; the control plants the same object owned by the CR and
+// requires the walk to run and remove it (#2197), so a change that stopped
+// the exit seeing owned residue reds here rather than passing as "nothing
+// wedged". The walk is observed through the one List it makes and the exit
+// never does: the provision Jobs (deleteA2AProvisionJobs). Since the walk
+// skips what this CR does not own, "the object survived" alone would be
+// true with or without the rule.
 func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.T) {
 	staleOwner := metav1.OwnerReference{
 		APIVersion:         agentv1alpha1.GroupVersion.String(),
@@ -3121,11 +3134,19 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 			if owned := metav1.IsControlledBy(planted, agent); owned != tc.owned {
 				t.Fatalf("planted object controlled by the CR = %t, want %t; the row is not the shape it names", owned, tc.owned)
 			}
+			jobLists := 0
+			funcs := ssaApplyInterceptor()
+			funcs.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*batchv1.JobList); ok {
+					jobLists++
+				}
+				return cl.List(ctx, list, opts...)
+			}
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(agent, planted).
 				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-				WithInterceptorFuncs(ssaApplyInterceptor()).
+				WithInterceptorFuncs(funcs).
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
@@ -3133,10 +3154,14 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 
 			for i := 0; i < 2; i++ {
 				if _, err := r.Reconcile(ctx, req); err != nil {
-					t.Fatalf("Reconcile %d of a today CR beside %s: %v\n"+
-						"The early exit counted an object this CR does not own as its own residue, "+
-						"and the walk's ownership refusal wedged the reconcile before status.", i+1, planted.Name, err)
+					t.Fatalf("Reconcile %d of a today CR beside %s: %v", i+1, planted.Name, err)
 				}
+			}
+			if tc.owned && jobLists == 0 {
+				t.Errorf("the walk never ran beside %s, which this CR owns: the exit no longer sees owned residue", planted.Name)
+			}
+			if !tc.owned && jobLists != 0 {
+				t.Errorf("the walk ran %d time(s) beside %s, which this CR does not own: the exit counted it as residue", jobLists, planted.Name)
 			}
 			stored := &agentv1alpha1.PlatformAgent{}
 			if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
