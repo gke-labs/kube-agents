@@ -3596,6 +3596,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			ImagePullSecrets:             resolveImagePullSecrets(agent.Spec.Deployment),
 			ServiceAccountName:           saName,
 			AutomountServiceAccountToken: ptr.To(false),
+			// See gatewayTerminationGracePeriodSeconds: covers the gateway's
+			// own cron drain and cleanup reserve before the kubelet SIGKILLs.
+			TerminationGracePeriodSeconds: ptr.To(gatewayTerminationGracePeriodSeconds),
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup: ptr.To(agentFSGroup),
 				// Every container in this Pod runs as the agent image's user.
@@ -3626,6 +3629,23 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
 const gatewayProgressDeadlineSeconds int32 = 1800
+
+// gatewayTerminationGracePeriodSeconds is how long the kubelet waits between
+// SIGTERM and SIGKILL for a gateway pod. Kubernetes defaults it to 30s, which
+// is shorter than the gateway's own stop path: on SIGTERM, stop() waits up to
+// agent.cron_drain_timeout (30s by default) for an in-flight cron run, then
+// keeps a 10s cleanup reserve to interrupt agents, kill tool subprocesses,
+// mark jobs and disconnect adapters. Hermes sizes its own systemd unit for the
+// same path at a 60s TimeoutStopSec floor (gateway/restart.py:
+// SYSTEMD_TIMEOUT_STOP_SEC_FLOOR). Under 30s a SIGTERM that arrives while a
+// cron job runs is followed by SIGKILL during cleanup, and the job stays at
+// last_status=running instead of being recorded as interrupted.
+//
+// The cost on an idle gateway is nothing: the pod exits as soon as stop()
+// returns (0.18s on 2026-10-17, ka-webconsole-pr2321), so a Recreate rollout
+// is not lengthened. The grace period only extends shutdown when there is
+// work to drain.
+const gatewayTerminationGracePeriodSeconds int64 = 60
 
 // buildDeployment generates the Deployment manifest for the agent payload
 func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsConfigHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, opts renderOptions) *appsv1.Deployment {

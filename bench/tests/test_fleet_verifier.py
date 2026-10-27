@@ -2367,3 +2367,71 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
             )
     assert seen, "no role asserts on a named subject; this test is vacuous"
 
+
+# ------------------------------------------- the planted-taint safeguards (#4037)
+#
+# Both cost cases guard the taint that keeps idle-batch-pool empty, across every
+# node the pool selector matches. The pool can have one node or several. These
+# tests parse each check from the shipped task YAML and run it over stubbed node
+# lists, pinning what `across_matches: every` does at one node and at two.
+# "Removed on one of two" passes today: `every` quantifies over the taint
+# filter's elements, so a node with no seeded-role taint drops out rather than
+# failing. #4038 tracks that; when it lands, flip the assertion.
+
+_TAINT_CHECKS = [
+    ("cost-idle-pool-probe", "the-planted-taint-survived-the-probe"),
+    ("cost-chat-request-runs-collector", "the-planted-taint-survived"),
+]
+
+
+def _shipped_check(case: str, name: str):
+    spec = yaml.safe_load((_BENCH / "tasks" / case / "task.yaml").read_text())
+    for entry in spec["verification_spec"]:
+        if entry["name"] == name:
+            return parse_node({**entry["check"], "name": name})
+    raise AssertionError(f"{case} has no check named {name!r}")
+
+
+def _pool_node(i: int, tainted: bool) -> dict:
+    taints = [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]
+    node = {"metadata": {"name": f"gke-seeded-a-idle-batch-pool-{i}"}, "spec": {}}
+    if tainted:
+        node["spec"]["taints"] = taints
+    return node
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+@pytest.mark.parametrize(
+    ("tainted", "expected"),
+    [
+        ([True], "pass"),
+        ([False], "fail"),
+        ([True, True], "pass"),  # #4037: failed before `every`, nothing changed
+        ([False, False], "fail"),
+        ([True, False], "pass"),  # the known gap, #4038
+    ],
+    ids=["1-kept", "1-removed", "2-kept", "2-removed", "2-removed-on-one"],
+)
+def test_the_planted_taint_safeguard_across_pool_sizes(
+    monkeypatch, provisioned, case, name, tainted, expected
+):
+    provisioned("idle-nodepool")
+    _fake_get_resource(monkeypatch, lambda k, n, kw: _ns_list("default"))
+    nodes = [_pool_node(i, t) for i, t in enumerate(tainted)]
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == expected, result.reason
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_a_changed_taint_value_on_one_node_fails(monkeypatch, provisioned, case, name):
+    # A taint that is still there but rewritten is caught on any node, unlike
+    # one that was removed.
+    provisioned("idle-nodepool")
+    _fake_get_resource(monkeypatch, lambda k, n, kw: _ns_list("default"))
+    nodes = [_pool_node(0, True), _pool_node(1, True)]
+    nodes[1]["spec"]["taints"][0]["value"] = "anything-else"
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "fail", result.reason
+    assert "gke-seeded-a-idle-batch-pool-1" in result.reason

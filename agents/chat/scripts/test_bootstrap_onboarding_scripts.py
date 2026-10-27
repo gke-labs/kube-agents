@@ -67,6 +67,8 @@ from cluster_agent_reconcile import SCAFFOLD_ARTIFACTS  # noqa: E402
 INVENTORY = "INVENTORY.md"
 DELIVERED = "INVENTORY.delivered.md"
 ALIGNED = ".user_aligned"
+# The plugin's hold on the report while the greeting is on its way (bootstrap_onboarding).
+HOLD_PREFIX = ".bootstrap_greeting_pending."
 COMPLETED = ".bootstrap_completed"
 SCAN_FILED = ".bootstrap_scan_filed"
 SHOWN = "INVENTORY.shown.json"
@@ -125,6 +127,112 @@ class DeliveryDecisionTest(unittest.TestCase):
         # another pod, and main() reads it only after this says yes.
         (self.d / ALIGNED).touch()
         self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    # --- the greeting hold (bootstrap_onboarding's .bootstrap_greeting_pending.<turn>) ---
+
+    def _hold(self, turn="turn-1", age=0.0):
+        path = self.d / f"{HOLD_PREFIX}{turn}"
+        path.touch()
+        if age:
+            at = time.time() - age
+            os.utime(path, (at, at))
+        return path
+
+    def _stage_log(self):
+        path = self.d / oobe.STAGE_LOG
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_a_young_hold_keeps_the_report_behind_the_greeting(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(hold.exists())
+        self.assertEqual(self._stage_log(), "")
+
+    def test_the_hold_holds_on_the_conversation_path_too(self):
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self._hold()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_a_hold_past_the_wait_is_dropped_once_with_a_log_line(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(
+            self._stage_log(),
+            f"bootstrap_delivery: the greeting did not finish within {bootstrap_delivery.GREETING_WAIT_SECONDS} s; "
+            "delivering the report\n",
+        )
+        # The next tick finds no hold and writes nothing more.
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertEqual(self._stage_log().count("\n"), 1)
+
+    def test_the_newest_hold_decides(self):
+        (self.d / ALIGNED).touch()
+        old = self._hold("turn-old", age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        young = self._hold("turn-new")
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(old.exists() and young.exists())
+
+    def test_a_hold_without_a_human_present_is_left_alone(self):
+        # Aligned first: a touch of the marker that failed leaves this hold, and the
+        # report waits for a turn that binds, as on the path before the hold. The
+        # hold ages out on the first tick after that turn binds.
+        hold = self._hold(age=bootstrap_delivery.GREETING_WAIT_SECONDS + 1)
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertTrue(hold.exists())
+        self.assertEqual(self._stage_log(), "")
+        (self.d / ALIGNED).touch()
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+        self.assertEqual(self._stage_log().count("\n"), 1)
+
+    def test_a_directory_in_place_of_the_hold_never_raises(self):
+        (self.d / ALIGNED).touch()
+        (self.d / f"{HOLD_PREFIX}dir").mkdir()
+        self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        at = time.time() - bootstrap_delivery.GREETING_WAIT_SECONDS - 1
+        os.utime(self.d / f"{HOLD_PREFIX}dir", (at, at))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_an_unreadable_hold_never_raises(self):
+        # Only the unreadable hold's stat raises: Python 3.12's Path.exists() goes
+        # through Path.stat(), so a raise on every path would hit the aligned check.
+        (self.d / ALIGNED).touch()
+        unreadable = self._hold("turn-unreadable")
+        real_stat = Path.stat
+
+        def stat_except_the_unreadable_hold(path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError("no")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=stat_except_the_unreadable_hold):
+            self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+            # An unreadable hold is skipped, not fatal: a readable young one still holds.
+            self._hold("turn-readable")
+            self.assertFalse(bootstrap_delivery._awaiting_delivery(self.d))
+        with mock.patch.object(Path, "glob", side_effect=OSError("no")):
+            self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+
+    def test_a_hold_from_a_clock_that_moved_back_is_dropped(self):
+        (self.d / ALIGNED).touch()
+        hold = self._hold(age=-(bootstrap_delivery.GREETING_WAIT_SECONDS + 1))
+        self.assertTrue(bootstrap_delivery._awaiting_delivery(self.d))
+        self.assertFalse(hold.exists())
+
+    def test_main_stays_silent_under_a_young_hold(self):
+        (self.d / ALIGNED).touch()
+        (self.d / INVENTORY).write_text("# report\n", encoding="utf-8")
+        self._hold()
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+                mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
 
 
 class DeliveryMainTest(unittest.TestCase):

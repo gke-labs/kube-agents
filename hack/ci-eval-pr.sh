@@ -179,8 +179,8 @@ readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
 readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
 readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 # The round trip after the suite verdict is for a next-mode run on main: a
-# pull request's next-mode run (the merge-blocking presubmit's, or a Tide
-# batch's) skips it, since nobody reads a report-only result there and the
+# pull request's next-mode run (the merge-blocking presubmit's, or a batch's
+# that Tide ran) skips it, since nobody reads a report-only result there and the
 # today lane below proves the same path every six hours on main, and on
 # demand on a pull request.
 readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"

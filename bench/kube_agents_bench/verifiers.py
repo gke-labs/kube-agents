@@ -186,13 +186,16 @@ _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
-# connection) is tried this many times, with this pause between tries, before
-# the check reports the API unreachable. One slow read must not red a run on
-# rung 2: gitlab.com's API times out a read now and then where GitHub's does
-# not, and the in-job GitLab helper retries its reads for the same reason. An
-# HTTP answer, whatever its status, is not retried: it is an observation.
+# connection) or is answered 5xx is tried this many times, with this pause
+# between tries, before the check reports the API unreachable or returns the
+# last 5xx. One slow read must not red a run on rung 2: gitlab.com's API times
+# out a read now and then where GitHub's does not, and the in-job GitLab helper
+# retries its reads for the same reason; a GitHub 502 on one branch listing
+# redded a merge gate (#3823). Any other HTTP answer is not retried: it is an
+# observation.
 _FORGE_READ_ATTEMPTS = 3
 _FORGE_READ_RETRY_PAUSE_SEC = 2.0
+_HTTP_SERVER_ERROR_FLOOR = 500
 # The sandbox's report changes at most twice (written, then renamed), so at most
 # two of three sandbox re-reads can differ from the read before them.
 _REPORT_READ_ATTEMPTS = 3
@@ -1437,11 +1440,13 @@ class ReportManifestVerifier(BaseVerifier):
         )
 
 
-# The header ``_append_delivered`` opens each card's result with in the final
-# message (harness.py), and the one ``_append_artifacts`` opens a file with. A
-# delivered result runs from its header to the next header of either kind.
+# The headers ``_append_delivered`` opens each card's result and each paused
+# card's question with in the final message (harness.py), and the one
+# ``_append_artifacts`` opens a file with. A delivered result runs from its
+# header to the next header of any kind.
 _DELIVERED_HEADER = re.compile(
-    r"^(?:Result of delegated task \S+|Artifact [^\n]* produced by delegated task \S+):\n",
+    r"^(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):\n",
     re.MULTILINE,
 )
 _RESULT_HEADER_PREFIX = "Result of delegated task "
@@ -1642,25 +1647,8 @@ class AnswerFirstVerifier(BaseVerifier):
 
 # Hermes' MCP dispatch wrapper: a worker's trajectory entry named this carries
 # the tool(s) it actually invoked under args["name"] or args["calls"][*]["name"].
-_TOOL_CALL_WRAPPER = "tool_call"
-
-
-def _wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
-    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
-    if entry.get("name") != _TOOL_CALL_WRAPPER:
-        return set()
-    args = entry.get("args")
-    if not isinstance(args, dict):
-        return set()
-    names: set[str] = set()
-    if args.get("name"):
-        names.add(str(args["name"]))
-    calls = args.get("calls")
-    if isinstance(calls, list):
-        for c in calls:
-            if isinstance(c, dict) and c.get("name"):
-                names.add(str(c["name"]))
-    return names
+_TOOL_CALL_WRAPPER = worker_trajectory.TOOL_CALL_WRAPPER
+_wrapped_tool_names = worker_trajectory.wrapped_tool_names
 
 
 def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
@@ -3935,10 +3923,10 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     Returns ``(status, decoded_json_or_None)``. Raises :class:`OSError`-family
     exceptions for transport failures, which the caller turns into
     ``status="error"`` rather than a fail — an unreachable API is the absence
-    of an observation, not a violation. A transport failure is retried
-    ``_FORGE_READ_ATTEMPTS`` times first, so one slow read does not become
-    that error; an HTTP answer is returned on the first try, whatever its
-    status.
+    of an observation, not a violation. A transport failure or a 5xx answer is
+    retried ``_FORGE_READ_ATTEMPTS`` times first, so one slow read or one
+    forge fault does not become that error; any other HTTP answer is returned
+    on the first try.
 
     Redirects are refused rather than followed. urllib does not strip
     ``Authorization`` across hosts, and a renamed repository answers ``301``;
@@ -3977,6 +3965,9 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
                 payload = json.loads(exc.read().decode("utf-8", errors="replace"))
             except (ValueError, OSError):
                 payload = None
+            if exc.code >= _HTTP_SERVER_ERROR_FLOOR and attempt < _FORGE_READ_ATTEMPTS:
+                time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
+                continue
             return exc.code, payload
         except json.JSONDecodeError as exc:
             raise OSError(f"the forge returned a body that is not JSON: {exc}") from exc

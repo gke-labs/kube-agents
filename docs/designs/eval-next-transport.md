@@ -359,9 +359,8 @@ scope reads the workers' tagged entries, which the trace does not carry, and sta
 the worker checks, as does a `tool_called` with a `result` pattern, since the trace records no results
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
-needs the front door — `agent-kanban-smoke`, which grades
-the chat profile's `kanban_create` — is a different matter:
-`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with the reason below, and the
+the transport removes is a different matter:
+`hack/eval/inject-lane-exclusions.txt` keeps it off this lane's matrix with its reason, and the
 api lane's roster is untouched. The lane runs the bridge's shipped default executor, `api`, the
 one a customer install runs: `hack/ci-deploy.sh` leaves the operator's `A2A_BRIDGE_EXECUTOR`
 unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from the
@@ -369,11 +368,12 @@ unset, so the rendered bridge carries no `BRIDGE_EXECUTOR` and picks `api` from 
 `"executor":"api"`, which a bridge that fell back to `cli` for want of the key fails. Under `api`
 the turn runs under the pod's API server, whose profile is the chat path's own (`default` on a
 stock install), so the agent that answers a case on this lane is the one the chat path reaches
-("What the lane grades" below). That does not return the exclusion's premise: the default
-profile may file the card, but the card's completion never reaches the A2A thread
-([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). The delegation
-wait appends the card's result to the graded answer (Completion signals), but it reads that from
-the pod, not from the thread, so the exclusion stays.
+("What the lane grades" below). A card that turn files completes after the turn has answered,
+and its report never reaches the inject door's thread, which records no notify route
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Executors"). On a chat door
+the notifier posts that report into the conversation, and the delegation wait reads the same
+card's result from the pod and appends it to the graded answer (Completion signals), so a
+delegating case grades the report a user would read without the door carrying it.
 `ledger_issue_contains` finds the ledger by scanning the final message for a GitHub issue URL, so
 it works on any transport that maps a result into the final message, which both new transports
 do, and its grade depends on that mapping: the fleet-audit cases get the URL from the delegated
@@ -610,10 +610,13 @@ store kept none, the `kanban_notify_subs` rows addressed to the session, through
 and polls `kanban.db` for their statuses until every card is terminal or the delegation timeout
 passes; a card the board has no row for on three reads in a row is dropped from the wait with a
 line on the record's errors, and nothing is graded for it. Then it reads `tasks.result` and the
-newest `task_runs.summary` of the cards the board shows terminal. No status turn is sent, because
+newest `task_runs.summary` of the cards the board shows terminal, and for a blocked card the
+newest block's kind and reason. No status turn is sent, because
 none could carry a result back through the door. Only a terminal card reaches the settle step,
 shaped as a `kanban_show` result, so the delivered card results are appended to the graded answer
-as today's wait appends them, `ledger_issue_contains` and `report_contains` see what the worker
+as today's wait appends them. A card blocked on `needs_input` delivers no result: its question,
+which the conversation shows as the needs-you message, is appended under
+`Question from delegated task <id>:` instead. `ledger_issue_contains` and `report_contains` see what the worker
 returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only

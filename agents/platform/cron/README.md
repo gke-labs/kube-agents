@@ -411,8 +411,8 @@ list equal to `read_only_roles` in the full-install composition.
 It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
 `stall-watch` does, so chat hears a role on the tick it first appears and again
 when it goes. A role still held is said again once a day, on the first tick from
-12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
-grant said once in a busy channel can be missed, and nothing else would raise it
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats a
+stuck card weekly: a grant said once in a busy channel can be missed, and nothing else would raise it
 again. Any other tick on an unchanged account prints nothing. That is why it can run
 hourly: a fresh install or a new grant is named within the hour, and a quiet
 hour costs one `kubectl` pair and one policy read per project, no model turn. A
@@ -482,24 +482,35 @@ engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
 with no comment or unblock since. A worker's or operator's block is sticky by
 design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked. Cards are listed newest first, with
-their kind, reason, and age read from the board; where multiple cards share a
-title, they are grouped to keep the report readable, with task IDs and reasons
-retained. The `hermes kanban unblock` and `archive` commands appear once in a
-footer (using `<task_id>` when multiple cards are stuck) rather than repeated
-under every card, so the room knows how to move a card while long reports stay
-bounded within chat limits, summarizing any omitted cards by task ID up to
-the character budget (and falling back to a count and list command when omitted IDs
-exceed the limit).
+weeks because nothing periodically asked.
 
-Daily, and it repeats: the rule is stateless, so a card still blocked is named
-(directly, or by task ID in the omitted list up to the budget)
-every morning until someone unblocks, comments on, or archives it. That is the
-intended nag, the same rule `findings-morning-nudge` keeps for the top
-criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a
-day. It fires at 12:35 UTC, half an hour after that nudge's daily reminder, for
-the same reason the reminder waits for 12:00: an earlier UTC hour is the middle
-of the night in the US, not a morning.
+The stuck cards are said in plain words for whoever is in the channel: a
+headline counting them ("2 tasks are stuck and need someone to decide."), then
+one row per card, newest first, with the card's own title in bold and how long
+it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
+for a `needs_input` block, which waits on a person's answer). Cards sharing a
+title and whether they wait on a person are one row with their count, and past
+`MAX_STUCK_ROWS` rows the rest are counted. A card that holds back todo cards
+(a child waits until every parent is done) names the first of them under its
+row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
+`hermes kanban` commands reach chat; `hermes kanban list` and `show` on the
+agent pod have them.
+
+It runs daily but speaks about stuck cards only when one first gets stuck, then
+once a week while any stays stuck: a card said once in a busy channel can be
+missed, and a daily repeat of the same list is noise. The ids last said, and
+when, are kept in `profiles/platform/cron/kanban_board_health.json` under the
+agent home; a card that comes unstuck drops out of it, so it is new again if it
+sticks again, and a record that cannot be read says every stuck card again. The
+record is written before the scheduler delivers, so a run that finds a
+`last_delivery_error` on this job's entry stamped after the last post says the
+cards again rather than leaving them unsaid for a week. The
+board's other findings (invariant violations and the engine's other rules) are
+rare and still print on every run that finds them, under
+`kanban board health: attention required`. It fires at 12:35 UTC, half an hour
+after the findings-queue nudge's daily reminder, for the same reason the
+reminder waits for 12:00: an earlier UTC hour is the middle of the night in the
+US, not a morning.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
@@ -811,7 +822,7 @@ at `$HERMES_HOME` directly and the entrypoint seeds it with
 `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
 step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
 `AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
-`scripts/` — and since the
+`scripts/` and `plugins/bootstrap_onboarding/` — and since the
 scheduler writes `last_run` into the volume's copy on every tick, that copy's
 timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
 
