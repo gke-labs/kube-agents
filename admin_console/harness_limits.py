@@ -84,6 +84,7 @@ PLAN_BASE_LEVELS = MappingProxyType(
 # Metric names, as bench/scale/README.md lists them.
 MEMORY_PEAK = "memory_peak_bytes"
 CPU_PEAK = "cpu_peak_cores"
+CPU_SECONDS = "cpu_seconds"
 RESTARTS = "restarts"
 OOMKILLS = "oomkills"
 PVC_USED = "pvc_used_bytes"
@@ -308,6 +309,7 @@ METRICS = MappingProxyType(
     {
         MEMORY_PEAK: MetricSpec("Memory peak", "MiB", MIB),
         CPU_PEAK: MetricSpec("CPU peak", "cores"),
+        CPU_SECONDS: MetricSpec("CPU used over the window", "core-s"),
         RESTARTS: MetricSpec("Restarts"),
         OOMKILLS: MetricSpec("OOMKills"),
         PVC_USED: MetricSpec("Data PVC used", "GiB", GIB),

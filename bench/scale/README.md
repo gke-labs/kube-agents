@@ -145,12 +145,15 @@ what the test clusters really had, summed over the fleet; fits use the totals fo
 `replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>`, so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
 run. `excluded_from` names the fits the record is left out of: `["response_seconds"]` when a prompt
 run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade readiness record written
-before answers were kept, when its completion cannot be checked. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records. `errors` lists what made the run differ from its plan: a failed prompt, a
+before answers were kept, when its completion cannot be checked. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records, and `remonitor` reads every stored record's Cloud
+Monitoring metrics again with the current queries, within Monitoring's retention. `errors` lists what made the run differ from its plan: a failed prompt, a
 cluster the event watcher did not watch, a churn batch that failed, a monitoring read that failed.
 
 Metric names:
 
-- per container: `memory_peak_bytes`, `cpu_peak_cores`, `restarts`, `oomkills`;
+- per container: `memory_peak_bytes`, `cpu_peak_cores`, `cpu_seconds` (the CPU used over the window,
+  summed over replicas: the work, which a container held at its CPU limit cannot show as a peak),
+  `restarts`, `oomkills`;
 - the data volume: `pvc_used_bytes`, `pvc_capacity_bytes`, `profile_bytes_max`, `profiles`;
 - the credential proxy: `proxy_wait_p50_seconds`, `proxy_wait_max_seconds`, `proxy_refusals`,
   `proxy_commands` (brokered commands run) and `proxy_command_seconds` (the seconds they ran, summed);

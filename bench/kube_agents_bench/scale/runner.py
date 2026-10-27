@@ -5,6 +5,7 @@
     python -m kube_agents_bench.scale.runner apply <plan.yaml> --factor F --level L
     python -m kube_agents_bench.scale.runner teardown <plan.yaml> [--delete-fleet]
     python -m kube_agents_bench.scale.runner reclassify <plan.yaml>
+    python -m kube_agents_bench.scale.runner remonitor <plan.yaml>
 
 ``run`` skips every run whose key is already in the data file, so an
 interrupted run resumes where it stopped; ``--force`` re-runs and replaces.
@@ -61,6 +62,8 @@ PREFLIGHT_SHELL = "/bin/sh"
 PREFLIGHT_TIMEOUT_SECONDS = 600
 TERMINATED_EXIT_CODE = 143
 PEAK_METRIC = "memory_peak_bytes"
+# What add_peaks reads from Cloud Monitoring; remonitor replaces exactly these.
+MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds")
 PROJECT_PLACEHOLDER = "<project>"
 MONITORING_ERROR = "monitoring:"
 REVISION_LENGTH = 12
@@ -620,6 +623,33 @@ class Runner:
             for name, value in values.items():
                 record.metrics.append(records.Metric(name, value, container))
 
+    def remonitor(self) -> int:
+        """Read every stored record's Cloud Monitoring metrics again, with the current queries.
+
+        A change in what the runner reads from Monitoring then reaches the stored records,
+        within Monitoring's retention; a record it cannot read keeps what it has. Returns how
+        many records changed.
+        """
+        data = records.load(self.data_file)
+        changed = []
+        for raw in data["records"]:
+            record = records.Record.from_dict(raw)
+            try:
+                peaks = self.install.container_peaks(_epoch(record.started), _epoch(record.ended))
+            except Exception as exc:  # one unreadable window keeps its record as it is
+                LOG.warning("could not read Monitoring for %s: %s", record.key, exc)
+                continue
+            if not peaks:
+                continue
+            record.metrics = [m for m in record.metrics if m.name not in MONITORING_METRICS] + [
+                records.Metric(name, value, container)
+                for container, values in peaks.items() for name, value in values.items()
+            ]
+            record.errors = [e for e in record.errors if not e.startswith(MONITORING_ERROR)]
+            changed.append(record)
+        records.merge(self.data_file, changed)
+        return len(changed)
+
     def teardown(self, delete_fleet: bool) -> None:
         """Remove every fixture and shrink the pools; ``delete_fleet`` deletes the test clusters too."""
         self.stop_churn()
@@ -645,7 +675,7 @@ class Runner:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["plan", "run", "apply", "teardown", "reclassify"])
+    parser.add_argument("command", choices=["plan", "run", "apply", "teardown", "reclassify", "remonitor"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--only-factor")
     parser.add_argument("--only-operation")
@@ -684,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
         runner.run(specs, args.force, args.limit)
     elif args.command == "reclassify":
         print(f"{runner.reclassify()} records changed")
+    elif args.command == "remonitor":
+        print(f"{runner.remonitor()} records changed")
     elif args.command == "apply":
         try:
             runner.apply_level(args.factor, args.level)

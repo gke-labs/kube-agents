@@ -5,8 +5,8 @@
 # CPU-starved proxy holds commands longer, which raises its memory peak. These runs show what the
 # proxy uses when CPU does not cap it. The runner reads the limits from the live pods into every
 # record; it does not change them: set the field before these runs and remove it after. Run
-# `--only-factor clusters` while the fleet has 16 clusters, before phase3.yaml moves to 8, and
-# `--only-factor base` after phase3.yaml's base runs.
+# `--only-factor clusters` while the fleet has 16 clusters, before phase3.yaml moves to 8. At the
+# base the proxy is far below its limit, so phase3.yaml's base runs already show its need there.
 phase: phase3-proxy-raised
 
 target:

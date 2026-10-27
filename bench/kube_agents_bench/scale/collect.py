@@ -374,7 +374,12 @@ class Install:
         return counts
 
     def container_peaks(self, start: float, end: float) -> dict[str, dict[str, float]]:
-        """Per container, the highest memory and CPU over [start, end], from Cloud Monitoring.
+        """Per container, the highest memory and CPU over [start, end], and the CPU-seconds used, from
+        Cloud Monitoring.
+
+        The CPU-seconds are the work: a container at its CPU limit shows the limit as its peak,
+        while the work a fleet asks of it grows with the fleet. They are summed over the
+        container's replicas; the peaks are the highest of any one.
 
         Monitoring refuses an interval whose end is not after its start, so a
         window shorter than a second is widened to one second.
@@ -387,16 +392,18 @@ class Install:
             f'AND resource.labels.namespace_name="{self.namespace}"'
         )
         queries = (
-            ("memory_peak_bytes", f'metric.type="{MEMORY_METRIC}" AND metric.labels.memory_type="{MEMORY_TYPE}" AND {base}', "ALIGN_MAX"),
-            ("cpu_peak_cores", f'metric.type="{CPU_METRIC}" AND {base}', "ALIGN_RATE"),
+            ("memory_peak_bytes", f'metric.type="{MEMORY_METRIC}" AND metric.labels.memory_type="{MEMORY_TYPE}" AND {base}', "ALIGN_MAX", max),
+            ("cpu_peak_cores", f'metric.type="{CPU_METRIC}" AND {base}', "ALIGN_RATE", max),
+            ("cpu_seconds", f'metric.type="{CPU_METRIC}" AND {base}', "ALIGN_DELTA", sum),
         )
-        for name, query, aligner in queries:
+        for name, query, aligner, reduce in queries:
             for series in self._time_series(query, aligner, start, end):
                 container = series["resource"]["labels"].get("container_name", "")
                 values = [_point_value(point) for point in series.get("points", [])]
                 if container and values:
                     current = peaks.setdefault(container, {}).get(name, 0.0)
-                    peaks[container][name] = max(current, max(values))
+                    # One series per replica: the peak is the highest, the work the sum.
+                    peaks[container][name] = max(current, max(values)) if reduce is max else current + sum(values)
         return peaks
 
     def _time_series(self, query: str, aligner: str, start: float, end: float) -> list[dict[str, Any]]:

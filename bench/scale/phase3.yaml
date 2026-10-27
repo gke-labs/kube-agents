@@ -35,7 +35,9 @@ base:
   listing_pods: 100
 
 factors:
-  clusters: [2, 16, 8]
+  # 6 and 4 are below the credential proxy's CPU limit (it reaches 1 core at about 7 clusters),
+  # so their CPU is the need rather than the limit, and the trend through them forecasts larger fleets.
+  clusters: [2, 16, 8, 6, 4]
 
 settings:
   settle_seconds: 300

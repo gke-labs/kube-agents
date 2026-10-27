@@ -837,7 +837,7 @@ def test_phase3_triggers_the_oobe_first_run_audits_in_a_window_of_their_own():
     assert audits.jobs == tuple(first_run)
     # The fleet only shrinks: the largest level runs first.
     assert [s.level for s in plan.matrix() if s.factor == "clusters" and s.operation.name == "onboarding_30m"] == [
-        16, 8]
+        16, 8, 6, 4]
 
 
 def test_a_plan_without_a_required_setting_is_refused_at_load(tmp_path):
@@ -864,3 +864,33 @@ def test_a_level_that_cannot_be_applied_stops_the_run(monkeypatch, tmp_path):
     run.run([s for s in plan.matrix() if s.factor == "clusters"], force=False)
     # The 8-cluster level, which would delete the clusters the 16-cluster level holds, never starts.
     assert applied == [16]
+
+
+def test_remonitor_replaces_only_the_monitoring_metrics(monkeypatch, tmp_path):
+    path = tmp_path / "data.json"
+    records.merge(path, [records.Record(
+        commit="e" * 40, mode="next", phase="phase3", factor="base", level=0, operation="onboarding_30m", run=1,
+        started="2026-10-27T00:00:00Z", ended="2026-10-27T00:30:00Z",
+        metrics=[records.Metric("memory_peak_bytes", 1.0, "shell"), records.Metric("proxy_commands", 9.0)],
+        errors=["monitoring: HTTPError: 503"])])
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), path)
+    run.install = type("Install", (), {"container_peaks": lambda self, start, end: {
+        "shell": {"memory_peak_bytes": 2.0, "cpu_peak_cores": 0.5, "cpu_seconds": 300.0}}})()
+    assert run.remonitor() == 1
+    stored = records.load(path)["records"][0]
+    assert {(m["name"], m.get("container"), m["value"]) for m in stored["metrics"]} == {
+        ("proxy_commands", None, 9.0), ("memory_peak_bytes", "shell", 2.0), ("cpu_peak_cores", "shell", 0.5),
+        ("cpu_seconds", "shell", 300.0)}
+    assert stored["errors"] == []
+
+
+def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
+    install = collect.Install("p", "ctx", "ns", "host", "zone")
+
+    def series(query, aligner, start, end):
+        points = {"ALIGN_MAX": (100.0, 300.0), "ALIGN_RATE": (0.2, 0.4), "ALIGN_DELTA": (30.0, 60.0)}[aligner]
+        return [{"resource": {"labels": {"container_name": "litellm-container"}},
+                 "points": [{"value": {"doubleValue": value}}]} for value in points]
+    monkeypatch.setattr(install, "_time_series", series)
+    peaks = install.container_peaks(0.0, 1800.0)["litellm-container"]
+    assert peaks == {"memory_peak_bytes": 300.0, "cpu_peak_cores": 0.4, "cpu_seconds": 90.0}
