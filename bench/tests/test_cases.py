@@ -187,11 +187,12 @@ def test_yaml_is_loaded_safely(write_task):
 # --------------------------------------------------------------------------
 
 
-def test_the_kanban_smoke_names_its_tool_called_objective(kanban_task):
+def test_the_kanban_smoke_declares_no_check_its_transport_can_blind(kanban_task):
+    """#4004: the case grades the answer the user receives and nothing about
+    how the front door delegated, so the inject lane sets nothing aside."""
     spec = load_case(kanban_task)
-    assert spec.transport_blind_checks == {"the-kanban-card-was-actually-filed"}
-    # A router-scope tool_called: gradable once the door shows the trace.
-    assert spec.trace_blind_checks == {"the-kanban-card-was-actually-filed"}
+    assert spec.transport_blind_checks == frozenset()
+    assert spec.trace_blind_checks == frozenset()
     assert spec.worker_blind_checks == frozenset()
 
 

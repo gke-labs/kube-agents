@@ -128,7 +128,8 @@ type Adapter interface {
 	// a backend that cannot hold this one, or whose API refuses it, returns
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
-	// With m.Chat nil it is Post(conversation, m.Text).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go).
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
@@ -217,6 +218,11 @@ type OutMessage struct {
 	// already read and validated for its carrier (chatmsg.Read); an adapter
 	// renders it or declines it, and never repairs one.
 	Chat *chatmsg.Message
+	// Feedback, when set, is the task id an answer can be rated under: the
+	// root of the chain whose final answer this message is (answer
+	// feedback, feedback.go). A backend that draws rating controls draws
+	// them on this message; every other backend ignores it.
+	Feedback string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message

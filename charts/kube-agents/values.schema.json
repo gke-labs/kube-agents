@@ -1288,6 +1288,9 @@
                 "homeChannelName": {
                   "type": "string"
                 },
+                "answerFeedback": {
+                  "type": "boolean"
+                },
                 "homeChannelPolicy": {
                   "type": "string",
                   "enum": ["", "auto", "manual"]
@@ -1460,6 +1463,93 @@
               }
             }
           }
+        }
+      }
+    },
+    "webConsole": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "assist": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "model": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-/:]*$|^$"
+            },
+            "url": {
+              "type": "string",
+              "pattern": "^https?://[A-Za-z0-9.\\-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~\\-/]*)?$|^$"
+            }
+          }
+        },
+        "releaseCheck": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "repo": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.\\-]+/[A-Za-z0-9_.\\-]+$"
+            }
+          }
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["", "Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "agentIdentity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "gcpServiceAccount": {
+              "type": "string"
+            },
+            "roles": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^,]+$"
+              }
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "securityContext": {
+          "type": "object"
         }
       }
     },

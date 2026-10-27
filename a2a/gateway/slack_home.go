@@ -97,6 +97,16 @@ const (
 	slackHomeOpened       = "opened "
 	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
 	slackHomePRLink = "<%s|#%d %s>"
+
+	// slackHomeFeedbackWeek is the answer ratings line, over the last
+	// slackHomeFeedbackWindow, drawn when answer feedback is on.
+	slackHomeFeedbackWeek   = "This week: %d 👍, %d 👎"
+	slackHomeFeedbackWindow = 7 * 24 * time.Hour
+	// slackHomeTallyFresh and slackHomeTallyErrorFresh are how long a tally,
+	// and a failed one, is reused: a week's count moves slowly, and the
+	// tally reads the whole bucket.
+	slackHomeTallyFresh      = 5 * time.Minute
+	slackHomeTallyErrorFresh = time.Minute
 	// slackHomeHTTPS is the scheme prRepo reads a forge URL under.
 	slackHomeHTTPS = "https://"
 
@@ -147,6 +157,10 @@ type slackHome struct {
 	// running: the running pass rearms the timer when it ends, so passes
 	// never overlap and no change is lost.
 	dirty bool
+	// The answer ratings tally, cached like the board (homeTally).
+	tallyUp, tallyDown int
+	tallyErr           error
+	tallyAt            time.Time
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -201,7 +215,8 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 			s.log.Warn("slack: home tab board read failed", "err", err)
 			board = &lib.Board{Error: err.Error()}
 		}
-		view.Blocks = slack.Blocks{BlockSet: s.homeBlocks(board, s.waitingOn(member), time.Now())}
+		blocks := s.homeBlocks(board, s.waitingOn(member), time.Now())
+		view.Blocks = slack.Blocks{BlockSet: append(blocks, s.homeFeedback()...)}
 	}
 	if _, err := s.api.PublishView(member, view, ""); err != nil {
 		s.log.Warn("slack: views.publish failed", "member", member, "err", err)
@@ -272,6 +287,50 @@ func (s *SlackAdapter) homeBoard() (*lib.Board, error) {
 	s.home.cached, s.home.readErr, s.home.readAt = b, err, time.Now()
 	s.home.mu.Unlock()
 	return b, err
+}
+
+// homeFeedback is the answer ratings line under a divider, or nothing when
+// answer feedback is off or the tally could not be read.
+func (s *SlackAdapter) homeFeedback() []slack.Block {
+	recorder := s.feedbackRecorder()
+	if recorder == nil {
+		return nil
+	}
+	up, down, err := s.homeTally(recorder)
+	if err != nil {
+		s.log.Warn("slack: home tab feedback tally failed", "err", err)
+		return nil
+	}
+	return []slack.Block{
+		slack.NewDividerBlock(),
+		slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, fmt.Sprintf(slackHomeFeedbackWeek, up, down), false, false)),
+	}
+}
+
+// homeTally is the cached tally of the last slackHomeFeedbackWindow's
+// ratings, read again once it is older than slackHomeTallyFresh.
+func (s *SlackAdapter) homeTally(recorder FeedbackRecorder) (up, down int, err error) {
+	s.home.mu.Lock()
+	age := time.Since(s.home.tallyAt)
+	switch {
+	case s.home.tallyErr == nil && !s.home.tallyAt.IsZero() && age < slackHomeTallyFresh:
+		up, down = s.home.tallyUp, s.home.tallyDown
+		s.home.mu.Unlock()
+		return up, down, nil
+	case s.home.tallyErr != nil && age < slackHomeTallyErrorFresh:
+		err = s.home.tallyErr
+		s.home.mu.Unlock()
+		return 0, 0, err
+	}
+	s.home.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), slackHomeBoardTimeout)
+	defer cancel()
+	now := time.Now()
+	up, down, err = recorder.Tally(ctx, now.Add(-slackHomeFeedbackWindow))
+	s.home.mu.Lock()
+	s.home.tallyUp, s.home.tallyDown, s.home.tallyErr, s.home.tallyAt = up, down, err, now
+	s.home.mu.Unlock()
+	return up, down, err
 }
 
 func (s *SlackAdapter) noteViewer(member string) {
