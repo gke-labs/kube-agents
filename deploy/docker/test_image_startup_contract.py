@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = REPO_ROOT / "deploy" / "shared" / "docker-entrypoint.sh"
 START_SERVICES = REPO_ROOT / "deploy" / "shared" / "start-services.sh"
 DOCKERFILE = REPO_ROOT / "deploy" / "docker" / "Dockerfile"
+SANDBOX_DOCKERFILE = REPO_ROOT / "deploy" / "sandbox" / "Dockerfile"
 MANIFESTS_GO = (
     REPO_ROOT
     / "k8s-operator"
@@ -606,6 +607,45 @@ class BytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
         # cache is an optimisation; losing part of it is today's behaviour, and
         # not a reason to fail the image.
         self.assertIn("||", self.compileall_command())
+
+
+class SandboxBytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
+    """The sandbox image must precompile Python standard library bytecode (#4027).
+
+    The sandbox image sets PYTHONDONTWRITEBYTECODE=1 (so root-run scripts do not
+    leave caches in /opt/defaults) and the non-root agent shell cannot write to
+    the root-owned standard library under /usr/local/lib/python3.14. Without a
+    build-time compileall pass, every python3 and credential-proxy-exec invocation
+    recompiles standard library modules from source, wasting ~0.85s of shell CPU
+    per command.
+    """
+
+    def setUp(self):
+        self.text = SANDBOX_DOCKERFILE.read_text()
+
+    def compileall_command(self):
+        """The whole RUN instruction that precompiles the stdlib."""
+        for instruction in joined_instructions(self.text):
+            if "compileall" in instruction:
+                return instruction
+        self.fail("deploy/sandbox/Dockerfile does not precompile the standard library")
+
+    def test_the_sandbox_image_precompiles_the_standard_library(self):
+        cmd = self.compileall_command()
+        self.assertIn("compileall", cmd)
+        self.assertIn("stdlib", cmd)
+
+    def test_it_compiles_with_python3(self):
+        # In the sandbox image python3 is the container's interpreter on PATH
+        self.assertIn("python3 -m compileall", self.compileall_command())
+
+    def test_it_does_not_ask_for_optimized_bytecode(self):
+        self.assertNotRegex(
+            self.compileall_command(), r"\s-o\b|\s--optimize\b"
+        )
+
+    def test_it_verifies_minimum_pyc_count(self):
+        self.assertRegex(self.compileall_command(), r"find\s+.*\.pyc.*-ge\s+\d+")
 
 
 class BytecodePremiseTest(unittest.TestCase):
