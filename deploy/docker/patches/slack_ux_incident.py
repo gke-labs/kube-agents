@@ -183,13 +183,14 @@ EDITED_MAX = 512
 #: with no button for it. The words may wrap onto continuation lines of the bullet. The label
 #: and the marker words may carry ``*`` or ``_`` emphasis (``__To authorize__``,
 #: ``_is being opened automatically_``), so the marker's boundaries exclude ``_`` where ``\b``
-#: would count it as a letter; a continuation line may open with bold
-#: (``**is being opened automatically**``). Only an unordered list marker (``-``, ``*``, ``+``)
-#: followed by whitespace, a thematic break (``---``, ``***``, ``___``), a ``#`` line, or a blank
-#: line ends the clause.
+#: would count it as a letter; an indented continuation line may open with bold
+#: (``  **is being opened automatically**``). The clause ends at an unordered list marker (``-``,
+#: ``*``, ``+``) followed by whitespace, a thematic break (``---``, ``***``, ``___``, a trailing
+#: ``\r`` allowed), a ``#`` line, a blank line, or an unindented line opening with ``-``, ``*``
+#: or ``+`` at all: an unindented ``**Note:**`` paragraph under the bullet is not part of it.
 OPENING_PULL_REQUEST = re.compile(
     r"^[^\w\n]*[*_]*To authorize[*_]*:?"
-    r"(?:[^\n]|\n(?![ \t]*(?:[-*+][ \t]|#|(?P<hr>[-*_])(?:[ \t]*(?P=hr)){2,}[ \t]*$)|\s*$))*?"
+    r"(?:[^\n]|\n(?![-*+]|[ \t]*(?:[-*+][ \t]|#|(?P<hr>[-*_])(?:[ \t]*(?P=hr)){2,}[ \t\r]*$)|\s*$))*?"
     r"(?<![^\W_])is\s+being\s+opened\s+automatically(?![^\W_])",
     re.IGNORECASE | re.MULTILINE,
 )

@@ -837,8 +837,10 @@ class RuntimeTest(unittest.TestCase):
         # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
         # continuation line, keeps every button: stripping one would leave a report that asks for
         # `apply` with no button for it, on an install that is not opening anything. Nor do the
-        # marker words count once the bullet has ended: on a sibling bullet, after a blank line, or
-        # past a thematic break (a heading line never reaches the pattern; `_sections` drops it).
+        # marker words count once the bullet has ended: on a sibling bullet, after a blank line, on an
+        # unindented line opening with `*` or `-` (a `**Note:**` paragraph, not a wrapped bold run,
+        # which is indented), or past a thematic break, a CRLF one included (a heading line never
+        # reaches the pattern; `_sections` drops it).
         for clause in (
             "- **To authorize:** reply **'apply'** and a GitOps Pull Request will be opened with this fix.",
             "- **To authorize:** reply **'apply'** and a GitOps Pull Request is being opened for review.",
@@ -847,8 +849,11 @@ class RuntimeTest(unittest.TestCase):
             "- **To authorize:** reply **'apply'** to choose a fix.\n- **Note:** a Pull Request for the drift finding is being opened automatically.",
             "- **To authorize:** reply **'apply'** to choose a fix.\n* **Note:** a Pull Request for the drift finding is being opened automatically.",
             "- **To authorize:** reply **'apply'** to choose a fix.\n\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n**Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n*Note:* a Pull Request for the drift finding is being opened automatically.",
             "- **To authorize:** reply **'apply'** to choose a fix.\n---\nA Pull Request for the drift finding is being opened automatically.",
             "- **To authorize:** reply **'apply'** to choose a fix.\n***\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\r\n---\r\nA Pull Request for the drift finding is being opened automatically.",
         ):
             with self.subTest(clause=clause):
                 off_report = REPORT.replace(
