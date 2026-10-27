@@ -6188,8 +6188,9 @@ def _listing_error(project: str, failed_reads: list[str]) -> str:
 
 def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int | None = None, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None, session: SessionFn | None = None, session_factory: Callable[[], SessionFn] | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
-    configs, the reviews, the re-checks); the default is the figure the
-    sibling collectors pin to the credential proxy's admitted count.
+    configs, the reviews, the re-checks); unset, it is what the credential
+    broker admits at once, less chat headroom, as for the sibling collectors
+    (broker_admission.sweep_width()).
     `discovery` is `discover_fleet`'s answer when the caller resolved it
     already (`main` does, before the lock, so an exit line can name the
     projects); without it the run resolves the projects itself. `clock`

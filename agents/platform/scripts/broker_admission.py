@@ -13,8 +13,9 @@ fits 9 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
 is the 1Gi memory request, and the budget fits 4. Only the broker sees the
 effective limit, so only the broker can say.
 
-`sweep_width` leaves two of the broker's slots free when it admits six or more,
-so a sweep doesn't take every slot a live chat read would queue behind, and
+`sweep_width` leaves the session role's cap free (two by default; the broker
+reports it) when the broker admits six or more, so a sweep doesn't take every
+slot a live chat read would queue behind, and
 otherwise reads at most four wide, today's width, so no install sweeps slower
 than it did. This doesn't coordinate sweeps that run at the same time: each
 sizes its own pool, and the broker admits in arrival order, so live reads still
@@ -39,7 +40,8 @@ ADMISSION_PATH = "/v1/exec/admission"
 FALLBACK_WIDTH = 4
 # How many of the broker's slots a sweep leaves free once it admits enough to
 # spare them: the session role's cap, the most one chat conversation's reads
-# take at once.
+# take at once. The broker reports its own; this is the default it ships with,
+# used when the report doesn't carry one.
 CHAT_HEADROOM = 2
 # The admitted count at or above which the headroom is taken; below it the
 # width stays at most FALLBACK_WIDTH, so no install sweeps slower than before.
@@ -48,15 +50,23 @@ HEADROOM_FROM = 6
 _cached_width: int | None = None
 
 
-def width_for(admitted: int) -> int:
-    """The sweep width for a broker that admits ``admitted`` commands at once."""
+def width_for(admitted: int, headroom: int = CHAT_HEADROOM) -> int:
+    """The sweep width for a broker that admits ``admitted`` commands at once
+    and keeps ``headroom`` for a chat session's reads."""
     if admitted >= HEADROOM_FROM:
-        return admitted - CHAT_HEADROOM
+        return max(1, admitted - headroom)
     return max(1, min(FALLBACK_WIDTH, admitted))
 
 
-def read_admitted(endpoint: str | None = None) -> int | None:
-    """The broker's admitted count, or None when it can't be read."""
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def read_report(endpoint: str | None = None) -> tuple[int, int] | None:
+    """The broker's admitted count and session cap, or None when they can't be
+    read. A report without a usable session cap gives CHAT_HEADROOM."""
     endpoint = (endpoint if endpoint is not None else os.environ.get("CREDENTIAL_PROXY_URL", "")).strip()
     if not endpoint:
         return None
@@ -69,10 +79,12 @@ def read_admitted(endpoint: str | None = None) -> int | None:
             report = json.load(response)
     except (urllib.error.URLError, OSError, ValueError, credential_proxy_client.TokenUnavailable):
         return None
-    admitted = report.get("admitted") if isinstance(report, dict) else None
-    if isinstance(admitted, bool) or not isinstance(admitted, int) or admitted < 1:
+    if not isinstance(report, dict):
         return None
-    return admitted
+    admitted = _positive_int(report.get("admitted"))
+    if admitted is None:
+        return None
+    return admitted, _positive_int(report.get("session_cap")) or CHAT_HEADROOM
 
 
 def sweep_width() -> int:
@@ -80,6 +92,6 @@ def sweep_width() -> int:
     process; FALLBACK_WIDTH when the broker can't say."""
     global _cached_width
     if _cached_width is None:
-        admitted = read_admitted()
-        _cached_width = FALLBACK_WIDTH if admitted is None else width_for(admitted)
+        report = read_report()
+        _cached_width = FALLBACK_WIDTH if report is None else width_for(*report)
     return _cached_width

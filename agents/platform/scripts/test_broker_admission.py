@@ -25,6 +25,9 @@ class WidthForTest(unittest.TestCase):
             with self.subTest(admitted=admitted):
                 self.assertEqual(width, broker_admission.width_for(admitted))
 
+    def test_a_large_headroom_never_takes_the_width_below_one(self):
+        self.assertEqual(1, broker_admission.width_for(6, headroom=10))
+
 
 class _Response(io.BytesIO):
     def __enter__(self):
@@ -35,7 +38,7 @@ class _Response(io.BytesIO):
         return False
 
 
-class ReadAdmittedTest(unittest.TestCase):
+class ReadReportTest(unittest.TestCase):
     ENDPOINT = "http://credential-proxy:8080"
 
     def _reading(self, body=None, error=None):
@@ -51,9 +54,15 @@ class ReadAdmittedTest(unittest.TestCase):
     def test_it_reads_the_admitted_count_from_the_route(self):
         with mock.patch.object(credential_proxy_client, "authorization_headers", return_value={"Authorization": "Bearer t"}), \
                 self._reading({"slot_cap": 8, "budget_admits": 9, "admitted": 8, "session_cap": 2}):
-            self.assertEqual(8, broker_admission.read_admitted(self.ENDPOINT))
+            self.assertEqual((8, 2), broker_admission.read_report(self.ENDPOINT))
         self.assertEqual(self.ENDPOINT + "/v1/exec/admission", self.seen[0].full_url)
         self.assertEqual("Bearer t", self.seen[0].get_header("Authorization"))
+
+    def test_a_missing_or_bad_session_cap_reads_as_the_default(self):
+        for name, body in {"missing": {"admitted": 8}, "zero": {"admitted": 8, "session_cap": 0}, "text": {"admitted": 8, "session_cap": "2"}}.items():
+            with self.subTest(case=name), mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                    self._reading(body):
+                self.assertEqual((8, broker_admission.CHAT_HEADROOM), broker_admission.read_report(self.ENDPOINT))
 
     def test_every_failure_reads_as_unknown(self):
         cases = {
@@ -69,18 +78,18 @@ class ReadAdmittedTest(unittest.TestCase):
         for name, case in cases.items():
             with self.subTest(case=name), mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
                     self._reading(**case):
-                self.assertIsNone(broker_admission.read_admitted(self.ENDPOINT))
+                self.assertIsNone(broker_admission.read_report(self.ENDPOINT))
 
     def test_an_unreadable_token_reads_as_unknown(self):
         with mock.patch.object(
             credential_proxy_client, "authorization_headers",
             side_effect=credential_proxy_client.TokenUnavailable("/token: missing"),
         ):
-            self.assertIsNone(broker_admission.read_admitted(self.ENDPOINT))
+            self.assertIsNone(broker_admission.read_report(self.ENDPOINT))
 
     def test_no_broker_url_reads_as_unknown_without_a_request(self):
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}), self._reading({"admitted": 8}):
-            self.assertIsNone(broker_admission.read_admitted())
+            self.assertIsNone(broker_admission.read_report())
         self.assertEqual([], self.seen)
 
 
@@ -90,16 +99,20 @@ class SweepWidthTest(unittest.TestCase):
         self.addCleanup(setattr, broker_admission, "_cached_width", None)
 
     def test_it_is_the_width_for_what_the_broker_admits(self):
-        with mock.patch.object(broker_admission, "read_admitted", return_value=8):
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2)):
             self.assertEqual(6, broker_admission.sweep_width())
 
+    def test_it_keeps_the_session_cap_the_broker_reports(self):
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 3)):
+            self.assertEqual(5, broker_admission.sweep_width())
+
     def test_it_falls_back_to_four_when_the_broker_cannot_say(self):
-        with mock.patch.object(broker_admission, "read_admitted", return_value=None):
+        with mock.patch.object(broker_admission, "read_report", return_value=None):
             self.assertEqual(broker_admission.FALLBACK_WIDTH, broker_admission.sweep_width())
         self.assertEqual(4, broker_admission.FALLBACK_WIDTH)
 
     def test_it_asks_once_per_process(self):
-        with mock.patch.object(broker_admission, "read_admitted", return_value=8) as read:
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2)) as read:
             broker_admission.sweep_width()
             broker_admission.sweep_width()
         self.assertEqual(1, read.call_count)

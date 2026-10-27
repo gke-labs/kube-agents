@@ -9339,7 +9339,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
-            "session_cap": self.session_slots.limit,
+            "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
 
     def do_GET(self) -> None:  # noqa: N802
