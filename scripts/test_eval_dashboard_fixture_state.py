@@ -29,6 +29,7 @@ What is pinned:
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -427,6 +428,69 @@ class ScanHarness(unittest.TestCase):
 
     def states(self, doc, project=PROJECT):
         return {role: entry["state"] for role, entry in doc["projects"][project]["roles"].items()}
+
+
+AGE_GATE_LINE = 'cluster createTime age_hours_ge 24: observed "2026-09-14T14:00:00+00:00", 6.0 hours old (why: Clears itself; no re-apply helps)'
+AHEAD_LINE = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000) (why: seeded_b_pin.py holds it)'
+ORDINARY_LINE = "pod?app=payments-api status.phase eq \"Running\": observed \"Pending\" (why: a planted object a re-apply restores)"
+
+
+class NoReapplyDrift(unittest.TestCase):
+    """#4005: drift lines no re-apply clears, by the assertion's op."""
+
+    def test_the_op_in_the_label_decides_not_the_why(self):
+        self.assertEqual(fixture_state.no_reapply_op(AGE_GATE_LINE), fixture_state.OP_AGE_GATE)
+        self.assertEqual(fixture_state.no_reapply_op(AHEAD_LINE), fixture_state.OP_AHEAD_OF_CHANNEL)
+        self.assertIsNone(fixture_state.no_reapply_op(ORDINARY_LINE))
+        self.assertIsNone(fixture_state.no_reapply_op("pod?app=x status.phase eq 1: observed 2 (why: unlike age_hours_ge or not_ahead_of_channel)"))
+        # An unset channel is the stack's to restore; only "newer than every" is the channel's to clear.
+        for other in ('; release channel unset', '; get-server-config lists no EXTENDED channel', ', not a GKE version'):
+            self.assertIsNone(fixture_state.no_reapply_op(f'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"{other}'), other)
+        self.assertIsNone(fixture_state.no_reapply_op("cluster currentMasterVersion not_ahead_of_channel: observed nothing"))
+        # A createTime ahead of the scanning host's clock reads as a negative age: still the age gate.
+        self.assertEqual(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "2026-10-27T12:00:00+00:00", -0.3 hours old'), fixture_state.OP_AGE_GATE)
+        # Hours past any date: no clear time, and no exception to take the tick down.
+        for huge in ("70000000", "30000000000"):
+            self.assertIsNone(fixture_state.age_gate_clears_at(f'cluster createTime age_hours_ge {huge}: observed "2026-10-27T12:00:00+00:00", 1.0 hours old'), huge)
+        # An unparseable timestamp is no age the clock will reach.
+        self.assertIsNone(fixture_state.no_reapply_op('cluster createTime age_hours_ge 24: observed "soon", not one RFC 3339 timestamp'))
+
+    def test_the_age_gate_clears_at_the_timestamp_plus_its_hours(self):
+        self.assertEqual(fixture_state.age_gate_clears_at(AGE_GATE_LINE), datetime(2026, 9, 15, 14, 0, tzinfo=UTC))
+        self.assertIsNone(fixture_state.age_gate_clears_at(AHEAD_LINE))
+
+    def test_only_lines_that_are_all_no_reapply_clear_nothing(self):
+        self.assertTrue(fixture_state.reapply_clears_nothing([AGE_GATE_LINE, AHEAD_LINE]))
+        self.assertFalse(fixture_state.reapply_clears_nothing([AGE_GATE_LINE, ORDINARY_LINE]))
+        self.assertFalse(fixture_state.reapply_clears_nothing([]))
+
+    def test_the_runners_own_age_gate_line_is_read(self):
+        # The line comes from hack/fleet-fixture-state.py; a change to its shape must show here.
+        spec = importlib.util.spec_from_file_location("fleet_fixture_state", REPO / "hack" / "fleet-fixture-state.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        created = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0)
+        entry = {"subject": "cluster", "path": "createTime", "op": "age_hours_ge", "value": 24, "steps": runner.parse_path("createTime")}
+        line = runner.evaluate(entry, [{"createTime": created.isoformat()}])
+        self.assertEqual(fixture_state.age_gate_clears_at(line), created + timedelta(hours=24))
+
+    def test_the_runners_own_ahead_of_channel_line_is_read(self):
+        # The line comes from hack/fleet-fixture-state.py's evaluate(); a change to its wording must show here.
+        spec = importlib.util.spec_from_file_location("fleet_fixture_state", REPO / "hack" / "fleet-fixture-state.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        entry = {"subject": "cluster", "path": "currentMasterVersion", "op": runner.OP_NOT_AHEAD, "value": None,
+                 "steps": runner.parse_path("currentMasterVersion")}
+        offered = ["1.34.11-gke.1209000", "1.35.8-gke.1919000"]
+        ahead = {"currentMasterVersion": "1.34.12-gke.1011000", "releaseChannel": {"channel": "REGULAR"}}
+        line = runner.evaluate(entry, [ahead], channel_valid=lambda name: offered)
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AHEAD_OF_CHANNEL)
+        # A minor the channel carries none of: "newer than every version", still the channel's to clear.
+        line = runner.evaluate(entry, [dict(ahead, currentMasterVersion="1.36.1-gke.100")], channel_valid=lambda name: offered)
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AHEAD_OF_CHANNEL)
+        # An unset channel is the stack's to restore.
+        line = runner.evaluate(entry, [{"currentMasterVersion": "1.34.12-gke.1011000"}], channel_valid=lambda name: offered)
+        self.assertIsNone(fixture_state.no_reapply_op(line))
 
 
 class ProjectList(unittest.TestCase):

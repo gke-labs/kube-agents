@@ -347,8 +347,9 @@ func main() {
 		setupLog.Error(nil, "The operator's role cannot read AgentProfiles; skipping the AgentProfile controller. Restart the operator after applying the current ClusterRole.", "denied", profileDenied)
 	case mapErr == nil:
 		if err := (&controller.AgentProfileReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			APIReader: mgr.GetAPIReader(),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "agentprofile")
 			os.Exit(1)

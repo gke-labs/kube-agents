@@ -108,7 +108,7 @@ func TestConfigFromEnvWithoutABrokerOffersNoInspectPR(t *testing.T) {
 		t.Error("a broker client with no broker URL")
 	}
 	names := toolNames(toolsFor(nil, nil, s.broker))
-	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl}
+	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolReadTopics}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools = %v, want %v (no %s)", names, want, mcp.ToolInspectPR)
 	}
@@ -129,7 +129,7 @@ func TestConfigFromEnvWithABrokerOffersInspectPR(t *testing.T) {
 		t.Fatal("no broker client with a broker URL")
 	}
 	names := toolNames(toolsFor(nil, nil, s.broker))
-	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolInspectPR}
+	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolReadTopics, mcp.ToolInspectPR}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools = %v, want %v", names, want)
 	}

@@ -63,10 +63,11 @@ const (
 	// it must be unique in the map.
 	agentProfileMapUserPrefix = "profile-"
 
-	// agentProfileNameMax keeps agentProfileMapUserPrefix plus the name
-	// within one 63-character DNS-1123 label. The CRD's name rule says the
-	// same number.
-	agentProfileNameMax = 63 - len(agentProfileMapUserPrefix)
+	// agentProfileNameMax keeps a profile's map user at the default tier,
+	// agentProfileMapUserPrefix plus the name plus "-read", within one
+	// 63-character DNS-1123 label. A profile that allows unattended has six
+	// characters fewer; the CRD's length rule says both numbers.
+	agentProfileNameMax = 63 - len(agentProfileMapUserPrefix) - len("-"+agentv1alpha1.AgentProfileTierRead)
 
 	// operatorNamespaceEnvVar and operatorServiceAccountEnvVar are the
 	// manager's own namespace and ServiceAccount, by the downward API. Both
@@ -112,13 +113,27 @@ func operatorBusPrincipal() (namespace, serviceAccount string, ok bool) {
 	return namespace, serviceAccount, ok
 }
 
-// agentProfileServiceAccountName is the ServiceAccount a profile's pods run as:
-// the one spec.identity names, or the one the operator creates.
-func agentProfileServiceAccountName(p *agentv1alpha1.AgentProfile) string {
+// agentProfileServiceAccountName is the ServiceAccount a profile's pods run as
+// at one tier, in the profile namespace (#3655): the one spec.identity names,
+// which the CRD allows only for a profile with one tier, or the one the
+// operator creates per tier.
+func agentProfileServiceAccountName(p *agentv1alpha1.AgentProfile, tier string) string {
 	if p.Spec.Identity.ServiceAccountName != "" {
 		return p.Spec.Identity.ServiceAccountName
 	}
-	return agentProfileServiceAccountPrefix + p.Name
+	return agentProfileServiceAccountPrefix + p.Name + "-" + tier
+}
+
+// agentProfileMapUser is a (profile, tier)'s map entry user: its label in
+// the map, which must be unique and one DNS-1123 label.
+func agentProfileMapUser(p *agentv1alpha1.AgentProfile, tier string) string {
+	return agentProfileMapUserPrefix + p.Name + "-" + tier
+}
+
+// agentProfileTierIdentity is one (profile, tier)'s ServiceAccount.
+type agentProfileTierIdentity struct {
+	tier           string
+	serviceAccount string
 }
 
 // reservedProfileServiceAccounts are the ServiceAccounts a profile may not run
@@ -159,8 +174,10 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 // agentProfileResolution is what the operator decided about one profile's
 // identity: the ServiceAccount it runs as, or why it renders nothing.
 type agentProfileResolution struct {
-	serviceAccount string
-	refused        error
+	// identities are the profile's (tier, ServiceAccount) pairs, one per
+	// allowed tier, in allowedTiers order.
+	identities []agentProfileTierIdentity
+	refused    error
 	// reason is the IdentityReady condition reason for a refusal: the
 	// profile itself is malformed, or its ServiceAccount is not usable.
 	reason string
@@ -199,52 +216,85 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 
 	out := make(map[string]agentProfileResolution, len(sorted))
 	claimedBy := map[string]string{}
+	profilesNS := profileNamespaceName(agent)
 	for i := range sorted {
 		p := &sorted[i]
-		sa := agentProfileServiceAccountName(p)
-		switch {
-		case !isDNS1123LabelToken(p.Name):
-			// The CRD refuses these too. Refused here as well so that a
-			// profile admitted by an older or edited CRD drops out of the
-			// map instead of failing the whole render.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
-		case !isDNS1123LabelToken(agentProfileMapUserPrefix + p.Name):
-			// A valid label can still be too long once prefixed: the map
-			// entry's user is the prefix plus the name, and the callout
-			// refuses a user that is not one DNS-1123 label, so a name past
-			// 55 characters would fail the whole map. The CRD refuses it too.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is longer than %d characters, so its bus identity %q would not be a DNS-1123 label", p.Name, agentProfileNameMax, agentProfileMapUserPrefix+p.Name), reason: reasonAgentProfileInvalid}
-		case malformedTopicGrant(p) != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
-		case foreignPublishTopic(p) != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name), reason: reasonAgentProfileInvalid}
-		case p.Spec.Identity.ServiceAccountName != "" && len(validation.IsDNS1123Subdomain(p.Spec.Identity.ServiceAccountName)) > 0:
-			// The CRD's pattern refuses this too; rechecked for the same
-			// reason as the name, since a malformed name makes a map key
-			// the whole render refuses.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is not a DNS-1123 subdomain", p.Spec.Identity.ServiceAccountName), reason: reasonAgentProfileRefused}
-		case p.Spec.Identity.ServiceAccountName != "" && strings.HasPrefix(p.Spec.Identity.ServiceAccountName, agentProfileServiceAccountPrefix):
-			// The operator-created ServiceAccounts belong to the profile
-			// they are named for. Without this a profile that sorts first
-			// could name another's and take its map entry over.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is an operator-created AgentProfile ServiceAccount", p.Spec.Identity.ServiceAccountName), reason: reasonAgentProfileRefused}
-		case p.Name == a2aBridgeAddressee:
-			// The CRD refuses this name too; the operator does not rely
-			// on admission alone, because CRD validation can be
-			// bypassed by an older CRD left on the cluster.
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name), reason: reasonAgentProfileInvalid}
-		case reserved[sa] != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is %s", sa, reserved[sa]), reason: reasonAgentProfileRefused}
-		case mapKeys[a2aServiceAccountName(agent.Namespace, sa)] != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is the bus principal %q's", sa, mapKeys[a2aServiceAccountName(agent.Namespace, sa)]), reason: reasonAgentProfileRefused}
-		case claimedBy[sa] != "":
-			out[p.Name] = agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is already AgentProfile %q's", sa, claimedBy[sa]), reason: reasonAgentProfileRefused}
-		default:
-			claimedBy[sa] = p.Name
-			out[p.Name] = agentProfileResolution{serviceAccount: sa}
-		}
+		out[p.Name] = resolveOneAgentProfile(p, agent, reserved, mapKeys, claimedBy, profilesNS)
 	}
 	return out
+}
+
+// resolveOneAgentProfile decides one profile's identities, recording each
+// ServiceAccount it claims in claimedBy, so a later profile naming one is
+// refused. A profile is refused whole: one tier it can't render leaves the
+// profile without identities rather than half-rendered.
+func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, reserved, mapKeys, claimedBy map[string]string, profilesNS string) agentProfileResolution {
+	named := p.Spec.Identity.ServiceAccountName
+	tiers := p.AllowedTierList()
+	switch {
+	case !isDNS1123LabelToken(p.Name):
+		// The CRD refuses these too. Refused here as well so that a
+		// profile admitted by an older or edited CRD drops out of the map
+		// instead of failing the whole render.
+		return agentProfileResolution{refused: fmt.Errorf("profile name %q is not a dot-free DNS-1123 label", p.Name), reason: reasonAgentProfileInvalid}
+	case malformedTopicGrant(p) != "":
+		return agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
+	case foreignPublishTopic(p) != "":
+		return agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name), reason: reasonAgentProfileInvalid}
+	case p.Name == a2aBridgeAddressee:
+		// The CRD refuses this name too; the operator does not rely on
+		// admission alone, because CRD validation can be bypassed by an
+		// older CRD left on the cluster.
+		return agentProfileResolution{refused: fmt.Errorf("profile name %q is the Hermes bridge's addressee", p.Name), reason: reasonAgentProfileInvalid}
+	case named != "" && len(tiers) > 1:
+		// The CRD refuses this too: one named ServiceAccount can't be the
+		// identity of more than one tier.
+		return agentProfileResolution{refused: fmt.Errorf("spec.identity.serviceAccountName names one ServiceAccount, so it can't serve the %d tiers allowedTiers lists; leave it unset or allow one tier", len(tiers)), reason: reasonAgentProfileRefused}
+	case named != "" && len(validation.IsDNS1123Subdomain(named)) > 0:
+		// The CRD's pattern refuses this too; rechecked for the same reason
+		// as the name, since a malformed name makes a map key the whole
+		// render refuses.
+		return agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is not a DNS-1123 subdomain", named), reason: reasonAgentProfileRefused}
+	case named != "" && strings.HasPrefix(named, agentProfileServiceAccountPrefix):
+		// The operator-created ServiceAccounts belong to the profile they
+		// are named for. Without this a profile that sorts first could name
+		// another's and take its map entry over.
+		return agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is an operator-created AgentProfile ServiceAccount", named), reason: reasonAgentProfileRefused}
+	}
+	var ids []agentProfileTierIdentity
+	for _, tier := range tiers {
+		sa := agentProfileServiceAccountName(p, tier)
+		key := a2aServiceAccountName(profilesNS, sa)
+		switch {
+		case !isDNS1123LabelToken(agentProfileMapUser(p, tier)):
+			// The map entry's user is the prefix, the name and the tier,
+			// and the callout refuses a user that is not one DNS-1123
+			// label, so a name too long for one of its tiers would fail
+			// the whole map.
+			return agentProfileResolution{refused: fmt.Errorf("profile name %q is too long for tier %s: its bus identity %q would not be a DNS-1123 label (at most 63 characters)", p.Name, tier, agentProfileMapUser(p, tier)), reason: reasonAgentProfileInvalid}
+		case reserved[sa] != "":
+			return agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is %s", sa, reserved[sa]), reason: reasonAgentProfileRefused}
+		case mapKeys[key] != "":
+			return agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is the bus principal %q's", sa, mapKeys[key]), reason: reasonAgentProfileRefused}
+		case claimedBy[sa] != "":
+			return agentProfileResolution{refused: fmt.Errorf("serviceAccountName %q is already AgentProfile %q's", sa, claimedBy[sa]), reason: reasonAgentProfileRefused}
+		}
+		ids = append(ids, agentProfileTierIdentity{tier: tier, serviceAccount: sa})
+	}
+	for _, id := range ids {
+		claimedBy[id.serviceAccount] = p.Name
+	}
+	return agentProfileResolution{identities: ids}
+}
+
+// serviceAccountList is a resolution's ServiceAccounts, for status and
+// messages: "a, b" in tier order.
+func (r agentProfileResolution) serviceAccountList() string {
+	names := make([]string, 0, len(r.identities))
+	for _, id := range r.identities {
+		names = append(names, id.serviceAccount)
+	}
+	return strings.Join(names, ", ")
 }
 
 // malformedTopicGrant returns the first topic grant the CRD's pattern refuses,
@@ -279,8 +329,9 @@ func ownsAgentTopic(profile, topic string) bool {
 	return !strings.HasPrefix(topic, "agent.") || strings.HasPrefix(topic, "agent."+profile+".")
 }
 
-// agentProfileMapEntries renders one narrowed map entry per profile that
-// resolved, in name order. Refused profiles are left out, never rendered with a
+// agentProfileMapEntries renders one narrowed map entry per (profile, tier)
+// that resolved, in name then tier order, keyed on the ServiceAccount in the
+// profile namespace. Refused profiles are left out, never rendered with a
 // fault: one bad profile must not fail the map for every other principal.
 func agentProfileMapEntries(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) []a2aAuthMapIdentity {
 	resolved := resolveAgentProfileIdentities(agent, profiles)
@@ -294,20 +345,23 @@ func agentProfileMapEntries(agent *agentv1alpha1.PlatformAgent, profiles []agent
 		if r.refused != nil {
 			continue
 		}
-		entry := a2aAuthMapIdentity{
-			ServiceAccount: a2aServiceAccountName(agent.Namespace, r.serviceAccount),
-			User:           agentProfileMapUserPrefix + p.Name,
-			Account:        a2aAccountApp,
-			Narrowing:      a2aNarrowingProfile,
-			Profile:        p.Name,
-		}
-		if len(p.Spec.Bus.PublishTopics) > 0 || len(p.Spec.Bus.SubscribeTopics) > 0 {
-			entry.Topics = &a2aAuthMapTopics{
-				Publish:   append([]string(nil), p.Spec.Bus.PublishTopics...),
-				Subscribe: append([]string(nil), p.Spec.Bus.SubscribeTopics...),
+		for _, id := range r.identities {
+			entry := a2aAuthMapIdentity{
+				ServiceAccount: a2aServiceAccountName(profileNamespaceName(agent), id.serviceAccount),
+				User:           agentProfileMapUser(p, id.tier),
+				Account:        a2aAccountApp,
+				Narrowing:      a2aNarrowingProfile,
+				Profile:        p.Name,
+				Tier:           id.tier,
 			}
+			if len(p.Spec.Bus.PublishTopics) > 0 || len(p.Spec.Bus.SubscribeTopics) > 0 {
+				entry.Topics = &a2aAuthMapTopics{
+					Publish:   append([]string(nil), p.Spec.Bus.PublishTopics...),
+					Subscribe: append([]string(nil), p.Spec.Bus.SubscribeTopics...),
+				}
+			}
+			out = append(out, entry)
 		}
-		out = append(out, entry)
 	}
 	return out
 }

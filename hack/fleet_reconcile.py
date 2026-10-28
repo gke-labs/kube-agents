@@ -172,7 +172,8 @@ pause = time.sleep
 gcloud_runner = subprocess.run
 
 # Where the CI health bot publishes its scan (docs/ci-health.md, "The
-# seeded-fleet scan"); `--drifted` applies the projects it lists.
+# seeded-fleet scan"); `--drifted` applies the projects it lists, except one
+# whose only drift no re-apply clears (drifted_projects).
 DEFAULT_FIXTURE_STATE = "gs://kube-agents-dashboards/evals/fixture-state.json"
 # The run's report, for the CI health bot (scripts/eval_dashboard/periodics.py
 # reads it from the job's artifacts): under Prow, ARTIFACTS is the directory
@@ -710,7 +711,14 @@ def load_fixture_state(source, runner=subprocess.run):
 
 
 def drifted_projects(document):
-    return sorted(fixture_state.drift_map(document))
+    """The projects the scan reports drifted, less those whose only drift no
+    re-apply clears (fixture_state.reapply_clears_nothing): an apply there
+    changes nothing."""
+    return sorted(
+        project
+        for project, roles in fixture_state.drift_map(document).items()
+        if not fixture_state.reapply_clears_nothing(line for role in roles for line in fixture_state.drift_detail(document, project, role))
+    )
 
 
 def pool_projects(ci_deploy_script=fixture_state.CI_DEPLOY_SCRIPT):
@@ -1283,7 +1291,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--all", action="store_true", help="every mapped project, asked for by name; busy ones are asked again within the budget")
-    mode.add_argument("--drifted", action="store_true", help="the projects the fixture-state scan reports drifted")
+    mode.add_argument("--drifted", action="store_true", help="the projects the fixture-state scan reports drifted, less those whose only drift no re-apply clears")
     mode.add_argument("--project", action="append", help="one project (repeatable)")
     parser.add_argument("--fixture-state", default=DEFAULT_FIXTURE_STATE, help="with --drifted: the scan, gs:// or a path")
     parser.add_argument("--no-lease", action="store_true", help="with --project: do not ask Boskos (a dev project, or a lease you hold)")
@@ -1478,8 +1486,12 @@ def _run(args, outcomes, error, run):
         else:
             boskos_pool.reset_stranded(args.boskos_server, HOLD_STATE, STRANDED_AFTER, "reconcile")
             if args.drifted:
-                projects = drifted_projects(load_fixture_state(args.fixture_state))
-                print("%d project(s) drifted in %s" % (len(projects), args.fixture_state))
+                document = load_fixture_state(args.fixture_state)
+                projects = drifted_projects(document)
+                waiting = sorted(set(fixture_state.drift_map(document)) - set(projects))
+                print("%d project(s) drifted in %s, %d to re-apply" % (len(projects) + len(waiting), args.fixture_state, len(projects)))
+                if waiting:
+                    print("skipped, no re-apply clears their drift: %s" % ", ".join(waiting))
                 reconcile_named(
                     projects, args.boskos_server, args.boskos_owner, runner=tofu_runner, dry_run=args.dry_run, outcomes=outcomes, run=run
                 )

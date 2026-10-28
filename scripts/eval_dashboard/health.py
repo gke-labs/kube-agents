@@ -584,6 +584,20 @@ ADVICE_FIXTURE_CAPACITY_MIXED = (
     " {roles} beside them reads capacity: seeded-a's default pool is below the headroom margin the scan keeps for the next fixtures,"
     " a re-apply changes nothing for it, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is its fix."
 )
+# Drift no re-apply clears (fixture_state.no_reapply_op, #4005): when it is
+# every drift line on the incident, the advice names the real remedy per kind
+# instead of the re-apply. Beside an ordinary drift the re-apply advice stands.
+ADVICE_FIXTURE_NO_REAPPLY = (
+    "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change,"
+    " and no re-apply of bench/tf/fleet clears it. {remedy}"
+)
+FIXTURE_NO_REAPPLY_REMEDY = {
+    fixture_state.OP_AGE_GATE: "{roles} reads a cluster under its age gate, which clears itself at {when}; retest after then.",
+    fixture_state.OP_AHEAD_OF_CHANNEL: (
+        "{roles} reads a master ahead of its release channel, which seeded_b_pin.py holds until the channel ships a newer patch of that minor;"
+        " retest once a scan reads it healthy, or sooner re-create seeded-b under a lease (bench/tf/fleet/README.md)."
+    ),
+}
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
     " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
@@ -1996,6 +2010,13 @@ def advice_for(
     if condition == FIXTURE_DRIFT:
         incident = incident or {}
         roles = list(incident.get("roles") or [])
+        remedy = fixture_no_reapply(incident)
+        if remedy:
+            return ADVICE_FIXTURE_NO_REAPPLY.format(
+                roles=", ".join(roles) or "the drifted fixture roles",
+                projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
+                remedy=remedy,
+            )
         capacity = [role for role in roles if role in CAPACITY_ROLES]
         template = ADVICE_FIXTURE_CAPACITY if roles and len(capacity) == len(roles) else ADVICE_FIXTURE_DRIFT
         advice = template.format(
@@ -2008,6 +2029,30 @@ def advice_for(
     if condition == POOL_DRIFT:
         return _pool_drift_advice(incident or {})
     return ADVICE_SETUP
+
+
+def fixture_no_reapply(incident: dict) -> str | None:
+    """The remedy sentences, one per kind, when every drift line on a
+    fixture-drift incident is one no re-apply clears; None otherwise. The age
+    gate names the latest time any project's gate passes."""
+    kinds: dict[str, set[str]] = {}
+    clears_at = None
+    for roles in (incident.get("drift") or {}).values():
+        for role, lines in roles.items():
+            if not fixture_state.reapply_clears_nothing(lines):
+                return None
+            for line in lines:
+                kinds.setdefault(fixture_state.no_reapply_op(line), set()).add(role)
+                when = fixture_state.age_gate_clears_at(line)
+                if when and (clears_at is None or when > clears_at):
+                    clears_at = when
+    if not kinds:
+        return None
+    day = f"{clears_at.astimezone(READER_TZ):%a} " if clears_at else ""
+    return " ".join(
+        FIXTURE_NO_REAPPLY_REMEDY[op].format(roles=", ".join(sorted(roles)), when=day + reader_clock(clears_at))
+        for op, roles in sorted(kinds.items())
+    )
 
 
 def pool_drift_split(incident: dict) -> tuple[list[str], list[str], list[str]]:

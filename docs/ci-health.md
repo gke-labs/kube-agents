@@ -37,6 +37,7 @@ turn's p50 and p95 as advice beside the p95 < 10 s target
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
 grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
+the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
 the section was skipped. A night can be the builds of up to three periodics
 (the main job, the main-b job when the main part runs as two halves, and the
@@ -175,7 +176,8 @@ jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
-spare again) — a case whose grade depends on the drifted fixture is recorded as
+spare again; for drift no re-apply clears, at the time or event the message
+names) — a case whose grade depends on the drifted fixture is recorded as
 infrastructure on a run whose own lease-time scan saw the drift, and a red on such a
 case from a run whose scan could not read the role is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries. Who the
@@ -888,16 +890,32 @@ Nightly report's.
 - **⚙️ Infra:** each part of the nightly lost last night, with its run and issue,
   and each case kept from running last night that has an open infra issue or a
   3-night streak (`nightly_infra.py`); "none last night" otherwise.
+- **⏱ Latency:** last night's opening chat turn (p50 and p95, beside the
+  p95 < 10 s target) and agent time (the median of the cases' agent p50),
+  each against its typical: the median of the same number over the last 7
+  earlier whole nights that carry it (not cut short, no part missing or still
+  running), with at least 3 of them. A number at 1.5× its typical or more gets a 🐢 mark. Under it,
+  **🐢 Slow cases**: a case whose agent p50 is at least 2× its own typical
+  (its last 7 earlier nights with timing, at least 3) and at least 60 s more,
+  largest ratio first, with its owner; "sustained N nights" when it was slow
+  on 2 or more of its nights in a row (its nights with timing, so a night it
+  did not run in does not break the streak). A slowdown that lasts about four
+  nights becomes the case's typical, and the case drops off the list. When more than a quarter of the cases
+  with timing and a typical are slow, and more than 5, one "broad slowdown" line replaces the
+  list: a shift that wide has one cause. A night cut off at the deadline,
+  or with a part missing or still running, carries the block too, labelled as
+  covering only the cases or parts on record. It is advisory and moves no
+  state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - A footer asking owners to reply in the thread.
 
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
 report. A night with no new bug, no case owed a bug for the first time, no
 case red for the first night (a tracked case red again after a green night
 counts), no recovery, no infra item and no part cut off, missing or still running is
-one line instead: the date, the pass count and how many were not graded, "no
-new reds, nothing recovered", and how many are still red. A night whose main part was cut
+one summary line instead: the date, the pass count and how many were not graded, "no
+new reds, nothing recovered", and how many are still red, followed by the latency block. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
-counted, and only the infra list follows; a writers part cut off, missing or still running is named in
+counted, and only the infra list and the latency block follow; a writers part cut off, missing or still running is named in
 the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from
@@ -1176,7 +1194,15 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing) — and the
+applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+keyed on its assertion rather than its role, the Chat message and the health box's advice say
+so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
+24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
+to retest after, and a `version-laggard` line reading `not_ahead_of_channel` with "newer than
+every", a master ahead of its channel, clears when REGULAR ships a newer patch of the minor `seeded_b_pin.py` holds, or sooner when seeded-b is
+re-created under a lease; one ordinary drift line beside them keeps the re-apply advice, the
+issue lists both as exceptions, and a hand run of `hack/fleet_reconcile.py --drifted` skips a
+project whose only drift is these) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
 them healthy; the bot closes it when the condition clears." An open issue that already names

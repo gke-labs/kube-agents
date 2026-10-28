@@ -257,7 +257,7 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn(f"EVAL_FORGE=gitlab: the GitLab lane runs {len(self.lane_entries())} case(s) on the presubmit tier", result.stdout)
+        self.assertIn(f"EVAL_FORGE=gitlab: the gitlab lane runs {len(self.lane_entries())} case(s) on the presubmit tier (eval/gitlab-cases.txt)", result.stdout)
         self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
         # pdb-remediation-pr was the lane's one roster case from 2026-10-14
         # (#2016) until its demotion to the nightly on 2026-10-17 (#3120),
@@ -316,6 +316,28 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertNotIn("excluded on the inject lane", result.stderr)
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
+    def test_a_forge_whose_list_the_checkout_lacks_is_refused_by_name(self):
+        """ghes maps to eval/ghes-cases.txt, which arrives with its lane (#3684):
+        until then the matrix stops naming the list and the lane, not with the
+        roster reader's message for a missing file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            result = load_matrix({"EVAL_FORGE": "ghes"}, hack_dir=hack)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("TASK ", result.stdout)
+        self.assertIn("EVAL_FORGE=ghes runs the lane list eval/ghes-cases.txt, which this checkout does not have", result.stderr)
+
+    def test_a_ghes_list_in_the_checkout_runs_as_the_ghes_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "ghes-cases.txt").write_text("./tasks/vcs-spent-branch-reuse/task.yaml\n")
+            result = load_matrix({"EVAL_FORGE": "ghes"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-spent-branch-reuse/task.yaml"])
+        self.assertIn("EVAL_FORGE=ghes: the ghes lane runs 1 case(s) on the presubmit tier (eval/ghes-cases.txt)", result.stdout)
+
     def test_a_gitlab_nightly_runs_the_same_lane_list(self):
         """The GitLab nightly is the lane's list once a night, not the
         catalogue: nothing else grades the forge, and the roster export is
@@ -325,7 +347,7 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn(f"the GitLab lane runs {len(self.lane_entries())} case(s) on the nightly tier", result.stdout)
+        self.assertIn(f"the gitlab lane runs {len(self.lane_entries())} case(s) on the nightly tier (eval/gitlab-cases.txt)", result.stdout)
         self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
         self.assertEqual(lines_tagged(result, "ROSTER"), ["pdb-remediation-pr,vcs-spent-branch-reuse"])
         self.assertNotIn("rung 4 is disarmed", result.stdout)
@@ -336,7 +358,7 @@ class GitLabLaneTest(unittest.TestCase):
         body = "\n".join([f'SCRIPT_DIR="{HACK_DIR}"', roster_constants(), section, part_switch, 'echo "PART_OK"'])
         refused = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("is the GitHub nightly's split; the GitLab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
+        self.assertIn("is the GitHub nightly's split; the gitlab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
         allowed = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "all"})
         self.assertIn("PART_OK", allowed.stdout, allowed.stderr)
         github = run_bash(body, {"EVAL_FORGE": "github", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
@@ -393,7 +415,7 @@ class GitLabLaneTest(unittest.TestCase):
 
     def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
         self.refused("# nothing\n", "gitlab-cases.txt names no case")
-        self.refused(None, "gitlab-cases.txt is missing")
+        self.refused(None, "gitlab-cases.txt, which this checkout does not have")
         self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-cases.txt", "registered cases only")
 
     def test_the_lane_file_does_not_change_the_github_run_when_broken(self):

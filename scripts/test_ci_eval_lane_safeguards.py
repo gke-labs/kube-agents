@@ -486,7 +486,7 @@ class StoppedAsksTest(unittest.TestCase):
                 'AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"',
                 'BENCH_GITOPS_REPO="acme/infra"',
                 'EVAL_RUN_STARTED_AT="2026-01-01T00:00:00Z"',
-                "unset EVAL_FORGE" if forge is None else f'EVAL_FORGE="{forge}"',
+                "unset EVAL_FORGE EVAL_FORGE_KIND" if forge is None else f'EVAL_FORGE="{forge}"; EVAL_FORGE_KIND="{forge}"',
                 f"mint_ledger_token() {{ return {mint_rc}; }}",
                 f"uv() {{ return {list_rc}; }}",
                 lifted_block(r"^report_github_leftovers\(\) \{.*?^\}$"),

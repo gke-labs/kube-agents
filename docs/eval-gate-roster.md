@@ -453,7 +453,8 @@ holds a line in `hack/eval/blocking-roster.txt` only when all five hold. Rules (
 judgments on the record, so the admission pull request shows them, in the roster-admission
 block of [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md). Rules (c),
 (d) and (e) can be read from the files, so `scripts/test_eval_rosters.py` checks them on every
-pull request.
+pull request. The block stays in every pull request: one that adds no roster line answers it
+with "Not a roster admission."
 
 - **(a) A recorded red.** The case has failed for the right reason before: against `main`
   without the fix it guards, the red half of the loop in
@@ -766,7 +767,10 @@ presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 `pull_request_diff_contains` check (a merge request) or a `ledger_issue_contains` check (a ledger
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
-from the catalogue and registers nothing. `hack/ci-eval-pr.sh` refuses an entry in neither file,
+from the catalogue and registers nothing. The same list runs on a self-managed GitLab
+(`EVAL_FORGE=gitlab-ce`), since the cases grade the forge and not where it is; a GitHub Enterprise
+Server run (`EVAL_FORGE=ghes`) reads a GHES list of its own, named by `lane_cases_file()` in
+`hack/ci-eval-pr.sh` and refused while the checkout lacks it. `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
 ledger case is in the lane (consistency-drift-outlier passes on the GitHub nightlies and holds a
