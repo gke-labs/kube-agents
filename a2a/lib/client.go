@@ -409,9 +409,23 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 // Close shuts the client down deliberately; no rebuild follows.
 func (c *Client) Close() {
 	c.closing.Store(true)
+	// A deferred-mode subscription gives its deliveries back on the
+	// connection, which takes the client's read lock, so it stops before
+	// the write lock below.
+	c.mu.RLock()
+	subs := append([]*durableSub(nil), c.subs...)
+	c.mu.RUnlock()
+	for _, s := range subs {
+		if s.deferred != nil {
+			s.stopDeferred()
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, s := range c.subs {
+		if s.deferred != nil {
+			continue
+		}
 		s.stopLocal()
 	}
 	c.subs = nil
@@ -798,13 +812,36 @@ func (s *durableSub) unregister() {
 // never waits for a handler: Close calls it under the client lock, and a
 // handler may be the caller.
 func (s *durableSub) stopLocal() {
+	if s.deferred != nil {
+		s.stopDeferred()
+		return
+	}
 	s.stopIntake()
 	if s.held != nil {
 		s.held.cancel()
 	}
-	if s.deferred != nil {
-		s.deferred.giveBack()
+}
+
+// stopDeferred stops a deferred-mode subscription without leaving a delivery
+// to wait out AckWait: intake closes first, so whatever arrives from here on
+// is given back as it is dispatched, then the consume context drains (the
+// deliveries already buffered or in flight to the client are dispatched,
+// and so given back, rather than dropped unanswered), and finally every
+// delivery still unsettled is given back.
+func (s *durableSub) stopDeferred() {
+	s.stopped.Store(true)
+	s.deferred.close()
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	if cc != nil {
+		cc.Drain()
+		select {
+		case <-cc.Closed():
+		case <-time.After(deferredDrainTimeout):
+		}
 	}
+	s.deferred.giveBack()
 }
 
 // stopIntake stops taking deliveries.

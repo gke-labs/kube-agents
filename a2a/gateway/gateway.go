@@ -594,13 +594,17 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// it is the only thing that tells a supervisor terminal from an
 	// executor's, and the relay owes the adapter that distinction
 	// (TerminalSource) the same way the heal and the read route give it.
-	sub, err := g.client.SubscribeDurableAttributed(ctx, lib.SubscribeConfig{
+	//
+	// Deferred-ack: each event is acked once it has been rendered, not when it
+	// is queued, and stopping gives every unrendered one back to the stream,
+	// so a gateway that stops with events queued loses none of them.
+	sub, err := g.client.SubscribeDurableDeferred(ctx, lib.SubscribeConfig{
 		Stream:    lib.TasksStream,
 		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
 		Durable:   g.relayDurable,
 		Session:   gatewayParty.Session,
 		Agreement: &agreement,
-	}, func(subject string, env *lib.Envelope) { g.relayEvent(ctx, subject, env) })
+	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}

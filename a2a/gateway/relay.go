@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -156,9 +157,36 @@ func (g *Gateway) relayFor(taskID string) *relayState {
 // executor's off the first, the supervisor's -- this gateway's, about an
 // executor that died or never ran -- off the second. The envelope does not
 // carry it, so it rides beside the envelope to the terminal.
+//
+// d is the event's delivery on the relay durable, settled once the event has
+// been rendered or deliberately dropped, so an event this gateway queued but
+// never rendered goes back to the stream for the next one. nil for an item
+// that didn't come off the durable.
 type relayItem struct {
 	env     *lib.Envelope
 	subject string
+	d       lib.DeferredDelivery
+}
+
+// settle acks the item's delivery: it was rendered, or it is not one this
+// gateway will ever render. A failed ack leaves it held, renewed, and the
+// stream redelivers it only if this gateway dies; the sequence guard
+// (SessionRecord.relayed) keeps a rendered one from posting twice.
+func (g *Gateway) settle(item relayItem) {
+	if item.d == nil {
+		return
+	}
+	if err := item.d.Ack(); err != nil {
+		g.log.Warn("relay: ack failed", "taskId", item.env.TaskID, "err", err)
+	}
+}
+
+// sequence is the item's stream sequence, 0 when it has none.
+func (item relayItem) sequence() uint64 {
+	if item.d == nil {
+		return 0
+	}
+	return item.d.Sequence()
 }
 
 // terminalSourceOf attributes a terminal by the subject it arrived on, the
@@ -179,7 +207,19 @@ func terminalSourceOf(subject string) TerminalSource {
 // rendering — session lock, KV, chat REST calls — happens on the per-session
 // worker, where one slow conversation stalls only itself.
 func (g *Gateway) relayEvent(ctx context.Context, subject string, env *lib.Envelope) {
+	g.relayItemIn(ctx, relayItem{env: env, subject: subject})
+}
+
+// relayDelivery is relayEvent for a delivery off the relay durable, which
+// stays held until the item is settled.
+func (g *Gateway) relayDelivery(ctx context.Context, d lib.DeferredDelivery) {
+	g.relayItemIn(ctx, relayItem{env: d.Envelope(), subject: d.Subject(), d: d})
+}
+
+func (g *Gateway) relayItemIn(ctx context.Context, item relayItem) {
+	env := item.env
 	if env.Kind != lib.KindStatusUpdate && env.Kind != lib.KindArtifactUpdate {
+		g.settle(item)
 		return
 	}
 	sessionKey := g.sessionForTask(ctx, env.TaskID)
@@ -187,9 +227,10 @@ func (g *Gateway) relayEvent(ctx context.Context, subject string, env *lib.Envel
 		// Not a task this gateway submitted (another requester's traffic on
 		// the shared events wildcard, or a post-terminal straggler whose
 		// index was already retired); not ours to render.
+		g.settle(item)
 		return
 	}
-	g.events.enqueue(sessionKey, relayItem{env: env, subject: subject})
+	g.events.enqueue(sessionKey, item)
 }
 
 // relayBatch renders a session's queued events in order. Rolling-line edits
@@ -215,13 +256,16 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		// done, so every retry fails the same way. Requeueing would spin
 		// for the life of the process.
 		if g.runCtx.Err() != nil {
+			// Left unsettled: the relay subscription's stop gives each
+			// delivery back for the next gateway to render.
 			g.log.Warn("relay: gateway stopping; batch not rendered", "session", sessionKey, "events", len(batch))
 			return
 		}
-		// The events stay unrendered, and they were acked when they were
-		// queued, so the stream won't redeliver them (#4170); requeue the
-		// batch so a transient KV failure on a terminal event cannot wedge
-		// the conversation with the result never posted.
+		// The events stay unrendered and their deliveries stay held (and
+		// renewed), so requeue the batch in order: a transient KV failure on
+		// a terminal event must not wedge the conversation with the result
+		// never posted. Requeueing here rather than giving the deliveries
+		// back keeps a task's events in the order they arrived.
 		g.log.Error("relay: session record unavailable; requeueing batch", "session", sessionKey, "err", err)
 		go func() {
 			select {
@@ -249,16 +293,41 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			if err := g.reg.DropTask(ctx, taskID); err != nil {
 				g.log.Warn("relay: task index cleanup failed", "taskId", taskID, "err", err)
 			}
+			g.settle(item)
 		}
 		return
 	}
 
-	for i, item := range batch {
-		g.applyEvent(ctx, rec, item, i == len(batch)-1)
+	// An event a gateway already rendered comes again only if that gateway
+	// died between its record write and its ack; its sequence is on the
+	// record then, and it is acked without rendering twice.
+	// In stream order: a stop gives deliveries back in order, but redelivery
+	// can still interleave with new events, and the stream sequence is the
+	// order they were written in. Items without one (not off the durable)
+	// keep the order they were queued in.
+	if !slices.ContainsFunc(batch, func(it relayItem) bool { return it.sequence() == 0 }) {
+		slices.SortStableFunc(batch, func(a, b relayItem) int { return cmp.Compare(a.sequence(), b.sequence()) })
+	}
+	fresh := batch[:0:0]
+	for _, item := range batch {
+		if rec.relayed(item.env.TaskID, item.sequence()) {
+			g.settle(item)
+			continue
+		}
+		fresh = append(fresh, item)
+	}
+	for i, item := range fresh {
+		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
+		rec.markRelayed(item.env.TaskID, item.sequence())
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("relay: session record write failed", "session", rec.Key, "err", err)
+	}
+	// Rendered, so acked whatever the write did: the posts are out, and a
+	// redelivery would make them again.
+	for _, item := range fresh {
+		g.settle(item)
 	}
 }
 

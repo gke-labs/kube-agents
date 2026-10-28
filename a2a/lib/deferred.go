@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,6 +30,16 @@ import (
 // AckWait. A redelivery is expected (after a stop, or a holder that died) and
 // is the caller's to recognise: the envelopeId dedup doesn't apply, and
 // Sequence is what to recognise it by.
+
+// deferredDrainTimeout bounds how long a stop waits for the consume context to
+// drain. A connection already gone never closes it; the unsettled deliveries
+// are given back either way.
+const deferredDrainTimeout = 2 * time.Second
+
+// giveBackSpacing is the step between the delays a stop gives deliveries back
+// with, which is what orders their redelivery. A thousand held deliveries
+// come back within a second.
+const giveBackSpacing = time.Millisecond
 
 // DeferredDelivery is one delivery in the deferred-ack mode.
 type DeferredDelivery interface {
@@ -84,16 +95,26 @@ func (d *deferredState) dispatch(msg jetstream.Msg, env *Envelope) {
 	if md, err := msg.Metadata(); err == nil && md != nil {
 		dd.delivered, dd.received, dd.seq = md.NumDelivered, md.Timestamp, md.Sequence.Stream
 	}
+	// The heartbeat starts before the delivery is visible to giveBack, which
+	// reads stopBeat when it settles it.
+	dd.stopBeat = dd.heartbeat(d.beat)
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
+		dd.stopBeat()
 		_ = msg.Nak()
 		return
 	}
 	d.pending[dd] = struct{}{}
 	d.mu.Unlock()
-	dd.stopBeat = dd.heartbeat(d.beat)
 	d.handler(dd)
+}
+
+// close stops intake: every later delivery is given back as it arrives.
+func (d *deferredState) close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.closed = true
 }
 
 // giveBack stops intake and gives every unsettled delivery back at once.
@@ -105,8 +126,13 @@ func (d *deferredState) giveBack() {
 		pending = append(pending, dd)
 	}
 	d.mu.Unlock()
-	for _, dd := range pending {
-		_ = dd.Nak(0)
+	// In stream order, so the next subscriber gets them back in the order
+	// they first came. A run of immediate naks comes back in no order the
+	// server promises (newest first, measured on 2.15), but a delayed one is
+	// redelivered when its delay ends, so the delays set the order.
+	sort.Slice(pending, func(i, j int) bool { return pending[i].seq < pending[j].seq })
+	for i, dd := range pending {
+		_ = dd.Nak(time.Duration(i+1) * giveBackSpacing)
 	}
 }
 
