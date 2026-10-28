@@ -80,7 +80,8 @@ message with no row and the Google Chat first-reply recovery, do not run on the 
 executor): before the task's first turn it looks the
 conversation's thread up in the same table, and the row the kanban notifier stores for
 a card's report inviting a reply, posted into a Slack or Google Chat gateway conversation (keyed by the Hermes
-session and the conversation key), and frames the report ahead of the user's words with the hook's
+session and the conversation key; a key naming a whole DM or space rather than a thread is not looked
+up), and frames the report ahead of the user's words with the hook's
 notice and token list.
 
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a

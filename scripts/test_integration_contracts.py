@@ -248,14 +248,18 @@ class SpecToolRegistryTest(unittest.TestCase):
     INJECT_TRANSPORT = "bench/kube_agents_bench/inject_transport.py"
     SCORING = "bench/kube_agents_bench/scoring.py"
 
-    # Trajectory entries the harness writes itself after a stopped ask's
-    # opening turn (bench/kube_agents_bench/stop_hook.py): what it did, not a
-    # tool the agent called. A spec names them in `tool_called` with
-    # `require_success`. Evidence of each is a constant in the stop hook that
-    # the harness puts on an entry's `name`
+    # Trajectory entries the harness writes itself (a stopped ask's, a
+    # pushed-report replay's plant): what it did, not a tool the agent called.
+    # A spec names them in `tool_called` with `require_success`. Evidence of
+    # each is a constant in the module named beside it that the harness, or
+    # that module, puts on an entry's `name`
     # (test_the_harness_entries_still_have_evidence_in_the_hook_and_harness).
-    HARNESS_ENTRIES = {"harness_stop_sent", "harness_cards_stopped"}
-    STOP_HOOK = "bench/kube_agents_bench/stop_hook.py"
+    HARNESS_ENTRY_MODULES = {
+        "harness_stop_sent": "bench/kube_agents_bench/stop_hook.py",
+        "harness_cards_stopped": "bench/kube_agents_bench/stop_hook.py",
+        "harness_pushed_report_stored": "bench/kube_agents_bench/pushed_report.py",
+    }
+    HARNESS_ENTRIES = frozenset(HARNESS_ENTRY_MODULES)
     HARNESS = "bench/kube_agents_bench/harness.py"
 
     def _mcp_server_aliases(self):
@@ -565,15 +569,16 @@ class SpecToolRegistryTest(unittest.TestCase):
             )
 
     def test_the_harness_entries_still_have_evidence_in_the_hook_and_harness(self):
-        hook = (REPO_ROOT / self.STOP_HOOK).read_text(errors="replace")
         harness = (REPO_ROOT / self.HARNESS).read_text(errors="replace")
-        for entry in sorted(self.HARNESS_ENTRIES):
+        for entry, module in sorted(self.HARNESS_ENTRY_MODULES.items()):
+            source = (REPO_ROOT / module).read_text(errors="replace")
+            modname = Path(module).stem
             literal = re.escape(json.dumps(entry))
-            consts = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", hook, re.M)
+            consts = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", source, re.M)
             self.assertTrue(
-                any(f'"name": stop_hook.{const}' in harness for const in consts),
-                f"{entry} is registered as a harness entry but {self.HARNESS} no longer "
-                f"writes it from a {self.STOP_HOOK} constant — stale registry entry",
+                any(f'"name": {modname}.{const}' in harness or f'"name": {const}' in source for const in consts),
+                f"{entry} is registered as a harness entry but neither {self.HARNESS} nor {module} "
+                f"writes it from a {module} constant — stale registry entry",
             )
 
 

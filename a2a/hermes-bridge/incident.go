@@ -48,12 +48,15 @@ const (
 	incidentReplyUser  = "[User reply in thread]: "
 	// The thread shapes a chat conversation key carries. A Slack home-channel
 	// thread is slack:<channel>/<ts>, stored as (channel, ts); a Google Chat
-	// thread is gchat:spaces/<s>/threads/<t>, stored as (spaces/<s>, the
-	// thread name). A DM or a bare space has no stored report of this shape.
+	// thread is gchat:spaces/<s>/threads/<t>, or gchat:dm/spaces/<s>/threads/<t>
+	// when the home is a DM space, stored either way as (spaces/<s>, the
+	// thread name). A Slack DM, a whole Google Chat DM or a bare space has no
+	// stored report of this shape.
 	incidentSlackPrefix   = "slack:"
 	incidentSlackDMPrefix = "slack:dm/"
 	incidentGchatPrefix   = "gchat:"
 	incidentGchatDMPrefix = "gchat:dm/"
+	incidentGchatDM       = "dm/"
 	incidentGchatSpace    = "gchat:space/"
 	incidentGchatThreads  = "/threads/"
 )
@@ -80,8 +83,11 @@ var incidentTokens = []struct {
 	{regexp.MustCompile(`(?i)<end_of_turn>`), "[token_end_of_turn]"},
 	{regexp.MustCompile(`(?i)<<SYS>>`), "[SYS_TEXT]"},
 	{regexp.MustCompile(`(?i)<</SYS>>`), "[/SYS_TEXT]"},
-	{regexp.MustCompile(`(?i)###\s*System:`), "[SYSTEM_TEXT]:"},
-	{regexp.MustCompile(`(?i)###\s*Instruction:`), "[INSTRUCTION_TEXT]:"},
+	// Python's \s, which the hook's re uses on str, is wider than RE2's
+	// (pySpaceChars, chat.go); the frame test maps this class back to \s
+	// when it compares the two lists.
+	{regexp.MustCompile(`(?i)###` + pySpace + `*System:`), "[SYSTEM_TEXT]:"},
+	{regexp.MustCompile(`(?i)###` + pySpace + `*Instruction:`), "[INSTRUCTION_TEXT]:"},
 	{regexp.MustCompile(`(?i)\[INST\]`), "[INST_TEXT]"},
 	{regexp.MustCompile(`(?i)\[/INST\]`), "[/INST_TEXT]"},
 	{regexp.MustCompile(`(?i)<untrusted_report>`), "[untrusted_report_tag]"},
@@ -148,8 +154,7 @@ func incidentWholeConversation(key string) bool {
 // key names one.
 func incidentThread(key string) (incidentAddress, bool) {
 	switch {
-	case strings.HasPrefix(key, incidentSlackDMPrefix), strings.HasPrefix(key, incidentGchatDMPrefix),
-		strings.HasPrefix(key, incidentGchatSpace):
+	case strings.HasPrefix(key, incidentSlackDMPrefix), strings.HasPrefix(key, incidentGchatSpace):
 		return incidentAddress{}, false
 	case strings.HasPrefix(key, incidentSlackPrefix):
 		channel, ts, ok := strings.Cut(key[len(incidentSlackPrefix):], "/")
@@ -158,7 +163,9 @@ func incidentThread(key string) (incidentAddress, bool) {
 		}
 		return incidentAddress{chatID: channel, threadID: ts}, true
 	case strings.HasPrefix(key, incidentGchatPrefix):
-		thread := key[len(incidentGchatPrefix):]
+		// A thread in a DM home is keyed gchat:dm/<thread name>; the relay
+		// stores it by the thread name alone, as in any space.
+		thread := strings.TrimPrefix(key[len(incidentGchatPrefix):], incidentGchatDM)
 		space, _, ok := strings.Cut(thread, incidentGchatThreads)
 		if !ok || space == "" {
 			return incidentAddress{}, false

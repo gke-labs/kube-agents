@@ -62,7 +62,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
+from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 
 __all__ = [
@@ -869,13 +869,17 @@ def _inject_blind(trajectory: list[Any]) -> bool:
     loss, on which every check grades as on the api transport with or
     without a call behind the marker, and for one that carries a tool entry
     with no marker at all (no shipped transport writes that; it grades as
-    it did before the marker existed).
+    it did before the marker existed). The entries the harness writes itself
+    (``cases.HARNESS_WRITTEN_ENTRIES``: a stopped ask's, a pushed-report
+    replay's plant) are part of the envelope here: they are not calls the
+    door showed, so a record with one and no marker is still a trace the
+    door never showed.
     """
     if not _inject_record(trajectory):
         return False
     names = [entry.get("name") if isinstance(entry, dict) else None for entry in trajectory]
     if INJECT_ACTIVITY_EVENT not in names:
-        return all(name in INJECT_ENVELOPE_EVENTS for name in names)
+        return all(name in INJECT_ENVELOPE_EVENTS or name in HARNESS_WRITTEN_ENTRIES for name in names)
     return not _inject_trace_vouched(trajectory)
 
 

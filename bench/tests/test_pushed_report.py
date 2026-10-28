@@ -435,6 +435,18 @@ def test_every_activity_marker_must_vouch_on_a_two_turn_record():
     assert not scoring._inject_trace_vouched([])
 
 
+def test_a_two_turn_record_with_no_marker_is_blind():
+    """The plant entry is the harness's, not a call the door showed: a merged
+    record whose door carried no trace is blind like a single-turn one."""
+    task = {"name": scoring.INJECT_TASK_EVENT, "args": {}}
+    done = {"name": scoring.A2A_STATUS_EVENT, "args": {"state": "completed", "final": True}}
+    plant = pushed_report.plant_entry("a2a-ctx-1", "inject:c", {"stored": True})
+    assert scoring._inject_blind([task, done, plant, task, done])
+    clean = {"name": scoring.INJECT_ACTIVITY_EVENT, "args": {"dropped": 0}}
+    assert not scoring._inject_blind([task, done, clean, plant, task, done, clean])
+    assert scoring._inject_blind([task, done, clean, plant, task, done])
+
+
 def test_a_follow_up_the_door_absorbed_records_the_refusal(monkeypatch):
     """The inject path itself: a follow-up the door answers no-task to is a not-accepted
     result carrying the refusal the retry keys on, not a transport error."""

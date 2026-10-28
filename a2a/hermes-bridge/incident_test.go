@@ -206,9 +206,10 @@ func TestIncidentAddresses(t *testing.T) {
 		{"gchat:dm/spaces/DDD", nil},
 		{"gchat:space/spaces/AAA", nil},
 		{"gchat:space/spaces/AAA/threads/BBB", nil},
-		// A thread inside a DM is one conversation per thread.
+		// A thread inside a DM is one conversation per thread; in a Google Chat
+		// DM home the relay stores its post by the thread name, as in any space.
 		{"slack:dm/D123/1712.0001", []incidentAddress{{"a2a-x", "slack:dm/D123/1712.0001"}}},
-		{"gchat:dm/spaces/DDD/threads/TTT", []incidentAddress{{"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
+		{"gchat:dm/spaces/DDD/threads/TTT", []incidentAddress{{"spaces/DDD", "spaces/DDD/threads/TTT"}, {"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
 		{"slack:C0HOME", []incidentAddress{{"a2a-x", "slack:C0HOME"}}},
 		{"inject:bench-7", []incidentAddress{{"a2a-x", "inject:bench-7"}}},
 		{"console:abc", []incidentAddress{{"a2a-x", "console:abc"}}},
@@ -240,6 +241,14 @@ func TestNeutralizeIncident_BluntsEveryTokenInAnyCase(t *testing.T) {
 	if got := neutralizeIncident("plain prose with <b>markup</b> and [brackets]"); got != "plain prose with <b>markup</b> and [brackets]" {
 		t.Fatalf("prose mangled: %q", got)
 	}
+	// Python's \s reaches a no-break space and a vertical tab; the hook blunts
+	// these, so the bridge must too.
+	for _, in := range []string{"###\u00a0System: x", "###\vInstruction: x", "###\u2003system: x"} {
+		got := neutralizeIncident(in)
+		if strings.Contains(strings.ToLower(got), "system:") || strings.Contains(strings.ToLower(got), "instruction:") {
+			t.Errorf("%q not blunted: %q", in, got)
+		}
+	}
 }
 
 // The token list and the frame are incident_context's, and this file is the
@@ -267,7 +276,9 @@ func TestIncidentFrame_MatchesTheIncidentContextHook(t *testing.T) {
 		t.Fatalf("incident_context lists %d tokens, this file %d", len(want), len(incidentTokens))
 	}
 	for i, w := range want {
-		if got := strings.TrimPrefix(incidentTokens[i].pattern.String(), "(?i)"); got != w[0] || incidentTokens[i].replacement != w[1] {
+		// The Go side spells Python's \s as pySpace; compare the hook's spelling.
+		got := strings.ReplaceAll(strings.TrimPrefix(incidentTokens[i].pattern.String(), "(?i)"), pySpace, `\s`)
+		if got != w[0] || incidentTokens[i].replacement != w[1] {
 			t.Errorf("token %d: (%q, %q), incident_context has (%q, %q)", i, got, incidentTokens[i].replacement, w[0], w[1])
 		}
 	}
