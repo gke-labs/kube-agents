@@ -1368,6 +1368,12 @@ class ProxyCapacityTest(unittest.TestCase):
 
 
 class CappedCpuTest(unittest.TestCase):
+    def test_the_records_table_shows_a_capped_peak_as_excluded(self):
+        proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
+        records = parse(record(metrics=((hl.CPU_PEAK, proxy, 1.0), (hl.CPU_PEAK, "shell", 0.4)), limits=limits))
+        rows = {row["Container"]: row["Excluded from fit"] for row in hl.measurement_rows(records)}
+        self.assertEqual(rows, {proxy: True, "shell": False})
+
     def test_a_cpu_peak_at_the_limit_stays_out_of_the_line(self):
         proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
         records = parse(

@@ -5931,8 +5931,18 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -6457,8 +6467,18 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -6983,8 +7003,18 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -11089,10 +11119,6 @@
           "value": 248373.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33333248.0,
           "container": "manager"
@@ -11271,6 +11297,10 @@
           "name": "cpu_seconds",
           "value": 1.222228227699634,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -11646,10 +11676,6 @@
           "value": 700348.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33337344.0,
           "container": "manager"
@@ -11828,6 +11854,10 @@
           "name": "cpu_seconds",
           "value": 1.5941756071725801,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -12203,10 +12233,6 @@
           "value": 404957.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33337344.0,
           "container": "manager"
@@ -12385,6 +12411,10 @@
           "name": "cpu_seconds",
           "value": 1.826475724499706,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -12768,10 +12798,6 @@
           "value": 310516.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33345536.0,
           "container": "manager"
@@ -12950,6 +12976,10 @@
           "name": "cpu_seconds",
           "value": 3.324896302820044,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -13316,10 +13346,6 @@
           "value": 201827.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33341440.0,
           "container": "manager"
@@ -13498,6 +13524,10 @@
           "name": "cpu_seconds",
           "value": 9.998031490897006,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -13874,10 +13904,6 @@
           "value": 310510.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33345536.0,
           "container": "manager"
@@ -14056,6 +14082,10 @@
           "name": "cpu_seconds",
           "value": 136.58949969649416,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -14432,10 +14462,6 @@
           "value": 799397.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33349632.0,
           "container": "manager"
@@ -14614,6 +14640,10 @@
           "name": "cpu_seconds",
           "value": 247.0632477830953,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 4,
@@ -14982,10 +15012,6 @@
           "value": 546185.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33353728.0,
           "container": "manager"
@@ -15164,6 +15190,10 @@
           "name": "cpu_seconds",
           "value": 5.347333322177382,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -15547,10 +15577,6 @@
           "value": 870662.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33394688.0,
           "container": "manager"
@@ -15729,6 +15755,10 @@
           "name": "cpu_seconds",
           "value": 216.31570778544122,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -16095,10 +16125,6 @@
           "value": 1062840.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33599488.0,
           "container": "manager"
@@ -16277,6 +16303,10 @@
           "name": "cpu_seconds",
           "value": 3.1234429633144827,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -17863,8 +17893,18 @@
       ],
       "provider_429s": 5,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -18389,9 +18429,18 @@
       ],
       "provider_429s": 5,
       "answers": [],
-      "excluded_from": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
       "errors": [
-        "IAM bindings missing for 7s of this run (an organization IAM automation removed them; a guard restored them)"
+        "IAM bindings missing for 7s of this run (an organization IAM automation removed them; a guard restored them)",
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
       "remonitored": "c0c44c17aaaa"
     },
@@ -18751,10 +18800,6 @@
           "value": 519928.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33763328.0,
           "container": "manager"
@@ -18933,6 +18978,10 @@
           "name": "cpu_seconds",
           "value": 4.387198255823023,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -19313,10 +19362,6 @@
           "value": 965830.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33296384.0,
           "container": "manager"
@@ -19495,6 +19540,10 @@
           "name": "cpu_seconds",
           "value": 3.2552861247014864,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -19881,10 +19930,6 @@
           "value": 464939.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33042432.0,
           "container": "manager"
@@ -20063,6 +20108,10 @@
           "name": "cpu_seconds",
           "value": 14.961497518737376,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -20449,10 +20498,6 @@
           "value": 2873084.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33828864.0,
           "container": "manager"
@@ -20631,6 +20676,10 @@
           "name": "cpu_seconds",
           "value": 155.53510439609755,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -21007,10 +21056,6 @@
           "value": 1113716.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33644544.0,
           "container": "manager"
@@ -21189,6 +21234,10 @@
           "name": "cpu_seconds",
           "value": 82.35302329003795,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -21555,10 +21604,6 @@
           "value": 4091656.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33697792.0,
           "container": "manager"
@@ -21737,6 +21782,10 @@
           "name": "cpu_seconds",
           "value": 191.55817426795966,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -22122,10 +22171,6 @@
           "value": 167101.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33759232.0,
           "container": "manager"
@@ -22304,6 +22349,10 @@
           "name": "cpu_seconds",
           "value": 5.556894615765304,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -22670,10 +22719,6 @@
           "value": 186853.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33759232.0,
           "container": "manager"
@@ -22852,6 +22897,10 @@
           "name": "cpu_seconds",
           "value": 3.786253494667911,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -23218,10 +23267,6 @@
           "value": 311141.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33726464.0,
           "container": "manager"
@@ -23400,6 +23445,10 @@
           "name": "cpu_seconds",
           "value": 37.462212698132134,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -24830,10 +24879,6 @@
           "value": 1683569.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33910784.0,
           "container": "manager"
@@ -25012,6 +25057,10 @@
           "name": "cpu_seconds",
           "value": 27.278717965483217,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -28036,7 +28085,13 @@
         "proxy_load_per_second",
         "proxy_load_p50_seconds",
         "proxy_load_p95_seconds",
-        "proxy_load_max_seconds"
+        "proxy_load_max_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "brokered commands from outside the load ran during it: 51"
@@ -28662,7 +28717,13 @@
         "proxy_load_per_second",
         "proxy_load_p50_seconds",
         "proxy_load_p95_seconds",
-        "proxy_load_max_seconds"
+        "proxy_load_max_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "brokered commands from outside the load ran during it: 60"
@@ -30512,7 +30573,13 @@
         "proxy_load_per_second",
         "proxy_load_p50_seconds",
         "proxy_load_p95_seconds",
-        "proxy_load_max_seconds"
+        "proxy_load_max_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "brokered commands from outside the load ran during it: 11"
@@ -31739,8 +31806,28 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "proxy_load_per_second",
+        "proxy_load_p50_seconds",
+        "proxy_load_p95_seconds",
+        "proxy_load_max_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
+      ],
+      "errors": [
+        "brokered commands from outside the load ran during it: 8"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -32362,7 +32449,13 @@
         "proxy_load_per_second",
         "proxy_load_p50_seconds",
         "proxy_load_p95_seconds",
-        "proxy_load_max_seconds"
+        "proxy_load_max_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "brokered commands from outside the load ran during it: 25"
@@ -34623,10 +34716,6 @@
           "value": 332991.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 32796672.0,
           "container": "manager"
@@ -34785,6 +34874,10 @@
           "name": "cpu_seconds",
           "value": 35.45901197489443,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -35230,10 +35323,6 @@
           "value": 458318.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 32796672.0,
           "container": "manager"
@@ -35412,6 +35501,10 @@
           "name": "cpu_seconds",
           "value": 2.9145749912349856,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -35847,10 +35940,6 @@
           "value": 680663.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33005568.0,
           "container": "manager"
@@ -36029,6 +36118,10 @@
           "name": "cpu_seconds",
           "value": 2.990007147138264,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -36464,10 +36557,6 @@
           "value": 514033.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33009664.0,
           "container": "manager"
@@ -36646,6 +36735,10 @@
           "name": "cpu_seconds",
           "value": 3.0627025030704167,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -37083,10 +37176,6 @@
           "value": 451235.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -37265,6 +37354,10 @@
           "name": "cpu_seconds",
           "value": 2.1625420976726675,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -37702,10 +37795,6 @@
           "value": 452490.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -37884,6 +37973,10 @@
           "name": "cpu_seconds",
           "value": 4.200288847725187,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -38321,10 +38414,6 @@
           "value": 420228.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33271808.0,
           "container": "manager"
@@ -38503,6 +38592,10 @@
           "name": "cpu_seconds",
           "value": 2.923148119536563,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -38945,10 +39038,6 @@
           "value": 482527.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -39127,6 +39216,10 @@
           "name": "cpu_seconds",
           "value": 2.8822691339593045,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -39569,10 +39662,6 @@
           "value": 248453.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -39751,6 +39840,10 @@
           "name": "cpu_seconds",
           "value": 74.306642653222,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -41544,8 +41637,18 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -42132,8 +42235,18 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -43896,8 +44009,18 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
       "remonitored": "c0c44c17aaaa"
     },
     {
@@ -46074,10 +46197,6 @@
           "value": 258538.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34152448.0,
           "container": "manager"
@@ -46256,6 +46375,10 @@
           "name": "cpu_seconds",
           "value": 110.51180358505674,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -46684,10 +46807,6 @@
           "value": 227363.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34381824.0,
           "container": "manager"
@@ -46866,6 +46985,10 @@
           "name": "cpu_seconds",
           "value": 135.57979863616748,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -47294,10 +47417,6 @@
           "value": 0.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34377728.0,
           "container": "manager"
@@ -47476,6 +47595,10 @@
           "name": "cpu_seconds",
           "value": 401.2050041886723,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -49673,10 +49796,6 @@
           "value": 353200.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33468416.0,
           "container": "manager"
@@ -49855,6 +49974,10 @@
           "name": "cpu_seconds",
           "value": 64.40640685178656,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -50292,10 +50415,6 @@
           "value": 396992.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33472512.0,
           "container": "manager"
@@ -50474,6 +50593,10 @@
           "name": "cpu_seconds",
           "value": 117.32376878530846,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -50912,10 +51035,6 @@
           "value": 397479.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33472512.0,
           "container": "manager"
@@ -51094,6 +51213,10 @@
           "name": "cpu_seconds",
           "value": 97.54951823843112,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -55063,10 +55186,6 @@
           "value": 272911.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33792000.0,
           "container": "manager"
@@ -55245,6 +55364,10 @@
           "name": "cpu_seconds",
           "value": 6.543617371153952,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -55672,10 +55795,6 @@
           "value": 327194.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34185216.0,
           "container": "manager"
@@ -55854,6 +55973,10 @@
           "name": "cpu_seconds",
           "value": 2.376771730245097,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -56291,10 +56414,6 @@
           "value": 594051.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34131968.0,
           "container": "manager"
@@ -56473,6 +56592,10 @@
           "name": "cpu_seconds",
           "value": 151.38083009556235,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -58102,10 +58225,6 @@
           "value": 255327.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33808384.0,
           "container": "manager"
@@ -58284,6 +58403,10 @@
           "name": "cpu_seconds",
           "value": 61.38963721520869,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -58721,10 +58844,6 @@
           "value": 336441.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33812480.0,
           "container": "manager"
@@ -58903,6 +59022,10 @@
           "name": "cpu_seconds",
           "value": 42.272065668939064,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -59340,10 +59463,6 @@
           "value": 232251.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34074624.0,
           "container": "manager"
@@ -59522,6 +59641,10 @@
           "name": "cpu_seconds",
           "value": 3.3105317228682507,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,

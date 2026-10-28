@@ -195,6 +195,8 @@ class Snapshot:
     oom: set[tuple[str, str]] = field(default_factory=set)
     # scrape target -> pod UID -> samples
     scraped: dict[str, dict[str, list[Sample]]] = field(default_factory=dict)
+    # pod UIDs that were running but could not be scraped; their growth is unknown, not their whole count
+    unread: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
 
     def samples(self, target: str) -> list[Sample]:
@@ -292,11 +294,13 @@ class Install:
                 port = _metrics_port(pod, container, env_name)
                 if not port:
                     snap.errors.append(f"no metrics port on {name}/{container}")
+                    snap.unread.add(pod["metadata"]["uid"])
                     continue
                 try:
                     per_pod[pod["metadata"]["uid"]] = scrape(self.context, self.namespace, name, container, port)
                 except kube.CommandError as exc:
                     snap.errors.append(f"scrape {name}: {exc}")
+                    snap.unread.add(pod["metadata"]["uid"])
             snap.scraped[attr] = per_pod
         return snap
 
@@ -488,9 +492,15 @@ def counter_increase(before: float, after: float) -> float:
 
 
 def _growth(before: Snapshot, after: Snapshot, target: str, family: str) -> float:
-    """A counter family's growth, pod by pod; a new pod or a reset counter counts from zero."""
+    """A counter family's growth, pod by pod; a new pod or a reset counter counts from zero.
+
+    A pod that was running at the start but could not be read then is left out: counting it
+    from zero would report its whole count since start as the window's growth.
+    """
     total = 0.0
     for pod, samples in after.scraped.get(target, {}).items():
+        if pod in before.unread:
+            continue
         earlier = family_sum(before.scraped.get(target, {}).get(pod, []), family)
         total += counter_increase(earlier, family_sum(samples, family))
     return total

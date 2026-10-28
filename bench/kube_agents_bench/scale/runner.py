@@ -67,6 +67,8 @@ STALL_WATCH_PERIOD_SECONDS = 1800
 STALL_WATCH_BASE_SECONDS = 120
 STALL_WATCH_SECONDS_PER_CLUSTER = 30
 STALL_WATCH_NOTE = "the Stall Watch's half-hourly read of every cluster overlapped the run"
+# The operation kinds whose windows are shorter than the period; an hour-long soak holds two ticks every time.
+STALL_WATCH_KINDS = ("prompt", "restart_soak")
 OUTSIDE_COMMANDS_NOTE = "brokered commands from outside the load ran during it"
 RESPONSE_FITS = ["response_seconds"]
 LEVEL_LABEL = "harness-scale/level"
@@ -387,18 +389,19 @@ class Runner:
     def mark_shared(record: records.Record, kind: str) -> None:
         """Leave a short run out of the fits that work other than its own loaded.
 
-        A prompt run is marked when it overlaps a Stall Watch tick; a proxy load run when the
-        broker ran more commands than its workers issued, beyond the ones still in flight.
+        A prompt or boot-burst run, shorter than the Stall Watch's period, is marked when it
+        overlaps a tick; a proxy load run when the broker ran a command its workers did not send.
         """
         fits: tuple[str, ...] = ()
-        if kind == "prompt" and _overlaps_stall_watch(record.started, record.ended, record.totals.get(CLUSTERS_TOTAL, 0)):
+        if kind in STALL_WATCH_KINDS and _overlaps_stall_watch(record.started, record.ended, record.totals.get(CLUSTERS_TOTAL, 0)):
             note, fits = STALL_WATCH_NOTE, RESOURCE_FITS
         elif kind == PROXY_LOAD_KIND:
             readings = {m.name: m.value for m in record.metrics if m.container is None}
             issued = readings.get("proxy_load_completed", 0.0) + readings.get("proxy_load_errors", 0.0)
             outside = readings.get("proxy_commands", 0.0) - issued
-            if outside > float(record.values.get(PROXY_CONCURRENCY, 1)):
-                note, fits = f"{OUTSIDE_COMMANDS_NOTE}: {outside:.0f}", RESOURCE_FITS + PROXY_LOAD_FITS
+            if outside > 0:
+                # The run makes no model call, so tokens in its window are the other work's too.
+                note, fits = f"{OUTSIDE_COMMANDS_NOTE}: {outside:.0f}", RESOURCE_FITS + PROXY_LOAD_FITS + TOKEN_FITS
         if not fits:
             return
         if not any(e.startswith(note.split(":")[0]) for e in record.errors):
@@ -415,6 +418,7 @@ class Runner:
         """
         data = records.load(self.data_file)
         changed = []
+        unnamed = 0
         for raw in data["records"]:
             record = records.Record.from_dict(raw)
             before = json.dumps(record.to_dict(), sort_keys=True)
@@ -428,6 +432,7 @@ class Runner:
                 if note not in record.errors:
                     record.errors.append(note)
             operation = next((o for o in self.plan.operations if o.name == record.operation), None)
+            unnamed += operation is None
             if operation and operation.kind == "prompt":
                 # Each answer is judged on its own text; a delegation-wait marker in the run's errors
                 # counts once, not once per answer.
@@ -456,6 +461,9 @@ class Runner:
                 self.mark_shared(record, operation.kind)
             if json.dumps(record.to_dict(), sort_keys=True) != before:
                 changed.append(record)
+        if unnamed:
+            # The operation's kind decides its rules, and only the plan holds it.
+            LOG.warning("%s records name an operation this plan lacks; run reclassify with their plans too", unnamed)
         records.merge(self.data_file, changed)
         return len(changed)
 

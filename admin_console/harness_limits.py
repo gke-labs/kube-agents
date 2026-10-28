@@ -2218,7 +2218,8 @@ def measurement_rows(records: Iterable[Record]) -> list[dict[str, Any]]:
             "Container": measurement.container or "",
             "Value": measurement.value,
             "Shown as": format_value(measurement.name, measurement.value),
-            "Excluded from fit": record.excluded(measurement.name),
+            "Excluded from fit": record.excluded(measurement.name)
+            or capped(record, measurement.name, measurement.container),
         }
         for record in records
         for measurement in record.metrics

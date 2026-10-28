@@ -901,27 +901,29 @@ def _short_run(operation, started, ended, clusters=2, metrics=(), values=None):
     ("2026-10-27T00:05:00Z", "2026-10-27T00:07:00Z", 16, True),   # the read lasts 10 min at 16
     ("2026-10-27T00:28:30Z", "2026-10-27T00:30:30Z", 2, True),    # holds the :30 tick
 ])
-def test_a_prompt_run_inside_a_stall_watch_read_leaves_the_resource_fits(started, ended, clusters, shared):
+@pytest.mark.parametrize("kind", ["prompt", "restart_soak"])
+def test_a_short_run_inside_a_stall_watch_read_leaves_the_resource_fits(started, ended, clusters, shared, kind):
     record = _short_run("fan_out", started, ended, clusters)
-    runner.Runner.mark_shared(record, "prompt")
+    runner.Runner.mark_shared(record, kind)
     assert ("cpu_peak_cores" in record.excluded_from) is shared
     assert ("response_seconds" in record.excluded_from) is False
     assert bool(record.errors) is shared
-    runner.Runner.mark_shared(record, "prompt")
+    runner.Runner.mark_shared(record, kind)
     assert len(record.errors) == (1 if shared else 0)
 
 
 def test_a_proxy_load_run_with_commands_from_outside_leaves_the_fits():
     window = ("2026-10-27T00:10:00Z", "2026-10-27T00:13:00Z")
-    in_flight = _short_run("proxy_load", *window, metrics=(("proxy_commands", 216.0), ("proxy_load_completed", 213.0)),
-                           values={"proxy_concurrency": 4})
-    runner.Runner.mark_shared(in_flight, "proxy_load")
-    assert in_flight.excluded_from == []
-    shared = _short_run("proxy_load", *window, metrics=(("proxy_commands", 264.0), ("proxy_load_completed", 213.0)),
-                        values={"proxy_concurrency": 4})
+    # The proxy counts a command before the client sees its answer, so a clean window's counts are equal.
+    clean = _short_run("proxy_load", *window, metrics=(("proxy_commands", 213.0), ("proxy_load_completed", 213.0)),
+                       values={"proxy_concurrency": 16})
+    runner.Runner.mark_shared(clean, "proxy_load")
+    assert clean.excluded_from == []
+    shared = _short_run("proxy_load", *window, metrics=(("proxy_commands", 216.0), ("proxy_load_completed", 213.0)),
+                        values={"proxy_concurrency": 16})
     runner.Runner.mark_shared(shared, "proxy_load")
-    assert {"proxy_load_per_second", "cpu_peak_cores"} <= set(shared.excluded_from)
-    assert shared.errors == ["brokered commands from outside the load ran during it: 51"]
+    assert {"proxy_load_per_second", "cpu_peak_cores", "tokens_input"} <= set(shared.excluded_from)
+    assert shared.errors == ["brokered commands from outside the load ran during it: 3"]
 
 
 def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
@@ -1000,3 +1002,16 @@ def test_a_resumed_runner_checks_the_latest_trigger_soaks_jobs(tmp_path):
     run = runner.Runner(load_plan(PHASE3, environ=ENV), data)
     op, since = run.last_trigger()
     assert (op.name, since) == ("audits_30m", "2026-10-27T03:00:00Z")
+
+def test_an_hour_long_soak_is_not_marked_for_the_ticks_it_always_holds():
+    record = _short_run("watcher_soak", "2026-10-27T00:10:00Z", "2026-10-27T01:10:00Z")
+    runner.Runner.mark_shared(record, "soak")
+    assert record.excluded_from == []
+
+
+def test_a_pod_unread_at_the_start_adds_no_growth():
+    sample = ("kubeagents_tool_execution_duration_seconds_count", {}, 500.0)
+    before = collect.Snapshot(unread={"uid-1"})
+    after = collect.Snapshot(scraped={"proxy": {"uid-1": [sample]}})
+    assert collect._growth(before, after, "proxy", "kubeagents_tool_execution_duration_seconds_count") == 0.0
+    assert collect._growth(collect.Snapshot(), after, "proxy", "kubeagents_tool_execution_duration_seconds_count") == 500.0
