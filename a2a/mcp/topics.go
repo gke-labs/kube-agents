@@ -197,8 +197,10 @@ func (c *topicCache) answer(ctx context.Context, key string, read func(context.C
 		}
 		r = &topicRead{done: make(chan struct{})}
 		c.inflight[key] = r
-		// Detached from the caller, as NATSBus.Status's read is.
-		go c.refresh(context.Background(), key, r, read)
+		// Detached from the caller's cancellation and deadline, as
+		// NATSBus.Status's read is, but keeping its values (a trace or
+		// request-scoped logger, if any reach the bus calls).
+		go c.refresh(context.WithoutCancel(ctx), key, r, read)
 	}
 	c.mu.Unlock()
 	select {

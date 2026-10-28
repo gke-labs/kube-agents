@@ -765,27 +765,42 @@ func (f *slowTopicsBus) ListTopics(ctx context.Context) (TopicList, error) {
 // has already gone is told so, and the read it started still answers the next
 // caller, uncut.
 func TestAReadOutlivesItsCaller(t *testing.T) {
-	f := &fakeTopicsBus{}
-	tool := readTopicsTool(f, time.Now)
+	// The caller that starts a read hangs up mid-read: it gets its context
+	// error, the read runs on with its own budget, and the next caller is
+	// answered from it without a second read.
+	c := newTopicCache(time.Now)
 	ctx, cancel := context.WithCancel(context.Background())
+	var reads atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	readCtxErr := make(chan error, 1)
+	read := func(rctx context.Context) (string, error) {
+		reads.Add(1)
+		close(started)
+		<-release
+		readCtxErr <- rctx.Err()
+		dl, ok := rctx.Deadline()
+		if !ok || time.Until(dl) > topicReadTimeout {
+			return "", fmt.Errorf("the read's budget was %v, want at most %v", time.Until(dl), topicReadTimeout)
+		}
+		return "the answer", nil
+	}
+	gone := make(chan error, 1)
+	go func() { _, err := c.answer(ctx, "list", read); gone <- err }()
+	<-started
 	cancel()
-	// The gone caller may be answered by the read or told it left first.
-	if _, err := tool.Call(ctx, []byte(`{"action":"list"}`)); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("a gone caller got %v, want the read's answer or context.Canceled", err)
+	if err := <-gone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the caller that hung up got %v, want context.Canceled", err)
 	}
-	if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
-		t.Fatal(err)
+	close(release)
+	if err := <-readCtxErr; err != nil {
+		t.Fatalf("the read's context ended with its caller: %v", err)
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.lists != 1 {
-		t.Errorf("the next caller read again (%d reads), want the gone caller's read", f.lists)
+	text, err := c.answer(context.Background(), "list", func(context.Context) (string, error) { reads.Add(1); return "", errors.New("read again") })
+	if err != nil || text != "the answer" {
+		t.Fatalf("the next caller got %q, %v; want the hung-up caller's read", text, err)
 	}
-	if f.ctxErr != nil {
-		t.Errorf("the read was handed the caller's cancelled context: %v", f.ctxErr)
-	}
-	if f.deadline <= 0 || f.deadline > topicReadTimeout {
-		t.Errorf("the read's budget was %v, want at most %v", f.deadline, topicReadTimeout)
+	if n := reads.Load(); n != 1 {
+		t.Errorf("%d reads, want 1", n)
 	}
 }
 
