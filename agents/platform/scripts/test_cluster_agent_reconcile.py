@@ -1419,7 +1419,9 @@ class ScopeTest(HomesMixin):
                 stall.hold()
             return True if cluster != "c" else False
 
-        listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
+        # No cluster on the list, so all three are described: a listed one would skip its
+        # describe (#3703) and leave only one completing describe beside the stall.
+        listings = {self.MGMT: []}
         with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
                 mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
