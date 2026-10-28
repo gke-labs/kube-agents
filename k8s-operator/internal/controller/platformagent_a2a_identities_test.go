@@ -126,7 +126,7 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 // (`a2a.>`), and an exact one inside it (`a2a.cap.verify.platform`). NATS
 // groups queue subscribers by name across patterns, so either joins.
 func TestOnlyTheVerifierReceivesVerifyRequests(t *testing.T) {
-	const verify, probe = "a2a.cap.verify.*", "a2a.cap.verify.probe"
+	const verify = "a2a.cap.verify.*"
 	// Overlap, not one-way matching: a grant with a wildcard in a middle token
 	// (a2a.cap.*.platform) reaches verify subjects without matching either way.
 	reaches := func(grant string) bool { return subjectPatternsOverlap(grant, verify) }
