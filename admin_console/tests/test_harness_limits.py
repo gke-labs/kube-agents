@@ -1379,5 +1379,18 @@ class CappedCpuTest(unittest.TestCase):
         self.assertEqual((raised.limit, raised.peak, raised.capped), (4.0, 2.2, False))
 
 
+class UnanchoredOperationTest(unittest.TestCase):
+    def test_an_operation_without_base_runs_anchors_nothing(self):
+        container = "envoy-credential-proxy"
+        records = parse(
+            record(metrics=((hl.CPU_PEAK, container, 0.6),), values=planned()),
+            # Measured once, at 16 clusters under raised limits: no base point of its own.
+            record("clusters", 16, "audits_raised", metrics=((hl.CPU_PEAK, container, 2.5),),
+                   totals={"clusters": 16}, values=planned(clusters=16)),
+        )
+        self.assertEqual(hl.base_fleet(records)[hl.CLUSTERS], 2.0)
+        self.assertAlmostEqual(hl.predict(records, hl.CPU_PEAK, container, hl.base_fleet(records)).base, 0.6)
+
+
 if __name__ == "__main__":
     unittest.main()

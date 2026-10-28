@@ -1090,10 +1090,16 @@ def fit_line(points: Iterable[Point]) -> Fit | None:
 
 
 def base_records(records: Iterable[Record], operation: str) -> list[Record]:
-    """The base runs of an operation, or each factor's lowest level when it has none."""
+    """The base runs of an operation.
+
+    An operation with no base run of its own, such as one measured at one fleet
+    size under raised limits, has no base and does not anchor a prediction. Only
+    data with no base run at all falls back to each factor's lowest level.
+    """
+    records = list(records)
     runs = [record for record in records if record.operation == operation]
     base = [record for record in runs if record.is_base]
-    if base:
+    if base or any(record.is_base for record in records):
         return base
     lowest: dict[str, float] = {}
     for record in runs:
