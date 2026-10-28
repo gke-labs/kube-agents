@@ -65,6 +65,20 @@ class _Stall:
         self.release.set()
 
 
+
+# The relay helper runs in the sandbox, which no test has: every test starts from the
+# gcloud path (the fallback when the helper cannot run), and the relay tests patch
+# `_relay_reads` themselves.
+_no_relay = mock.patch.object(rec, "_relay_reads", return_value=None)
+
+
+def setUpModule():
+    _no_relay.start()
+
+
+def tearDownModule():
+    _no_relay.stop()
+
 def _identity(project="p", cluster="c", location="us-central1"):
     return {"project": project, "cluster": cluster, "location": location}
 
@@ -3129,6 +3143,101 @@ class ScopeTest(HomesMixin):
         self.assertEqual(asked, ["prod"])
         self.assertEqual(deleted, [])
         self.assertEqual(report["kept"], ["cluster-prod"])
+
+
+    # #3703 step 2: the GKE reads go through the broker's relay, one sandbox process a batch.
+
+    NOT_FOUND = {"error": {"code": 404, "status": "NOT_FOUND", "message": "Not found: cluster"}}
+
+    def _relay(self, lists=None, gets=None):
+        """A `_relay_reads` stub over canned rows, recording each batch it was sent."""
+        batches: list = []
+
+        def relay(request, timeout):
+            batches.append(request)
+            return {"lists": {p: (lists or {})[p] for p in request.get("projects", [])},
+                    "gets": {"/".join(c): (gets or {})["/".join(c)] for c in request.get("clusters", [])}}
+        return batches, relay
+
+    @staticmethod
+    def _ok_list(*clusters, location="us-central1"):
+        return {"status": 200, "clusters": [[c, location] for c in clusters]}
+
+    def _key(self, cluster, project=None):
+        return f"{project or self.MGMT}/us-central1/{cluster}"
+
+    def _relayed_run(self, relay, profiles, identities, lister=None):
+        gcloud_lists: list = []
+        gcloud_describes: list = []
+
+        def gcloud_list(project, timeout=None):
+            gcloud_lists.append(project)
+            return (lister or {}).get(project, ([], rec.OUTCOME_OK))
+
+        def gcloud_describe(project, cluster, location, timeout=None):
+            gcloud_describes.append(cluster)
+            return True
+        with mock.patch.object(rec, "_relay_reads", side_effect=relay):
+            report, _, deleted = self._run(None, gcloud_list, profiles=profiles, identities=identities,
+                                           exists=gcloud_describe)
+        return report, deleted, gcloud_lists, gcloud_describes
+
+    def test_the_relay_lists_and_describes_with_no_gcloud(self):
+        profiles, identities = self._profiles("a", "gone")
+        batches, relay = self._relay(lists={self.MGMT: self._ok_list("a")},
+                                     gets={self._key("gone"): {"status": 404, "error": self.NOT_FOUND}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(([], []), (lists, describes))
+        self.assertEqual(deleted, ["cluster-gone"])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        # The listed cluster is not looked up: only the unlisted one reaches a get.
+        self.assertEqual([[self.MGMT, "us-central1", "gone"]], [c for b in batches for c in b.get("clusters", [])])
+
+    def test_a_relayed_partial_list_cannot_delete_a_live_cluster(self):
+        profiles, identities = self._profiles("a", "omitted")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list("a")},
+                               gets={self._key("omitted"): {"status": 200}})
+        report, deleted, _, _ = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-omitted"])
+
+    def test_only_the_apis_own_notfound_deletes(self):
+        # A 404 that is not a Google NOT_FOUND (the broker's, a proxy's) is unknown.
+        profiles, identities = self._profiles("broker404", "denied", "unreached")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
+            self._key("broker404"): {"status": 404, "error": {"text": "<html>not here</html>"}},
+            self._key("denied"): {"status": 403, "error": {"error": {"code": 403, "status": "PERMISSION_DENIED"}}},
+            self._key("unreached"): {"status": 0, "error": {"exception": "ConnectTimeout"}},
+        })
+        report, deleted, _, _ = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["skipped_error"]), ["cluster-broker404", "cluster-denied", "cluster-unreached"])
+
+    def test_a_relayed_list_failure_is_classified_as_gcloud_would_be(self):
+        _, relay = self._relay(lists={self.MGMT: {"status": 403, "error": {"error": {
+            "code": 403, "status": "PERMISSION_DENIED", "message": "does not have permission"}}}})
+        report, _, lists, _ = self._relayed_run(relay, [], {})
+        self.assertEqual([], lists)
+        self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_DENIED})
+
+    def test_a_broker_refusal_falls_back_to_gcloud_for_the_run(self):
+        # A broker older than the routes answers SECURITY_POLICY_BLOCKED: that says nothing
+        # about the clusters, so the tick lists and describes with gcloud instead.
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: {"status": 403, "error": {
+            "code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.host"}}})
+        report, deleted, lists, describes = self._relayed_run(
+            relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+        self.assertEqual([self.MGMT], lists)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+
+    def test_a_helper_that_cannot_run_falls_back_to_gcloud(self):
+        profiles, identities = self._profiles("a")
+        report, _, lists, describes = self._relayed_run(lambda request, timeout: None, profiles, identities)
+        self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
+        self.assertEqual(report["kept"], ["cluster-a"])
 
 
 class ProjectSourceTest(unittest.TestCase):

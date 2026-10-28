@@ -401,7 +401,140 @@ def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WOR
     budget, before calling this: its listing decides `create_pass_ran`, and when it
     reaches the sandbox its ssh opens the multiplexed connection the pool then shares.
     """
+    if not projects:
+        return {}
+    relayed = _relay_lists(projects, deadline)
+    if relayed is not None:
+        return relayed
     return _bounded_map(_list_project, projects, deadline, "listing clusters in", workers, budget_seconds)
+
+
+# The GKE reads through the broker's read-only Cloud API relay (#3703), from one sandbox
+# process per batch: `gke_cluster_reads.py`, shipped in the sandbox image, does every
+# list and get as a REST call on the shell's token (`api_policy` routes
+# gcp.api.container.clusters-list and -get, projected to name, location, status and id).
+# A `gcloud` process per read cost ~2.4 s of the sandbox's CPU each; a REST call costs a
+# fraction of that. When the relay cannot be used -- the helper is missing (a sandbox
+# image older than this script), it failed, or the broker refused the route (a broker
+# older than the routes) -- the run says so once and falls back to `gcloud` for the rest
+# of the tick, so a version skew between the pods costs speed, never correctness.
+GKE_READS_HELPER = "/opt/defaults/scripts/gke_cluster_reads.py"
+GKE_READS_WORKERS = 16
+# The broker's own refusal codes. Any of them on a relayed read means the relay itself
+# said no, which is not an answer about the cluster or the project.
+_RELAY_REFUSAL_CODES = frozenset({"SECURITY_POLICY_BLOCKED", "CALLER_ROLE_FORBIDDEN", "API_RELAY_DISABLED",
+                                  "UPSTREAM_UNEXPECTED", "UPSTREAM_RESPONSE_TOO_LARGE", "UPSTREAM_REDIRECTED"})
+_relay_unusable_this_run = False
+
+
+class _RelayUnusable(Exception):
+    """The relay answered in a way that says nothing about the clusters; use gcloud."""
+
+
+def _relay_reads(request: dict, timeout: float) -> dict | None:
+    """One batch through the sandbox helper, or None when it could not run or answer."""
+    try:
+        result = sandbox_exec.run(["python3", GKE_READS_HELPER], stdin=json.dumps(request),
+                                  check=True, timeout=timeout)
+        answer = json.loads(result.stdout or "")
+    except Exception as e:  # noqa: BLE001 - any failure means "use gcloud", never a verdict
+        log(f"the GKE relay helper could not run ({type(e).__name__}: {str(e)[:200]}); using gcloud this run.")
+        return None
+    return answer if isinstance(answer, dict) else None
+
+
+def _google_error_text(error: dict | None) -> str:
+    """The Google error's status, reasons and message as one string for the classifier."""
+    inner = (error or {}).get("error")
+    if not isinstance(inner, dict):
+        return json.dumps(error or {})[:LOG_ROW_PREVIEW_CHARS]
+    reasons = [d.get("reason", "") for d in inner.get("details") or [] if isinstance(d, dict)]
+    reasons += [e.get("reason", "") for e in inner.get("errors") or [] if isinstance(e, dict)]
+    return " ".join(str(x) for x in (inner.get("status", ""), inner.get("code", ""), *reasons, inner.get("message", "")))
+
+
+def _check_relay_answer(row) -> dict:
+    if not isinstance(row, dict):
+        raise _RelayUnusable("a row that is not an object")
+    error = row.get("error")
+    if isinstance(error, dict) and error.get("code") in _RELAY_REFUSAL_CODES:
+        raise _RelayUnusable(f"the broker answered {error.get('code')} ({error.get('rule', '')})")
+    return row
+
+
+def _read_list(project: str, row) -> tuple[list | None, str]:
+    """A relayed `clusters.list` answer in `_list_project`'s shape."""
+    row = _check_relay_answer(row)
+    if row.get("status") == 200 and isinstance(row.get("clusters"), list):
+        return [(project, name, location) for name, location in row["clusters"]], OUTCOME_OK
+    if not row.get("status"):
+        return None, OUTCOME_UNREACHABLE
+    text = _google_error_text(row.get("error"))
+    outcome = _classify_list_failure(text)
+    log(f"listing clusters in {project} failed ({outcome}; skipping create for it this run): {text}")
+    return None, outcome
+
+
+def _read_get(project: str, row) -> bool | None:
+    """A relayed `clusters.get` answer as `_cluster_exists` answers: True, False or None.
+
+    False only for the API's own NotFound: a 404 whose body is a Google error with status
+    NOT_FOUND. A 404 from anywhere else (the broker, a proxy in between) is unknown.
+    """
+    row = _check_relay_answer(row)
+    status = row.get("status")
+    if status == 200:
+        return True
+    inner = (row.get("error") or {}).get("error")
+    if status == 404 and isinstance(inner, dict) and inner.get("status") == "NOT_FOUND":
+        return False
+    text = _google_error_text(row.get("error"))
+    classified = _classify_list_failure(text)
+    if classified == OUTCOME_DENIED:
+        _denied_this_run.add(project)
+    elif classified == OUTCOME_API_DISABLED:
+        _api_disabled_this_run.add(project)
+    log(f"relayed describe in {project} answered {status or 'nothing'} (treating as unknown): {text}")
+    return None
+
+
+def _relay_lists(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]] | None:
+    """Every project listed through the relay, or None to fall back to gcloud."""
+    global _relay_unusable_this_run
+    if _relay_unusable_this_run:
+        return None
+    answer = _relay_reads({"projects": projects, "workers": GKE_READS_WORKERS},
+                          max(1.0, deadline - time.monotonic()))
+    if answer is None:
+        _relay_unusable_this_run = True
+        return None
+    try:
+        lists = answer["lists"]
+        return {project: _read_list(project, lists[project]) for project in projects}
+    except (KeyError, TypeError, ValueError, _RelayUnusable) as e:
+        _relay_unusable_this_run = True
+        log(f"the GKE relay is not usable this run ({type(e).__name__}: {e}); listing with gcloud.")
+        return None
+
+
+def _relay_describes(keys: dict[str, dict], deadline: float) -> dict[str, tuple[bool | None, str]] | None:
+    """`name -> (exists, "")` for each identity through the relay, or None to fall back."""
+    global _relay_unusable_this_run
+    if _relay_unusable_this_run or not keys:
+        return None if keys else {}
+    triples = {name: (i["project"], i["location"], i["cluster"]) for name, i in keys.items()}
+    answer = _relay_reads({"clusters": [list(t) for t in triples.values()], "workers": GKE_READS_WORKERS},
+                          max(1.0, deadline - time.monotonic()))
+    if answer is None:
+        _relay_unusable_this_run = True
+        return None
+    try:
+        gets = answer["gets"]
+        return {name: (_read_get(t[0], gets["/".join(t)]), "") for name, t in triples.items()}
+    except (KeyError, TypeError, ValueError, _RelayUnusable) as e:
+        _relay_unusable_this_run = True
+        log(f"the GKE relay is not usable this run ({type(e).__name__}: {e}); describing with gcloud.")
+        return None
 
 
 def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
@@ -1449,6 +1582,8 @@ def reconcile(dry_run: bool = False) -> dict:
     management, management_authoritative = _project_source()
     _denied_this_run.clear()
     _api_disabled_this_run.clear()
+    global _relay_unusable_this_run
+    _relay_unusable_this_run = False
     scope, scope_readable, scope_present, containers_known, selectors_known = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
@@ -1507,7 +1642,8 @@ def reconcile(dry_run: bool = False) -> dict:
     listing_deadline = time.monotonic() + list_budget
     listings: dict[str, tuple[list | None, str]] = {}
     if management:
-        listings[management] = _list_project(management)
+        relayed = _relay_lists([management], listing_deadline)
+        listings[management] = relayed[management] if relayed is not None else _list_project(management)
     groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline, workers, list_budget)
     searches = {g: r for g, r in groups.items() if _is_container(g)}
     selector_reports = {g: r for g, r in groups.items() if _is_selector(g)}
@@ -1839,11 +1975,14 @@ def reconcile(dry_run: bool = False) -> dict:
         log(f"{len(listed_alive)} profile(s) are on their project's cluster list this run; "
             f"describing the other {len(to_describe)}.")
     prune_budget = _prune_budget_seconds(cap, len(to_describe))
-    described = _bounded_map(
-        lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
-        to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
-        consequence="inconclusive; the profile is kept",
-    )
+    prune_deadline = time.monotonic() + prune_budget
+    described = _relay_describes({name: identities[name] for name in to_describe}, prune_deadline)
+    if described is None:
+        described = _bounded_map(
+            lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
+            to_describe, prune_deadline, "describing the cluster of", workers, prune_budget,
+            consequence="inconclusive; the profile is kept",
+        )
     described.update({name: (True, "") for name in listed_alive})
     for name in profiles:
         identity = identities[name]

@@ -494,6 +494,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          only and deliberately so — the sidecar imports it
 #                          across the credential boundary, so it may not reach
 #                          for anything that shells out
+#   gke_cluster_reads.py   the Cluster Agent reconcile's GKE list and get reads, one
+#                          process a batch, through the broker's read-only relay (#3703).
+#                          The reconcile runs in the agent pod and sends it the batch
+#                          over sandbox_exec; it imports only credential_proxy_client
 #   forge.py               the typed layer over the version-control verbs —
 #                          pull requests, comments, identity, permission —
 #                          imported by pr_conversation. Not a REST client and no
@@ -617,6 +621,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
+     agents/platform/scripts/gke_cluster_reads.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py

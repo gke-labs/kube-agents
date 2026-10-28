@@ -10108,6 +10108,29 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        projection = api_policy.response_projection(decision.rule_id)
+        if projection is not None and HTTPStatus.OK <= upstream.status < HTTPStatus.MULTIPLE_CHOICES:
+            # The route hands back only what its projection keeps (the GKE cluster
+            # routes drop `masterAuth`, which can carry a client key). A body the
+            # projection cannot read is answered 502 rather than relayed whole.
+            projected = projection(upstream.body)
+            if projected is None:
+                LOGGER.warning(
+                    "api response unprojectable request_id=%s host=%s rule=%s status=%d",
+                    request_id,
+                    host,
+                    decision.rule_id,
+                    upstream.status,
+                )
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {
+                        "error": "the upstream answer was not the shape this route relays",
+                        "code": "UPSTREAM_UNEXPECTED",
+                    },
+                )
+                return
+            upstream = replace(upstream, body=projected)
         LOGGER.info(
             "api forwarded request_id=%s host=%s status=%d bytes=%d duration_ms=%d",
             request_id,
