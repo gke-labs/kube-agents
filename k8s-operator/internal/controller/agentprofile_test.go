@@ -1348,7 +1348,7 @@ func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
 	// boundAgentProfiles -> enabledAgentProfileNames projects KUBE_AGENTS_ENABLED_PROFILES=tse.
 	h := newProfileHarness(t, agent, &tse)
 	reconciler := &PlatformAgentReconciler{Client: h.c, Scheme: h.c.Scheme()}
-	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileWorkload with bound tse AgentProfile: %v", err)
 	}
 	var liveDep appsv1.Deployment
@@ -1371,7 +1371,7 @@ func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
 	}
 	skewedAgent := agent.DeepCopy()
 	skewedAgent.Spec.Mode = ptr.To("quantum")
-	if err := reconciler.reconcileWorkload(context.Background(), skewedAgent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+	if err := reconciler.reconcileWorkload(context.Background(), skewedAgent, "cfg", "fb", "set", "pol", nil, "", false, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileWorkload under mode skew: %v", err)
 	}
 	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
@@ -1382,7 +1382,7 @@ func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
 	}
 
 	reconciler.agentProfilesUnreadable = true
-	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileWorkload under agentProfilesUnreadable: %v", err)
 	}
 	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
@@ -1395,7 +1395,7 @@ func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
 	// 3. Healthy removal path: once AgentProfile reads succeed again with `tse` deleted,
 	// reconcileWorkload removes KUBE_AGENTS_ENABLED_PROFILES from the gateway Deployment.
 	reconciler.agentProfilesUnreadable = false
-	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileWorkload after deleting tse AgentProfile: %v", err)
 	}
 	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {

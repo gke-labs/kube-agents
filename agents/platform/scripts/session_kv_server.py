@@ -1999,8 +1999,9 @@ def _platform_setting_in(path: str, platform: str, key: str) -> str:
 def _slack_home_channel() -> str:
     """Slack's home channel, from the environment or from either config file.
 
-    The operator renders `SLACK_HOME_CHANNEL` only when the CR sets
-    `slack.homeChannel`, and that is not the only way an install gets one:
+    The operator renders `SLACK_HOME_CHANNEL` when the CR sets
+    `slack.homeChannel` or, under `next`, when it admits the channel the
+    gateway learned, and neither is the only way an install gets one:
     `/sethome` writes `platforms.slack.home_channel` into the writable
     `config.yaml`, which is precisely why that file is not mounted read-only.
     Reading the environment alone left such an install's Slack leg with an empty

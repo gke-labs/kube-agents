@@ -4257,8 +4257,8 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			},
 			// The home-channel record, one named ConfigMap: the gateway's
 			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
-			// once an A2A_HOME_CHANNEL_LEARN this operator does not yet render
-			// arms it (platformagent_home_channel_record.go).
+			// and the operator reads it back into the agent env and the
+			// HomeChannelUnset condition (platformagent_home_channel_record.go).
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"configmaps"},
@@ -4803,18 +4803,19 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
-		// The learned-home contract (platformagent_home_channel_record.go),
-		// for a gateway that learns a home channel from the first admitted
-		// mention: whether it may, the record it would write, and its own
-		// image for the record's writer and reader keys. The gateway reads
-		// them, and learns only once A2A_HOME_CHANNEL_LEARN is rendered true,
-		// which this release does not. The gateway's home env above stays the
-		// CR's: a learned value reaches the gateway through the record, not a
-		// re-render.
+		// The learned-home contract (platformagent_home_channel_record.go):
+		// whether the gateway may learn a home channel from the first
+		// admitted mention, the record it writes, its own image for the
+		// record's writer and reader keys, and the switch that arms the
+		// learn. The operator reads the record back into the agent env and
+		// the HomeChannelUnset condition. The gateway's home env above stays
+		// the CR's: a learned value reaches the gateway through the record,
+		// not a re-render.
 		backendEnv = append(backendEnv,
 			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
 			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
 			corev1.EnvVar{Name: a2aGatewaySelfImageEnvVar, Value: a2aGatewayImage()},
+			corev1.EnvVar{Name: a2aHomeChannelLearnEnvVar, Value: a2aHomeChannelLearnEnvValue},
 		)
 	}
 	var chatEnv []corev1.EnvVar
@@ -5057,6 +5058,12 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// homeRecord is the home-channel record the reconcile read before the
+	// agent render (platformagent_home_channel_record.go), carried to the
+	// status writers so the HomeChannelUnset condition follows the same read
+	// the agent env did; the zero value is no record.
+	homeRecord homeChannelRecord
 
 	// AuthMapVersion is the identity-map version this reconcile rendered.
 	// BusCredentialsReady is the callout confirming it is serving this
