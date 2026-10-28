@@ -61,12 +61,13 @@ python3 -m kube_agents_bench.scale.runner teardown <plan> --delete-fleet
 
 An operation's `kind` says what a run does:
 
-- `prompt` sends the operation's `prompt` through the agent API, and above a concurrency of 1 its
-  `follow_up` beside it;
+- `prompt` sends the operation's `prompt` through the agent API, and at a `concurrent` value of N
+  sends N − 1 copies of its `follow_up` beside it;
 - `soak` waits `window_seconds`; `restart_soak` restarts the gateway pod first; `reset_soak` resets
   the install's state volumes first;
 - `proxy_load` runs the operation's `command` through `credential-proxy-exec` in the sandbox shell,
-  from `proxy_concurrency` workers at once for `window_seconds`, with no model call;
+  from as many workers at once as the point's `proxy_concurrency` value, for `window_seconds`, with
+  no model call;
 - `trigger_soak` marks the cron `jobs` on the roster under `jobs_home` due at the window's start, as
   the OOBE job marks its first-run audits, and notes the ones not finished when the window ends.
 

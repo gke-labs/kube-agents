@@ -2,12 +2,12 @@
 # onboarding work moved into a window of its own so a 30-minute window still holds the peak.
 #
 # After a reset, the OOBE job (agents/chat/scripts/oobe.py) runs the reconcile and the scan
-# (a card per Cluster Agent), then five first-run audits one after another, each reading every
-# cluster through the broker. The audits peak the credential proxy and the shell 40-60 minutes
-# after the reset, past a 30-minute window. Here the onboarding window holds the reset, the
-# reconcile and the scan, and a second window marks the five audits due at its start, all at
-# once, as OOBE marks them one by one: a worse case than OOBE's order, bounded for the broker by
-# its 8 command slots.
+# (a card per Cluster Agent), then its first-run audits one after another, each reading every
+# cluster through the broker. The audits peak the credential proxy and the shell from about 40
+# minutes up to two hours after the reset, past a 30-minute window. Here the onboarding window
+# holds the reset, the reconcile and the scan, and a second window marks the first-run audits due
+# at its start, all at once, as OOBE marks them one by one: a worse case than OOBE's order,
+# bounded for the broker by its 8 command slots. A job the build's roster lacks is noted.
 #
 # Set the target as for phase1.yaml. The cluster levels run from the largest down and the base
 # runs last, so the fleet only shrinks. The 22-cluster fleet was deleted before Phase 3 measured it

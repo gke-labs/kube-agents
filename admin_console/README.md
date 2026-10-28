@@ -228,8 +228,7 @@ replicas included (a Job's or an init container's peak holds no node).
 The raw records, with each run's errors, are in a collapsed section.
 
 The page's limits default to the ones most runs had, so a short experiment under
-other limits does not change them. A CPU peak at 90% or more of a container's
-CPU limit stays out of the CPU line, because it shows the limit, not the need.
+other limits does not change them.
 
 `python3 -m admin_console.estimate` prints the same model as Markdown:
 
