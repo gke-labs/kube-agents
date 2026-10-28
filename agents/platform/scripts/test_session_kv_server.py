@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 import unittest
@@ -2345,21 +2346,21 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         ]
         self.assertEqual([e["pull_request"] for e in events], [self.FIX_URL, ""])
 
-    def test_a_fix_opened_from_the_incident_thread_holds_it_too(self):
-        # A human's `apply` files the card elsewhere; it carries the incident
-        # thread's subscription instead of the incident's session.
+    def test_a_pull_request_from_a_card_only_subscribed_to_the_thread_does_not_hold(self):
+        # Anything asked for in the incident's thread files a card carrying the
+        # thread's subscription, so its pull request need not be the fix.
         import sqlite3
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
                 patch.object(session_kv_server, "_proposal_state", return_value="open"), \
                 patch.object(session_kv_server, "_remind_fix_pull_request"):
-            anchor_id, session = self._first_incident("threadfix-api-6cfdb6b98b-aaaaa")
+            _anchor, session = self._first_incident("threadfix-api-6cfdb6b98b-aaaaa")
             with sqlite3.connect(temp_db_path) as conn, conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
                     (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.1"})),
                 )
-            self._board(cards=[("t-apply", "a2a-elsewhere", self.FIX_URL)], subs=[("t-apply", "C1", "1700.1")])
-            self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "folded")
+            self._board(cards=[("t-label", "a2a-elsewhere", self.FIX_URL)], subs=[("t-label", "C1", "1700.1")])
+            self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
     def test_a_merged_or_closed_fix_or_none_starts_a_new_incident(self):
         for state, prefix in (("merged", "mergedfix"), ("closed", "closedfix"), (None, "nofix")):
@@ -2476,6 +2477,17 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             forge.call.reset_mock()
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
+
+    def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
+        release = threading.Event()
+        forge = MagicMock()
+        forge.call.side_effect = lambda *a, **k: release.wait(5) and {}
+        self.addCleanup(release.set)
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+        workers = [t for t in threading.enumerate() if t.name == "fix-pr-lookup"]
+        self.assertTrue(workers, "the overrunning call has no thread left to inspect")
+        self.assertTrue(all(t.daemon for t in workers), "a non-daemon worker is joined at interpreter exit")
 
     def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
         plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"

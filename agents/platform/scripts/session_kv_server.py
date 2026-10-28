@@ -1733,48 +1733,32 @@ class FixPullRequest(NamedTuple):
 
 
 def _incident_pull_request_urls(session_id: str) -> list[str]:
-    """The pull requests cards opened for an incident's session, newest first.
+    """The pull requests cards filed in an incident's own session opened, newest first.
 
-    Two cards can open one: the card the front door files in the incident's
-    own session (INCIDENT_TRIAGE_OPEN_PULL_REQUEST, `tasks.session_id`), and
-    the card a human's `apply` in the incident's thread files elsewhere, which
-    carries that thread's subscription (`kanban_notify_subs`). Each card that
-    opened one has a `pr_opened` event (agents/platform/plugins/pr_opened).
+    The card the front door files in the incident's own session
+    (INCIDENT_TRIAGE_OPEN_PULL_REQUEST; Hermes stamps the filing session on
+    `tasks.session_id`) opens the fix, and a card that opened one has a
+    `pr_opened` event (agents/platform/plugins/pr_opened). Not the cards
+    subscribed to the incident's thread: anything asked for in the thread
+    files one, so a pull request found that way need not be the fix.
     Best-effort: an unreadable board, or one without a table or column these
     read, contributes nothing.
     """
-    queries: list[tuple[str, tuple]] = [
-        (
-            "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
-            "WHERE e.kind = ? AND t.session_id = ? ORDER BY e.created_at DESC, e.id DESC",
-            (PR_OPENED_EVENT_KIND, session_id),
-        )
-    ]
-    _platform, chat_id, thread_id = _lookup_session_routing(session_id)
-    if chat_id and thread_id:
-        queries.append(
-            (
-                "SELECT e.payload FROM task_events e JOIN kanban_notify_subs s ON s.task_id = e.task_id "
-                "WHERE e.kind = ? AND s.chat_id = ? AND s.thread_id = ? ORDER BY e.created_at DESC, e.id DESC",
-                (PR_OPENED_EVENT_KIND, chat_id, thread_id),
-            )
-        )
+    sql = (
+        "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = ? AND t.session_id = ? ORDER BY e.created_at DESC, e.id DESC"
+    )
     urls: list[str] = []
     try:
         with closing(_read_only(_kanban_db_path())) as conn:
-            for sql, params in queries:
+            for (payload,) in conn.execute(sql, (PR_OPENED_EVENT_KIND, session_id)).fetchall():
                 try:
-                    rows = conn.execute(sql, params).fetchall()
-                except sqlite3.Error:
+                    data = json.loads(payload) if isinstance(payload, str) else payload
+                except ValueError:
                     continue
-                for (payload,) in rows:
-                    try:
-                        data = json.loads(payload) if isinstance(payload, str) else payload
-                    except ValueError:
-                        continue
-                    url = data.get("url") if isinstance(data, dict) else None
-                    if isinstance(url, str) and PROPOSAL_URL_RE.match(url) and url not in urls:
-                        urls.append(url)
+                url = data.get("url") if isinstance(data, dict) else None
+                if isinstance(url, str) and PROPOSAL_URL_RE.match(url) and url not in urls:
+                    urls.append(url)
     except Exception as exc:
         logger.warning(f"Could not read the board for session {session_id}'s pull requests: {exc!r}")
     return urls
@@ -1785,21 +1769,30 @@ def _proposal_state(url: str, timeout: float) -> Optional[str]:
     match = PROPOSAL_URL_RE.match(url)
     if match is None or timeout <= 0:
         return None
-    executor = None
-    try:
-        import forge
+    # A daemon thread, not a ThreadPoolExecutor: a forge call that outlives the
+    # budget is abandoned, and an executor's worker would hold a restart until
+    # it ends (forge's own hop allows FORWARD_TIMEOUT_S an attempt).
+    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
-        executor = ThreadPoolExecutor(max_workers=1)
-        call = executor.submit(
-            forge.call, "proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True
-        )
-        proposal = call.result(timeout=timeout).get("proposal") or {}
-    except Exception as exc:
-        logger.warning(f"Could not read the state of {url}: {exc!r}")
+    def _view() -> None:
+        try:
+            import forge
+
+            view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
+            answer.put((True, view))
+        except Exception as exc:
+            answer.put((False, exc))
+
+    threading.Thread(target=_view, name="fix-pr-lookup", daemon=True).start()
+    try:
+        ok, result = answer.get(timeout=timeout)
+    except queue.Empty:
+        logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
         return None
-    finally:
-        if executor is not None:
-            executor.shutdown(wait=False)
+    if not ok:
+        logger.warning(f"Could not read the state of {url}: {result!r}")
+        return None
+    proposal = (result.get("proposal") if isinstance(result, dict) else None) or {}
     state = proposal.get("state") if isinstance(proposal, dict) else None
     return state if isinstance(state, str) else None
 

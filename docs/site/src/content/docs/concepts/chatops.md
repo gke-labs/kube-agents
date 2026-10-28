@@ -387,7 +387,7 @@ platformAgent:
         value: "900"
 ```
 
-With the setting on, a workload that breaks again after the window, while a pull request the agent opened to fix one of its recent incidents is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand does not count.
+With the setting on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
 
 The hold covers the same fault only: the event's reason must be the incident's, so a workload waiting on a fix for `BackOff` that starts failing `Unhealthy` gets a new incident. For the same fault, the incident's chat thread gets one short reminder per window instead, naming the pull request: the fault is already diagnosed and its fix is waiting on a person. Once that pull request is merged or closed, the next new failure is a new incident again. The feed `GET /v1/intercepted-events` lists such an event as `folded`, with the pull request in its `pull_request` field.
 
