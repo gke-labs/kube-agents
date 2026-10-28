@@ -1474,6 +1474,50 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 	return restartRigWrapped(t, r, nil, whileDown...)
 }
 
+// relayPullClearRecheck spaces waitForRelayPullsToClear's two reads.
+const relayPullClearRecheck = 100 * time.Millisecond
+
+// waitForRelayPullsToClear waits until the server holds no pull request on
+// the relay durable: the stopped gateway's last pull outlives its client's
+// close by however long the server takes to notice, and an event delivered
+// to it is held unacked for the durable's AckWait (gke-labs/kube-agents#4169).
+// Two zero reads in a row, so a pull still in flight on the old connection
+// can't register between one read and the second gateway's start. This hides
+// the race from the restart tests and doesn't remove it: a gateway restart in
+// production still delays or loses events in this window, which is #4170's,
+// and a message already delivered to the old client but not acked keeps the
+// AckWait delay, which no pull count can see.
+func waitForRelayPullsToClear(t *testing.T, url, durable string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear := func() bool {
+		c, err := js.Consumer(context.Background(), lib.TasksStream, durable)
+		if errors.Is(err, jetstream.ErrConsumerNotFound) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		info, err := c.Info(context.Background())
+		return err == nil && info.NumWaiting == 0
+	}
+	waitFor(t, "the stopped gateway's relay pull to clear", func() bool {
+		if !clear() {
+			return false
+		}
+		time.Sleep(relayPullClearRecheck)
+		return clear()
+	})
+}
+
 // restartRigWrapped is restartRig with the second gateway's adapter chosen
 // by wrap, as startRigWithSpawnerAdapter chooses the first's.
 func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
@@ -1485,6 +1529,7 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 		t.Fatal("the first gateway did not stop")
 	}
 	r.client.Close()
+	waitForRelayPullsToClear(t, r.url, r.g.relayDurable)
 	for _, f := range whileDown {
 		f()
 	}
