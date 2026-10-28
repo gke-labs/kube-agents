@@ -187,8 +187,9 @@ def _stamp_soul_identity(home: Path, project: str, cluster: str, location: str) 
     tool calls searching for USER.md from its kanban task scratch workspace.
 
     The block goes last because SOUL.md opens the system prompt: everything before the
-    block is byte-identical across every cluster's profile, so the model provider's
-    prefix cache is shared by all of them. A block left near the top by an earlier
+    block is byte-identical across every cluster's profile, so a longest-prefix cache
+    (Gemini implicit caching, vLLM prefix caching) can serve it to all of them; Anthropic's
+    per-breakpoint cache gains nothing from the move. A block left near the top by an earlier
     version is removed, so the file carries exactly one, and re-stamping is idempotent.
     """
     soul_path = home / SOUL_MD_NAME
