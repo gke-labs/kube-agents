@@ -63,6 +63,14 @@ readonly FORGE_NETWORK="default"
 readonly FORGE_ROWS="ghes gitlab-ce"
 readonly FORGE_FIREWALL_RULE="allow-forge-443"
 readonly FORGE_FIREWALL_SOURCE_RANGES="10.0.0.0/8"
+readonly FORGE_FIREWALL_ALLOWED="tcp:443"
+# The deny rule on the same tag, one priority step below the allow (gcloud's
+# default 1000): a forge VM's external address answers nothing else, the
+# default network's stock allow-ssh included.
+readonly FORGE_DENY_RULE="deny-forge-ingress"
+readonly FORGE_DENY_PRIORITY=1100
+readonly FORGE_DENY_SOURCE_RANGES="0.0.0.0/0"
+readonly FORGE_DENY_RULES="all"
 readonly FORGE_NETWORK_TAG="forge"
 readonly FORGE_VM_SA_ID="forge-vm"
 readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
@@ -677,15 +685,19 @@ for row in ${FORGE_ROWS}; do
   echo "✓ ${host} -> ${ip} (${address})"
 done
 if ! gcloud compute firewall-rules describe "${FORGE_FIREWALL_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
-  gcloud compute firewall-rules create "${FORGE_FIREWALL_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --allow=tcp:443 \
+  gcloud compute firewall-rules create "${FORGE_FIREWALL_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --allow="${FORGE_FIREWALL_ALLOWED}" \
     --source-ranges="${FORGE_FIREWALL_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+if ! gcloud compute firewall-rules describe "${FORGE_DENY_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_DENY_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --action=DENY --rules="${FORGE_DENY_RULES}" \
+    --priority="${FORGE_DENY_PRIORITY}" --source-ranges="${FORGE_DENY_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
 fi
 FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
   gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
 fi
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
-echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rule ${FORGE_FIREWALL_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
+echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform

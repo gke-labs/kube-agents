@@ -37,8 +37,10 @@ STUB_GCLOUD = textwrap.dedent(
       *"dns record-sets describe"*)
         case "$*" in *"describe ghes.eval.internal. "*) ;; *) echo "not found" >&2; exit 1 ;; esac
         [ -e "$state/record" ] && { cat "$state/record"; exit 0; } || { echo "not found" >&2; exit 1; } ;;
-      *"compute firewall-rules describe"*)
+      *"compute firewall-rules describe allow-forge-443"*)
         [ -e "$state/firewall" ] && { echo allow-forge-443; exit 0; } || exit 1 ;;
+      *"compute firewall-rules describe deny-forge-ingress"*)
+        [ -e "$state/deny" ] && { echo deny-forge-ingress; exit 0; } || exit 1 ;;
       *"iam service-accounts describe"*)
         [ -e "$state/sa" ] && { echo forge-vm@x; exit 0; } || exit 1 ;;
       *"compute instances list"*)
@@ -144,6 +146,7 @@ class ForgeScriptTest(unittest.TestCase):
         (self.gstate / "address").write_text(ip + "\n")
         (self.gstate / "record").write_text((record_ip or ip) + "\n")
         (self.gstate / "firewall").write_text("")
+        (self.gstate / "deny").write_text("")
         (self.gstate / "sa").write_text("")
         (self.gstate / "serial").write_text(serial)
 
@@ -208,7 +211,7 @@ class ForgeScriptTest(unittest.TestCase):
             f"--zone=us-central1-a", "--machine-type=e2-small", "--image-family=cos-stable", "--image-project=cos-cloud",
             f"--private-network-ip={FORGE_IP}", f"--service-account=forge-vm@{PROJECT}.iam.gserviceaccount.com",
             "--tags=forge", "--labels=kube-agents-forge=ghes,kube-agents-build=1234",
-            "host=ghes.eval.internal", "enterprise-version=3.17.0", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
+            "host=ghes.eval.internal", "enterprise-version=3.17.0", "block-project-ssh-keys=TRUE", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
         ):
             self.assertIn(flag, create)
         # Readiness from the serial console, the key out of metadata, then one curl from a pod in the host cluster, with the CA.
@@ -221,7 +224,7 @@ class ForgeScriptTest(unittest.TestCase):
         # The CA is passed as a multi-line value, so the call spans lines in the log.
         log = self.calls.read_text()
         run = log[log.index("kubectl run"):]
-        self.assertIn("--image=curlimages/curl:8.11.1", run)
+        self.assertIn("--image=curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69", run)
         self.assertIn("--rm -i", run)
         self.assertIn("FORGE_URL=https://ghes.eval.internal/api/v3/meta", run)
         self.assertIn("FORGE_CA=-----BEGIN CERTIFICATE-----\nca-for-ghes.eval.internal", run)
@@ -248,7 +251,7 @@ class ForgeScriptTest(unittest.TestCase):
         # Nothing provisioned: every piece named, nothing created.
         proc = self.run_forge("up")
         self.assertNotEqual(proc.returncode, 0)
-        for piece in ("the reserved address forge-ghes in us-central1", "the A record ghes.eval.internal. in the private zone eval-internal", "the firewall rule allow-forge-443", f"the VM identity forge-vm@{PROJECT}.iam.gserviceaccount.com"):
+        for piece in ("the reserved address forge-ghes in us-central1", "the A record ghes.eval.internal. in the private zone eval-internal", "the firewall rule allow-forge-443", "the deny rule deny-forge-ingress", f"the VM identity forge-vm@{PROJECT}.iam.gserviceaccount.com"):
             self.assertIn(piece, proc.stderr)
         self.assertIn("docs/ci-pool-projects.md 5.8", proc.stderr)
         self.assertFalse(self.calls_of("instances create") or self.calls_of("builds submit") or self.calls_of("make-certs"))

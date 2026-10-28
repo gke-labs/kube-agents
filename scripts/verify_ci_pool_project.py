@@ -421,6 +421,14 @@ FORGE_ROW_HOSTS = {"ghes": "ghes.eval.internal", "gitlab-ce": "gitlab.eval.inter
 FORGE_ADDRESS_TEMPLATE = "forge-{row}"
 FORGE_FIREWALL_RULE = "allow-forge-443"
 FORGE_FIREWALL_SOURCE_RANGES = "10.0.0.0/8"
+FORGE_FIREWALL_ALLOWED = "tcp:443"
+# The deny rule on the same tag, one priority step below the allow (gcloud's
+# default 1000): everything else from anywhere, the default network's stock
+# allow-ssh included, stops before it reaches a forge VM's external address.
+FORGE_DENY_RULE = "deny-forge-ingress"
+FORGE_DENY_PRIORITY = 1100
+FORGE_DENY_SOURCE_RANGES = "0.0.0.0/0"
+FORGE_DENY_RULES = "all"
 FORGE_NETWORK_TAG = "forge"
 FORGE_VM_SA_ID = "forge-vm"
 FORGE_VM_SA_ROLES = frozenset({"roles/artifactregistry.reader"})
@@ -430,6 +438,12 @@ FINDING_FORGE_ZONE_MISSING = "forge/zone/missing"
 # records the lane needs cannot live in it, and a create by name skips it.
 FINDING_FORGE_ZONE_MISMATCH = "forge/zone/mismatch"
 FINDING_FORGE_FIREWALL_MISSING = "forge/firewall/missing"
+FINDING_FORGE_FIREWALL_MISMATCH = "forge/firewall/mismatch"
+FINDING_FORGE_DENY_MISSING = "forge/firewall-deny/missing"
+FINDING_FORGE_DENY_MISMATCH = "forge/firewall-deny/mismatch"
+# Roles beyond the registry read: the VM runs with the cloud-platform scope,
+# so every role the identity holds is usable from it (docs 5.8, "nothing else").
+FINDING_FORGE_VM_SA_ROLE_EXTRA = "forge/vm-sa/extra"
 FINDING_FORGE_VM_SA_MISSING = "forge/vm-sa/missing"
 FINDING_FORGE_ADDRESS_MISSING = "forge/address/missing/{row}"
 FINDING_FORGE_RECORD_MISSING = "forge/record/missing/{host}"
@@ -439,7 +453,10 @@ FINDING_FORGE_VM_SA_ROLE_MISSING = "forge/vm-sa/missing/{role}"
 # these pieces, so a leased run passes with any of them; only the self-managed
 # lanes (#3683, #3684) refuse the lease, at second zero and by name.
 FORGE_FINDINGS = frozenset(
-    {FINDING_FORGE_ZONE_MISSING, FINDING_FORGE_ZONE_MISMATCH, FINDING_FORGE_FIREWALL_MISSING, FINDING_FORGE_VM_SA_MISSING}
+    {
+        FINDING_FORGE_ZONE_MISSING, FINDING_FORGE_ZONE_MISMATCH, FINDING_FORGE_FIREWALL_MISSING, FINDING_FORGE_FIREWALL_MISMATCH,
+        FINDING_FORGE_DENY_MISSING, FINDING_FORGE_DENY_MISMATCH, FINDING_FORGE_VM_SA_MISSING, FINDING_FORGE_VM_SA_ROLE_EXTRA,
+    }
     | {FINDING_FORGE_ADDRESS_MISSING.format(row=row) for row in FORGE_ROW_HOSTS}
     | {FINDING_FORGE_RECORD_MISSING.format(host=host) for host in FORGE_ROW_HOSTS.values()}
     | {FINDING_FORGE_RECORD_MISMATCH.format(host=host) for host in FORGE_ROW_HOSTS.values()}
@@ -3518,13 +3535,17 @@ def _forge_repair(project_id: str, location: str) -> str:
             f"--rrdatas=\"$(gcloud compute addresses describe {address} --region={location} --project={project_id} --format='value(address)')\""
         )
     lines.append(
-        f"gcloud compute firewall-rules create {FORGE_FIREWALL_RULE} --network={FORGE_NETWORK} --direction=INGRESS --allow=tcp:443 "
+        f"gcloud compute firewall-rules create {FORGE_FIREWALL_RULE} --network={FORGE_NETWORK} --direction=INGRESS --allow={FORGE_FIREWALL_ALLOWED} "
         f"--source-ranges={FORGE_FIREWALL_SOURCE_RANGES} --target-tags={FORGE_NETWORK_TAG} --project={project_id}"
+    )
+    lines.append(
+        f"gcloud compute firewall-rules create {FORGE_DENY_RULE} --network={FORGE_NETWORK} --direction=INGRESS --action=DENY --rules={FORGE_DENY_RULES} "
+        f"--priority={FORGE_DENY_PRIORITY} --source-ranges={FORGE_DENY_SOURCE_RANGES} --target-tags={FORGE_NETWORK_TAG} --project={project_id}"
     )
     lines.append(f"gcloud iam service-accounts create {FORGE_VM_SA_ID} --display-name='kube-agents forge VM' --project={project_id}")
     for role in sorted(FORGE_VM_SA_ROLES):
         lines.append(_project_binding(project_id, f"serviceAccount:{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com", role))
-    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; a create on a piece already there fails with ALREADY_EXISTS and is the skip; a record that points elsewhere takes `gcloud dns record-sets update` with the same flags; a zone of another name, visibility or network is deleted first (`gcloud dns managed-zones delete`); the bindings are idempotent)"
+    return "\n".join(lines) + "\n(docs/ci-pool-projects.md 5.8; a create on a piece already there fails with ALREADY_EXISTS and is the skip; a record that points elsewhere takes `gcloud dns record-sets update` with the same flags; a zone of another name, visibility or network is deleted first (`gcloud dns managed-zones delete`), a firewall rule of another shape likewise (`gcloud compute firewall-rules delete`); the bindings are idempotent, and a role the VM identity holds beyond the registry read is removed by hand)"
 
 
 def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckResult:
@@ -3586,12 +3607,30 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
             missing(FINDING_FORGE_RECORD_MISMATCH.format(host=host), f"{host}. resolves to {record} in zone {FORGE_DNS_ZONE}, but the reserved address {address} is {ip}; the forge VM takes the address, so the record must point at it")
         elif ok_rr and ok_ip and ip:
             details.append(f"✓ {host} -> {ip} ({address})")
-    rule, ok = read(["gcloud", "compute", "firewall-rules", "describe", FORGE_FIREWALL_RULE, f"--project={project_id}", "--format=value(name)"], f"the firewall rule {FORGE_FIREWALL_RULE}")
+    rule, ok = read(
+        ["gcloud", "compute", "firewall-rules", "describe", FORGE_FIREWALL_RULE, f"--project={project_id}", "--format=value(sourceRanges.list(),targetTags.list(),allowed[].map().firewall_rule().list())"],
+        f"the firewall rule {FORGE_FIREWALL_RULE}",
+    )
     firewall_checked = ok
+    expected_rule = [FORGE_FIREWALL_SOURCE_RANGES, FORGE_NETWORK_TAG, FORGE_FIREWALL_ALLOWED]
     if ok and not rule:
         missing(FINDING_FORGE_FIREWALL_MISSING, f"The firewall rule {FORGE_FIREWALL_RULE} is missing in {project_id}; the host cluster's pods could not reach a forge VM on 443")
+    elif ok and rule.split("\t") != expected_rule:
+        missing(FINDING_FORGE_FIREWALL_MISMATCH, f"Firewall rule {FORGE_FIREWALL_RULE} in {project_id} is {rule!r}, not {FORGE_FIREWALL_ALLOWED} from {FORGE_FIREWALL_SOURCE_RANGES} to tag {FORGE_NETWORK_TAG}; delete it and run the provisioning commands")
     elif ok:
-        details.append(f"✓ Firewall rule {FORGE_FIREWALL_RULE}")
+        details.append(f"✓ Firewall rule {FORGE_FIREWALL_RULE}: {FORGE_FIREWALL_ALLOWED} from {FORGE_FIREWALL_SOURCE_RANGES} to tag {FORGE_NETWORK_TAG}")
+    deny, ok = read(
+        ["gcloud", "compute", "firewall-rules", "describe", FORGE_DENY_RULE, f"--project={project_id}", "--format=value(direction,priority,sourceRanges.list(),targetTags.list(),denied[].map().firewall_rule().list())"],
+        f"the deny rule {FORGE_DENY_RULE}",
+    )
+    deny_checked = ok
+    expected_deny = ["INGRESS", str(FORGE_DENY_PRIORITY), FORGE_DENY_SOURCE_RANGES, FORGE_NETWORK_TAG, FORGE_DENY_RULES]
+    if ok and not deny:
+        missing(FINDING_FORGE_DENY_MISSING, f"The deny rule {FORGE_DENY_RULE} is missing in {project_id}; a forge VM's external address would answer the default network's stock rules (ssh from anywhere)")
+    elif ok and deny.split("\t") != expected_deny:
+        missing(FINDING_FORGE_DENY_MISMATCH, f"Deny rule {FORGE_DENY_RULE} in {project_id} is {deny!r}, not INGRESS priority {FORGE_DENY_PRIORITY} denying {FORGE_DENY_RULES} from {FORGE_DENY_SOURCE_RANGES} to tag {FORGE_NETWORK_TAG}; delete it and run the provisioning commands")
+    elif ok:
+        details.append(f"✓ Deny rule {FORGE_DENY_RULE}: everything else to tag {FORGE_NETWORK_TAG} at priority {FORGE_DENY_PRIORITY}")
     sa_email = f"{FORGE_VM_SA_ID}@{project_id}.iam.gserviceaccount.com"
     sa, ok = read(["gcloud", "iam", "service-accounts", "describe", sa_email, f"--project={project_id}", "--format=value(email)"], f"the VM identity {sa_email}")
     identity_checked = ok
@@ -3607,8 +3646,11 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
             held = set(roles.split()) if roles else set()
             for role in sorted(FORGE_VM_SA_ROLES - held):
                 missing(FINDING_FORGE_VM_SA_ROLE_MISSING.format(role=role), f"The VM identity {sa_email} lacks {role} on {project_id}; the forge VM could not pull its image")
-            if FORGE_VM_SA_ROLES <= held:
-                details.append(f"✓ VM identity {sa_email} holds {', '.join(sorted(FORGE_VM_SA_ROLES))}")
+            extra = sorted(held - FORGE_VM_SA_ROLES)
+            if extra:
+                missing(FINDING_FORGE_VM_SA_ROLE_EXTRA, f"The VM identity {sa_email} also holds {', '.join(extra)} on {project_id}; the forge VM runs with the cloud-platform scope, so every role it holds is usable from it")
+            elif FORGE_VM_SA_ROLES <= held:
+                details.append(f"✓ VM identity {sa_email} holds {', '.join(sorted(FORGE_VM_SA_ROLES))} and nothing else")
     if not read_any:
         return CheckResult(name, True, "Not checked", details, warnings, findings, read=False)
     # The summary must not assert an item a warning above retracts: with the
@@ -3620,6 +3662,7 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
             ("the reserved addresses", addresses_checked),
             ("the A records", records_checked),
             ("the firewall rule", firewall_checked),
+            ("the deny rule", deny_checked),
             ("the VM identity and its role", identity_checked),
         ]
     )
@@ -3628,7 +3671,7 @@ def check_forge_pieces(project_id: str, location: str = "us-central1") -> CheckR
     elif partial:
         message = partial
     else:
-        message = "Zone, addresses, records, firewall rule and VM identity present"
+        message = "Zone, addresses, records, firewall and deny rules and VM identity present"
     return CheckResult(name, passed, message, details, warnings, findings, read=True)
 
 

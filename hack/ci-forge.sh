@@ -46,6 +46,7 @@ readonly FORGE_VM_BUILD_LABEL_KEY="kube-agents-build"
 readonly FORGE_NAME_PREFIX="forge"
 readonly FORGE_NETWORK_TAG="forge"
 readonly FORGE_FIREWALL_RULE="allow-forge-443"
+readonly FORGE_DENY_RULE="deny-forge-ingress"
 readonly FORGE_DNS_ZONE="eval-internal"
 readonly FORGE_VM_SERVICE_ACCOUNT_ID="forge-vm"
 readonly FORGE_VM_IMAGE_FAMILY="cos-stable"
@@ -70,7 +71,10 @@ readonly FORGE_BUILD_TIMEOUT_SECONDS="${FORGE_BUILD_TIMEOUT_SECONDS:-900}"
 # build's time plus the upload and the stream's tail.
 readonly FORGE_BUILD_CLIENT_BOUND_SECONDS="${FORGE_BUILD_CLIENT_BOUND_SECONDS:-$((FORGE_BUILD_TIMEOUT_SECONDS + 120))}"
 # The in-cluster reachability check: one pod, one curl, bounded.
-readonly FORGE_CLUSTER_CHECK_IMAGE="curlimages/curl:8.11.1"
+readonly FORGE_CLUSTER_CHECK_IMAGE="curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69"
+# The VM takes no project-wide ssh key: with the deny rule on its tag, nothing
+# but 443 from the VPC reaches it, and nothing could log in if it did.
+readonly FORGE_VM_METADATA_SSH="block-project-ssh-keys=TRUE"
 readonly FORGE_CLUSTER_CHECK_TIMEOUT="180s"
 readonly FORGE_CLUSTER_CHECK_NAMESPACE="default"
 # The record `up` leaves beside ca.crt so `down` deletes exactly this run's VM.
@@ -207,6 +211,8 @@ preflight_project_pieces() {
   fi
   gcloud compute firewall-rules describe "${FORGE_FIREWALL_RULE}" --project="${PROJECT_ID}" --format='value(name)' >/dev/null 2>&1 \
     || missing+=("the firewall rule ${FORGE_FIREWALL_RULE}")
+  gcloud compute firewall-rules describe "${FORGE_DENY_RULE}" --project="${PROJECT_ID}" --format='value(name)' >/dev/null 2>&1 \
+    || missing+=("the deny rule ${FORGE_DENY_RULE}")
   gcloud iam service-accounts describe "${FORGE_VM_SERVICE_ACCOUNT}" --project="${PROJECT_ID}" --format='value(email)' >/dev/null 2>&1 \
     || missing+=("the VM identity ${FORGE_VM_SERVICE_ACCOUNT}")
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -214,7 +220,7 @@ preflight_project_pieces() {
     echo "       These are provisioned once per pool project (scripts/provision_ci_pool_project.sh; by hand per docs/ci-pool-projects.md 5.8); not creating a VM nothing could reach." >&2
     exit 1
   fi
-  echo "✓ Project pieces present: ${FORGE_ADDRESS_NAME}=${FORGE_IP}, ${EVAL_FORGE_HOST}. in ${FORGE_DNS_ZONE}, ${FORGE_FIREWALL_RULE}, ${FORGE_VM_SERVICE_ACCOUNT}"
+  echo "✓ Project pieces present: ${FORGE_ADDRESS_NAME}=${FORGE_IP}, ${EVAL_FORGE_HOST}. in ${FORGE_DNS_ZONE}, ${FORGE_FIREWALL_RULE}, ${FORGE_DENY_RULE}, ${FORGE_VM_SERVICE_ACCOUNT}"
 }
 
 # ─── up: certificates, from the repo's own helper, Linux only ────────────────
@@ -284,7 +290,9 @@ EOF
 }
 
 # The ephemeral external address is the VM's way to github.com: the pool
-# projects have no Cloud NAT, and the proxy forwards every request there.
+# projects have no Cloud NAT, and the proxy forwards every request there. The
+# deny rule on the tag and the blocked project ssh keys are what keep that
+# address from answering anything but 443 from the VPC.
 create_ghes_vm() {
   local startup
   startup="$(mktemp "${FORGE_SCRATCH_DIR}/forge-startup.XXXXXX")"
@@ -300,7 +308,7 @@ create_ghes_vm() {
     --service-account="${FORGE_VM_SERVICE_ACCOUNT}" --scopes=cloud-platform \
     --tags="${FORGE_NETWORK_TAG}" \
     --labels="${FORGE_VM_LABEL_KEY}=${EVAL_FORGE},${FORGE_VM_BUILD_LABEL_KEY}=${BUILD_ID:-local}" \
-    --metadata="host=${EVAL_FORGE_HOST},image=${GHES_PROXY_IMAGE},enterprise-version=${GHES_PROXY_ENTERPRISE_VERSION}" \
+    --metadata="host=${EVAL_FORGE_HOST},image=${GHES_PROXY_IMAGE},enterprise-version=${GHES_PROXY_ENTERPRISE_VERSION},${FORGE_VM_METADATA_SSH}" \
     --metadata-from-file="startup-script=${startup},tls-crt=${FORGE_CERT_DIR}/tls.crt,${FORGE_KEY_METADATA_KEY}=${FORGE_CERT_DIR}/tls.key,ca-crt=${FORGE_CERT_DIR}/ca.crt" \
     --quiet >/dev/null
   rm -f "${startup}"
