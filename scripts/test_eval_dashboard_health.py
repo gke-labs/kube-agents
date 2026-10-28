@@ -421,7 +421,49 @@ class Storm(unittest.TestCase):
         result = assess(self.stormy([1, 2, 3], 6), T0)
         self.assertEqual(result["state"], "DEGRADED")
         self.assertEqual(result["condition"], "storm")
-        self.assertRegex(result["cause"], r"quota storm window \d\d:\d\d–\d\d:\d\d UTC")
+        self.assertRegex(result["cause"], r"quota storm window \d\d:\d\d–\d\d:\d\d UTC \(429 rate not read\)")
+        self.assertTrue(any(line.endswith("; unconfirmed: no Vertex 429 reading") for line in result["evidence"]), result["evidence"])
+
+    def reading(self, share, read_at=T0, requests=100, hours=4):
+        """vertex_429.py's document: ten-minute pool buckets back from T0 with
+        `requests` calls each, `share` of them 429s."""
+        buckets = [{"end": health.iso(T0 - timedelta(minutes=10 * i)), "requests": requests, "429": int(requests * share)} for i in range(hours * 6)]
+        return {"schema_version": 1, "read_at": health.iso(read_at), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
+
+    def judge(self, doc, vertex):
+        return health.assess(health.load_runs(doc), T0, health.Roster.fixed(ADMITTED), vertex_429=vertex)
+
+    def test_a_fresh_429_reading_confirms_or_denies_the_storm(self):
+        doc = self.stormy([1, 2, 3], 6)
+        confirmed = self.judge(doc, self.reading(0.12))
+        self.assertEqual((confirmed["state"], confirmed["condition"]), ("DEGRADED", "storm"))
+        self.assertTrue(confirmed["cause"].endswith("(peak 429 share 12 %)"), confirmed["cause"])
+        self.assertTrue(any("the pool's peak 429 share was 12.0 % of 600 Vertex calls in the hour to" in line for line in confirmed["evidence"]), confirmed["evidence"])
+        self.assertEqual((confirmed["vertex_429"]["read"], round(confirmed["vertex_429"]["peak"], 2)), (True, 0.12))
+        # The same reps under a 2 % pool share: infra deaths, not a quota storm.
+        denied = self.judge(doc, self.reading(0.02))
+        self.assertEqual((denied["state"], denied["condition"]), ("GREEN", None))
+        self.assertTrue(any("under the 5 % a storm needs: infra deaths, not a quota storm" in line for line in denied["evidence"]), denied["evidence"])
+        self.assertEqual("storm" in denied["open_conditions"], False)
+        # Exactly the threshold confirms.
+        self.assertEqual(self.judge(doc, self.reading(0.05))["condition"], "storm")
+
+    def test_a_reading_that_cannot_judge_leaves_the_rule_to_the_runs(self):
+        doc = self.stormy([1, 2, 3], 6)
+        for vertex, reason in (
+            (self.reading(0.01, read_at=T0 - timedelta(hours=4)), "the Vertex 429 reading is stale"),
+            (dict(self.reading(0.01), read=[], errors={"p": "HTTP 403"}), "the Vertex 429 reading covered no project (HTTP 403)"),
+            (self.reading(0.01, requests=10), "fewer than 200 Vertex calls in any hour of the window"),
+            (dict(self.reading(0.01), buckets=[{"end": health.iso(T0 - timedelta(hours=9)), "requests": 1000, "429": 0}]), "fewer than 200 Vertex calls in any hour of the window"),
+        ):
+            with self.subTest(reason=reason):
+                result = self.judge(doc, vertex)
+                self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "storm"))
+                self.assertTrue(result["cause"].endswith("(429 rate not read)"))
+                self.assertTrue(any(line.endswith(f"; unconfirmed: {reason}") for line in result["evidence"]), result["evidence"])
+        # Below the rep floors nothing is read at all.
+        quiet = self.judge(self.stormy([1, 2], 6), self.reading(0.5))
+        self.assertEqual((quiet["state"], quiet["vertex_429"]["read"], quiet["vertex_429"]["reason"]), ("GREEN", False, None))
         self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", result["evidence"][0])
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):

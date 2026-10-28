@@ -578,6 +578,16 @@ jobs:
           # it has not run, and there is no pool_state to report.
           gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true
 
+      # Rule 2's evidence (scripts/eval_dashboard/vertex_429.py): the pool's
+      # Vertex AI 429 share, per project from Cloud Monitoring, as the
+      # publisher. Best-effort: a project the credential cannot read is
+      # recorded with its error, and no file at all leaves the storm rule to
+      # the runs, as before, saying the storm is unconfirmed.
+      - name: Read the pool's Vertex 429 rate
+        continue-on-error: true
+        timeout-minutes: 5
+        run: python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json
+
       - name: Adjudicate
         run: |
           # --posted-state is the poster's file, read for the tracking issue
@@ -586,11 +596,13 @@ jobs:
           # --fixture-state and --pool-state are the hourly scans' documents,
           # for the fixture_drift and pool_drift conditions. --periodics-dir is
           # what the step above fetched of the watched Prow periodics.
+          # --vertex-429 is the step above's reading, rule 2's evidence.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
             --posted-state work/health-state.json \
             --pool-pressure work/pool-pressure.json \
+            --vertex-429 work/vertex-429.json \
             --fixture-state work/fixture-state.json \
             --pool-state work/pool-state.json \
             --periodics-dir work/periodics \

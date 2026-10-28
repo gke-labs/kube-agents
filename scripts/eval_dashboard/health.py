@@ -221,6 +221,22 @@ STORM_REASON_RE = re.compile(
 # "Retest after" is the end of the storm window plus this: a run started the
 # minute the last storm-hit run finished still overlaps its tail.
 STORM_COOLDOWN = timedelta(minutes=30)
+# Rule 2's evidence outside the runs (scripts/eval_dashboard/vertex_429.py):
+# the pool-wide share of Vertex AI calls that returned 429, in ten-minute
+# buckets. The reps' own phrasings cannot tell a quota storm from a batch of
+# teardown deaths (2026-09-24: five ceiling runs' teardown read as a storm at
+# a 1-5 % pool rate; a real storm runs 6-30 %). A storm needs the peak
+# hourly share over STORM_429_MIN_RATE in the window the hit runs spent on
+# their model calls; a reading older than VERTEX_429_MAX_AGE, or one with
+# fewer than STORM_429_MIN_REQUESTS calls in its best hour, confirms nothing
+# and the rule stands as before, saying so.
+STORM_429_MIN_RATE = 0.05
+STORM_429_MIN_REQUESTS = 200
+STORM_429_HOUR = timedelta(hours=1)
+# How far before the first hit run's finish its model calls reach.
+STORM_429_LOOKBACK = timedelta(hours=3)
+VERTEX_429_MAX_AGE = timedelta(hours=3)
+VERTEX_429_KEY = "vertex_429"
 # A finished run carrying at least this many storm repetitions is still
 # "inside the storm" for recovery purposes (rule 6): one or two infra reps
 # in a run are background noise on any day and must not hold GREEN off.
@@ -1058,30 +1074,77 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
     }
 
 
-def storm(full_runs, now: datetime) -> dict:
-    """Rule 2. Returns {fires, reps, prs, start, end, evidence, signature_runs}."""
+def vertex_429_rate(vertex: dict | None, now: datetime, start: datetime | None, end: datetime | None) -> dict:
+    """The pool's peak hourly 429 share over the hours the hit runs made their
+    model calls. Returns {read, peak, requests, hour_end, reason}: `read` False
+    (with the reason) when there is no fresh reading to judge on."""
+    out = {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": None}
+    if not isinstance(vertex, dict):
+        out["reason"] = "no Vertex 429 reading"
+        return out
+    read_at = parse_iso(vertex.get("read_at"))
+    if read_at is None or now - read_at > VERTEX_429_MAX_AGE:
+        out["reason"] = f"the Vertex 429 reading is {'of unknown age' if read_at is None else 'stale'}"
+        return out
+    if not vertex.get("read"):
+        errors = vertex.get("errors") or {}
+        sample = next(iter(errors.values()), "") if isinstance(errors, dict) else ""
+        out["reason"] = f"the Vertex 429 reading covered no project ({sample})" if sample else "the Vertex 429 reading covered no project"
+        return out
+    buckets = []
+    for bucket in vertex.get("buckets") or []:
+        at = parse_iso(bucket.get("end")) if isinstance(bucket, dict) else None
+        if at is not None and (start is None or at >= start - STORM_429_LOOKBACK) and (end is None or at <= end):
+            buckets.append((at, int(bucket.get("requests") or 0), int(bucket.get("429") or 0)))
+    best = None
+    for at, _, _ in buckets:
+        hour = [(r, h) for b_at, r, h in buckets if at - STORM_429_HOUR < b_at <= at]
+        requests, limited = sum(r for r, _ in hour), sum(h for _, h in hour)
+        if requests >= STORM_429_MIN_REQUESTS and (best is None or limited / requests > best[0]):
+            best = (limited / requests, requests, at)
+    if best is None:
+        out["reason"] = f"fewer than {STORM_429_MIN_REQUESTS} Vertex calls in any hour of the window"
+        return out
+    out.update({"read": True, "peak": best[0], "requests": best[1], "hour_end": best[2]})
+    return out
+
+
+def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
+    """Rule 2. Returns {fires, reps, prs, start, end, evidence, signature_runs,
+    runs, rate}. With a fresh Vertex 429 reading (`vertex`), the reps alone
+    are not a storm: the pool's peak hourly 429 share must clear
+    STORM_429_MIN_RATE, else the reps are infra deaths of another kind and
+    the rule does not fire. Without one the reps decide, as before, and the
+    evidence says the storm is unconfirmed."""
     window = _in_window(full_runs, now, STORM_WINDOW)
     hit = [run for run in window if run.storm_reps > 0]
     reps = sum(run.storm_reps for run in hit)
     prs = _prs(hit)
-    fires = reps >= STORM_MIN_REPS and len(prs) >= STORM_MIN_PRS
     start = min((run.finished for run in hit), default=None)
     end = max((run.finished for run in hit), default=None)
+    reps_fire = reps >= STORM_MIN_REPS and len(prs) >= STORM_MIN_PRS
+    rate = vertex_429_rate(vertex, now, start, end) if reps_fire else {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": None}
+    confirmed = rate["read"] and rate["peak"] >= STORM_429_MIN_RATE
+    fires = reps_fire and (confirmed or not rate["read"])
     evidence = []
     if hit:
-        evidence.append(
-            f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs"
-            f" in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
-        )
+        line = f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
+        if reps_fire and rate["read"]:
+            share = f"{rate['peak'] * 100:.1f} % of {rate['requests']} Vertex calls in the hour to {hhmm(rate['hour_end'])} UTC"
+            line += f"; the pool's peak 429 share was {share}" + ("" if confirmed else f", under the {STORM_429_MIN_RATE * 100:.0f} % a storm needs: infra deaths, not a quota storm")
+        elif reps_fire:
+            line += f"; unconfirmed: {rate['reason']}"
+        evidence.append(line)
     return {
         "fires": fires,
         "reps": reps,
         "prs": prs,
         "start": start,
         "end": end,
-        "evidence": evidence if fires else [],
+        "evidence": evidence if (fires or (reps_fire and rate["read"])) else [],
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
         "runs": len(hit),
+        "rate": rate,
     }
 
 
@@ -2163,16 +2226,18 @@ def assess(
     pool_state_doc: dict | None = None,
     pool_pressure: dict | None = None,
     previously_applying=(),
+    vertex_429: dict | None = None,
 ) -> dict:
     """Apply rules 1-4 to the runs visible at `now`, rule 3c to the fleet
     scan and rule 3e to the pool scan when one was given; no hysteresis yet.
     `pool_pressure` is the periodic's artifact, read for the projects the
     reconcile holds (reconcile_held); `previously_applying` the ones it held
-    around the previous scan, from the previous health.json."""
+    around the previous scan, from the previous health.json; `vertex_429` is
+    vertex_429.py's reading, rule 2's evidence."""
     visible = [run for run in runs if run.finished <= now]
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
-    r2 = storm(full_runs, now)
+    r2 = storm(full_runs, now, vertex_429)
     r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
@@ -2192,7 +2257,9 @@ def assess(
         cause = CAUSE_LOST_PODS.format(count=len(r3b["lost"]), prs=len(r3b["prs"]), start=hhmm(r3b["start"]), end=hhmm(r3b["end"]))
     elif r2["fires"]:
         state, condition = DEGRADED, STORM
-        cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"]))
+        cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"])) + (
+            f" (peak 429 share {r2['rate']['peak'] * 100:.0f} %)" if r2["rate"]["read"] else " (429 rate not read)"
+        )
     elif r2b["fires"]:
         state, condition = DEGRADED, DELEGATION_CEILING
         cause = CAUSE_CEILING.format(reps=r2b["reps"], prs=len(r2b["prs"]), start=hhmm(r2b["start"]), end=hhmm(r2b["end"]))
@@ -2324,6 +2391,7 @@ def assess(
         "roster": roster,
         "fixture": r3c,
         "pool_state": r3e,
+        "vertex_429": r2["rate"],
         # Every condition whose rule still fires, whose scan could not say, or
         # whose run-based exit is not yet met, whatever condition won above:
         # the poster closes a bot-filed tracking issue when its condition
@@ -2608,6 +2676,7 @@ def adjudicate(
     fixture_state_doc: dict | None = None,
     pool_state_doc: dict | None = None,
     periodics_readings: dict | None = None,
+    vertex_429: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
@@ -2634,7 +2703,7 @@ def adjudicate(
     if runs is None:
         runs = load_runs(data)
     previously_applying = ((prev or {}).get("fixture_state") or {}).get("applying") or []
-    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying)
+    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying, vertex_429)
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
@@ -2779,6 +2848,15 @@ def adjudicate(
         "advice": advice,
         "recovering": decided["recovering"],
         "open_conditions": assessed["open_conditions"],
+        # Rule 2's evidence: the pool's peak hourly Vertex 429 share over the
+        # storm's hours when a fresh reading exists, else why not.
+        VERTEX_429_KEY: {
+            "read": assessed["vertex_429"]["read"],
+            "peak": assessed["vertex_429"]["peak"],
+            "requests": assessed["vertex_429"]["requests"],
+            "hour_end": iso(assessed["vertex_429"]["hour_end"]),
+            "reason": assessed["vertex_429"]["reason"],
+        },
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "pool_state": scan_block(assessed["pool_state"]),
@@ -3052,6 +3130,7 @@ def parse_args(argv):
     )
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
     parser.add_argument("--pool-pressure", type=pathlib.Path, help="the pool-pressure periodic's pool-pressure.json, for rule 8 (missing is fine)")
+    parser.add_argument("--vertex-429", type=pathlib.Path, help="vertex_429.py's reading of the pool's Vertex 429 rate, for rule 2 (missing is fine)")
     parser.add_argument("--fixture-state", type=pathlib.Path, help="the hourly fleet scan's fixture-state.json, for the fixture_drift condition (missing is fine)")
     parser.add_argument("--pool-state", type=pathlib.Path, help="the hourly pool scan's pool-state.json, for the pool_drift condition (missing is fine)")
     parser.add_argument("--periodics-dir", type=pathlib.Path, help="the directory periodics.py fetch wrote, one <job>.json per watched Prow periodic (missing is fine)")
@@ -3102,6 +3181,7 @@ def main(argv=None) -> int:
             wall_clock=None if args.now else wall_clock,
             posted=load_json(args.posted_state),
             pool_pressure=load_json(args.pool_pressure),
+            vertex_429=load_json(args.vertex_429),
             fixture_state_doc=load_json(args.fixture_state),
             pool_state_doc=load_json(args.pool_state),
             periodics_readings=periodics.load_readings(args.periodics_dir),
