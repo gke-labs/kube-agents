@@ -204,7 +204,9 @@ func TestAGatewayWithoutItsShellIsNotReady(t *testing.T) {
 
 // TestAGatewayWithoutItsBrokerIsNotReady is the other half. Here the shell
 // exists and every credentialed command in it fails, because the Service it
-// dials has no endpoints.
+// dials has no endpoints. The message also says what that costs meanwhile
+// (gke-labs/kube-agents#2711): an eviction of the one broker pod stalled
+// chat for minutes while the CR named the Deployment and nothing else.
 func TestAGatewayWithoutItsBrokerIsNotReady(t *testing.T) {
 	agent := splitReadinessAgent()
 	phase, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 0))
@@ -212,7 +214,9 @@ func TestAGatewayWithoutItsBrokerIsNotReady(t *testing.T) {
 	if phase != "Provisioning" {
 		t.Errorf("got phase %q, want Provisioning: nothing in the agent can mint a credential", phase)
 	}
-	if want := "Waiting for Deployment test-agent-credential-proxy to become ready"; msg != want {
+	want := "Waiting for Deployment test-agent-credential-proxy to become ready; " +
+		"while the credential broker is away, Google Chat messages wait in Pub/Sub and brokered commands fail"
+	if msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
 }
@@ -227,7 +231,8 @@ func TestTheMessageNamesEveryWorkloadItIsWaitingOn(t *testing.T) {
 	if phase != "Provisioning" {
 		t.Errorf("got phase %q, want Provisioning", phase)
 	}
-	want := "Waiting for StatefulSet test-agent-shell and Deployment test-agent-credential-proxy to become ready"
+	want := "Waiting for StatefulSet test-agent-shell and Deployment test-agent-credential-proxy to become ready; " +
+		"while the credential broker is away, Google Chat messages wait in Pub/Sub and brokered commands fail"
 	if msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}

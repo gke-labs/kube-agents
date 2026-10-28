@@ -255,8 +255,8 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go).
 # A cut drain loses those settles: unsettled records go to the next instance,
 # which can post one duplicate drift record to Session KV per non-graceful
-# restart. The credential runtime is not waited on; it is killed once the
-# supervisors are gone.
+# restart. The credential runtime is drained after them, on its own budget
+# (RUNTIME_DRAIN_SECONDS): it leaves on SIGTERM too.
 #
 # With the current operator, the only pod that runs this drain is the gateway
 # pod, where this script runs in the agent-api-auth native sidecar. That pod's
@@ -269,11 +269,22 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # may spend up to 56s (50s drain plus lease release calls), leaving this drain
 # about 4s; resizing it is tracked in #3407. An older operator's `combined`
 # sidecar keeps the 30s default, which 15s fits. The standalone broker pod
-# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so terminate()
-# has nothing to drain there. The poll is whole seconds: the drain is bounded by
-# the settle, not by how often it is checked.
+# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so only the
+# runtime drain below runs there. The poll is whole seconds: the drain is
+# bounded by the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
+# The credential runtime's own drain budget. In the broker role the runtime
+# leaves on SIGTERM (install_shutdown_handler in
+# agents/platform/scripts/credential_proxy.py): it refuses new event pulls,
+# keeps the settle routes open for its 3s window so the gateway's acks land,
+# hands any unsettled Chat receipt back to Pub/Sub, and exits. Killing it and
+# returning, as terminate() once did, delivered the signal and not that
+# shutdown, because terminate() returning is PID 1 exiting. Ten seconds is the
+# window plus margin, inside the broker pod's 30s default grace with the Envoy
+# kill after it. In the api-proxy role the runtime installs no handler and
+# exits on the signal, so the wait there is one poll.
+readonly RUNTIME_DRAIN_SECONDS=10
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -454,13 +465,16 @@ drain_supervised() {
   local pid
   local waited=0
   local running
+  # The supervisors' budget unless the caller set DRAIN_BUDGET_SECONDS for
+  # this call, as terminate() does for the credential runtime.
+  local budget="${DRAIN_BUDGET_SECONDS:-${SHUTDOWN_DRAIN_SECONDS}}"
 
   for pid in "$@"; do
     pkill -TERM -P "${pid}" 2>/dev/null || true
     kill -TERM "${pid}" 2>/dev/null || true
   done
 
-  while [[ "${waited}" -lt "${SHUTDOWN_DRAIN_SECONDS}" ]]; do
+  while [[ "${waited}" -lt "${budget}" ]]; do
     running=""
     for pid in "$@"; do
       if kill -0 "${pid}" 2>/dev/null; then
@@ -488,7 +502,9 @@ terminate() {
   # grace period does not grow with the number of processes in the container.
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${supervisors[@]}"
 
-  [[ -z "${runtime_pid}" ]] || kill "${runtime_pid}" 2>/dev/null || true
+  # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS. Its child commands
+  # get the same SIGTERM first, as a supervisor's process does.
+  [[ -z "${runtime_pid}" ]] || DRAIN_BUDGET_SECONDS="${RUNTIME_DRAIN_SECONDS}" drain_supervised "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM

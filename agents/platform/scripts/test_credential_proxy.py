@@ -8467,6 +8467,172 @@ class ChatEventPullLegibilityTest(unittest.TestCase):
         )
 
 
+class GracefulShutdownTest(unittest.TestCase):
+    """SIGTERM stops the broker without stranding a pulled Chat message.
+
+    gke-labs/kube-agents#2711: an eviction ended the process at once, so a
+    message the gateway had pulled and not yet acked waited out its ack
+    deadline, and every pull in between failed with no word of why.
+    """
+
+    SUBSCRIPTION = "projects/kagents-dev/subscriptions/a2a-chat-sub"
+    PULL_ROUTES = (
+        ("/v1/chat/a2a/events", {"subscription": SUBSCRIPTION}),
+        ("/v1/chat/events", {}),
+        ("/v1/chat/slack/events", {}),
+    )
+
+    def setUp(self):
+        self.addCleanup(CredentialProxyHandler.shutting_down.clear)
+
+    def _relay(self):
+        relay = types.SimpleNamespace(subscription_path=self.SUBSCRIPTION, pulls=0, settled=[])
+
+        def pull():
+            relay.pulls += 1
+            return None
+
+        def settle(receipt, acknowledge):
+            relay.settled.append((receipt, acknowledge))
+            return True
+
+        relay.pull = pull
+        relay.settle = settle
+        return relay
+
+    def _handler(self, path, relay):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.a2a_chat_relay = relay
+        handler.chat_relay = relay
+        handler.slack_relay = relay
+        handler._authenticated = lambda: object()
+        captured = {}
+        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+        return handler, captured
+
+    def _drain_thread(self):
+        for thread in threading.enumerate():
+            if thread.name == credential_proxy.SHUTDOWN_THREAD_NAME:
+                thread.join(5)
+
+    def _install(self, server, relays):
+        installed = {}
+        with mock.patch.object(
+            credential_proxy.signal, "signal",
+            lambda signum, handler: installed.update(signum=signum, handler=handler),
+        ):
+            credential_proxy.install_shutdown_handler(server, relays, settle_seconds=0)
+        self.assertEqual(credential_proxy.signal.SIGTERM, installed["signum"])
+        return installed["handler"]
+
+    def test_every_event_pull_is_refused_once_the_stop_begins(self):
+        CredentialProxyHandler.shutting_down.set()
+        for path, extra in self.PULL_ROUTES:
+            with self.subTest(path=path):
+                relay = self._relay()
+                handler, captured = self._handler(path, relay)
+                handler.do_GET()
+                self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+                self.assertEqual(
+                    {"error": "credential proxy shutting down", **extra}, captured["payload"]
+                )
+                self.assertEqual(0, relay.pulls)
+
+    def test_a_pull_before_the_stop_is_served(self):
+        for path, _extra in self.PULL_ROUTES:
+            with self.subTest(path=path):
+                relay = self._relay()
+                handler, captured = self._handler(path, relay)
+                handler.do_GET()
+                self.assertEqual(HTTPStatus.OK, captured["status"])
+                self.assertEqual(1, relay.pulls)
+
+    def test_an_ack_still_lands_during_the_window(self):
+        CredentialProxyHandler.shutting_down.set()
+        relay = self._relay()
+        handler, captured = self._handler("/v1/chat/a2a/events/ack", relay)
+        handler._read_json_body = lambda: {"receipt": "r1"}
+        handler._handle_chat_post()
+        self.assertEqual(HTTPStatus.OK, captured["status"])
+        self.assertEqual([("r1", True)], relay.settled)
+
+    def _chat_relay(self, receipts):
+        relay = GoogleChatRelay.__new__(GoogleChatRelay)
+        relay._lock = threading.Lock()
+        relay._receipts = dict(receipts)
+        relay.subscription_path = self.SUBSCRIPTION
+        relay.subscriber = mock.Mock()
+        return relay
+
+    def test_release_unsettled_hands_back_every_receipt_once(self):
+        relay = self._chat_relay({"r1": "ack-1", "r2": "ack-2"})
+
+        self.assertEqual(2, relay.release_unsettled())
+
+        relay.subscriber.modify_ack_deadline.assert_called_once_with(
+            request={
+                "subscription": self.SUBSCRIPTION,
+                "ack_ids": ["ack-1", "ack-2"],
+                "ack_deadline_seconds": 0,
+            }
+        )
+        self.assertEqual({}, relay._receipts)
+        self.assertEqual(0, relay.release_unsettled())
+        self.assertEqual(1, relay.subscriber.modify_ack_deadline.call_count)
+
+    def test_a_failed_hand_back_is_logged_and_counts_nothing(self):
+        relay = self._chat_relay({"r1": "ack-1"})
+        relay.subscriber.modify_ack_deadline.side_effect = RuntimeError("unavailable")
+
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            self.assertEqual(0, relay.release_unsettled())
+
+        self.assertIn("1 unsettled receipt(s) failed type=RuntimeError", "\n".join(logs.output))
+
+    def test_sigterm_refuses_pulls_then_hands_back_and_stops(self):
+        events = []
+        server = mock.Mock()
+        server.shutdown.side_effect = lambda: events.append("shutdown")
+        relay = mock.Mock()
+        relay.release_unsettled.side_effect = lambda: events.append("release") or 2
+        handler = self._install(server, [relay])
+
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            # Pulls are refused from the signal itself, before the drain runs.
+            self.assertTrue(CredentialProxyHandler.shutting_down.is_set())
+            self._drain_thread()
+
+        self.assertEqual(["release", "shutdown"], events)
+        self.assertIn("handed back 2 unsettled receipt(s)", "\n".join(logs.output))
+
+    def test_a_second_sigterm_starts_no_second_drain(self):
+        server = mock.Mock()
+        relay = mock.Mock()
+        relay.release_unsettled.return_value = 0
+        handler = self._install(server, [relay])
+
+        with self.assertLogs("credential-proxy", level="INFO"):
+            handler(credential_proxy.signal.SIGTERM, None)
+            handler(credential_proxy.signal.SIGTERM, None)
+            self._drain_thread()
+
+        self.assertEqual(1, relay.release_unsettled.call_count)
+        self.assertEqual(1, server.shutdown.call_count)
+
+    def test_installing_off_the_main_thread_keeps_the_default_handler(self):
+        before = credential_proxy.signal.getsignal(credential_proxy.signal.SIGTERM)
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            thread = threading.Thread(
+                target=credential_proxy.install_shutdown_handler, args=(mock.Mock(), [])
+            )
+            thread.start()
+            thread.join(5)
+        self.assertIn("not on the main thread", "\n".join(logs.output))
+        self.assertIs(before, credential_proxy.signal.getsignal(credential_proxy.signal.SIGTERM))
+
+
 class SlackRelayTest(unittest.TestCase):
     class FakeResponse:
         """Stands in for slack_sdk's SlackResponse.
@@ -8999,13 +9165,23 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True), \
                     mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
-                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
+                    mock.patch.object(credential_proxy, "install_shutdown_handler") as install:
                 with self.assertRaises(self._Stop):
                     credential_proxy.serve(args)
         finally:
             for server in bound:
                 server.server_close()
+        self.installed_shutdown = install.call_args
         return CredentialProxyHandler.enforce_read_only
+
+    def test_serve_installs_the_sigterm_handler_on_the_credentialed_server(self):
+        # gke-labs/kube-agents#2711. No chat relay is armed here, so the
+        # relay list is empty; the server is the one serve_forever ran on.
+        self._serve_with(None)
+        server, relays = self.installed_shutdown.args
+        self.assertIsInstance(server, credential_proxy.ThreadingUnixHTTPServer)
+        self.assertEqual([], relays)
 
     def test_serve_arms_the_gate_by_default(self):
         CredentialProxyHandler.enforce_read_only = False

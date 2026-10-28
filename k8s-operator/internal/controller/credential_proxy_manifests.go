@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -61,6 +62,28 @@ import (
 // the metrics port off this container and no other, and the Downward API
 // reference that hands the broker its memory limit names it too.
 const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
+
+// credentialProxyPDBMaxUnavailable is the budget's one field, on one replica.
+//
+// What it does: nothing to any drain. With one pod, desiredHealthy is 1 - 1 =
+// 0, so the eviction of a Ready proxy is always allowed, and there is never a
+// second pod for a refusal to protect. What it buys is the declaration: this
+// pod may be evicted, and leaves by its SIGTERM path
+// (install_shutdown_handler in agents/platform/scripts/credential_proxy.py).
+// The chart writes the same budget for its single-replica Hindsight
+// workloads (charts/kube-agents/templates/pdb.yaml) for the same reason, and
+// the obtainability audit never flags maxUnavailable 1 and lets it stand at a
+// floor of one (agents/platform/governance/obtainability_audit_sop.md §3.4).
+//
+// The shapes that would protect something were rejected because each one
+// holds a node: minAvailable 1 or maxUnavailable 0 on one replica sets
+// disruptionsAllowed to 0 for good, so no node holding the proxy could drain,
+// upgrade or scale down without a human deleting the budget, which the same
+// audit reports as its critical blocking-pdb finding (§3.4). Two replicas,
+// which would let a budget mean something, are the design question
+// docs/designs/credential-proxy-single-pod.md records; the budget follows
+// the Deployment's scale if that reopens.
+const credentialProxyPDBMaxUnavailable = 1
 
 const (
 	// Where the federated token and the ADC config derived from it live. Both
@@ -377,7 +400,8 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // emptyDir, so a second pod behind the Service breaks them; only the exec route
 // scales as it is. docs/designs/credential-proxy-single-pod.md records the
 // decision, the load it was sized against, and the split exec tier to build if
-// it reopens.
+// it reopens. What one pod costs on an eviction or a rollout, and how the pod
+// leaves, is buildCredentialProxyPDB's and the proxy's SIGTERM handler's.
 //
 // The AgentPlugins resolved for the agent reach the container's environment
 // (buildCredentialProxyEnvForPlugins); buildCredentialProxyDeployment is this
@@ -451,6 +475,26 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 	withCommonLabels(dep, agent)
 	dep.Labels["app"] = credentialProxyName(agent)
 	return dep
+}
+
+// buildCredentialProxyPDB renders the proxy's PodDisruptionBudget:
+// maxUnavailable credentialProxyPDBMaxUnavailable (the argument is on the
+// constant), AlwaysAllow so a proxy that is Running and NotReady, during its
+// own cold start or a broken image, can still be evicted, and the
+// Deployment's own name and selector, so the budget cannot outlive the
+// Deployment's labels or select another workload's pods.
+func buildCredentialProxyPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	pdb := &policyv1.PodDisruptionBudget{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable:             ptr.To(intstr.FromInt32(credentialProxyPDBMaxUnavailable)),
+			Selector:                   &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
+		},
+	}
+	withCommonLabels(pdb, agent)
+	return pdb
 }
 
 // buildCredentialProxyContainer is buildCredentialProxyContainerForPlugins with
