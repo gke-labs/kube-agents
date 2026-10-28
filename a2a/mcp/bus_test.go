@@ -46,11 +46,11 @@ var consolePublish = []string{
 var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
 
 // consolePublishDeny and consoleSubscribeDeny are the console's deny lists as
-// rendered: none today. A deny the operator adds must be mirrored here, or the
-// test server would grant what the cluster refuses.
+// rendered. A deny the operator adds must be mirrored here, or the test server
+// would grant what the cluster refuses.
 var (
 	consolePublishDeny   []string
-	consoleSubscribeDeny []string
+	consoleSubscribeDeny = []string{"a2a.cap.>"}
 )
 
 // renderedConf is the operator's render the callout suite starts from.

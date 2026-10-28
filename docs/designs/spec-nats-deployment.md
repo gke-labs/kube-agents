@@ -412,8 +412,8 @@ Layout:
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
   `web` user for the read-only web UI, one of the two bus credentials published to a
-  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
-  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` (less `a2a.cap.>`,
+  so it cannot join the verifier's queue group) and its own inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
   ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport

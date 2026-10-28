@@ -1088,6 +1088,11 @@ func consoleIdentity() a2aIdentity {
 			"chat.console.*.out",
 			"_INBOX.console.>",
 		},
+		// web's subtraction, for web's reason: `a2a.>` covers the
+		// verifier's request subject, and any subscriber may join its
+		// queue group and swallow a share of every verify request. This
+		// password is handed to a browser too (console.go's /config.json).
+		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
 
