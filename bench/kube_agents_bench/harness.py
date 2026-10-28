@@ -797,18 +797,15 @@ def _is_rate_limited_triage(
     task_id: str,
     summaries: dict[str, str],
     errors: dict[str, str],
-    results: dict[str, str] | None = None,
 ) -> bool:
     """Whether a card in triage carries an infrastructure rate limit failure reason."""
     if status != "triage":
         return False
     summary = summaries.get(task_id) or ""
     error = errors.get(task_id) or ""
-    result_text = (results.get(task_id) if results else None) or ""
     return bool(
         _extract_infra_failure_reason(summary)
         or _extract_infra_failure_reason(error)
-        or _extract_infra_failure_reason(result_text)
     )
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
@@ -2942,13 +2939,11 @@ class KubeAgentsHarness(AgentHarness):
             card = read.cards.get(task_id, {}) if read is not None else {}
             summary = str(card.get("summary") or "")
             error = str(card.get("error") or "")
-            result_val = str(card.get("result") or "")
             return _is_rate_limited_triage(
                 st,
                 task_id,
                 {task_id: summary},
                 {task_id: error},
-                {task_id: result_val},
             )
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
@@ -2966,6 +2961,7 @@ class KubeAgentsHarness(AgentHarness):
                 for t in card_ids
                 if str(read.cards.get(t, {}).get("status") or "") == "triage"
                 and not read.cards.get(t, {}).get("summary")
+                and not read.cards.get(t, {}).get("error")
             ]
             if triage_need:
                 fresh_triage = _read(triage_need)
@@ -3017,7 +3013,7 @@ class KubeAgentsHarness(AgentHarness):
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
-            _fetch_triage(read.card_ids)
+            _fetch_triage([t for t in read.card_ids if t not in awaited])
             outstanding = _merge()
 
         # Only a card the board shows terminal is read back, as the status-turn
@@ -3506,7 +3502,7 @@ class KubeAgentsHarness(AgentHarness):
                 if isinstance(runs, list) and runs:
                     last_run = runs[-1]
                     if isinstance(last_run, dict):
-                        s = last_run.get("summary")
+                        s = last_run.get("summary") or last_run.get("error")
                         if isinstance(s, str) and s.strip():
                             summary = s
                 last_observed_cards[tid] = (status, summary)

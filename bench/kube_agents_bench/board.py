@@ -331,21 +331,38 @@ if out["error"] is None:
                 "SELECT id, status FROM tasks WHERE id IN (%s)" % marks(part), part
             ):
                 out["cards"][str(tid)] = {"status": str(status), "result": None, "summary": None,
-                                          "block": None}
+                                          "error": None, "block": None}
         wanted = [t for t in WANT if t in out["cards"]]
         if wanted:
-            if "result" in columns(board, "tasks"):
+            cols = columns(board, "tasks")
+            if "result" in cols:
                 for tid, result in board.execute(
                     "SELECT id, result FROM tasks WHERE id IN (%s)" % marks(wanted), wanted
                 ):
                     out["cards"][str(tid)]["result"] = result
-            if has_table(board, "task_runs") and "summary" in columns(board, "task_runs"):
-                for tid in wanted:
-                    row = board.execute(
-                        "SELECT summary FROM task_runs WHERE task_id = ? "
-                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    if row and row[0]:
-                        out["cards"][tid]["summary"] = row[0]
+            if "last_failure_error" in cols:
+                for tid, err in board.execute(
+                    "SELECT id, last_failure_error FROM tasks WHERE id IN (%s)" % marks(wanted), wanted
+                ):
+                    if err:
+                        out["cards"][str(tid)]["error"] = err
+            if has_table(board, "task_runs"):
+                run_cols = columns(board, "task_runs")
+                if "summary" in run_cols:
+                    for tid in wanted:
+                        row = board.execute(
+                            "SELECT summary FROM task_runs WHERE task_id = ? "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if row and row[0]:
+                            out["cards"][tid]["summary"] = row[0]
+                if "error" in run_cols:
+                    for tid in wanted:
+                        if not out["cards"][tid].get("error"):
+                            row = board.execute(
+                                "SELECT error FROM task_runs WHERE task_id = ? "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                            if row and row[0]:
+                                out["cards"][tid]["error"] = row[0]
             if has_table(board, "task_events"):
                 for tid in wanted:
                     if out["cards"][tid]["status"] != BLOCKED:
@@ -480,9 +497,10 @@ class SessionCards:
         task: dict[str, Any] = {"id": task_id, "status": card.get("status"), "result": card.get("result")}
         if card.get("block"):
             task["block"] = card["block"]
+        summary = card.get("summary") or card.get("error")
         payload: dict[str, Any] = {
             "task": task,
-            "runs": [{"summary": card["summary"]}] if card.get("summary") else [],
+            "runs": [{"summary": summary}] if summary else [],
         }
         return {
             "name": "kanban_show",
@@ -590,6 +608,7 @@ def read_session_cards(
                     "summary": card.get("summary")
                     if isinstance(card.get("summary"), str)
                     else None,
+                    "error": card.get("error") if isinstance(card.get("error"), str) else None,
                     "block": _block(card.get("block")),
                 }
     return SessionCards(

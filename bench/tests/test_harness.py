@@ -5264,3 +5264,62 @@ def test_settle_delegated_worker_triage_rate_limit_is_infra(
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "card on board recorded rate_limit" in res.errors[0]
 
+
+def test_settle_delegated_worker_triage_rate_limit_with_worker_actions_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a worker executed a tool before being routed to triage by a rate limit, it acted and stays graded."""
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    tool_entry = {"name": "kubectl", "agent": "platform", "args": {"command": "get pods"}, "result": "ok"}
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[tool_entry],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    show = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    harness.KubeAgentsHarness._settle(
+        res,
+        [show],
+        ["t_1"],
+        board_messages=[],
+    )
+    # Stays graded because worker acted
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert tool_entry in res.trajectory
+
+
+def test_delivered_results_rate_limit_result_excluded_and_non_string_handled() -> None:
+    """delivered_results excludes rate-limited triage/blocked results and handles non-string result safely."""
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+
+    # Rate-limited result on triage card is excluded
+    entry_triage = {"result": json.dumps({"task": {"id": "t_1", "status": "triage", "result": rate_limit_text}})}
+    assert harness.delivered_results([entry_triage], ["t_1"]) == {}
+
+    # Rate-limited result on blocked card is excluded
+    entry_blocked = {"result": json.dumps({"task": {"id": "t_1", "status": "blocked", "result": rate_limit_text}})}
+    assert harness.delivered_results([entry_blocked], ["t_1"]) == {}
+
+    # Non-string results on triage/blocked cards do not crash with AttributeError
+    for non_str in (5, True, False, ["list"], {"nested": "dict"}):
+        entry_non_str = {"result": json.dumps({"task": {"id": "t_1", "status": "triage", "result": non_str}})}
+        assert harness.delivered_results([entry_non_str], ["t_1"]) == {}
+
+    # Legitimate non-rate-limit result delivers normally
+    entry_ok = {"result": json.dumps({"task": {"id": "t_1", "status": "done", "result": "completed report"}})}
+    assert harness.delivered_results([entry_ok], ["t_1"]) == {"t_1": "completed report"}
+

@@ -333,10 +333,10 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
             if not isinstance(task, dict):
                 continue
             task_id, text = task.get("id"), task.get("result")
-            status = str(task.get("status") or "")
-            if status in BOARD_INFRA_STATUSES and extract_infra_failure_reason(text):
-                continue
             if task_id in task_ids and isinstance(text, str) and text.strip():
+                status = str(task.get("status") or "")
+                if status in BOARD_INFRA_STATUSES and extract_infra_failure_reason(text):
+                    continue
                 delivered[task_id] = text
         # ``runs`` sits beside ``task``, not inside it, so it can only be
         # attributed to the card that payload showed, and only when the card
