@@ -1,20 +1,20 @@
 ---
 name: gke-stockout-investigator
-description: Act upon GKE cluster-autoscaler stockout alerts, diagnose them using ComputeClass debugging guidelines, and submit a remediation Pull Request.
+description: Act upon GKE cluster-autoscaler scale-up failure and capacity constraint alerts, diagnose them using ComputeClass debugging guidelines, and submit a remediation Pull Request.
 ---
 
-# GKE Stockout Diagnosis & GitOps Remediation Skill
+# GKE Capacity Constraint Diagnosis & GitOps Remediation Skill
 
-This skill guides the Platform Agent on how to handle, diagnose, and remediate GKE capacity stockout alerts (`scale.up.error.out.of.resources` or equivalent) received via Google Cloud Pub/Sub.
+This skill guides the Platform Agent on how to handle, diagnose, and remediate GKE capacity constraint and scale-up failure alerts (`scale.up.error.out.of.resources` or equivalent) received via Google Cloud Pub/Sub.
 
 ## Workflow
 
 ### 1. Notify User of Investigation Start (MANDATORY FIRST STEP)
 
-Before executing ANY terminal commands, scripts, or diagnostics, you MUST immediately call the `send_notification` tool (or `mcp_platform_control_send_notification`) to announce that the stockout alert was received and investigation is starting:
+Before executing ANY terminal commands, scripts, or diagnostics, you MUST immediately call the `send_notification` tool (or `mcp_platform_control_send_notification`) to announce that the scale-up failure alert was received and investigation is starting:
 
 ```json
-send_notification(message="🚨 GKE Stockout Investigation Started\nWorkload: <workload_name>\nCluster: <cluster_name>\nDetails: A GKE capacity stockout alert is confirmed. I am starting an investigation and diagnosis.")
+send_notification(message="🚨 GKE Capacity Investigation Started\nWorkload: <workload_name>\nCluster: <cluster_name>\nDetails: A GKE capacity or scale-up failure alert is confirmed. I am starting an investigation and diagnosis.")
 ```
 
 **CRITICAL**: You MUST invoke `send_notification` (or `mcp_platform_control_send_notification`) as an actual tool call. Do NOT output this notification as plain markdown text. After calling the tool, proceed immediately to Step 2 in your next tool turn without stopping.
@@ -52,11 +52,11 @@ To prevent duplicate effort and redundant PRs, inspect currently open Pull Reque
    - Immediately STOP processing.
    - Do NOT update, edit, modify, or rewrite the existing open PR description or contents.
    - Do NOT run any further diagnostics, do NOT search the workspace, do NOT create a new branch, and do NOT submit another PR.
-   - Output a clear message to the user explaining that a relevant PR is already in place, referencing the `number` and `url` the listing returned (e.g. `Deduplicated: An open PR is already active for this stockout: PR #123 - https://github.com/<org>/<repo>/pull/123`).
+   - Output a clear message to the user explaining that a relevant PR is already in place, referencing the `number` and `url` the listing returned (e.g. `Deduplicated: An open PR is already active for this workload: PR #123 - https://github.com/<org>/<repo>/pull/123`).
 
-#### B. Determine if the Stockout is a Real Issue or a False Signal
+#### B. Determine if the Alert is a Real Issue or a False Signal
 
-A stockout alert is a "false signal" if the cluster has already recovered (e.g. the unschedulable pods have been scheduled, deleted, or the issue was transient).
+A scale-up alert is a "false signal" if the cluster has already recovered (e.g. the unschedulable pods have been scheduled, deleted, or the issue was transient).
 
 1. Identify the workload name and namespace from the alert payload (e.g., look at `jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups` or the log text).
 2. Check the current status of the pods for this workload in the namespace:
@@ -68,16 +68,16 @@ A stockout alert is a "false signal" if the cluster has already recovered (e.g. 
    ```bash
    kubectl describe pod <pod_name> -n <namespace>
    ```
-   Check if the events contain `FailedScheduling` with messages indicating lack of resources (e.g., "0/N nodes are available", "out of resources", "quota exceeded", "didn't match Pod's node affinity/selector") or `NotTriggerScaleUp` events. When pods use a custom `ComputeClass` or request GPUs, affinity/selector mismatches indicate that GKE cannot provision nodes matching the compute class due to zonal quota or capacity limits, and this MUST be treated as an active quota/stockout issue (not a false signal).
+   Check if the events contain `FailedScheduling` with messages indicating lack of resources (e.g., "0/N nodes are available", "out of resources", "quota exceeded", "didn't match Pod's node affinity/selector") or `NotTriggerScaleUp` events. When pods use a custom `ComputeClass` or request GPUs, affinity/selector mismatches indicate that GKE cannot provision nodes matching the compute class due to zonal quota or capacity limits, and this MUST be treated as an active quota or capacity constraint issue (not a false signal).
 5. **If the workload pods do not exist in the namespace, OR if there are no pods for this workload currently in `Pending` state with scheduling errors (e.g. all pods are successfully `Running` or the workload is absent)**:
    - Identify this as a **false signal** or a transient issue that has already resolved.
    - Immediately STOP processing.
    - Do NOT run any further commands, do NOT search the workspace, and do NOT propose any configuration changes.
-   - Output a clear message to the user explaining that the stockout is a false signal and the workload pods are currently healthy and running.
+   - Output a clear message to the user explaining that the alert is a false signal and the workload pods are currently healthy and running.
 
 ### 3. Parse Alert Details & Take a Working Copy
 
-If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stockout issue):
+If the pre-diagnosis checks pass (no duplicate PRs and it is a real active capacity or scale-up issue):
 
 1. **Parse details**: Extract the GKE cluster name and location (region/zone) from the alert details.
 2. **Get a working copy.** The pod is not a git checkout. `submit_suggestion.py prepare` brings the GitOps repository down onto this filesystem, stands you on the remediation branch, and prints one JSON line:
@@ -125,7 +125,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
    check in Step 2 §A asks the forge about
    `platform-agent/remediate-stockout-<workload>` and nothing else, so a pull request opened on any other name is invisible to the next
    alert for this workload: that alert finds nothing open, reaches this same
-   refusal, suffixes again, and opens a second pull request for one stockout.
+   refusal, suffixes again, and opens a second pull request for one incident.
    One name per workload is what makes the duplicate check a check.
 
    > [!CAUTION]
@@ -179,7 +179,7 @@ kubectl top pod -n <namespace>
 
 #### D. Spot VM Availability and Pricing Advice
 
-If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot advice APIs to check obtainability and preemption risk across target zones:
+If configuring fallback Spot instances or diagnosing GPU capacity constraints, use the Spot advice APIs to check obtainability and preemption risk across target zones:
 
 1. **VM & GPU Availability Advice**:
    ```bash
@@ -221,12 +221,12 @@ Inspect the target `ComputeClass` and workload manifests in the printed `workspa
 
 #### Rule A: Lack of Zone/Family Fallbacks
 
-- **Problem**: The ComputeClass `priorities[]` is pinned to a single machine family or a single zone, leaving no alternative when GCE encounters a stockout.
+- **Problem**: The ComputeClass `priorities[]` is pinned to a single machine family or a single zone, leaving no alternative when GCE encounters a zonal capacity constraint.
 - **Fix**: Propose adding fallback priorities (additional machine families like `n4`, `c4`, `n2` or other zones within the region).
 
 #### Rule B: Large VM Shape Scarcity (>32 vCPUs)
 
-- **Problem**: The workload requests very large VMs (>32 vCPU) which draw from thinner capacity pools and are highly prone to stockouts.
+- **Problem**: The workload requests very large VMs (>32 vCPU) which draw from thinner capacity pools and are highly prone to capacity constraints.
 - **Fix**:
   - If the workload is horizontally-scalable (e.g., stateless app with multiple replicas, batch job), propose updating the workload manifest to use smaller replicas (e.g., ≤32 vCPUs) and adding smaller-core fallback priorities to the ComputeClass.
   - If the workload is NOT horizontally-scalable (e.g., a single large monolithic database or inference server), do NOT shrink the shape. Instead, vary the machine family (e.g., fallback from C3 to N2/N4) and zones.
@@ -243,7 +243,7 @@ Inspect the target `ComputeClass` and workload manifests in the printed `workspa
 
 #### Rule E: Regional Scarcity (Specialized Hardware, e.g., GPUs/TPUs)
 
-- **Problem**: The requested specialized hardware (e.g., Nvidia H100, L4, or TPU v5e) is completely stocked out across all zones in the target region.
+- **Problem**: The requested specialized hardware (e.g., Nvidia H100, L4, or TPU v5e) is unavailable across all zones in the target region.
 - **Fix**: Recommend migrating the workload and its infrastructure to another GCP region where capacity is available, or changing the application architecture to use a more available hardware class.
 
 #### Rule F: Regional Quota Exceeded Violation (`quota exceeded` / GPU Limit Cap)
@@ -264,7 +264,7 @@ Inspect the target `ComputeClass` and workload manifests in the printed `workspa
 
 #### Rule H: Hyperdisk Incompatibility with Older Generation Machines [ccc-hyperdisk-incompatible]
 
-- **Problem**: A workload using Hyperdisk (e.g. `hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`, or StorageClass with hyperdisk CSI provisioner) uses a CCC definition whose 1st choice is a 3rd/4th generation machine type (e.g. `c3-standard-4`, `c4-standard-4`), but has fallbacks to older generation machine types (e.g. `c2`, `n2`, `e2`). Once there is a stockout on the 1st choice, Cluster Autoscaler falls back to an incompatible machine type (`c2`, `n2`, `e2`) that does not support Hyperdisk, causing scale-up to fail.
+- **Problem**: A workload using Hyperdisk (e.g. `hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`, or StorageClass with hyperdisk CSI provisioner) uses a CCC definition whose 1st choice is a 3rd/4th generation machine type (e.g. `c3-standard-4`, `c4-standard-4`), but has fallbacks to older generation machine types (e.g. `c2`, `n2`, `e2`). Once the 1st choice is unavailable, Cluster Autoscaler falls back to an incompatible machine type (`c2`, `n2`, `e2`) that does not support Hyperdisk, causing scale-up to fail.
 - **Diagnosis**:
   1. **Storage volume check:** Check if the workload uses Hyperdisk storage (e.g., look for `hyperdisk-balanced`, `hyperdisk-throughput`, or `hyperdisk-extreme` in the `StorageClass` or `Volume` definitions).
   2. **Incompatible fallback check:** Inspect the `ComputeClass` `priorities` list. If the workload uses Hyperdisk and the `priorities` list contains Gen 2 machine families (like `c2`, `n2`, or `e2`) as fallbacks, flag this as a Rule H violation.
@@ -281,10 +281,10 @@ Do not modify the live GKE cluster directly. Instead, propose the change as a co
 Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g. `/opt/data/scratch/vcs/github__acme__fleet__platform-agent__remediate-stockout-frontend-web-app`). It is already on `platform-agent/remediate-stockout-<workload_name>`, so there is no branch to create.
 
 1. Apply the fixes to the ComputeClass or workload YAML files **inside `<workspace>`**.
-   - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate stockouts.
+   - **Mandatory YAML Comments**: For EVERY change or addition in a YAML manifest (e.g. `topology.kubernetes.io/zone`, `nodeSelector`, `ComputeClass` priorities), append an inline YAML comment (`# Remediation: ...`) explaining how this specific change helps prevent or mitigate capacity constraints or scale-up failures.
 2. **Self-Review Step**:
    - Run `cd <workspace> && git diff` to inspect all proposed changes before committing.
-   - Verify that ONLY changes strictly necessary to mitigate the stockout are included (no unrelated formatting or whitespace edits).
+   - Verify that ONLY changes strictly necessary to mitigate the capacity constraint or scale-up failure are included (no unrelated formatting or whitespace edits).
    - Confirm that every updated YAML line includes the explanatory remediation comment.
 3. **Special Case (Major Changes / Migration)**: If migrating to another region or changing architecture (Rule E), do NOT just change files. You **must** also write a detailed migration playbook in `<workspace>/docs/migrations/stockout-<workload_name>-plan.md`. This plan must detail:
    - Target destination region.
@@ -292,7 +292,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
    - Network routing/DNS cutover approach.
    - Rollout steps.
 4. **PR Staging Hygiene (MANDATORY)**: Stage ONLY the specific modified/created files using exact file paths relative to the repository root (e.g., `cd <workspace> && git add deployment/<workload_name>.yaml deployment/<compute_class_name>.yaml`). **NEVER use `git add .`, `git add -A`, or `git commit -a`**, as doing so will accidentally commit unrelated scratch files or workspace logs.
-5. Commit using a Conventional Commit message (e.g., `cd <workspace> && git commit -m "fix(compute-class): add fallback machine families to remediate stockout"`).
+5. Commit using a Conventional Commit message (e.g., `cd <workspace> && git commit -m "fix(compute-class): add fallback machine families to remediate capacity constraint"`).
 
 ### 7. Submit Suggestion & Open PR
 
@@ -303,6 +303,7 @@ Substitute `<workspace>` below with the exact path from Step 3's JSON line (e.g.
 - 🛑 **NON-NEGOTIABLE RULE**: The description MUST contain the literal text `- **Checks Performed**:` followed by a `bash` code block containing the exact `kubectl describe pod ...`, `kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml`, `gcloud compute regions describe ...`, `gcloud beta compute advice capacity ...`, and `gcloud beta compute advice capacity-history ...` commands you executed during analysis. Failing to include that block will cause the PR to be rejected by automated SRE audit rules.
 - Do NOT omit the `Checks Performed` section or its code block.
 - Do NOT include any forge CLI commands in the summary or PR description. The `Checks Performed` block records diagnostics, not how the PR was opened.
+- **Terminology**: Use `"capacity constraint"` or `"scale-up failure"` in the Pull Request title, description, YAML comments, and chat notifications — do NOT call the diagnosis a `"stockout"`.
 
 Write the description to a file and pass the path, never `--body`. The `Checks Performed` block those rules mandate is nothing but backticks and `--format="json(...)"` strings, and inside the double quotes of a `--body` argument bash expands both — the diagnostic commands you are being told to record would run in the working copy instead of appearing in the pull request.
 
@@ -311,10 +312,10 @@ Run the `submit_suggestion.py` helper script with the `submit` subcommand to pub
 ````bash
 BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)
 cat > "$BODY" <<'EOF'
-### 🚨 Stockout Diagnostic Report
+### 🚨 Capacity & Scale-Up Diagnostic Report
 
-- **Trigger**: Received stockout alert for workload `<workload_name>` in cluster `<cluster_name>` (`<region_zone>`).
-- **Diagnosis**: <detailed summary of what caused the stockout and which rule was violated>.
+- **Trigger**: Received scale-up failure alert for workload `<workload_name>` in cluster `<cluster_name>` (`<region_zone>`).
+- **Diagnosis**: <detailed summary of what caused the capacity constraint or scale-up failure and which rule was violated>.
 - **Checks Performed**:
 
 ```bash
@@ -332,7 +333,7 @@ EOF
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --repo "<owner>/<repo>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
-  --title "fix(capacity): remediate GKE stockout for <workload_name>" \
+  --title "fix(capacity): remediate GKE capacity constraint for <workload_name>" \
   --body-file "$BODY"
 ````
 
@@ -343,7 +344,7 @@ The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc exp
 When running in a background/PubSub context or when a new SRE review Pull Request with remediation is being created, before providing your final response, you MUST call the `send_notification` tool to notify the user/SRE immediately (do not run any scripts or external RPC clients):
 
 ````json
-send_notification(message="🛠️ GKE Stockout Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
+send_notification(message="🛠️ GKE Capacity Remediation Proposed\nWorkload: <workload_name>\nPR: <PR_URL>\nSummary: <summary>\nChecks Performed:\n```bash\nkubectl describe pod <pod_name>\nkubectl get configmap cluster-autoscaler-status -n kube-system -o yaml\ngcloud compute regions describe us-central1 ...\ngcloud beta compute advice capacity ...\ngcloud beta compute advice capacity-history ...\n```")
 ````
 
 After calling the tool, provide the user with the generated PR URL and a summary of your findings.
