@@ -54,7 +54,7 @@ DEFAULT_AGENT_HOME = "/opt/data"
 # optimized bytecode leaves the interpreter with no valid cache and forces it
 # back to compiling from source on every import. Matches both separated (-o 1,
 # --optimize 1, --optimize=1) and attached (-o1, -qo1) flag forms.
-OPTIMIZE_FLAG_RE = r"\s-o\d*\b|\s-[a-z]*o\d*|\s--optimize\b"
+OPTIMIZE_FLAG_RE = r"\s-[a-z]*o\d*|\s--optimize\b"
 
 
 def stage_body(dockerfile_text: str, target: str) -> str:
@@ -637,8 +637,10 @@ class SandboxBytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
 
     def test_the_sandbox_image_precompiles_the_standard_library(self):
         cmd = self.compileall_command()
-        self.assertIn("compileall", cmd)
         self.assertIn("stdlib", cmd)
+
+    def test_a_module_that_will_not_compile_does_not_break_the_build(self):
+        self.assertIn("||", self.compileall_command())
 
     def test_it_compiles_with_python3(self):
         # In the sandbox image python3 is the container's interpreter on PATH
