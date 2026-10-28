@@ -1093,3 +1093,39 @@ func TestAnEmptyStateTopicOpensNoConsumer(t *testing.T) {
 		t.Errorf("%d consumers opened for a topic with no entries, want 0", got)
 	}
 }
+
+// Reads in flight are bounded across keys: with maxTopicReads distinct keys
+// being read, a new key is turned away at once rather than starting another
+// detached read, and a caller already gone starts nothing.
+func TestTopicReadsInFlightAreBounded(t *testing.T) {
+	c := newTopicCache(time.Now)
+	var reads []*blockedRead
+	for i := 0; i < maxTopicReads; i++ {
+		r := newBlockedRead()
+		reads = append(reads, r)
+		go func(key string) { _, _ = c.answer(context.Background(), key, r.read) }(fmt.Sprintf("k%d", i))
+		<-r.started
+	}
+	defer func() {
+		for _, r := range reads {
+			close(r.release)
+		}
+	}()
+	started := false
+	_, err := c.answer(context.Background(), "one-too-many", func(context.Context) (string, error) { started = true; return "", nil })
+	if !errors.Is(err, errReadersBusy) || started {
+		t.Fatalf("a read past the bound: err %v, started %v; want errReadersBusy and no read", err, started)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c2 := newTopicCache(time.Now)
+	ran := make(chan struct{}, 1)
+	if _, err := c2.answer(ctx, "gone", func(context.Context) (string, error) { ran <- struct{}{}; return "", nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a caller already gone: err %v; want context.Canceled", err)
+	}
+	select {
+	case <-ran:
+		t.Fatal("a caller already gone started a read")
+	case <-time.After(300 * time.Millisecond):
+	}
+}

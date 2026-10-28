@@ -34,9 +34,14 @@ const (
 	topicSubjects = "a2a.topics.>"
 	topicSep      = "."
 
-	// topicReadTimeout bounds one call end to end, whatever the caller's
-	// context allows.
+	// topicReadTimeout bounds one read, which runs detached from its
+	// callers; a caller can still leave earlier, when its own context ends.
 	topicReadTimeout = 10 * time.Second
+
+	// maxTopicReads bounds the reads in flight across all keys. Keys are any
+	// well-formed topic name, so without it a client sending many distinct
+	// names could start that many detached reads at once.
+	maxTopicReads = maxTaskReaders
 
 	// maxTopicNameBytes is longer than any topic subject the registry can
 	// hold (a2a.topics.agent.{63}.{63}); a longer name is refused unread.
@@ -180,11 +185,20 @@ func (c *topicCache) answer(ctx context.Context, key string, read func(context.C
 	}
 	r := c.inflight[key]
 	if r == nil {
+		// A caller already gone starts nothing, and a full set of reads
+		// turns the next new key away rather than queueing it.
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return "", err
+		}
+		if len(c.inflight) >= maxTopicReads {
+			c.mu.Unlock()
+			return "", errReadersBusy
+		}
 		r = &topicRead{done: make(chan struct{})}
 		c.inflight[key] = r
-		// WithoutCancel keeps the first caller's values (its logger) and
-		// drops its cancellation and deadline.
-		go c.refresh(context.WithoutCancel(ctx), key, r, read)
+		// Detached from the caller, as NATSBus.Status's read is.
+		go c.refresh(context.Background(), key, r, read)
 	}
 	c.mu.Unlock()
 	select {
