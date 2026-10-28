@@ -589,7 +589,7 @@ class CheckTest(unittest.TestCase):
         return {check.metric: check for check in checks}
 
     def test_headroom_and_status_against_the_limit(self):
-        limits = hl.latest_limits(self.records)
+        limits = hl.usual_limits(self.records)
 
         passing = self.checks(8, limits)[hl.MEMORY_PEAK]
         failing = self.checks(40, limits)[hl.MEMORY_PEAK]
@@ -602,7 +602,7 @@ class CheckTest(unittest.TestCase):
         self.assertAlmostEqual(failing.reached, (2048 - 500) / (2400 - 500))
 
     def test_the_limits_table_round_trips_in_mib_and_cores(self):
-        table = hl.limit_table(hl.latest_limits(self.records), ["agent-api-auth", "other"])
+        table = hl.limit_table(hl.usual_limits(self.records), ["agent-api-auth", "other"])
 
         self.assertEqual(table[hl.LIMIT_MEMORY_COLUMN], [2048.0, 0.0])
         table[hl.LIMIT_CPU_COLUMN] = [None, 0.5]
@@ -683,7 +683,7 @@ class CheckTest(unittest.TestCase):
         self.assertIsNone(hl.reached_at(at_base, 2 * GIB))
 
     def test_the_first_limit_is_crossed_at_the_smallest_growth(self):
-        checks = self.checks(40, hl.latest_limits(self.records))
+        checks = self.checks(40, hl.usual_limits(self.records))
 
         first = hl.first_limit(checks.values())
 
@@ -1390,6 +1390,18 @@ class UnanchoredOperationTest(unittest.TestCase):
         )
         self.assertEqual(hl.base_fleet(records)[hl.CLUSTERS], 2.0)
         self.assertAlmostEqual(hl.predict(records, hl.CPU_PEAK, container, hl.base_fleet(records)).base, 0.6)
+
+
+class UsualLimitsTest(unittest.TestCase):
+    def test_a_short_experiment_under_raised_limits_does_not_change_the_limits(self):
+        default, raised = {"cpu_cores": 1.0, "memory_bytes": 2 * GIB}, {"cpu_cores": 4.0, "memory_bytes": 4 * GIB}
+        records = parse(
+            record(run=1, limits={"envoy-credential-proxy": default}, started="2026-10-27T01:00:00Z"),
+            record(run=2, limits={"envoy-credential-proxy": default}, started="2026-10-27T02:00:00Z"),
+            record("clusters", 16, "audits_raised", limits={"envoy-credential-proxy": raised},
+                   started="2026-10-27T03:00:00Z"),
+        )
+        self.assertEqual(hl.usual_limits(records)["envoy-credential-proxy"], default)
 
 
 if __name__ == "__main__":

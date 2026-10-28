@@ -178,13 +178,13 @@ if len(grown) > 1:
 st.divider()
 section_title(
     "Are these container limits enough for this fleet?",
-    "The limits default to those of the latest run. Set 0 for no limit.",
+    "The limits default to those most runs had. Set 0 for no limit.",
 )
 limits: dict[str, dict[str, float]] = {}
 if selected:
     number_column = st.column_config.NumberColumn(min_value=0.0, format=NUMBER_FORMAT)
     edited = st.data_editor(
-        hl.limit_table(hl.latest_limits(records), selected),
+        hl.limit_table(hl.usual_limits(records), selected),
         hide_index=True,
         width="stretch",
         disabled=[hl.LIMIT_CONTAINER_COLUMN],

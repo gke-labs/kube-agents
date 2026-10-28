@@ -73,7 +73,7 @@ class EstimateTest(unittest.TestCase):
         data["records"][-1]["requests"] = {"platform-agent": {"memory_bytes": 600 * MIB}}
         self.data.write_text(json.dumps(data))
         text = self.run_main("--against", "requests")
-        self.assertIn("against the latest run's requests", text)
+        self.assertIn("against the requests most runs had", text)
         self.assertIn("| 600 MiB (platform-agent request) | 500 MiB | 4.0 clusters |", text)
 
     def test_an_unknown_commit_or_mode_is_an_error(self):

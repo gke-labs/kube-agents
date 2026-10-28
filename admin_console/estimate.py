@@ -7,7 +7,7 @@ The same model as the console's Harness limits page (``harness_limits``): for
 each check, the fleet size at which it first fails, for a fleet of clusters
 shaped like the base point and for each factor alone; then the credential
 proxy's throughput and the demand each operation put on it. The checks use the
-limits of the latest run; ``--against requests`` uses its requests instead,
+limits most runs had; ``--against requests`` uses their requests instead,
 which is what an Autopilot cluster without bursting gives each container, and
 ``--limits`` reads a JSON or YAML mapping of container to ``memory_bytes`` and
 ``cpu_cores``.
@@ -246,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--commit", help="the commit to report (default: the latest)")
     parser.add_argument("--mode", help=f"the mode to report (default: {hl.DEFAULT_MODE} when measured)")
     parser.add_argument("--against", choices=("limits", "requests"), default="limits",
-                        help="check against the latest run's limits (default) or its requests")
+                        help="check against the limits most runs had (default) or their requests")
     parser.add_argument("--limits", type=Path, help="JSON or YAML: container -> memory_bytes, cpu_cores")
     args = parser.parse_args(argv)
     dataset = hl.load_dataset(args.data)
@@ -272,12 +272,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.limits:
         limits, against = read_limits(args.limits), f"limits from {args.limits}"
     elif args.against == "requests":
-        limits, against, resource = hl.latest_requests(records), "the latest run's requests", REQUEST
+        limits, against, resource = hl.usual_requests(records), "the requests most runs had", REQUEST
         if not limits:
             print("No record of this commit and mode holds requests.", file=sys.stderr)
             return 1
     else:
-        limits, against = hl.latest_limits(records), "the latest run's limits"
+        limits, against = hl.usual_limits(records), "the limits most runs had"
     title = f"{hl.commit_label(dataset.records, commit)}, mode {mode}, against {against}"
     if dataset.is_sample:
         title += " (sample data, not measured)"

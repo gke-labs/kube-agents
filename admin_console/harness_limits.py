@@ -959,22 +959,32 @@ def metric_names(records: Iterable[Record]) -> list[str]:
     return [name for name in METRICS if name in found] + sorted(found - set(METRICS))
 
 
-def latest_limits(records: Iterable[Record]) -> dict[str, dict[str, float]]:
-    """Per container, the limits of the latest run that read them."""
-    limits: dict[str, dict[str, float]] = {}
+def _usual(records: Iterable[Record], kind: str) -> dict[str, dict[str, float]]:
+    """Per container, the resources most runs read; a tie goes to the later run.
+
+    A short experiment under other limits, such as runs with the credential
+    proxy's limits raised, does not change what the install's limits are.
+    """
+    seen: dict[str, dict[tuple[tuple[str, float], ...], tuple[int, str]]] = {}
     for record in sorted(records, key=lambda item: (item.started, item.key)):
-        for container, values in record.limits.items():
-            limits[container] = dict(values)
-    return limits
+        for container, values in getattr(record, kind).items():
+            key = tuple(sorted(values.items()))
+            count, _ = seen.setdefault(container, {}).get(key, (0, ""))
+            seen[container][key] = (count + 1, record.started)
+    return {
+        container: dict(max(options, key=lambda key: options[key]))
+        for container, options in seen.items()
+    }
 
 
-def latest_requests(records: Iterable[Record]) -> dict[str, dict[str, float]]:
-    """Per container, the requests of the latest run that read them."""
-    requests: dict[str, dict[str, float]] = {}
-    for record in sorted(records, key=lambda item: (item.started, item.key)):
-        for container, values in record.requests.items():
-            requests[container] = dict(values)
-    return requests
+def usual_limits(records: Iterable[Record]) -> dict[str, dict[str, float]]:
+    """Per container, the limits most runs read."""
+    return _usual(records, "limits")
+
+
+def usual_requests(records: Iterable[Record]) -> dict[str, dict[str, float]]:
+    """Per container, the requests most runs read."""
+    return _usual(records, "requests")
 
 
 def limit_table(
@@ -2216,7 +2226,7 @@ def metric_charts(
 ) -> list[MetricChart]:
     """One chart per metric the factor's runs of the operation measured."""
     fleet_x = fleet_value(factor, fleet)
-    limits = latest_limits(records)
+    limits = usual_limits(records)
     charts = []
     for metric in metric_names(records):
         owners = {
