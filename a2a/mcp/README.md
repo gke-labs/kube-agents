@@ -12,6 +12,8 @@ The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
 - `<agent>-a2a-mcp-token`: the bearer token callers present, minted once by the operator.
 
+The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and its token Secret, `<agent>-a2a-mcp-token`. If either name is already taken by an object the operator does not control, the server is not rendered and the PlatformAgent carries the `A2AMCPServer` condition ([conditions](../../docs/site/src/content/docs/operator/platformagent-crd.md)).
+
 Unset the flag and all of it is removed, the token included.
 
 ## Connect a client

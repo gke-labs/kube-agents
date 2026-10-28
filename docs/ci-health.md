@@ -34,8 +34,8 @@ describes it. When the section cannot be built, the digest carries one line on
 the night instead (the cases recorded, how many passed all reps, partial and
 failed, what is newly failing against the night before, the opening chat
 turn's p50 and p95 as advice beside the p95 < 10 s target
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
-`spec.mode: next`, because the harness times the opening turn on the agent API only),
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
+grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
 the section was skipped. A night can be the builds of up to three periodics

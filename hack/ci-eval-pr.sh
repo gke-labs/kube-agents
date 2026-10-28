@@ -3155,6 +3155,9 @@ unit_cost_hint() {
     # measured 7-11 minutes a repetition on a dev install.
     gitops-drift-deleted-policy-triage) echo 900 ;;
     gitops-drift-load-bearing-change-triage) echo 900 ;;
+    # The same shape with a namespace as the subject (#3972). Unmeasured;
+    # priced with its siblings.
+    gitops-drift-unmanaged-object-triage) echo 900 ;;
     # The autoops-incident stack at three replicas, on the infra lock, and a
     # board read. Unmeasured; priced with autoops-warning-event-triage.
     incident-triage-workload-fold) echo 900 ;;

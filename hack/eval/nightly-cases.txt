@@ -1039,6 +1039,13 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# A drift to an object git does not declare (#3972): a namespace created by
+# hand, its Pod Security level loosened, and no GitOps marker on it. Every
+# sibling's object is GitOps-managed, so an agent that offers "revert to what
+# git declares" for every drift passed them all. Holds the infra lock; 900s,
+# the drift band; listed in nightly-main-b.txt to balance the halves.
+./tasks/gitops-drift-unmanaged-object-triage/task.yaml
+
 # A general fleet health question ("check if my clusters are all healthy") runs
 # fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
 # fleet the per-cluster fan-out queued behind the board's five user slots for

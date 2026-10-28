@@ -19,7 +19,7 @@ with its own copy. `bench/tf/modules/drift-inject/build_payload.py` replaced
 all three, and nothing else in the repository renders a payload -- so without
 this file a mistake in it reaches a judge rather than a test.
 
-All three consumers are registered in the nightly, so the builder is
+Every consumer is registered in the nightly, so the builder is
 exercised there -- but once a night, three repetitions, against a chain that
 truncated three times in the week before the two CUJ 1 halves joined it. A
 defect here would reach a judge before it reached a test, and on a truncated

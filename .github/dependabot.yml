@@ -36,6 +36,7 @@ updates:
     directories:
       - "/k8s-operator"
       - "/a2a"
+      - "/k8s-api-proxy"
     schedule:
       interval: "weekly"
     cooldown:

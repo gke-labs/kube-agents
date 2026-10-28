@@ -373,7 +373,7 @@ def healthy_world(*projects):
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
         },
         "describe": {project: {"seeded-a": _peer(), "seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED}, "seeded-d": _peer()} for project in projects},
-        "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
+        "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000"]}]},
     }
 
 

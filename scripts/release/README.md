@@ -77,6 +77,27 @@ page under "Why there is no `gke-admin` set".
 - `sign_release_artifacts.sh`: Signs `checksums.txt` in `DIST_DIR` using Keyless Cosign OIDC, producing `checksums.txt.bundle` to provide verifiable cryptographic supply-chain provenance for all offline distribution archives and SBOMs. The `cosign` CLI is mandatory in CI (exits 1 if missing or signing fails) and skipped with a dry-run warning locally.
 - `publish_github_release.sh`: Publishes official GitHub Releases with notes GitHub generates (`gh release create --generate-notes`) from the pull requests merged since the release commit's own previous GA tag (`get_base_ga_tag_for_commit` below the release: `0.7.1`'s notes start at `0.7.0`, and `0.8.0`'s at `0.7.0` even when `0.7.2` exists on the line), grouped by the label categories in `.github/release.yml` and excluding Dependabot's and anything labelled `duplicate`, `invalid` or `wontfix`; discovers and attaches all distribution artifacts (`.tar.gz`, `.zip`, `.tgz`, `*.spdx.json`, `*.cdx.json`, `checksums.txt`, `checksums.txt.bundle`) from `DIST_DIR`; and handles idempotent re-runs via `gh release upload --clobber`. Those notes and the compare view, not a milestone, are where a release's contents are; no milestones are kept. The notes start from the previous GA tag, passed explicitly as `--notes-start-tag`: GA tags sit on stamped commits that never return to `main`, and left to pick the start tag itself GitHub started 0.4.0's notes from 0.2.0 and 0.5.0's from the first commit. The tag is `get_base_ga_tag_for_commit` from `common.sh` with the release as its ceiling, or `PREVIOUS_VERSION` from the environment for a hand run (`release-publish.yml` sets none). With no lower GA tag the flag is omitted and the script warns: that is the first release, or a checkout that did not fetch its tags, and the script cannot tell them apart locally, so the banner's `Notes Start Tag` line and the warning are the check. It does not call `release_fetch_tags`; like `resolve_release_commit`, it relies on the publish job's `fetch-depth: 0` checkout.
 
+## Tag families
+
+Every commit and build moves through six tag families. The site's
+[release versioning page](../../docs/site/src/content/docs/deploy/release-versioning.md) describes
+the GA tag `X.Y.Z` in prose; the other families are this runbook's.
+
+| Family            | Shape                                 | Pushed by                                                   | What it means                                                                                                                                                                  |
+| ----------------- | ------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Candidate build   | `<COMMIT_SHA>` (bare 40-char SHA)     | A push to `main` or to a `release/<X.Y>` branch             | Images built once in GHCR; no tag in Git.                                                                                                                                      |
+| Release candidate | `rc_YYMMDDHHMM_<SHORT_SHA>`           | The three-hourly RC scheduler, or a manual dispatch         | A candidate selected for the live-cluster suite.                                                                                                                               |
+| RC validated      | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | A green RC pipeline (step 4)                                | `install.sh` and the narrow E2E suite passed on a real GKE cluster. The GA gate for a patch from a release line.                                                               |
+| Eval candidate    | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | A green nightly matrix (`tag_eval_candidate.sh`)            | A nomination, not a promotion: starts the release-candidate eval and deploys nothing. Stays on a rejected candidate; `drop_eval_candidate.sh` removes it when no verdict came. |
+| Staging promoted  | `staging_YYMMDDHHMM_<SHORT_SHA>`      | A green eval on the nomination (`tag_staging_promotion.sh`) | The GA gate for `main`: the full matrix and the eval both passed. Also the deploy trigger for the staging estate.                                                              |
+| GA release        | `X.Y.Z`                               | `release-publish.yml`, daily or dispatched                  | The release, on a stamped commit parented by the target commit, pushed with the release line `release/X.Y`.                                                                    |
+
+The two nightly tags name the same candidate, and the eval runs between them: one tag could not
+both start the eval and trigger the staging deploy, since the deploy reaches the cluster in
+minutes while the eval is hours from a verdict. Nothing deploys from an `evalcand_` tag with no
+`staging_` tag beside it; [The nightly environment](#the-nightly-environment) says what each such
+tag means and which are retried.
+
 ## Pipeline Cadence & Execution Flow
 
 The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatched by a scheduler and can also be triggered manually:

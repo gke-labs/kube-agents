@@ -349,6 +349,10 @@ offered for as long as `validMasterVersions` or any channel's roster carries it,
 re-drawn: each reconcile returns the running version until REGULAR ships a patch above it, so
 if every roster drops that version meanwhile, branch (a) fires on every project, and correctly,
 until REGULAR catches up or the cluster is destroyed and re-created.
+The hourly seeded-fleet scan accepts a patch REGULAR has moved past and reads one newer than
+every REGULAR patch of its minor, the 2026-10-14 shape, as `version-laggard` drift
+(`not_ahead_of_channel` in `fixtures.json`): agents compared that patch with REGULAR's and
+read the cluster as current or ahead rather than behind.
 
 A case touching `version-laggard` may assert that branch (a) is absent, and
 `upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it
