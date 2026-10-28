@@ -52,7 +52,7 @@ settings:
   # us-central1-c ran out of E2 and N2 capacity at the 16-cluster level. From then on the
   # default pool holds up to this many fixture Pods, so the 100-object levels need no fixture
   # pool, and new clusters use N2 default pools. The earlier levels had a fixture pool on every
-  # cluster (3-4 nodes per cluster); the 16- and 32-cluster levels have 2.
+  # cluster (3-4 nodes per cluster at the base); the 22-cluster level has 2.
   default_pool_pods: 150
   test_cluster_machine_type: n2-standard-2
   fixture_pool: scale-pool
@@ -77,7 +77,7 @@ operations:
     window_seconds: 3600
   fan_out:
     kind: prompt
-    factors: [clusters, concurrent, combined]
+    factors: [concurrent, combined]
     runs: 3
     timeout_seconds: 2400
     prompt: Which of my clusters, if any, are stressed right now? Check every cluster.

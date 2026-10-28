@@ -61,6 +61,7 @@ HEX_DIGITS = set("0123456789abcdef")
 PREFLIGHT_SHELL = "/bin/sh"
 PREFLIGHT_TIMEOUT_SECONDS = 600
 TERMINATED_EXIT_CODE = 143
+STOPPED_EXIT_CODE = 2
 PEAK_METRIC = "memory_peak_bytes"
 # What add_peaks reads from Cloud Monitoring; remonitor replaces exactly these.
 MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds")
@@ -531,12 +532,14 @@ class Runner:
         point = self.plan.combined[int(spec.level) - 1]
         return all(stored.get(name) == value for name, value in point.items())
 
-    def run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> None:
+    def run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> bool:
+        """Run the specs; False when it stopped at a level it could not apply."""
         self.backfill_peaks()
         pending = specs if force else self.pending(specs)
         todo = pending[:limit] if limit else pending
         LOG.info("%s runs to do (%s pending of %s)", len(todo), len(pending), len(specs))
         awaiting: list[tuple[float, records.Record]] = []
+        stopped = False
         relay = operations.Relay(self.install.context, self.install.namespace)
         try:
             relay.start()
@@ -549,6 +552,7 @@ class Runner:
                     # the clusters this level made, or create more in a zone that just refused some).
                     # A resume starts again at this level.
                     LOG.exception("could not apply %s=%s; stopping the run", factor, level)
+                    stopped = True
                     break
                 for spec in group:
                     try:
@@ -570,6 +574,7 @@ class Runner:
             self.stop_churn()
             relay.stop()
             self.flush_peaks(awaiting, wait=True)
+        return not stopped
 
     def flush_peaks(self, awaiting: list[tuple[float, records.Record]], wait: bool) -> list[tuple[float, records.Record]]:
         """Add Cloud Monitoring peaks to the records whose window is old enough, and merge them again.
@@ -711,7 +716,9 @@ def main(argv: list[str] | None = None) -> int:
     atexit.register(private.unlink, missing_ok=True)
     runner = Runner(plan, data_file)
     if args.command == "run":
-        runner.run(specs, args.force, args.limit)
+        # Non-zero when the run stopped at a level, so a script does not go on to its next step.
+        if not runner.run(specs, args.force, args.limit):
+            return STOPPED_EXIT_CODE
     elif args.command == "reclassify":
         print(f"{runner.reclassify()} records changed")
     elif args.command == "remonitor":

@@ -861,7 +861,7 @@ def test_a_level_that_cannot_be_applied_stops_the_run(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "pending", lambda specs: specs)
     monkeypatch.setattr(runner.operations.Relay, "start", lambda self: None)
     monkeypatch.setattr(runner.operations.Relay, "stop", lambda self: None)
-    run.run([s for s in plan.matrix() if s.factor == "clusters"], force=False)
+    assert run.run([s for s in plan.matrix() if s.factor == "clusters"], force=False) is False
     # The 8-cluster level, which would delete the clusters the 16-cluster level holds, never starts.
     assert applied == [16]
 
@@ -894,3 +894,10 @@ def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
     monkeypatch.setattr(install, "_time_series", series)
     peaks = install.container_peaks(0.0, 1800.0)["litellm-container"]
     assert peaks == {"memory_peak_bytes": 300.0, "cpu_peak_cores": 0.4, "cpu_seconds": 90.0}
+
+
+def test_a_plan_can_run_its_base_last():
+    plan = load_plan(PHASE3, environ=ENV)
+    levels = list(dict.fromkeys((s.factor, s.level) for s in plan.matrix()))
+    assert levels == [("clusters", 16), ("clusters", 8), ("clusters", 6), ("clusters", 4), ("base", 0)]
+    assert load_plan(PHASE2, environ=ENV).matrix()[0].factor == "base"

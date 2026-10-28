@@ -9,11 +9,12 @@
 # once, as OOBE marks them one by one: a worse case than OOBE's order, bounded for the broker by
 # its 8 command slots.
 #
-# Set the target as for phase1.yaml. Run the cluster levels first, then the base, so the fleet
-# only shrinks: `run phase3.yaml --only-factor clusters`, then `--only-factor base`. The 22-cluster
-# fleet was deleted before Phase 3 measured it (a plan that lacked a setting, which the runner now
-# refuses at load); the 22-cluster point is Phase 2's 2-hour window.
+# Set the target as for phase1.yaml. The cluster levels run from the largest down and the base
+# runs last, so the fleet only shrinks. The 22-cluster fleet was deleted before Phase 3 measured it
+# (a plan that lacked a setting, which the runner now refuses at load); the 22-cluster point is
+# Phase 2's 2-hour window.
 phase: phase3
+base_last: true
 
 target:
   host_cluster: scale-host
@@ -35,8 +36,9 @@ base:
   listing_pods: 100
 
 factors:
-  # 6 and 4 are below the credential proxy's CPU limit (it reaches 1 core at about 7 clusters),
-  # so their CPU is the need rather than the limit, and the trend through them forecasts larger fleets.
+  # 6 and 4 were meant to stay below the credential proxy's CPU limit (it reaches 1 core at about
+  # 6 clusters in onboarding), so their CPU would show the need; the audit window reached the limit
+  # at every size, so phase3-proxy-raised.yaml measures the need with the limit raised.
   clusters: [2, 16, 8, 6, 4]
 
 settings:

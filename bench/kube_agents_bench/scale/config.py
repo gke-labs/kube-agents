@@ -82,6 +82,9 @@ class Plan:
     operations: list[Operation]
     settings: dict[str, Any] = field(default_factory=dict)
     combined: list[dict[str, float]] = field(default_factory=list)
+    # Run the base point after the factors' levels, so a plan whose levels shrink the fleet ends
+    # at its smallest fleet instead of starting there.
+    base_last: bool = False
 
     def level_values(self, factor: str, level: float) -> dict[str, float]:
         """Every factor's value at one point: the base, with ``factor`` set to ``level``,
@@ -94,21 +97,25 @@ class Plan:
         return values
 
     def matrix(self) -> list[RunSpec]:
-        """Every run the plan asks for, base first, in factor and level order.
+        """Every run the plan asks for, the base first (or last, with ``base_last``), then each factor's
+        levels in plan order.
 
         The base point runs every operation once per configured run; each
         factor's other levels run only the operations that list the factor.
         """
         specs: list[RunSpec] = []
-        for operation in self.operations:
-            for run in range(1, operation.runs + 1):
-                specs.append(RunSpec(BASE_FACTOR, 0, operation, run))
+        base = [RunSpec(BASE_FACTOR, 0, operation, run) for operation in self.operations
+                for run in range(1, operation.runs + 1)]
+        if not self.base_last:
+            specs += base
         for factor, levels in self.factors.items():
             for level, operation in itertools.product(levels, self.operations):
                 if level == self.base.get(factor) or factor not in operation.factors:
                     continue
                 for run in range(1, operation.runs + 1):
                     specs.append(RunSpec(factor, level, operation, run))
+        if self.base_last:
+            specs += base
         return specs
 
 
@@ -185,4 +192,5 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
         operations=operations,
         settings=settings,
         combined=combined,
+        base_last=bool(raw.get("base_last", False)),
     )
