@@ -943,7 +943,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 11. Reconcile the credential proxy: its own Deployment, its Service and the
 	// NetworkPolicy narrowing who may reach it.
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins); err != nil {
+	// Whether the broker may admit the MCP pod's ServiceAccount: read here
+	// because the broker renders before the A2A stack that would otherwise
+	// answer it (a2aMCPIdentityOwned).
+	mcpIdentityOwned, err := r.a2aMCPIdentityOwned(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, mcpIdentityOwned); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2982,7 +2989,7 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // and the sandbox's wrapped CLIs both dial the Service, and neither has any
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
-func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) error {
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, an override under the
@@ -3027,7 +3034,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// reaching a container that never restarts. (On a Slack-armed next install
 	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
 	// stamps.)
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins)
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -3964,6 +3971,37 @@ func a2aGatewayConditionStands(agent *agentv1alpha1.PlatformAgent) bool {
 		(existing.Reason == a2aGatewayLegacyDarkReason || existing.Reason == a2aGatewayWakingReason)
 }
 
+// a2aMCPIdentityConditionCurrent and setA2AMCPIdentityCondition carry the
+// MCP server condition (a2aMCPIdentityConditionType): present, True, with
+// the reason a2aProvisionState.mcpNotRendered names, while the door is on
+// and an unowned object holds one of the server's reserved names; absent
+// otherwise. Same shape as the gateway's, and written by both status
+// writers (updateStatusReady and syncA2AConditions), so the ordinary Ready
+// pass and a Degraded park both carry it.
+func a2aMCPIdentityConditionCurrent(agent *agentv1alpha1.PlatformAgent, reason string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aMCPIdentityConditionType)
+	if reason == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == reason && existing.Message == a2aMCPNotRenderedMessage(agent, reason)
+}
+
+func setA2AMCPIdentityCondition(agent *agentv1alpha1.PlatformAgent, reason string, now metav1.Time) {
+	if reason == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aMCPIdentityConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aMCPIdentityConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            a2aMCPNotRenderedMessage(agent, reason),
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
 // setA2AGatewayCondition writes the A2AGateway condition on the EventWatcher
 // pattern: present while the state holds, removed the pass it stops holding.
 // The only state is the way back on an upgraded install (a gateway an older
@@ -4121,13 +4159,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	homeMsg := homeChannelUnsetMessage(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
-		homeChannelUnsetConditionCurrent(agent, homeMsg) {
+		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live))
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
 	}) {
 		return nil
 	}
@@ -4136,6 +4176,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
+	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4447,6 +4488,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// reason.
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
+	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4495,7 +4537,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4573,6 +4615,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
+	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {

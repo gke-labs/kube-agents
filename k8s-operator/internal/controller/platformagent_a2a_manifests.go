@@ -5010,6 +5010,13 @@ type a2aProvisionState struct {
 	// pass because no auth callout replica is ready yet (the gate at the
 	// create site). It shares the requeue with !done, which it implies.
 	jobHeld bool
+	// mcpNotRendered is the reason the MCP server was removed rather than
+	// rendered this pass with its door on: a2aMCPIdentityUnownedReason for
+	// a ServiceAccount under the MCP pod's name that is not this
+	// PlatformAgent's (reconcileA2AMCPBrokerIdentity),
+	// a2aMCPTokenUnownedReason for its token Secret (ensureA2AMCPToken), ""
+	// otherwise. The status writers carry it as a2aMCPIdentityConditionType.
+	mcpNotRendered string
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5257,11 +5264,24 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// same reasons: after the fences, ahead of the gateway's hold. Its
 	// broker identity first, so the ServiceAccount exists before the pod
 	// that names it.
-	if err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
+	mcpIdentityOwned, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent)
+	if err != nil {
 		return state, err
 	}
-	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
-		return state, err
+	if mcpIdentityOwned {
+		reason, err := r.reconcileA2AMCP(ctx, agent)
+		if err != nil {
+			return state, err
+		}
+		state.mcpNotRendered = reason
+	} else {
+		// Not rendered over an identity that is not ours; a server rendered
+		// on an earlier pass goes too, so no MCP pod runs as that account.
+		// The fence stays, for the reason reconcileA2AMCP gives.
+		if err := r.removeA2AMCPServer(ctx, agent); err != nil {
+			return state, err
+		}
+		state.mcpNotRendered = a2aMCPIdentityUnownedReason
 	}
 
 	// The session-pod quota, the enforcement half of the bound whose

@@ -26,10 +26,10 @@ runs `hack/fleet-kubeconfigs.sh` against the project and requires every fixture 
 then runs `hack/fleet-fixture-state.py` and requires each of them to be in its **designed
 state** — the `state` assertions beside each role in `fixtures.json` (the crashloop has a
 recorded OOMKilled termination, `checkout-gateway` has two Ready replicas and no PDB in its
-namespace, `seeded-b`'s master is still one minor behind its channel with the exclusion
-window ahead of now, `seeded-c` at least a day old). That last one means a project applied
-today fails the check until tomorrow, the drift SOP's age gate below. Presence alone passed
-on 2026-09-07 while every slot-a fixture sat
+namespace, `seeded-b`'s master is still one minor behind its channel, on no patch newer
+than the channel offers, with the exclusion window ahead of now, `seeded-c` at least a day
+old). That last one means a project applied today fails the check until tomorrow, the drift
+SOP's age gate below. Presence alone passed on 2026-09-07 while every slot-a fixture sat
 Pending (#1278); the state pass is what would have failed that project. A role on a cluster
 it could not reach usually reports as unchecked rather than absent; the warnings that
 override that default are in `docs/ci-pool-projects.md` §6.
@@ -95,8 +95,10 @@ found on such a patch, the script holds the pin instead, at the newest REGULAR p
 that minor above the running one if there is one, else at the running version, and the
 apply after that step does the minor bump, one minor per apply (GKE's control-plane
 rule), so a master the hold left two minors behind reaches the target over two applies.
-While a hold lasts the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
-`version-laggard` as drifted until REGULAR ships a patch above the running one, and if
+While a hold lasts the master may run a patch newer than any REGULAR patch of its minor,
+and after a minor roll the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
+`version-laggard` as drifted on either (`not_ahead_of_channel`,
+`minor_behind_channel_default`) until REGULAR ships a patch above the running one, and if
 REGULAR drops the minor first no pin can recover, so the cluster is upgraded by hand off
 the channel or destroyed and re-created (the recovery below). `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it

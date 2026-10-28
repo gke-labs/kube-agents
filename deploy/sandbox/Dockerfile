@@ -147,6 +147,24 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # for the REST reads no CLI exposes, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
 
+# Precompile the standard library to bytecode at build time (#4027).
+# python:3.14-slim ships no precompiled .pyc files in the standard library, and
+# PYTHONDONTWRITEBYTECODE=1 (needed so root runs do not write caches into /opt/defaults)
+# prevents Python from caching bytecode at runtime. Without this, every invocation of
+# python3 or credential-proxy-exec re-compiles the standard library from source,
+# costing ~0.85s of CPU per command in the shell.
+# Precompiled bytecode is baked into /usr/local/lib/python3.14/ and never touches
+# /opt/defaults, so PYTHONDONTWRITEBYTECODE=1 can safely stay.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# An `-o` or `-oN` would write `.opt-N.pyc` files that nothing loads, quietly
+# putting the runtime back to compiling from source.
+RUN STDLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
+    [ -d "$STDLIB" ] && \
+    { python3 -m compileall -q -j 0 "$STDLIB" || true; } && \
+    [ "$(find "$STDLIB" -name '*.pyc' ! -name '*.opt-*.pyc' | head -500 | wc -l)" -ge 500 ]
+
 # A real git with no credential and no way to reach a host.
 #
 # The sandbox holds no forge token, so anything that talks to a remote runs in
