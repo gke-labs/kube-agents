@@ -59,10 +59,13 @@ reason:
     the counted nights' own, and every counted night has a model on record.
 
 The rendered page goes next to ``data.json`` as ``health-email.html`` (the
-workflow's render step). TODO(#3440): sending it -- to whom, from which
-account, and the one chat line linking to it -- is not built; it needs a
-mail route and permissions a maintainer decides. A refused render then
-posts its reasons to the CI health space instead of sending.
+workflow's render step). With ``--chat-out``, a page that passed also
+writes the week's Chat summary (``chat_text``: the same week, tiles,
+needs-attention rows and open-bug counts the page printed, plus the task
+time's 90th percentile and slowest area), which ``weekly_chat.py`` posts to
+the CI-health space once a week; a refused week writes none, so nothing is
+posted. TODO(#3440): mailing the page -- to whom, from which account -- is
+not built; it needs a mail route and permissions a maintainer decides.
 """
 
 from __future__ import annotations
@@ -86,13 +89,13 @@ try:
     import case_owner
 
     from eval_dashboard import classify, ghcli, nightly, nightly_bugs, nightly_infra
-    from eval_dashboard.post_health import DASHBOARD_URL
+    from eval_dashboard.post_health import DASHBOARD_SITE, DASHBOARD_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/weekly_email.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     import case_owner
 
     from eval_dashboard import classify, ghcli, nightly, nightly_bugs, nightly_infra
-    from eval_dashboard.post_health import DASHBOARD_URL
+    from eval_dashboard.post_health import DASHBOARD_SITE, DASHBOARD_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 # The artifact's name beside data.json in the bucket.
@@ -117,6 +120,10 @@ NEEDS_ATTENTION_BELOW_PCT = 65
 NEEDS_ATTENTION_DROP_PTS = 5
 PERCENT = 100
 SECONDS_PER_MINUTE = 60
+# Task time's tail: the 90th percentile of the graded repetitions' agent_s,
+# read as "the slowest 10%".
+TIME_PERCENTILE = 90
+SLOWEST_SHARE = f"slowest {PERCENT - TIME_PERCENTILE}%"
 
 TREND_UP = "up"
 TREND_DOWN = "down"
@@ -200,7 +207,7 @@ TILE_SCENARIOS_LABEL = "scenarios compared"
 TILE_SCENARIOS_SUB = "graded both weeks"
 TILE_TIME_LABEL = "typical task time"
 TILE_TIME_VALUE = "{minutes} min"
-TILE_TIME_SUB = "middle of {count} timed runs"
+TILE_TIME_SUB = "middle of {count} timed runs; " + SLOWEST_SHARE + " over {p90} min"
 TILE_TIME_NONE = "n/a"
 TILE_TIME_NONE_SUB = "no timing on record"
 CHANGE_UP = "&#9650; {pts} pts vs last week"
@@ -275,6 +282,42 @@ WHY_NO_MAIN_B = "no main-b part"
 WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B}
 WHY_RUN_EVENT = "nearly every scenario failed"
 WHY_NO_RUN = "no run on record"
+
+# The weekly Chat post (weekly_chat.py sends it): the page's week in Chat's
+# text markup, *bold* and <url|label>.
+REPORT_URL = f"{DASHBOARD_SITE}/{OUT_NAME}"
+# The --chat-out file's keys, which weekly_chat.py reads.
+CHAT_WEEK_KEY = "week_end"
+CHAT_TEXT_KEY = "text"
+CHAT_TITLE = "*kube-agents weekly health · {range}*"
+CHAT_LEAD = "{pct}% of nightly test runs passed ({passed} of {graded}) across {scenarios} scenarios{change}."
+CHAT_CHANGE_UP = ", up {pts} points from last week"
+CHAT_CHANGE_DOWN = ", down {pts} points from last week"
+CHAT_CHANGE_STEADY = ", steady with last week"
+CHAT_NO_TREND = "No week-over-week trend: only {counted} of {dates} nights counted ({why})."
+CHAT_NO_TREND_PREV = "No week-over-week trend: only {counted} of last week's {dates} nights counted ({why})."
+CHAT_LEFT_OUT = "{count} {why}"
+# Why a night is not counted, as the post words it.
+CHAT_WHY = {WHY_CUT: "cut off", WHY_NO_MAIN: "missing the main part", WHY_NO_MAIN_B: "missing the main-b part",
+            WHY_RUN_EVENT: "failed run-wide", WHY_NO_RUN: "not run"}
+CHAT_ATTENTION_TITLE = "*Needs attention*"
+CHAT_ATTENTION_ITEM = "• {name}: {state}, <{url}|{bugs}>"
+CHAT_ATTENTION_NONE = "*Needs attention:* nothing this week"
+CHAT_BUGS = "{count} open bugs"
+CHAT_BUG = "1 open bug"
+CHAT_STRONGEST = "Strongest: {items}"
+CHAT_STRONGEST_ITEM = "{name} {pct}%"
+# The areas the "Strongest" line names, best first, needs-attention ones aside.
+CHAT_STRONGEST_COUNT = 3
+CHAT_TIME = "⏱ Task time: typical {typical} min{change}, " + SLOWEST_SHARE + " over {p90} min{slowest}"
+CHAT_TIME_UP = " (up {minutes} min from last week)"
+CHAT_TIME_DOWN = " (down {minutes} min from last week)"
+CHAT_TIME_SAME = " (same as last week)"
+CHAT_TIME_SLOWEST = " · slowest area: {name} ({minutes} min)"
+CHAT_TIME_NONE = "⏱ Task time: no timing on record"
+CHAT_LINKS = "<{report}|full report> · <{dashboard}|dashboard>"
+CHAT_JOIN = " · "
+CHAT_BLOCK_JOIN = "\n\n"
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title}</title></head>
 <body style="margin:0;padding:0;background:{page_bg};">
@@ -369,6 +412,19 @@ def log(message: str) -> None:
 def pct_of(passed: int, graded: int) -> int:
     """Whole percent, half rounded up, so 84.5% is 85% as a reader expects."""
     return (passed * PERCENT * 2 + graded) // (graded * 2)
+
+
+def minutes(seconds: float) -> int:
+    return round(seconds / SECONDS_PER_MINUTE)
+
+
+def percentile(values: list[float], pct: int) -> float | None:
+    """The ``pct``th percentile, interpolated between the two nearest values."""
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return statistics.quantiles(values, n=PERCENT, method="inclusive")[pct - 1]
 
 
 def short_date(day: datetime.date) -> str:
@@ -700,7 +756,10 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     overall["change"] = overall["pct"] - overall["prev_pct"] if trend_ok else None
     overall["trend"] = trend_of(overall["change"])
     times = [t for c in common for t in this_cases[c]["agent_s"]]
+    prev_times = [t for c in common for t in prev_cases[c]["agent_s"]]
     overall["agent_s_median"] = statistics.median(times) if times else None
+    overall["agent_s_p90"] = percentile(times, TIME_PERCENTILE)
+    overall["prev_agent_s_median"] = statistics.median(prev_times) if prev_times else None
     overall["timed_runs"] = len(times)
     week["overall"] = overall
 
@@ -714,8 +773,12 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
         row["few"] = len(cases) < MIN_TREND_SCENARIOS
         row["change"] = row["pct"] - row["prev_pct"] if trend_ok and not row["few"] else None
         row["trend"] = trend_of(row["change"])
+        row_times = [t for c in cases for t in this_cases[c]["agent_s"]]
+        row["agent_s_median"] = statistics.median(row_times) if row_times else None
         week["rows"].append(row)
     week["rows"].sort(key=lambda r: (-r["pct"], r["name"]))
+    timed = [r for r in week["rows"] if r["agent_s_median"] is not None]
+    overall["slowest_area"] = min(timed, key=lambda r: (-r["agent_s_median"], r["name"]))["slug"] if timed else None
     week["attention"] = [r["slug"] for r in week["rows"] if needs_attention(r)]
     week["claims"] = build_claims(week, days)
     return week
@@ -963,8 +1026,8 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
     else:
         change = CHANGE_NONE
     if overall["agent_s_median"] is not None:
-        time_value = TILE_TIME_VALUE.format(minutes=round(overall["agent_s_median"] / SECONDS_PER_MINUTE))
-        time_sub = TILE_TIME_SUB.format(count=overall["timed_runs"])
+        time_value = TILE_TIME_VALUE.format(minutes=minutes(overall["agent_s_median"]))
+        time_sub = TILE_TIME_SUB.format(count=overall["timed_runs"], p90=minutes(overall["agent_s_p90"]))
     else:
         time_value, time_sub = TILE_TIME_NONE, TILE_TIME_NONE_SUB
     tile = {"rule": RULE, "ink": INK, "faint": FAINT}
@@ -979,14 +1042,8 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
     bug_counts = domain_counts(bugs["open"], week["attention"])
     for slug in week["attention"]:
         row = rows_by_slug[slug]
-        if row["few"]:
-            state = ATTENTION_FEW.format(pct=row["pct"])
-        elif row["trend"] == TREND_DOWN:
-            state = ATTENTION_DOWN.format(pct=row["pct"], pts=-row["change"])
-        else:
-            state = ATTENTION_RATE.format(pct=row["pct"])
         shown[slug] = bug_counts.get(slug, 0)
-        items.append(ATTENTION_ITEM.format(rule=RULE, ink=INK, muted=MUTED, link=LINK, name=esc(row["name"]), state=state,
+        items.append(ATTENTION_ITEM.format(rule=RULE, ink=INK, muted=MUTED, link=LINK, name=esc(row["name"]), state=attention_state(row),
                                            url=esc(bugs_url(repo, slug)), bugs=OPEN_BUGS.format(count=shown[slug])))
     if not items:
         items.append(ATTENTION_EMPTY.format(rule=RULE, muted=MUTED, text=ATTENTION_NONE if week["trend_ok"] else ATTENTION_NONE_NO_TREND))
@@ -1024,21 +1081,106 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
                        rows=ROWS_JOIN.join([header, intro, tiles, attention, by_area, fix, close]))
 
 
+def attention_state(row: dict) -> str:
+    if row["few"]:
+        return ATTENTION_FEW.format(pct=row["pct"])
+    if row["trend"] == TREND_DOWN:
+        return ATTENTION_DOWN.format(pct=row["pct"], pts=-row["change"])
+    return ATTENTION_RATE.format(pct=row["pct"])
+
+
+# ---------------------------------------------------------------------------
+# the Chat post
+
+
+def chat_no_trend(week: dict) -> str:
+    """Why no change is called: the short week's counted nights and why the
+    rest are left out, this week's when it is the short one."""
+    this_short = len(week["counted"]) < MIN_COUNTED_NIGHTS
+    days, counted = (week["days"], week["counted"]) if this_short else (week["prev_days"], week["prev_counted"])
+    whys: dict[str, int] = {}
+    for day in days:
+        if day in week["left_out"]:
+            why = week["left_out"][day]
+            whys[why] = whys.get(why, 0) + 1
+    why = NAMES_JOIN.join(CHAT_LEFT_OUT.format(count=count, why=CHAT_WHY.get(reason, reason))
+                          for reason, count in sorted(whys.items(), key=lambda item: (-item[1], item[0])))
+    return (CHAT_NO_TREND if this_short else CHAT_NO_TREND_PREV).format(counted=len(counted), dates=len(days), why=why)
+
+
+def chat_time(week: dict) -> str:
+    overall = week["overall"]
+    if overall["agent_s_median"] is None:
+        return CHAT_TIME_NONE
+    typical = minutes(overall["agent_s_median"])
+    change = ""
+    if overall["trend"] is not None and overall["prev_agent_s_median"] is not None:
+        delta = typical - minutes(overall["prev_agent_s_median"])
+        change = CHAT_TIME_UP.format(minutes=delta) if delta > 0 else CHAT_TIME_DOWN.format(minutes=-delta) if delta < 0 else CHAT_TIME_SAME
+    slowest = ""
+    if overall["slowest_area"] is not None:
+        row = next(r for r in week["rows"] if r["slug"] == overall["slowest_area"])
+        slowest = CHAT_TIME_SLOWEST.format(name=row["name"], minutes=minutes(row["agent_s_median"]))
+    return CHAT_TIME.format(typical=typical, change=change, p90=minutes(overall["agent_s_p90"]), slowest=slowest)
+
+
+def chat_text(week: dict) -> str:
+    """The weekly Chat post, from the week ``render`` printed: the same
+    numbers, needs-attention rows and open-bug counts (``shown_bugs``)."""
+    overall = week["overall"]
+    rows_by_slug = {r["slug"]: r for r in week["rows"]}
+    days = [datetime.date.fromisoformat(d) for d in week["days"]]
+    change = {TREND_UP: CHAT_CHANGE_UP.format(pts=overall["change"]), TREND_DOWN: CHAT_CHANGE_DOWN.format(pts=-(overall["change"] or 0)),
+              TREND_STEADY: CHAT_CHANGE_STEADY}.get(overall["trend"], "")
+    head = [CHAT_TITLE.format(range=date_range(days[0], days[-1])),
+            CHAT_LEAD.format(pct=overall["pct"], passed=overall["passed"], graded=overall["graded"],
+                             scenarios=overall["scenarios"], change=change)]
+    if not week["trend_ok"]:
+        head.append(chat_no_trend(week))
+    head += [claim_text(c, rows_by_slug) for c in week["claims"] if c["kind"] == CLAIM_MODEL_CHANGE]
+
+    if week["attention"]:
+        attention = [CHAT_ATTENTION_TITLE]
+        for slug in week["attention"]:
+            count = week["shown_bugs"][slug]
+            attention.append(CHAT_ATTENTION_ITEM.format(name=rows_by_slug[slug]["name"], state=attention_state(rows_by_slug[slug]),
+                                                        url=bugs_url(week["repo"], slug),
+                                                        bugs=CHAT_BUG if count == 1 else CHAT_BUGS.format(count=count)))
+    else:
+        attention = [CHAT_ATTENTION_NONE]
+
+    tail = []
+    strongest = [r for r in week["rows"] if r["slug"] not in week["attention"]][:CHAT_STRONGEST_COUNT]
+    if strongest:
+        tail.append(CHAT_STRONGEST.format(items=CHAT_JOIN.join(CHAT_STRONGEST_ITEM.format(name=r["name"], pct=r["pct"]) for r in strongest)))
+    tail.append(chat_time(week))
+    links = CHAT_LINKS.format(report=REPORT_URL, dashboard=DASHBOARD_URL)
+    return CHAT_BLOCK_JOIN.join(ROWS_JOIN.join(block) for block in (head, attention, tail, [links]))
+
+
 # ---------------------------------------------------------------------------
 
 
 def produce(data: dict, store: dict | None, domain_rows: list[dict], week_end: datetime.date, bugs: dict | None,
             now: datetime.datetime, repo: str = ghcli.DEFAULT_REPO, repo_root: pathlib.Path = REPO_ROOT) -> tuple[str | None, list[str]]:
     """``(html, [])`` when every check passes, else ``(None, reasons)``."""
+    _, page, failures = produce_week(data, store, domain_rows, week_end, bugs, now, repo, repo_root)
+    return page, failures
+
+
+def produce_week(data: dict, store: dict | None, domain_rows: list[dict], week_end: datetime.date, bugs: dict | None,
+                 now: datetime.datetime, repo: str = ghcli.DEFAULT_REPO,
+                 repo_root: pathlib.Path = REPO_ROOT) -> tuple[dict, str | None, list[str]]:
+    """``produce``, with the computed week (``chat_text`` reads it)."""
     week = build_week(data, store, domain_rows, week_end, repo_root)
     week["rendered"] = now.strftime(TIME_FORMAT)
     failures = integrity_failures(week, domain_rows, bugs, data)
     if failures:
-        return None, failures
+        return week, None, failures
     failures = recheck_footer(week, data, store)
     page = render(week, bugs, repo)
     failures += integrity_failures(week, domain_rows, bugs, data, page)
-    return (None, sorted(set(failures), key=failures.index)) if failures else (page, [])
+    return (week, None, sorted(set(failures), key=failures.index)) if failures else (week, page, [])
 
 
 def parse_args(argv=None):
@@ -1049,6 +1191,7 @@ def parse_args(argv=None):
     parser.add_argument("--week-end", type=datetime.date.fromisoformat, help="the week's last nightly date (default: the Sunday before today, UTC)")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
     parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding domains.yaml and bench/tasks")
+    parser.add_argument("--chat-out", type=pathlib.Path, help="also write the week's Chat summary here (JSON: week_end, text) for weekly_chat.py; not written when the page is refused")
     return parser.parse_args(argv)
 
 
@@ -1068,15 +1211,22 @@ def main(argv=None, gh_runner=None, now: datetime.datetime | None = None) -> int
     gh = ghcli.Gh(args.repo, gh_runner) if gh_runner else ghcli.Gh(args.repo)
     bugs = read_bugs(gh, data if isinstance(data, dict) else {}, args.repo)
     week_end = args.week_end or default_week_end(now.date())
-    page, failures = produce(data if isinstance(data, dict) else {}, store, domain_rows, week_end, bugs, now, args.repo, args.repo_root)
+    week, page, failures = produce_week(data if isinstance(data, dict) else {}, store, domain_rows, week_end, bugs, now,
+                                        args.repo, args.repo_root)
     if failures:
         log(f"weekly health email for the week ending {week_end}: NOT rendered; an integrity check failed:")
         for reason in failures:
             log(f"  - {reason}")
+        if args.chat_out:
+            log("the weekly Chat summary is not written either, so nothing is posted for this week until a render passes")
         return 1
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(page)
     print(f"weekly health email for the week ending {week_end}: wrote {args.out}")
+    if args.chat_out:
+        args.chat_out.parent.mkdir(parents=True, exist_ok=True)
+        args.chat_out.write_text(json.dumps({CHAT_WEEK_KEY: week_end.isoformat(), CHAT_TEXT_KEY: chat_text(week)}, ensure_ascii=False) + "\n")
+        print(f"weekly Chat summary for the week ending {week_end}: wrote {args.chat_out}")
     return 0
 
 

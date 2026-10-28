@@ -26,7 +26,9 @@ plus one line, once per episode, when the gate is slow without being broken
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
-([below](#the-watched-periodics)).
+([below](#the-watched-periodics)). Once a week, from 9 AM Toronto time on
+Monday, `scripts/eval_dashboard/weekly_chat.py` posts the weekly health
+summary to the same space ([below](#the-weekly-health-email)).
 The digest also carries a section on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected), built by
 `scripts/eval_dashboard/nightly_digest.py`; [The nightly section](#the-nightly-section)
@@ -1009,8 +1011,9 @@ is a dry run; `--live` writes.
 `scripts/eval_dashboard/weekly_email.py` renders a one-page summary of the
 nightly tier for leadership and the team. Its step runs after the bug filer, so
 a bug filed that tick counts, and publishes it as `health-email.html` beside
-`data.json`. Nothing sends it yet: the mail route,
-the sending account and the chat line that links to it are still to be decided.
+`data.json`. Nothing mails it yet: the mail route and the sending account are
+still to be decided. Its summary is posted to the CI-health Chat space once a
+week (below).
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
@@ -1026,7 +1029,8 @@ counted in the closing note.
 
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
-the compared scenarios' graded repetitions), a "Needs attention" box, one row per area with
+the compared scenarios' graded repetitions with its 90th percentile, "the
+slowest 10%"), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1063,9 +1067,30 @@ stays. The checks:
   footer names those models and the two weeks' dates; a week that changed model
   says so in the intro.
 
+The weekly Chat post is the same week in a few lines: the pass rate with its
+change from last week (or why no change is called: how many nights counted and
+why the rest were left out), the "Needs attention" areas with their open-bug
+counts and links, the three strongest areas, the task time (the median, the
+90th percentile and the area with the slowest median, with the median's change
+when the week has a trend), and links to the page and the dashboard. The
+render step writes it (`--chat-out`) only when the page passes, from the
+numbers the page printed, so the two cannot disagree and a refused week posts
+nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
+the first tick at or after 9 AM Toronto time on the Monday after the week ends,
+through the poster's app identity and token, and records the week in
+`weekly-chat-state.json` beside `data.json`, so later ticks and re-runs post
+nothing more for that week. The week is recorded after the post, so a record
+that fails to write means the next tick posts it again rather than never. A
+Monday missed (a refused render, a failed post) is retried each tick until the
+week rolls over at 00:00 UTC Monday (Sunday evening in Toronto). `CI_HEALTH_MUTE=true`
+skips it and records nothing; a state object it cannot read posts nothing that
+tick.
+
 Locally,
-`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html`
-renders against any downloaded pair (it reads the issues with `gh`).
+`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html --chat-out weekly-chat.json`
+renders against any downloaded pair (it reads the issues with `gh`), and
+`python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
+prints the post.
 
 ## The seeded-fleet scan
 
@@ -1374,8 +1399,8 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_SA` override them. The off switch is the repository variable
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
-step on pull requests is skipped, the nightly bug filer and the coverage-gap
-filer run dry, and the refresh, the verdict and the
+step on pull requests and the weekly summary are skipped, the nightly bug
+filer and the coverage-gap filer run dry, and the refresh, the verdict and the
 `health.json` upload carry on. It exits before writing `health-state.json`
 too, so what the poster remembers stands still while muted: an alert already
 sent stays sent. The dashboard is unaffected — the pool episode's start rides
