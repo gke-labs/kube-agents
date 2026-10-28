@@ -147,12 +147,13 @@ class WhenNothingIsPosted(Base):
         self.assertFalse(self.state.exists())
         self.assertIn("no weekly summary to post", self.log)
 
-    def test_a_failed_post_records_nothing_so_the_next_tick_retries(self):
+    def test_a_post_that_fails_after_the_record_is_not_retried(self):
         self.assertEqual(self.tick(DUE, opener=FakeOpener(fail=True)), 1)
-        self.assertFalse(self.state.exists())
+        self.assertEqual(json.loads(self.state.read_text())["week_end"], WEEK_END)
+        self.assertIn("NOT retried", self.log)
         self.assertNotIn(TOKEN, self.log)
         self.assertEqual(self.tick("2026-10-26T13:15:00Z"), 0)
-        self.assertEqual(self.opener.texts, [TEXT])
+        self.assertEqual(self.opener.texts, [])
 
     def test_unconfigured_posts_nothing(self):
         self.assertEqual(self.tick(DUE, env={}), 0)
@@ -196,7 +197,7 @@ class GsState(Base):
         self.assertEqual(self.tick(DUE), 1)
         self.assertEqual(self.opener.texts, [])
 
-    def test_a_record_that_fails_to_write_is_posted_again_rather_than_never(self):
+    def test_a_record_that_fails_to_write_posts_nothing_and_the_next_tick_posts_once(self):
         gs = FakeGsutil()
 
         def failing_cp(argv, **kwargs):
@@ -204,12 +205,15 @@ class GsState(Base):
                 raise wc.subprocess.CalledProcessError(1, argv)
             return gs(argv, **kwargs)
 
-        self.assertEqual(self.tick(DUE, state=GS_STATE, runner=failing_cp), 1)
-        self.assertIn("may post it again", self.log)
-        self.assertEqual(self.tick("2026-10-26T13:15:00Z", state=GS_STATE, runner=gs), 0)
-        self.assertEqual(self.opener.texts, [TEXT, TEXT])
+        # Every tick whose write fails posts nothing: never a post per tick.
+        for now in (DUE, "2026-10-26T13:15:00Z"):
+            self.assertEqual(self.tick(now, state=GS_STATE, runner=failing_cp), 1)
+        self.assertEqual(self.opener.texts, [])
+        self.assertIn("not posting", self.log)
+        for now in ("2026-10-26T13:30:00Z", "2026-10-26T13:45:00Z"):
+            self.assertEqual(self.tick(now, state=GS_STATE, runner=gs), 0)
+        self.assertEqual(self.opener.texts, [TEXT])
         self.assertEqual(json.loads(gs.content)["week_end"], WEEK_END)
-
 
 if __name__ == "__main__":
     unittest.main()

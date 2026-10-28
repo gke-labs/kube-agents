@@ -1079,10 +1079,12 @@ nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
 the first tick at or after 9 AM Toronto time on the Monday after the week ends,
 through the poster's app identity and token, and records the week in
 `weekly-chat-state.json` beside `data.json`, so later ticks and re-runs post
-nothing more for that week. The week is recorded after the post, so a record
-that fails to write means the next tick posts it again rather than never. A
-Monday missed (a refused render, a failed post) is retried each tick until the
-week rolls over at 00:00 UTC Monday (Sunday evening in Toronto). `CI_HEALTH_MUTE=true`
+nothing more for that week. The week is recorded before the post, so it goes
+out at most once: a Monday missed (a refused render, a state object it cannot
+read or write) is retried each tick until the week rolls over at 00:00 UTC
+Monday (Sunday evening in Toronto), but a post that fails after the record is
+written is not: the step logs an error and that week's summary is missed
+(deleting `weekly-chat-state.json` posts it on the next tick). `CI_HEALTH_MUTE=true`
 skips it and records nothing; a state object it cannot read posts nothing that
 tick.
 

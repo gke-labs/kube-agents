@@ -17,8 +17,10 @@ alternative), through post_health.Sender. CI_HEALTH_MUTE=true posts nothing
 and records nothing, so a week muted on Monday posts once unmuted, within
 the week. A state object it cannot read (anything but a NotFound, or not
 JSON) posts nothing that tick, rather than risk posting a week twice. The
-week is recorded after the post: a post whose record then fails to write is
-posted again next tick (at least once, never skipped).
+week is recorded before the post, so it goes out at most once: a record that
+fails to write posts nothing (the next tick retries), and a post that fails
+after the record is written is not retried -- the week is missed, and the
+log says so.
 
 Run:  python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run
 Test: cd scripts && python3 -m unittest test_eval_dashboard_weekly_chat
@@ -131,14 +133,15 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
     if not sender.configured:
         log(post_health.NOT_CONFIGURED)
         return 0
-    if not sender.send(text):
-        log(f"weekly summary for the week ending {week_end}: post failed; the next tick retries")
-        return 1
     try:
         post_health.write_state(args.state, {STATE_WEEK_KEY: week_end.isoformat(),
                                              STATE_POSTED_KEY: now.isoformat(timespec="seconds")}, runner)
     except (OSError, subprocess.CalledProcessError) as exc:
-        log(f"weekly summary for the week ending {week_end}: posted, but {args.state} was not written ({exc}); the next tick may post it again")
+        log(f"weekly summary for the week ending {week_end}: {args.state} could not be written ({exc}); not posting, the next tick retries")
+        return 1
+    if not sender.send(text):
+        log(f"ERROR: weekly summary for the week ending {week_end}: the post failed after the week was recorded in "
+            f"{args.state}; it is NOT retried and this week's summary is missed (delete the object to post it again)")
         return 1
     log(f"weekly summary for the week ending {week_end}: posted via {sender.describe()}")
     return 0
