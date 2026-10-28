@@ -48,6 +48,14 @@ _LEDGER_MINT = _REPO_ROOT / "hack" / "ledger_token_mint.py"
 # test that supplies both halves of an agreement cannot detect them diverging.
 _TERMINAL_RC = 1
 
+# The three renewal tests below poll for the renewal with these; together
+# they give about twenty seconds. Nominal completion is three to five seconds
+# (a two-second period, then one-second retries), the bound sits inside the
+# subprocess's sixty-second timeout, and the slack is for a saturated runner,
+# where the unit-test job ran one file per CPU in three shards.
+_RENEWAL_POLLS = 40
+_RENEWAL_POLL_SECONDS = 0.5
+
 
 def _extract(pattern, what):
     text = _CI_EVAL_PR.read_text(encoding="utf-8")
@@ -255,9 +263,16 @@ class LedgerTokenRenewalTest(unittest.TestCase):
     def _run(self, body, **env):
         key_file = self.tmp / "ledger.pem"
         key_file.write_text("not a real key -- the mint itself is stubbed\n")
+        # stderr goes to a file rather than a pipe so the body can read what
+        # the renewer has printed so far (RENEWER_LOG) while it is still
+        # running; it is read back into proc.stderr once bash exits, so the
+        # assertions see the same text they would from a pipe.
+        log_file = self.tmp / "renewer.log"
         script = "\n".join(
             [
                 "set -euo pipefail",
+                f"RENEWAL_POLLS={_RENEWAL_POLLS}",
+                f"RENEWAL_POLL_SECONDS={_RENEWAL_POLL_SECONDS}",
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
@@ -287,15 +302,20 @@ class LedgerTokenRenewalTest(unittest.TestCase):
             "BENCH_GITHUB_TOKEN": "tok-at-launch",
             "TOKEN_FILE": str(self.tmp / "unit.ledger-token"),
             "COUNT_FILE": str(self.tmp / "mint-count"),
+            "RENEWER_LOG": str(log_file),
         }
         overrides.update(env)
-        return subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env=get_isolated_test_env(overrides=overrides),
-        )
+        with log_file.open("w", encoding="utf-8") as log:
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=log,
+                text=True,
+                timeout=60,
+                env=get_isolated_test_env(overrides=overrides),
+            )
+        proc.stderr = log_file.read_text(encoding="utf-8")
+        return proc
 
     def test_the_file_starts_with_the_launch_token_and_is_renewed_then_removed(self):
         proc = self._run(
@@ -305,9 +325,9 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 echo "EXPORTED=${BENCH_GITHUB_TOKEN_FILE}"
                 echo "AT_LAUNCH=$(cat "${TOKEN_FILE}")"
                 echo "MODE=$(stat -c %a "${TOKEN_FILE}" 2>/dev/null || stat -f %Lp "${TOKEN_FILE}")"
-                for _ in $(seq 1 20); do
+                for _ in $(seq 1 "${RENEWAL_POLLS}"); do
                   grep -q tok-renewed "${TOKEN_FILE}" && break
-                  command sleep 0.5
+                  command sleep "${RENEWAL_POLL_SECONDS}"
                 done
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 renewer="${LEDGER_TOKEN_RENEWER}"
@@ -333,13 +353,19 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         # Two refusals, then a mint. With the retry at a whole period the
         # third attempt would come six seconds in; at the retry step it comes
         # in about four, well inside the wait below.
+        #
+        # The wait is on the renewer's "renewed after" line, not on the token
+        # file: the renewer moves the new token into the file and only then
+        # prints the line, so a stop issued as soon as the file changes can
+        # kill it between the two and the assertion on the line fails. Once
+        # the line is on record the file already holds the renewed token.
         proc = self._run(
             textwrap.dedent(
                 """\
                 start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
-                for _ in $(seq 1 12); do
-                  grep -q tok-renewed "${TOKEN_FILE}" && break
-                  command sleep 0.5
+                for _ in $(seq 1 "${RENEWAL_POLLS}"); do
+                  grep -q "renewed after" "${RENEWER_LOG}" && break
+                  command sleep "${RENEWAL_POLL_SECONDS}"
                 done
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 stop_ledger_token_renewal "${TOKEN_FILE}"
@@ -355,13 +381,17 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         # The mint's ERROR block says grading cannot proceed, which is false
         # while the file still holds a live token; repeated on every retry it
         # filled the job log for the rest of the unit.
+        #
+        # Waits on the renewer's "renewed after" line rather than the token
+        # file, for the reason given in the test above: the line is printed
+        # after the token swap, and a stop between the two loses it.
         proc = self._run(
             textwrap.dedent(
                 """\
                 start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
-                for _ in $(seq 1 16); do
-                  grep -q tok-renewed "${TOKEN_FILE}" && break
-                  command sleep 0.5
+                for _ in $(seq 1 "${RENEWAL_POLLS}"); do
+                  grep -q "renewed after" "${RENEWER_LOG}" && break
+                  command sleep "${RENEWAL_POLL_SECONDS}"
                 done
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 stop_ledger_token_renewal "${TOKEN_FILE}"
