@@ -277,7 +277,7 @@ func readMCPToken(t *testing.T, cl client.Client) (*corev1.Secret, error) {
 
 // The token is minted once and never rotated by the operator, so a person can
 // rotate it by editing the Secret; an empty one is filled; an unowned one is
-// refused rather than adopted.
+// left alone and reported rather than adopted.
 func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 	ctx := context.Background()
 	agent := a2aTestAgent()

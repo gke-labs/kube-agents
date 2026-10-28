@@ -3971,12 +3971,6 @@ func a2aGatewayConditionStands(agent *agentv1alpha1.PlatformAgent) bool {
 		(existing.Reason == a2aGatewayLegacyDarkReason || existing.Reason == a2aGatewayWakingReason)
 }
 
-// setA2AGatewayCondition writes the A2AGateway condition on the EventWatcher
-// pattern: present while the state holds, removed the pass it stops holding.
-// The only state is the way back on an upgraded install (a gateway an older
-// operator ran at zero replicas, scaled to one and not ready yet). Not
-// Degraded: the message says the gateway is waiting for its replica, and
-// the Ready condition says on what.
 // a2aMCPIdentityConditionCurrent and setA2AMCPIdentityCondition carry the
 // MCP server condition (a2aMCPIdentityConditionType): present, True, with
 // the reason a2aProvisionState.mcpNotRendered names, while the door is on
@@ -4008,6 +4002,12 @@ func setA2AMCPIdentityCondition(agent *agentv1alpha1.PlatformAgent, reason strin
 	})
 }
 
+// setA2AGatewayCondition writes the A2AGateway condition on the EventWatcher
+// pattern: present while the state holds, removed the pass it stops holding.
+// The only state is the way back on an upgraded install (a gateway an older
+// operator ran at zero replicas, scaled to one and not ready yet). Not
+// Degraded: the message says the gateway is waiting for its replica, and
+// the Ready condition says on what.
 func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
 	if msg == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aGatewayConditionType)
