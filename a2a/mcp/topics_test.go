@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -761,19 +762,174 @@ func (f *slowTopicsBus) ListTopics(ctx context.Context) (TopicList, error) {
 }
 
 // The read runs detached from its caller, under its own budget: a caller that
-// has already gone does not cut short the answer the next caller is handed.
+// has already gone is told so, and the read it started still answers the next
+// caller, uncut.
 func TestAReadOutlivesItsCaller(t *testing.T) {
 	f := &fakeTopicsBus{}
+	tool := readTopicsTool(f, time.Now)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := readTopicsTool(f, time.Now).Call(ctx, []byte(`{"action":"list"}`)); err != nil {
+	// The gone caller may be answered by the read or told it left first.
+	if _, err := tool.Call(ctx, []byte(`{"action":"list"}`)); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("a gone caller got %v, want the read's answer or context.Canceled", err)
+	}
+	if _, err := tool.Call(context.Background(), []byte(`{"action":"list"}`)); err != nil {
 		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lists != 1 {
+		t.Errorf("the next caller read again (%d reads), want the gone caller's read", f.lists)
 	}
 	if f.ctxErr != nil {
 		t.Errorf("the read was handed the caller's cancelled context: %v", f.ctxErr)
 	}
 	if f.deadline <= 0 || f.deadline > topicReadTimeout {
 		t.Errorf("the read's budget was %v, want at most %v", f.deadline, topicReadTimeout)
+	}
+}
+
+// blockedRead is a topic read that counts its calls and returns text once
+// release is closed.
+type blockedRead struct {
+	reads   atomic.Int32
+	started chan struct{} // closed by the first call
+	once    sync.Once
+	release chan struct{}
+	ctx     chan context.Context // the first call's context, if buffered
+}
+
+func newBlockedRead() *blockedRead {
+	return &blockedRead{started: make(chan struct{}), release: make(chan struct{}), ctx: make(chan context.Context, 1)}
+}
+
+func (b *blockedRead) read(ctx context.Context) (string, error) {
+	b.reads.Add(1)
+	b.once.Do(func() { b.ctx <- ctx; close(b.started) })
+	<-b.release
+	return "slow answer", nil
+}
+
+// A key with a kept answer is answered at once while another key's read is
+// still running: the lock is not held across a read.
+func TestACachedTopicIsNotQueuedBehindAnotherRead(t *testing.T) {
+	c := newTopicCache(time.Now)
+	if _, err := c.answer(context.Background(), "fast", func(context.Context) (string, error) { return "fast answer", nil }); err != nil {
+		t.Fatal(err)
+	}
+	slow := newBlockedRead()
+	defer close(slow.release)
+	go func() { _, _ = c.answer(context.Background(), "slow", slow.read) }()
+	<-slow.started
+
+	got := make(chan string, 1)
+	go func() {
+		text, _ := c.answer(context.Background(), "fast", func(context.Context) (string, error) { return "", errors.New("read again") })
+		got <- text
+	}()
+	select {
+	case text := <-got:
+		if text != "fast answer" {
+			t.Errorf("cached key answered %q, want the kept answer", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cached key waited behind another key's read")
+	}
+}
+
+// Concurrent callers of one key share one read.
+func TestConcurrentCallersOfAKeyShareOneRead(t *testing.T) {
+	const callers = 32
+	c := newTopicCache(time.Now)
+	r := newBlockedRead()
+	var ready, done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			text, err := c.answer(context.Background(), "k", r.read)
+			if err == nil && text != "slow answer" {
+				err = fmt.Errorf("answer %q", text)
+			}
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	<-r.started
+	// Give every caller time to reach the in-flight read; a late one is
+	// answered from the kept answer, which is one read either way.
+	time.Sleep(50 * time.Millisecond)
+	close(r.release)
+	done.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if n := r.reads.Load(); n != 1 {
+		t.Errorf("%d concurrent callers of one key read %d times, want 1", callers, n)
+	}
+}
+
+// A waiter whose context ends leaves with an error while the read runs on,
+// and the read's answer is kept for the next caller.
+func TestAWaiterLeavesOnItsDeadlineAndTheReadIsKept(t *testing.T) {
+	c := newTopicCache(time.Now)
+	r := newBlockedRead()
+	go func() { _, _ = c.answer(context.Background(), "k", r.read) }()
+	<-r.started
+	rctx := <-r.ctx
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	left := make(chan error, 1)
+	go func() { _, err := c.answer(ctx, "k", r.read); left <- err }()
+	select {
+	case err := <-left:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter past its deadline got %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(r.release)
+		t.Fatal("a waiter past its deadline did not leave")
+	}
+	if err := rctx.Err(); err != nil {
+		t.Fatalf("the read was cut short when a waiter left: %v", err)
+	}
+	close(r.release)
+	// Wait for the read to finish and be kept, then ask again.
+	for {
+		c.mu.Lock()
+		_, busy := c.inflight["k"]
+		c.mu.Unlock()
+		if !busy {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	text, err := c.answer(context.Background(), "k", func(context.Context) (string, error) { return "", errors.New("read again") })
+	if err != nil || text != "slow answer" {
+		t.Errorf("next caller got %q, %v; want the kept answer", text, err)
+	}
+	if n := r.reads.Load(); n != 1 {
+		t.Errorf("reads = %d, want 1", n)
+	}
+}
+
+// A read that panics fails its waiters and frees its key, rather than leaving
+// every later caller of the key waiting.
+func TestAPanickingTopicReadFreesItsKey(t *testing.T) {
+	c := newTopicCache(time.Now)
+	if _, err := c.answer(context.Background(), "k", func(context.Context) (string, error) { panic("boom") }); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want the panic as an error", err)
+	}
+	text, err := c.answer(context.Background(), "k", func(context.Context) (string, error) { return "ok", nil })
+	if err != nil || text != "ok" {
+		t.Errorf("after a panic the key answered %q, %v; want a fresh read", text, err)
 	}
 }
 
