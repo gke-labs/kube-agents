@@ -59,9 +59,11 @@ type fakeSlackAPI struct {
 	// onPost, when set, runs at the start of every chat.postMessage, so a
 	// test can look at the adapter's state while a post is in flight.
 	onPost func()
-	// conversations and conversationErr answer conversations.info.
-	conversations   map[string]*slack.Channel
-	conversationErr error
+	// conversations and conversationErr answer conversations.info;
+	// conversationInfoCalls counts the calls.
+	conversations         map[string]*slack.Channel
+	conversationErr       error
+	conversationInfoCalls int
 	// views records views.publish calls by member.
 	views []publishedView
 }
@@ -112,6 +114,7 @@ func (f *fakeSlackAPI) GetUserInfoContext(_ context.Context, user string, option
 func (f *fakeSlackAPI) GetConversationInfoContext(_ context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.conversationInfoCalls++
 	if ch, ok := f.conversations[input.ChannelID]; ok {
 		return ch, nil
 	}

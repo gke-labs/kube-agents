@@ -21,8 +21,9 @@
 # shape; the SC2154 half is this file's, because it reads as well as writes.
 
 # The scaffolding a gitops-drift fixture needs around its own plant -- for the
-# three stacks that hand the record straight to the Session KV daemon:
-# gitops-drift, gitops-drift-deleted-policy and gitops-drift-load-bearing.
+# stacks that hand the record straight to the Session KV daemon:
+# gitops-drift, gitops-drift-deleted-policy, gitops-drift-load-bearing and
+# gitops-drift-unmanaged-object.
 #
 # gitops-drift-noise is NOT one of them. It publishes to Pub/Sub and drives the
 # real detector, so only step 0 is common ground, and it still carries its own

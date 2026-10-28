@@ -3053,8 +3053,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self.assertIn(
                 "**Who acts on this:**\n"
                 "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
-                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                + session_kv_server.TRIAGE_FIX_AGAINST_LIVE_OBJECT
+                + "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
                 "(no `kubectl scale`, `patch`, or `apply`).",
                 body,
             )
@@ -3096,7 +3097,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
         self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
         slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
-        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        self.assertIn(r"is\s+being\s+opened\s+automatically", slack)
         task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
         self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
         off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
@@ -3111,6 +3112,16 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             r"^platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled-[0-9a-f]{8}$",
         )
         self.assertIn("**submit-suggestion**", body)
+        self.assertIn("Implement ONLY that recommended option", body)
+        self.assertIn("changing only the file(s) that option calls for", body)
+        self.assertIn("edit only the synced workload manifest(s)", body)
+        self.assertIn("never bundle any non-recommended option", body)
+        self.assertIn(
+            "never touch unrelated manifests or infrastructure definitions that the recommended option does not target",
+            body,
+        )
+        self.assertNotIn("ArgoCD", body)
+        self.assertNotIn("unapplied Terraform", body)
         self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
@@ -4396,6 +4407,100 @@ class TestIsFleetAuditJob(unittest.TestCase):
                     self.assertFalse(session_kv_server._is_fleet_audit_job(profile, job_id))
 
 
+class TestProfileHome(unittest.TestCase):
+    """A profile's directory is resolved once, under the agent home; a name that leaves it is no profile."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def test_the_default_profile_is_the_agent_home_and_a_named_one_sits_under_profiles(self):
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            self.assertEqual(session_kv_server._profile_home("default"), self.home)
+            self.assertEqual(session_kv_server._profile_home("platform"), os.path.join(self.home, "profiles", "platform"))
+            self.assertEqual(session_kv_server._profile_home("seeded-a.v2"), os.path.join(self.home, "profiles", "seeded-a.v2"))
+
+    def test_a_profile_that_leaves_the_profiles_directory_is_none(self):
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            for profile in ("..", ".", "../..", "../platform", "profiles/platform", "a/b", self.home, "/etc", "", "a b"):
+                with self.subTest(profile=profile):
+                    self.assertIsNone(session_kv_server._profile_home(profile))
+
+    def test_a_home_of_slash_or_dot_still_resolves(self):
+        # `agent_home` returns "/" for PLATFORM_AGENT_HOME=/ and "." for
+        # PLATFORM_AGENT_HOME=.: the first is a root that already ends in a
+        # separator, the second resolves against the working directory, as the
+        # open would.
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value="/"):
+            self.assertEqual(session_kv_server._profile_home("default"), "/")
+            self.assertEqual(session_kv_server._profile_home("platform"), "/profiles/platform")
+            self.assertIsNone(session_kv_server._profile_home(".."))
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.home)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            self.assertEqual(session_kv_server._profile_home("default"), os.getcwd())
+            self.assertEqual(session_kv_server._profile_home("platform"), os.path.join(os.getcwd(), "profiles", "platform"))
+            self.assertIsNone(session_kv_server._profile_home(".."))
+
+    def test_the_state_db_of_a_profile_that_leaves_the_data_root_is_none(self):
+        # A `state.db` where a climb out of `profiles/` would land, the data
+        # root itself: the default profile's store, never `..`'s.
+        root = Path(self.home)
+        (root / "state.db").write_bytes(b"")
+        self.assertEqual(session_kv_server._profile_state_db(root, "default"), root / "state.db")
+        self.assertEqual(session_kv_server._profile_state_db(root, ""), root / "state.db")
+        for profile in ("..", "../..", "a/b", self.home):
+            with self.subTest(profile=profile):
+                self.assertIsNone(session_kv_server._profile_state_db(root, profile))
+        self.assertIsNone(session_kv_server._profile_state_db(root, "platform"))  # no store there
+
+    def test_a_relative_home_whose_working_directory_is_gone_names_no_profile(self):
+        # `agent_home` returns "." for PLATFORM_AGENT_HOME=.; once the process's
+        # working directory is unlinked, `abspath` cannot resolve it. That is
+        # no profile, not an exception: each reader keeps its fallback.
+        import gitops_workspace
+
+        self.addCleanup(os.chdir, os.getcwd())
+        gone = tempfile.mkdtemp()
+        os.chdir(gone)
+        os.rmdir(gone)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            self.assertIsNone(session_kv_server._profile_home("platform"))
+            self.assertIsNone(session_kv_server._profile_home("default"))
+        self.assertIsNone(session_kv_server._profile_state_db(Path("."), "platform"))
+
+    def test_a_profile_that_is_a_symlink_out_of_the_profiles_directory_is_none(self):
+        # `profiles/<name>` that points outside the profiles directory is no
+        # profile, even though its name is one segment and its lexical path
+        # stays under `profiles/`: the store it would reach is not the
+        # profile's. A link that stays inside, and a home that is itself a
+        # link, both pass.
+        import gitops_workspace
+
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        (Path(outside) / "state.db").write_bytes(b"")
+        profiles = os.path.join(self.home, "profiles")
+        os.makedirs(os.path.join(profiles, "platform"))
+        os.symlink(outside, os.path.join(profiles, "escaped"))
+        os.symlink(os.path.join(profiles, "platform"), os.path.join(profiles, "alias"))
+        linked_home = os.path.join(outside, "home-link")
+        os.symlink(self.home, linked_home)
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            self.assertIsNone(session_kv_server._profile_home("escaped"))
+            self.assertEqual(session_kv_server._profile_home("alias"), os.path.join(profiles, "alias"))
+        self.assertIsNone(session_kv_server._profile_state_db(Path(self.home), "escaped"))
+        self.assertEqual(
+            session_kv_server._profile_home("platform", linked_home), os.path.join(linked_home, "profiles", "platform")
+        )
+
+
 class TestAuditChatReport(unittest.TestCase):
     """A fleet-audit job posts the report its run's `finish` left, never its final message."""
 
@@ -4936,6 +5041,24 @@ class TestSchedulerFailureLine(unittest.TestCase):
                 failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
                 self.assertTrue(failure.text.endswith("It will try again at its next scheduled run."))
 
+    def test_a_profile_that_leaves_the_profiles_directory_reads_no_roster(self):
+        # A daily roster where a climb out of `profiles/` would land, the agent
+        # home itself: readable as the default profile's, never as `..`'s, so
+        # the line for such a profile says "next scheduled run", not "tomorrow".
+        import cron_schedule
+
+        cron = os.path.join(self.home, "cron")
+        os.makedirs(cron)
+        with open(os.path.join(cron, "jobs.json"), "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "obtainability-audit", "schedule": {"kind": "cron", "expr": "50 6 * * *"}}]}, handle)
+        self.assertTrue(session_kv_server._runs_daily("default", "obtainability-audit"))
+        for profile in ("..", "../..", self.home, "a/b"):
+            with self.subTest(profile=profile), patch.object(cron_schedule, "open", create=True) as opened:
+                self.assertFalse(session_kv_server._runs_daily(profile, "obtainability-audit"))
+                opened.assert_not_called()
+                failure = session_kv_server.scheduler_failure_line(profile, "obtainability-audit", self.TITLE, self.QUOTA)
+                self.assertTrue(failure.text.endswith(session_kv_server.SCHEDULER_FAILURE_NEXT_UNKNOWN))
+
     def test_every_leg_gets_the_same_line_with_no_clock_time(self):
         self.roster("50 6 * * *")
         _, sent = self.post(platforms=("slack", "google_chat"))
@@ -4984,8 +5107,20 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(len(sent), 1)
 
     def test_a_profile_that_is_not_one_segment_reads_no_ledger(self):
+        import sqlite3
+
+        # A ledger with a clean run where a climb out of `profiles/` would land,
+        # the agent home itself: read as the default profile's, never as `..`'s.
         self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
-        for profile in ("..", "../..", "/var/lib/x", "a/b"):
+        cron = os.path.join(self.home, "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('obtainability-audit', 'completed', '2026-10-21T06:50:00+00:00')")
+        with patch.object(session_kv_server.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            self.assertTrue(session_kv_server._run_completed_since("default", "obtainability-audit", 0.0))
+            connect.assert_called_once()
+        for profile in ("..", "../..", "/var/lib/x", self.home, "a/b"):
             with self.subTest(profile=profile), patch.object(session_kv_server.sqlite3, "connect") as connect:
                 self.assertTrue(session_kv_server._run_completed_since(profile, "obtainability-audit", 0.0))
                 connect.assert_not_called()
@@ -6444,6 +6579,47 @@ class TestDriftInject(unittest.TestCase):
             / "SKILL.md"
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
+
+    def test_the_card_handles_an_object_git_does_not_declare(self):
+        """No declared state means no revert, and the card has to say so twice.
+
+        Once as the instruction, and once in **Done when**, which otherwise
+        demands revert-or-codify and so makes a report that correctly offers no
+        revert unfinishable. The card defers the list of GitOps markers to the
+        skill ("the skill lists them"), so the skill has to carry one: the
+        worker has no repository to check, and the markers are all it has.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("establish whether git declares this object at all", card)
+        self.assertIn("no declared state to revert to", card)
+        # A delete leaves no live object, so no markers proves nothing and the
+        # revert has to survive: gitops-drift-deleted-policy-triage expects it.
+        # No pull request can delete an object git never held, and chat turns
+        # every lettered option into an 'apply' button, so deletion is an
+        # unlettered Manual step (observed: a lettered "Delete unmanaged
+        # namespace" option with "apply Option B" beside it).
+        self.assertIn("never a lettered option, never the recommendation", card)
+        self.assertIn("- **Manual step (<title>):**", card)
+        # Only a person's kubectl subcommands read as "not in git"; a manager
+        # the card cannot name may be a pipeline's and keeps the revert.
+        self.assertIn("its only field managers are a person's `kubectl` subcommands", card)
+        self.assertIn("a field manager you do not recognise", card)
+        self.assertIn("A deleted object carries nothing to read", card)
+        self.assertIn("keep the revert", card)
+        done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("for an object git does not declare", done_when)
+        self.assertIn("proposes codifying it", done_when)
+
+        skill = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for marker in ("argocd-controller", "kustomize-controller", "configsync.gke.io"):
+            self.assertIn(marker, skill, f"the skill the card defers to no longer names {marker}")
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
@@ -8057,6 +8233,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             self.assertNotIn(leaked, sess_serialized)
         self.assertIn("[REDACTED_SECRET]", serialized)
         self.assertIn("[REDACTED_PRIVATE_KEY]", serialized)
+        # A manifest's `data` is blanked by shape, a ConfigMap's as a Secret's.
+        self.assertNotIn("kept_plain_value", serialized)
+        self.assertIn("plain_field", serialized)
         for preserved in (
             "app-tls-secret",
             "/var/run/secrets/token",
@@ -8070,7 +8249,6 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "tls.crt:  1679 bytes",
             "cert.pem: OK",
             "cert.pem: PEM certificate",
-            "kept_plain_value",
             "/etc/creds/mounted-path",
             "deployment-controller mounts them",
             "/opt/data/gitops/x",
@@ -8130,7 +8308,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", benign), benign)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
-        # `_CLI_USERPASS_FLAG_RE` and `_CLI_SHORT_P_RE` end a command's segment
+        # `worker_transcript.CLI_USERPASS_FLAG_RE` and `CLI_SHORT_P_RE` end a command's segment
         # at `&`, `;` or `|`; inside a quoted argument those are data.
         for cmd, cred, kept in (
             (
@@ -8169,8 +8347,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(cleaned, crafted_line)
 
     def test_secret_read_command_detector_covers_every_output_form(self):
-        # The detector keys on "get secret" plus any output shaping or pipe,
-        # not on an enumerated list of formatters an agent may not pick.
+        # The detector fails closed: a `kubectl get` of a secret is served only
+        # as the bare list, a store's command only as one of its named lists,
+        # and a form no list named withholds (the grammar's own cases live in
+        # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
@@ -8207,9 +8387,23 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "sops --decrypt secrets.enc.yaml",
             "kubectl exec deploy/api -- cat /etc/db-creds/password",
             "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+            # a form no list named fails closed (the grammar's own cases
+            # live in test_worker_transcript.py)
+            "kubectl get secret db -n prod --some-flag-added-next-release",
+            "kubectl get secrets -n $NS",
+            "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
+            "printf secret/db | xargs kubectl get -n prod -o yaml",
+            "aws secretsmanager batch-get-secret-value --secret-id-list db",
+            "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
         ]
         served = [
             "kubectl get secrets -n kube-system",
+            "kubectl get secret db -n prod --ignore-not-found",
+            "kubectl get secrets -A 2>/dev/null",
+            "kubectl get secrets -n prod | wc -l",
+            "kubectl get pods -n external-secrets",
+            "kubectl get pods -n prod -l app=kubectl-proxy",
+            "kubectl get pods -n vault",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
             "kubectl get secrets -n kube-system --show-labels",

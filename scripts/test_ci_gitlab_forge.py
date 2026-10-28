@@ -33,6 +33,7 @@ import json
 import os
 import pathlib
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -864,6 +865,106 @@ def _runner(stdout=b"glpat-fake", code=0, stderr=b""):
     return run
 
 
+class PrivateCaTest(unittest.TestCase):
+    """A self-managed instance's CA (kube-agents#3682): api() verifies with it
+    when configured or named in the environment, the system store otherwise,
+    and a CA that does not load is a refusal naming the file."""
+
+    def setUp(self):
+        gitlab.configure_ca(None)
+        self.addCleanup(gitlab.configure_ca, None)
+
+    def test_no_ca_means_the_system_store(self):
+        with mock.patch.dict(os.environ, {gitlab.CA_FILE_ENV: ""}):
+            self.assertIsNone(gitlab.ssl_context())
+
+    def test_a_configured_or_named_ca_builds_a_verifying_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pathlib.Path(tmp) / "ca.crt"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", str(pathlib.Path(tmp) / "ca.key"), "-out", str(ca), "-days", "1", "-subj", "/CN=test-ca"], check=True, capture_output=True)
+            gitlab.configure_ca(str(ca))
+            context = gitlab.ssl_context()
+            self.assertIsNotNone(context)
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            gitlab.configure_ca(None)
+            with mock.patch.dict(os.environ, {gitlab.CA_FILE_ENV: str(ca)}):
+                self.assertIsNotNone(gitlab.ssl_context())
+
+    def test_a_ca_that_does_not_load_is_a_refusal_naming_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = pathlib.Path(tmp) / "ca.crt"
+            bad.write_text("not a certificate\n")
+            gitlab.configure_ca(str(bad))
+            with self.assertRaises(gitlab.ResetError) as caught:
+                gitlab.ssl_context()
+            self.assertIn(str(bad), str(caught.exception))
+            gitlab.configure_ca(str(pathlib.Path(tmp) / "missing.crt"))
+            with self.assertRaises(gitlab.ResetError):
+                gitlab.ssl_context()
+
+    def test_api_hands_the_context_to_urlopen(self):
+        seen = {}
+
+        class _Resp:
+            status = 200
+            def read(self): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(request, timeout=None, context=None):
+            seen["context"] = context
+            seen["url"] = request.full_url
+            return _Resp()
+
+        sentinel = ssl.create_default_context()
+        with mock.patch.object(gitlab, "ssl_context", lambda: sentinel), mock.patch.object(gitlab.urllib.request, "urlopen", fake_urlopen):
+            gitlab.api("GET", "/version", "tok", host="gitlab.eval.internal")
+        self.assertIs(seen["context"], sentinel)
+        self.assertEqual(seen["url"], "https://gitlab.eval.internal/api/v4/version")
+
+
+class SelfManagedDispatchTest(unittest.TestCase):
+    """`--host` and `--ca-file` on the two reset helpers reach the GitLab
+    module: the host is where the calls go, the CA is configured before them,
+    and neither flag means anything under --forge github."""
+
+    def test_the_ledger_reset_passes_the_host_and_configures_the_ca(self):
+        seen = {}
+        def fake_reset(path, project, build, token, audit, dry_run, host=gitlab.DEFAULT_HOST, **kw):
+            seen.update(path=path, host=host, ca=gitlab._ca_file); return 0
+        with mock.patch.object(gitlab, "reset_ledgers", fake_reset), mock.patch.dict(os.environ, {"LEDGER_RESET_TOKEN": "tok"}), redirect_stdout(io.StringIO()):
+            code = ledgers.main(["--repo", PATH, "--project", PROJECT, "--build", "b", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "/tmp/eval-forge/ca.crt"])
+        gitlab.configure_ca(None)
+        self.assertEqual(code, 0)
+        self.assertEqual((seen["path"], seen["host"], seen["ca"]), (PATH, "gitlab.eval.internal", "/tmp/eval-forge/ca.crt"))
+
+    def test_the_pulls_reset_passes_the_host_and_configures_the_ca(self):
+        seen = {}
+        def fake_reset(path, project, build, scope, token, dry_run, record, host=gitlab.DEFAULT_HOST, **kw):
+            seen.update(path=path, host=host, ca=gitlab._ca_file); record["clean"] = True; return record
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gitlab, "reset_merge_requests", fake_reset), mock.patch.dict(os.environ, {"AGENT_PULLS_RESET_TOKEN": "tok"}), redirect_stdout(io.StringIO()):
+            code = pulls.main(["--repo", PATH, "--project", PROJECT, "--build", "b", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "/tmp/eval-forge/ca.crt", "--record", f"{tmp}/r.json"])
+        gitlab.configure_ca(None)
+        self.assertEqual(code, 0)
+        self.assertEqual((seen["path"], seen["host"], seen["ca"]), (PATH, "gitlab.eval.internal", "/tmp/eval-forge/ca.crt"))
+
+    def test_the_default_host_stays_gitlab_com_without_the_flag(self):
+        seen = {}
+        def fake_reset(path, project, build, token, audit, dry_run, host=gitlab.DEFAULT_HOST, **kw):
+            seen["host"] = host; return 0
+        with mock.patch.object(gitlab, "reset_ledgers", fake_reset), mock.patch.dict(os.environ, {"LEDGER_RESET_TOKEN": "tok"}), redirect_stdout(io.StringIO()):
+            ledgers.main(["--repo", PATH, "--project", PROJECT, "--build", "b", "--forge", "gitlab"])
+        self.assertEqual(seen["host"], "gitlab.com")
+
+    def test_the_flags_are_refused_under_github(self):
+        for module, env in ((ledgers, "LEDGER_RESET_TOKEN"), (pulls, "AGENT_PULLS_RESET_TOKEN")):
+            with self.subTest(module=module.__name__), mock.patch.dict(os.environ, {env: "tok"}), redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as exited:
+                    module.main(["--repo", "o/r", "--project", PROJECT, "--build", "b", "--host", "ghes.eval.internal"])
+                self.assertEqual(exited.exception.code, 2)
+                self.assertIn("--forge gitlab only", err.getvalue())
+
+
 class SweepGitLabPassTest(unittest.TestCase):
     def test_the_gitlab_mapping_is_read_from_the_deploy_script(self):
         mapping = sweeper.pool_repos(CI_DEPLOY, sweeper.GITLAB_MAPPING_FUNCTION)
@@ -1178,6 +1279,19 @@ def lifted_line(pattern):
     return match.group(0)
 
 
+def lifted_forge_setup():
+    """The eval script's forge block as it ships: the lifted table, the kind,
+    host and self-managed flag, the CA rule, the GitLab constants and the
+    helper arguments. From `eval_forge_profile() {` through the `fi` that
+    closes the helper-argument block; SCRIPT_DIR must point at a directory
+    holding ci-deploy.sh when it runs."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    start = src.index("eval_forge_profile() {")
+    marker = src.index('EVAL_FORGE_HELPER_ARGS+=(--ca-file "${EVAL_FORGE_CA_FILE}")', start)
+    end = src.index("\nfi\n", marker) + len("\nfi\n")
+    return src[start:end]
+
+
 def literal(path, name):
     match = re.search(rf'^{name}="([^"]*)"$', path.read_text(encoding="utf-8"), re.MULTILINE)
     assert match, f"{name} not found in {path}"
@@ -1214,6 +1328,15 @@ STUB_WHOAMI = textwrap.dedent(
     """
 )
 
+OPENSSL_STUB = """#!/usr/bin/env bash
+# openssl stand-in for the tests: `x509 -noout -text -in FILE` prints a Basic
+# Constraints block, CA:TRUE for a PEM certificate, CA:FALSE when the file
+# carries the marker NOT-A-CA; anything that is not PEM fails to parse.
+f="${@: -1}"
+grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null || { echo "unable to load certificate" >&2; exit 1; }
+if grep -q "NOT-A-CA" "$f"; then printf "X509v3 Basic Constraints: critical\n    CA:FALSE\n"; else printf "X509v3 Basic Constraints: critical\n    CA:TRUE\n"; fi
+"""
+
 STUB_HELPER = textwrap.dedent(
     """\
     import json, os, sys
@@ -1225,6 +1348,8 @@ STUB_HELPER = textwrap.dedent(
 
 
 class EvalScriptGitLabTest(unittest.TestCase):
+    forge = "gitlab"
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -1235,6 +1360,8 @@ class EvalScriptGitLabTest(unittest.TestCase):
         (self.dir / "ci_reset_agent_pulls.py").write_text(STUB_HELPER)
         (self.dir / "ci_gitlab_forge.py").write_text(STUB_WHOAMI)
         (self.dir / "ci-deploy.sh").write_text(CI_DEPLOY.read_text(encoding="utf-8"))
+        (self.bin / "openssl").write_text(OPENSSL_STUB)
+        (self.bin / "openssl").chmod(0o755)
 
     def _run(self, body, dead=""):
         """run_bash with the whoami stub's knobs: its log, and the token values it refuses."""
@@ -1245,7 +1372,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
         stub.write_text(
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$*" >> "{self.dir}/gcloud.argv"\n'
-            f'case "$*" in *"{fail}"*) [ -n "{fail}" ] && exit 1 ;; esac\n'
+            f'case "$*" in *"{fail}"*) [ -n "{fail}" ] && {{ echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: stub" >&2; exit 1; }} ;; esac\n'
             f'case "$*" in *gitlab-agent-token*) printf "%s\\n" "{agent}" ;; *gitlab-ledger-token*) printf "%s\\n" "{ledger}" ;; esac\n'
         )
         stub.chmod(0o755)
@@ -1253,19 +1380,16 @@ class EvalScriptGitLabTest(unittest.TestCase):
     def _preamble(self):
         return "\n".join(
             [
-                'EVAL_FORGE="gitlab"',
-                # The assignment is lifted, not restated: the line that fills
-                # the array is what the argv assertions below pin.
-                lifted_line(r"^EVAL_FORGE_HELPER_ARGS=\(\)$"),
-                lifted_line(r'^\[ "\$\{EVAL_FORGE\}" = "gitlab" \] && EVAL_FORGE_HELPER_ARGS=\(--forge gitlab\)$'),
-                f'GITLAB_SECRETS_PROJECT="{literal(SCRIPT, "GITLAB_SECRETS_PROJECT")}"',
-                f'GITLAB_AGENT_SM_SECRET="{literal(SCRIPT, "GITLAB_AGENT_SM_SECRET")}"',
-                f'GITLAB_LEDGER_SM_SECRET="{literal(SCRIPT, "GITLAB_LEDGER_SM_SECRET")}"',
-                f'GITLAB_BOT_LOGIN="{literal(SCRIPT, "GITLAB_BOT_LOGIN")}"',
-                f'GITLAB_FORGE_HOST="{literal(SCRIPT, "GITLAB_FORGE_HOST")}"',
-                f'SCRIPT_DIR="{self.dir}"; PROJECT_ID="{PROJECT}"; BUILD_ID=1; EVAL_LEDGER_APP_KEY_FILE=""; EVAL_LEDGER_APP_ID=1',
+                f'EVAL_FORGE="{self.forge}"; SCRIPT_DIR="{self.dir}"; EVAL_FORGE_STATE_DIR="{self.dir}/forge-state"',
+                # The forge block is lifted, not restated: the table, the kind
+                # and host it yields, the CA rule and the helper arguments are
+                # what the argv assertions below pin.
+                lifted_forge_setup(),
+                f'PROJECT_ID="{PROJECT}"; BUILD_ID=1; EVAL_LEDGER_APP_KEY_FILE=""; EVAL_LEDGER_APP_ID=1',
                 f'ARTIFACT_DIR="{self.dir}/artifacts"; AGENT_PULLS_RESET_PERMISSIONS=\'{{}}\'',
                 'EVAL_GITLAB_AGENT_TOKEN=""',
+                lifted("gitlab_token_source"),
+                lifted("read_gitlab_token"),
                 lifted("read_gitlab_tokens"),
                 lifted("eval_gitlab_project"),
                 lifted("forge_write_token"),
@@ -1308,7 +1432,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
 
     def test_the_probe_is_skipped_on_github_and_on_an_unmapped_project(self):
         self._gcloud()
-        proc = self._run(self._probe_body('EVAL_FORGE="github"'))
+        proc = self._run(self._probe_body('EVAL_FORGE="github"; EVAL_FORGE_KIND="github"'))
         self.assertIn("RC=0", proc.stdout)
         self.assertNotIn("PROBE ", (self.dir / "whoami.log").read_text())
         proc = self._run(self._probe_body('EVAL_LEDGER_REPO=""'))
@@ -1316,10 +1440,21 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertIn("Ledger probe (lease): skipped, PROJECT_ID=kube-agents-evals-2 maps to no GitLab project", proc.stdout)
         self.assertNotIn("PROBE ", (self.dir / "whoami.log").read_text())
 
+    def test_the_per_run_project_layout_equals_the_guards(self):
+        # The deploy derives a per-run GitLab's project from the lease with these two
+        # constants; the helper's project guard accepts exactly that shape.
+        self.assertEqual(literal(CI_DEPLOY, "GITLAB_FORGE_GROUP"), gitlab.GROUP)
+        self.assertEqual(literal(CI_DEPLOY, "GITLAB_FORGE_PROJECT_SUFFIX"), gitlab.PROJECT_SUFFIX)
+        proc = run_bash(lifted("eval_gitlab_project") + '\nEVAL_FORGE_SELF_MANAGED="yes"; eval_gitlab_project some-leased-project\n', env={"SCRIPT_DIR": str(HACK)})
+        self.assertEqual(proc.stdout.strip(), "gke-agentic/some-leased-project-infra")
+
     def test_the_secret_names_equal_the_deploys(self):
-        for name in ("GITLAB_SECRETS_PROJECT", "GITLAB_AGENT_SM_SECRET", "GITLAB_FORGE_HOST"):
+        for name in ("GITLAB_SECRETS_PROJECT", "GITLAB_AGENT_SM_SECRET"):
             with self.subTest(name=name):
                 self.assertEqual(literal(SCRIPT, name), literal(CI_DEPLOY, name))
+        # The host is no literal any more: both scripts read ci-deploy.sh's forge table.
+        proc = run_bash(lifted_forge_setup() + '\necho "PROFILE=${EVAL_FORGE_KIND} ${EVAL_FORGE_HOST} ${EVAL_FORGE_SELF_MANAGED} ${GITLAB_FORGE_HOST}"\n', env={"EVAL_FORGE": "gitlab", "SCRIPT_DIR": str(HACK)})
+        self.assertIn("PROFILE=gitlab gitlab.com no gitlab.com", proc.stdout)
         # Pinned as literals too: a test that only compares the two files would
         # pass with both pointing somewhere wrong.
         self.assertEqual(literal(SCRIPT, "GITLAB_SECRETS_PROJECT"), "kube-agents-prow")
@@ -1361,7 +1496,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
         """The function's return code is one half; the other is the line that
         turns it into a stopped run, under the gitlab branch of the preflight."""
         src = SCRIPT.read_text(encoding="utf-8")
-        branch = src.index('if [ "${EVAL_FORGE}" = "gitlab" ]; then\n  read_gitlab_tokens || exit 1')
+        branch = src.index('if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then\n  read_gitlab_tokens || exit 1')
         self.assertLess(branch, src.index('mint_ledger_token "preflight" || exit 1'), "the GitHub mint is the other branch of the same if")
         self.assertLess(branch, src.index('reset_audit_ledgers "lease"'))
 
@@ -1371,6 +1506,10 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertIn("RC=1", proc.stdout)
         self.assertIn("could not read kube-agents-prow/gitlab-ledger-token as this runner", proc.stderr)
         self.assertNotIn("gitlab-agent-token", proc.stderr.split("could not read", 1)[1].split(" as this runner")[0])
+        # gcloud's own reason stays above the script's line: the redirect that
+        # quiets the per-run file read must not cover the Secret Manager read.
+        self.assertIn("PERMISSION_DENIED", proc.stderr)
+        self.assertLess(proc.stderr.index("PERMISSION_DENIED"), proc.stderr.index("could not read"))
 
     def test_the_resets_get_the_agent_token_and_the_forge_flag(self):
         self._gcloud()
@@ -1386,35 +1525,104 @@ class EvalScriptGitLabTest(unittest.TestCase):
         )
         proc = self._run(body)
         out = proc.stdout
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab"]', out)
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--audit", "compliance-audit"]', out)
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com"]', out)
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com", "--audit", "compliance-audit"]', out)
         record = f"{self.dir}/artifacts/agent-pulls-reset/lease.json"
         self.assertIn(
-            f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--scope", "lease", "--record", "{record}", "--forge", "gitlab"]',
+            f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--scope", "lease", "--record", "{record}", "--forge", "gitlab", "--host", "gitlab.com"]',
             out,
         )
         self.assertIn("HELPER token=glpat-agent", out)
         self.assertNotIn("glpat-ledger", out.replace("LEDGER=glpat-ledger", ""))
         self.assertIn("PULLS_RC=0", out)
 
+    def test_the_resets_run_on_a_per_run_gitlab_without_the_app_key(self):
+        # The skip gate reads the kind, not the name: on gitlab-ce the agent token
+        # drives both resets with no GitHub App key mounted (found live, kube-agents#3682).
+        state = self.dir / "forge-state"
+        state.mkdir()
+        (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        (state / "agent-token").write_text("glpat-perrun-agent\n")
+        (state / "ledger-token").write_text("glpat-perrun-ledger\n")
+        body = self._preamble().replace(f'EVAL_FORGE="{self.forge}"', 'EVAL_FORGE="gitlab-ce"', 1) + "\n".join(
+            [
+                "",
+                "read_gitlab_tokens >/dev/null || exit 9",
+                'EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID}")"',
+                'reset_audit_ledgers "lease"',
+                'reset_agent_pulls "lease"; echo "PULLS_RC=$?"',
+            ]
+        )
+        proc = self._run(body)
+        out = proc.stdout
+        self.assertNotIn("EVAL_LEDGER_APP_KEY_FILE is unset", out)
+        per_run = f"gke-agentic/{PROJECT}-infra"
+        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', out)
+        self.assertIn("HELPER token=glpat-perrun-agent", out)
+        self.assertEqual(out.count("HELPER argv="), 2)
+        self.assertIn("PULLS_RC=0", out)
+
     def test_the_forge_switch_refuses_an_unknown_forge(self):
         src = SCRIPT.read_text(encoding="utf-8")
         start = src.index('EVAL_FORGE="${EVAL_FORGE:-github}"')
-        block = src[start : src.index("esac", start) + 4]
-        proc = run_bash(block, env={"EVAL_FORGE": "bitbucket"})
+        block = src[start:start + len('EVAL_FORGE="${EVAL_FORGE:-github}"')] + "\n" + lifted_forge_setup() + '\necho "ARGS=${EVAL_FORGE_HELPER_ARGS[*]-} CA=${EVAL_FORGE_CA_FILE}"\n'
+        env = {"SCRIPT_DIR": str(HACK), "EVAL_FORGE_STATE_DIR": f"{self.dir}/no-such-state"}
+        proc = run_bash(block, env={**env, "EVAL_FORGE": "bitbucket"})
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("EVAL_FORGE='bitbucket' is not a forge", proc.stderr)
-        self.assertEqual(run_bash(block, env={"EVAL_FORGE": ""}).returncode, 0)
+        self.assertEqual(run_bash(block, env={**env, "EVAL_FORGE": ""}).returncode, 0)
         # A developer's GitHub-era override is refused under gitlab, where the deploy ignores it.
-        overridden = run_bash(block, env={"EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": "me/throwaway"})
+        overridden = run_bash(block, env={**env, "EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": "me/throwaway"})
         self.assertNotEqual(overridden.returncode, 0)
         self.assertIn("does not take EVAL_GITOPS_REPO", overridden.stderr)
-        self.assertEqual(run_bash(block, env={"EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": ""}).returncode, 0)
+        public = run_bash(block, env={**env, "EVAL_FORGE": "gitlab", "EVAL_GITOPS_REPO": ""})
+        self.assertEqual(public.returncode, 0)
+        self.assertIn("ARGS=--forge gitlab --host gitlab.com CA=", public.stdout)
+
+    def test_a_self_managed_forge_needs_its_ca_and_hands_it_on(self):
+        """ghes and gitlab-ce (kube-agents#3682): refused without the CA the lane
+        step leaves in the state directory; with it, the kind, the private host
+        and the CA reach the helpers and the grader's variables."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        start = src.index('EVAL_FORGE="${EVAL_FORGE:-github}"')
+        block = src[start:start + len('EVAL_FORGE="${EVAL_FORGE:-github}"')] + "\n" + lifted_forge_setup() + '\necho "KIND=${EVAL_FORGE_KIND} HOST=${EVAL_FORGE_HOST} ARGS=${EVAL_FORGE_HELPER_ARGS[*]-} CA=${EVAL_FORGE_CA_FILE}"\n'
+        state = self.dir / "forge-state"
+        for forge, kind, host in (("ghes", "github", "ghes.eval.internal"), ("gitlab-ce", "gitlab", "gitlab.eval.internal")):
+            with self.subTest(forge=forge):
+                (state / "ca.crt").unlink(missing_ok=True)
+                missing = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertNotEqual(missing.returncode, 0)
+                self.assertIn(f"{state}/ca.crt (its private CA) is missing or empty", missing.stderr)
+                state.mkdir(exist_ok=True)
+                (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nNOT-A-CA\n-----END CERTIFICATE-----\n")
+                leaf = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertNotEqual(leaf.returncode, 0)
+                self.assertIn(f"{state}/ca.crt is not a CA certificate", leaf.stderr)
+                (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+                proc = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                args = f"--forge gitlab --host {host} --ca-file {state}/ca.crt" if kind == "gitlab" else ""
+                self.assertIn(f"KIND={kind} HOST={host} ARGS={args} CA={state}/ca.crt", proc.stdout)
+        # A developer's own instance: the host follows the override, the kind does not.
+        own = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": "gitlab.dev.example"}, bin_dir=self.bin)
+        self.assertIn("KIND=gitlab HOST=gitlab.dev.example", own.stdout)
+        # A relative state directory is refused where it is read: the grader would resolve it under bench/.
+        relative = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": "forge-state"}, bin_dir=self.bin)
+        self.assertNotEqual(relative.returncode, 0)
+        self.assertIn("EVAL_FORGE_STATE_DIR='forge-state' must be an absolute path", relative.stderr)
+        # A host that is not a bare hostname stops the eval at the table, naming the variable, not as an unknown forge.
+        for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge"), ("www.gitlab.com", "is a public forge")):
+            with self.subTest(host=bad):
+                refused = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": bad}, bin_dir=self.bin)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn(f"EVAL_GITLAB_CE_HOST='{bad}' {why}", refused.stderr)
+                self.assertNotIn("is not a forge this eval knows", refused.stderr)
+                self.assertNotIn("KIND=", refused.stdout)
 
     def test_the_mint_is_a_no_op_under_gitlab(self):
         body = "\n".join(
             [
-                'EVAL_FORGE="gitlab"; EVAL_LEDGER_APP_KEY_FILE="/k.pem"; EVAL_LEDGER_APP_ID=1; EVAL_LEDGER_INSTALLATION_ID=1',
+                'EVAL_FORGE="gitlab"; EVAL_FORGE_KIND="gitlab"; EVAL_LEDGER_APP_KEY_FILE="/k.pem"; EVAL_LEDGER_APP_ID=1; EVAL_LEDGER_INSTALLATION_ID=1',
                 "LEDGER_MINT_RETRYABLE=75; LEDGER_MINT_ATTEMPTS=1; LEDGER_GRADING_MINT_BODY='{}'",
                 '_ledger_token_mint() { echo "MINTED" >&2; return 1; }',
                 lifted("mint_ledger_token"),

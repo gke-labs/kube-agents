@@ -22,6 +22,7 @@ rather than a copy.
 """
 
 import base64
+import os
 import pathlib
 import re
 import subprocess
@@ -148,6 +149,31 @@ def _script_dir_with_chart(tmp_path, crd_lists_gitlab, helpers_register_gitlab=N
     return str(hack)
 
 
+_OPENSSL_STUB = """#!/usr/bin/env bash
+# openssl stand-in for the tests: `x509 -noout -text -in FILE` prints a Basic
+# Constraints block, CA:TRUE for a PEM certificate, CA:FALSE when the file
+# carries the marker NOT-A-CA; anything that is not PEM fails to parse.
+f="${@: -1}"
+grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null || { echo "unable to load certificate" >&2; exit 1; }
+if grep -q "NOT-A-CA" "$f"; then printf "X509v3 Basic Constraints: critical\n    CA:FALSE\n"; else printf "X509v3 Basic Constraints: critical\n    CA:TRUE\n"; fi
+"""
+
+
+def _openssl_stub_dir():
+    """A directory holding the openssl stand-in, made once per process."""
+    global _OPENSSL_DIR
+    try:
+        return _OPENSSL_DIR
+    except NameError:
+        pass
+    tmp = tempfile.mkdtemp(prefix="openssl-stub-")
+    stub = pathlib.Path(tmp) / "openssl"
+    stub.write_text(_OPENSSL_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    _OPENSSL_DIR = tmp
+    return tmp
+
+
 def _resolution_block():
     text = _CI_DEPLOY.read_text(encoding="utf-8")
     start = text.find(_SECTION_START)
@@ -189,6 +215,14 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     # CRD through SCRIPT_DIR, the checkout's by default.
                     "EVAL_FORGE": "",
                     "SCRIPT_DIR": str(_REPO_ROOT / "hack"),
+                    # A developer's own forge state must not reach these runs:
+                    # a CA left in the default directory would refuse github.
+                    "EVAL_FORGE_STATE_DIR": str(_REPO_ROOT / "no-such-forge-state"),
+                    "EVAL_GHES_HOST": "",
+                    "EVAL_GITLAB_CE_HOST": "",
+                    # openssl stands in, so the CA gate reads the fixture
+                    # files below rather than this machine's openssl.
+                    "PATH": f"{_openssl_stub_dir()}:{os.environ.get('PATH', '')}",
                     **env,
                 }
             ),
@@ -359,6 +393,162 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     )
                     self.assertIn("platformAgent.integration.repositories[0].role=gitops", args)
 
+    # --- self-managed forges (kube-agents#3682) ---------------------------
+
+    def _state_dir(self, tmp, with_ca=True):
+        state = pathlib.Path(tmp) / "forge-state"
+        state.mkdir()
+        if with_ca:
+            (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n", encoding="utf-8")
+        return str(state)
+
+    def test_the_forge_table_names_its_rows_when_refusing(self):
+        rc, out, err = self._resolve("kube-agents-evals", PULL_NUMBER="123", EVAL_FORGE="bitbucket")
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("RESOLVED", out)
+        for row in ("github", "gitlab", "ghes", "gitlab-ce"):
+            self.assertIn(row, err)
+
+    def test_ghes_declares_the_github_forge_at_the_private_host_with_the_ca_and_keeps_the_minter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out, err = self._resolve(
+                "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE="ghes", EVAL_GITHUB_APP_ID="123456",
+                EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertEqual(rc, 0, err)
+        # The repository is the pool's github.com one, resolved as under github.
+        self.assertEqual(self._resolved_repo(out), "gke-agentic/kube-agents-evals-2-infra")
+        minter = self._minter_args(out)
+        self.assertIn("githubMinter.enabled=true", minter)
+        self.assertIn("githubMinter.appId=123456", minter)
+        args = self._forge_args(out)
+        self.assertIn("platformAgent.integration.github.gitRepo= ", args + " ")
+        self.assertIn("platformAgent.integration.forges[0].name=github", args)
+        self.assertIn("platformAgent.integration.forges[0].provider=github", args)
+        self.assertIn("platformAgent.integration.forges[0].host=ghes.eval.internal", args)
+        self.assertIn("platformAgent.integration.forges[0].namespace=gke-agentic", args)
+        self.assertIn("platformAgent.integration.forges[0].caBundleRef.name=github-forge-ca", args)
+        self.assertIn("platformAgent.integration.forges[0].caBundleRef.key=ca.crt", args)
+        self.assertIn("platformAgent.integration.repositories[0].forge=github", args)
+        self.assertIn("platformAgent.integration.repositories[0].repository=https://ghes.eval.internal/gke-agentic/kube-agents-evals-2-infra", args)
+        self.assertIn("platformAgent.integration.repositories[0].role=gitops", args)
+        self.assertNotIn("credentialsRef", args)
+
+    def test_gitlab_ce_is_the_gitlab_forge_at_the_private_host_with_the_ca(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = _script_dir_with_chart(pathlib.Path(tmp), crd_lists_gitlab=True)
+            rc, out, err = self._resolve(
+                "kube-agents-evals-2", PULL_NUMBER="123", JOB_NAME="pull-eval", EVAL_FORGE="gitlab-ce",
+                EVAL_GITHUB_APP_ID="123456", SCRIPT_DIR=script_dir, EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._resolved_repo(out), "")
+        self.assertIn("githubMinter.enabled=false", self._minter_args(out))
+        args = self._forge_args(out)
+        self.assertIn("platformAgent.integration.forges[0].provider=gitlab", args)
+        self.assertIn("platformAgent.integration.forges[0].host=gitlab.eval.internal", args)
+        self.assertIn(f"platformAgent.integration.forges[0].credentialsRef.name={_GITLAB_FORGE_SECRET}", args)
+        self.assertIn("platformAgent.integration.forges[0].caBundleRef.name=gitlab-forge-ca", args)
+        self.assertIn("platformAgent.integration.forges[0].caBundleRef.key=ca.crt", args)
+        self.assertIn("platformAgent.integration.repositories[0].repository=https://gitlab.eval.internal/gke-agentic/kube-agents-evals-2-infra", args)
+
+    def test_gitlab_ce_derives_the_project_from_the_lease_and_needs_no_mapping_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = _script_dir_with_chart(pathlib.Path(tmp), crd_lists_gitlab=True)
+            rc, out, err = self._resolve(
+                _NEVER_MAPPED_PROJECT, PULL_NUMBER="123", JOB_NAME="pull-eval", EVAL_FORGE="gitlab-ce",
+                SCRIPT_DIR=script_dir, EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertEqual(rc, 0, err)
+        args = self._forge_args(out)
+        self.assertIn("platformAgent.integration.forges[0].namespace=gke-agentic", args)
+        self.assertIn(f"platformAgent.integration.repositories[0].repository=https://gitlab.eval.internal/gke-agentic/{_NEVER_MAPPED_PROJECT}-infra", args)
+
+    def test_a_self_managed_host_can_be_a_developers_own(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out, err = self._resolve(
+                "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE="ghes", EVAL_GITHUB_APP_ID="123456",
+                EVAL_FORGE_STATE_DIR=self._state_dir(tmp), EVAL_GHES_HOST="ghes.dev.example",
+            )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("platformAgent.integration.forges[0].host=ghes.dev.example", self._forge_args(out))
+
+    def test_a_host_override_that_is_not_a_bare_hostname_is_refused_before_anything(self):
+        # The row is split on whitespace and the chart takes a bare host, so a
+        # port, a scheme or a space is refused at second zero, naming the variable.
+        for forge, var in (("ghes", "EVAL_GHES_HOST"), ("gitlab-ce", "EVAL_GITLAB_CE_HOST")):
+            for bad, why in (
+                ("ghes.eval.internal:8443", "is not a dotted bare hostname"), ("https://ghes.dev", "is not a dotted bare hostname"),
+                ("ghes.dev example", "is not a dotted bare hostname"), ("-ghes.dev", "is not a dotted bare hostname"),
+                ("localhost", "is not a dotted bare hostname"), ("GitHub.com", "is a public forge"), ("gitlab.com", "is a public forge"),
+                ("www.github.com", "is a public forge"), ("ssh.github.com", "is a public forge"), ("www.gitlab.com", "is a public forge"),
+            ):
+                with self.subTest(forge=forge, host=bad), tempfile.TemporaryDirectory() as tmp:
+                    rc, out, err = self._resolve(
+                        "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE=forge, EVAL_GITHUB_APP_ID="123456",
+                        EVAL_FORGE_STATE_DIR=self._state_dir(tmp), **{var: bad},
+                    )
+                    self.assertNotEqual(rc, 0)
+                    self.assertIn(f"{var}='{bad}' {why}", err)
+                    self.assertNotIn("is not a forge this deploy knows", err)
+                    self.assertNotIn("forges[0]", out)
+
+    def test_a_relative_state_dir_is_refused_before_anything(self):
+        # The grader runs under bench/, so a relative state directory would pass
+        # both preflights and lose the CA there; refused where the variable is read.
+        rc, out, err = self._resolve("kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE="ghes", EVAL_GITHUB_APP_ID="123456", EVAL_FORGE_STATE_DIR="eval-forge")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("EVAL_FORGE_STATE_DIR='eval-forge' must be an absolute path", err)
+        self.assertNotIn("forges[0]", out)
+
+    def test_a_ca_file_that_is_not_a_ca_is_refused_before_anything(self):
+        # A leaf certificate copied into place, or a CA made without CA:TRUE
+        # (the macOS/LibreSSL shape), passes -s and fails the grader after the
+        # build; the gate reads basicConstraints before anything else runs.
+        for forge in ("ghes", "gitlab-ce"):
+            for content in ("-----BEGIN CERTIFICATE-----\nNOT-A-CA\n-----END CERTIFICATE-----\n", "this is not a certificate\n"):
+                with self.subTest(forge=forge, content=content[:12]), tempfile.TemporaryDirectory() as tmp:
+                    state = self._state_dir(tmp)
+                    (pathlib.Path(state) / "ca.crt").write_text(content, encoding="utf-8")
+                    rc, out, err = self._resolve(
+                        "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE=forge, EVAL_GITHUB_APP_ID="123456",
+                        EVAL_FORGE_STATE_DIR=state,
+                    )
+                    self.assertNotEqual(rc, 0)
+                    self.assertIn(f"{state}/ca.crt is not a CA certificate", err)
+                    self.assertIn("make-certs.sh", err)
+                    self.assertNotIn("forges[0]", out)
+
+    def test_a_self_managed_forge_without_its_ca_is_refused_before_anything(self):
+        for forge in ("ghes", "gitlab-ce"):
+            with self.subTest(forge=forge), tempfile.TemporaryDirectory() as tmp:
+                rc, out, err = self._resolve(
+                    "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE=forge, EVAL_GITHUB_APP_ID="123456",
+                    EVAL_FORGE_STATE_DIR=self._state_dir(tmp, with_ca=False),
+                )
+                self.assertNotEqual(rc, 0)
+                self.assertNotIn("RESOLVED", out)
+                self.assertIn("its private CA) is missing or empty", err)
+
+    def test_ghes_needs_the_pools_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out, err = self._resolve(
+                "dev-project", EVAL_GITOPS_REPO="none", EVAL_FORGE="ghes", EVAL_GITHUB_APP_ID="123456",
+                EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("RESOLVED", out)
+        self.assertIn("EVAL_GITOPS_REPO=none is not an option on this forge", err)
+
+    def test_a_ca_left_for_a_public_forge_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out, err = self._resolve(
+                "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE="", EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("RESOLVED", out)
+        self.assertIn("a public forge that takes no private CA", err)
+
     def test_gitlab_unmapped_project_is_refused_naming_the_table(self):
         with tempfile.TemporaryDirectory() as tmp:
             script_dir = _script_dir_with_chart(pathlib.Path(tmp), crd_lists_gitlab=True)
@@ -495,7 +685,7 @@ class CiDeployGitlabSecretTest(unittest.TestCase):
     _NS = "kubeagents-system-test"
     _PID = "kube-agents-evals-7"
 
-    def _run(self, tmp_path, gcloud_exit="0"):
+    def _run(self, tmp_path, gcloud_exit="0", preamble=""):
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         log = tmp_path / "log"
@@ -532,6 +722,7 @@ class CiDeployGitlabSecretTest(unittest.TestCase):
             'GITLAB_FORGE_SECRET_NAME="gitlab-forge-token"; GITLAB_FORGE_SECRET_KEY="token"\n'
             f'GITLAB_AGENT_SM_SECRET="gitlab-agent-token"; GITLAB_SECRETS_PROJECT="{_GITLAB_SECRETS_PROJECT}"\n'
             f'GITLAB_FORGE_SECRET_LABEL="{_TEARDOWN_SELECTOR}"\n'
+            + preamble
             + _materialize_function()
             + "materialize_gitlab_forge_secret\n"
         )
@@ -594,10 +785,108 @@ def _preflight_function():
     return text[start : end + len("\n}\n")]
 
 
+class CiDeployGitlabCeTokenTest(unittest.TestCase):
+    """On a per-run GitLab (gitlab-ce) the token is the file the lane step left,
+    not a Secret Manager read: nothing asks gcloud, and the value still travels
+    on stdin into the same Secret and key."""
+
+    def test_the_token_comes_from_the_state_file_and_gcloud_is_never_asked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = pathlib.Path(tmp) / "agent-token"
+            token_file.write_text(_FAKE_TOKEN + "\n", encoding="utf-8")
+            runner = CiDeployGitlabSecretTest()
+            proc, gcloud_argv, kubectl_argv, applied = runner._run(
+                pathlib.Path(tmp),
+                preamble=f'EVAL_FORGE_SELF_MANAGED="yes"; GITLAB_FORGE_AGENT_TOKEN_FILE="{token_file}"\n',
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(gcloud_argv, "")
+        self.assertIn(f"create secret generic gitlab-forge-token -n {runner._NS} --from-file=token=/dev/stdin --dry-run=client -o yaml", kubectl_argv)
+        self.assertIn("token: " + base64.b64encode(_FAKE_TOKEN.encode()).decode() + "\n", applied)
+        self.assertNotIn(_FAKE_TOKEN, kubectl_argv)
+        self.assertIn(f"from {token_file}", proc.stdout)
+
+    def test_a_missing_state_file_stops_before_the_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = CiDeployGitlabPreflightTest()
+            proc, gcloud_argv = runner._run(
+                pathlib.Path(tmp), gcloud_exit="0",
+                preamble=f'EVAL_FORGE_SELF_MANAGED="yes"; GITLAB_FORGE_AGENT_TOKEN_FILE="{tmp}/agent-token"\n',
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(f"{tmp}/agent-token (the per-run GitLab agent token) is missing or empty", proc.stderr)
+            self.assertEqual(gcloud_argv, "")
+            pathlib.Path(tmp, "agent-token").write_text("glpat-x\n", encoding="utf-8")
+            second = pathlib.Path(tmp, "second")
+            second.mkdir()
+            proc, gcloud_argv = runner._run(
+                second, gcloud_exit="0",
+                preamble=f'EVAL_FORGE_SELF_MANAGED="yes"; GITLAB_FORGE_AGENT_TOKEN_FILE="{tmp}/agent-token"\n',
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("readable", proc.stdout)
+        self.assertEqual(gcloud_argv, "")
+
+
+def _forge_ca_function():
+    text = _CI_DEPLOY.read_text(encoding="utf-8")
+    start = text.find("materialize_forge_ca_secret() {")
+    assert start != -1, "materialize_forge_ca_secret() not found in hack/ci-deploy.sh"
+    end = text.index("\n}\n", start) + 3
+    return text[start:end]
+
+
+class CiDeployForgeCaSecretTest(unittest.TestCase):
+    """A self-managed forge's CA goes from the state file into the Secret the
+    forge's caBundleRef names, the installer's name per kind, under ca.crt."""
+
+    def _run(self, tmp_path, kind):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        log = tmp_path / "log"
+        log.mkdir()
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{log}/kubectl.argv"\n'
+            'case "$*" in\n'
+            '  "create secret"*) printf "kind: Secret\\ndata:\\n  ca.crt: $(base64 < "${5#*=}" 2>/dev/null | tr -d \'\\n\')\\n" ;;\n'
+            '  "create namespace"*) printf "kind: Namespace\\n" ;;\n'
+            '  "label --local"*) cat; printf "  labels:\\n    %s\\n" "$(printf "%s" "$5" | sed "s/=/: /")" ;;\n'
+            f'  "apply -f -") cat >> "{log}/applied.yaml" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        kubectl.chmod(kubectl.stat().st_mode | 0o111)
+        ca = tmp_path / "ca.crt"
+        ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n", encoding="utf-8")
+        script = (
+            "set -euo pipefail\n"
+            f'NAMESPACE="ns-test"; EVAL_FORGE_KIND="{kind}"; EVAL_FORGE_HOST="forge.eval.internal"; FORGE_CA_FILE="{ca}"\n'
+            'GITLAB_FORGE_CA_SECRET_NAME="gitlab-forge-ca"; GITHUB_FORGE_CA_SECRET_NAME="github-forge-ca"; FORGE_CA_SECRET_KEY="ca.crt"\n'
+            f'GITLAB_FORGE_SECRET_LABEL="{_TEARDOWN_SELECTOR}"\n'
+            + _forge_ca_function()
+            + "materialize_forge_ca_secret\n"
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env(bin_dir=bin_dir))
+        read = lambda name: (log / name).read_text(encoding="utf-8") if (log / name).exists() else ""
+        return proc, read("kubectl.argv"), read("applied.yaml"), ca
+
+    def test_the_ca_secret_is_named_per_kind_and_applied_under_ca_crt(self):
+        for kind, name in (("gitlab", "gitlab-forge-ca"), ("github", "github-forge-ca")):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                proc, kubectl_argv, applied, ca = self._run(pathlib.Path(tmp), kind)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(f"create secret generic {name} -n ns-test --from-file=ca.crt={ca} --dry-run=client -o yaml", kubectl_argv)
+                self.assertIn("kind: Namespace", applied)
+                self.assertIn("kind: Secret", applied)
+                self.assertIn(f"Forge CA: Secret ns-test/{name} (key ca.crt) from {ca}, for forge.eval.internal", proc.stdout)
+
+
 class CiDeployGitlabPreflightTest(unittest.TestCase):
     """The token is read once before the image build, and a failed read stops the run there."""
 
-    def _run(self, tmp_path, gcloud_exit):
+    def _run(self, tmp_path, gcloud_exit, preamble=""):
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         log = tmp_path / "gcloud.argv"
@@ -614,6 +903,7 @@ class CiDeployGitlabPreflightTest(unittest.TestCase):
             "set -euo pipefail\n"
             'PROJECT_ID="kube-agents-evals-9"; GITLAB_AGENT_SM_SECRET="gitlab-agent-token"\n'
             f'GITLAB_SECRETS_PROJECT="{_GITLAB_SECRETS_PROJECT}"\n'
+            + preamble
             + _preflight_function()
             + "preflight_gitlab_forge_secret\n"
         )

@@ -98,12 +98,13 @@ def dump_function() -> str:
 
 
 def gateway_collector() -> str:
-    """collect_gateway_log(), collect_litellm_log(),
+    """last_bytes(), collect_gateway_log(), collect_litellm_log(),
     collect_credential_proxy_evidence() and their constants, lifted from
     ci-env.sh.
 
-    The dumper calls all three, so the dump under test carries the real
-    collectors rather than stubs: their `|| true` guards are among the ones
+    The dumper calls all three collectors, and each bounds its log through
+    last_bytes(), so the dump under test carries the real collectors and
+    helper rather than stubs: their `|| true` guards are among the ones
     the survival test below is about. Every `*_LOG_*` and `CREDENTIAL_PROXY_*`
     readonly comes along, since `set -u` would end the script at the first
     unbound one.
@@ -111,7 +112,12 @@ def gateway_collector() -> str:
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly (?:[A-Z_]*_LOG_[A-Z_]+|CREDENTIAL_PROXY_[A-Z_]+)=.*$", src, re.MULTILINE)
     functions = []
-    for name in ("collect_gateway_log", "collect_litellm_log", "collect_credential_proxy_evidence"):
+    for name in (
+        "last_bytes",
+        "collect_gateway_log",
+        "collect_litellm_log",
+        "collect_credential_proxy_evidence",
+    ):
         match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
         if match is None or not constants:  # pragma: no cover
             raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
@@ -244,6 +250,13 @@ class FailureDumpArtifactsTest(unittest.TestCase):
     def test_the_envoy_sidecar_and_kube_system_events_are_captured(self):
         result, tmp = self.run_dump(kubectl_exit=0)
         self.assertIn("SURVIVED", result.stdout)
+        self.assertNotIn("command not found", result.stderr)
+        for name in (
+            "platform-agent-gateway.log",
+            "litellm.log",
+            "envoy-credential-proxy.log",
+        ):
+            self.assertTrue((tmp / "artifacts" / name).is_file(), name)
         kubectl_args = (tmp / "kubectl.args").read_text(encoding="utf-8")
         self.assertIn("-c envoy-credential-proxy", kubectl_args)
         self.assertRegex(

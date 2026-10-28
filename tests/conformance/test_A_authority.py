@@ -982,22 +982,23 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
         That is the Publish literal `executorGrants` starts both narrowings
         from (session pods and AgentProfile pods), plus the bodies of
-        `sessionGrants` and `profileGrants`, which append to it. The literal
-        alone, not all of `executorGrants`: its consumer filters name `…in`
-        as a READ, which is what the assertions here distinguish. Each
-        narrowing is required to call `executorGrants`, so one that stopped
+        `sessionGrants`, `profileWorkerGrants` and `profileGrants`, which
+        append to it. The literal alone, not all of `executorGrants`: its
+        consumer filters name `…in` as a READ, which is what the assertions
+        here distinguish. Each narrowing is required to call `executorGrants`
+        (the profile one through `profileWorkerGrants`), so one that stopped
         would not silently fall out of what is read.
         """
         body = h.go_function_body(h.text("a2a_session_grants"), "executorGrants")
         block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
         assert block is not None, "executorGrants no longer starts from a Publish literal"
-        narrowings = [
-            h.go_function_body(h.text("a2a_session_grants"), "sessionGrants"),
-            h.go_function_body(h.text("a2a_profile_grants"), "profileGrants"),
-        ]
-        for narrowing in narrowings:
+        session = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        worker = h.go_function_body(h.text("a2a_profile_grants"), "profileWorkerGrants")
+        profile = h.go_function_body(h.text("a2a_profile_grants"), "profileGrants")
+        for narrowing in (session, worker):
             assert "executorGrants(" in narrowing, "a narrowing no longer starts from executorGrants"
-        return block.group(1) + "\n".join(narrowings)
+        assert "profileWorkerGrants(" in profile, "profileGrants no longer starts from profileWorkerGrants"
+        return block.group(1) + "\n".join((session, worker, profile))
 
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import hmac
 import importlib.util
 import json
@@ -26,7 +25,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
 from contextlib import ExitStack, closing, nullcontext
 from pathlib import Path
@@ -43,6 +42,7 @@ import gitops_workspace
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
+import worker_transcript
 
 # Configure logging
 logging.basicConfig(
@@ -150,13 +150,12 @@ SESSION_TASK_LIVE_STEPS_MAX = 10
 TASK_STEP_ROW_MULTIPLIER = 2
 TASK_STEP_PREVIEW_MAX_CHARS = 240
 TASK_STEP_DETAIL_MAX_CHARS = 4000
-# The user prompt the kanban dispatcher starts a worker session with
-# (`hermes -p <profile> chat -q "work kanban task <id>"`). Used to map a card
-# to its worker session in the profile's `state.db` when `task_runs.metadata`
-# does not record `worker_session_id`.
-WORKER_PROMPT_PREFIX = "work kanban task "
+# The user prompt the kanban dispatcher starts a worker session with, and the
+# session-store layout under the data root: the shared transcript reader's,
+# so the feed and the bench map a card to its worker session the same way.
+WORKER_PROMPT_PREFIX = worker_transcript.WORKER_PROMPT_PREFIX
 HERMES_JSON_CONTENT_PREFIX = "\x00json:"
-HERMES_STATE_DB_FILENAME = "state.db"
+HERMES_STATE_DB_FILENAME = worker_transcript.HERMES_STATE_DB_FILENAME
 # Fail-closed placeholder returned for every worker step kind (`thinking`,
 # `tool_call`, `tool_result`, `reply`) and card text field whenever
 # `AuditRedactor` cannot be loaded or structural recursion exceeds Python's limit.
@@ -442,6 +441,24 @@ MANAGED_DOTENV_PATH = os.path.join(
 # Resolved from HERMES_MANAGED_DIR the same way, and for the same reason.
 MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
+)
+
+# How a Cluster Agent describes a fix on an event or stall triage card. (The
+# drift card keeps its own wording: its report compares the live object with
+# the declared state, which it reads from the object's field ownership.) A
+# Cluster Agent has no GitOps repository: the Platform Agent finds the file
+# when it opens the Pull Request. Without this, "precisely
+# enough that someone can open the Pull Request from your report alone" sent a
+# worker that had its cause in the first minute on a 21-minute hunt for the
+# workload's source, and it never answered (gke-labs#3078).
+TRIAGE_FIX_AGAINST_LIVE_OBJECT = (
+    "Describe each change against the live object you read: its kind, namespace and name, the field, and the "
+    "current and proposed value, or for a missing object, what to create and the fields it needs. You have no "
+    "GitOps repository and need none, because the agent that opens the Pull Request finds the file. Do not look "
+    "for the workload's source, whether in this pod's files, with git, or through any repository tool: a source "
+    "file you haven't seen is not a gap in the report. The cause is the evidenced dependency or setting the failure "
+    "points to, not the command or log line that reports it, so check that it exists before you call the "
+    "investigation done. Then complete the card. "
 )
 
 
@@ -945,6 +962,14 @@ SECONDS_PER_MINUTE = 60
 # taking the whole server down with it.
 DEFAULT_TRIAGE_WATCHDOG_SECONDS = 3600
 TRIAGE_WATCHDOG_SECONDS = _alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", DEFAULT_TRIAGE_WATCHDOG_SECONDS)
+# How long a quiet follow-up with no chat thread keeps waiting for the alert's
+# card, or for a board that would not answer, counted from the daemon's first
+# attempt (a 503 the watcher retries each sweep) before it is answered
+# `unrouted` for good. An hour, as triage is allowed before the watchdog calls
+# its absence out, but its own constant: the watchdog's knob has a zero that
+# means off, and the object's own stamps are already a quiet period old when
+# the first attempt arrives.
+FOLLOWUP_CARD_WAIT_SECONDS = 3600
 # The busy timeout of the sqlite connects the follow-up and the watchdog open.
 SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
@@ -2705,7 +2730,8 @@ def _triage_who_acts(open_pull_request: bool) -> str:
     if not open_pull_request:
         return (
             "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-            "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
             "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
             "(no `kubectl scale`, `patch`, or `apply`)."
         )
@@ -2715,8 +2741,10 @@ def _triage_who_acts(open_pull_request: bool) -> str:
         "complete this card (`done`), reads your report, and opens the Pull Request for the option you marked ✅ Recommended, or for "
         "the single Proposed fix — not you, and not from this card (if this card ends `blocked`, the follow-up card stays held in "
         "`todo` until this card is unblocked and completed or archived). "
-        "Your job is to make that possible: name the manifest change each option needs precisely enough that the Pull Request can be "
-        "opened from your report alone, and with two or more options mark exactly one Recommended. Keep the `- **To authorize:**` bullet "
+        "Your job is to make that possible: name the change each option needs precisely enough that the Pull Request can be "
+        "opened from your report alone, and with two or more options mark exactly one Recommended. "
+        f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        "Keep the `- **To authorize:**` bullet "
         "label as the template above writes it (the notifier keys on that label to store your report for thread follow-ups), telling "
         f"the reader that a GitOps Pull Request for the recommended fix {TRIAGE_OPEN_PR_MARKER} (and with two or more options, "
         "that they can reply **'apply Option B'** to request an alternative option instead) — do not tell the reader to reply "
@@ -2822,7 +2850,13 @@ def _triage_pr_task_body(payload: Dict[str, Any], session_id: str) -> str:
         f"`Open GitOps PR` card for `{branch}` (other than this card) is already `running`, do not run `submit-suggestion prepare` "
         f"and complete this card noting that the sibling card is already preparing the Pull Request.\n"
         f"3. **Open the Pull Request** for the option marked '✅ Recommended', or for the single 'Proposed fix' when there "
-        f"is only one, with the **submit-suggestion** skill, on the branch `{branch}`. Use that branch name exactly. It "
+        f"is only one, with the **submit-suggestion** skill, on the branch `{branch}`. Implement ONLY that recommended "
+        f"option (or single 'Proposed fix'), changing only the file(s) that option calls for (when the repository holds "
+        f"both a GitOps sync source path and cluster bootstrap or provisioning copies of the workload, check the "
+        f"repository's GitOps sync declaration for the namespace or workload and edit only the synced workload "
+        f"manifest(s)) — never bundle any "
+        f"non-recommended option or optional hardening into the same Pull Request, and never touch unrelated manifests "
+        f"or infrastructure definitions that the recommended option does not target. Use that branch name exactly. It "
         f"is keyed to this incident, so if a Pull Request for it is already open, `prepare` hands that one back and you "
         f"revise it rather than opening a second. Never pass `--force` to `prepare` while another `Open GitOps PR` card "
         f"is `running`; if `prepare` refuses because a copy is already there (its message reads `there is already a copy at <path> with ...` "
@@ -3270,6 +3304,17 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     establishing whether the state git declares still runs before proposing that
     the change be undone.
 
+    The detector does not consult git, so the object may be one git does not
+    declare at all, and then there is no declared state to revert to
+    (docs/designs/drift-detection.md, "Resources not in Git at all"). The
+    worker has no repository to check, so the body tells it to read that off
+    the live object's GitOps markers, which the skill lists, and widens the
+    options and the **Done when** line to codifying it. Deleting it is sound
+    too, but no pull request can delete what git does not hold, so it is an
+    unlettered **Manual step** bullet: slack_ux_incident.parse_triage turns
+    every lettered option into an 'apply Option X' button, and a lettered
+    delete would become a button for a pull request that cannot exist. bench/tasks/gitops-drift-unmanaged-object-triage grades it.
+
     On an install with no usable GitOps repository the card is
     :func:`_drift_task_body_without_gitops` instead: an explanation with no
     options. The bench contract above binds only this, the registered path.
@@ -3291,6 +3336,21 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
         f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
         f"whichever way it comes out belongs in the report.\n\n"
+        f"**Before any of that, establish whether git declares this object at all.** You have no access to the "
+        f"repository; the live object tells you. A GitOps tool marks what it applies — its field manager, or its "
+        f"tracking label or annotation — and the skill lists them. If the object still exists, carries none of "
+        f"them, and its only field managers are a person's `kubectl` subcommands (`kubectl-create`, "
+        f"`kubectl-edit`, `kubectl-label`, `kubectl-patch` and the like), say it is probably not in git and what "
+        f"you checked. There is then no declared state to revert to, so do not offer one: codify it in git, saying "
+        f"whether the manifest keeps the change or undoes it — that is the option, or the two options, to letter. "
+        f"Deleting it is also sound, since git declares nothing, but no pull request can do it, so it is never a "
+        f"lettered option, never the recommendation, and never named in the 'apply' line: where it is worth "
+        f"naming, add one bullet after the lettered options, `- **Manual step (<title>):** <why, and the command a "
+        f"person runs>`, and do not call it an option. If its only markers are ones the skill calls ambiguous, "
+        f"which a person's `kubectl apply` or `helm install` leaves too, or a field manager you do not recognise, "
+        f"which may be a pipeline's, keep the revert beside those options and say what would decide between them. "
+        f"A deleted object carries nothing to read, so its absence of markers is no evidence: say whether git "
+        f"declares it could not be read off the cluster, and keep the revert.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
@@ -3299,7 +3359,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
         f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
         f"revert's consequence being whether the state git declares would still run, read off this cluster or "
-        f"reported as not established. "
+        f"reported as not established — or, for an object git does not declare, proposes codifying it, naming "
+        f"deletion by hand as a manual step where it is worth naming. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -3310,7 +3371,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"the declared state is the one that should win.\n\n"
         f"Propose as many options as the situation genuinely warrants. Usually there are two — revert to what git "
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
-        f"obviously right, because the reader is deciding which state wins.\n\n"
+        f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
+        f"they are the ones above.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -3319,7 +3381,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"else, replacing the ones in the template below:\n"
         f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
-        f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action. The one exception is the "
+        f"**Manual step** bullet for an object git does not declare, which may follow them.\n\n"
         f"**If the change was already reconciled away and nothing is left to do,** make 'What to do' this one "
         f"bullet: '- **No action needed:** the object already matches the declared state.' No Proposed fix, and "
         f"keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
@@ -3330,7 +3393,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"## What's wrong\n\n"
         f"<1 sentence: who changed what, and whether it is still live>\n\n"
         f"## Why\n\n"
-        f"- <What the live object shows now, and how it differs from what git declares, with the evidence>\n"
+        f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
+        f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
@@ -3553,8 +3617,9 @@ def _stall_task_body(payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**Who acts on this:**\n"
         f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not "
-        f"you, and not from this card. Name the manifest change each option needs precisely enough that someone can "
-        f"open the Pull Request from your report alone: the object, the field, and the value. Two things are true "
+        f"you, and not from this card. Name the change each option needs precisely enough that someone can "
+        f"open the Pull Request from your report alone. {TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        f"Two things are true "
         f"whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written "
         f"to the live cluster directly (no `kubectl create`, `patch`, or `apply`)."
     )
@@ -4027,7 +4092,9 @@ FLEET_AUDIT_SKILL = "fleet-audit"
 DEFAULT_PROFILE = "default"
 PROFILES_DIR = "profiles"
 CRON_ROSTER = ("cron", "jobs.json")
-# A profile name is one path segment; anything else is never a roster.
+# A profile name is one path segment; anything else is never a roster, a
+# ledger or a session store. `_profile_home` applies it, then normalises the
+# directory and checks it stays under its root.
 _PROFILE_SEGMENT_RE = re.compile(r"\A(?!\.{1,2}\Z)[\w.-]+\Z")
 
 # Newlines and the tokens that could open a role or forge a fence. Labels get a
@@ -4377,32 +4444,46 @@ def _slack_audit_headline(
     return AuditHeadline(text, issue, ref)
 
 
-def _validated_profile_home(profile: str, data_root: Optional[Path] = None) -> Optional[Path]:
-    """Return the validated directory for `profile` under `data_root` (or `agent_home()`)."""
+def _profile_home(profile: str, data_root: str | os.PathLike | None = None) -> str | None:
+    """`profile`'s home under `data_root` (the agent home when None), where its roster, ledger and state live; None when it names no profile.
+
+    `profile` is caller-supplied. The default profile's home is the root
+    itself; any other is one path segment under the profiles directory, and a
+    name that leaves it is no profile. Every reader of a profile's files gets
+    its directory here: abspath (a relative root resolves against the working
+    directory, as the open would) followed by startswith is the containment
+    check CodeQL recognises (py/path-injection); the segment check alone, and
+    `Path.resolve` with `is_relative_to`, are not. A second containment check
+    on the real paths then refuses a `profiles/<name>` that is a symlink out
+    of the profiles directory, which the lexical check cannot see; a home
+    that is itself a symlink passes, since both sides resolve through it.
+    A root that cannot be resolved (a relative home whose working directory
+    is gone) names no profile either, so every reader keeps its fallback.
+    """
     if not _PROFILE_SEGMENT_RE.match(profile):
         return None
-    root = data_root if data_root is not None else Path(gitops_workspace.agent_home())
     try:
-        root_resolved = root.resolve()
-        candidate = (
-            root_resolved
-            if profile == DEFAULT_PROFILE
-            else (root_resolved / PROFILES_DIR / profile).resolve()
-        )
-        if candidate != root_resolved and not candidate.is_relative_to(root_resolved):
+        home = os.path.abspath(os.fspath(data_root) if data_root is not None else gitops_workspace.agent_home())
+        if profile == DEFAULT_PROFILE:
+            return home
+        root = os.path.join(home, PROFILES_DIR)
+        base = os.path.normpath(os.path.join(root, profile))
+        if not base.startswith(root + os.sep):
             return None
-        return candidate
+        if not os.path.realpath(base).startswith(os.path.realpath(root) + os.sep):
+            return None
     except OSError:
         return None
+    return base
 
 
 def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster runs fleet-audit; False when it cannot be read."""
-    home = _validated_profile_home(profile)
-    if home is None:
+    base = _profile_home(profile)
+    if base is None:
         return False
     try:
-        with open(home.joinpath(*CRON_ROSTER), encoding="utf-8") as handle:
+        with open(os.path.join(base, *CRON_ROSTER), encoding="utf-8") as handle:
             store = json.load(handle)
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
@@ -4805,23 +4886,10 @@ def _delivering_run_start(profile: str, job_id: str) -> float | None:
     allows one live run per job. `claimed` rows are left out: a tick writes one
     at submit and may lose the claim. Read-only, and any failure is None.
     """
-    from gitops_workspace import agent_home
-
-    # `profile` is caller-supplied, and a ledger is only ever under the agent
-    # home (the default profile) or the profiles directory (the rest): a path
-    # that leaves its root is no ledger. abspath (a relative home resolves
-    # against the working directory, as the open would) followed by startswith
-    # is the containment check CodeQL recognises (py/path-injection).
-    home = os.path.abspath(agent_home())
-    if profile == DEFAULT_PROFILE:
-        root, base = home, home
-    else:
-        root = os.path.join(home, PROFILES_DIR)
-        base = os.path.join(root, profile)
-    path = os.path.normpath(os.path.join(base, *RUN_LEDGER))
-    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
-    if not path.startswith(prefix):
+    base = _profile_home(profile)
+    if base is None:
         return None
+    path = os.path.join(base, *RUN_LEDGER)
     if not os.path.exists(path):
         return None
     try:
@@ -4939,19 +5007,11 @@ class SchedulerFailure(NamedTuple):
     text: str
 
 
-def _profile_home(profile: str) -> str:
-    """`profile`'s home under the agent home, where its cron roster and run ledger live."""
-    from gitops_workspace import agent_home
-
-    return agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
-
-
 def _runs_daily(profile: str, job_id: str) -> bool:
     """Whether `job_id` in `profile`'s cron roster fires once a day, every day; False when it cannot be read."""
-    if not _PROFILE_SEGMENT_RE.match(profile):
-        return False
     try:
-        return cron_schedule.job_runs_daily(_profile_home(profile), job_id)
+        base = _profile_home(profile)
+        return base is not None and cron_schedule.job_runs_daily(base, job_id)
     except Exception as exc:
         logger.warning(f"Relay for {profile}/{job_id}: cron schedule unreadable: {exc}")
         return False
@@ -4987,13 +5047,14 @@ def _run_completed_since(profile: str, job_id: str, since: float) -> bool:
     """Whether the scheduler's ledger has a run of `job_id` that started after `since` and finished cleanly.
 
     True when the ledger cannot say, so a failure that cannot be told from a
-    repeat is posted rather than withheld; that includes a `profile` that is not
-    one path segment, since it is caller-supplied and a path that leaves the
-    profiles directory is no ledger.
+    repeat is posted rather than withheld; that includes a `profile` that
+    :func:`_profile_home` refuses, since it is caller-supplied and a name that
+    is no profile has no ledger.
     """
-    if not _PROFILE_SEGMENT_RE.match(profile):
+    base = _profile_home(profile)
+    if base is None:
         return True
-    path = os.path.join(_profile_home(profile), *RUN_LEDGER)
+    path = os.path.join(base, *RUN_LEDGER)
     if not os.path.exists(path):
         return True
     try:
@@ -6387,10 +6448,13 @@ def _card_for_alert_session(session_id: str) -> Optional[str]:
         return BOARD_UNREADABLE
 
 
-def _comment_alert_card(session_id: str, text: str) -> bool:
+def _comment_alert_card(session_id: str, text: str, card: Optional[str] = None) -> bool:
     """Leave ``text`` as a comment on the alert's card, so the board carries the
-    follow-up beside the report. False when there is no card or the board refused."""
-    card = _card_for_alert_session(session_id)
+    follow-up beside the report. ``card`` is the id when the caller has already
+    read it; otherwise it is looked up. False when there is no card or the
+    board refused; the caller decides whether that loses anything."""
+    if card is None:
+        card = _card_for_alert_session(session_id)
     if not card or card == BOARD_UNREADABLE:
         return False
     try:
@@ -6398,9 +6462,39 @@ def _comment_alert_card(session_id: str, text: str) -> bool:
 
         kanban(f"comment {shlex.quote(card)} {shlex.quote(text)}")
         return True
-    except Exception as exc:  # noqa: BLE001 - reported; the chat line is the delivery that matters
+    except Exception as exc:  # noqa: BLE001 - reported; the caller answers for the delivery
         logger.warning(f"Could not comment on card {card} for session {session_id}: {exc}")
         return False
+
+
+# What the daemon remembers about card-only follow-ups, per session: when it
+# first tried, so the wait for a card is bounded from the attempt rather than
+# from the object's stamps, and that the line is on the card, so a retry the
+# watcher sends because its 10s client gave up while the board was slow does
+# not write the line again. In memory on purpose: a restart forgets both, and
+# the cost of forgetting is one more hour of waiting or one duplicate line.
+_FOLLOWUP_FIRST_ATTEMPT_AT: Dict[str, float] = {}
+_FOLLOWUP_CARD_POSTED: Set[str] = set()
+# Sessions whose card comment is being written right now: a second request
+# for one (the watcher's retry while the first still waits on the board's
+# lock) is answered 503 without touching the board, so the two cannot both
+# post when the lock frees.
+_FOLLOWUP_CARD_IN_FLIGHT: Set[str] = set()
+_FOLLOWUP_MEMORY_LIMIT = 10_000
+
+
+def _followup_can_wait_for_card(session_id: str, now: Optional[float] = None) -> bool:
+    """Whether a card-only follow-up should be retried rather than let go: true
+    while the daemon's first attempt for the session is younger than
+    FOLLOWUP_CARD_WAIT_SECONDS. The first call records the attempt."""
+    moment = time.time() if now is None else now
+    first = _FOLLOWUP_FIRST_ATTEMPT_AT.setdefault(session_id, moment)
+    if len(_FOLLOWUP_FIRST_ATTEMPT_AT) >= _FOLLOWUP_MEMORY_LIMIT:
+        for sid, at in list(_FOLLOWUP_FIRST_ATTEMPT_AT.items()):
+            if sid != session_id and moment - at >= FOLLOWUP_CARD_WAIT_SECONDS:
+                _FOLLOWUP_FIRST_ATTEMPT_AT.pop(sid, None)
+                _FOLLOWUP_CARD_POSTED.discard(sid)
+    return moment - first < FOLLOWUP_CARD_WAIT_SECONDS
 
 
 def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[datetime] = None) -> str:
@@ -6436,7 +6530,7 @@ def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[da
 
 
 def _post_followup(session_id: str, platform: str, chat_id: str, thread_id: str, text: str) -> None:
-    """Deliver a follow-up line into the alert's thread and onto its card."""
+    """Deliver a follow-up line into the alert's thread and onto its card (the routed path)."""
     if _send_to_chat(platform, text, chat_id, thread_id) is None:
         logger.error(f"Follow-up for session {session_id} did not reach {platform} thread {thread_id}")
     _comment_alert_card(session_id, text)
@@ -6455,10 +6549,19 @@ def _inject_followup(
     recorded; the line goes there as a reply, and onto the card the session
     filed as a comment, so a reader of either sees that the object went quiet
     and when. No ledger row, no quota, no agent turn: nothing new happened in
-    the cluster, something stopped happening. A session nothing routed (the
-    alert never reached chat) gets `unrouted` and nothing is posted; the
-    watcher marks the incident notified either way, which is right, since
-    there is no thread to tell.
+    the cluster, something stopped happening. The card does not need the
+    thread: an install with no chat surface (every eval install) routes no
+    session anywhere, and its cards still have to say the object went quiet.
+    With no thread the card is the only delivery, so it is written here,
+    before the answer, and a comment that fails is a 503 the watcher retries
+    on its next sweep. A card not filed yet, or a board that cannot say, is
+    the same 503 while the daemon's first attempt for the session is younger
+    than FOLLOWUP_CARD_WAIT_SECONDS (triage may still be queued); past that,
+    and for a session with neither thread nor card, the answer is `unrouted`,
+    on which the watcher marks the incident notified, since there is nowhere
+    to tell. A line already on the card is answered `followup` again without
+    touching the board, for the retry the watcher sends when its client gave
+    up on a slow board after the comment had landed.
 
     A reply, not an edit of the alert: the gateway edits by update key only
     inside a conversation request (a2a/gateway/notify.go, postConversation),
@@ -6467,10 +6570,35 @@ def _inject_followup(
     message had taken that key since, the triage report included.
     """
     platform, chat_id, thread_id = _lookup_session_routing(session_id)
-    if not platform or not thread_id:
-        logger.info(f"Follow-up for session {session_id}: no chat thread is routed to it; nothing posted")
-        return {"status": "unrouted"}
     text = _followup_message(session_id, payload)
+    if not platform or not thread_id:
+        if session_id in _FOLLOWUP_CARD_POSTED:
+            return {"status": "followup"}  # the watcher's retry of a line already on the card
+        if session_id in _FOLLOWUP_CARD_IN_FLIGHT:
+            raise HTTPException(status_code=503, detail="no chat thread, and the card comment is still being written; retry")
+        # In flight from the board read on, not from the write: the read is the
+        # handler's longest wait, and a retry arriving during it must not read
+        # and write a second line of its own.
+        _FOLLOWUP_CARD_IN_FLIGHT.add(session_id)
+        try:
+            can_wait = _followup_can_wait_for_card(session_id)
+            card = _card_for_alert_session(session_id)
+            if not card or card == BOARD_UNREADABLE:
+                why = "the board cannot say whether the alert has a card" if card == BOARD_UNREADABLE else "the alert's card is not on the board yet"
+                if can_wait:
+                    raise HTTPException(status_code=503, detail=f"no chat thread, and {why}; retry")
+                logger.info(f"Follow-up for session {session_id}: no chat thread, and {why}, an hour after the first attempt; nothing posted")
+                return {"status": "unrouted"}
+            landed = _comment_alert_card(session_id, text, card=card)
+        finally:
+            _FOLLOWUP_CARD_IN_FLIGHT.discard(session_id)
+        if not landed:
+            if can_wait:
+                raise HTTPException(status_code=503, detail=f"no chat thread, and the comment on card {card} did not land; retry")
+            logger.warning(f"Follow-up for session {session_id}: the comment on card {card} did not land within the hour; nothing posted")
+            return {"status": "unrouted"}
+        _FOLLOWUP_CARD_POSTED.add(session_id)
+        return {"status": "followup"}
     background_tasks.add_task(_post_followup, session_id, platform, chat_id, thread_id, text)
     return {"status": "followup"}
 
@@ -7071,10 +7199,10 @@ def list_tasks(since: int = 0, limit: int = FEED_TASKS_DEFAULT_LIMIT, assignee: 
 
 def _profile_state_db(data_root: Path, profile: str) -> Optional[Path]:
     """Return the read-only `state.db` path for `profile` under `data_root`."""
-    home = _validated_profile_home(profile or DEFAULT_PROFILE, data_root)
+    home = _profile_home(profile or DEFAULT_PROFILE, data_root)
     if home is None:
         return None
-    candidate = home / HERMES_STATE_DB_FILENAME
+    candidate = Path(home) / HERMES_STATE_DB_FILENAME
     try:
         return candidate if candidate.is_file() else None
     except OSError:
@@ -7111,558 +7239,11 @@ def _get_audit_redactor() -> Any:
         return _AUDIT_REDACTOR
 
 
-_REDACTED_SECRET_MARKER = "[REDACTED_SECRET]"
-_REDACTED_PRIVATE_KEY_MARKER = "[REDACTED_PRIVATE_KEY]"
-_YAML_SECRET_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
-_YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
-_JSON_SECRET_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
-_JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
-_URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
-_UNTERMINATED_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[ \t]*\r?\n[A-Za-z0-9+/=\s]*\Z",
-    re.IGNORECASE,
-)
-_CLI_LONG_FLAG_RE = re.compile(
-    r"(?P<prefix>(?:^|\s)--)(?P<flag>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<sep>[ \t=]+)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|\S+)"
-)
-_CLI_EXTRA_SECRET_FLAGS = frozenset(
-    {
-        "docker-password",
-        "admin-password",
-        "auth-token",
-        "authtoken",
-        "bearer-token",
-        "passphrase",
-    }
-)
-_CLI_NON_SECRET_FLAGS = frozenset({"with-token"})
-_CLI_USERPASS_FLAG_RE = re.compile(
-    r"\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm(?:\s+registry)?)\s+login)\b[^\r\n;|&]*"
-)
-_CLI_USERPASS_ARG_RE = re.compile(
-    r"(?P<prefix>\s(?:-u|--user)[ \t=]*)"
-    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"']+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
-    r"|(?P<user>[^:\s\"']+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
-)
-_CLI_SHORT_P_RE = re.compile(
-    r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
-    r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
-)
-# The two rules above end a command's segment at `;`, `|` or `&`, but a
-# shell operator inside a quoted argument (`?query=x&type=dash-db`,
-# `-e "select 1 | 2"`) is data. `_sub_shell_segments` therefore finds the
-# segment on a copy of the text whose quoted interiors are blanked to spaces
-# (same length, so every offset holds) and reads the flag and its value out
-# of the original at that span. A quote that does not close on its own line
-# is left as written, which is how a shell would reject it.
-_SHELL_QUOTE_CHARS = ("'", '"')
-_SHELL_QUOTE_BLANK_CHAR = " "
-_SHELL_QUOTED_SPAN_RE = re.compile(r"'[^'\r\n]*'|\"(?:[^\"\\\r\n]|\\[^\r\n])*\"")
-# A scheme-led value (`Bearer <token>`) after any credential-named key, with
-# `:` or `=` as the separator: the redactor's own bearer rule needs twelve
-# token characters from its alphabet, so a short or `~`-bearing token after
-# `auth:`, `token:` or `AUTH_HEADER=` would otherwise outlive the marker.
-# The redactor runs first and, for a key its own key rule knows (`token:`),
-# masks the scheme word as the value; the marker it leaves there counts as
-# the scheme so the token after it is still taken.
-_AUTH_SCHEME_HEADER_RE = re.compile(
-    r"(?i)(?P<prefix>[\"']?\b(?P<key>[\w.\-]+)[\"']?[ \t]*[:=][ \t]*"
-    r"(?:bearer|basic|token|apikey|api-key|digest|negotiate|aws4-hmac-sha256|mutual|"
-    + re.escape(_REDACTED_SECRET_MARKER)
-    + r")[ \t]+)"
-    r"(?P<val>[^\s\"',}{\[\]\\]+)"
-)
-_TEXT_COLON_KV_RE = re.compile(
-    r"(?m)^(?P<prefix>[ \t]*(?:-[ \t]+)?[\"']?)(?P<key>[\w.\-]+)(?P<sep>[\"']?[ \t]*:[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
-)
-_QUOTED_COLON_KV_RE = re.compile(
-    r"(?P<prefix>[\"'])(?P<key>[\w.\-]+)(?P<sep>(?P=prefix)[ \t]*:[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*(?:\"|\Z)|'[^'\r\n]*(?:'|\Z)|[^\s\"',}{\[\]]+)"
-)
-_TEXT_EQUALS_KV_RE = re.compile(
-    r"(?<![\w.\-/\"])(?P<prefix>)(?P<key>[\w.\-]+)(?P<sep>[ \t]*=[ \t]*)"
-    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"',}{\[\]]+)"
-)
-_SUPPLEMENT_BLOCK_SCALAR_RE = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?[\"']?(?P<key>[\w.\-]+)[\"']?[ \t]*:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
-    r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
-)
-_SUPPLEMENT_ENV_BLOCK_RE = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
-    r"[ \t]*\r?\n(?P=indent)(?P<keyindent>[ \t]*)value:[ \t]*[|>][+-]?[0-9]?[+-]?[ \t]*\r?\n"
-    r"(?P<body>(?:(?:[ \t]*\r?\n)*(?P=indent)(?P=keyindent)[ \t]+[^\r\n]*(?:\r?\n|$))+)"
-)
-_SUPPLEMENT_ENV_YAML_PATTERNS = (
-    re.compile(
-        r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)"
-        r"[ \t]*\r?\n(?P=indent)[ \t]*value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)(?=\r?$)"
-    ),
-    re.compile(
-        r"(?m)^(?P<indent>[ \t]*)(?:-[ \t]+)?value:[ \t]*(?P<value>(?:\S[^\r\n]*)?)\r?\n"
-        r"(?P=indent)[ \t]*name:[ \t]*(?P<nq>[\"']?)(?P<name>[\w.\-]+)(?P=nq)[ \t]*(?=\r?$)"
-    ),
-)
-_KEY_DATA_WORDS = ({"key", "data"}, {"certificate", "data"})
-# A key that is a file name (`tls.crt`, `cert.pem`) opens ordinary diagnostic
-# lines: `kubectl describe secret` rows (`tls.crt:  1679 bytes`), `openssl
-# verify` (`cert.pem: OK`), `file` (`cert.pem: PEM certificate`), `grep -n`
-# (`cert.pem:1:-----BEGIN`, `cert.pem:28:-----END`). The value there is a
-# byte count followed by the word `bytes`, a line number with at most a PEM
-# marker after it, or one of the words those tools print, never key
-# material, so the name alone does not mask it. A `grep -n` body line
-# (`tls.key:2:MIIEvQ...`), a bare number (`api.key: 1234567890123456`) and a
-# describe row of a non-file key (`token:  1234 bytes`) stay masked: the
-# first two can be a credential, the third is over-masking that is safe.
-_FILE_NAME_KEY_SUFFIXES = (".key", ".pem", ".crt", ".p12", ".pfx")
-_FILE_KEY_LINE_NUMBER_RE = re.compile(r"^\d+:(?:-----[A-Za-z]*)?$")
-_FILE_KEY_BYTE_COUNT_RE = re.compile(r"^\d+$")
-_FILE_KEY_BYTES_WORD_RE = re.compile(r"^[ \t]+bytes\b")
-_FILE_KEY_BENIGN_WORDS = frozenset(
-    {"ok", "pem", "openssh", "data", "ascii", "certificate", "verification", "error", "cannot", "unable", "bytes"}
-)
-_SENSITIVE_KEY_SUFFIXES = (
-    *_FILE_NAME_KEY_SUFFIXES,
-    ".dockercfg",
-    ".dockerconfigjson",
-    "privatekey",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-)
-_BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
-_INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
-# A `kubectl get` of a secret whose output is shaped (`-o`/`--output`/
-# `--template`, in any spelling: `-o json`, `-o=go-template=...`,
-# `--output=yaml`) or piped anywhere (`| jq`, `| yq`, `| base64`) can print a
-# value; the formatter is not enumerated because the agent writes the command
-# and a form the list does not name would land as the value alone, which no
-# key rule recognises. kubectl takes its flags in any position, so the two
-# conditions are lookaheads from `kubectl`, not a token order: `get` with
-# `secret` somewhere after it on the same unpiped segment, and a flag or a
-# pipe anywhere on the line. A whitespace-led `-o` counts whatever follows
-# it (`-ojson`, `-o'go-template=...'`, `-o"..."`, `-o$FMT`): kubectl reads
-# the attached text as the format, and a quote or a variable is the shell's
-# to resolve. A bare list (`kubectl get secrets -n ns`) prints names and ages
-# only; a ConfigMap whose name contains `secret` is withheld too, which is
-# the safe direction. gcloud and aws take global flags and a release track
-# before the subcommand (`gcloud --project=p beta secrets versions access`,
-# `aws --region r secretsmanager get-secret-value`), so those two match the
-# subcommand anywhere on the same unpiped segment after the binary.
-# A shell joins a backslash-newline before it parses, so the detector folds
-# the continuation (and the indentation after it) to one space first; every
-# alternative below is line-bounded and would otherwise see two commands.
-_SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
-# The tool-call argument keys that carry a shell command, in the order
-# `_is_secret_read_tool_call` and `_scrub_worker_step_text` read them.
-_COMMAND_ARG_KEYS = ("command", "cmd")
-_SECRET_READ_COMMAND_RE = re.compile(
-    r"(?i)(?:"
-    r"\bkubectl\b(?=[^\r\n]*\bget\b[^\r\n|]*\bsecrets?\b)"
-    r"(?=[^\r\n]*(?:(?:^|\s)(?:-o|--output(?:[=\s]|$)|--template(?:[=\s]|$))|\|))"
-    r"|\bjsonpath\s*=\s*['\"]?[^'\"]*\.(?:data|stringData)\b"
-    r"|\bgcloud\b[^\r\n|;&]*\bsecrets\s+versions\s+access\b"
-    r"|\baws\b[^\r\n|;&]*\bsecretsmanager\s+get-secret-value\b"
-    r"|\baws\b[^\r\n|;&]*\bssm\s+get-parameters?\b"
-    r"|\baz\b[^\r\n|;&]*\bkeyvault\s+secret\s+show\b"
-    r"|\bvault\s+(?:kv\s+get|read)\b"
-    r"|\bsops\s+(?:-d|--decrypt|decrypt)\b"
-    # A file read (also after `kubectl exec ... --`) under a well-known secret
-    # mount, or under a directory component that is, or ends in `-`,
-    # `secret(s)`, `creds` or `credentials` (`/etc/db-creds/password`).
-    r"|\b(?:cat|head|tail|less|more|base64)\b[^\r\n]*/"
-    r"(?:var/run/secrets|etc/kubernetes/pki|etc/ssl/private|\.ssh/id_|(?:[^\s/]*-)?(?:secrets?|creds|credentials)/)[^\r\n]*"
-    r")"
-)
-
-
-def _scrub_secret_blocks(redactor: Any, text: str) -> str:
-    # `stringData` carries its only "data" capitalised; the fast path must
-    # let it through to the block rules below.
-    if "data" not in text and "Data" not in text:
-        return text
-    lines = text.split("\n")
-    block: Optional[int] = None
-    for i, line in enumerate(lines):
-        opener = _YAML_SECRET_BLOCK_RE.match(line)
-        if opener:
-            block = len(opener.group(1))
-            continue
-        if block is None or not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= block:
-            block = None
-            continue
-        pair = _YAML_PAIR_RE.match(line)
-        if pair is None:
-            lines[i] = " " * indent + _REDACTED_SECRET_MARKER
-        elif pair.group(3):
-            lines[i] = f"{pair.group(1)}{pair.group(2)}: {_REDACTED_SECRET_MARKER}"
-    joined = "\n".join(lines)
-
-    def _mask_json_block(m: "re.Match[str]") -> str:
-        if '"stringData"' not in m.group(1) and not redactor.JSON_CREDENTIAL_KIND_PATTERN.search(joined):
-            return m.group(0)
-        return (
-            m.group(1)
-            + _JSON_PAIR_RE.sub(lambda p: p.group(1) + _REDACTED_SECRET_MARKER + p.group(3), m.group(2))
-            + m.group(3)
-        )
-
-    return _JSON_SECRET_BLOCK_RE.sub(_mask_json_block, joined)
-
-
-def _is_non_credential_key_suffix(redactor: Any, name: str) -> bool:
-    last_word = redactor._last_key_word(name)
-    non_cred_suffixes = getattr(
-        sys.modules.get("kube_agents_session_kv_redactor"),
-        "NON_CREDENTIAL_KEY_SUFFIXES",
-        frozenset({"name", "names", "path", "file", "mode", "ref", "type", "kind"}),
-    )
-    return last_word in non_cred_suffixes
-
-
-def _cli_flag_is_sensitive(redactor: Any, flag: str) -> bool:
-    norm_flag = flag.lower().replace("_", "-")
-    if norm_flag in _CLI_NON_SECRET_FLAGS or _is_non_credential_key_suffix(redactor, norm_flag):
-        return False
-    return norm_flag in _CLI_EXTRA_SECRET_FLAGS or bool(redactor.CREDENTIAL_NAME_PATTERN.match(norm_flag))
-
-
-def _dict_key_needs_supplement(redactor: Any, name: str) -> bool:
-    """Supplemental dictionary key check for keys `AuditRedactor.SENSITIVE_KEYS`
-    does not cover (`client-key-data`, `client-certificate-data`, and `.key`/`.crt`
-    file-name keys)."""
-    if _is_non_credential_key_suffix(redactor, name):
-        return False
-    words = redactor._get_key_words(name)
-    return (
-        any(w <= words for w in _KEY_DATA_WORDS)
-        or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
-    )
-
-
-def _named_value_is_sensitive(redactor: Any, name: str) -> bool:
-    if _is_non_credential_key_suffix(redactor, name):
-        return False
-    words = redactor._get_key_words(name)
-    return (
-        bool(words & redactor.SENSITIVE_KEYS)
-        or any(w <= words for w in _KEY_DATA_WORDS)
-        or name.lower().endswith(_SENSITIVE_KEY_SUFFIXES)
-    )
-
-
-def _blank_quoted_spans(text: str) -> str:
-    """Return `text` with the interior of every single- or double-quoted span
-    replaced by spaces, keeping the quotes and the length."""
-    if not any(q in text for q in _SHELL_QUOTE_CHARS):
-        return text
-    return _SHELL_QUOTED_SPAN_RE.sub(
-        lambda m: m.group(0)[0] + _SHELL_QUOTE_BLANK_CHAR * (len(m.group(0)) - 2) + m.group(0)[-1], text
-    )
-
-
-def _sub_shell_segments(
-    segment_re: "re.Pattern[str]",
-    text: str,
-    mask: "Callable[[re.Match[str], str], str]",
-) -> str:
-    """Find each `segment_re` match on the quote-blanked copy of `text` and
-    replace that span of the original with `mask(match, text)`."""
-    blanked = _blank_quoted_spans(text)
-    out: list[str] = []
-    pos = 0
-    for match in segment_re.finditer(blanked):
-        out.append(text[pos : match.start()])
-        out.append(mask(match, text))
-        pos = match.end()
-    out.append(text[pos:])
-    return "".join(out)
-
-
-def _unquote_token(raw: str) -> str:
-    stripped = raw.strip()
-    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in ("'", '"'):
-        return stripped[1:-1]
-    if len(stripped) >= 1 and stripped[0] in ("'", '"'):
-        return stripped[1:]
-    return stripped
-
-
-def _scrub_supplement_env_pairs(redactor: Any, text: str) -> str:
-    if "name" not in text or "value" not in text:
-        return text
-
-    def _mask_env_block(match: "re.Match[str]") -> str:
-        if not _named_value_is_sensitive(redactor, match.group("name")):
-            return match.group(0)
-        body = match.group("body")
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        if lines and all(line.startswith("[REDACTED_") for line in lines):
-            return match.group(0)
-        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
-        ending = "\n" if body.endswith("\n") else ""
-        return f"{match.group(0)[: match.start('body') - match.start()]}{body_indent}{_REDACTED_SECRET_MARKER}{ending}"
-
-    def _mask_env_span(match: "re.Match[str]", start: int, end: int) -> str:
-        value = match.string[start:end]
-        if not redactor._is_credential_value(value) or not _named_value_is_sensitive(
-            redactor, match.group("name")
-        ):
-            return match.group(0)
-        whole = match.group(0)
-        return f"{whole[:start - match.start()]}{_REDACTED_SECRET_MARKER}{whole[end - match.start():]}"
-
-    def _mask_env_yaml(match: "re.Match[str]") -> str:
-        raw = match.group("value").rstrip()
-        start = match.start("value")
-        if len(raw) > 1 and raw[0] in ("'", '"') and raw[-1] == raw[0]:
-            return _mask_env_span(match, start + 1, start + len(raw) - 1)
-        return _mask_env_span(match, start, start + len(raw))
-
-    def _mask_env_json(match: "re.Match[str]") -> str:
-        return _mask_env_span(match, match.start("value"), match.end("value"))
-
-    text = _SUPPLEMENT_ENV_BLOCK_RE.sub(_mask_env_block, text)
-    for pattern in _SUPPLEMENT_ENV_YAML_PATTERNS:
-        text = pattern.sub(_mask_env_yaml, text)
-    for pattern in getattr(redactor, "ENV_PAIR_JSON_PATTERNS", ()):
-        text = pattern.sub(_mask_env_json, text)
-    return text
-
-
-def _file_key_value_is_benign(value: str, tail: str) -> bool:
-    """True for what a file-named key holds on a diagnostic line and never as
-    key material: a line number, a byte count that the word `bytes` follows
-    (tail is the text after the value), or one of the words the tools print."""
-    if _FILE_KEY_LINE_NUMBER_RE.match(value):
-        return True
-    if _FILE_KEY_BYTE_COUNT_RE.match(value):
-        return bool(_FILE_KEY_BYTES_WORD_RE.match(tail))
-    return value.lower() in _FILE_KEY_BENIGN_WORDS
-
-
-def _blank_named_values(redactor: Any, text: str) -> str:
-    def _mask_block(match: "re.Match[str]") -> str:
-        if not _named_value_is_sensitive(redactor, match.group("key")):
-            return match.group(0)
-        body = match.group("body")
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        if lines and all(line.startswith("[REDACTED_") for line in lines):
-            return match.group(0)
-        body_indent = body[: len(body) - len(body.lstrip(" \t"))]
-        ending = "\n" if body.endswith("\n") else ""
-        head = match.group(0)[: match.start("body") - match.start()]
-        return f"{head}{body_indent}{_REDACTED_SECRET_MARKER}{ending}"
-
-    def _mask_colon_kv(match: "re.Match[str]") -> str:
-        key = match.group("key")
-        unquoted = _unquote_token(match.group("val"))
-        if key.lower().endswith(_FILE_NAME_KEY_SUFFIXES) and _file_key_value_is_benign(
-            unquoted, match.string[match.end() :]
-        ):
-            return match.group(0)
-        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
-        return match.group(0)
-
-    def _mask_equals_kv(match: "re.Match[str]") -> str:
-        key = match.group("key")
-        raw_val = match.group("val")
-        unquoted = _unquote_token(raw_val)
-        if _named_value_is_sensitive(redactor, key) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{key}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
-        if "=" in unquoted:
-            rescanned = _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, unquoted)
-            if rescanned != unquoted:
-                if len(raw_val) >= 2 and raw_val[0] == raw_val[-1] and raw_val[0] in ("'", '"'):
-                    return f"{match.group('prefix')}{key}{match.group('sep')}{raw_val[0]}{rescanned}{raw_val[0]}"
-                return f"{match.group('prefix')}{key}{match.group('sep')}{rescanned}"
-        return match.group(0)
-
-    def _mask_long_flag(match: "re.Match[str]") -> str:
-        flag = match.group("flag")
-        raw_val = match.group("val")
-        unquoted = _unquote_token(raw_val)
-        if unquoted.startswith("-"):
-            return match.group(0)
-        if _cli_flag_is_sensitive(redactor, flag) and redactor._is_credential_value(unquoted):
-            return f"{match.group('prefix')}{flag}{match.group('sep')}{_REDACTED_SECRET_MARKER}"
-        return match.group(0)
-
-    def _mask_short_p(match: "re.Match[str]", source: str) -> str:
-        # `match` comes from the quote-blanked copy; the value is read from `source`.
-        unquoted = _unquote_token(source[match.start("val") : match.end("val")])
-        if unquoted.startswith("-") or not redactor._is_credential_value(unquoted):
-            return source[match.start() : match.end()]
-        return f"{source[match.start() : match.start('val')]}{_REDACTED_SECRET_MARKER}"
-
-    def _mask_userpass_segment(match: "re.Match[str]", source: str) -> str:
-        return _CLI_USERPASS_ARG_RE.sub(_mask_userpass, source[match.start() : match.end()])
-
-    def _mask_userpass(match: "re.Match[str]") -> str:
-        quote = match.group("quote") or ""
-        user = match.group("quser") if quote else match.group("user")
-        val = match.group("qval") if quote else _unquote_token(match.group("val"))
-        if val.startswith("-") or not redactor._is_credential_value(val):
-            return match.group(0)
-        return f"{match.group('prefix')}{quote}{user}{_REDACTED_SECRET_MARKER}{quote}"
-
-    def _mask_auth_scheme(match: "re.Match[str]") -> str:
-        val = _unquote_token(match.group("val"))
-        if not _named_value_is_sensitive(redactor, match.group("key")) or not redactor._is_credential_value(val):
-            return match.group(0)
-        return f"{match.group('prefix')}{_REDACTED_SECRET_MARKER}"
-
-    text = _scrub_supplement_env_pairs(redactor, text)
-    text = _SUPPLEMENT_BLOCK_SCALAR_RE.sub(_mask_block, text)
-    text = _AUTH_SCHEME_HEADER_RE.sub(_mask_auth_scheme, text)
-    text = _CLI_LONG_FLAG_RE.sub(_mask_long_flag, text)
-    text = _sub_shell_segments(_CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment)
-    text = _sub_shell_segments(_CLI_SHORT_P_RE, text, _mask_short_p)
-    text = _TEXT_COLON_KV_RE.sub(_mask_colon_kv, text)
-    text = _QUOTED_COLON_KV_RE.sub(_mask_colon_kv, text)
-    return _TEXT_EQUALS_KV_RE.sub(_mask_equals_kv, text)
-
-
-def _as_json_structure(text: str) -> Any:
-    if text.lstrip()[:1] not in "{[":
-        return None
-    try:
-        parsed = json.loads(text)
-    except (ValueError, RecursionError):
-        return None
-    return parsed if isinstance(parsed, (dict, list)) else None
-
-
-def _is_base64_encoded_secret_value(v: str) -> bool:
-    if len(v) < 4 or len(v) % 4 != 0 or _BASE64_SECRET_VALUE_RE.fullmatch(v) is None:
-        return False
-    try:
-        raw = base64.b64decode(v, validate=True)
-    except ValueError:
-        return False
-    if not raw:
-        return False
-    try:
-        decoded_text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return v.endswith("=")
-    return all(ch.isprintable() or ch in "\n\r\t" for ch in decoded_text)
-
-
-def _is_flat_base64_secret_map(redactor: Any, value: Dict[Any, Any]) -> bool:
-    if not value:
-        return False
-    has_long_or_sensitive = False
-    for k, v in value.items():
-        if not isinstance(k, str) or not isinstance(v, str):
-            return False
-        if not _is_base64_encoded_secret_value(v):
-            return False
-        if len(v) >= 16 or _named_value_is_sensitive(redactor, k):
-            has_long_or_sensitive = True
-    return has_long_or_sensitive
-
-
-def _supplement_redact(
-    redactor: Any,
-    value: Any,
-    key: Optional[str] = None,
-    *,
-    is_tool_result: bool = False,
-    parent_is_secret: bool = False,
-) -> Any:
-    if isinstance(value, str):
-        nested = _as_json_structure(value)
-        if nested is not None:
-            return json.dumps(
-                _supplement_redact(redactor, nested, key=None, is_tool_result=is_tool_result)
-            )
-        if is_tool_result and "{" in value and "}" in value:
-
-            def _scrub_inline_obj(m: "re.Match[str]") -> str:
-                obj = _as_json_structure(m.group(0))
-                if isinstance(obj, dict) and _is_flat_base64_secret_map(redactor, obj):
-                    return json.dumps(
-                        {
-                            k: _REDACTED_SECRET_MARKER if isinstance(v, str) else v
-                            for k, v in obj.items()
-                        }
-                    )
-                return m.group(0)
-
-            value = _INLINE_JSON_OBJECT_RE.sub(_scrub_inline_obj, value)
-        text = redactor.PRIVATE_KEY_PATTERN.sub(_REDACTED_PRIVATE_KEY_MARKER, value)
-        text = _UNTERMINATED_PRIVATE_KEY_RE.sub(_REDACTED_PRIVATE_KEY_MARKER, text)
-        text = _URL_USERINFO_RE.sub(lambda m: m.group(1) + _REDACTED_SECRET_MARKER, text)
-        return _blank_named_values(redactor, _scrub_secret_blocks(redactor, text))
-    if isinstance(value, dict):
-        if (
-            key == "stringData"
-            or (key == "data" and parent_is_secret)
-            or (is_tool_result and key is None and _is_flat_base64_secret_map(redactor, value))
-        ):
-            return {
-                k: _REDACTED_SECRET_MARKER
-                if isinstance(v, str)
-                else _supplement_redact(redactor, v, str(k), is_tool_result=is_tool_result)
-                for k, v in value.items()
-            }
-        is_secret_obj = value.get("kind") == "Secret"
-        env_name = value.get("name")
-        is_cred_env = isinstance(env_name, str) and _named_value_is_sensitive(redactor, env_name)
-        return {
-            k: (
-                _REDACTED_SECRET_MARKER
-                if isinstance(v, str)
-                and ((is_cred_env and k == "value") or _dict_key_needs_supplement(redactor, str(k)))
-                and redactor._is_credential_value(v.strip())
-                else _supplement_redact(
-                    redactor,
-                    v,
-                    str(k),
-                    is_tool_result=is_tool_result,
-                    parent_is_secret=is_secret_obj,
-                )
-            )
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_supplement_redact(redactor, v, is_tool_result=is_tool_result) for v in value]
-    return value
-
-
 def _scrub_worker_step_text(kind: str, text: str) -> str:
-    """Scrub worker step text with `AuditRedactor.redact`, then supplemental key/block rules;
-    withhold step text across all kinds if the redactor module is unavailable."""
-    redactor = _get_audit_redactor()
-    if redactor is None:
-        return WORKER_STEP_WITHHELD
-    try:
-        parsed = _as_json_structure(text)
-        if kind == "tool_call":
-            # Fold a shell line continuation once, here, so every line-bounded
-            # CLI rule below (`-u user:pass`, `-p pass`, `--password pass`)
-            # reads the command the shell would run; `_as_json_structure`
-            # returns a fresh object, so the fold does not touch the row.
-            if isinstance(parsed, dict):
-                for arg_key in _COMMAND_ARG_KEYS:
-                    if isinstance(parsed.get(arg_key), str):
-                        parsed[arg_key] = _SHELL_CONTINUATION_RE.sub(" ", parsed[arg_key])
-            elif parsed is None:
-                text = _SHELL_CONTINUATION_RE.sub(" ", text)
-        if parsed is not None:
-            return json.dumps(
-                _supplement_redact(redactor, redactor.redact(parsed), is_tool_result=(kind == "tool_result"))
-            )
-        return str(_supplement_redact(redactor, redactor.redact(text), is_tool_result=(kind == "tool_result")))
-    except RecursionError:
-        return WORKER_STEP_WITHHELD
+    """Scrub worker step text by the shared rules (`worker_transcript.scrub_step_text`):
+    `AuditRedactor.redact`, then the supplement; withheld across all kinds when
+    the redactor module is unavailable."""
+    return worker_transcript.scrub_step_text(_get_audit_redactor(), kind, text, WORKER_STEP_WITHHELD)
 
 
 def _decode_hermes_content(content: Any) -> str:
@@ -7696,15 +7277,7 @@ def _parse_tool_calls(raw: Any) -> list[Dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)]
 
 
-def _is_secret_read_tool_call(raw_args: Any) -> bool:
-    parsed = _as_json_structure(raw_args) if isinstance(raw_args, str) else raw_args
-    if isinstance(parsed, dict):
-        cmd = next((parsed.get(k) for k in _COMMAND_ARG_KEYS if parsed.get(k)), "")
-        if isinstance(cmd, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", cmd)):
-            return True
-    elif isinstance(raw_args, str) and _SECRET_READ_COMMAND_RE.search(_SHELL_CONTINUATION_RE.sub(" ", raw_args)):
-        return True
-    return False
+_is_secret_read_tool_call = worker_transcript.is_secret_read_tool_call
 
 
 def _make_worker_step(
@@ -7732,8 +7305,6 @@ def _make_worker_step(
         step["at"] = at
     return step
 
-
-_WORKER_PROMPT_TASK_RE = re.compile(re.escape(WORKER_PROMPT_PREFIX) + r"([\w-]+)(?![\w-])")
 
 
 def _extract_steps_from_conn(
@@ -8267,7 +7838,7 @@ class _WorkerStepReader:
                     if not isinstance(sid, str) or not sid:
                         continue
                     content = _decode_hermes_content(row["content"])
-                    for matched_task in _WORKER_PROMPT_TASK_RE.findall(content):
+                    for matched_task in worker_transcript.WORKER_PROMPT_TASK_RE.findall(content):
                         bucket = index.setdefault(matched_task, [])
                         if sid not in bucket:
                             bucket.append(sid)
@@ -8303,24 +7874,10 @@ def _read_task_worker_steps(
                 include_detail=include_detail,
             )
 
-    stamped_sessions: list[tuple[str, str]] = []
-    seen_sids: set[str] = set()
-    missing_run_session = not runs
-
-    for run in runs:
-        raw_meta = run.get("metadata")
-        try:
-            meta = json.loads(raw_meta) if isinstance(raw_meta, str) and raw_meta else {}
-        except ValueError:
-            meta = {}
-        sid = meta.get("worker_session_id") if isinstance(meta, dict) else None
-        prof = str(run.get("profile") or assignee or "")
-        if isinstance(sid, str) and sid:
-            if sid not in seen_sids:
-                seen_sids.add(sid)
-                stamped_sessions.append((sid, prof))
-        else:
-            missing_run_session = True
+    stamped_sessions, unstamped = worker_transcript.stamped_worker_sessions(runs, assignee)
+    seen_sids: set[str] = {sid for sid, _ in stamped_sessions}
+    # A run without a stamp sends the read to the prompt index below.
+    missing_run_session = not runs or unstamped
 
     window_size = max_steps * TASK_STEP_ROW_MULTIPLIER
     session_chunks: list[tuple[tuple[float, int, int], list[Dict[str, Any]]]] = []

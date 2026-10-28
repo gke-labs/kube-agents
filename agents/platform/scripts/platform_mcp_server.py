@@ -16,6 +16,7 @@ from pathlib import Path
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env
+from untrusted_text import strip_unsafe
 from chat_platforms import HOME_CHANNEL_ENV_SUFFIX, enabled_chat_platforms
 import chat_notify
 
@@ -136,51 +137,9 @@ def _pod_summary(pod: dict) -> dict | None:
 # Input Sanitization Helpers for Pod & Audit Logs (Task 537148227)
 # =============================================================================
 
-def _is_safe_char(ch: str) -> bool:
-    """Check whether a character is safe from control/zero-width/bidi smuggling."""
-    code = ord(ch)
-    # Preserve newline (\n, 10) and tab (\t, 9)
-    if code in (9, 10):
-        return True
-    # Strip C0 control characters (< 32), DEL (127), and C1 control characters (128-159)
-    if code < 32 or 127 <= code <= 159:
-        return False
-    # Strip zero-width, bidi, and format control characters
-    # U+200B-U+200F (Zero-width space, non-joiner, joiner, LRM, RLM)
-    # U+202A-U+202E (Bidi embedding/override controls: LRE, RLE, PDF, LRO, RLO)
-    # U+2060-U+206F (Word joiner, invisible operators, bidi isolates)
-    # U+FEFF (Zero-width no-break space / BOM)
-    # U+00AD (Soft hyphen), U+034F (Combining grapheme joiner), U+061C (Arabic letter mark), U+180E (Mongolian vowel separator)
-    if (
-        0x200B <= code <= 0x200F
-        or 0x202A <= code <= 0x202E
-        or 0x2060 <= code <= 0x206F
-        or code in (0xFEFF, 0x00AD, 0x034F, 0x061C, 0x180E)
-    ):
-        return False
-    # Strip Unicode tag block and non-printable supplementary blocks (U+E0000 and above)
-    if code >= 0xE0000:
-        return False
-    return True
-
-
 def _strip_unsafe_chars(text: str) -> str:
-    """
-    Strip ANSI escape codes (7-bit and 8-bit CSI), carriage returns, C0/C1
-    control characters, DEL, zero-width characters, bidi control characters,
-    and Unicode tag blocks.
-    """
-    if not text:
-        return ""
-    # Strip ANSI escape codes (7-bit ESC sequences and 8-bit CSI sequences) and carriage returns
-    text = re.sub(r"\r", "", text)
-    text = re.sub(
-        r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])",
-        "",
-        text,
-    )
-    # Strip C0/C1 control characters, DEL, zero-width/bidi characters, and Unicode tag block
-    return "".join(ch for ch in text if _is_safe_char(ch))
+    """ANSI escape sequences, carriage returns, control, zero-width and bidi characters out; see untrusted_text."""
+    return strip_unsafe(text)
 
 
 def _neutralize_tokens(text: str) -> str:

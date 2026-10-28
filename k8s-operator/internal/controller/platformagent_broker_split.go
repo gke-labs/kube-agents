@@ -209,7 +209,7 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // says which Pod called; the audience (credentialProxyChatAudience and its
 // siblings) says which role the call is for. The A2A gateway is told apart
 // the same way.
-func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
+func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, mcpIdentityOwned bool) string {
 	callers := []string{
 		// The gateway Pod, which presents the chat and watcher tokens. The
 		// broker's own ServiceAccount is not a caller: the broker serves these
@@ -232,10 +232,11 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 		callers = append(callers, a2aSessionBrokerCaller(agent))
 	}
 	// The MCP server's own ServiceAccount, under its flag
-	// (a2aMCPBrokerEnabled), never the namespace default it ran as before.
-	// Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which
+	// (a2aMCPBrokerEnabled) and only while this PlatformAgent owns the
+	// account (a2aMCPIdentityOwned), never the namespace default it ran as
+	// before. Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which
 	// a2aMCPBrokerEnv renders beside it, the same way the session caller is.
-	if a2aMCPBrokerEnabled(agent) {
+	if a2aMCPBrokerEnabled(agent) && mcpIdentityOwned {
 		callers = append(callers, a2aMCPBrokerCaller(agent))
 	}
 	return strings.Join(callers, ",")
