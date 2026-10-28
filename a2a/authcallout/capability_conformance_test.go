@@ -472,11 +472,12 @@ func TestTheConsoleCredentialCannotReachTheVerifyPlane(t *testing.T) {
 func TestCalloutMintedPrincipalsCannotJoinTheVerifyQueue(t *testing.T) {
 	for _, c := range []struct {
 		name, pod, token string
+		addressee        string // the principal's own verify token
 		idmap            string
 		tokens           map[string]Attested
 	}{
-		{"session pod", podA, tokenPodA, sessionMap, sessionTokens()},
-		{"profile pod", auditorPod1, tokenAuditorPod1, profileMap, profileTokens()},
+		{"session pod", podA, tokenPodA, podA, sessionMap, sessionTokens()},
+		{"profile pod", auditorPod1, tokenAuditorPod1, auditor, profileMap, profileTokens()},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := startHarness(t, c.idmap, c.tokens)
@@ -487,7 +488,7 @@ func TestCalloutMintedPrincipalsCannotJoinTheVerifyQueue(t *testing.T) {
 			for _, subject := range []string{
 				capability.VerifySubscribe,
 				strings.Replace(capability.VerifySubscribe, "*", bridgeAddressee, 1),
-				strings.Replace(capability.VerifySubscribe, "*", c.pod, 1),
+				strings.Replace(capability.VerifySubscribe, "*", c.addressee, 1),
 			} {
 				if !queueSubscribeRefused(t, nc, violations, subject, capability.VerifyQueue) {
 					t.Errorf("%s joined queue group %q on %s", c.name, capability.VerifyQueue, subject)

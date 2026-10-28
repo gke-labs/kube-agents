@@ -127,7 +127,9 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 // groups queue subscribers by name across patterns, so either joins.
 func TestOnlyTheVerifierReceivesVerifyRequests(t *testing.T) {
 	const verify, probe = "a2a.cap.verify.*", "a2a.cap.verify.probe"
-	reaches := func(grant string) bool { return subjectMatches(grant, probe) || subjectMatches(verify, grant) }
+	// Overlap, not one-way matching: a grant with a wildcard in a middle token
+	// (a2a.cap.*.platform) reaches verify subjects without matching either way.
+	reaches := func(grant string) bool { return subjectPatternsOverlap(grant, verify) }
 	// The operator's principal renders only with its namespace and
 	// ServiceAccount set, which TestMain unsets; set them so it is checked too.
 	t.Setenv(operatorNamespaceEnvVar, testOperatorNamespace)
@@ -628,11 +630,11 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 //     a callout identity is dropped before the JWT is minted, unconditionally,
 //     whether or not an allow sits beside it.
 //
-// Neither is live today: the three deny lists in the table
-// (gateway, bridge, web) sit on static principals with allows in the same
-// direction, which is the case that renders correctly. The point is that
-// nothing stops the next one. Every deny in this table is an operator-authored
-// constant -- capDenyPublish, capDenySubscribe, and web's literal -- so this
+// Neither is live today: the deny lists in the table (gateway, bridge, web,
+// console) sit on static principals with allows in the same direction, which
+// is the case that renders correctly. The point is that nothing stops the next
+// one. Every deny in this table is an operator-authored constant --
+// capDenyPublish, capDenySubscribe, and web's and console's literals -- so this
 // test sees all of them, which is what makes a test the right place for the
 // check. If a deny list ever becomes CR-derived, a passing test here stops
 // meaning anything and the refusal has to move into the render.
