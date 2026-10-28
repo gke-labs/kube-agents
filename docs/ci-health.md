@@ -163,9 +163,9 @@ deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
-state on the same pool project on two consecutive scans, or on 3+ projects in
-one scan; #1550, below), or pool drift (the same rule over the pool-state scan's
-findings; #1967, below). A zero-task run
+state on the same pool project on two consecutive scans; #1550, below), or pool
+drift (the same over the pool-state scan's findings, or a finding on 3+
+projects in one scan; #1967, below). A zero-task run
 is at most one of a lost pod, a conflicted merge (below), a deadline kill
 (above) and a setup death, in that order: a lost pod is never a setup death,
 whatever its duration. When more
@@ -206,8 +206,12 @@ and the delegation-ceiling repetitions on a day that had any. `health.json`'s
 and whether it was read at all, the infra-rep rate, `setup_deaths`,
 `lost_pods`, `deadline_kills`, `ceiling_reps`.
 
-A case failing on exactly one pull request while passing elsewhere is that pull
-request's problem and moves no state; the message lists it as "PR-caused".
+A case failing on exactly one pull request is that pull request's problem and
+moves no state; the message lists it as "PR-caused" when the evidence rules out
+a flake and a moving main: the case passed on another pull request's run built
+on the same main commit, or it failed on two or more of that pull request's
+runs (a retest counts) while passing on another pull request. One red run with
+no same-base pass gets no line.
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
@@ -1147,12 +1151,15 @@ Until the grant is in place the scan pre-flights one token mint per project,
 fails it, and records every role as "not checked" with gcloud's own words.
 
 **The condition.** `health.py`'s `fixture_drift` fires when the same role is
-drifted on the same project in two consecutive scans, or on 3 or more projects
-in one scan. One scan on one project is not enough: in #1278's retest sweep the
-crashloop fixture lagged the node repair by about 40 minutes on one project (it
-needs its first restart before OOMKilled evidence exists), and one hourly scan
-can land inside that window. Three projects at once is the fleet-wide shape
-(#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
+drifted on the same project in two consecutive scans. One scan is not enough,
+however many projects it covers: in #1278's retest sweep the crashloop fixture
+lagged the node repair by about 40 minutes on one project (it needs its first
+restart before OOMKilled evidence exists), and one hourly scan can land inside
+that window; and a reconcile rolling a patch in batches of four holds each
+batch half-applied for about an hour, which one scan reads as drift on four
+projects at once. The fleet-wide shape (#1278 was all 30) waits for the
+second scan like any other; the daily reconcile could not have repaired it
+sooner. It is DEGRADED, ranked below every
 run-based condition (the presubmit runs the same check on its own lease and
 records the cases that need a drifted role as infrastructure under
 `fixture-drift:<role>` rather than running them, so a fixture the lease's own

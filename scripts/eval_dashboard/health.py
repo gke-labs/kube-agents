@@ -184,6 +184,9 @@ SHARED_BREAK_MIN_RUNS = 3
 SHARED_BREAK_MIN_PRS = 3
 SHARED_BREAK_MAJORITY = 0.5
 SHARED_BREAK_MIN_RED_SHARE = 0.5
+# Rule 4 without a same-base pass: this many red runs of the one pull request
+# (a retest, or a new push) before its case is called the pull request's.
+PR_CAUSED_MIN_RUNS = 2
 
 # --- Rule 2: quota storm -> DEGRADED (#1225, #1097, #1214) -------------------
 # Incident: the Gemini API key's fixed token quota (#1208) saturates under a
@@ -755,11 +758,14 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
         self.pr = run.get("pr")
+        # The main commit the run was built on (SCHEMA.md, optional): rule 4
+        # compares a PR's red with passes on the same base. Absent is unknown.
+        self.base_sha = run.get("base_sha") if isinstance(run.get("base_sha"), str) else None
         self.started = parse_iso(run.get("started"))
         self.finished = parse_iso(run.get("finished"))
         # SCHEMA.md promises SUCCESS|FAILURE|ABORTED verbatim; Prow has also
@@ -983,15 +989,29 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         for case, runs in collapses.items()
         if len(runs) >= SHARED_BREAK_MIN_RUNS and len(_prs(runs)) >= SHARED_BREAK_MIN_PRS
     )
-    # Rule 4: a case failing on exactly one pull request while passing on
-    # others is that pull request's, and carries no state.
+    # Rule 4: a case failing on exactly one pull request is that pull
+    # request's, and carries no state, when the evidence rules out a flake
+    # and a moving main: the case passed on another pull request's run built
+    # on the same main commit, or it failed on PR_CAUSED_MIN_RUNS of this
+    # pull request's runs (a retest counts) while passing on another pull
+    # request. One red run and no same-base pass says nothing.
     pr_caused = []
     for case, runs in sorted(collapses.items()):
         prs = _prs(runs)
-        elsewhere = passes.get(case, set()) - set(prs)
-        if len(prs) == 1 and elsewhere:
+        if len(prs) != 1:
+            continue
+        elsewhere = [run for run in window if case in run.passing_cases() and run.pr != prs[0]]
+        if not elsewhere:
+            continue
+        bases = {run.base_sha for run in runs if run.base_sha}
+        same_base = [run for run in elsewhere if run.base_sha and run.base_sha in bases]
+        if same_base:
             pr_caused.append(
-                f"PR-caused: {case} failing only on #{prs[0]} (passing on {len(elsewhere)} other PRs)"
+                f"PR-caused: {case} failing only on #{prs[0]} (passing on {len(_prs(same_base))} other PRs built on the same main commit)"
+            )
+        elif len({run.build_id for run in runs}) >= PR_CAUSED_MIN_RUNS:
+            pr_caused.append(
+                f"PR-caused: {case} failing on {len(runs)} runs of #{prs[0]} (passing on {len(_prs(elsewhere))} other PRs)"
             )
 
     concluded = [run for run in window if run.result in (RUN_SUCCESS, RUN_FAILURE)]
@@ -1191,15 +1211,21 @@ class ScanKind:
     (the role itself; the finding's check). Rule 6's exit asks whether a
     later scan read those same units on the incident's projects."""
 
-    def __init__(self, module, label: str, verb: str, unit_read):
+    def __init__(self, module, label: str, verb: str, unit_read, widespread_fires: bool):
         self.module = module
         self.label = label
         self.verb = verb
         self.unit_read = unit_read
+        # Whether one scan on FIXTURE_DRIFT_MIN_PROJECTS projects fires on its
+        # own. The pool scan: a grant missing on 40 projects is fleet-wide on
+        # first sight. The fleet scan: a reconcile rolling a patch in batches
+        # of four holds each batch half-applied for an hour, which one scan
+        # reads as drift, so only a reading repeated on the same project fires.
+        self.widespread_fires = widespread_fires
 
 
-FIXTURE_SCAN = ScanKind(fixture_state, FIXTURE_STATE_LABEL, "drifted on", lambda doc, project, role: role)
-POOL_SCAN = ScanKind(pool_state, POOL_STATE_LABEL, "found on", pool_state.check_of)
+FIXTURE_SCAN = ScanKind(fixture_state, FIXTURE_STATE_LABEL, "drifted on", lambda doc, project, role: role, widespread_fires=False)
+POOL_SCAN = ScanKind(pool_state, POOL_STATE_LABEL, "found on", pool_state.check_of, widespread_fires=True)
 
 
 def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
@@ -1302,11 +1328,11 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
         line = f"{unit} {scan.verb} {len(projs)} pool project(s) ({_project_list(projs)}) at the {hhmm(scanned_at)} UTC scan"
         if repeated:
             line += f", the {FIXTURE_DRIFT_CONSECUTIVE_SCANS}nd consecutive scan on {_project_list(repeated)}"
-        fires = len(projs) >= FIXTURE_DRIFT_MIN_PROJECTS or bool(repeated)
+        fires = bool(repeated) or (scan.widespread_fires and len(projs) >= FIXTURE_DRIFT_MIN_PROJECTS)
         if fires:
             firing[unit] = projs
         else:
-            line += "; not yet repeated or widespread"
+            line += "; not yet repeated or widespread" if scan.widespread_fires else "; not yet repeated"
         out["evidence"].append(line)
     if firing:
         out["fires"] = True

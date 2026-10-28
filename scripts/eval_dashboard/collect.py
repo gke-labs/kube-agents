@@ -264,6 +264,11 @@ _JOB_IN_PATH = re.compile(r"/(?P<job>[^/]+)/\d+/?$")
 # What a commit id looks like, and how much of one runs[].head_sha keeps.
 _SHA_SHAPE = re.compile(r"^[0-9a-f]{7,40}$")
 HEAD_SHA_CHARS = 7
+# started.json's `repos` maps "org/repo" to "<base ref>:<base sha>,<pr>:<head sha>,...";
+# the first segment names the main commit the run was built on.
+STARTED_REPOS_KEY = "repos"
+REPOS_SEGMENT_SEP = ","
+REPOS_REF_SEP = ":"
 
 # The shape of a Prow presubmit build-directory glob,
 # gs://<bucket>/pr-logs/pull/<org_repo>/<pr or *>/<job>/*, from which the
@@ -818,6 +823,22 @@ def parse_podinfo(text: str | None) -> dict | None:
     }
 
 
+def parse_base_sha(repos) -> str | None:
+    """The main commit a run was built on, from started.json's `repos`: the
+    sha of the first (base) segment, HEAD_SHA_CHARS long; None when the map
+    is absent or carries no sha-shaped value there."""
+    if not isinstance(repos, dict) or not repos:
+        return None
+    for value in repos.values():
+        if not isinstance(value, str):
+            continue
+        first = value.split(REPOS_SEGMENT_SEP, 1)[0]
+        _, _, sha = first.rpartition(REPOS_REF_SEP)
+        if _SHA_SHAPE.match(sha):
+            return sha[:HEAD_SHA_CHARS]
+    return None
+
+
 def parse_clone_records(text: str | None) -> bool | None:
     """Whether the clone failed on the merge, from clone-records.json text.
 
@@ -996,6 +1017,8 @@ def build_run(
             head_sha = candidate[:HEAD_SHA_CHARS]
             break
 
+    base_sha = parse_base_sha(started.get(STARTED_REPOS_KEY))
+
     started_ts = started.get("timestamp")
     finished_ts = finished.get("timestamp")
     # The verdict line's Total Duration covers only the eval loop; the
@@ -1011,6 +1034,7 @@ def build_run(
         "job": job,
         "pr": pr,
         "head_sha": head_sha,
+        "base_sha": base_sha,
         "project": parsed["project"],
         "started": _iso(started_ts),
         "finished": _iso(finished_ts),

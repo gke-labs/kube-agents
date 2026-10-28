@@ -108,6 +108,9 @@ layout and are collected from the moment they start running.
   `finished.json`'s `revision` and `started.json`'s `repo-commit` (a
   periodic's `finished.json` says `revision: main` and keeps the commit in
   `started.json`); `null` when neither is one.
+- `base_sha` — first 7 chars of the main commit the run was built on, from the
+  base segment of `started.json`'s `repos` map; `null` when absent. Optional:
+  a document written before the collector recorded it has no key.
 - `project` — from the `Successfully leased project: <name>` log line;
   `null` when the log never got that far.
 - `started` / `finished` — `started.json` / `finished.json` timestamps as
