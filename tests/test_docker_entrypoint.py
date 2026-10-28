@@ -1111,6 +1111,7 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertIn(f"- cluster: {self._IDENTITY['cluster']}", persona)
         self.assertIn(f"- location: {self._IDENTITY['location']}", persona)
         self.assertEqual(persona.count("## Target Cluster Identity"), 1)
+        self.assertTrue(persona.endswith(f"- location: {self._IDENTITY['location']}\n"))
 
     def test_the_cluster_loop_refreshes_the_image_owned_plugin_code(self):
         """A cluster profile on the volume runs the image's tool_call_audit, not its own.

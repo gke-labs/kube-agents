@@ -716,6 +716,8 @@ class CreateProfileTest(unittest.TestCase):
         self.assertIn(f"- project: {self.PROJECT}", soul)
         self.assertIn(f"- cluster: {self.CLUSTER}", soul)
         self.assertIn(f"- location: {self.LOCATION}", soul)
+        self.assertTrue(soul.startswith("# Cluster Agent — Soul\n\n---\n\n## 1. Core Truths\n"))
+        self.assertTrue(soul.endswith(f"- location: {self.LOCATION}\n"))
         # Re-scaffolding is idempotent and does not duplicate the section.
         self.create()
         soul_again = (self.profile / "SOUL.md").read_text(encoding="utf-8")
@@ -1005,34 +1007,42 @@ class ListReadyProfilesTest(unittest.TestCase):
         cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
         self.assertFalse((p / "SOUL.md").exists())
 
-        # Branch 1: Anchor present -> inserts before SOUL_SECTION_1_ANCHOR
-        (p / "SOUL.md").write_text(
-            "# SOUL.md\n\nIntro paragraph.\n\n---\n\n## 1. Core Truths\n\n- Truth 1\n",
-            encoding="utf-8",
-        )
+        def block(project, cluster, location):
+            return (
+                f"---\n\n## Target Cluster Identity\n\n- project: {project}\n"
+                f"- cluster: {cluster}\n- location: {location}\n"
+            )
+
+        template = "# SOUL.md\n\nIntro paragraph.\n\n---\n\n## 1. Core Truths\n\n- Truth 1\n"
+
+        # A fresh template gets the block appended after everything else.
+        (p / "SOUL.md").write_text(template, encoding="utf-8")
         cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
         first = (p / "SOUL.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "---\n\n## Target Cluster Identity\n\n- project: proj-a\n- cluster: clus-a\n- location: us-central1\n\n---\n\n## 1. Core Truths",
-            first,
-        )
+        self.assertEqual(first, template + "\n" + block("proj-a", "clus-a", "us-central1"))
 
-        # Branch 2: Existing Target Cluster Identity block -> replaces in place without duplicating
+        # Re-stamping the same identity leaves identical bytes.
+        cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
+        self.assertEqual((p / "SOUL.md").read_text(encoding="utf-8"), first)
+
+        # A new identity replaces the tail block without duplicating it.
         cap._stamp_soul_identity(p, "proj-b", "clus-b", "europe-west1")
         replaced = (p / "SOUL.md").read_text(encoding="utf-8")
-        self.assertEqual(replaced.count("## Target Cluster Identity"), 1)
-        self.assertIn("- project: proj-b\n- cluster: clus-b\n- location: europe-west1\n", replaced)
-        self.assertNotIn("proj-a", replaced)
+        self.assertEqual(replaced, template + "\n" + block("proj-b", "clus-b", "europe-west1"))
 
-        # Branch 3: Anchor missing and no existing block -> appends at the end
-        (p / "SOUL.md").write_text("# Custom SOUL without section 1 anchor\n", encoding="utf-8")
-        cap._stamp_soul_identity(p, "proj-c", "clus-c", "asia-east1")
-        appended = (p / "SOUL.md").read_text(encoding="utf-8")
-        self.assertTrue(
-            appended.endswith(
-                "\n\n---\n\n## Target Cluster Identity\n\n- project: proj-c\n- cluster: clus-c\n- location: asia-east1\n"
-            )
+        # A profile stamped by the old code carries the block before section 1. It
+        # migrates to exactly one block, at the end, with the template's bytes restored
+        # around the gap, and stays put on the next stamp.
+        old_layout = template.replace(
+            "---\n\n## 1. Core Truths",
+            block("proj-old", "clus-old", "us-west1") + "\n---\n\n## 1. Core Truths",
         )
+        (p / "SOUL.md").write_text(old_layout, encoding="utf-8")
+        cap._stamp_soul_identity(p, "proj-c", "clus-c", "asia-east1")
+        migrated = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertEqual(migrated, template + "\n" + block("proj-c", "clus-c", "asia-east1"))
+        cap._stamp_soul_identity(p, "proj-c", "clus-c", "asia-east1")
+        self.assertEqual((p / "SOUL.md").read_text(encoding="utf-8"), migrated)
 
         # CLI subcommand `stamp-soul --profile-dir` reads config.yaml and stamps a fresh template SOUL.md
         (p / "SOUL.md").write_text(
@@ -1047,6 +1057,25 @@ class ListReadyProfilesTest(unittest.TestCase):
         cap.cmd_stamp_soul(args)
         cli_stamped = (p / "SOUL.md").read_text(encoding="utf-8")
         self.assertIn("- project: proj-cli\n- cluster: clus-cli\n- location: us-east1\n", cli_stamped)
+
+    def test_soul_md_of_two_clusters_share_the_whole_template_as_a_prefix(self):
+        """SOUL.md opens the system prompt, so the bytes two clusters' profiles share
+        before they diverge are the prefix the model provider can cache across them.
+        The identity block is the only per-cluster text; everything before it must be
+        the shipped template, unchanged."""
+        template = (Path(__file__).resolve().parents[2] / "cluster" / "SOUL.md").read_text(encoding="utf-8")
+        stamped = []
+        for name, identity in (
+            ("cluster-a", ("proj-a", "clus-a", "us-central1")),
+            ("cluster-b", ("proj-b", "clus-b", "europe-west1")),
+        ):
+            home = self.tmp / name
+            home.mkdir()
+            (home / "SOUL.md").write_text(template, encoding="utf-8")
+            cap._stamp_soul_identity(home, *identity)
+            stamped.append((home / "SOUL.md").read_text(encoding="utf-8"))
+        shared = len(os.path.commonprefix(stamped))
+        self.assertGreaterEqual(shared, len(template.rstrip("\n")))
 
     def test_list_profiles_excludes_reserved_tse_and_dot_deleted(self):
         for name in ("default", "platform", "tse", "cluster-demo", ".deleted"):

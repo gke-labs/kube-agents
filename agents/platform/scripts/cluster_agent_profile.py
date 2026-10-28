@@ -80,7 +80,6 @@ KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 USER_MD_NAME = "USER.md"
 SOUL_MD_NAME = "SOUL.md"
 SOUL_IDENTITY_HEADING = "## Target Cluster Identity"
-SOUL_SECTION_1_ANCHOR = "---\n\n## 1. Core Truths"
 # The one connection attempt the scaffold makes after pinning the kubeconfig,
 # so an unreachable cluster is reported here, with the endpoint it was reached
 # over, rather than discovered by the first Cluster Agent run. `kubectl
@@ -179,13 +178,18 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
 
 
 def _stamp_soul_identity(home: Path, project: str, cluster: str, location: str) -> None:
-    """Stamp the target cluster identity directly into the profile's SOUL.md.
+    """Stamp the target cluster identity at the end of the profile's SOUL.md.
 
     Hermes always injects SOUL.md into the system prompt via build_context_files_prompt(),
     whereas USER.md is skipped when user_profile_enabled is false (the Cluster Agent
     default) or when an external memory provider is active. Stamping project, cluster,
     and location into SOUL.md gives the worker its identity in turn 1 without spending
     tool calls searching for USER.md from its kanban task scratch workspace.
+
+    The block goes last because SOUL.md opens the system prompt: everything before the
+    block is byte-identical across every cluster's profile, so the model provider's
+    prefix cache is shared by all of them. A block left near the top by an earlier
+    version is removed, so the file carries exactly one, and re-stamping is idempotent.
     """
     soul_path = home / SOUL_MD_NAME
     if not soul_path.is_file():
@@ -197,20 +201,13 @@ def _stamp_soul_identity(home: Path, project: str, cluster: str, location: str) 
         f"- cluster: {cluster}\n"
         f"- location: {location}\n"
     )
+    # The trailing newline is the blank line that separated an old mid-file block from
+    # the section after it; taking it restores the template's bytes around the gap.
     pattern = re.compile(
-        rf"(?:---\n\n)?{re.escape(SOUL_IDENTITY_HEADING)}\n\n(?:- [^\n]+\n)+",
+        rf"(?:---\n\n)?{re.escape(SOUL_IDENTITY_HEADING)}\n\n(?:- [^\n]+\n)+\n?",
         re.MULTILINE,
     )
-    if pattern.search(text):
-        updated = pattern.sub(block, text, count=1)
-    elif SOUL_SECTION_1_ANCHOR in text:
-        updated = text.replace(
-            SOUL_SECTION_1_ANCHOR,
-            f"{block}\n{SOUL_SECTION_1_ANCHOR}",
-            1,
-        )
-    else:
-        updated = text.rstrip("\n") + f"\n\n{block}"
+    updated = pattern.sub("", text).rstrip("\n") + f"\n\n{block}"
     if updated != text:
         tmp_path = soul_path.with_name(soul_path.name + ".tmp")
         tmp_path.write_text(updated, encoding="utf-8")
