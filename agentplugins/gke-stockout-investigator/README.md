@@ -1,7 +1,7 @@
 # GKE Stockout Investigator
 
 Diagnoses GKE scale-up failures. When the cluster autoscaler cannot place a workload, this
-judges whether the alert is a real, active stockout or a stale duplicate; if it is real, it
+judges whether the alert is a real, active capacity constraint or scale-up failure or a stale duplicate; if it is real, it
 inspects the live cluster — pending pods, ComputeClasses, quotas, capacity advice — and
 proposes a GitOps remediation PR.
 
