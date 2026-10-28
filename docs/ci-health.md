@@ -1014,12 +1014,15 @@ the sending account and the chat line that links to it are still to be decided.
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
-when none of its parts was cut off at the job deadline, it has a main part, and
-it is not a night on which nearly every graded case failed; two counted nights
+when none of its parts was cut off at the job deadline, it has both halves of
+the main matrix it owed (the main part, and the main-b part once that job runs;
+the digest withholds its verdict on a night without either), and it is not a
+night on which nearly every graded case failed; two counted nights
 on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
-weeks; a scenario graded in only one week is left out and counted in the
-closing note.
+weeks; a scenario graded in only one week, or no longer in the suite (no
+`task.yaml` on the checkout, or no `domain:` line, so no area), is left out and
+counted in the closing note.
 
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
@@ -1033,7 +1036,7 @@ each reason and exits 1, the step logs a warning, and the last published copy
 stays. The checks:
 
 - **Same cases.** Both weeks' numbers are over one set of scenarios, and the
-  counts shown add up to it.
+  tile and the area rows' scenario counts add up to it.
 - **Truncated nights.** No counted night was cut off.
 - **Not enough data.** With fewer than 4 counted nights in either week, the
   intro says so and nothing is called up, down or steady.

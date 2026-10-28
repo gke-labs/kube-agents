@@ -15,8 +15,10 @@ default the Sunday before today, UTC), and **last week** the seven before
 it. A night is dated as ``nightly.night_date`` dates it.
 
 **A counted night** ran to its verdict: none of its parts was cut off at
-the job deadline (``nightly.run_truncated``), it has a main part, and it
-is not a run-level event (``classify.is_run_event``: nearly every graded
+the job deadline (``nightly.run_truncated``), it has both halves of the
+main matrix it owed (main, and main-b once that job runs: the night's
+``verdict_withheld_by``, as the digest reads it), and it is not a
+run-level event (``classify.is_run_event``: nearly every graded
 case failed). Two counted nights on one date are one night: per case the
 newer verdict stands, as ``nightly_bugs.graded_nights`` reads a re-run. A
 repetition the classifier calls infrastructure is never graded
@@ -25,14 +27,16 @@ repetition the classifier calls infrastructure is never graded
 **The numbers** are graded repetitions: a pass rate is passes over graded
 repetitions, over the scenarios that were graded in both weeks -- the same
 set both weeks, and the count the email shows. A scenario graded in one
-week only is left out of every number and counted in the closing note.
+week only, or no longer in the suite (no area: ``removed_cases``), is
+left out of every number and
+counted in the closing note.
 
 **The integrity checks** (#3440, "Integrity checks") run over the computed
 week and the rendered page; any failure refuses the render and prints every
 reason:
 
 1. same cases: both weeks' numbers are over one set of scenarios, and the
-   counts shown add up to it;
+   tile and the area rows' scenario counts add up to it;
 2. truncated nights excluded: no counted night was cut off;
 3. not enough data: with fewer than MIN_COUNTED_NIGHTS counted nights in
    either week, nothing is called up, down or steady;
@@ -232,7 +236,10 @@ HOW_TO_READ = ("How to read this: each area has a set of test scenarios that pla
                "and check the agent&rsquo;s answer. Some scenarios are hard on purpose, so watch the trend, not the "
                "absolute number. Areas with few scenarios swing more. Compared on the {scenarios} scenarios graded "
                "both weeks{left_out}; {cut}.")
-LEFT_OUT = " ({count} graded in only one week are left out)"
+LEFT_OUT = " ({what} are left out)"
+LEFT_OUT_ONE_WEEK = "{count} graded in only one week"
+LEFT_OUT_REMOVED = "{count} no longer in the suite"
+LEFT_OUT_JOIN = " and "
 CUT_NONE = "no night was cut off by a time limit"
 CUT_SOME = "these nights are left out: {days}"
 CUT_DAY = "{day} ({why})"
@@ -263,6 +270,9 @@ ROWS_JOIN = "\n"
 # Why a night is not counted, as the footer names it.
 WHY_CUT = "cut off"
 WHY_NO_MAIN = "no main part"
+WHY_NO_MAIN_B = "no main-b part"
+# The half of the main matrix a night lacks (``verdict_withheld_by``) -> why.
+WHY_NO_PART = {nightly.PART_MAIN: WHY_NO_MAIN, nightly.PART_MAIN_B: WHY_NO_MAIN_B}
 WHY_RUN_EVENT = "nearly every scenario failed"
 WHY_NO_RUN = "no run on record"
 
@@ -333,6 +343,7 @@ WHY_NOT_ENOUGH_MISSING = "the week has too few counted nights and the intro does
 WHY_TREND = "{name}'s change {change} is called {trend}"
 WHY_DOUBLE = "an area counts a scenario twice, or one not graded both weeks"
 WHY_TILE = "the tile shows {shown} scenarios but {count} were compared"
+WHY_ROWS = "the area rows hold {shown} scenarios but {count} were compared"
 WHY_NOT_COMMON = "the compared scenarios are not the ones graded in both weeks"
 WHY_SUM = "the overall {key} count is not the sum over the compared scenarios"
 NO_TREND = "no trend"
@@ -476,13 +487,17 @@ def bugs_url(repo: str, slug: str) -> str:
 # the nights
 
 
-def night_status(night: dict[str, dict]) -> str | None:
-    """None for a counted night, else why it is left out."""
+def night_status(night: dict[str, dict], data: dict) -> str | None:
+    """None for a counted night, else why it is left out. A night without a
+    half of the main matrix it owed is the night ``nightly`` withholds a
+    verdict for (``verdict_withheld_by``): no main part, or main-b missing
+    while main-b runs."""
     parts = nightly.night_parts(night)
     if any(nightly.run_truncated(run) for run in parts):
         return WHY_CUT
-    if nightly.PART_MAIN not in night:
-        return WHY_NO_MAIN
+    withheld = nightly.joined_night_document(night, data, None)["verdict_withheld_by"]
+    if withheld:
+        return WHY_NO_PART[withheld]
     if classify.is_run_event({"tasks": [t for run in parts for t in classify.run_tasks(run)]}):
         return WHY_RUN_EVENT
     return None
@@ -497,7 +512,7 @@ def nights_by_date(data: dict) -> tuple[dict[datetime.date, list[dict]], dict[da
         day = nightly.night_date(nightly.night_parts(night)[0])
         if day is None:
             continue
-        why = night_status(night)
+        why = night_status(night, data)
         if why is None:
             counted.setdefault(day, []).append(night)
             left_out.pop(day, None)
@@ -545,6 +560,13 @@ def week_cases(counted: dict[datetime.date, list[dict]], days: list[datetime.dat
             row["graded"] += reps["graded"]
             row["agent_s"] += reps["agent_s"]
     return out
+
+
+def removed_cases(cases: set[str], domain_of: dict[str, str]) -> set[str]:
+    """The cases with no area: no task.yaml on this checkout (renamed or
+    deleted, old runs still on record), or no ``domain:`` line collect can
+    read, which ``nightly.domains`` both file as DOMAIN_UNKNOWN."""
+    return {c for c in cases if domain_of.get(c, nightly.DOMAIN_UNKNOWN) == nightly.DOMAIN_UNKNOWN}
 
 
 def week_models(counted: dict, days: list[datetime.date], models: dict[str, set[str]]) -> tuple[list[str], list[datetime.date]]:
@@ -630,8 +652,10 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     this_nights = [d for d in days if d in counted]
     prev_nights = [d for d in prev_days if d in counted]
     this_cases, prev_cases = week_cases(counted, days), week_cases(counted, prev_days)
-    common = sorted(set(this_cases) & set(prev_cases))
     domain_of = nightly.domains(data)
+    graded = set(this_cases) | set(prev_cases)
+    removed = removed_cases(graded, domain_of)
+    common = sorted((set(this_cases) & set(prev_cases)) - removed)
     trend_ok = len(this_nights) >= MIN_COUNTED_NIGHTS and len(prev_nights) >= MIN_COUNTED_NIGHTS
     models = store_models(store)
     this_models, this_missing = week_models(counted, days, models)
@@ -641,13 +665,13 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
         "counted": [d.isoformat() for d in this_nights], "prev_counted": [d.isoformat() for d in prev_nights],
         "left_out": {d.isoformat(): left_out.get(d, WHY_NO_RUN) for d in days + prev_days if d not in counted},
         "trend_ok": trend_ok, "cases": common,
-        "one_week_only": sorted((set(this_cases) | set(prev_cases)) - set(common)),
+        "one_week_only": sorted(graded - set(common) - removed), "removed": sorted(removed),
         "data_domains": {}, "rows": [], "attention": [], "claims": [], "fatal": None,
         "footer": {"range": [prev_days[0].isoformat(), week_end.isoformat()], "models": this_models,
                    "prev_models": prev_models, "missing": [d.isoformat() for d in this_missing + prev_missing]},
         "streaks": streak_cases(data, repo_root), "horizon": filer_horizon(data),
     }
-    for case in sorted(set(this_cases) | set(prev_cases)):
+    for case in sorted(graded):
         week["data_domains"].setdefault(domain_of.get(case, nightly.DOMAIN_UNKNOWN), []).append(case)
     if not this_nights:
         week["fatal"] = FAIL_NO_NIGHTS.format(range=date_range(days[0], days[-1]))
@@ -784,10 +808,13 @@ def integrity_failures(week: dict, domain_rows: list[dict], bugs: dict | None,
         out.append(FAIL_SAME_CASES.format(what=WHY_DOUBLE))
     if week["overall"]["scenarios"] != len(common):
         out.append(FAIL_SAME_CASES.format(what=WHY_TILE.format(shown=week["overall"]["scenarios"], count=len(common))))
+    if sum(r["scenarios"] for r in rows) != len(common):
+        out.append(FAIL_SAME_CASES.format(what=WHY_ROWS.format(shown=sum(r["scenarios"] for r in rows), count=len(common))))
     counted, _ = nights_by_date(data)
     this_cases = week_cases(counted, [datetime.date.fromisoformat(d) for d in week["days"]])
     prev_cases = week_cases(counted, [datetime.date.fromisoformat(d) for d in week["prev_days"]])
-    if common != set(this_cases) & set(prev_cases):
+    domain_of = nightly.domains(data)
+    if common != (set(this_cases) & set(prev_cases)) - removed_cases(set(this_cases) | set(prev_cases), domain_of):
         out.append(FAIL_SAME_CASES.format(what=WHY_NOT_COMMON))
     else:
         for key, source in (("passed", this_cases), ("graded", this_cases), ("prev_passed", prev_cases), ("prev_graded", prev_cases)):
@@ -849,7 +876,7 @@ def integrity_failures(week: dict, domain_rows: list[dict], bugs: dict | None,
     for domain, cases in sorted(week["data_domains"].items()):
         if domain not in known and domain != nightly.DOMAIN_UNKNOWN:
             out.append(FAIL_DOMAIN_UNKNOWN.format(domain=domain, cases=NAMES_JOIN.join(cases)))
-    this_domains = {nightly.domains(data).get(c) for c in this_cases}
+    this_domains = {domain_of.get(c) for c in this_cases}
     for row in domain_rows:
         if row["slug"] not in this_domains and not row["new"]:
             out.append(FAIL_DOMAIN_NO_DATA.format(domain=row["slug"]))
@@ -980,7 +1007,9 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
     left = [d for d in week["days"] + week["prev_days"] if d in week["left_out"]]
     cut = CUT_SOME.format(days=NAMES_JOIN.join(CUT_DAY.format(day=short_date(datetime.date.fromisoformat(d)), why=week["left_out"][d])
                                                for d in sorted(left))) if left else CUT_NONE
-    left_out = LEFT_OUT.format(count=len(week["one_week_only"])) if week["one_week_only"] else ""
+    left_what = ([LEFT_OUT_ONE_WEEK.format(count=len(week["one_week_only"]))] if week["one_week_only"] else []) + (
+        [LEFT_OUT_REMOVED.format(count=len(week["removed"]))] if week["removed"] else [])
+    left_out = LEFT_OUT.format(what=LEFT_OUT_JOIN.join(left_what)) if left_what else ""
     how = HOW_TO_READ.format(scenarios=overall["scenarios"], left_out=left_out, cut=cut)
     close = CLOSE_ROW.format(dashboard=esc(DASHBOARD_URL), link=LINK, faint=FAINT, button=DASHBOARD_BUTTON, how=how)
 
