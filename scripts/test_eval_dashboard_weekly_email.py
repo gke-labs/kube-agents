@@ -307,6 +307,20 @@ class SplitNights(Base):
         self.assertEqual(failures, [])
         self.assertIn(f"Oct 15 ({we.WHY_NO_MAIN})", page)
 
+    def test_a_main_rerun_after_a_cut_main_keeps_the_dates_other_parts(self):
+        # main was cut on the 14th and re-run the same day; the re-run's night
+        # borrows the 14th's main-b and writers, so the week reads as if main
+        # had finished the first time.
+        runs = split_runs(truncated={(JOB, 14)})
+        rerun = run(14, [task(c, passes_for(c, 14)) for c in SPLIT[JOB]])
+        rerun.update(build_id="30000000000001409", started="2026-10-14T09:00:00+00:00", finished="2026-10-14T15:00:00+00:00")
+        runs.append(rerun)
+        split = self.week(data_of(runs), store_of(runs))
+        whole = self.week(data_of(split_runs()), store_of(split_runs()))
+        self.assertIn("2026-10-14", split["counted"])
+        self.assertEqual(split["overall"], whole["overall"])
+        self.assertEqual([(r["slug"], r["pct"]) for r in split["rows"]], [(r["slug"], r["pct"]) for r in whole["rows"]])
+
     def test_a_night_without_main_b_is_not_counted(self):
         # main-b ran the cost cases every other night, so a night without it
         # graded half the main matrix: the digest withholds its verdict.

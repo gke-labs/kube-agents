@@ -505,10 +505,16 @@ def night_status(night: dict[str, dict], data: dict) -> str | None:
 
 def nights_by_date(data: dict) -> tuple[dict[datetime.date, list[dict]], dict[datetime.date, str]]:
     """``({date: [counted night, ...] oldest first}, {date: why left out})``;
-    a date with no counted night is left out with its newest night's reason."""
+    a date with no counted night is left out with its newest night's reason.
+    A main re-run's night borrows its date's other parts (``lent_parts``)."""
     counted: dict[datetime.date, list[dict]] = {}
     left_out: dict[datetime.date, str] = {}
-    for night in nightly.group_nights(nightly.sorted_nightly_runs(data)):
+    nights = nightly.group_nights(nightly.sorted_nightly_runs(data))
+    lent = nightly.lent_parts(nights)
+    for index, night in enumerate(nights):
+        # A same-date main re-run reads its date's other parts, as the
+        # nightly report does, so a re-run after a cut main keeps them.
+        night = {**night, **{part: nights[at][part] for part, at in lent.get(index, {}).items()}}
         day = nightly.night_date(nightly.night_parts(night)[0])
         if day is None:
             continue
