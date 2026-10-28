@@ -170,9 +170,14 @@ what the test clusters really had, summed over the fleet; fits use the totals fo
 `replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>`, so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
 run. `excluded_from` names the fits the record is left out of: `["response_seconds"]` when a prompt
 run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade readiness record written
-before answers were kept, when its completion cannot be checked; the CPU, memory and proxy metrics when
-jobs an earlier `trigger_soak` started were still running. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records, and `remonitor` reads every stored record's Cloud
-Monitoring metrics again with the current queries, within Monitoring's retention. `errors` lists what made the run differ from its plan: a failed prompt, a
+before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics
+are left out too when work other than the run's own shared the broker: jobs an earlier `trigger_soak`
+started were still running; a prompt run started inside a Stall Watch read (2 minutes plus 30 seconds
+per cluster after :00 or :30) or held a tick; a proxy load run's broker ran more commands than its
+workers sent, beyond one per worker in flight (its throughput is left out as well). A prompt answered
+without its operation is left out of those and of the token metrics. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records, and `remonitor` reads every stored record's Cloud
+Monitoring metrics again with the current queries, within Monitoring's retention, and writes its own
+revision in the record's `remonitored`; a record it could not read keeps the field as it was. `errors` lists what made the run differ from its plan: a failed prompt, a
 cluster the event watcher did not watch, a churn batch that failed, a monitoring read that failed.
 
 Metric names:

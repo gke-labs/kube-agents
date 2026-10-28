@@ -20,8 +20,6 @@ import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
-import yaml
-
 from admin_console import harness_limits as hl
 
 TABLE_SEPARATOR = " | "
@@ -234,6 +232,9 @@ def report(
 
 
 def read_limits(path: Path) -> dict[str, dict[str, float]]:
+    # Imported here: the console's requirements do not install PyYAML, and only --limits reads YAML.
+    import yaml
+
     raw = yaml.safe_load(path.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: expected a mapping of container to memory_bytes and cpu_cores")

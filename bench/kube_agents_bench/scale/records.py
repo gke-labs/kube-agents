@@ -77,6 +77,8 @@ class Record:
     answers: list[str] = field(default_factory=list)
     excluded_from: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # The runner revision that last read the record's Monitoring metrics again (``remonitor``).
+    remonitored: str = ""
 
     @property
     def key(self) -> str:

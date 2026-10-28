@@ -364,8 +364,8 @@ def test_unfinished_answers_are_recognized():
 def test_reclassify_excludes_unfinished_and_unchecked_runs_and_scrubs_the_project(tmp_path):
     plan = load_plan(PHASE1, environ=ENV)
     path = tmp_path / "data.json"
-    base = dict(commit="e" * 40, mode="next", phase="phase1", level=0, started="2026-10-24T00:00:00Z",
-                ended="2026-10-24T00:05:00Z")
+    base = dict(commit="e" * 40, mode="next", phase="phase1", level=0, started="2026-10-24T00:10:00Z",
+                ended="2026-10-24T00:15:00Z")
     records.merge(path, [
         records.Record(factor="base", operation="fleet_audit", run=1, **base),                      # no answers
         records.Record(factor="base", operation="fan_out", run=1, **base),                          # no answers, fine
@@ -377,7 +377,7 @@ def test_reclassify_excludes_unfinished_and_unchecked_runs_and_scrubs_the_projec
     by = {r["key"].split("|", 2)[2]: r for r in records.load(path)["records"]}
     assert by["base|0|fleet_audit|1"]["excluded_from"] == ["response_seconds"]
     assert by["base|0|fan_out|1"]["excluded_from"] == []
-    assert by["clusters|8|fleet_audit|2"]["excluded_from"] == ["response_seconds"]
+    assert by["clusters|8|fleet_audit|2"]["excluded_from"] == ["response_seconds", *runner.RESOURCE_FITS, *runner.TOKEN_FITS]
     assert "example-project" not in json.dumps(by["clusters|8|fleet_audit|2"])
 
 
@@ -438,7 +438,7 @@ def test_reclassify_counts_unfinished_prompts_and_trusts_failed_ones(tmp_path):
     plan = load_plan(PHASE1, environ=ENV)
     path = tmp_path / "data.json"
     base = dict(commit="e" * 40, mode="next", phase="phase1", factor="clusters", level=8,
-                started="2026-10-24T00:00:00Z", ended="2026-10-24T00:05:00Z", operation="fleet_audit")
+                started="2026-10-24T00:10:00Z", ended="2026-10-24T00:15:00Z", operation="fleet_audit")
     records.merge(path, [
         records.Record(run=1, answers=["Audit cancelled as all 8 managed clusters are explicitly excluded"], **base),
         records.Record(run=2, answers=["Checked 8 clusters; 3 findings"], **base),
@@ -449,6 +449,9 @@ def test_reclassify_counts_unfinished_prompts_and_trusts_failed_ones(tmp_path):
     metric = {run: next(m["value"] for m in by[run]["metrics"] if m["name"] == "unfinished_prompts") for run in by}
     assert metric == {1: 1.0, 2: 0.0, 3: 0.0}
     assert not any("written before answers were kept" in e for e in by[3]["errors"])
+    # A prompt answered without its operation measures none of its cost; a completed one stays in.
+    assert {"memory_peak_bytes", "cpu_peak_cores", "tokens_input"} <= set(by[1]["excluded_from"])
+    assert by[2]["excluded_from"] == []
 
 
 def test_a_relay_that_dies_at_start_removes_its_kubeconfig(monkeypatch):
@@ -882,6 +885,43 @@ def test_remonitor_replaces_only_the_monitoring_metrics(monkeypatch, tmp_path):
         ("proxy_commands", None, 9.0), ("memory_peak_bytes", "shell", 2.0), ("cpu_peak_cores", "shell", 0.5),
         ("cpu_seconds", "shell", 300.0)}
     assert stored["errors"] == []
+    assert stored["remonitored"] == runner.RUNNER_REVISION
+
+
+def _short_run(operation, started, ended, clusters=2, metrics=(), values=None):
+    return records.Record(
+        commit="e" * 40, mode="next", phase="phase2", factor="base", level=0, operation=operation, run=1,
+        started=started, ended=ended, totals={"clusters": clusters}, values=values or {},
+        metrics=[records.Metric(name, value) for name, value in metrics])
+
+
+@pytest.mark.parametrize("started,ended,clusters,shared", [
+    ("2026-10-27T00:01:00Z", "2026-10-27T00:03:00Z", 2, True),    # starts inside the read (3 min at 2)
+    ("2026-10-27T00:05:00Z", "2026-10-27T00:07:00Z", 2, False),   # starts after it
+    ("2026-10-27T00:05:00Z", "2026-10-27T00:07:00Z", 16, True),   # the read lasts 10 min at 16
+    ("2026-10-27T00:28:30Z", "2026-10-27T00:30:30Z", 2, True),    # holds the :30 tick
+])
+def test_a_prompt_run_inside_a_stall_watch_read_leaves_the_resource_fits(started, ended, clusters, shared):
+    record = _short_run("fan_out", started, ended, clusters)
+    runner.Runner.mark_shared(record, "prompt")
+    assert ("cpu_peak_cores" in record.excluded_from) is shared
+    assert ("response_seconds" in record.excluded_from) is False
+    assert bool(record.errors) is shared
+    runner.Runner.mark_shared(record, "prompt")
+    assert len(record.errors) == (1 if shared else 0)
+
+
+def test_a_proxy_load_run_with_commands_from_outside_leaves_the_fits():
+    window = ("2026-10-27T00:10:00Z", "2026-10-27T00:13:00Z")
+    in_flight = _short_run("proxy_load", *window, metrics=(("proxy_commands", 216.0), ("proxy_load_completed", 213.0)),
+                           values={"proxy_concurrency": 4})
+    runner.Runner.mark_shared(in_flight, "proxy_load")
+    assert in_flight.excluded_from == []
+    shared = _short_run("proxy_load", *window, metrics=(("proxy_commands", 264.0), ("proxy_load_completed", 213.0)),
+                        values={"proxy_concurrency": 4})
+    runner.Runner.mark_shared(shared, "proxy_load")
+    assert {"proxy_load_per_second", "cpu_peak_cores"} <= set(shared.excluded_from)
+    assert shared.errors == ["brokered commands from outside the load ran during it: 51"]
 
 
 def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):

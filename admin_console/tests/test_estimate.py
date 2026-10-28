@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -80,3 +82,10 @@ class EstimateTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(estimate.main(["--data", str(self.data), "--commit", "deadbeef"]), 2)
             self.assertEqual(estimate.main(["--data", str(self.data), "--mode", "today"]), 2)
+
+    def test_the_module_runs_without_pyyaml(self):
+        # The console's own requirements do not install PyYAML; only --limits reads YAML.
+        code = "import sys; sys.modules['yaml'] = None; import admin_console.estimate"
+        result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[2],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)

@@ -1318,6 +1318,18 @@ class ProxyCapacityTest(unittest.TestCase):
                          [(4.0, 2, 2.5), (8.0, 1, 3.5)])
         self.assertEqual(levels[0].cpu_cores, 0.7)
 
+    def test_a_proxy_load_run_that_shared_the_broker_is_left_out(self):
+        records = parse(
+            *(
+                record("proxy_concurrency", 4, "proxy_load", run,
+                       metrics=((hl.PROXY_LOAD_RATE, None, rate), (hl.CPU_PEAK, hl.PROXY_CONTAINER, cpu)),
+                       values=planned(proxy_concurrency=4), excluded=excluded)
+                for run, rate, cpu, excluded in ((1, 1.5, 0.8, ()), (2, 1.1, 0.95, (hl.PROXY_LOAD_RATE, hl.CPU_PEAK)))
+            ),
+        )
+        [level] = hl.proxy_levels(records)
+        self.assertEqual((level.runs, level.per_second, level.cpu_cores), (1, 1.5, 0.8))
+
     def test_demand_is_commands_per_minute_per_cluster(self):
         records = parse(
             record("clusters", 8, "watcher_soak", metrics=((hl.PROXY_COMMANDS, None, 240.0),

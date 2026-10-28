@@ -33,7 +33,7 @@ from pathlib import Path
 
 from kube_agents_bench.scale import collect, fixtures, kube, operations, records
 from kube_agents_bench.scale.config import (
-    BASE_FACTOR, COMBINED_FACTOR, TRIGGER_SOAK_KIND, Operation, Plan, RunSpec, load_plan,
+    BASE_FACTOR, COMBINED_FACTOR, PROXY_LOAD_KIND, TRIGGER_SOAK_KIND, Operation, Plan, RunSpec, load_plan,
 )
 
 LOG = logging.getLogger("harness-scale")
@@ -51,9 +51,23 @@ WATCHER_POLL_SECONDS = 30
 # How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
 TRIGGER_DRAIN_SECONDS = 1800
 DRAIN_POLL_SECONDS = 60
-# The fits a run leaves out when jobs an earlier run started are still loading the harness.
-CARRIED_WORK_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
-                     "proxy_wait_max_seconds", "proxy_wait_p50_seconds")
+# The fits a run leaves out when work other than its own loaded the harness during it.
+RESOURCE_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
+                 "proxy_wait_max_seconds", "proxy_wait_p50_seconds")
+# A proxy load run that shared the broker also leaves out its throughput and command times.
+PROXY_LOAD_FITS = ("proxy_load_per_second", "proxy_load_p50_seconds", "proxy_load_p95_seconds", "proxy_load_max_seconds")
+# A prompt answered without its operation measures none of the operation's cost.
+TOKEN_FITS = ("tokens_input", "tokens_output", "tokens_cached", "run_tokens_input", "run_tokens_output",
+              "run_tokens_cached")
+# The Platform Agent's Stall Watch reads every cluster through the broker, one at a time, at
+# :00 and :30 (agents/platform/cron/jobs.json). How long a tick keeps the broker busy, from the
+# stored prompt runs: the ones that started 2 to 6 minutes after a tick at 2 to 16 clusters show
+# its commands and shell CPU, and the ones 4 to 8 minutes after it at 2 to 8 clusters do not.
+STALL_WATCH_PERIOD_SECONDS = 1800
+STALL_WATCH_BASE_SECONDS = 120
+STALL_WATCH_SECONDS_PER_CLUSTER = 30
+STALL_WATCH_NOTE = "the Stall Watch's half-hourly read of every cluster overlapped the run"
+OUTSIDE_COMMANDS_NOTE = "brokered commands from outside the load ran during it"
 RESPONSE_FITS = ["response_seconds"]
 LEVEL_LABEL = "harness-scale/level"
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -123,6 +137,14 @@ def commit_of(image: str) -> str:
     tag = image.rsplit(":", 1)[-1] if ":" in image.rsplit("/", 1)[-1] else ""
     return tag if len(tag) == COMMIT_LENGTH and set(tag) <= HEX_DIGITS else ""
 
+
+
+def _overlaps_stall_watch(started: str, ended: str, clusters: float) -> bool:
+    """Whether the window shares the broker with a Stall Watch tick: starts inside one, or holds one."""
+    start, end = _epoch(started), _epoch(ended)
+    tick = start - start % STALL_WATCH_PERIOD_SECONDS
+    busy = STALL_WATCH_BASE_SECONDS + STALL_WATCH_SECONDS_PER_CLUSTER * clusters
+    return start < tick + busy or end > tick + STALL_WATCH_PERIOD_SECONDS
 
 class Runner:
     def __init__(self, plan: Plan, data_file: Path) -> None:
@@ -361,6 +383,28 @@ class Runner:
         """Replace the target project's ID in recorded text, so the committed data names no project."""
         return text.replace(self.project, PROJECT_PLACEHOLDER)
 
+    @staticmethod
+    def mark_shared(record: records.Record, kind: str) -> None:
+        """Leave a short run out of the fits that work other than its own loaded.
+
+        A prompt run is marked when it overlaps a Stall Watch tick; a proxy load run when the
+        broker ran more commands than its workers issued, beyond the ones still in flight.
+        """
+        fits: tuple[str, ...] = ()
+        if kind == "prompt" and _overlaps_stall_watch(record.started, record.ended, record.totals.get(CLUSTERS_TOTAL, 0)):
+            note, fits = STALL_WATCH_NOTE, RESOURCE_FITS
+        elif kind == PROXY_LOAD_KIND:
+            readings = {m.name: m.value for m in record.metrics if m.container is None}
+            issued = readings.get("proxy_load_completed", 0.0) + readings.get("proxy_load_errors", 0.0)
+            outside = readings.get("proxy_commands", 0.0) - issued
+            if outside > float(record.values.get(PROXY_CONCURRENCY, 1)):
+                note, fits = f"{OUTSIDE_COMMANDS_NOTE}: {outside:.0f}", RESOURCE_FITS + PROXY_LOAD_FITS
+        if not fits:
+            return
+        if not any(e.startswith(note.split(":")[0]) for e in record.errors):
+            record.errors.append(note)
+        record.excluded_from += [fit for fit in fits if fit not in record.excluded_from]
+
     def reclassify(self) -> int:
         """Apply the current rules to every stored record; returns how many changed.
 
@@ -406,6 +450,10 @@ class Runner:
                     for fit in RESPONSE_FITS:
                         if fit not in record.excluded_from:
                             record.excluded_from.append(fit)
+                if any(reason and reason != UNCHECKED_ANSWER for reason in reasons):
+                    record.excluded_from += [f for f in RESOURCE_FITS + TOKEN_FITS if f not in record.excluded_from]
+            if operation:
+                self.mark_shared(record, operation.kind)
             if json.dumps(record.to_dict(), sort_keys=True) != before:
                 changed.append(record)
         records.merge(self.data_file, changed)
@@ -461,7 +509,7 @@ class Runner:
         elif op.kind == "restart_soak":
             operations.restart(self.install.context, self.install.namespace)
             outcome = operations.soak(op.window_seconds)
-        elif op.kind == "proxy_load":
+        elif op.kind == PROXY_LOAD_KIND:
             concurrency = int(values.get(PROXY_CONCURRENCY, 1))
             kubeconfig_glob = PROFILE_KUBECONFIG_GLOB.format(project=self.project, cluster=self.cluster_names(count)[0])
             outcome = operations.proxy_load(self.install.context, self.install.namespace, op, concurrency, kubeconfig_glob)
@@ -511,15 +559,19 @@ class Runner:
         # LiteLLM logs every retry of one refusal; the client sees one per prompt. Take the larger.
         provider_429s = max(logs["provider_429s"], outcome.provider_429s)
         excluded = RESPONSE_FITS if op.kind == "prompt" and (provider_429s or outcome.unfinished_prompts) else []
+        if op.kind == "prompt" and outcome.unfinished_prompts:
+            excluded = excluded + list(RESOURCE_FITS + TOKEN_FITS)
         errors = [self.scrub(e) for e in errors]
-        return records.Record(
+        record = records.Record(
             commit=commit, mode=mode, phase=self.plan.phase, runner=RUNNER_REVISION,
             factor=spec.factor, level=spec.level, operation=op.name, run=spec.run,
             started=started_iso, ended=ended_iso, image=image, values=values, totals=totals,
             limits=limits, requests=requests, replicas=replicas, metrics=metrics,
             provider_429s=provider_429s, answers=[self.scrub(a) for a in outcome.previews],
-            excluded_from=list(excluded) + carried_fits, errors=errors,
+            excluded_from=list(excluded) + [f for f in carried_fits if f not in excluded], errors=errors,
         )
+        self.mark_shared(record, op.kind)
+        return record
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
         """The runs whose key is not in the data file yet, for the build the install runs now."""
@@ -621,12 +673,12 @@ class Runner:
         try:
             statuses = operations.job_statuses(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
         except kube.CommandError as exc:
-            return [f"could not tell whether the jobs an earlier run started had finished: {exc}"], list(CARRIED_WORK_FITS)
+            return [f"could not tell whether the jobs an earlier run started had finished: {exc}"], list(RESOURCE_FITS)
         active = [job for job, status in statuses.items() if status in operations.JOB_ACTIVE]
         if not active:
             self.triggered = None
             return [], []
-        return [f"{job}, started by an earlier run, was {statuses[job]}" for job in active], list(CARRIED_WORK_FITS)
+        return [f"{job}, started by an earlier run, was {statuses[job]}" for job in active], list(RESOURCE_FITS)
 
     def last_trigger(self) -> tuple[Operation, str] | None:
         """The latest stored trigger_soak run of this plan, so a resumed runner still checks its jobs."""
@@ -712,6 +764,7 @@ class Runner:
                 for container, values in peaks.items() for name, value in values.items()
             ]
             record.errors = [e for e in record.errors if not e.startswith(MONITORING_ERROR)]
+            record.remonitored = RUNNER_REVISION
             changed.append(record)
         records.merge(self.data_file, changed)
         return len(changed)

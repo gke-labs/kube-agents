@@ -11069,10 +11069,6 @@
           "value": 248373.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33333248.0,
           "container": "manager"
@@ -11251,6 +11247,10 @@
           "name": "cpu_seconds",
           "value": 1.222228227699634,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -11258,11 +11258,25 @@
         "checking all 8 clusters.\n\nThe fleet audit was cancelled because the platform agent found that all 8 managed clusters are explicitly excluded from the audit scope in the project's configuration (`fleet_scope.json`). \n\nHere is the complete re"
       ],
       "excluded_from": [
-        "response_seconds"
+        "response_seconds",
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "prompt unfinished: the agent did not perform the operation (explicitly excluded from the audit scope)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|fleet_audit|2",
@@ -11612,10 +11626,6 @@
           "value": 700348.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33337344.0,
           "container": "manager"
@@ -11794,6 +11804,10 @@
           "name": "cpu_seconds",
           "value": 1.5941756071725801,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -11801,11 +11815,25 @@
         "checking all 8 clusters.\n\nI couldn't run the fleet audit. The platform agent is blocked because this install has no registered GitOps repository.\n\nRegister the repository in the PlatformAgent's `spec.integration.repositories` (or re-run the"
       ],
       "excluded_from": [
-        "response_seconds"
+        "response_seconds",
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "prompt unfinished: the agent did not perform the operation (no registered GitOps repository)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|fleet_audit|3",
@@ -12155,10 +12183,6 @@
           "value": 404957.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33337344.0,
           "container": "manager"
@@ -12337,6 +12361,10 @@
           "name": "cpu_seconds",
           "value": 1.826475724499706,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -12344,11 +12372,25 @@
         "checking the fleet.\n\nTask `t_8e027ff4` is **done** by the platform agent.\n\nResult:\n**Audit cancelled as all 8 managed clusters are explicitly excluded from the configured fleet scope.**\n\nThe fleet scope configuration (`/opt/data/fleet_scope"
       ],
       "excluded_from": [
-        "response_seconds"
+        "response_seconds",
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "prompt unfinished: the agent did not perform the operation (audit cancelled)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|fan_out|1",
@@ -12706,10 +12748,6 @@
           "value": 310516.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33345536.0,
           "container": "manager"
@@ -12888,6 +12926,10 @@
           "name": "cpu_seconds",
           "value": 3.324896302820044,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -12895,7 +12937,8 @@
         "checking all 8 clusters.\n\n**Of the 8 scaling clusters checked, only one is currently stressed.** `scale-01` in `us-central1-c` is experiencing workload stress due to a deployment and pod that are unable to run, while the other 7 are healthy"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|fan_out|2",
@@ -13253,10 +13296,6 @@
           "value": 201827.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33341440.0,
           "container": "manager"
@@ -13435,14 +13474,29 @@
           "name": "cpu_seconds",
           "value": 9.998031490897006,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 8 clusters.\n\nTask `t_c3461573` is `done`. The platform agent finished it and reported:\n\n**The fleet is healthy except for `scale-01`, which has a Pending pod and an unavailable Deployment replica.** 8 clusters were read and 1 h"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|fan_out|3",
@@ -13800,10 +13854,6 @@
           "value": 310510.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33345536.0,
           "container": "manager"
@@ -13982,14 +14032,29 @@
           "name": "cpu_seconds",
           "value": 136.58949969649416,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 8 clusters.\n\nTask `t_7fa916b5` has finished (\"done\"). Here is its full result:\n\n**Only `scale-01` is experiencing stress; the other 7 managed clusters are running normally.** \n\nThe `scale-01` cluster has one pod (`broken-image-"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|upgrade_readiness|1",
@@ -14347,10 +14412,6 @@
           "value": 799397.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33349632.0,
           "container": "manager"
@@ -14529,6 +14590,10 @@
           "name": "cpu_seconds",
           "value": 247.0632477830953,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 4,
@@ -14538,7 +14603,8 @@
       "excluded_from": [
         "response_seconds"
       ],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|upgrade_readiness|2",
@@ -14896,10 +14962,6 @@
           "value": 546185.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33353728.0,
           "container": "manager"
@@ -15078,6 +15140,10 @@
           "name": "cpu_seconds",
           "value": 5.347333322177382,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -15085,11 +15151,25 @@
         "checking all 8 clusters.\n\n[SILENT]\n\nResult of delegated task t_1c537664:\nNO_REGISTERED_REPO: this install has no registered GitOps repository. Register the repository in the PlatformAgent's spec.integration.repositories (or re-run the insta"
       ],
       "excluded_from": [
-        "response_seconds"
+        "response_seconds",
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "prompt unfinished: the agent did not perform the operation (NO_REGISTERED_REPO)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|8|upgrade_readiness|3",
@@ -15447,10 +15527,6 @@
           "value": 870662.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33394688.0,
           "container": "manager"
@@ -15629,6 +15705,10 @@
           "name": "cpu_seconds",
           "value": 216.31570778544122,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -15636,7 +15716,8 @@
         "checking all 8 clusters.\n\nTask `t_53fc7c6e` is done. Here is its complete result:\n\n**The 8 checked clusters are ready to upgrade against their channel targets with no blockers.** (8 clusters were excluded from scope, as per the install's `f"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|objects|4000|fleet_audit|3",
@@ -15994,10 +16075,6 @@
           "value": 1062840.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33599488.0,
           "container": "manager"
@@ -16176,6 +16253,10 @@
           "name": "cpu_seconds",
           "value": 3.1234429633144827,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -16185,7 +16266,8 @@
       "excluded_from": [],
       "errors": [
         "profiles of deleted test clusters still present: 8 profiles for 2 test clusters"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|failing_pods|100|watcher_soak|1",
@@ -18645,10 +18727,6 @@
           "value": 519928.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33763328.0,
           "container": "manager"
@@ -18827,6 +18905,10 @@
           "name": "cpu_seconds",
           "value": 4.387198255823023,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -18848,7 +18930,8 @@
         "I currently monitor two clusters: scale-01 and scale-02."
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|15|fan_out|2",
@@ -19206,10 +19289,6 @@
           "value": 965830.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33296384.0,
           "container": "manager"
@@ -19388,6 +19467,10 @@
           "name": "cpu_seconds",
           "value": 3.2552861247014864,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -19415,7 +19498,8 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|15|fan_out|3",
@@ -19773,10 +19857,6 @@
           "value": 464939.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33042432.0,
           "container": "manager"
@@ -19955,6 +20035,10 @@
           "name": "cpu_seconds",
           "value": 14.961497518737376,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -19982,7 +20066,8 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|fleet_audit|1",
@@ -20340,10 +20425,6 @@
           "value": 2873084.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33828864.0,
           "container": "manager"
@@ -20522,14 +20603,29 @@
           "name": "cpu_seconds",
           "value": 155.53510439609755,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 2 clusters.\n\nThe task `t_1a12225a` (Fleet-wide audit) is `done`. \n\nHere is its result:\n\n\u26a0\ufe0f **Not published:** the compliance-audit audit ran `start`, but no `finish` published its ledger, so no ledger issue exists for this run."
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|fleet_audit|2",
@@ -20887,10 +20983,6 @@
           "value": 1113716.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33644544.0,
           "container": "manager"
@@ -21069,6 +21161,10 @@
           "name": "cpu_seconds",
           "value": 82.35302329003795,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -21076,7 +21172,8 @@
         "checking all 2 clusters.\n\n**`t_c185719c` (Fleet audit across all managed clusters) \u00b7 done \u00b7 platform**\n\n**The fleet audit is complete: `scale-02` has a critical public control plane exposure, and 236 total findings were identified across co"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|fleet_audit|3",
@@ -21434,10 +21531,6 @@
           "value": 4091656.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 1.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33697792.0,
           "container": "manager"
@@ -21616,6 +21709,10 @@
           "name": "cpu_seconds",
           "value": 191.55817426795966,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -21623,12 +21720,27 @@
         "checking every cluster."
       ],
       "excluded_from": [
-        "response_seconds"
+        "response_seconds",
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "tokens_input",
+        "tokens_output",
+        "tokens_cached",
+        "run_tokens_input",
+        "run_tokens_output",
+        "run_tokens_cached"
       ],
       "errors": [
         "KUBE_AGENTS_DELEGATION_CEILING: delegated tasks did not finish within 1800s: t_5d668a6d (running)",
-        "prompt unfinished: the delegation wait ran out; the answer is the acknowledgement only"
-      ]
+        "prompt unfinished: the delegation wait ran out; the answer is the acknowledgement only",
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|listing|1",
@@ -21986,10 +22098,6 @@
           "value": 167101.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33759232.0,
           "container": "manager"
@@ -22168,6 +22276,10 @@
           "name": "cpu_seconds",
           "value": 5.556894615765304,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -22175,7 +22287,8 @@
         "checking the pods in scale-listing on scale-01.\n\nTask `t_c041306b` is done.\n\n**There are 4,000 pods in the `scale-listing` namespace, exceeding the 4,000-character limit for chat delivery as a single table.** I have published the full table"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|listing|2",
@@ -22533,10 +22646,6 @@
           "value": 186853.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33759232.0,
           "container": "manager"
@@ -22715,6 +22824,10 @@
           "name": "cpu_seconds",
           "value": 3.786253494667911,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -22722,7 +22835,8 @@
         "checking the scale-listing pods on scale-01.\n\nThe scale-listing namespace contains 4,000 pods, so the full list is attached as a file because it exceeds chat limits.\n\nThere are 4,000 pods currently present in the namespace. The list of all "
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|listing|3",
@@ -23080,10 +23194,6 @@
           "value": 311141.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33726464.0,
           "container": "manager"
@@ -23262,14 +23372,29 @@
           "name": "cpu_seconds",
           "value": 37.462212698132134,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking scale-listing on scale-01.\n\nTask `t_1e4be6ef` is done.\n\nResult:\nThe `scale-listing` namespace contains 4000 pods. Because the resulting markdown table is over 280 KB (exceeding chat size limits), I have attached it as a file to thi"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|base|0|onboarding|1",
@@ -24679,10 +24804,6 @@
           "value": 1683569.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33910784.0,
           "container": "manager"
@@ -24861,6 +24982,10 @@
           "name": "cpu_seconds",
           "value": 27.278717965483217,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -24868,7 +24993,8 @@
         "checking all 2 clusters.\n\n**Both managed clusters currently have severe capacity or configuration issues, with hundreds of pods pending and deployments unavailable across both.**\nThe fleet health sweep collected data for 2 clusters (`scale-"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|base|0|proxy_load|1",
@@ -27869,8 +27995,23 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "proxy_load_per_second",
+        "proxy_load_p50_seconds",
+        "proxy_load_p95_seconds",
+        "proxy_load_max_seconds"
+      ],
+      "errors": [
+        "brokered commands from outside the load ran during it: 51"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|4|proxy_load|3",
@@ -28480,8 +28621,23 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "proxy_load_per_second",
+        "proxy_load_p50_seconds",
+        "proxy_load_p95_seconds",
+        "proxy_load_max_seconds"
+      ],
+      "errors": [
+        "brokered commands from outside the load ran during it: 60"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|8|proxy_load|1",
@@ -30313,8 +30469,23 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "proxy_load_per_second",
+        "proxy_load_p50_seconds",
+        "proxy_load_p95_seconds",
+        "proxy_load_max_seconds"
+      ],
+      "errors": [
+        "brokered commands from outside the load ran during it: 11"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|16|proxy_load|1",
@@ -32146,8 +32317,23 @@
       ],
       "provider_429s": 0,
       "answers": [],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds",
+        "proxy_load_per_second",
+        "proxy_load_p50_seconds",
+        "proxy_load_p95_seconds",
+        "proxy_load_max_seconds"
+      ],
+      "errors": [
+        "brokered commands from outside the load ran during it: 25"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|32|proxy_load|1",
@@ -34400,10 +34586,6 @@
           "value": 332991.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 32796672.0,
           "container": "manager"
@@ -34562,6 +34744,10 @@
           "name": "cpu_seconds",
           "value": 35.45901197489443,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -34575,8 +34761,19 @@
         "I currently monitor the scale-01 and scale-02 clusters (both in the <project> project, us-central1-c).",
         "I currently monitor two clusters: the scale-01 cluster and the scale-02 cluster. I have a dedicated cluster agent for each to handle live runtime diagnostics, plus a platform agent that handles fleet-wide architecture, provisioning, and Git"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|8|fan_out|2",
@@ -34996,10 +35193,6 @@
           "value": 458318.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 32796672.0,
           "container": "manager"
@@ -35178,6 +35371,10 @@
           "name": "cpu_seconds",
           "value": 2.9145749912349856,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -35192,7 +35389,8 @@
         "I currently monitor two clusters: **scale-01** and **scale-02** (both in us-central1-c)."
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|8|fan_out|3",
@@ -35612,10 +35810,6 @@
           "value": 680663.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33005568.0,
           "container": "manager"
@@ -35794,6 +35988,10 @@
           "name": "cpu_seconds",
           "value": 2.990007147138264,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -35808,7 +36006,8 @@
         "I currently monitor two clusters: scale-01 and scale-02."
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|10|fan_out|1",
@@ -36228,10 +36427,6 @@
           "value": 514033.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33009664.0,
           "container": "manager"
@@ -36410,6 +36605,10 @@
           "name": "cpu_seconds",
           "value": 3.0627025030704167,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -36426,7 +36625,8 @@
         "I currently monitor two clusters: **scale-01** and **scale-02** (both in the `<project>` project, `us-central1-c` region)."
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|10|fan_out|2",
@@ -36846,10 +37046,6 @@
           "value": 451235.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -37028,6 +37224,10 @@
           "name": "cpu_seconds",
           "value": 2.1625420976726675,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -37044,7 +37244,8 @@
         "I currently monitor two clusters: `scale-01` and `scale-02` (both in project `<project>`, region `us-central1-c`)."
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|10|fan_out|3",
@@ -37464,10 +37665,6 @@
           "value": 452490.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -37646,6 +37843,10 @@
           "name": "cpu_seconds",
           "value": 4.200288847725187,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -37662,7 +37863,8 @@
         "I currently monitor two clusters: **scale-01** and **scale-02** (both in the `<project>` project, region `us-central1-c`)."
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|12|fan_out|1",
@@ -38082,10 +38284,6 @@
           "value": 420228.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33271808.0,
           "container": "manager"
@@ -38264,6 +38462,10 @@
           "name": "cpu_seconds",
           "value": 2.923148119536563,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -38285,7 +38487,8 @@
       "errors": [
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|12|fan_out|2",
@@ -38705,10 +38908,6 @@
           "value": 482527.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -38887,6 +39086,10 @@
           "name": "cpu_seconds",
           "value": 2.8822691339593045,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -38908,7 +39111,8 @@
       "errors": [
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|concurrent|12|fan_out|3",
@@ -39328,10 +39532,6 @@
           "value": 248453.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -39510,6 +39710,10 @@
           "name": "cpu_seconds",
           "value": 74.306642653222,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -39527,11 +39731,21 @@
         "I currently monitor two clusters via the scale-01 cluster agent and the scale-02 cluster agent (both in the `<project>` project, `us-central1-c`). I also have a platform agent that handles fleet-wide work, provisioning, and general Kub",
         "I currently monitor two clusters: scale-01 and scale-02 (both in the <project> project, us-central1-c)."
       ],
-      "excluded_from": [],
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
       "errors": [
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
-        "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
-      ]
+        "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|failing_pods|10|watcher_soak|1",
@@ -45813,10 +46027,6 @@
           "value": 258538.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34152448.0,
           "container": "manager"
@@ -45995,6 +46205,10 @@
           "name": "cpu_seconds",
           "value": 110.51180358505674,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -46002,7 +46216,8 @@
         "checking all 8 clusters.\n\nYes, I can investigate the pending pods on one of them for you.\n\nHere is the full report from the check:\n\n**All 8 scale clusters in `<project>` are currently stressed, with pods stuck in `Pending` for over 10 "
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|combined|1|fan_out|2",
@@ -46422,10 +46637,6 @@
           "value": 227363.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34381824.0,
           "container": "manager"
@@ -46604,6 +46815,10 @@
           "name": "cpu_seconds",
           "value": 135.57979863616748,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -46611,7 +46826,8 @@
         "checking all 8 clusters.\n\nTask t_dfc8a17c is `done`. The platform agent reported:\n\n**Every scale cluster in <project> (scale-01 through scale-08) is currently stressed by a severe capacity shortage, with hundreds of pods Pending and do"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|combined|1|fan_out|3",
@@ -47031,10 +47247,6 @@
           "value": 0.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34377728.0,
           "container": "manager"
@@ -47213,6 +47425,10 @@
           "name": "cpu_seconds",
           "value": 401.2050041886723,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -47220,7 +47436,8 @@
         "checking all 8 clusters.\n\nTask `t_e85680cf` is complete.\n\n**All 8 scale clusters (scale-01 through scale-08) are severely stressed, with hundreds of Pending pods and unavailable Deployments across the fleet.** The health sweep confirms that"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|22|onboarding|1",
@@ -49406,10 +49623,6 @@
           "value": 353200.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33468416.0,
           "container": "manager"
@@ -49588,6 +49801,10 @@
           "name": "cpu_seconds",
           "value": 64.40640685178656,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -49605,7 +49822,8 @@
       ],
       "errors": [
         "obtainability-audit, started by the previous run's audit window, was still running until 2026-10-27T19:02:40Z (read from the Platform Agent's cron run log after the run)"
-      ]
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|16|fan_out|2",
@@ -50024,10 +50242,6 @@
           "value": 396992.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33472512.0,
           "container": "manager"
@@ -50206,6 +50420,10 @@
           "name": "cpu_seconds",
           "value": 117.32376878530846,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -50222,8 +50440,10 @@
         "proxy_wait_p50_seconds"
       ],
       "errors": [
-        "obtainability-audit, started by the previous run's audit window, was still running until 2026-10-27T19:02:40Z (read from the Platform Agent's cron run log after the run)"
-      ]
+        "obtainability-audit, started by the previous run's audit window, was still running until 2026-10-27T19:02:40Z (read from the Platform Agent's cron run log after the run)",
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|16|fan_out|3",
@@ -50642,10 +50862,6 @@
           "value": 397479.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33472512.0,
           "container": "manager"
@@ -50824,14 +51040,29 @@
           "name": "cpu_seconds",
           "value": 97.54951823843112,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 16 clusters.\n\nTask `t_d11fb06c` is done. Here is the result:\n\n**Fifteen of the 16 fleet clusters are healthy, while one cluster (`scale-01`) is currently showing signs of stress.** \n`scale-01` has a Pending pod and an unavailab"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|16|onboarding_30m_proxy_raised|1",
@@ -54776,10 +55007,6 @@
           "value": 272911.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33792000.0,
           "container": "manager"
@@ -54958,6 +55185,10 @@
           "name": "cpu_seconds",
           "value": 6.543617371153952,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -54965,7 +55196,8 @@
         "checking all 6 clusters.\n\n**One cluster, `scale-01`, is currently experiencing stress due to a pending pod and an unavailable deployment.** The other five managed clusters are healthy with no pods stuck in Pending or CrashLoopBackOff states"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|6|fan_out|2",
@@ -55384,10 +55616,6 @@
           "value": 327194.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34185216.0,
           "container": "manager"
@@ -55566,14 +55794,29 @@
           "name": "cpu_seconds",
           "value": 2.376771730245097,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 6 clusters.\n\nTask t_6f3d6c52 is done. Here is its full result:\n\n**Five of the six scale clusters are healthy, but `scale-01` is stressed due to a pending pod and an unavailable deployment.** `scale-01` has a pod (`broken-image-"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|6|fan_out|3",
@@ -55992,10 +56235,6 @@
           "value": 594051.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34131968.0,
           "container": "manager"
@@ -56174,14 +56413,29 @@
           "name": "cpu_seconds",
           "value": 151.38083009556235,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 6 clusters.\n\nchecking scale-01 broken-image.\n\nTask `t_5fe925be` is done. Its complete result is:\n\n**Deployment `broken-image` is unavailable because its pod `broken-image-66698c6f6-lwpb9` is stuck in `ImagePullBackOff` due to t"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|4|onboarding_30m|1",
@@ -57790,10 +58044,6 @@
           "value": 255327.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33808384.0,
           "container": "manager"
@@ -57972,14 +58222,29 @@
           "name": "cpu_seconds",
           "value": 61.38963721520869,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 4 clusters.\n\nTask `t_5c4d4914` is done.\n\n**Result:**\n**One of the four clusters, `scale-01`, is currently stressed.**\nThe deployment `broken-image` has been running 1 replica short of available and pod `broken-image-66698c6f6-l"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|4|fan_out|2",
@@ -58398,10 +58663,6 @@
           "value": 336441.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 33812480.0,
           "container": "manager"
@@ -58580,14 +58841,29 @@
           "name": "cpu_seconds",
           "value": 42.272065668939064,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
       "answers": [
         "checking all 4 clusters.\n\nTask `t_3f9be361` has finished (`done`). Here is the result:\n\n**Cluster `scale-01` is currently stressed with a Pending pod and an unavailable Deployment, while `scale-02`, `scale-03`, and `scale-04` are healthy.**"
       ],
-      "excluded_from": [],
-      "errors": []
+      "excluded_from": [
+        "cpu_peak_cores",
+        "cpu_seconds",
+        "memory_peak_bytes",
+        "proxy_command_seconds",
+        "proxy_commands",
+        "proxy_wait_max_seconds",
+        "proxy_wait_p50_seconds"
+      ],
+      "errors": [
+        "the Stall Watch's half-hourly read of every cluster overlapped the run"
+      ],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|clusters|4|fan_out|3",
@@ -59006,10 +59282,6 @@
           "value": 232251.0
         },
         {
-          "name": "unfinished_prompts",
-          "value": 0.0
-        },
-        {
           "name": "memory_peak_bytes",
           "value": 34074624.0,
           "container": "manager"
@@ -59188,6 +59460,10 @@
           "name": "cpu_seconds",
           "value": 3.3105317228682507,
           "container": "shell"
+        },
+        {
+          "name": "unfinished_prompts",
+          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -59195,7 +59471,8 @@
         "checking all 4 clusters.\n\nTask `t_682dca77` is done. \n\nHere is its result:\n\n**Only `scale-01` is currently stressed with a Pending pod and an unavailable Deployment.** The fleet health sweep read 4 clusters (8 were excluded from scope), and"
       ],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": ""
     },
     {
       "key": "eeb8a95c|next|base|0|onboarding_30m|1",

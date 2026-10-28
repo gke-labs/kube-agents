@@ -1748,17 +1748,17 @@ def _cpu_reading(record: Record, metric: str, container: str) -> float | None:
 
 
 def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
-    """The proxy load runs, one row per worker count, in rising order."""
+    """The proxy load runs, one row per worker count, in rising order; a run that shared the broker is left out."""
     groups: dict[float, list[Record]] = {}
     for record in records:
         workers = factor_value(record, PROXY_CONCURRENCY)
-        if record.value(PROXY_LOAD_RATE) is not None and workers is not None:
+        if record.value(PROXY_LOAD_RATE) is not None and workers is not None and not record.excluded(PROXY_LOAD_RATE):
             groups.setdefault(workers, []).append(record)
     levels = []
     for workers, runs in sorted(groups.items()):
-        peaks = [value for run in runs if (value := run.value(CPU_PEAK, PROXY_CONTAINER)) is not None]
-        shell = [value for run in runs if (value := run.value(CPU_PEAK, SHELL_CONTAINER)) is not None]
-        waits = [value for run in runs if (value := run.value(PROXY_WAIT_P50)) is not None]
+        peaks = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, PROXY_CONTAINER)) is not None]
+        shell = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, SHELL_CONTAINER)) is not None]
+        waits = [value for run in runs if not run.excluded(PROXY_WAIT_P50) and (value := run.value(PROXY_WAIT_P50)) is not None]
         levels.append(
             ProxyLevel(
                 workers,
