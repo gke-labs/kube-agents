@@ -193,8 +193,6 @@ INTERPOLATED_LABEL = "within the measured range"
 MEASURED_LABEL = "measured at the base point"
 BASE_VALUE_LABEL = "base value"
 NO_VALUE = "—"
-YES_LABEL = "✓ yes"
-NO_LABEL = "no"
 LIMIT_LABEL = "{container} limit"
 PVC_CAPACITY_LABEL = "PVC capacity {capacity}"
 # The columns of the editable limits table.
@@ -400,6 +398,27 @@ FLEET_WIDE_FACTORS = (CHURN, FAILING_PODS)
 # The credential proxy's container, and the operation that loads it with no model call.
 PROXY_CONTAINER = "envoy-credential-proxy"
 SHELL_CONTAINER = "shell"
+AGENT_CONTAINER = "platform-agent"
+# Containers whose limits no PlatformAgent field sets: the operator fixes them, so they cap how
+# many clusters one install holds once every settable limit is raised.
+FIXED_LIMIT_CONTAINERS = (SHELL_CONTAINER,)
+# The containers whose limits a fleet's size moves; the others keep their defaults in every measured fleet.
+SIZED_CONTAINERS = (AGENT_CONTAINER, "agent-api-auth", PROXY_CONTAINER, SHELL_CONTAINER)
+MINUTES_PER_DAY = 1440.0
+# The fleet choice that starts every input at the measured base instead of an example fleet.
+CUSTOM_PROFILE = "Custom: the measured base"
+# The checks the bottleneck chart draws, in the order a growing fleet reaches them.
+BOTTLENECK_CHECKS = (
+    (CPU_PEAK, PROXY_CONTAINER),
+    (MEMORY_PEAK, PROXY_CONTAINER),
+    (CPU_PEAK, SHELL_CONTAINER),
+    (PROXY_WAIT_MAX, None),
+    (CPU_PEAK, AGENT_CONTAINER),
+    (MEMORY_PEAK, AGENT_CONTAINER),
+)
+# Cluster counts the bottleneck chart is drawn at: about 12 per tenfold, from 1 to 10,000.
+BOTTLENECK_POINTS_PER_DECADE = 12
+BOTTLENECK_DECADES = 4
 PROXY_LOAD_OPERATION = "proxy_load"
 SECONDS_PER_MINUTE = 60.0
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -911,11 +930,6 @@ def factors(records: Iterable[Record], operation: str | None = None) -> list[str
     return [name for name in FACTORS if name in found] + sorted(found - set(FACTORS))
 
 
-def unmapped_factors(records: Iterable[Record]) -> list[str]:
-    """Factors that have no fleet input, so predictions hold them at their base."""
-    return [name for name in factors(records) if name not in FACTORS and name not in LOAD_FACTORS]
-
-
 def factor_label(factor: str) -> str:
     """A factor's name as the page shows it."""
     if factor in FACTORS:
@@ -1188,16 +1202,6 @@ def base_fleet(records: Sequence[Record]) -> dict[str, float]:
         ] or planned
         fleet[factor] = _mean(values) if values else PLAN_BASE_LEVELS[factor]
     return fleet
-
-
-def grown_factors(records: Sequence[Record], fleet: Mapping[str, float]) -> list[str]:
-    """The measured factors at which the fleet differs from the base point."""
-    base = base_fleet(records)
-    return [
-        factor
-        for factor in factors(records)
-        if factor in FACTORS and not _close(fleet.get(factor, base[factor]), base[factor])
-    ]
 
 
 def _contribution(
@@ -1485,6 +1489,120 @@ def scaled_fleet(base: Mapping[str, float], clusters: float) -> dict[str, float]
     for factor in FLEET_WIDE_FACTORS:
         fleet[factor] = base[factor] * ratio
     return fleet
+
+
+@dataclass(frozen=True)
+class FleetProfile:
+    """An example fleet: a size class built from customer fleets, rounded and without names."""
+
+    name: str
+    description: str
+    clusters: int
+    projects: int
+    autopilot_share: float
+    workloads_per_day: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}: {self.description}, {self.clusters:,} clusters"
+
+    def fleet(self, base: Mapping[str, float]) -> dict[str, float]:
+        """The base fleet's cluster shape at this many clusters; each workload counts as one Pod created."""
+        fleet = scaled_fleet(base, self.clusters)
+        fleet[CHURN] = self.workloads_per_day / MINUTES_PER_DAY
+        return fleet
+
+
+# S is made up; M, L and XL are rounded from three customer fleets. Nodes and objects per cluster
+# are not known for them, so a profile keeps the measured clusters' shape, and Pods failing at once
+# grow with the clusters as in the base.
+FLEET_PROFILES = (
+    FleetProfile("S", "startup", 4, 2, 1.0, 1_500),
+    FleetProfile("M", "mid-size company", 45, 20, 0.25, 25_000),
+    FleetProfile("L", "large company", 250, 140, 0.20, 45_000),
+    FleetProfile("XL", "largest company, the benchmark size", 2_500, 2_400, 0.90, 260_000),
+)
+
+
+@dataclass(frozen=True)
+class InstallPlan:
+    """How many installs a fleet needs, and the share of the fleet each one holds."""
+
+    # The most clusters one install holds with every settable limit raised; None when no fixed limit is reached.
+    capacity: float | None
+    # The fixed limit that sets the capacity.
+    limit: Check | None
+    installs: int
+    fleet: dict[str, float]
+
+
+def install_plan(
+    records: Sequence[Record], containers: Sequence[str], fleet: Mapping[str, float]
+) -> InstallPlan:
+    """Split ``fleet`` into installs that each stay below the first limit no setting raises.
+
+    The settable limits count as raised, so only the fixed containers' limits and the fixed
+    thresholds remain. A threshold already past at the base point (the response time) does not
+    grow with clusters and decides nothing here.
+    """
+    fixed = {name: value for name, value in usual_limits(records).items() if name in FIXED_LIMIT_CONTAINERS}
+    shaped = capacities(
+        records,
+        containers,
+        fixed,
+        lambda clusters: scaled_fleet(fleet, clusters),
+        min(fleet[CLUSTERS], base_fleet(records)[CLUSTERS]),
+        max(fleet[CLUSTERS], 1.0) * CAPACITY_CEILING,
+    )
+    reached = [item for item in shaped if item.value is not None and not item.at_base and item.check.lines]
+    if not reached:
+        return InstallPlan(None, None, 1, dict(fleet))
+    first = min(reached, key=lambda item: item.value)
+    per_install = max(math.floor(first.value), 1)
+    installs = max(math.ceil(fleet[CLUSTERS] / per_install), 1)
+    return InstallPlan(first.value, first.check, installs, scaled_fleet(fleet, fleet[CLUSTERS] / installs))
+
+
+@dataclass(frozen=True)
+class BottleneckSeries:
+    label: str
+    clusters: tuple[float, ...]
+    # The prediction as a share of the threshold: 1.0 is the limit.
+    shares: tuple[float, ...]
+
+
+def bottleneck_series(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    limits: Mapping[str, Mapping[str, float]],
+) -> list[BottleneckSeries]:
+    """Each key check's prediction against its threshold as the fleet grows in clusters, its shape kept."""
+    counts = tuple(
+        10 ** (step / BOTTLENECK_POINTS_PER_DECADE)
+        for step in range(BOTTLENECK_POINTS_PER_DECADE * BOTTLENECK_DECADES + 1)
+    )
+    series = []
+    for metric, container in BOTTLENECK_CHECKS:
+        if metric in CONTAINER_LIMIT_KEYS:
+            threshold = limits.get(container, {}).get(CONTAINER_LIMIT_KEYS[metric])
+        else:
+            threshold = FIXED_LINES[metric][0].value
+        if not threshold:
+            continue
+        shares = []
+        for clusters in counts:
+            prediction = predict(records, metric, container, scaled_fleet(fleet, clusters))
+            shares.append(prediction.value / threshold if prediction else math.nan)
+        if all(math.isnan(share) for share in shares):
+            continue
+        name = metric_spec(metric).label
+        series.append(BottleneckSeries(f"{name} · {container}" if container else name, counts, tuple(shares)))
+    return series
+
+
+def measured_clusters(records: Iterable[Record]) -> float:
+    """The largest fleet a run measured."""
+    return max((record.totals.get(CLUSTERS, 0.0) for record in records), default=0.0)
 
 
 def capacities(
@@ -1989,51 +2107,6 @@ def threshold_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
     ]
 
 
-def contribution_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
-    """How each prediction is built: its base value and every factor that grows."""
-    rows = []
-    for check in checks:
-        prediction = check.prediction
-        if prediction is None:
-            continue
-        rows.append(
-            {
-                "Check": check.label,
-                "Factor": BASE_VALUE_LABEL,
-                "Operation": prediction.base_operation,
-                "Base": NO_VALUE,
-                "This fleet": NO_VALUE,
-                "Measured": NO_VALUE,
-                "Value": format_value(check.metric, prediction.base),
-                "Fit": NO_VALUE,
-            }
-        )
-        for item in prediction.contributions:
-            if not item.grows:
-                continue
-            rows.append(
-                {
-                    "Check": check.label,
-                    "Factor": FACTORS[item.factor].input_label
-                    if item.factor in FACTORS
-                    else item.factor,
-                    "Operation": item.operation,
-                    "Base": _optional_number(item.base_x),
-                    "This fleet": _optional_number(item.fleet_x),
-                    "Measured": (
-                        f"{_axis_text(item.fit.x_min)}–{_axis_text(item.fit.x_max)}"
-                        if item.fit
-                        else NO_VALUE
-                    ),
-                    "Value": f"+{format_value(check.metric, item.delta)}"
-                    if item.delta >= 0
-                    else format_value(check.metric, item.delta),
-                    "Fit": item.fit.label if item.fit else NO_FIT_LABEL,
-                }
-            )
-    return rows
-
-
 def _optional_number(value: float | None) -> str:
     return NO_VALUE if value is None else _axis_text(value)
 
@@ -2074,43 +2147,6 @@ def _request_text(memory_bytes: float, cpu_cores: float) -> tuple[str, str]:
     )
 
 
-def pod_rows(plan: NodePlan) -> list[dict[str, str]]:
-    """Each pod's recommended requests, the inputs of the node answer."""
-    rows = []
-    for pod in plan.pods:
-        memory, cpu = _request_text(pod.memory_bytes, pod.cpu_cores)
-        rows.append(
-            {
-                "Pod": pod.name,
-                "Containers": ", ".join(pod.containers),
-                "Replicas": str(pod.replicas),
-                "Memory request": memory,
-                "CPU request": cpu,
-            }
-        )
-    return rows
-
-
-def machine_rows(plan: NodePlan) -> list[dict[str, str]]:
-    rows = []
-    for machine in MACHINE_TYPES:
-        holds = fits(machine, plan.largest_memory_bytes, plan.largest_cpu_cores)
-        nodes = nodes_needed(machine, plan.total_memory_bytes, plan.total_cpu_cores)
-        rows.append(
-            {
-                "Machine type": machine.name,
-                "vCPU": str(machine.vcpu),
-                "Memory": f"{machine.memory_gib:g} GiB",
-                "Allocatable memory": f"{machine.allocatable_memory_gib:g} GiB",
-                "Allocatable CPU": f"{machine.allocatable_cpu:g}",
-                "Holds the largest pod": YES_LABEL if holds else NO_LABEL,
-                "Nodes for every pod": str(nodes) if holds else NO_VALUE,
-                "Why it is on the list": machine.reason,
-            }
-        )
-    return rows
-
-
 def unfixable_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
     return [
         {
@@ -2126,104 +2162,8 @@ def unfixable_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
     ]
 
 
-def combined_rows(records: Sequence[Record], containers: Iterable[str]) -> list[dict[str, str]]:
-    """Each combined point's measured peaks against the page's prediction for its fleet.
-
-    A prediction adds the factors one by one, and a combined point moves several
-    at once, so a measured peak above the prediction is an interaction the sum
-    misses. The prediction is made from every run except the combined ones.
-    """
-    single = [record for record in records if record.factor != COMBINED]
-    base_values = next((record.values for record in single if record.is_base and record.values), {})
-    rows = []
-    for level in sorted({record.level for record in records if record.factor == COMBINED}):
-        runs = [record for record in records if record.factor == COMBINED and record.level == level]
-        fleet = base_fleet(single)
-        moved = [
-            factor
-            for factor in FACTORS
-            if factor in runs[0].values and runs[0].values[factor] != base_values.get(factor)
-        ]
-        for factor in moved:
-            values = [value for record in runs if (value := factor_value(record, factor)) is not None]
-            if values:
-                fleet[factor] = _mean(values)
-        point = ", ".join(f"{FACTORS[factor].input_label} {_number_text(fleet[factor])}" for factor in moved)
-        for metric in (MEMORY_PEAK, CPU_PEAK):
-            for container in containers:
-                measured = [
-                    value for record in runs if (value := record.value(metric, container)) is not None
-                ]
-                if not measured:
-                    continue
-                # The operations the point ran, so the prediction and the peak measure the same work.
-                prediction = predict(single, metric, container, fleet, only=sorted({r.operation for r in runs}))
-                predicted = prediction.value if prediction is not None else None
-                rows.append(
-                    {
-                        "Point": point,
-                        "Container": container,
-                        "Metric": METRICS[metric].label,
-                        "Measured (largest run)": format_value(metric, max(measured)),
-                        "Predicted": format_value(metric, predicted),
-                        "Measured ÷ predicted": (
-                            f"{max(measured) / predicted:.2f}" if predicted else NO_VALUE
-                        ),
-                    }
-                )
-    return rows
-
-
-def record_rows(records: Iterable[Record]) -> list[dict[str, Any]]:
-    return [
-        {
-            "Key": record.key,
-            "Commit": record.commit[:COMMIT_LABEL_LENGTH],
-            "Mode": record.mode,
-            "Phase": record.phase,
-            "Factor": record.factor,
-            "Level": record.level,
-            "Operation": record.operation,
-            "Run": record.run,
-            "Started": record.started,
-            "Ended": record.ended,
-            "Image": record.image,
-            "Errors": "; ".join(record.errors),
-            "Provider 429s": record.provider_429s,
-            "Excluded from": ", ".join(record.excluded_from),
-            "Values": _pairs(record.values),
-            "Totals": _pairs(record.totals),
-            "Limits": "; ".join(
-                f"{container}: {_pairs(values)}" for container, values in record.limits.items()
-            ),
-            "Replicas": _pairs(record.replicas),
-        }
-        for record in records
-    ]
-
-
 def _pairs(values: Mapping[str, float]) -> str:
     return ", ".join(f"{name}={value:g}" for name, value in values.items())
-
-
-def measurement_rows(records: Iterable[Record]) -> list[dict[str, Any]]:
-    return [
-        {
-            "Key": record.key,
-            "Factor": record.factor,
-            "Level": record.level,
-            "Operation": record.operation,
-            "Run": record.run,
-            "Metric": measurement.name,
-            "Container": measurement.container or "",
-            "Value": measurement.value,
-            "Shown as": format_value(measurement.name, measurement.value),
-            "Excluded from fit": record.excluded(measurement.name)
-            or capped(record, measurement.name, measurement.container),
-        }
-        for record in records
-        for measurement in record.metrics
-    ]
 
 
 # --- charts -----------------------------------------------------------------

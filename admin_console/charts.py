@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from html import escape
@@ -15,6 +16,8 @@ from admin_console.harness_limits import (
     LIMIT_LABEL,
     PREDICTED_LABEL,
     TWO_POINT_LABEL,
+    BottleneckSeries,
+    FleetProfile,
     MetricChart,
 )
 from admin_console.ui import ATTRIBUTION_COLORS, PALETTE, STATUS_COLORS, TRIGGER_COLORS
@@ -34,6 +37,14 @@ EXCLUDED_SYMBOL = "circle-open"
 EXCLUDED_LABEL = "excluded from fit"
 FLEET_LABEL = "this fleet"
 CONTAINER_LIMIT_KEY = "container limit"
+BOTTLENECK_CHART_HEIGHT = 440
+# The share axis stops at 4 times the limit: past that, every line has long since failed.
+BOTTLENECK_SHARE_CEILING = 4.0
+LIMIT_SHARE = 1.0
+LIMIT_SHARE_LABEL = "limit"
+MEASURED_RANGE_LABEL = "measured"
+MEASURED_RANGE_OPACITY = 0.12
+PROFILE_LINE_WIDTH = 1
 
 
 def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
@@ -407,3 +418,66 @@ def harness_limit_chart(chart: MetricChart, colors: Mapping[str | None, str]) ->
         title=chart.y_title, showgrid=True, gridcolor=GRID, rangemode="tozero", zeroline=False
     )
     return _base_layout(figure, height=HARNESS_CHART_HEIGHT)
+
+
+def bottleneck_chart(
+    series: list[BottleneckSeries],
+    profiles: tuple[FleetProfile, ...],
+    measured: float,
+    fleet_clusters: float,
+    colors: list[str],
+) -> go.Figure:
+    """Each key check against its limit as the fleet grows, with the example fleet sizes marked."""
+    figure = go.Figure()
+    for index, item in enumerate(series):
+        figure.add_trace(
+            go.Scatter(
+                x=list(item.clusters),
+                y=list(item.shares),
+                mode="lines",
+                name=item.label,
+                line={"color": colors[index % len(colors)], "width": HARNESS_LINE_WIDTH},
+                hovertemplate=(
+                    f"<b>{escape(item.label)}</b><br>%{{x:,.0f}} clusters · %{{y:.0%}} of its limit"
+                    "<extra></extra>"
+                ),
+            )
+        )
+    first = series[0].clusters[0] if series else LIMIT_SHARE
+    # On a log axis, shapes take data values and annotations take their logarithm.
+    figure.add_vrect(x0=first, x1=max(measured, first), fillcolor=PALETTE.neutral, opacity=MEASURED_RANGE_OPACITY, line_width=0)
+    figure.add_annotation(
+        x=math.log10(max(measured, first)), y=1, xref="x", yref="paper", text=MEASURED_RANGE_LABEL,
+        showarrow=False, xanchor="right", yanchor="top", font={"color": TEXT},
+    )
+    figure.add_hline(
+        y=LIMIT_SHARE,
+        line={"color": PALETTE.danger, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+        annotation_text=LIMIT_SHARE_LABEL,
+        annotation_position="bottom right",
+        annotation_font_color=TEXT,
+    )
+    for profile in profiles:
+        figure.add_vline(
+            x=profile.clusters,
+            line={"color": PALETTE.neutral, "width": PROFILE_LINE_WIDTH, "dash": PREDICTION_DASH},
+        )
+        figure.add_annotation(
+            x=math.log10(profile.clusters), y=1, xref="x", yref="paper", text=escape(profile.name),
+            showarrow=False, yanchor="bottom", font={"color": TEXT},
+        )
+    figure.add_vline(
+        x=max(fleet_clusters, first),
+        line={"color": PALETTE.accent, "width": HARNESS_LINE_WIDTH, "dash": FLEET_DASH},
+    )
+    _style_key(figure, FLEET_LABEL, dash=FLEET_DASH)
+    figure.update_xaxes(title="Clusters", type="log", showgrid=True, gridcolor=GRID, zeroline=False)
+    figure.update_yaxes(
+        title="Share of the limit",
+        tickformat=".0%",
+        range=[0, BOTTLENECK_SHARE_CEILING],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+    )
+    return _base_layout(figure, height=BOTTLENECK_CHART_HEIGHT)

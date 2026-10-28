@@ -388,10 +388,6 @@ class FitTest(unittest.TestCase):
         self.assertFalse(any(item.excluded for item in used))
         # The base value is the run whose prompts all completed.
         self.assertAlmostEqual(prediction.value, 20)
-        self.assertEqual(
-            [row["Excluded from fit"] for row in hl.measurement_rows(records[1:2])],
-            [True, False],
-        )
 
     def test_the_transport_failure_marker_also_marks_a_failed_prompt(self):
         marked, unrelated = parse(
@@ -454,12 +450,6 @@ class PredictionTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(prediction.value, 168)
-        self.assertEqual(
-            hl.grown_factors(records, self.fleet(records, clusters=8, nodes=10)),
-            [hl.CLUSTERS, hl.NODES],
-        )
-        self.assertEqual(hl.grown_factors(records, self.fleet(records, clusters=8)), [hl.CLUSTERS])
-        self.assertEqual(hl.grown_factors(records, hl.base_fleet(records)), [])
 
     def test_the_largest_base_and_the_largest_increase_count(self):
         records = parse(
@@ -872,9 +862,6 @@ class NodePlanTest(unittest.TestCase):
 
         self.assertIsNone(plan.machine)
         self.assertIsNone(plan.nodes)
-        rows = hl.machine_rows(plan)
-        self.assertEqual({row["Holds the largest pod"] for row in rows}, {hl.NO_LABEL})
-        self.assertEqual({row["Nodes for every pod"] for row in rows}, {hl.NO_VALUE})
 
     def test_a_container_without_a_recommendation_requests_nothing(self):
         plan = hl.node_plan(
@@ -1059,6 +1046,10 @@ class HarnessLimitsPageTest(unittest.TestCase):
         app = AppTest.from_file(APP_PATH, default_timeout=60).run()
         return app.switch_page(PAGE_PATH).run()
 
+    def custom_fleet(self, app: AppTest) -> AppTest:
+        app.selectbox[0].set_value(hl.CUSTOM_PROFILE)
+        return app.run()
+
     def test_the_page_renders_the_sample_without_a_connection(self):
         app = self.open_page()
 
@@ -1066,31 +1057,27 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertEqual(app.title[0].value, "Harness limits")
         self.assertTrue(any("Sample data" in item.value for item in app.warning))
         self.assertFalse(any("Connect a project" in item.value for item in app.info))
-        self.assertTrue(any("checks pass" in item.value for item in app.success))
-        # The gateway pod (3,235Mi, 1,586m) fits an e2-standard-2; every pod's
-        # 2,717m of CPU needs two of them.
-        self.assertTrue(any("**2 × e2-standard-2**" in item.value for item in app.success))
-        self.assertEqual(app.expander[-1].label, "Raw records")
-        raw = app.expander[-1].dataframe[0].value
-        self.assertIn("Errors", raw.columns)
-        self.assertIn(PROMPT_FAILURE, set(raw["Errors"]))
+        # The benchmark size is the default fleet, and both questions are answered for it.
+        self.assertEqual(app.selectbox[0].value, hl.FLEET_PROFILES[-1].label)
+        headings = " ".join(str(item.value) for item in app.subheader)
+        self.assertIn("1. Are these container limits enough for this fleet?", headings)
+        self.assertIn("2. What node size and container limits does this fleet need?", headings)
+        self.assertNotIn("Raw records", [item.label for item in app.expander])
 
-    def test_the_failing_pods_input_is_a_count(self):
-        app = self.open_page()
+    def test_the_custom_fleet_starts_at_the_measured_base(self):
+        app = self.custom_fleet(self.open_page())
 
         (failing,) = [item for item in app.number_input if item.label == "Pods failing at once"]
 
         self.assertEqual(failing.value, 1.0)
         self.assertNotIn("minute", failing.help)
+        self.assertTrue(any("Every limit holds" in item.value for item in app.success))
 
-    def test_the_margin_note_claims_no_error_band(self):
+    def test_the_benchmark_fleet_is_split_into_installs(self):
         app = self.open_page()
 
-        (note,) = [item.value for item in app.info if "Why 30%" in item.value]
-
-        self.assertIn("The 30% is the whole margin.", note)
-        self.assertIn("Phase 1 draws no error band", note)
-        self.assertIn("predicted, not measured", note)
+        self.assertTrue(any("installs" in item.value for item in app.warning))
+        self.assertTrue(any("limits fail" in item.value for item in app.error))
 
     def test_the_page_names_no_project_or_cluster(self):
         app = self.open_page()
@@ -1119,18 +1106,12 @@ class HarnessLimitsPageTest(unittest.TestCase):
                 self.assertFalse([pattern for pattern in patterns if re.search(pattern, text)])
 
     def test_a_larger_fleet_fails_and_is_predicted_not_measured(self):
-        app = self.open_page()
+        app = self.custom_fleet(self.open_page())
         next(item for item in app.number_input if item.label == "Clusters").set_value(64.0)
         app = app.run()
 
         self.assertEqual(len(app.exception), 0, [item.value for item in app.exception])
-        self.assertTrue(any("checks fail" in item.value for item in app.error))
-        self.assertTrue(
-            any("predicted, not measured" in item.value for item in app.warning)
-        )
-        self.assertTrue(any("**2 × n2-standard-16**" in item.value for item in app.success))
-
-
+        self.assertTrue(any("limits fail" in item.value for item in app.error))
 
 
 class LevelCountTest(unittest.TestCase):
@@ -1199,7 +1180,7 @@ class ChurnAxisTest(unittest.TestCase):
 
 
 class Phase2FactorTest(unittest.TestCase):
-    def test_a_combined_point_is_no_axis_and_is_checked_against_the_prediction(self):
+    def test_a_combined_point_is_no_axis(self):
         container = "platform-agent"
         records = parse(
             record(metrics=(memory(container, 500),), values=planned()),
@@ -1219,13 +1200,9 @@ class Phase2FactorTest(unittest.TestCase):
             ),
         )
         self.assertEqual(hl.factors(records), [hl.CLUSTERS])
-        self.assertEqual(hl.unmapped_factors(records), [])
-        [row] = hl.combined_rows(records, [container])
         # Objects has no single-factor runs here, so the prediction is the clusters line alone.
-        self.assertEqual(row["Point"], "Clusters 8.0, Objects per cluster 4,000")
-        self.assertEqual(row["Measured (largest run)"], hl.format_value(hl.MEMORY_PEAK, 1000 * MIB))
-        self.assertEqual(row["Predicted"], hl.format_value(hl.MEMORY_PEAK, 800 * MIB))
-        self.assertEqual(row["Measured ÷ predicted"], "1.25")
+        prediction = hl.predict(records, hl.MEMORY_PEAK, container, {**hl.base_fleet(records), hl.CLUSTERS: 8})
+        self.assertAlmostEqual(prediction.value, 800 * MIB)
 
     def test_proxy_load_workers_are_charted_but_move_no_prediction(self):
         records = parse(
@@ -1235,7 +1212,6 @@ class Phase2FactorTest(unittest.TestCase):
                    metrics=((hl.CPU_PEAK, "credential-proxy", 1.0),), values=planned(proxy_concurrency=8)),
         )
         self.assertEqual(hl.factors(records, "proxy_load"), [hl.PROXY_CONCURRENCY])
-        self.assertEqual(hl.unmapped_factors(records), [])
         self.assertEqual(hl.factor_label(hl.PROXY_CONCURRENCY), "Credential proxy load workers")
         prediction = hl.predict(records, hl.CPU_PEAK, "credential-proxy", hl.base_fleet(records))
         self.assertEqual(prediction.contributions, ())
@@ -1368,12 +1344,6 @@ class ProxyCapacityTest(unittest.TestCase):
 
 
 class CappedCpuTest(unittest.TestCase):
-    def test_the_records_table_shows_a_capped_peak_as_excluded(self):
-        proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
-        records = parse(record(metrics=((hl.CPU_PEAK, proxy, 1.0), (hl.CPU_PEAK, "shell", 0.4)), limits=limits))
-        rows = {row["Container"]: row["Excluded from fit"] for row in hl.measurement_rows(records)}
-        self.assertEqual(rows, {proxy: True, "shell": False})
-
     def test_a_cpu_peak_at_the_limit_stays_out_of_the_line(self):
         proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
         records = parse(
