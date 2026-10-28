@@ -200,10 +200,15 @@ func TestIncidentAddresses(t *testing.T) {
 	}{
 		{"slack:C0HOME/1712.0001", []incidentAddress{{"C0HOME", "1712.0001"}, {"a2a-x", "slack:C0HOME/1712.0001"}}},
 		{"gchat:spaces/AAA/threads/BBB", []incidentAddress{{"spaces/AAA", "spaces/AAA/threads/BBB"}, {"a2a-x", "gchat:spaces/AAA/threads/BBB"}}},
-		{"slack:dm/D123", []incidentAddress{{"a2a-x", "slack:dm/D123"}}},
+		// A whole conversation is never looked up: every later message there
+		// would carry the first stored report.
+		{"slack:dm/D123", nil},
+		{"gchat:dm/spaces/DDD", nil},
+		{"gchat:space/spaces/AAA", nil},
+		{"gchat:space/spaces/AAA/threads/BBB", nil},
+		// A thread inside a DM is one conversation per thread.
 		{"slack:dm/D123/1712.0001", []incidentAddress{{"a2a-x", "slack:dm/D123/1712.0001"}}},
-		{"gchat:dm/spaces/DDD", []incidentAddress{{"a2a-x", "gchat:dm/spaces/DDD"}}},
-		{"gchat:space/spaces/AAA", []incidentAddress{{"a2a-x", "gchat:space/spaces/AAA"}}},
+		{"gchat:dm/spaces/DDD/threads/TTT", []incidentAddress{{"a2a-x", "gchat:dm/spaces/DDD/threads/TTT"}}},
 		{"slack:C0HOME", []incidentAddress{{"a2a-x", "slack:C0HOME"}}},
 		{"inject:bench-7", []incidentAddress{{"a2a-x", "inject:bench-7"}}},
 		{"console:abc", []incidentAddress{{"a2a-x", "console:abc"}}},

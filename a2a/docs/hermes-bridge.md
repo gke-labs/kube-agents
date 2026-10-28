@@ -413,7 +413,9 @@ names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/thread
 the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
 gateway conversation (a console
 conversation's row carries the filing turn's task in its key, which a later reply does not know,
-so it is not found). A row found is spliced ahead of
+so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
+since every later message there shares it and would carry the first stored report for the row's
+life). A row found is spliced ahead of
 the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
 the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
 the hook by its test). No row, a store that errors, or a bridge with no route store leaves the

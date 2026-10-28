@@ -107,9 +107,16 @@ type incidentAddress struct {
 // subscription to the session holding the route and the key; a console
 // subscription's key also carries the filing turn's task, which a later
 // reply does not know, so that row is not found).
+//
+// A key that names a whole conversation rather than a thread (a Google Chat
+// DM or space with no thread, a thread-less Slack DM) takes neither: every
+// later message there shares the key and the session, so a row stored
+// under it would be spliced ahead of every question for the row's life,
+// and the first card's report would answer a reply to the second's. The
+// hook never had this, since it looks up the message's own thread.
 func incidentAddresses(key, sessionID string) []incidentAddress {
 	key = strings.TrimSpace(key)
-	if key == "" {
+	if key == "" || incidentWholeConversation(key) {
 		return nil
 	}
 	var out []incidentAddress
@@ -120,6 +127,21 @@ func incidentAddresses(key, sessionID string) []incidentAddress {
 		out = append(out, incidentAddress{chatID: sessionID, threadID: key})
 	}
 	return out
+}
+
+// incidentWholeConversation reports whether key names a conversation every
+// top-level message shares: a Google Chat space, a Google Chat DM with no
+// thread, or a Slack DM with no thread.
+func incidentWholeConversation(key string) bool {
+	switch {
+	case strings.HasPrefix(key, incidentGchatSpace):
+		return true
+	case strings.HasPrefix(key, incidentGchatDMPrefix):
+		return !strings.Contains(key[len(incidentGchatDMPrefix):], incidentGchatThreads)
+	case strings.HasPrefix(key, incidentSlackDMPrefix):
+		return !strings.Contains(key[len(incidentSlackDMPrefix):], "/")
+	}
+	return false
 }
 
 // incidentThread is the stored address of a home-channel thread's post, when

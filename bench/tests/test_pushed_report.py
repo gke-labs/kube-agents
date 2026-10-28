@@ -52,10 +52,22 @@ def test_a_bad_prompt_is_refused(body):
         pushed_report.parse(f"{DIRECTIVE}\n{body}")
 
 
+def test_a_near_miss_directive_is_refused_not_sent():
+    """A folded or one-line prompt glues the fields onto the directive line."""
+    glued = f"{DIRECTIVE} opening: Say OK. report: np-quartz-7 at 92%. reply: which pool?"
+    assert pushed_report.is_reply_under_pushed_report(glued)
+    with pytest.raises(ValueError):
+        pushed_report.parse(glued)
+    with pytest.raises(ValueError):
+        pushed_report.parse(f"{DIRECTIVE} extra\nopening: a\nreport: b\nreply: c")
+
+
 def test_the_api_transport_refuses_the_replay(monkeypatch):
     monkeypatch.setenv("AGENT_TRANSPORT", "api")
     got = harness.KubeAgentsHarness()._execute(PROMPT)
     assert DIRECTIVE in " ".join(got.errors)
+    glued = harness.KubeAgentsHarness()._execute(f"{DIRECTIVE} opening: a report: b reply: c")
+    assert DIRECTIVE in " ".join(glued.errors)
 
 
 def test_the_module_imports_without_devops_bench():

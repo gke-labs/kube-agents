@@ -138,9 +138,13 @@ class Replay:
 
 
 def is_reply_under_pushed_report(prompt: str) -> bool:
-    """Whether the prompt's first line is the directive."""
-    lines = prompt.strip().splitlines()
-    return bool(lines) and lines[0].strip() == DIRECTIVE
+    """Whether the prompt's first non-blank line opens with the directive: the
+    one test :func:`parse` and every other reader of the grammar share. A
+    near miss (the directive with its fields glued onto its line, as a folded
+    or one-line prompt produces) is a replay here, so :func:`parse` refuses
+    it rather than sending the directive and the report to the agent as an
+    ordinary ask, as ``stop_hook.is_stopped_ask`` does for its directive."""
+    return prompt.strip().partition("\n")[0].startswith(DIRECTIVE)
 
 
 def parse(prompt: str) -> Replay | None:
@@ -151,8 +155,11 @@ def parse(prompt: str) -> Replay | None:
     """
     if not is_reply_under_pushed_report(prompt):
         return None
+    lines = prompt.strip().splitlines()
+    if lines[0].strip() != DIRECTIVE:
+        raise ValueError(f"{DIRECTIVE} must stand alone on the first line; got {lines[0].strip()!r}")
     fields: dict[str, str] = {}
-    for line in prompt.strip().splitlines()[1:]:
+    for line in lines[1:]:
         if not line.strip():
             continue
         key, sep, value = line.partition(":")
