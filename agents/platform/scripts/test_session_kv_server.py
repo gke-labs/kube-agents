@@ -2324,7 +2324,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         """Inject `pod`'s event, then age its row past the fold window; returns (row id, session id)."""
         self.assertEqual(self._inject(pod, reason=reason)["status"], "injected")
         workload = pod.rsplit("-", 2)[0]
-        row_id = self._rows(workload)[0][0]
+        row_id = self._rows(workload)[-1][0]
         self._age(row_id, self.WINDOW + 60)
         return row_id, f"sess-{pod}-{reason}"
 
@@ -2417,6 +2417,66 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                 patch.object(session_kv_server, "_send_to_chat") as send:
             session_kv_server._remind_fix_pull_request("sess-headless-nothread", "x", "BackOff", self.FIX_URL)
         send.assert_not_called()
+
+    def test_the_newest_incident_with_an_open_fix_holds_it(self):
+        older_url, newer_url = self.FIX_URL, "https://github.com/acme/fleet/pull/8"
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _older, older_session = self._first_incident("newest-api-6cfdb6b98b-aaaaa")
+            newer, newer_session = self._first_incident("newest-api-6cfdb6b98b-bbbbb")
+            self._board(cards=[("t-old", older_session, older_url), ("t-new", newer_session, newer_url)])
+            reply = self._inject("newest-api-6cfdb6b98b-ccccc")
+        self.assertEqual(reply["duplicate_of"], str(newer))
+        self.assertEqual(reply["pull_request"], newer_url)
+        self.assertEqual(state.call_args_list[0].args[0], newer_url)
+
+    def test_the_search_stops_at_its_deadline(self):
+        def slow_closed(_url, _timeout):
+            time.sleep(0.1)
+            return "closed"
+
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "FIX_PR_LOOKUP_TIMEOUT_S", 0.05), \
+                patch.object(session_kv_server, "_proposal_state", side_effect=slow_closed) as state:
+            _older, older_session = self._first_incident("deadline-api-6cfdb6b98b-aaaaa")
+            _newer, newer_session = self._first_incident("deadline-api-6cfdb6b98b-bbbbb")
+            self._board(cards=[("t-old", older_session, self.FIX_URL), ("t-new", newer_session, self.FIX_URL)])
+            self.assertEqual(self._inject("deadline-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(state.call_count, 1)
+
+    def test_the_forge_is_asked_for_the_pull_request_and_its_state_read(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(self.FIX_URL, 5), "open")
+            forge.call.assert_called_once_with(
+                "proposal-view", {"number": 7}, "https://github.com/acme/fleet", retry_transient=True
+            )
+            forge.call.reset_mock()
+            mr = "https://gitlab.example.com/acme/fleet/-/merge_requests/12"
+            self.assertEqual(session_kv_server._proposal_state(mr, 5), "open")
+            self.assertEqual(forge.call.call_args.args[1:], ({"number": 12}, "https://gitlab.example.com/acme/fleet"))
+
+    def test_a_forge_that_fails_or_overruns_reads_as_no_state(self):
+        forge = MagicMock()
+        with patch.dict(sys.modules, {"forge": forge}):
+            forge.call.side_effect = RuntimeError("forge down")
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 5))
+            forge.call.side_effect = lambda *a, **k: time.sleep(0.5) or {"proposal": {"state": "open"}}
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+            forge.call.reset_mock()
+            self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
+            forge.call.assert_not_called()
+
+    def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
+        plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("pr_opened_constants", plugin_path)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(session_kv_server.PR_OPENED_EVENT_KIND, plugin.PR_OPENED_KIND)
+        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, plugin.OPEN_STATE)
+        self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
     def test_off_by_default(self):
         self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)

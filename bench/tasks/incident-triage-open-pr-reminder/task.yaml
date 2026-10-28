@@ -2,7 +2,18 @@
 # FIXTURE_NOT_READY (#2513), in no roster file under hack/eval/ until an
 # evaluation install sets INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and the pool
 # GitOps repositories declare eval-pr-reminder-workload. Run it by hand against
-# such an install.
+# such an install, with INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 and shorter
+# than the pull request takes to open (150 holds; the stack does not wait out a
+# longer window), and with no agent pull request left open on the workload's
+# manifest by an earlier run: that one would hold this run's first incident.
+#
+# Before a roster takes it, the case has to request its pull request the way
+# the inject lane counts one (a pull_request_opened check, or an entry under
+# `requesting:` in hack/eval/inject-lane-safeguards.yaml): without it the lane
+# runs it in the first phase, with no repository reset between repetitions,
+# and its safeguard charges the remediation pull request as unrequested. The
+# stack's GitHub poll also reads BENCH_GITHUB_TOKEN once, where the CI lane
+# renews a minted token through BENCH_GITHUB_TOKEN_FILE.
 #
 # Domain: incident triage (AutoOps). Journey: a workload breaks, its incident
 # is triaged and the fix opened as a pull request; the workload breaks again
