@@ -16,11 +16,13 @@ Per `AGENTS.md` ("Delegation") single-cluster runtime debugging is the Cluster A
 
 ## Running the sweep
 
+Call the `platform_control` `fleet_scope` tool first: when it lists `excluded_clusters`, drop each one from the target triples (excluded clusters are never read, listed or reported on) and name each one as excluded and not checked.
+
 ```bash
 leeway report --topology-tier-c-signals --clusters <project>/<location>/<cluster>,<project>/<location>/<cluster>
 ```
 
-Name every target as a `project/location/cluster` triple (resolve them with `list_cluster_profiles`, or from the request); add `--namespace <ns>` to scope every cluster to one namespace. Target clusters with `--clusters` only: inside the sandbox each triple becomes a `kubectl --context=gke_<project>_<location>_<cluster>` read through the credential proxy, and an exported `KUBECONFIG` would make the shim answer every name from that one file. `--topology-tier-c-signals` adds the Tier C rows — workloads with no declared or assumed spread intent that are nonetheless skewed — which is where a StatefulSet on zonal disks shows up.
+Name every target as a `project/location/cluster` triple (resolve them with `list_cluster_profiles`, or from the request, less any `excluded_clusters`); add `--namespace <ns>` to scope every cluster to one namespace. Target clusters with `--clusters` only: inside the sandbox each triple becomes a `kubectl --context=gke_<project>_<location>_<cluster>` read through the credential proxy, and an exported `KUBECONFIG` would make the shim answer every name from that one file. `--topology-tier-c-signals` adds the Tier C rows — workloads with no declared or assumed spread intent that are nonetheless skewed — which is where a StatefulSet on zonal disks shows up.
 
 The output is one JSON document (`leeway.report/v1alpha1`) on stdout with one `clusters[]` entry per target, in the order given, and a `summary` with `clusters_total`, `clusters_succeeded`, `clusters_failed`, `topology_findings`, `by_severity` and `by_tier`. A real one, from a four-cluster sweep, is at `references/report-example.json`. If `leeway` is not on `PATH`, the sandbox image predates it: say so and stop rather than substituting a hand survey.
 
