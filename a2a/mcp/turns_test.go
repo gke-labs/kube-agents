@@ -121,7 +121,8 @@ type gatewayScenario struct {
 	lateStart time.Duration
 	// lateNotice, when set, posts the acknowledgement notice after the
 	// root's submission, by this much: the order the two connections the
-	// gateway publishes on can produce.
+	// gateway publishes on can produce. A delay inside noticeSettle is the
+	// notice the window exists to catch; past it, the notice is dropped.
 	lateNotice time.Duration
 }
 
@@ -965,7 +966,7 @@ func TestATurnWhoseFirstEventIsLateIsWaitedOn(t *testing.T) {
 // precedes (two connections, one of them unflushed); a turn whose notice trails
 // its submission still shows the notice.
 func TestANoticeThatTrailsTheSubmissionIsStillShown(t *testing.T) {
-	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, lateNotice: 50 * time.Millisecond})
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, lateNotice: noticeSettle / 4})
 	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "wait_seconds": 10})
 	if res.IsError {
 		t.Fatalf("send_message failed: %s", res.Content[0].Text)

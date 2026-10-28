@@ -64,7 +64,11 @@ const (
 	// its acknowledgement unflushed on the console connection and the
 	// submission synchronously through JetStream on another, so the
 	// acknowledgement can reach this server after the submission it
-	// precedes; returned at the match, the turn would show without it.
+	// precedes; returned at the match, the turn would show without it. A
+	// steered turn's acknowledgement is the second producer: the gateway
+	// posts it after the follow-up is published and after a read of the
+	// task's stream, so one that read takes longer than the window to post
+	// is missed, as every acknowledgement was before the window.
 	noticeSettle = 200 * time.Millisecond
 	// maxFollowedTasks bounds the delegated tasks one wait follows.
 	maxFollowedTasks = 8
