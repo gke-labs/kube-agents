@@ -387,7 +387,9 @@ platformAgent:
         value: "900"
 ```
 
-[`session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#folding-a-workloads-repeat-events) describes which earlier alert a later event is folded into.
+With the setting on, a workload that breaks again after the window, while the fix pull request for its last incident is still open for review, also starts no new triage turn. The incident's chat thread gets one short reminder per window instead, naming the pull request: the fault is already diagnosed and its fix is waiting on a person. Once that pull request is merged or closed, the next failure is a new incident again. The feed `GET /v1/intercepted-events` lists such an event as `folded`, with the pull request in its `pull_request` field.
+
+[`session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#folding-a-workloads-repeat-events) describes which earlier alert a later event is folded into, and [holding a recurrence](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#holding-a-recurrence-while-its-fix-waits-for-review) how the open fix is found.
 
 ### Opening the pull request without a reply
 

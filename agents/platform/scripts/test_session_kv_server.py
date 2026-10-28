@@ -2292,6 +2292,132 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                     (f"-{seconds} seconds", row_id),
                 )
 
+    # --- held for an open fix (_open_fix_pull_request) ----------------------
+
+    FIX_URL = "https://github.com/acme/fleet/pull/7"
+
+    def _board(self, cards=(), subs=()):
+        """A kanban board with `cards` (task_id, session_id, pr_url or None) and `subs` (task_id, chat_id, thread_id)."""
+        import sqlite3
+        board = os.path.join(tempfile.mkdtemp(), "kanban.db")
+        with sqlite3.connect(board) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            conn.execute(
+                "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
+                "payload TEXT, created_at INTEGER)"
+            )
+            conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
+            for task_id, session_id, url in cards:
+                conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+                if url:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, 1)",
+                        (task_id, json.dumps({"url": url, "number": 7, "title": "fix"})),
+                    )
+            for task_id, chat_id, thread_id in subs:
+                conn.execute("INSERT INTO kanban_notify_subs VALUES (?, 'slack', ?, ?)", (task_id, chat_id, thread_id))
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", board)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _first_incident(self, pod, reason="BackOff"):
+        """Inject `pod`'s event, then age its row past the fold window; returns (row id, session id)."""
+        self.assertEqual(self._inject(pod, reason=reason)["status"], "injected")
+        workload = pod.rsplit("-", 2)[0]
+        row_id = self._rows(workload)[0][0]
+        self._age(row_id, self.WINDOW + 60)
+        return row_id, f"sess-{pod}-{reason}"
+
+    def test_a_workload_that_breaks_again_while_its_fix_is_open_is_held(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request") as remind:
+            anchor_id, session = self._first_incident("heldfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            reply = self._inject("heldfix-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+        self.assertEqual(self.trigger.call_count, 1, "a second investigation started")
+        self.assertEqual([r[3] for r in self._rows("heldfix-api")], [None, anchor_id])
+        remind.assert_called_once_with(session, "heldfix-api", "BackOff", self.FIX_URL)
+        events = [
+            e for e in self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
+            if e["name"] == "heldfix-api"
+        ]
+        self.assertEqual([e["pull_request"] for e in events], [self.FIX_URL, ""])
+
+    def test_a_fix_opened_from_the_incident_thread_holds_it_too(self):
+        # A human's `apply` files the card elsewhere; it carries the incident
+        # thread's subscription instead of the incident's session.
+        import sqlite3
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            anchor_id, session = self._first_incident("threadfix-api-6cfdb6b98b-aaaaa")
+            with sqlite3.connect(temp_db_path) as conn, conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.1"})),
+                )
+            self._board(cards=[("t-apply", "a2a-elsewhere", self.FIX_URL)], subs=[("t-apply", "C1", "1700.1")])
+            self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "folded")
+
+    def test_a_merged_or_closed_fix_or_none_starts_a_new_incident(self):
+        for state, prefix in (("merged", "mergedfix"), ("closed", "closedfix"), (None, "nofix")):
+            with self.subTest(state=state), \
+                    patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                    patch.object(session_kv_server, "_proposal_state", return_value=state):
+                _anchor, session = self._first_incident(f"{prefix}-api-6cfdb6b98b-aaaaa")
+                self._board(cards=[("t-pr", session, self.FIX_URL)])
+                self.assertEqual(self._inject(f"{prefix}-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_an_incident_with_no_pull_request_on_the_board_starts_a_new_one(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _anchor, session = self._first_incident("nopr-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-triage", session, None)])
+            self.assertEqual(self._inject("nopr-api-6cfdb6b98b-bbbbb")["status"], "injected")
+        state.assert_not_called()
+
+    def test_a_critical_is_not_held_by_a_warning_incident_with_an_open_fix(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"):
+            _anchor, session = self._first_incident("critfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            self.assertEqual(self._inject("critfix-api-6cfdb6b98b-bbbbb", reason="CrashLoopBackOff")["status"], "injected")
+
+    def test_with_folding_off_nothing_is_held_or_looked_up(self):
+        with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")
+            self.assertEqual(self._inject("offfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+        state.assert_not_called()
+
+    def test_the_thread_is_reminded_at_most_once_a_window(self):
+        import sqlite3
+        session = "sess-remind"
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.2"})),
+            )
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_send_to_chat", return_value="1700.2") as send:
+            session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            self.assertEqual(send.call_count, 1)
+            platform, message, chat_id, thread_id = send.call_args.args
+            self.assertEqual((platform, chat_id, thread_id), ("slack", "C1", "1700.2"))
+            self.assertIn(self.FIX_URL, message)
+            self.assertIn("still failing", message)
+            with patch.object(session_kv_server.time, "time", return_value=time.time() + self.WINDOW + 1):
+                session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            self.assertEqual(send.call_count, 2)
+
+    def test_an_incident_with_no_thread_is_not_reminded(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_send_to_chat") as send:
+            session_kv_server._remind_fix_pull_request("sess-headless-nothread", "x", "BackOff", self.FIX_URL)
+        send.assert_not_called()
+
     def test_off_by_default(self):
         self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)
         for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
