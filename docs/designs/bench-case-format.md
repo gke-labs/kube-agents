@@ -68,6 +68,14 @@ prompt an ask the harness stops once it has filed a card
 only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
 `harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
+A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
+lines under it, sends the opening as turn one, stores the report for the conversation in the
+agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
+into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
+([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
+the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
+for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
+as well.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that

@@ -71,9 +71,17 @@ and the report stored against that thread — are reused unchanged.
 
 Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
 than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
-"Proactive posts: the chat.notify route"). The report still lands in a thread, but a
-reply typed into it reaches the gateway, which has no binding to the report, so the
-`incident_context` step above does not apply there.
+"Proactive posts: the chat.notify route"). The report still lands in a thread and the
+same `incidents` row is stored against it, but a reply typed into it reaches the A2A
+gateway and runs through the hermes-bridge's `api` executor, never through the Hermes
+gateway's `incident_context` hook. The bridge makes the hook's by-thread read instead
+(`a2a/hermes-bridge/incident.go`; the hook's other two steps, the recent-reports index for a
+message with no row and the Google Chat first-reply recovery, do not run on the `api`
+executor): before the task's first turn it looks the
+conversation's thread up in the same table, and the row the kanban notifier stores for
+a card's report inviting a reply, posted into a Slack or Google Chat gateway conversation (keyed by the Hermes
+session and the conversation key), and frames the report ahead of the user's words with the hook's
+notice and token list.
 
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
 headline in place of the report (`slack_audit_report.py`, called from

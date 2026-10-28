@@ -699,7 +699,10 @@ Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject
 the stopped asks (a `stop` sent on the conversation after the opening turn,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
-into the reply. `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+into the reply, and the reply-under-pushed-report replays (a report stored for the conversation
+after the opening turn, then the reply sent as a second message on it,
+[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
 the cases that request a pull request, with its window marked exclusive like theirs, so a stop
 that fails and lets its card write reds that case whether or not it names the write, and only

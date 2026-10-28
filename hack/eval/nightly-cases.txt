@@ -914,6 +914,13 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# A reply typed under a pushed report is answered with the report (#4059):
+# the harness stores the report for the conversation as the kanban notifier
+# would, then sends the reply on it; the hermes-bridge attaches the stored
+# report to the turn. deployer: noop, two front-door turns, reads no cluster;
+# inject lane only (api-lane-exclusions.txt).
+./tasks/chat-reply-under-pushed-report/task.yaml
+
 # The front door routes "which namespaces exist in this cluster?" to the host
 # cluster's agent (or platform) without asking which cluster (#3286).
 # deployer: noop, read-only, one front-door turn plus the card round trip:
