@@ -84,14 +84,15 @@ const (
 	a2aMCPIdentityConditionType = "A2AMCPServer"
 	a2aMCPIdentityUnownedReason = "UnownedServiceAccount"
 	a2aMCPTokenUnownedReason    = "UnownedTokenSecret" // #nosec G101 -- Condition reason, not a credential
-	// The remedy's timing: an unowned object carries no owner reference, so
-	// deleting it raises no event this controller watches, and the clearing
-	// pass is the periodic requeue. ServiceAccount is an Owns() kind, so a
-	// controller reference on the account is an update on an owned object
-	// and wakes a pass at once; Secrets are outside the watch set
-	// altogether, so either remedy for the token waits for that pass.
-	a2aMCPIdentityUnownedMessageFormat = "ServiceAccount %s/%s is not controlled by this PlatformAgent, so the MCP server is not rendered and the credential broker does not admit that account; delete it (seen on the operator's next pass, within 15 minutes) or give it a controller reference to this PlatformAgent (seen at once)"
-	a2aMCPTokenUnownedMessageFormat    = "Secret %s/%s is not controlled by this PlatformAgent, so the MCP server is not rendered; delete it, or give it a controller reference to this PlatformAgent; either is seen on the operator's next pass, within 15 minutes" // #nosec G101 -- Condition message text, not a credential
+	// The remedy is deletion. An unowned object carries no owner reference,
+	// so deleting it raises no event this controller watches, and the
+	// clearing pass is the periodic requeue. The message says what a
+	// controller reference would do instead of offering it as a remedy: the
+	// ownership test is IsControlledBy, so a reference anyone adds makes
+	// the operator adopt the object as it stands, annotations and contents
+	// included, which is what not adopting it was for.
+	a2aMCPIdentityUnownedMessageFormat = "ServiceAccount %s/%s is not controlled by this PlatformAgent, so the MCP server is not rendered and the credential broker does not admit that account; delete it (seen on the operator's next pass, within 15 minutes). A controller reference to this PlatformAgent would make the operator adopt the account as it is, annotations included"
+	a2aMCPTokenUnownedMessageFormat    = "Secret %s/%s is not controlled by this PlatformAgent, so the MCP server is not rendered; delete it (seen on the operator's next pass, within 15 minutes). A controller reference to this PlatformAgent would make the operator use the Secret's contents as the token" // #nosec G101 -- Condition message text, not a credential
 )
 
 // a2aMCPBrokerEnabled is the one predicate every MCP broker render asks: the
