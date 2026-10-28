@@ -499,8 +499,20 @@ interrupted in, each with its reason and its one next step, then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
-did. `periodics_runs` carries every read
-job's latest build and its summary, which is what the recovery message says. A
+did. For a failed build the note also carries how it died, read from what
+Prow wrote beside it: the node its pod ran on and a Warning pod event when
+the pod recorded one (`podinfo.json`; a run that outlives the event window
+has none), and the line of its log that says so (from the tail of
+`build-log.txt`: the script's last line that starts or ends like an error,
+else the message of Prow's own entrypoint line when the build hit its
+timeout, else the last line of all when the build wrote no report, which is a
+script that died before its summary), each left out when it cannot be read.
+The quoted line has credential shapes scrubbed and control characters and
+Chat markup dropped first, because it leaves the job's bucket: the same words
+ride the evidence into the tracking issues that quote it, and `health.json`
+is public. `periodics_runs`
+carries every read job's latest build and its summary, which is what the
+recovery message says. A
 job with no reading writes no note and ends none: that is the bot losing sight
 of the job, not the job recovering.
 
@@ -511,15 +523,21 @@ last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
 reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
-messages are four lines, the failed one with the report's detail lines under its
-second: a headline naming where and what stopped happening ("Eval GitOps repos:
+messages are four lines, the failed one with the report's detail lines and a
+"how it died" line (the log line that says so, the node, a Warning pod event)
+under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
 leftover pull requests from eval runs are not being cleaned up"); the job, what
 it does and how often, which run and how it failed; the effect and the scope
-("CI eval infrastructure only"); the runbook link and the build link. The
+("CI eval infrastructure only"); the runbook link and the build link. Failed
+jobs whose builds died on the same log line, when both are news in the same
+tick, are one message: the places and the shared last line (the same line,
+which is one place to look first, not proof of one cause), then each job as
+its own block would say it (its node and pod event included), the effects, a
+footer per job. The
 recovery is one line naming the run and what it did ("closed 241 pull request(s)
-across 12 project(s)"). The digest carries one line per open note, and one per
-reconcile job's latest run: when, which build, passed or failed, dry run or
-not, and what it did. Nothing here
+across 12 project(s)"). The digest carries one line per open note (with how a failed build died,
+when that was read), and one per reconcile job's latest run: when, which
+build, passed or failed, dry run or not, and what it did. Nothing here
 files an issue: the recovery is a person's, and the failed and stopped messages
 link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
