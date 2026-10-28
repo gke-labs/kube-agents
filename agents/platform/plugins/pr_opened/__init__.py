@@ -93,9 +93,25 @@ RUN_ID_ENV = "HERMES_KANBAN_RUN_ID"
 #: The tool whose commands reach the shell sandbox.
 TERMINAL_TOOL = "terminal"
 
-#: A command that runs the submit-suggestion skill's ``prepare`` or ``submit``.
-#: The script has no other subcommands (``submit_suggestion.COMMANDS``).
-SUBMIT_SUGGESTION_RUN = re.compile(r"submit_suggestion\.py\b.*?\b(prepare|submit)\b", re.DOTALL)
+#: ``submit_suggestion.py`` and the first argument after it, if any. The script
+#: reads any first argument that isn't a command as ``submit`` (its
+#: ``normalise_argv``: the old bare ``--branch/--title/--body`` shape), so every
+#: invocation runs ``prepare`` or ``submit`` except a help request and a retired
+#: command, which errors on its own.
+SUBMIT_SUGGESTION_ARG = re.compile(r"submit_suggestion\.py[\"']?(?:\s+([^\s;|&]+))?")
+
+#: First arguments that don't run ``prepare`` or ``submit``
+#: (``submit_suggestion.RETIRED_COMMANDS`` and the help flags).
+NOT_A_RUN = frozenset({"-h", "--help", "list", "fetch"})
+
+
+def runs_submit_suggestion(command):
+    """True when ``command`` runs the submit-suggestion skill's ``prepare`` or ``submit``, in any form."""
+    for match in SUBMIT_SUGGESTION_ARG.finditer(command):
+        first = (match.group(1) or "").strip("\"'")
+        if first and first not in NOT_A_RUN:
+            return True
+    return False
 
 #: The card status a live run holds.
 RUNNING_STATUS = "running"
@@ -342,7 +358,7 @@ def on_pre_tool_call(tool_name="", args=None, **_):
     if tool_name != TERMINAL_TOOL or not isinstance(args, dict):
         return None
     command = args.get("command")
-    if not isinstance(command, str) or not SUBMIT_SUGGESTION_RUN.search(command):
+    if not isinstance(command, str) or not runs_submit_suggestion(command):
         return None
     own = _own_run_id()
     if own is None:

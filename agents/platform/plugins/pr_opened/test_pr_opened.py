@@ -345,11 +345,23 @@ class EndedRunGuardTest(unittest.TestCase):
         env = {plugin.TASK_ENV: "t_other", plugin.RUN_ID_ENV: str(RUN_ID)}
         self.assertIsNone(self.call(PREPARE, status="done", env=env))
 
+    def test_the_bare_old_shape_is_refused_too(self):
+        # The script reads a first argument that isn't a command as `submit`.
+        for command in (
+            'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py --branch platform-agent/pdb --title "Add PDB" --body-file "$BODY"',
+            "cd /tmp/wc && python3 submit_suggestion.py --branch x --title y",
+        ):
+            with self.subTest(command=command[:50]), self.assertLogs(plugin.logger, "WARNING"):
+                self.assertEqual(self.call(command, status="done")["action"], "block")
+
     def test_other_commands_and_tools_are_never_looked_at(self):
         for command in (
             "kubectl get pdb -A -o json",
             'python3 "$HERMES_HOME"/scripts/gitops_preflight.py --list',
             "python3 submit_suggestion.py --help",
+            "python3 submit_suggestion.py -h",
+            "python3 submit_suggestion.py list --handle x",
+            "cat agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py",
         ):
             with self.subTest(command=command):
                 self.assertIsNone(self.call(command, status="done"))

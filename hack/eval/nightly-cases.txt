@@ -969,8 +969,8 @@
 # answered in the card's result with the PodDisruptionBudget manifest, and no
 # worker runs submit_suggestion.py, during its run or after kanban_complete.
 # The prompt is the card body the gate's failing repetitions carried. About
-# one repetition in 25 failed on main, so a night's three are a sample, not a
-# red on demand. deployer: noop, read-only, the no-pdb-workload fixture plus
+# one gate repetition in 25 failed on main, so a night's three are a sample;
+# on a dev lane main failed 8 of 20 end to end (#4105). deployer: noop, read-only, the no-pdb-workload fixture plus
 # the pool repository's checkout-gateway declaration (#3145); first phase,
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml

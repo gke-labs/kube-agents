@@ -18,9 +18,11 @@
 # words, so the worker sees a request close to the one it failed on, not the
 # same text.
 #
-# Not red on demand: at about 4% a repetition, three runs on main rarely show
-# it. The red record is the gate's (the issue's run list) and a replay of the
-# captured card bodies; see the pull request's Live validation.
+# How often main fails it depends on where it runs. On the eval gate about 4%
+# of repetitions wrote (the issue's run list), so a night's three are a
+# sample. On a dev next-mode lane with a GitOps repo, the same request failed
+# 8 of 20 times end to end on main and 0 of 20 on the fix (#4105's Live
+# validation). It is nightly, not blocking, until its own record builds.
 #
 # What it grades that obtainability-remediation-proposal does not: that case
 # checks the manifest's nouns in the reply. This one parses the manifest
@@ -31,7 +33,7 @@
 # its github_writes safeguard, which sees a write the trajectory does not.
 # A worker that writes after the harness has captured the run is seen by
 # neither; the image's ended-run guard (the pr_opened plugin) refuses that
-# write.
+# worker's submit_suggestion.py, though not other ways to open one (vcs.py).
 #
 # Planted defect required: the no-pdb-workload fixture's two-replica
 # Deployment checkout-gateway in namespace seeded-reliability with no
