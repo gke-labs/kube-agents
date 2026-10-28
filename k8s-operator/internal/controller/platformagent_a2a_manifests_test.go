@@ -2614,6 +2614,102 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	}
 }
 
+// TestAFlipToTodayCompletesAroundAnUnownedDoorObject (#3871): the walk lists
+// both doors' objects whatever the flags say, and one under a door's name that
+// this CR does not own is somebody else's. The flip removes everything that is
+// ours and leaves that object as found, instead of halting at it with the
+// rest of the stack still standing. One unowned object sits in each of the
+// walk's three parts: a door Secret (the pre-bus list), the MCP server's
+// fence (the bus list; never rendered with the MCP door off), and, swapped in
+// after the render, a StatefulSet under the NATS name (the sentinel delete).
+func TestAFlipToTodayCompletesAroundAnUnownedDoorObject(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+	doorKey := types.NamespacedName{Name: a2aDoorName(next), Namespace: next.Namespace}
+	squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: doorKey.Name, Namespace: doorKey.Namespace},
+		Data: map[string][]byte{"token": []byte("theirs")}}
+	mcpFenceKey := types.NamespacedName{Name: a2aMCPNetpolName(next), Namespace: next.Namespace}
+	mcpFence := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: mcpFenceKey.Name, Namespace: mcpFenceKey.Namespace}}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy(), squatter, mcpFence).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, next)
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	stsKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
+	rendered := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, stsKey, rendered); err != nil {
+		t.Fatalf("precondition: the NATS StatefulSet was not rendered: %v", err)
+	}
+	// The render owns its StatefulSet; a foreign one under the name can only
+	// exist in its place, so swap it. The gateway Deployment, still owned,
+	// is the sentinel that keeps the walk alive.
+	if err := cl.Delete(ctx, rendered); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: stsKey.Name, Namespace: stsKey.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	natsSvcKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
+	if err := cl.Get(ctx, natsSvcKey, &corev1.Service{}); err != nil {
+		t.Fatalf("precondition: the NATS Service was not rendered: %v", err)
+	}
+	quotaKey := types.NamespacedName{Name: a2aSessionQuotaName(next), Namespace: next.Namespace}
+	if err := cl.Get(ctx, quotaKey, &corev1.ResourceQuota{}); err != nil {
+		t.Fatalf("precondition: the session quota was not rendered: %v", err)
+	}
+
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("an unowned object under a reserved name stopped the flip to today: %v", err)
+	}
+	// Ours went. The Service heads the bus list, so its absence shows the
+	// walk passed the pre-bus list and the door Secret; the session quota
+	// sits after the MCP fence in the bus list, so its absence shows the
+	// walk passed that too.
+	if err := cl.Get(ctx, natsSvcKey, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("the NATS Service survived the flip: %v", err)
+	}
+	if err := cl.Get(ctx, quotaKey, &corev1.ResourceQuota{}); !errors.IsNotFound(err) {
+		t.Errorf("the session quota survived the flip: %v", err)
+	}
+	// Theirs stayed, owner-less.
+	got := &corev1.Secret{}
+	if err := cl.Get(ctx, doorKey, got); err != nil {
+		t.Fatalf("the unowned Secret is gone: %v", err)
+	}
+	if string(got.Data["token"]) != "theirs" || len(got.OwnerReferences) != 0 {
+		t.Errorf("the unowned Secret was touched: data=%q owners=%+v", got.Data["token"], got.OwnerReferences)
+	}
+	for _, planted := range []struct {
+		what string
+		key  types.NamespacedName
+		obj  client.Object
+	}{
+		{"MCP fence", mcpFenceKey, &networkingv1.NetworkPolicy{}},
+		{"NATS StatefulSet", stsKey, &appsv1.StatefulSet{}},
+	} {
+		if err := cl.Get(ctx, planted.key, planted.obj); err != nil {
+			t.Errorf("the unowned %s is gone: %v", planted.what, err)
+		} else if refs := planted.obj.GetOwnerReferences(); len(refs) != 0 {
+			t.Errorf("the unowned %s was adopted: owner references %+v", planted.what, refs)
+		}
+	}
+}
+
 // TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding pins the invariant
 // that on CR deletion (handleDeletion), an unowned or squatted callout
 // ClusterRoleBinding is logged and skipped rather than wedging finalizer removal,
@@ -2959,12 +3055,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 // TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall pins the
 // ownership rule the early exit applies to its sentinels, from both sides.
 //
-// The walk refuses to delete anything this CR does not own, and Reconcile
-// returns that refusal before status is written. So if a sentinel counted on
-// presence alone, a NetworkPolicy under a reserved name that this CR does not
-// own would send every reconcile of a today install into the refusal with no
-// phase and no conditions, requeued only by the error path's backoff -- a
-// wedge. The shape is concrete: a
+// The walk leaves anything this CR does not own alone, so a sentinel that
+// counted on presence alone would send every reconcile of a today install
+// through the eleven reads and the walk for nothing. The shape is concrete: a
 // next CR refused on its first reconcile, deleted, and re-created under the
 // same name in today mode holds its predecessor's fences under the old UID
 // until the garbage collector reaps them. A hand-written NetworkPolicy
@@ -2972,10 +3065,14 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 //
 // The sentinel rule is: an object counts only when this CR owns it. The rows
 // below plant each fence under a stale UID and under no owner at all and
-// require the reconcile to go through and leave the object alone; the control
-// plants the same object owned by the CR and requires the walk to remove it
-// (#2197), so a change that stopped the exit seeing owned residue reds here
-// rather than passing as "nothing wedged".
+// require the reconcile to go through, leave the object alone, and never
+// start the walk; the control plants the same object owned by the CR and
+// requires the walk to run and remove it (#2197), so a change that stopped
+// the exit seeing owned residue reds here rather than passing as "nothing
+// wedged". The walk is observed through the one List it makes and the exit
+// never does: the provision Jobs (deleteA2AProvisionJobs). Since the walk
+// skips what this CR does not own, "the object survived" alone would be
+// true with or without the rule.
 func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.T) {
 	staleOwner := metav1.OwnerReference{
 		APIVersion:         agentv1alpha1.GroupVersion.String(),
@@ -3037,11 +3134,19 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 			if owned := metav1.IsControlledBy(planted, agent); owned != tc.owned {
 				t.Fatalf("planted object controlled by the CR = %t, want %t; the row is not the shape it names", owned, tc.owned)
 			}
+			jobLists := 0
+			funcs := ssaApplyInterceptor()
+			funcs.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*batchv1.JobList); ok {
+					jobLists++
+				}
+				return cl.List(ctx, list, opts...)
+			}
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(agent, planted).
 				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-				WithInterceptorFuncs(ssaApplyInterceptor()).
+				WithInterceptorFuncs(funcs).
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
@@ -3049,10 +3154,14 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 
 			for i := 0; i < 2; i++ {
 				if _, err := r.Reconcile(ctx, req); err != nil {
-					t.Fatalf("Reconcile %d of a today CR beside %s: %v\n"+
-						"The early exit counted an object this CR does not own as its own residue, "+
-						"and the walk's ownership refusal wedged the reconcile before status.", i+1, planted.Name, err)
+					t.Fatalf("Reconcile %d of a today CR beside %s: %v", i+1, planted.Name, err)
 				}
+			}
+			if tc.owned && jobLists == 0 {
+				t.Errorf("the walk never ran beside %s, which this CR owns: the exit no longer sees owned residue", planted.Name)
+			}
+			if !tc.owned && jobLists != 0 {
+				t.Errorf("the walk ran %d time(s) beside %s, which this CR does not own: the exit counted it as residue", jobLists, planted.Name)
 			}
 			stored := &agentv1alpha1.PlatformAgent{}
 			if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
@@ -6631,10 +6740,8 @@ func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
 // TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret: a Secret under the
 // rendered name that this agent did not create is not the door's key. The
 // token is the door's only access control, so adopting one would arm the door
-// with a credential its planter holds; and the flag-off removal refuses to
-// delete an unowned object, so a render built on it would wedge every later
-// reconcile. The reconcile fails before the Service is rendered, and the
-// planted Secret is left exactly as it was.
+// with a credential its planter holds. The reconcile fails before the Service
+// is rendered, and the planted Secret is left exactly as it was.
 func TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	scheme := setupScheme()

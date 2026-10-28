@@ -468,24 +468,27 @@ session store rather than from the trajectory (Completion signals), so a case wh
 delegated worker's report is graded on that report, as on the api lane. Two differences from the
 api lane remain, and both are the transport's rather than the agent's. A router-scope
 `tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
-calls. And the GitHub-write safeguard dates a
-write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
-time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
-the card's worker opens lands in its own case's window. What the wait does not follow is a
-worker's own fan-out, the child cards a worker files, nor a card still running when the case
-reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
-the next unit's window and charge the next unit for it. Attributing each write to its case is
-[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
+calls. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
+call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
+lane what names a write is the reply and the workers' calls the harness reads back from the pod
+once the delegation wait has found the cards; a write neither names is recorded as unattributed
+and charged to nobody. The wait holds a case until the cards it filed are terminal, so a pull
+request the card's worker opens lands in its own case's window. What the wait does not follow is
+a worker's own fan-out, the child cards a worker files, nor a card still running when the case
+reaches the delegation ceiling or when the wait falls back. A write from one of those that lands
+in a later first-phase unit's window is unattributed there; one that lands in a requesting
+case's window, which runs alone and is marked exclusive, is charged to that case, so read a block
 on a requesting case's later repetitions as transport when the earlier case fanned out or ended
 at the ceiling. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
-through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
-by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
-none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
-repository), because the platform persona can open a pull request where the cluster safeguards
+through the exclusion list with its reason. And every case carries a GitHub-write safeguard,
+applied by the CI script to every case it runs on both lanes so the two face the same bar
+(`hack/eval/inject-lane-safeguards.yaml`, a none-wrapped `github_writes` at catastrophic
+severity over the leased project's GitOps repository, charging a write only to the repetition
+that made it), because the platform persona can open a pull request where the cluster safeguards
 see nothing (in the turn under `cli`, from a card the Planning Agent files under `api`), and the
 first run left several on the pool repository that no case had asked for. The
 lane moves to the session agent's front door when the delegation primitive lands, and the
@@ -674,16 +677,17 @@ changes nothing else about the run except what hangs off that transport switch: 
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
 than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
 (`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
-lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases grade; the lane's
-safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
-remaining task file, which the unit hands devops-bench, over the leased project's GitOps
-repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request, and the stopped asks, run in a second phase after every
-other unit, one at a time and each after a settle, so no repetition that requests nothing shares the repository with one
-that writes by design and no window reaches back into the unit before; and after the
-fan-out the script lists in the job log what the run left on that repository, closing nothing.
-With the flag unset both scripts are byte for byte what
-they were, and the presubmit's own tests hold that.
+lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
+grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
+nor the transport: on both lanes they are appended to a scratch copy of every remaining task
+file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
+`BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
+request, and the stopped asks, run in a second phase after every other unit, one at a time and
+each after a settle, so no repetition that requests nothing shares the repository with one that
+writes by design and no window reaches back into the unit before; and after the fan-out the
+script lists in the job log what the run left on that repository, closing nothing. With the flag
+unset, the transport, the inject lane's exclusion list, the card stop and the rollback check
+below are off; the api lane's exclusion list and the lane safeguards still apply.
 
 Under the flag a run on `main` also checks the rollback path once the suite verdict is computed and
 before the final line announces it (a pull request's run, `JOB_TYPE` presubmit or batch, skips it,

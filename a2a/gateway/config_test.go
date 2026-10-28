@@ -1111,3 +1111,31 @@ func TestNewDefaultsAConsoleOnlyGatewayToTheConsole(t *testing.T) {
 		t.Fatalf("a console-only gateway attributes to %q, want %q", g.backend, consoleBackend)
 	}
 }
+
+func TestConfigHomeLearnArmed(t *testing.T) {
+	armed := Config{SlackBotToken: "xoxb-x", HomeChannelRecord: "platform-agent-home-channel", HomeChannelLearn: true}
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want bool
+	}{
+		{"all gates hold", func(*Config) {}, true},
+		{"policy absent is auto", func(c *Config) { c.SlackHomePolicy = "" }, true},
+		{"CR home set", func(c *Config) { c.SlackHomeChannel = "C0HOME" }, false},
+		{"CR home set but malformed", func(c *Config) { c.SlackHomeChannel = "general" }, false},
+		{"policy manual", func(c *Config) { c.SlackHomePolicy = slackHomePolicyManual }, false},
+		{"no record named", func(c *Config) { c.HomeChannelRecord = "" }, false},
+		{"learn not armed by the operator", func(c *Config) { c.HomeChannelLearn = false }, false},
+		{"Chat holds the gateway", func(c *Config) { c.GchatRelayURL = "https://relay" }, false},
+		{"no backend", func(c *Config) { c.SlackBotToken = "" }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := armed
+			tc.mut(&c)
+			if got := c.HomeLearnArmed(); got != tc.want {
+				t.Errorf("HomeLearnArmed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

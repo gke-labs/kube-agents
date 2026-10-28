@@ -93,7 +93,7 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # health-history.jsonl beside it (download, append, upload: GCS has no
 # append); a failure there is a warning.
 #
-# Three things write to GitHub with this workflow's own token, which is why
+# Four things write to GitHub with this workflow's own token, which is why
 # the job asks for pull-requests: write and issues: write and nothing else
 # does: the poster files the tracking issue a new OUTAGE lacks (label
 # presubmit-gate; it adopts and labels a human's if one names the same
@@ -122,6 +122,12 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the issues it filed that tick. The section turns owners' GitHub logins
 # into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
 # object, login -> Chat user id); without it the logins print as text.
+# A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
+# `presubmit-gate` issue open per domain with no blocking roster seat,
+# assigned to the domain owner, and closes it when the domain is covered
+# again. It is armed by the same NIGHTLY_BUGS_LIVE / CI_HEALTH_MUTE switch
+# and needs no permission beyond issues: write. It opens no roster pull
+# request: this job holds no branch write path.
 #
 # A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
 # runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
@@ -235,10 +241,11 @@ env:
   COLLECT_TIMEOUT_S: "1500"
   # The refresh job's timeout-minutes in seconds (move the two together),
   # and what the store read must leave on that clock for the adjudicator,
-  # the render, the nightly bug filer and the post after it (recent ticks
-  # spend 80-150 s on the whole job; the filer step is capped at 3 minutes).
+  # the render, the nightly bug filer, the coverage-gap filer and the post
+  # after it (recent ticks spend 80-150 s on the whole job; the two filer
+  # steps are capped at 3 and 2 minutes).
   JOB_TIMEOUT_S: "1800"
-  JOB_TAIL_S: "420"
+  JOB_TAIL_S: "540"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
   # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
@@ -274,7 +281,7 @@ jobs:
     # The workflow-level grant plus the writes the header explains: the
     # gate comment on a pull request (a red run, a lost build node, or a
     # deadline kill), the tracking issue (an OUTAGE, or a lost_pods
-    # condition) and, once armed, the nightly bug.
+    # condition) and, once armed, the nightly bug and the coverage-gap issue.
     permissions:
       contents: read
       id-token: write
@@ -684,6 +691,24 @@ jobs:
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
           python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
 
+      # One `presubmit-gate` issue per domain with no blocking roster seat,
+      # assigned to the domain owner, kept current, closed when a roster case
+      # covers the domain again (docs/ci-health.md, "Coverage gaps"). Armed
+      # by the nightly bug filer's switch, not a variable of its own; the
+      # same github.token issue scope. Best-effort and bounded like the step
+      # above, inside JOB_TAIL_S, so it cannot cancel the post.
+      - name: File an issue per domain with no presubmit seat (dry run unless armed)
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mode=--dry-run
+          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
+          store_args=()
+          [ -f work/store.json ] && store_args=(--store work/store.json)
+          python3 scripts/eval_dashboard/coverage_gaps.py --data work/data.json "${store_args[@]}" "$mode"
+
       # The token goes to the poster step alone, as a masked step output
       # rather than through GITHUB_ENV, so no later step sees it.
       - name: Mint a Chat token
@@ -711,9 +736,14 @@ jobs:
           # --data is the data.json this tick collected (or, after a failed
           # collect, the bucket's): the digest's nightly section reads last
           # night's run from it.
+          # --store, when the store was read, gives the digest's coverage-gap
+          # lines the evidence store's verdict on each best candidate.
+          store_args=()
+          [ -f work/store.json ] && store_args=(--store work/store.json)
           python3 scripts/eval_dashboard/post_health.py \
             --health work/health.json \
             --data work/data.json \
+            "${store_args[@]}" \
             --state "$DASHBOARD_BUCKET/health-state.json" \
             --digest-hour 9
 

@@ -4179,10 +4179,10 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				ResourceNames: []string{agent.Name},
 				Verbs:         []string{"get"},
 			},
-			// The home-channel record, one named ConfigMap, for a gateway that
-			// learns the home channel from the first admitted mention in a
-			// channel; no shipped gateway reads or patches it yet
-			// (platformagent_home_channel_record.go).
+			// The home-channel record, one named ConfigMap: the gateway's
+			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
+			// once an A2A_HOME_CHANNEL_LEARN this operator does not yet render
+			// arms it (platformagent_home_channel_record.go).
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"configmaps"},
@@ -4282,10 +4282,8 @@ func (r *PlatformAgentReconciler) ensureA2AInjectTokenSecret(ctx context.Context
 		if !metav1.IsControlledBy(existing, agent) {
 			// Not ours, not adopted. The token is the door's only access
 			// control, so a Secret somebody else wrote under the rendered name
-			// would hand the door to whoever wrote it; and the flag-off
-			// removal refuses to delete an unowned object, so a render built
-			// on one would wedge later. Refused here, before the Service and
-			// the gateway's env reference the name.
+			// would hand the door to whoever wrote it. Refused here, before
+			// the Service and the gateway's env reference the name.
 			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A inject door's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
 		}
 		if len(existing.Data[a2aInjectTokenKey]) > 0 {
@@ -4732,9 +4730,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// The learned-home contract (platformagent_home_channel_record.go),
 		// for a gateway that learns a home channel from the first admitted
 		// mention: whether it may, the record it would write, and its own
-		// image for the record's writer key. No shipped gateway reads these
-		// yet. The gateway's home env above stays the CR's: a learned value
-		// would reach the gateway through the record, not a re-render.
+		// image for the record's writer and reader keys. The gateway reads
+		// them, and learns only once A2A_HOME_CHANNEL_LEARN is rendered true,
+		// which this release does not. The gateway's home env above stays the
+		// CR's: a learned value reaches the gateway through the record, not a
+		// re-render.
 		backendEnv = append(backendEnv,
 			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
 			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
@@ -5651,10 +5651,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 // selecting it. Counters only, and
 // the same async-reap gap a2aBusTeardown's session-fence comment names;
 // closing it would mean holding the removal until no gateway pod remains.
-// One cached read: NetworkPolicy is an Owns() kind.
+// One cached read: NetworkPolicy is an Owns() kind. A policy under the name
+// that this PlatformAgent does not own is skipped, as the doors' removals
+// skip theirs (removeA2AInjectBackend): this runs on every held pass, and
+// the render that follows the hold applies the fence over it.
 func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
-	if err := r.deleteOwnedA2AObject(ctx, agent, np, r.Client); err != nil {
+	if err := r.deleteA2AObjectIfOwned(ctx, agent, np, r.Client, nil); err != nil {
 		return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy: %w", err)
 	}
 	return nil
@@ -5720,12 +5723,20 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 //
 // A teardown entry exists for all four as well, for the flip to `today`
 // where neither this function nor the render runs at all.
+//
+// This runs on every next reconcile while the flag is off, so an object
+// under the door's name, in any of its four kinds, that this PlatformAgent
+// does not own (a copy made by hand, or the previous CR's while the garbage
+// collector runs after a delete and re-create) is skipped and logged, not
+// refused: refusing stopped the rest of the reconcile and the status write
+// behind it until a person deleted it (#3871). The flag's own path still
+// refuses to adopt one (ensureA2AInjectTokenSecret).
 func (r *PlatformAgentReconciler) removeA2AInjectBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if a2aInjectBackendEnabled() {
 		return nil
 	}
 	for _, entry := range r.a2aInjectObjects(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return fmt.Errorf("failed to remove the A2A inject backend's %T: %w", entry.obj, err)
 		}
 	}
@@ -5777,14 +5788,15 @@ func (r *PlatformAgentReconciler) applyA2AAgentDoor(ctx context.Context, agent *
 }
 
 // removeA2AAgentDoor takes the A2A door away when its flag is not set. See
-// removeA2AInjectBackend for why the removal exists and why the Secret is
-// read uncached.
+// removeA2AInjectBackend for why the removal exists, why the Secret is read
+// uncached, and why an unowned object is skipped (the flag's own refusal is
+// ensureA2ADoorTokenSecret's).
 func (r *PlatformAgentReconciler) removeA2AAgentDoor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if a2aAgentDoorEnabled() {
 		return nil
 	}
 	for _, entry := range r.a2aDoorObjects(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return fmt.Errorf("failed to remove the A2A door's %T: %w", entry.obj, err)
 		}
 	}
@@ -5802,21 +5814,6 @@ func (r *PlatformAgentReconciler) a2aDoorObjects(agent *agentv1alpha1.PlatformAg
 		{&networkingv1.NetworkPolicy{ObjectMeta: meta}, r.Client},
 		{&corev1.Secret{ObjectMeta: meta}, r.a2aReader()},
 	}
-}
-
-// deleteOwnedA2AObject removes one object this agent owns, tolerating its
-// absence. The ownership check is cleanupA2A's, for the same reason: an
-// object somebody else created under a name we render is not ours to delete.
-// reader is the client that may read this kind -- the cache for kinds the
-// manager watches, a2aReader for a Secret (see removeA2AInjectBackend).
-func (r *PlatformAgentReconciler) deleteOwnedA2AObject(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, reader client.Reader) error {
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !metav1.IsControlledBy(obj, agent) {
-		return fmt.Errorf("refusing to delete unowned A2A %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
-	}
-	return client.IgnoreNotFound(r.Delete(ctx, obj))
 }
 
 // a2aCalloutCanServeANewGateway reports whether at least one replica of the
@@ -6190,7 +6187,8 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // are the gateway's, not the operator's: every spawned pod carries an
 // ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
 // deleting the gateway here hands any stragglers to Kubernetes GC, with no
-// operator exception to the IsControlledBy refusal below.
+// operator exception to the ownership rule below: the walk deletes only
+// what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
@@ -6260,11 +6258,13 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
 	// object under a reserved name is not residue of this CR and is left to
-	// its owner or to the garbage collector. The walk below refuses to delete
-	// anything this CR does not own, so a present-but-unowned sentinel that
-	// counted would send every reconcile of a today install into that refusal
-	// -- the shape a next CR deleted and re-created under the same name in
-	// today mode takes, while its old fences still carry the old UID.
+	// its owner or to the garbage collector. The walk below leaves anything
+	// this CR does not own alone (deleteA2AObjectIfOwned), so a flip with an
+	// unowned object under a reserved name completes around it (#3871); a
+	// present-but-unowned sentinel that counted would only send every
+	// reconcile of a today install through the walk for nothing -- the shape
+	// a next CR deleted and re-created under the same name in today mode
+	// takes, while its old fences still carry the old UID.
 	// Ownership is read off the fetched object, so the exit stays at eleven
 	// Gets, plus one for the profile namespace's fence below, which carries
 	// no owner reference and is tested by this agent's labels instead.
@@ -6334,7 +6334,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// Deleted first so the services built on top of the bus are initiated and stopped
 	// before the bus itself.
 	for _, entry := range r.a2aPreBusTeardown(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return err
 		}
 	}
@@ -6383,7 +6383,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// 4. The NATS bus namespaced objects (Service, NetworkPolicy fences,
 	// config Secret, ResourceQuota).
 	for _, entry := range r.a2aBusTeardown(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return err
 		}
 	}
@@ -6417,7 +6417,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 // dying anywhere earlier leaves the StatefulSet standing to resume cleanup (#2216).
 func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
-	return r.deleteOwnedA2AObject(ctx, agent, sts, r.Client)
+	return r.deleteA2AObjectIfOwned(ctx, agent, sts, r.Client, nil)
 }
 
 // deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label

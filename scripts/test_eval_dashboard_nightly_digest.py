@@ -308,6 +308,23 @@ class TrackingTest(Harness):
         self.assertIn(f"• Capacity: case-red, night 4 · <https://github.com/{REPO}/issues/4005|#4005> (closed) · <users/1001>", text)
         self.assertIn(f"• Capacity: case-maint, night 2 · <https://github.com/{REPO}/issues/4006|#4006> · @carol", text)
 
+    def test_a_bug_fixed_while_last_nights_run_ran_tracks_until_three_nights_start_after(self):
+        # #4041: the fix closed case-red's bug while the 20th's run, started
+        # before it, was going. The filer does not file again, so the case
+        # is not owed a bug (a loud line): it is still red, tracked.
+        nights = [night(day, [green("case-green"), red("case-red") if day >= 18 else green("case-red")]) for day in range(15, 21)]
+        fixed = {**issue(4005, "case-red", "2026-10-18T05:00:00Z"), "state": "closed", "state_reason": "completed", "closed_at": "2026-10-20T00:30:00Z"}
+        section = self.build(data(*nights), [], gh=StubGh([], closed_issues=[fixed]))
+        self.assertTrue(section.quiet, section.lines)
+        self.assertIn("1 still red", section.lines[0])
+        # Fixed, then green, then red again: a new failure the closed bug
+        # does not track (the filer reads closes against a streak only).
+        nights = [night(day, [green("case-green"), red("case-red") if day in (18, 20) else green("case-red")]) for day in range(15, 21)]
+        fixed = dict(fixed, closed_at="2026-10-18T00:30:00Z")
+        text = "\n".join(self.build(data(*nights), [], gh=StubGh([], closed_issues=[fixed])).lines)
+        self.assertIn("Red last night, no bug yet", text)
+        self.assertNotIn("#4005", text)
+
 
     def test_a_bug_filed_late_for_a_case_not_graded_last_night_is_new(self):
         # case-red was red three nights, then kept from running last night;

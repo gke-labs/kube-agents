@@ -214,9 +214,13 @@ layout and are collected from the moment they start running.
       decimal each. `agent_s`
       is the agent run's wall clock (`results.json`'s `latency`, which
       devops-bench takes around the harness run: the delegation wait is in
-      it, provisioning, fixtures, verification and the judge are not); `turn1_s` is the opening chat turn on the api transport,
+      it, provisioning, fixtures, verification and the judge are not); `turn1_s` is the opening chat turn: on the api transport
       the attempt that succeeded only, with no retry, backoff or status
-      poll in it (none on the inject transport). The collector consumes the
+      poll in it; on the inject transport the opening task from the door
+      accepting it (from the POST that went out) to the read that saw it completed (a wait in the
+      bridge's queue and the one-second poll pause are in it), and none
+      for a task that failed, ran to its budget, ended only on the stream
+      without the relay's post, lost an opening POST's reply (the task may have started before the retry), or was lost to infrastructure. The collector consumes the
       line whole, like the report line; it keeps only these two keys, as
       floats, when the value is a finite number above zero, and skips an
       unknown key or a value that does not parse. Each key is **absent**

@@ -25,9 +25,11 @@
 #
 # The stop lands while the card is still being dispatched, minutes before a
 # change reaches its pull request, so no write window is needed. A stop that
-# fails lets the card write, and the lane's safeguard charges that write to
-# every case whose window it overlaps; hack/ci-eval-pr.sh therefore runs a
-# stopped ask in the second phase, one unit at a time, so it reds only itself.
+# fails lets the card write; in a shared window the lane's safeguard would
+# charge that write only if this case named it, so hack/ci-eval-pr.sh runs a
+# stopped ask in the second phase, one unit at a time, and the lane marks its
+# window exclusive (bench/kube_agents_bench/lane.py): the write reds this
+# case whether named or not, and reds only this case.
 #
 # Planted defect required: the no-pdb-workload fixture's two-replica
 # Deployment checkout-gateway in namespace seeded-reliability. Nothing is

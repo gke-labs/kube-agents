@@ -443,6 +443,24 @@ MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
 )
 
+# How a Cluster Agent describes a fix on an event or stall triage card. (The
+# drift card keeps its own wording: its report compares the live object with
+# the declared state, which it reads from the object's field ownership.) A
+# Cluster Agent has no GitOps repository: the Platform Agent finds the file
+# when it opens the Pull Request. Without this, "precisely
+# enough that someone can open the Pull Request from your report alone" sent a
+# worker that had its cause in the first minute on a 21-minute hunt for the
+# workload's source, and it never answered (gke-labs#3078).
+TRIAGE_FIX_AGAINST_LIVE_OBJECT = (
+    "Describe each change against the live object you read: its kind, namespace and name, the field, and the "
+    "current and proposed value, or for a missing object, what to create and the fields it needs. You have no "
+    "GitOps repository and need none, because the agent that opens the Pull Request finds the file. Do not look "
+    "for the workload's source, whether in this pod's files, with git, or through any repository tool: a source "
+    "file you haven't seen is not a gap in the report. The cause is the evidenced dependency or setting the failure "
+    "points to, not the command or log line that reports it, so check that it exists before you call the "
+    "investigation done. Then complete the card. "
+)
+
 
 # The report a fleet-audit run's `finish` leaves for the relay, in the
 # directory the run's shell writes to (`audit_report.SCRATCH_DIR`, in the shell
@@ -2712,7 +2730,8 @@ def _triage_who_acts(open_pull_request: bool) -> str:
     if not open_pull_request:
         return (
             "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-            "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+            f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
             "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
             "(no `kubectl scale`, `patch`, or `apply`)."
         )
@@ -2722,8 +2741,10 @@ def _triage_who_acts(open_pull_request: bool) -> str:
         "complete this card (`done`), reads your report, and opens the Pull Request for the option you marked ✅ Recommended, or for "
         "the single Proposed fix — not you, and not from this card (if this card ends `blocked`, the follow-up card stays held in "
         "`todo` until this card is unblocked and completed or archived). "
-        "Your job is to make that possible: name the manifest change each option needs precisely enough that the Pull Request can be "
-        "opened from your report alone, and with two or more options mark exactly one Recommended. Keep the `- **To authorize:**` bullet "
+        "Your job is to make that possible: name the change each option needs precisely enough that the Pull Request can be "
+        "opened from your report alone, and with two or more options mark exactly one Recommended. "
+        f"{TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        "Keep the `- **To authorize:**` bullet "
         "label as the template above writes it (the notifier keys on that label to store your report for thread follow-ups), telling "
         f"the reader that a GitOps Pull Request for the recommended fix {TRIAGE_OPEN_PR_MARKER} (and with two or more options, "
         "that they can reply **'apply Option B'** to request an alternative option instead) — do not tell the reader to reply "
@@ -3283,6 +3304,17 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     establishing whether the state git declares still runs before proposing that
     the change be undone.
 
+    The detector does not consult git, so the object may be one git does not
+    declare at all, and then there is no declared state to revert to
+    (docs/designs/drift-detection.md, "Resources not in Git at all"). The
+    worker has no repository to check, so the body tells it to read that off
+    the live object's GitOps markers, which the skill lists, and widens the
+    options and the **Done when** line to codifying it. Deleting it is sound
+    too, but no pull request can delete what git does not hold, so it is an
+    unlettered **Manual step** bullet: slack_ux_incident.parse_triage turns
+    every lettered option into an 'apply Option X' button, and a lettered
+    delete would become a button for a pull request that cannot exist. bench/tasks/gitops-drift-unmanaged-object-triage grades it.
+
     On an install with no usable GitOps repository the card is
     :func:`_drift_task_body_without_gitops` instead: an explanation with no
     options. The bench contract above binds only this, the registered path.
@@ -3304,6 +3336,21 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
         f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
         f"whichever way it comes out belongs in the report.\n\n"
+        f"**Before any of that, establish whether git declares this object at all.** You have no access to the "
+        f"repository; the live object tells you. A GitOps tool marks what it applies — its field manager, or its "
+        f"tracking label or annotation — and the skill lists them. If the object still exists, carries none of "
+        f"them, and its only field managers are a person's `kubectl` subcommands (`kubectl-create`, "
+        f"`kubectl-edit`, `kubectl-label`, `kubectl-patch` and the like), say it is probably not in git and what "
+        f"you checked. There is then no declared state to revert to, so do not offer one: codify it in git, saying "
+        f"whether the manifest keeps the change or undoes it — that is the option, or the two options, to letter. "
+        f"Deleting it is also sound, since git declares nothing, but no pull request can do it, so it is never a "
+        f"lettered option, never the recommendation, and never named in the 'apply' line: where it is worth "
+        f"naming, add one bullet after the lettered options, `- **Manual step (<title>):** <why, and the command a "
+        f"person runs>`, and do not call it an option. If its only markers are ones the skill calls ambiguous, "
+        f"which a person's `kubectl apply` or `helm install` leaves too, or a field manager you do not recognise, "
+        f"which may be a pipeline's, keep the revert beside those options and say what would decide between them. "
+        f"A deleted object carries nothing to read, so its absence of markers is no evidence: say whether git "
+        f"declares it could not be read off the cluster, and keep the revert.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
@@ -3312,7 +3359,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
         f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
         f"revert's consequence being whether the state git declares would still run, read off this cluster or "
-        f"reported as not established. "
+        f"reported as not established — or, for an object git does not declare, proposes codifying it, naming "
+        f"deletion by hand as a manual step where it is worth naming. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -3323,7 +3371,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"the declared state is the one that should win.\n\n"
         f"Propose as many options as the situation genuinely warrants. Usually there are two — revert to what git "
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
-        f"obviously right, because the reader is deciding which state wins.\n\n"
+        f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
+        f"they are the ones above.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -3332,7 +3381,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"else, replacing the ones in the template below:\n"
         f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
-        f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
+        f"No Recommended line, and nothing after **'apply'** in the call to action. The one exception is the "
+        f"**Manual step** bullet for an object git does not declare, which may follow them.\n\n"
         f"**If the change was already reconciled away and nothing is left to do,** make 'What to do' this one "
         f"bullet: '- **No action needed:** the object already matches the declared state.' No Proposed fix, and "
         f"keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
@@ -3343,7 +3393,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"## What's wrong\n\n"
         f"<1 sentence: who changed what, and whether it is still live>\n\n"
         f"## Why\n\n"
-        f"- <What the live object shows now, and how it differs from what git declares, with the evidence>\n"
+        f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
+        f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
@@ -3566,8 +3617,9 @@ def _stall_task_body(payload: Dict[str, Any]) -> str:
         f"---"
         f"\n\n**Who acts on this:**\n"
         f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not "
-        f"you, and not from this card. Name the manifest change each option needs precisely enough that someone can "
-        f"open the Pull Request from your report alone: the object, the field, and the value. Two things are true "
+        f"you, and not from this card. Name the change each option needs precisely enough that someone can "
+        f"open the Pull Request from your report alone. {TRIAGE_FIX_AGAINST_LIVE_OBJECT}"
+        f"Two things are true "
         f"whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written "
         f"to the live cluster directly (no `kubectl create`, `patch`, or `apply`)."
     )

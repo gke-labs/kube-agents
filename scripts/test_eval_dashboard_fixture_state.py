@@ -374,7 +374,7 @@ def healthy_world(*projects):
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
         },
         "describe": {project: {"seeded-a": _peer(), "seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED}, "seeded-d": _peer()} for project in projects},
-        "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"}]},
+        "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000"]}]},
     }
 
 
@@ -473,6 +473,24 @@ class NoReapplyDrift(unittest.TestCase):
         entry = {"subject": "cluster", "path": "createTime", "op": "age_hours_ge", "value": 24, "steps": runner.parse_path("createTime")}
         line = runner.evaluate(entry, [{"createTime": created.isoformat()}])
         self.assertEqual(fixture_state.age_gate_clears_at(line), created + timedelta(hours=24))
+
+    def test_the_runners_own_ahead_of_channel_line_is_read(self):
+        # The line comes from hack/fleet-fixture-state.py's evaluate(); a change to its wording must show here.
+        spec = importlib.util.spec_from_file_location("fleet_fixture_state", REPO / "hack" / "fleet-fixture-state.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        entry = {"subject": "cluster", "path": "currentMasterVersion", "op": runner.OP_NOT_AHEAD, "value": None,
+                 "steps": runner.parse_path("currentMasterVersion")}
+        offered = ["1.34.11-gke.1209000", "1.35.8-gke.1919000"]
+        ahead = {"currentMasterVersion": "1.34.12-gke.1011000", "releaseChannel": {"channel": "REGULAR"}}
+        line = runner.evaluate(entry, [ahead], channel_valid=lambda name: offered)
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AHEAD_OF_CHANNEL)
+        # A minor the channel carries none of: "newer than every version", still the channel's to clear.
+        line = runner.evaluate(entry, [dict(ahead, currentMasterVersion="1.36.1-gke.100")], channel_valid=lambda name: offered)
+        self.assertEqual(fixture_state.no_reapply_op(line), fixture_state.OP_AHEAD_OF_CHANNEL)
+        # An unset channel is the stack's to restore.
+        line = runner.evaluate(entry, [{"currentMasterVersion": "1.34.12-gke.1011000"}], channel_valid=lambda name: offered)
+        self.assertIsNone(fixture_state.no_reapply_op(line))
 
 
 class ProjectList(unittest.TestCase):

@@ -457,16 +457,18 @@ class BugsExist(Base):
 
     def test_a_closed_bug_that_still_tracks_counts(self):
         # Handed off as not planned before the streak's newest night finished,
-        # with no pass since: tracked by the hand-off rule alone.
+        # with no pass since: tracked.
         handed_off = bug("obs-1", "obs", closed_at="2026-10-17T12:00:00Z", state_reason="not_planned")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [handed_off]))
         self.assertEqual(failures, [])
-        # The same close as "completed" is not a hand-off, so it does not track.
+        # The same close as "completed" tracks too: some of the streak's
+        # nights started before it, so it has not had three nights that all
+        # started after it (#4041).
         completed = dict(handed_off, state_reason="completed")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [completed]))
-        self.assertRefused(failures, "bugs: Observability has obs-1")
-        # A "completed" close before the streak's newest night does not.
-        fixed = bug("obs-1", "obs", closed_at="2026-10-16T12:00:00Z", state_reason="completed")
+        self.assertEqual(failures, [])
+        # A "completed" close before the streak's oldest night started does not.
+        fixed = bug("obs-1", "obs", closed_at="2026-10-15T12:00:00Z", state_reason="completed")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [fixed]))
         self.assertRefused(failures, "bugs: Observability has obs-1")
 

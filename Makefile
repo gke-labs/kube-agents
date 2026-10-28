@@ -833,7 +833,7 @@ docs-check-links:
 docs-check-terminology:
 	@./hack/check-docs-terminology.sh
 
-docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
+docs-check-audience: ## Fail when a published site page carries a maintainer identifier or cites a pull request (shapes: scripts/docs_audience_denylist.txt; pinned backlog: scripts/docs_audience_allowlist.txt).
 	@python3 scripts/check_docs_audience.py
 
 docs-check-prose: ## Fail when a published site page's prose is out of step with scripts/docs_prose_ratchet.json (above a ceiling: fix the prose; below: lower the entry).

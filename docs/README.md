@@ -166,11 +166,19 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-audience` — `scripts/check_docs_audience.py`; no page under
   `docs/site/src/content/docs/` may match a shape in
   `scripts/docs_audience_denylist.txt` (workflow secret and variable names, App
-  and installation IDs, the maintainers' Prow project, internal repositories),
-  name a project ID `hack/ci-env.sh` exports (the evaluation pool), or name a
-  service-account email in a non-placeholder project; it also fails when it
-  finds no site page or derives no project ID. The rule is
-  `.agents/rules/documentation.md`.
+  and installation IDs, the maintainers' Prow project, internal repositories,
+  release-pipeline tag and workflow names), name a project ID `hack/ci-env.sh`
+  exports (the evaluation pool), name a service-account email in a
+  non-placeholder project, or cite a pull request or issue in prose (a bare
+  `#NNN`, this repository's `pull/` or `issues/` URL, or a link carrying both;
+  fenced code, inline code and comments are not read, nor is prose on the line
+  a multi-line HTML comment closes on; a number counts once per line, so a
+  reference-style link or a link wrapped after its number counts twice;
+  `contributing.md` is exempt). The pages that carried findings when a shape arrived are pinned per
+  page and shape in `scripts/docs_audience_allowlist.txt`, which only shrinks
+  and pins only those shapes: a count that rises fails, and so does one left
+  higher than the page. It also fails when it finds no site page or derives no
+  project ID. The rule is `.agents/rules/documentation.md`.
 - `docs-check-prose` — `scripts/check_docs_prose.py`; the prose on each page
   under `docs/site/src/content/docs/` (frontmatter, fences, comments, generated
   regions, component tags, code spans and link URLs set aside) may not carry
@@ -314,11 +322,11 @@ identifier appears, add its source here.
 | Release-stage tracking: the `ci:release-stage-broken` label, the watched release pipelines, the one-issue-per-workflow marker and run stamp, the sweep interval, the candidate and first-failure log patterns, the Chat message shapes | `scripts/release/notify_release_stage_broken.py` (`WATCHED_WORKFLOWS`) and `.github/workflows/release-stage-broken-notify.yml`; the roster the contract test enforces is `RELEASE_STAGE_WATCHED_WORKFLOWS` in `scripts/test_integration_contracts.py`; the Chat variables are the CI-health poster's row below |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) and hard per-file rule cap (`.agents/rules/*.md`) | `BUDGET` and `RULE_FILE_BYTE_CAP` in `scripts/check_context_budget.py` |
 | Site prose ceilings and the banned word, phrase and epigram lists the prose check enforces, and each page's recorded counts | `PARAGRAPH_WORD_LIMIT`, `CELL_WORD_LIMIT`, `SENTENCE_WORD_LIMIT`, `BANNED_WORDS`, `BANNED_PHRASES`, `LEVERAGE_VERB_RE` and `ANTITHESIS_RES` in `scripts/check_docs_prose.py`; per-page ceilings in `scripts/docs_prose_ratchet.json` |
-| Who may set the `approved` and `lgtm` labels on a change | `OWNERS` (`approvers`; `reviewers` for `lgtm` only), `hack/OWNERS`, and `OWNERS_ALIASES`; the `skip_collaborators` switch that makes `lgtm` OWNERS-gated is `prow/oss/plugins.yaml` in `GoogleCloudPlatform/oss-test-infra` |
+| Who may set the `approved` and `lgtm` labels on a change | `OWNERS` (`approvers`; `reviewers` for `lgtm` only), `hack/OWNERS`, `k8s-api-proxy/OWNERS`, and `OWNERS_ALIASES`; the `skip_collaborators` switch that makes `lgtm` OWNERS-gated is `prow/oss/plugins.yaml` in `GoogleCloudPlatform/oss-test-infra` |
 | Which Prow presubmits run on a pull request, and the Prow plugin settings behind `lgtm` and `approved` | `prow/prowjobs/gke-labs/kube-agents/` and `prow/oss/plugins.yaml` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository; the labels the merge queue reads are the "Merge queue enqueue sweep" row above |
 | Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`; who may set the first two is the "Who may set" row above) and the `triage` permission grant | Prow in `GoogleCloudPlatform/oss-test-infra` and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
 | Queue-wait thresholds that justify onboarding an eval project, the window they run over, and the JUnit row names and metric property the TestGrid tab reads | `scripts/pool_pressure.py` |
-| Presubmit-gate health rules (windows, thresholds, hysteresis), the Chat posting variables and the digest hour; the nightly bug filer's streaks, labels and `NIGHTLY_BUGS_LIVE` switch; the digest's nightly section and its `CI_HEALTH_CHAT_MENTIONS` map; the weekly health email's thresholds | `scripts/eval_dashboard/health.py`, `scripts/eval_dashboard/post_health.py`, `scripts/eval_dashboard/periodics.py`, `scripts/eval_dashboard/nightly_bugs.py`, `scripts/eval_dashboard/nightly_infra.py`, `scripts/eval_dashboard/nightly_digest.py`, `scripts/eval_dashboard/weekly_email.py` and `.github/workflows/ci-health.yml` |
+| Presubmit-gate health rules (windows, thresholds, hysteresis), the Chat posting variables and the digest hour; the nightly bug filer's streaks, labels and `NIGHTLY_BUGS_LIVE` switch; the coverage-gap filer's issue and digest lines; the digest's nightly section and its `CI_HEALTH_CHAT_MENTIONS` map; the weekly health email's thresholds | `scripts/eval_dashboard/health.py`, `scripts/eval_dashboard/post_health.py`, `scripts/eval_dashboard/periodics.py`, `scripts/eval_dashboard/nightly_bugs.py`, `scripts/eval_dashboard/nightly_infra.py`, `scripts/eval_dashboard/nightly_digest.py`, `scripts/eval_dashboard/coverage_gaps.py`, `scripts/eval_dashboard/weekly_email.py` and `.github/workflows/ci-health.yml` |
 | The eval dashboard's roster-page contract (the `demoted YYYY-MM-DD` phrase inside a `- **case-name** —` hold-out bullet), its page files and its URL parameter vocabularies | `ROSTER_ENTRY_RE` / `DEMOTED_RE` and `PAGES` in `scripts/eval_dashboard/render.py`; `linkState()` in `scripts/eval_dashboard/template/pages.js` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |

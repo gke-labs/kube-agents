@@ -284,6 +284,9 @@ type SlackAdapter struct {
 	// nil is slack-go's, through the bounded client. Tests fake it.
 	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
 
+	// homeLearn is the learned home channel's state (slack_home_channel.go).
+	homeLearn slackHomeLearn
+
 	// workspaceURL is the bot's workspace as auth.test names it
 	// ("https://acme.slack.com/"), the root of a message's permalink; home is
 	// the Home tab's state (slack_home.go).
@@ -570,6 +573,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// blocks with it, which is the honest reading of "the pump is finished".
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	// A home-channel learn or adopt in flight finishes its write before Run
+	// returns, and none starts after (slack_home_channel.go).
+	defer s.closeHomeLearn()
 
 	// The pump below exits only on ctx, so derive our own: any return from
 	// Run — a failed auth.test, or RunContext giving up on an invalid token
@@ -754,6 +760,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
+					s.noteHomeCandidate(msg, inner)
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}

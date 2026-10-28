@@ -220,7 +220,7 @@ func (r *PlatformAgentReconciler) reconcileA2AMCPBrokerIdentity(ctx context.Cont
 		if unowned {
 			return nil
 		}
-		if err := r.deleteOwnedA2AObject(ctx, agent, sa, r.Client); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, sa, r.Client, nil); err != nil {
 			return fmt.Errorf("failed to remove the MCP server's ServiceAccount: %w", err)
 		}
 		return nil

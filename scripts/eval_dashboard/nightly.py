@@ -161,7 +161,8 @@ UNKNOWN_CLOCK = "an unknown wall clock"
 DIGEST_NAMED_CASES = 3
 # The per-rep timing the collector records from `rep N timing:` (SCHEMA.md:
 # runs[].tasks[].reps): the agent run's wall clock (results.json's latency),
-# and the opening chat turn on the api transport.
+# and the opening chat turn (on the inject transport, the opening task to
+# its terminal).
 REP_AGENT_S = "agent_s"
 REP_TURN1_S = "turn1_s"
 # The slow-run percentile the Nightly page shows beside a case's medians, for

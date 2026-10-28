@@ -10,8 +10,9 @@ is the nightly's counterpart of ``gate_issue.py``::
     a case failed every graded repetition on its last STREAK_NIGHTS graded nights
     and its task.yaml does not carry `expected_fail: true`
     and no OPEN issue labelled `nightly-red` already names it,
-    and none was closed after the streak's newest night, or closed as
-        not planned with no pass since (``still_tracks``)
+    and none was closed after the streak's oldest night started
+        (``closed_after_start``), or closed as not planned with no pass
+        since (``still_tracks``)
     -> file one, labelled `nightly-red`, `domain:<slug>` and `needs-triage`,
        assigned per the rule below
 
@@ -131,14 +132,15 @@ LABEL = "nightly-red"
 TRIAGE_LABEL = "needs-triage"
 INFRA_LABEL = "Infra"
 DOMAIN_LABEL = "domain:{slug}"
-OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
+OPEN_ISSUES_PATH = "issues?labels={label}&state=open&per_page=100"
 # Closed ones too, updated since the window's first night: a bug closed
-# after the streak's newest night has seen this streak, so it is not filed
-# again until a newer failing night (a fix that merged before the next
-# nightly closes its issue, and the streak on record is still red); one
-# handed off as not planned counts only while its close is on record
-# (``still_tracks``), so nothing older is needed.
-CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
+# after any of the streak's nights started has seen this streak, so it is
+# not filed again until STREAK_NIGHTS failing nights all started after the
+# close (``closed_after_start``: a fix that merges closes its issue, and the
+# nights on record, even one running when it merged, tested the code before
+# it); one handed off as not planned counts only while its close is on
+# record (``still_tracks``), so nothing older is needed.
+CLOSED_ISSUES_PATH = "issues?labels={label}&state=closed&since={since}&per_page=100"
 # The cross-check on both listings: the same issues read through GraphQL.
 # On 2026-10-22 the REST issue listing (any filter) and the search API both
 # answered 200 with no issues about half the time while the issues existed,
@@ -540,26 +542,41 @@ def closed_after(issue: dict | None, night: dict) -> bool:
     return bool(closed and ended and closed > ended)
 
 
+def closed_after_start(issue: dict | None, night: dict) -> bool:
+    """Whether a closed issue was closed after ``night``'s run started. That
+    run checked out ``main`` before the close, so it tested the code before
+    a fix that closed it: on 2026-10-27 a night that started at 00:01 and
+    finished after #3863's fix merged at 02:00 re-filed the case as #4039
+    (#4041). Its nights count only from the first run started after the
+    close."""
+    closed = nightly.parse_iso((issue or {}).get("closed_at"))
+    started = nightly.parse_iso(night.get("started"))
+    return bool(closed and started and closed > started)
+
+
 # GitHub's state_reason for a close that hands the issue off rather than
 # fixing it: "not planned" (or "duplicate") is what a triager picks when
 # closing in favour of another issue, a `Fixes #N` merge sets "completed".
 HANDED_OFF_REASONS = frozenset({"not_planned", "duplicate"})
 
 
-def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None) -> bool:
+def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None, oldest: dict | None = None) -> bool:
     """Whether a closed issue still tracks a streak ending at ``newest``.
-    One closed after that night finished has seen it (``closed_after``). One
+    One closed after that night finished has seen it (``closed_after``). A
+    completed close after ``oldest``, the first of the streak's nights,
+    started (``closed_after_start``) has too: fewer than STREAK_NIGHTS nights
+    tested the code after the close. One
     handed off (HANDED_OFF_REASONS) tracks the problem until a good night --
     a pass, a clean run, a graded case -- finishes after the close: the
     problem is the other issue's until it clears, and a new one after that
-    files fresh. A "completed" close that did not fix it files again on the
-    next bad night. A hand-off closed before ``horizon`` (the start of the
+    files fresh. A "completed" close that did not fix it files again once
+    STREAK_NIGHTS failing nights all started after it. A hand-off closed before ``horizon`` (the start of the
     window's first night) cannot be confirmed -- the record no longer shows
     whether the case cleared since -- so it does not hold a new streak back."""
     if closed_after(issue, newest):
         return True
     if issue.get("state_reason") not in HANDED_OFF_REASONS:
-        return False
+        return bool(oldest and closed_after_start(issue, oldest))
     closed = nightly.parse_iso(issue.get("closed_at"))
     if not closed or not horizon or closed < horizon:
         return False
@@ -577,12 +594,12 @@ def infra_issue_part(issue: dict) -> str:
     return next((part for job, part in nightly.PART_JOBS.items() if f"`{job}`" in body), nightly.PART_MAIN)
 
 
-def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: str | None) -> str | None:
-    """Why the REST listings cannot be trusted, or None when GraphQL
-    agrees with them (LISTING_QUERY). A dedupe that reads an empty list
-    files every case again."""
+def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: str | None, label: str = LABEL) -> str | None:
+    """Why the REST listings of ``label`` cannot be trusted, or None when
+    GraphQL agrees with them (LISTING_QUERY). A dedupe that reads an empty
+    list files every case again."""
     owner, _, name = gh.repo.partition("/")
-    variables = {"owner": owner, "name": name, "label": LABEL, "since": since, "closed": bool(since)}
+    variables = {"owner": owner, "name": name, "label": label, "since": since, "closed": bool(since)}
     found = gh.call("POST", GRAPHQL_PATH, {"query": LISTING_QUERY, "variables": variables}, read=True)
     repo = ((found or {}).get("data") or {}).get("repository") if isinstance(found, dict) else None
     if not isinstance(repo, dict) or (found or {}).get("errors"):
@@ -601,23 +618,24 @@ def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: s
     return None
 
 
-def read_listings(gh: ghcli.Gh, since: str | None) -> tuple[list | None, list | None, str | None]:
-    """``(open, closed, doubt)``: the two REST listings (closed ones updated
+def read_listings(gh: ghcli.Gh, since: str | None, label: str = LABEL) -> tuple[list | None, list | None, str | None]:
+    """``(open, closed, doubt)``: the two REST listings of ``label`` (closed ones updated
     since ``since``; none without it), read up to LISTING_ATTEMPTS times
     until GraphQL agrees with them (``listing_doubt``). ``open`` or
     ``closed`` is None when a read failed; ``doubt`` is why the last read is
-    not trusted, None when it is. The filer and the digest's nightly section
-    both read the issues through this."""
+    not trusted, None when it is. The filer, the digest's nightly section
+    and the coverage-gap filer (``coverage_gaps.py``, label
+    `presubmit-gate`) read the issues through this."""
     doubt = None
     for attempt in range(1, LISTING_ATTEMPTS + 1):
-        open_issues = gh.call("GET", gh.path(OPEN_ISSUES_PATH), paginate=True)
-        closed_issues = gh.call("GET", gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True) if since else []
+        open_issues = gh.call("GET", gh.path(OPEN_ISSUES_PATH.format(label=label)), paginate=True)
+        closed_issues = gh.call("GET", gh.path(CLOSED_ISSUES_PATH.format(label=label, since=since)), paginate=True) if since else []
         if open_issues is None or closed_issues is None:
             return open_issues, closed_issues, None
-        doubt = listing_doubt(gh, open_issues, closed_issues, since)
+        doubt = listing_doubt(gh, open_issues, closed_issues, since, label)
         if not doubt:
             break
-        log(f"warning: the nightly-red issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
+        log(f"warning: the {label} issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
         if attempt < LISTING_ATTEMPTS:
             time.sleep(LISTING_RETRY_DELAY_S)
     return open_issues, closed_issues, doubt
@@ -675,7 +693,7 @@ class Filer:
             streak = red_streak(verdicts)
             if streak:
                 passes = [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]
-                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes, self.horizon)], case)
+                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes, self.horizon, streak[0])], case)
                 if fields is None:
                     result["skipped"].append({"case": case, "why": "no readable task.yaml on this checkout"})
                 elif case not in active:
@@ -795,10 +813,10 @@ class Filer:
 
     def file_infra(self, kind, key, newest, title, body, nights, good, closed_issues, result) -> None:
         """File the infra issue for ``key`` unless a closed one still tracks
-        this streak (``still_tracks``; ``good`` are the clean or graded
-        nights). ``body(addressee=...)`` renders it with the assignment
+        this streak (``still_tracks``, from the streak's oldest night
+        ``nights[0]``; ``good`` are the clean or graded nights). ``body(addressee=...)`` renders it with the assignment
         line."""
-        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon)], key, kind)
+        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon, nights[0])], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})
             return
