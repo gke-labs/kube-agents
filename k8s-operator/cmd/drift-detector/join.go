@@ -764,7 +764,13 @@ func (j *joiner) charge(identity clusterIdentity, elapsed time.Duration, err, lo
 		return
 	}
 	if elapsed < j.slowLookup {
-		delete(j.strikes, identity)
+		// Only an answer clears the streak. A lookup a deadline ended before it
+		// answered -- the batch budget already spent, or cut within this long of
+		// starting -- says nothing about the cluster, any more than a SIGTERM
+		// does, so the streak stays where it was.
+		if !errors.Is(lookupErr, context.DeadlineExceeded) {
+			delete(j.strikes, identity)
+		}
 		return
 	}
 	if err != nil && errors.Is(lookupErr, context.DeadlineExceeded) {

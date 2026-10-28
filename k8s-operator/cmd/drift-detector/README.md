@@ -740,7 +740,7 @@ hangs. Three such records exhaust a thirty-second batch for every cluster in it.
 than one cluster, a lookup that runs at least `slowLookupThreshold` (2s) and then ends on a deadline
 benches its cluster for `slowClusterCooldown` at once. One that answers that slowly, with the object,
 a `NotFound` or any other error, is a strike instead, and the second slow answer in a row from one
-cluster (`slowAnswerStrikes`) benches it; a fast answer clears the streak. A slow answer keeps its
+cluster (`slowAnswerStrikes`) benches it; a fast answer clears the streak, and a lookup a deadline ended before it answered leaves it alone. A slow answer keeps its
 own result, so it is still `enriched`. The cluster's later records skip the lookup and come out
 `failed` with a `lookup_error` naming the cluster and the slow lookup, counted `benched=` on the join
 tally rather than `failed=`, and one log line says when a cluster is benched. A healthy control plane
@@ -788,7 +788,7 @@ That bounds the blast radius rather than removing it. Six consecutive unresponsi
 exhaust a thirty-second budget between them, and what the operator sees when they do is a batch of
 `failed` **lookups** — every later record's `GET` returning a deadline error — which reads
 identically to a slow control plane and is not. Those lookups fail at once on the spent context, so
-they do not bench their clusters, and `benched=` stays out of `failed=`. Check the inject tally on the shutdown line before
+they neither bench their clusters nor clear a slow cluster's strike, and `benched=` stays out of `failed=`. Check the inject tally on the shutdown line before
 blaming the API server, and turn the inject off with an empty `--daemon-url` to tell the two apart.
 Sizing the budget for an install with the inject on still means budgeting for the daemon's latency
 as well as the control plane's; a per-record budget covering the whole handler, rather than the

@@ -1456,6 +1456,30 @@ func TestJoinBenchesOnTheSecondSlowAnswerInARow(t *testing.T) {
 	}
 }
 
+// A lookup the batch budget ends before it answers is not a fast answer: it
+// leaves the streak alone, so a cluster that answers slowly still benches on
+// its second slow answer even when a spent budget cut a lookup in between.
+func TestJoinStreakSurvivesALookupTheBudgetCutShort(t *testing.T) {
+	const slow = 40 * time.Millisecond
+	j, _, _, _ := slowFleet(t)
+	getter := &slowAnswerGetter{delay: slow}
+	j.clusters[joinCluster()] = getter
+	j.timeout = time.Second
+
+	spent, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	j.Handle(context.Background(), joinRecord()) // slow answer: strike one
+	j.Handle(spent, joinRecord())                // ended at once on the spent budget
+	if _, benched := j.slow[joinCluster()]; benched {
+		t.Fatal("benched after one slow answer and one cut-short lookup, want a strike only")
+	}
+	j.Handle(context.Background(), joinRecord()) // second slow answer
+	if _, benched := j.slow[joinCluster()]; !benched {
+		t.Errorf("not benched: the cut-short lookup cleared the streak (strikes=%d)", j.strikes[joinCluster()])
+	}
+}
+
 // The DRIFT line carries the lookup's duration when there was a lookup, and
 // not otherwise, so latency is readable from the logs.
 func TestLogDriftEventLookupDuration(t *testing.T) {
