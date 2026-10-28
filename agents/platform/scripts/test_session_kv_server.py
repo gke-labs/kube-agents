@@ -2394,6 +2394,21 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertEqual(self._inject("reasonfix-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "injected")
         state.assert_not_called()
 
+    def test_a_reason_folded_into_the_incident_is_held_too(self):
+        # A cascade: the incident's BackOff, then another replica's Unhealthy
+        # folded into it inside the window. A replacement pod replays both.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            self.assertEqual(self._inject("cascade-api-6cfdb6b98b-aaaaa")["status"], "injected")
+            self.assertEqual(self._inject("cascade-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "folded")
+            anchor_id = self._rows("cascade-api")[0][0]
+            self._age(anchor_id, self.WINDOW + 60)
+            self._board(cards=[("t-pr", "sess-cascade-api-6cfdb6b98b-aaaaa-BackOff", self.FIX_URL)])
+            reply = self._inject("cascade-api-6cfdb6b98b-ccccc", reason="Unhealthy")
+        self.assertEqual(reply["status"], "folded")
+        self.assertEqual(reply["duplicate_of"], str(anchor_id))
+
     def test_with_folding_off_nothing_is_held_or_looked_up(self):
         with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
             self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")

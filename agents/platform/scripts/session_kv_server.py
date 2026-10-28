@@ -1808,8 +1808,10 @@ def _open_fix_pull_request(
     open. A merged or closed one is not a fix in review: a merged fix that did
     not hold, or a rejected one, is a new incident. A Critical event is held
     only by a Critical incident, as the fold holds it (_workload_incident_anchor).
-    Another reason is another fault, which the open fix may not touch, so it is
-    triaged rather than reminded.
+    The event's reason has to be one the incident showed, its own or one folded
+    into it (a cascade such as `Failed` then `BackOff` is one fault): another
+    reason is another fault, which the open fix may not touch, so it is triaged
+    rather than reminded.
 
     Fails open: an unreadable ledger or board, a forge that refuses or is slow
     past FIX_PR_LOOKUP_TIMEOUT_S for the whole search, all answer None, and the
@@ -1821,7 +1823,8 @@ def _open_fix_pull_request(
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
             incidents = conn.execute(
                 "SELECT id, session_id FROM intercepted_events "
-                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? AND reason = ? "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? "
+                "AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) "
                 "AND (? != ? OR severity = ?) "
                 "AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' "
                 "ORDER BY id DESC LIMIT ?",
@@ -1830,6 +1833,7 @@ def _open_fix_pull_request(
                     namespace,
                     object_kind,
                     workload_key,
+                    reason,
                     reason,
                     severity,
                     CRITICAL_SEVERITY,

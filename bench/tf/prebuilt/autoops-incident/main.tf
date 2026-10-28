@@ -520,7 +520,7 @@ resource "null_resource" "incident" {
         fi
         open_fix() {
           curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
-            "$api/repos/$repo/pulls?state=open&per_page=50" 2>/dev/null \
+            "$api/repos/$repo/pulls?state=open&per_page=50" \
           | python3 -c '
       import json, subprocess, sys
       since, path, api, repo, token = sys.argv[1:6]
@@ -531,7 +531,8 @@ resource "null_resource" "incident" {
               ["curl", "-fsS", "-H", "Authorization: Bearer " + token,
                api + "/repos/" + repo + "/pulls/" + str(pull["number"]) + "/files?per_page=100"],
               capture_output=True, text=True).stdout
-          if any(f.get("filename", "").endswith(path) for f in json.loads(files or "[]")):
+          names = [f.get("filename", "") for f in json.loads(files or "[]")]
+          if any(n == path or n.endswith("/" + path) for n in names):
               print(pull["html_url"]); break
       ' "$started_at" "${var.gitops_manifest_path}" "$api" "$repo" "$token"
         }
