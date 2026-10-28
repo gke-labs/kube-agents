@@ -248,6 +248,146 @@ class TestSharedThread(MultiUserMemoryTestCase):
         self.assertTrue(self.shared()._session_is_shared)
 
 
+class TestA2AAndUnattributedIdentity(MultiUserMemoryTestCase):
+    """Under spec.mode: next (a2a-* sessions), identity comes from session_kv.db,
+    and an unattributed session fails closed instead of sharing 'default_<hash>.md' (#3596).
+    """
+
+    def setUp(self):
+        super().setUp()
+        from contextlib import closing
+        import sqlite3
+        from unittest.mock import patch
+        self.kv_db = self.home / "session_kv.db"
+        env = patch.dict(os.environ, {"SESSION_KV_DB_PATH": str(self.kv_db)})
+        env.start()
+        self.addCleanup(env.stop)
+        with closing(sqlite3.connect(str(self.kv_db))) as conn, conn:
+            conn.execute(
+                "CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)"
+            )
+
+    def _put_route(self, session_id: str, route: dict) -> None:
+        from contextlib import closing
+        import sqlite3
+        with closing(sqlite3.connect(str(self.kv_db))) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session_id, json.dumps({"conversation_route": route})),
+            )
+
+    def test_missing_or_default_user_id_fails_closed_without_shared_default_file(self):
+        for empty in ("", "   ", "default", None):
+            with self.subTest(user_id=empty):
+                p = mum.MultiUserFileMemoryProvider()
+                p.initialize("a2a-ctx-unattributed", hermes_home=str(self.home), user_id=empty)
+                self.assertEqual(p._user_id, "")
+                res_write = p.handle_tool_call(
+                    "multiuser_memory",
+                    {"action": "add", "target": "user", "content": "Secret cluster: X"},
+                )
+                self.assertTrue(self.failed(res_write), res_write)
+                self.assertIn("no user identity", json.loads(res_write)["error"])
+                res_read = p.handle_tool_call(
+                    "multiuser_memory", {"action": "read", "target": "user"}
+                )
+                self.assertTrue(self.failed(res_read), res_read)
+                self.assertEqual(self.user_files(), [])
+                self.assertIn("no user identity", p.system_prompt_block())
+
+    def test_a2a_dm_session_resolves_hmac_principal_and_isolates_two_users(self):
+        alice_hmac = "hmac:0123456789abcdef0123456789abcdef"
+        bob_hmac = "hmac:fedcba9876543210fedcba9876543210"
+        self._put_route(
+            "a2a-ctx-alice",
+            {"platform": "google_chat", "conversation": "gchat:spaces/DM1", "context_id": "ctx-alice", "user_id": alice_hmac, "chat_type": "dm"},
+        )
+        self._put_route(
+            "a2a-ctx-bob",
+            {"platform": "google_chat", "conversation": "gchat:spaces/DM2", "context_id": "ctx-bob", "user_id": bob_hmac, "chat_type": "dm"},
+        )
+
+        p_alice = mum.MultiUserFileMemoryProvider()
+        p_alice.initialize("a2a-ctx-alice", hermes_home=str(self.home))
+        res_a = p_alice.handle_tool_call(
+            "multiuser_memory", {"action": "add", "target": "user", "content": "Default cluster: alice-prod"}
+        )
+        self.assertTrue(json.loads(res_a)["success"], res_a)
+
+        p_bob = mum.MultiUserFileMemoryProvider()
+        p_bob.initialize("a2a-ctx-bob", hermes_home=str(self.home))
+        self.assertNotIn("alice-prod", p_bob.system_prompt_block())
+        read_bob = json.loads(p_bob.handle_tool_call("multiuser_memory", {"action": "read", "target": "user"}))
+        self.assertEqual(read_bob["entries"], [])
+        self.assertEqual(self.user_files(), [_expected_filename(alice_hmac)])
+
+    def test_a2a_group_session_disables_personal_store_without_thread_id(self):
+        self._put_route(
+            "a2a-ctx-space",
+            {
+                "platform": "google_chat",
+                "conversation": "gchat:spaces/SPACE1",
+                "context_id": "ctx-space",
+                "user_id": "hmac:0123456789abcdef0123456789abcdef",
+                "chat_type": "group",
+            },
+        )
+        p = mum.MultiUserFileMemoryProvider()
+        p.initialize("a2a-ctx-space", hermes_home=str(self.home))
+        self.assertTrue(p._session_is_shared)
+        self.assertEqual(p._user_id, "")
+        res = p.handle_tool_call(
+            "multiuser_memory", {"action": "add", "target": "user", "content": "Default cluster: space-leak"}
+        )
+        self.assertTrue(self.failed(res), res)
+        self.assertIn("shared thread", json.loads(res)["error"])
+
+    def test_compressed_continuation_walks_state_db_to_a2a_parent(self):
+        from contextlib import closing
+        import sqlite3
+        alice_hmac = "hmac:0123456789abcdef0123456789abcdef"
+        self._put_route(
+            "a2a-ctx-root",
+            {"platform": "slack", "conversation": "slack:dm/D1", "context_id": "ctx-root", "user_id": alice_hmac, "chat_type": "dm"},
+        )
+        self._put_route(
+            "a2a-ctx-branched",
+            {"platform": "slack", "conversation": "slack:dm/D2", "context_id": "ctx-branched", "user_id": alice_hmac, "chat_type": "dm"},
+        )
+        state_db = self.home / "state.db"
+        with closing(sqlite3.connect(str(state_db))) as conn, conn:
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, model_config TEXT)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-root', NULL, 'compression', NULL)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_120000_abcd1234', 'a2a-ctx-root', NULL, NULL)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_fork_of_compressed', 'a2a-ctx-root', NULL, '{\"_branched_from\": \"a2a-ctx-root\"}')")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_delegate_of_compressed', 'a2a-ctx-root', NULL, '{\"_delegate_from\": \"a2a-ctx-root\"}')")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('a2a-ctx-branched', NULL, 'branched', NULL)")
+            conn.execute("INSERT INTO sessions (id, parent_session_id, end_reason, model_config) VALUES ('20261021_branch', 'a2a-ctx-branched', NULL, NULL)")
+
+        p = mum.MultiUserFileMemoryProvider()
+        p.initialize("20261021_120000_abcd1234", hermes_home=str(self.home))
+        self.assertEqual(p._user_id, _expected_filename(alice_hmac)[:-3])
+
+        # Non-compression parent_session_id (e.g. 'branched') does not inherit an A2A route, even when the parent has a route row.
+        p_branch = mum.MultiUserFileMemoryProvider()
+        p_branch.initialize("20261021_branch", hermes_home=str(self.home))
+        self.assertEqual(p_branch._user_id, "")
+
+        # A Hermes fork (_branched_from) or delegate (_delegate_from) of a compressed a2a session must not inherit the parent's route.
+        p_fork = mum.MultiUserFileMemoryProvider()
+        p_fork.initialize("20261021_fork_of_compressed", hermes_home=str(self.home))
+        self.assertEqual(p_fork._user_id, "")
+
+        p_del = mum.MultiUserFileMemoryProvider()
+        p_del.initialize("20261021_delegate_of_compressed", hermes_home=str(self.home))
+        self.assertEqual(p_del._user_id, "")
+
+        # A non-a2a session passing gateway_session_key="a2a-..." does not hijack the victim's route.
+        p_spoof = mum.MultiUserFileMemoryProvider()
+        p_spoof.initialize("api-attacker-session", gateway_session_key="a2a-ctx-root", hermes_home=str(self.home))
+        self.assertEqual(p_spoof._user_id, "")
+
+
 class TestInputValidationAndSanitization(MultiUserMemoryTestCase):
     """Input validation and sanitization for persistent prompt injection defense (PI-006)."""
 
@@ -954,6 +1094,40 @@ class TestInputValidationAndSanitization(MultiUserMemoryTestCase):
         )
         self.assertTrue(json.loads(rep_res)["success"], rep_res)
         self.assertEqual(p._read_entries("memory"), ["Default region: us-central1", "Backup region: us-east1"])
+
+
+class TextFilterPinTest(unittest.TestCase):
+    """The plugin's own character filter must agree with the shared one.
+
+    The MCP server and the issue resolver import `agents/platform/scripts/untrusted_text.py`;
+    this plugin keeps its copy because the gateway process that loads it has its own
+    import path. A copy nobody checks is how three filters drifted by three code points.
+    """
+
+    # Every code point there is, the tag block and the planes above it included.
+    CODE_POINT_COUNT = 0x110000
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts" / "untrusted_text.py"
+        spec = importlib.util.spec_from_file_location("untrusted_text_under_test", path)
+        cls.untrusted_text = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.untrusted_text)
+
+    def test_is_safe_char_agrees_with_the_shared_filter_on_every_code_point(self):
+        disagreements = [
+            hex(code)
+            for code in range(self.CODE_POINT_COUNT)
+            if mum._is_safe_char(chr(code)) != self.untrusted_text.is_safe_char(chr(code))
+        ]
+        self.assertEqual(disagreements, [])
+
+    def test_the_ansi_pattern_is_the_shared_definition(self):
+        self.assertEqual(mum.ANSI_ESCAPE_RE.pattern, self.untrusted_text.ANSI_ESCAPE_RE.pattern)
+
+    def test_strip_unsafe_chars_agrees_with_the_shared_filter(self):
+        dirty = "line\r\n\x1b[31mred\x1b[0m \x9b1mcsi\u200bzero\u2028sep\U000e0041tag\x00"
+        self.assertEqual(mum._strip_unsafe_chars(dirty), self.untrusted_text.strip_unsafe(dirty))
 
 
 if __name__ == "__main__":

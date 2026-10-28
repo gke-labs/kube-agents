@@ -122,6 +122,19 @@ type SessionRecord struct {
 	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
 	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
 	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+	// CardStop is the card-stop control in flight on this conversation, nil
+	// when there is none (cardstop.go). Not ActiveTask and not in Tasks: the
+	// control is the gateway's own errand for a stop, not a turn, so it
+	// serializes nothing, steers nothing, is no status ask's subject, and
+	// never counts as a task the conversation ran.
+	CardStop *CardStopRun `json:"cardStop,omitempty"`
+	// RetiredCardStops are the last controls that ended, newest last, at most
+	// cardStopRetiredKept, kept so a late event for one is dropped even when
+	// its task index outlived the route's retirement (a failed DropTask):
+	// read as an ordinary task, its terminal would post the executor's raw
+	// text. More than one, because a follow-up ends seconds after the control
+	// it follows.
+	RetiredCardStops []string `json:"retiredCardStops,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,
@@ -252,6 +265,10 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// QuietCancel marks a cancel the Slack Stop button sent
+	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
+	// relay posts no "canceled" line for the task's terminal.
+	QuietCancel bool `json:"quietCancel,omitempty"`
 	// TerminalObserved marks that observeTaskTerminal has already been called
 	// for this task (e.g. by healActiveTask when recovering a stale terminal
 	// from the stream), so a queued or redelivered relayTerminal does not
@@ -330,6 +347,11 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// CardsAnswer, on a chain's root entry, records that a task of the chain
+	// handed the ask to kanban cards (cardsPending or handedOff at its
+	// terminal): a card's report answers the ask, so no relay answer in the
+	// chain, the wake's included, carries rating controls (answer feedback).
+	CardsAnswer bool `json:"cardsAnswer,omitempty"`
 	// AskMessageID is the backend id of the human message that started the
 	// chain, on its root entry only: the message the chain's mark is drawn
 	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
@@ -446,6 +468,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// markQuietCancel records that taskID's cancel came from the Slack Stop
+// button (TaskRef.QuietCancel).
+func (rec *SessionRecord) markQuietCancel(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].QuietCancel = true
 			return
 		}
 	}

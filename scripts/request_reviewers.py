@@ -58,13 +58,10 @@ import pathlib
 import random
 import re
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import yaml
 
-from github_api import API_ROOT, PER_PAGE, GitHubAPI, log
+from github_api import GitHubAPI, log
 
 # The `AI Review` check run comes from the kube-agents-bot GitHub App. The name
 # alone is not enough of an identity check: any App may post a check run with
@@ -106,8 +103,9 @@ GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 # directory's subtree; a `filters:` entry covers the paths its regex matches,
 # relative to the OWNERS file's directory; `no_parent_owners` stops the walk
 # once a file has matched something at that level. `OWNERS_ALIASES` expands
-# names in either list. Root OWNERS approvers and `hack/OWNERS`'s eval-crew
-# filter are the two shapes this repository has today.
+# names in either list. This repository has three shapes today: root OWNERS
+# approvers, `hack/OWNERS`'s eval-crew filter, and `k8s-api-proxy/OWNERS`, a
+# plain nested list that adds to the root's.
 OWNERS_FILENAME = "OWNERS"
 OWNERS_ALIASES_FILENAME = "OWNERS_ALIASES"
 DEFAULT_OWNERS_ROOT = "."
@@ -183,10 +181,6 @@ UNSUPPORTED_CONFIG = {
 # Glob syntax minimatch accepts and `glob_to_regex` does not translate. `!` is
 # only special leading the pattern; the rest are special anywhere.
 UNSUPPORTED_GLOB_CHARS = "{}[]()|\\"
-
-
-def log(message):
-    print(message, file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------- #

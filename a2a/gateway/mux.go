@@ -222,6 +222,21 @@ func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// PostTerminal goes to the backend that owns the conversation
+// (TerminalPoster); one that does not implement it answers
+// errNoTerminalFrames, which the caller treats as nothing to do.
+func (m *MultiAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	poster, ok := a.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
 // ShowsTaskStatus answers for the backend that owns the conversation
 // (StatusShower); one that does not implement it keeps the rolling line.
 func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
@@ -284,10 +299,28 @@ func (m *MultiAdapter) CancelPublished(conversation, taskID string) {
 	}
 }
 
+func (m *MultiAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(HomeSink); ok {
+			sink.SetHome(admits, board)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {
 			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to every backend
+// that draws rating controls (FeedbackSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(FeedbackSink); ok {
+			sink.SetFeedbackRecorder(r)
 		}
 	}
 }

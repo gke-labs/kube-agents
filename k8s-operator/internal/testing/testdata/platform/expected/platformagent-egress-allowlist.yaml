@@ -18,6 +18,24 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-agent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -109,6 +127,40 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - applications
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kustomize.toolkit.fluxcd.io
+    resources:
+      - kustomizations
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - source.toolkit.fluxcd.io
+    resources:
+      - gitrepositories
+      - ocirepositories
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - configsync.gke.io
+    resources:
+      - rootsyncs
+      - reposyncs
+    verbs:
+      - get
+      - list
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -128,6 +180,9 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
+    namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
     namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -185,6 +240,9 @@ subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
     namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -240,7 +298,7 @@ roleRef:
   name: kubeagents:leader:kubeagents-system:platformagent
 subjects:
   - kind: ServiceAccount
-    name: kubeagents-platform-agent
+    name: platformagent-gateway-agent
     namespace: kubeagents-system
 ---
 apiVersion: v1
@@ -265,7 +323,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 50Gi
 status: {}
 ---
 apiVersion: v1
@@ -342,6 +400,12 @@ data:
     KUBEAGENTS_MODE=today
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
+    GKE_PROJECT_ID=example-project
+    STALL_WATCH_EXCLUDE_NAMESPACES=
+    STALL_WATCH_MIN_AGE_MINUTES=
+    STALL_WATCH_KINDS=
+    PUBSUB_RELAY_URL=
+    PUBSUB_RELAY_PROJECT=example-project
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
@@ -771,7 +835,8 @@ spec:
             name: platformagent-settings
             optional: true
           name: settings
-        - emptyDir: {}
+        - emptyDir:
+            sizeLimit: 1Mi
           name: hermes-sync-block
         - name: credential-proxy-token
           projected:
@@ -794,7 +859,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 10Gi
+            storage: 50Gi
       status: {}
     - metadata:
         name: sshd
@@ -1034,7 +1099,7 @@ spec:
             - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
@@ -1345,6 +1410,9 @@ spec:
               value: /var/run/secrets/kubeagents/credential-proxy/token
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
+            - name: PUBSUB_RELAY_URL
+            - name: PUBSUB_RELAY_PROJECT
+              value: example-project
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH
@@ -1589,9 +1657,11 @@ spec:
           resources:
             limits:
               cpu: 100m
+              ephemeral-storage: 65Mi
               memory: 64Mi
             requests:
               cpu: 10m
+              ephemeral-storage: 65Mi
               memory: 16Mi
           securityContext:
             allowPrivilegeEscalation: false
@@ -1703,7 +1773,8 @@ spec:
         runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
-      serviceAccountName: kubeagents-platform-agent
+      serviceAccountName: platformagent-gateway-agent
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:
@@ -1733,7 +1804,8 @@ spec:
             defaultMode: 420
             name: platformagent-fluent-bit-config
           name: fluent-bit-config
-        - emptyDir: {}
+        - emptyDir:
+            sizeLimit: 128Mi
           name: fluent-bit-state
         - name: system-metadata
           persistentVolumeClaim:
@@ -1798,7 +1870,8 @@ spec:
                 path: id_ed25519
             optional: true
             secretName: platform-agent-secrets
-        - emptyDir: {}
+        - emptyDir:
+            sizeLimit: 1Mi
           name: sandbox-ssh
 status: {}
 ---
@@ -2017,20 +2090,6 @@ spec:
             cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
-    - ports:
-        - port: 80
-          protocol: TCP
-      to:
-        - ipBlock:
-            cidr: 169.254.169.254/32
-    - ports:
-        - port: 988
-          protocol: TCP
-      to:
-        - ipBlock:
-            cidr: 169.254.169.252/32
-        - ipBlock:
-            cidr: 169.254.169.254/32
     - ports:
         - port: 80
           protocol: TCP

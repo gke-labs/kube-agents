@@ -84,15 +84,22 @@ type InboundMessage struct {
 	// sender's such message is dropped without the public refusal notice,
 	// since they asked the bot nothing. False on every other path.
 	Unaddressed bool
+	// Shortcut marks a message a member sent by using the "ask about this"
+	// message shortcut on someone's message: the conversation is the thread
+	// under that message, MessageID names it, and Text quotes it. A sender
+	// the gateway cannot verify gets no refusal in that thread, which the
+	// channel reads; the adapter tells them privately. False on every other
+	// path, and on every backend but Slack.
+	Shortcut bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
-// task. The chat backends have no way to express it -- a human types "stop"
-// and the text matcher reads it -- but a program should not have to spell a
-// phrase to reach a control path, and a phrase that changes meaning is a
-// class of bug an API does not have. The inject door has an explicit route
-// for it, and it lands on the bus as kind: cancel exactly as the text route
-// does.
+// task. A chat message cannot express it -- a human types "stop" and the
+// text matcher reads it -- but a program should not have to spell a phrase
+// to reach a control path, and a phrase that changes meaning is a class of
+// bug an API does not have. The inject door has an explicit route for it,
+// Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
+// as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:
@@ -121,7 +128,8 @@ type Adapter interface {
 	// a backend that cannot hold this one, or whose API refuses it, returns
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
-	// With m.Chat nil it is Post(conversation, m.Text).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go).
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
@@ -210,6 +218,11 @@ type OutMessage struct {
 	// already read and validated for its carrier (chatmsg.Read); an adapter
 	// renders it or declines it, and never repairs one.
 	Chat *chatmsg.Message
+	// Feedback, when set, is the task id an answer can be rated under: the
+	// root of the chain whose final answer this message is (answer
+	// feedback, feedback.go). A backend that draws rating controls draws
+	// them on this message; every other backend ignores it.
+	Feedback string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message
@@ -305,7 +318,9 @@ type TaskObserver interface {
 	// CancelPublished says a kind:cancel envelope for taskID is on the
 	// task's `in` subject. Called after the publish returns, on both cancel
 	// routes (the active task's and a named task the conversation no longer
-	// holds).
+	// holds), and for the card-stop control a stop sends (cardstop.go), with
+	// the control's id: that stop reached the bus too, whether or not a task
+	// was running to cancel.
 	//
 	// Signalled on success only, like TaskAccepted, and read against the end
 	// of the turn: the gateway's answer to a cancel it did not publish is a

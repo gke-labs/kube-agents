@@ -21,6 +21,12 @@ patched ``block_task`` and tool handlers, with real worker processes:
   ``kanban_block``) gets the same answer without opening the board, even
   with the card put back as if the run were current.
 
+- a parent linked onto a running card mid-run gets the card's
+  ``kanban_complete`` a plain answer that it now waits on that parent, not
+  upstream's "stale run"; the worker's dependency block then goes through,
+  the card is ready again once the parent is done, and its worker context
+  then opens with the result the first run saved (#3252).
+
 Before the patch the blocked card's worker keeps running, and its
 ``kanban_complete`` is told "If the prior run already did the work, verify it
 and report the result via kanban_complete".
@@ -197,6 +203,43 @@ try:
     check("the board's refusal says the run is over", "no longer yours to finish" in err, err)
     check("and none of the earlier run's failure", "protocol violation" not in err, err)
     kt._kanban_refuse_ended_run = gate
+    ker._LATCHED = None
+
+    print("a parent linked onto a running card mid-run (#3252):")
+    linked = tool_create("Check web-7 logs")
+    linked_run, _ = start_run(linked)
+    gate_parent = tool_create("Rotate the web-7 credentials first")
+    as_operator()
+    K.link_tasks(conn, gate_parent, linked)
+    linked_row = tuple(conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (linked,)).fetchone())
+    check("the linked card is still running on its run", linked_row == ("running", linked_run), str(linked_row))
+    as_worker(linked, linked_run)
+    out = json.loads(kt._handle_complete({"summary": "done", "result": "web-7 is fine."}))
+    err = out.get("error", "")
+    check("kanban_complete is refused saying the card now waits on its new parent",
+          f"now waits on {gate_parent}" in err and "kanban_comment" in err, err)
+    check("not with upstream's stale-run reason", "stale run" not in err, err)
+    check("the refusal names a dependency block as the exit", 'kanban_block(kind="dependency")' in err, err)
+    # The dispatcher runs the card's worker under its assignee's profile,
+    # which kanban_comment records as the author.
+    os.environ["HERMES_PROFILE"] = "platform"
+    saved = json.loads(kt._handle_comment({"task_id": linked, "body": ker.SAVED_RESULT_LEAD + "\nweb-7 is fine: no errors in the last hour"}))
+    os.environ.pop("HERMES_PROFILE", None)
+    check("the worker saves its result as a comment", saved.get("ok"), str(saved))
+    blocked = json.loads(kt._handle_block({"reason": f"waits on {gate_parent}", "kind": "dependency"}))
+    check("the worker's dependency block goes through", blocked.get("ok"), str(blocked))
+    check("and the card waits in todo, not counted as a failure", status(linked) == "todo", status(linked))
+    as_operator()
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (gate_parent,))
+    conn.commit()
+    K.recompute_ready(conn)
+    check("once the parent is done the card is ready again", status(linked) == "ready", status(linked))
+    context = K.build_worker_context(conn, linked)
+    check("the re-run's worker context opens with the saved result",
+          context.startswith(ker.SAVED_RESULT_HEADING) and ker.banner_text([gate_parent]) in context
+          and "> web-7 is fine: no errors in the last hour" in context, context[:400])
+    plain = K.build_worker_context(conn, own)
+    check("a card with no saved result reads as before", "Saved result from a previous run" not in plain, plain[:200])
     ker._LATCHED = None
 
     print("the stopped run's handoffs:")

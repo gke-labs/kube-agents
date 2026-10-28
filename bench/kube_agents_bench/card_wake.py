@@ -1,9 +1,8 @@
-"""Replay the wake a blocked, failed or retried card sends the front door.
+"""Replay the wake a card blocked on a question sends the front door.
 
 The front door's reply to a card's wake is a turn the harness's own asks never
-reach. Two replays produce one. A prompt whose first line is
-:data:`QUESTION_DIRECTIVE` or :data:`FAILURE_DIRECTIVE` is a replay instead of
-an ask; :func:`parse` reads it.
+reach. A prompt whose first line is :data:`QUESTION_DIRECTIVE` is a replay
+instead of an ask; :func:`parse` reads it.
 
 **A specialist's Slack question.** A card that blocks on ``needs_input`` wakes
 the conversation that filed it, and the front door's reply follows
@@ -20,28 +19,13 @@ from the harness. The API server never subscribes a card the way a Slack
 thread does, and on an install with no Slack adapter the notifier skips a
 Slack subscription before it builds any text.
 
-For :data:`QUESTION_DIRECTIVE`, the in-pod script files a card on the agent's
-board and blocks it on ``needs_input`` with the case's question, posts the
-question through ``needs_you`` with a stub Slack client where the image has
-that module, and builds the wake with the image's own notifier. An image that
-has the module but posts nothing is broken, not red. The harness then sends
-that wake as the first turn and the case's answer (typed, or with
-``answer_by: click`` the click's turn) as the second, on one conversation (:meth:`KubeAgentsHarness._execute_card_wake`).
-
-**A card that blocked or gave up.** On the API server a ``blocked`` or
-``gave_up`` card wakes the conversation that filed it through the notifier's
-self-post (``deploy/docker/patches/kanban_notifier.py``, ``wake_kinds_for``: a
-non-push adapter always wakes for the failure kinds), and the reply to that
-wake is the user's only announcement of the failure (``agents/chat/SOUL.md``
-§2, step 5). The harness never reads it: its own poll turns ask for a status
-recital, and no prompt makes a specialist fail every time. For
-:data:`FAILURE_DIRECTIVE` the in-pod script files the card, blocks it with the case's reason (``outcome:
-blocked``) or trips its failure breaker with it as the error (``outcome:
-gave_up``, the event the dispatcher records when its retries run out), and
-builds the wake with the image's notifier through a non-push stub adapter, as
-the API server's is. The harness sends that wake as the run's only turn. The
-wake names the card but not the reason, so the front door reads the card
-(``kanban_show``) as it would in a real thread.
+The in-pod script files a card on the agent's board and blocks it on
+``needs_input`` with the case's question, posts the question through
+``needs_you`` with a stub Slack client where the image has that module, and
+builds the wake with the image's own notifier. An image that has the module
+but posts nothing is broken, not red. The harness then sends that wake as the
+first turn and the case's answer (typed, or with ``answer_by: click`` the
+click's turn) as the second, on one conversation (:meth:`KubeAgentsHarness._execute_card_wake`).
 
 **A typed answer in a session the wake never reached.** A question prompt
 with ``session: fresh`` sends the answer on a new conversation instead, as
@@ -72,41 +56,15 @@ without that button, is broken, not red. The answer turn's reply rides on the
 trajectory's :data:`SETTLED_ENTRY` (``args.answer_reply``), so
 ``reply_is_silent`` can grade it as well as the wake's.
 
-**A worker that crashed or timed out.** The dispatcher retries a ``crashed``
-or ``timed_out`` card until its failure breaker trips
-(``hermes_cli/kanban_db_dispatch.py``, ``_record_task_failure``:
-``DEFAULT_FAILURE_LIMIT`` consecutive failures, or the card's own
-``max_retries``). Below the limit the card goes back to ``ready`` and the
-event wakes the front door alone (``outcome: crashed`` or ``timed_out``). On
-the attempt that trips it, the dispatcher appends ``gave_up`` straight after
-the ``crashed`` or ``timed_out`` event and parks the card in ``blocked``, so
-one wake carries both (``outcome: crashed_final`` or ``timed_out_final``) and
-its status names both: gave up, and that the dispatcher will retry. The plant
-records each attempt as the dispatcher does, the event and then
-``_record_task_failure``, which counts it and trips on its own: one attempt
-for a retry, and as many as the image's ``DEFAULT_FAILURE_LIMIT`` for a final
-one. The card is assigned to
-:data:`WORKER_ASSIGNEE` before it fails, a profile no install has, so a
-retrying card left ``ready`` never starts a worker.
-
-A final attempt's wake can arrive in two halves, which neither replay
-reproduces: the dispatcher appends the ``crashed`` or ``timed_out`` event and
-the breaker's ``gave_up`` in separate transactions, so the notifier can claim
-the first alone and wake with "dispatcher will retry", then wake again with
-``gave_up``. The plant always delivers both in one wake.
-
-What neither replay reproduces: the turns arrive on the run's own
+What the replay does not reproduce: the turns arrive on the run's own
 ``/v1/responses`` conversation rather than the session that filed the card, so
-the front door has not seen the ask that led to it; for a question, the flag is
-set in the script's process whatever the install's setting and no message
-reaches Slack. The wake under test is the notifier's, built by the image's own
-code.
+the front door has not seen the ask that led to it; the flag is set in the
+script's process whatever the install's setting and no message reaches Slack.
+The wake under test is the notifier's, built by the image's own code.
 
-A question, blocked or gave_up card stays unassigned on the board, so
-unblocking it hands no worker anything; the notifier is given a copy naming
-:data:`WAKE_ASSIGNEE`, as a delegated card would carry, so the wake does not
-read ``@None``. A crashed or timed-out card is assigned to
-:data:`WORKER_ASSIGNEE`, and its wake names that.
+The card stays unassigned on the board, so unblocking it hands no worker
+anything; the notifier is given a copy naming :data:`WAKE_ASSIGNEE`, as a
+delegated card would carry, so the wake does not read ``@None``.
 
 Every replay's card carries a key minted for the run
 (:data:`REPLAY_KEY_PREFIX`, the card's ``idempotency_key``). :func:`archive`
@@ -122,16 +80,7 @@ Unlike :mod:`kube_agents_bench.board`, a failed plant is not best effort: a
 run that never saw the wake grades nothing. :func:`plant` raises
 :class:`ReplayUnavailable`, which the harness records as infrastructure, when
 the script never ran to completion, and :class:`ReplayBroken`, which it
-records as an error, when the script ran in the image and failed there. A
-breaker that disagrees with the outcome (a retry that trips it, a final
-attempt that does not) is an error too: the image's dispatcher no longer
-retries the way the case asserts, so :func:`plant` raises
-:class:`ReplayMismatch` and the harness records an errored run rather than an
-infrastructure one, which the gate excludes. An errored run has no trajectory
-and a null token count, so a single repetition of it stops at one of the
-gate's absolute rungs (a check that did not run, or "not evidence of a real
-agent run"): an absolute red, admitted case or not. The printed reason names
-the rung, not the mismatch; the run's error names the mismatch.
+records as an error, when the script ran in the image and failed there.
 """
 
 from __future__ import annotations
@@ -147,14 +96,11 @@ from devops_bench.agents import AgentResult
 from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
 __all__ = [
-    "FAILURE_DIRECTIVE",
     "QUESTION_DIRECTIVE",
     "SETTLED_ENTRY",
-    "Failure",
     "Planted",
     "Replay",
     "ReplayBroken",
-    "ReplayMismatch",
     "ReplayUnavailable",
     "Settled",
     "archive",
@@ -166,12 +112,11 @@ __all__ = [
     "thread_messages",
 ]
 
-# First lines of the two replay prompts. The ``key: value`` lines under each
-# are its fields (:data:`_QUESTION_FIELDS` with the optional
-# :data:`SESSION_FIELD` and :data:`ANSWER_BY_FIELD`, :data:`_FAILURE_FIELDS`);
-# blank lines are skipped, and any other line is an authoring error.
+# First line of a replay prompt. The ``key: value`` lines under it are its
+# fields (:data:`_QUESTION_FIELDS` with the optional :data:`SESSION_FIELD`
+# and :data:`ANSWER_BY_FIELD`); blank lines are skipped, and any other line
+# is an authoring error.
 QUESTION_DIRECTIVE = "[bench:slack-question-wake]"
-FAILURE_DIRECTIVE = "[bench:card-failure-wake]"
 _QUESTION_FIELDS = ("title", "question", "options", "answer")
 # Optional for a question replay: ``session: fresh`` sends the answer on a new
 # conversation that starts from the thread's context.
@@ -181,32 +126,12 @@ SESSION_FRESH = "fresh"
 # click on its button rather than as typed text.
 ANSWER_BY_FIELD = "answer_by"
 ANSWER_BY_CLICK = "click"
-_FAILURE_FIELDS = ("title", "body", "outcome", "reason")
 OPTION_SEPARATOR = "|"
 
 # The name of the harness trajectory entry carrying the card as the run left
 # it: ``args.card`` is the card, ``result`` is ``Settled.as_metadata()`` or
 # ``None`` when the card could not be read.
 SETTLED_ENTRY = "card_wake_settled"
-
-# How the plant script ends the card. ``question`` is a ``needs_input`` block;
-# the failure outcomes are a failure prompt's ``outcome:`` values.
-OUTCOME_QUESTION = "question"
-OUTCOME_BLOCKED = "blocked"
-OUTCOME_GAVE_UP = "gave_up"
-# A worker's crash or timeout the dispatcher will retry, and the same on the
-# attempt that trips its failure breaker.
-OUTCOME_CRASHED = "crashed"
-OUTCOME_TIMED_OUT = "timed_out"
-OUTCOME_CRASHED_FINAL = "crashed_final"
-OUTCOME_TIMED_OUT_FINAL = "timed_out_final"
-WORKER_OUTCOMES = (
-    OUTCOME_CRASHED,
-    OUTCOME_TIMED_OUT,
-    OUTCOME_CRASHED_FINAL,
-    OUTCOME_TIMED_OUT_FINAL,
-)
-FAILURE_OUTCOMES = (OUTCOME_BLOCKED, OUTCOME_GAVE_UP, *WORKER_OUTCOMES)
 
 # Line the in-pod scripts print before their JSON. A reply without it means
 # the script never ran to completion.
@@ -234,10 +159,6 @@ FLAG_ON = "1"
 # thread a question is posted in. Slack never sees the thread.
 CARD_CREATOR = "devops-bench"
 WAKE_ASSIGNEE = "platform"
-# Who a crashed or timed-out card says was working it: shaped like a
-# scaffolded cluster agent's profile (cluster_agent_profile.py, profile_name)
-# but never scaffolded, so the dispatcher never takes a card assigned to it.
-WORKER_ASSIGNEE = "cluster-bench-project-bench-sandbox-us-central1"
 STUB_CHANNEL = "C0BENCHWAKE"
 STUB_THREAD = "1700000000.000100"
 # The fresh-session thread: the user who asked and answers, and the bot that
@@ -252,37 +173,28 @@ ASK_MESSAGE_ID = "bench-ask"
 
 # Runs inside the agent container. Positional arguments: the sentinel, the
 # hermes root, the scripts directory, the flag, its on value, the creator,
-# the stub channel, the stub thread, the card title, its body, the block
-# reason or failure error, the outcome, the wake's assignee, the run's key,
+# the stub channel, the stub thread, the card title, the block reason (also
+# the card's body), the wake's assignee, the run's key,
 # the decoy's key (empty for no decoy), the label of the button an answer
 # by click presses (empty for a typed answer), the replay key prefix and the
 # stale age. Before filing, it archives other runs' replay cards older than the
 # stale age, which an archive whose exec failed left on the board; that sweep
 # failing does not stop the plant. The cards are archived again if anything
-# after filing them fails. The worker pid, elapsed time and runtime limit in
-# a crash or timeout's payload are made up; only the front door reads them.
+# after filing them fails.
 _PLANT_SCRIPT = r"""
 import asyncio, dataclasses, json, os, sys, time
 
 (SENTINEL, HERMES_ROOT, SCRIPTS, FLAG, ON, CREATOR,
- CHANNEL, THREAD, TITLE, BODY, REASON, OUTCOME, ASSIGNEE, KEY, DECOY_KEY, CLICK, PREFIX,
- STALE) = sys.argv[1:19]
+ CHANNEL, THREAD, TITLE, REASON, ASSIGNEE, KEY, DECOY_KEY, CLICK, PREFIX,
+ STALE) = sys.argv[1:17]
 STUB_TS = "1700000000.000200"
-STUB_PID = 4242
-STUB_ELAPSED, STUB_LIMIT = 1830, 1800
-# A final attempt's wake: its own crashed or timed_out event, then gave_up.
-FINAL_BATCH = 2
 # The decoy lists first (kanban_list sorts by priority, then created_at) and
 # the planted card is backdated so the decoy is the newer: created_at is
 # whole seconds, and two cards filed together would otherwise tie.
 DECOY_PRIORITY = 1
 CARD_BACKDATE_SECONDS = 60
 out = {"card": None, "decoy": None, "wake": None, "posted": 0, "post": None, "click": None,
-       "error": None, "mismatch": None, "swept": []}
-
-
-class BreakerMismatch(RuntimeError):
-    pass
+       "error": None, "swept": []}
 
 
 class _Client:
@@ -303,14 +215,6 @@ class _Adapter:
 
     def _get_client(self, chat_id, team_id=None):
         return _Client(self.posts)
-
-
-class _ApiServerAdapter:
-    # The API server's adapter has no push channel: its wake is a self-post.
-    supports_async_delivery = False
-
-    def __init__(self):
-        self.posts = []
 
 
 conn = None
@@ -336,100 +240,51 @@ try:
         out["swept"] = [old for old in stale if kb.archive_task(conn, old)]
     except Exception as exc:
         out["sweep_error"] = "%s: %s" % (type(exc).__name__, exc)
-    gave_up = OUTCOME == "gave_up"
-    card = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR, idempotency_key=KEY)
+    card = kb.create_task(conn, title=TITLE, body=REASON, created_by=CREATOR, idempotency_key=KEY)
     out["card"] = card
-    batch = 1
-    if OUTCOME in ("crashed", "timed_out", "crashed_final", "timed_out_final"):
-        from hermes_cli import kanban_db_dispatch as dispatch
-        trigger, final = OUTCOME.replace("_final", ""), OUTCOME.endswith("_final")
-        # Assigned before it fails, as a real card is: the profile does not
-        # exist, so no dispatcher ever takes it.
-        if not kb.assign_task(conn, card, ASSIGNEE):
-            raise RuntimeError("card %s would not take assignee %s" % (card, ASSIGNEE))
-        # The payloads detect_crashed_workers and enforce_max_runtime write.
-        if trigger == "crashed":
-            payload = {"pid": STUB_PID, "claimer": None, "retry_status": "ready"}
-            extra = {"pid": STUB_PID, "claimer": None}
-        else:
-            payload = {"pid": STUB_PID, "elapsed_seconds": STUB_ELAPSED, "limit_seconds": STUB_LIMIT,
-                       "sigkill": False, "retry_status": "ready"}
-            extra = {"pid": STUB_PID, "sigkill": False, "retry_status": "ready"}
-        # Each attempt as the dispatcher records it: the event, then the
-        # breaker's count, which appends gave_up when it trips. A final
-        # attempt is the one that reaches the image's own limit.
-        for _attempt in range(dispatch.DEFAULT_FAILURE_LIMIT if final else 1):
-            with kb.write_txn(conn):
-                kb._append_event(conn, card, trigger, payload)
-            tripped = dispatch._record_task_failure(conn, card, REASON, outcome=trigger,
-                                                    event_payload_extra=extra)
-        if tripped != final:
-            raise BreakerMismatch("card %s %s its failure breaker"
-                                  % (card, "tripped" if tripped else "did not trip"))
-        kind = "gave_up" if final else trigger
-        # The notifier claims every event since its cursor, so a final
-        # attempt's crash or timeout reaches the wake with the gave_up after it.
-        batch = FINAL_BATCH if final else 1
-    elif gave_up:
-        from hermes_cli import kanban_db_dispatch as dispatch
-        # force_trip records gave_up and parks the card on its first failure,
-        # where the dispatcher would after exhausting its retries.
-        if not dispatch._record_task_failure(conn, card, REASON, outcome="crashed", force_trip=True):
-            raise RuntimeError("card %s would not give up" % card)
-        kind = "gave_up"
-    else:
-        block_kind = "needs_input" if OUTCOME == "question" else None
-        if not kb.block_task(conn, card, reason=REASON, kind=block_kind):
-            raise RuntimeError("card %s would not block" % card)
-        kind = "blocked"
-    events = [e for e in kb.list_events(conn, card) if e.kind != "assigned"][-batch:]
-    if not events or events[-1].kind != kind:
-        raise RuntimeError("card %s has no %s event" % (card, kind))
-    if OUTCOME == "question":
-        sub = {"task_id": card, "platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD,
-               "delivery_mode": "notify+wake"}
-        adapter = _Adapter()
-        if moments is not None:
-            asyncio.run(moments.needs_you(adapter, sub, events[0].payload or {}, events[0].id))
-            if not adapter.posts:
-                raise RuntimeError("the image has slack_ux_moments but it posted nothing for card %s" % card)
-        if CLICK:
-            if moments is None:
-                raise RuntimeError("an answer by click needs gateway/slack_ux_moments.py in the image")
-            from gateway import slack_ux_clicks as clicks
-            post = adapter.posts[0]
-            # A question beside a side bar keeps its buttons in the attachment.
-            blocks = clicks._presenter.message_blocks(post)
-            shown = [e for b in blocks if b.get("type") == "actions" for e in b.get("elements") or []]
-            if not shown:
-                # Usually the case's fault: slack_moments shows 2 to 5 short options after a
-                # question as buttons, unless it only asks whether to go on.
-                raise RuntimeError("the question for card %s shows no buttons; its options are not ones "
-                                   "slack_moments renders as buttons, so the case cannot click" % card)
-            # The option as its button shows it: a link's label, without code or bold markup.
-            render = moments._moments
-            label = render._unmarked(render._presenter.MD_LINK.sub(r"\1", CLICK)) if render else CLICK
-            buttons = [e for e in shown if clicks._shown_text(e) == label]
-            if not buttons:
-                raise RuntimeError("the question for card %s has no %r button" % (card, label))
-            message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": post.get("blocks") or [],
-                       "attachments": post.get("attachments") or []}
-            turn = clicks._turn(label, buttons[0].get("value"), message)
-            out["click"] = clicks._turn_text(turn, moments.question_card(CHANNEL, STUB_TS) or "")
-    else:
-        sub = {"task_id": card, "platform": "api_server", "chat_id": CHANNEL, "thread_id": "",
-               "delivery_mode": "notify+wake"}
-        adapter = _ApiServerAdapter()
-    # A blocked, question or gave_up card stays unassigned on the board, so an
-    # unblock hands no worker anything; a crashed or timed-out one carries a
-    # profile no dispatcher takes. The notifier's copy names the assignee a
-    # delegated card carries.
+    if not kb.block_task(conn, card, reason=REASON, kind="needs_input"):
+        raise RuntimeError("card %s would not block" % card)
+    events = kb.list_events(conn, card)[-1:]
+    if not events or events[-1].kind != "blocked":
+        raise RuntimeError("card %s has no blocked event" % card)
+    sub = {"task_id": card, "platform": "slack", "chat_id": CHANNEL, "thread_id": THREAD,
+           "delivery_mode": "notify+wake"}
+    adapter = _Adapter()
+    if moments is not None:
+        asyncio.run(moments.needs_you(adapter, sub, events[0].payload or {}, events[0].id))
+        if not adapter.posts:
+            raise RuntimeError("the image has slack_ux_moments but it posted nothing for card %s" % card)
+    if CLICK:
+        if moments is None:
+            raise RuntimeError("an answer by click needs gateway/slack_ux_moments.py in the image")
+        from gateway import slack_ux_clicks as clicks
+        post = adapter.posts[0]
+        # A question beside a side bar keeps its buttons in the attachment.
+        blocks = clicks._presenter.message_blocks(post)
+        shown = [e for b in blocks if b.get("type") == "actions" for e in b.get("elements") or []]
+        if not shown:
+            # Usually the case's fault: slack_moments shows 2 to 5 short options after a
+            # question as buttons, unless it only asks whether to go on.
+            raise RuntimeError("the question for card %s shows no buttons; its options are not ones "
+                               "slack_moments renders as buttons, so the case cannot click" % card)
+        # The option as its button shows it: a link's label, without code or bold markup.
+        render = moments._moments
+        label = render._unmarked(render._presenter.MD_LINK.sub(r"\1", CLICK)) if render else CLICK
+        buttons = [e for e in shown if clicks._shown_text(e) == label]
+        if not buttons:
+            raise RuntimeError("the question for card %s has no %r button" % (card, label))
+        message = {"ts": STUB_TS, "text": post.get("text") or "", "blocks": post.get("blocks") or [],
+                   "attachments": post.get("attachments") or []}
+        turn = clicks._turn(label, buttons[0].get("value"), message)
+        out["click"] = clicks._turn_text(turn, moments.question_card(CHANNEL, STUB_TS) or "")
+    # The card stays unassigned on the board, so an unblock hands no worker
+    # anything. The notifier's copy names the assignee a delegated card carries.
     task = dataclasses.replace(kb.get_task(conn, card), assignee=ASSIGNEE)
     wake = notifier._KanbanNotification(
         None, {"sub": sub, "task": task, "board": kb.DEFAULT_BOARD, "events": events},
         platform_cls=None, sub_fail_counts={})
     wake.adapter = adapter
-    wake.is_push_adapter = OUTCOME == "question"
+    wake.is_push_adapter = True
     for ev in events:
         wake.format_event(ev)
     wake.build_wake_text()
@@ -440,7 +295,7 @@ try:
         out["post"] = {key: adapter.posts[0].get(key) or default for key, default in (("text", ""), ("blocks", []), ("attachments", []))}
     if DECOY_KEY:
         # Filed after the planted card, so it is the newer of two cards blocked on one question.
-        decoy = kb.create_task(conn, title=TITLE, body=BODY, created_by=CREATOR,
+        decoy = kb.create_task(conn, title=TITLE, body=REASON, created_by=CREATOR,
                                priority=DECOY_PRIORITY, idempotency_key=DECOY_KEY)
         out["decoy"] = decoy
         if not kb.block_task(conn, decoy, reason=REASON, kind="needs_input"):
@@ -448,7 +303,7 @@ try:
         conn.execute("UPDATE tasks SET created_at = created_at - ? WHERE id = ?",
                      (CARD_BACKDATE_SECONDS, card))
 except Exception as exc:
-    out["mismatch" if isinstance(exc, BreakerMismatch) else "error"] = "%s: %s" % (type(exc).__name__, exc)
+    out["error"] = "%s: %s" % (type(exc).__name__, exc)
     for filed in (out["card"], out["decoy"]):
         if conn is not None and filed:
             try:
@@ -567,10 +422,6 @@ class ReplayBroken(RuntimeError):
     """The plant script ran in the image and failed there: the image's fault or the case's, not the cluster's."""
 
 
-class ReplayMismatch(RuntimeError):
-    """The image's failure breaker disagrees with the replay's outcome."""
-
-
 @dataclass(frozen=True)
 class Replay:
     """A replay prompt's fields: the card, its question and the user's answer."""
@@ -586,16 +437,6 @@ class Replay:
     def reason(self) -> str:
         """The block reason as a specialist writes it: the question, then a ``- `` line per choice."""
         return "\n".join([self.question, *(f"- {option}" for option in self.options)])
-
-
-@dataclass(frozen=True)
-class Failure:
-    """A failure prompt's fields: the card, its body, how it ended and why."""
-
-    title: str
-    body: str
-    outcome: str
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -654,26 +495,16 @@ def _fields(lines: list[str], names: tuple[str, ...]) -> dict[str, str]:
     return fields
 
 
-def parse(prompt: str) -> Replay | Failure | None:
+def parse(prompt: str) -> Replay | None:
     """The replay ``prompt`` asks for, or ``None`` when it is an ordinary ask.
 
     Raises :class:`ValueError` for a replay prompt missing a field, carrying
-    a line that is not one, naming an unknown outcome, or giving ``session``
+    a line that is not one, or giving ``session``
     or ``answer_by`` any value but its one: that is a case authoring error,
     not a run.
     """
     lines = prompt.strip().splitlines()
     directive = lines[0].strip() if lines else ""
-    if directive == FAILURE_DIRECTIVE:
-        fields = _fields(lines[1:], _FAILURE_FIELDS)
-        missing = [f for f in _FAILURE_FIELDS if not fields.get(f)]
-        if missing:
-            raise ValueError(f"{directive} prompt is missing {', '.join(missing)}")
-        if fields["outcome"] not in FAILURE_OUTCOMES:
-            raise ValueError(
-                f"{directive} outcome {fields['outcome']!r} is not one of {', '.join(FAILURE_OUTCOMES)}"
-            )
-        return Failure(fields["title"], fields["body"], fields["outcome"], fields["reason"])
     if directive != QUESTION_DIRECTIVE:
         return None
     fields = _fields(lines[1:], (*_QUESTION_FIELDS, SESSION_FIELD, ANSWER_BY_FIELD))
@@ -714,13 +545,8 @@ def decoy_key(key: str) -> str:
     return key + DECOY_KEY_SUFFIX
 
 
-def plant_command(replay: Replay | Failure, key: str) -> str:
-    """The ``sh -c`` line that files, parks and wakes the replay's card in the pod."""
-    if isinstance(replay, Failure):
-        body, outcome = replay.body, replay.outcome
-        assignee = WORKER_ASSIGNEE if outcome in WORKER_OUTCOMES else WAKE_ASSIGNEE
-    else:
-        body, outcome, assignee = replay.reason, OUTCOME_QUESTION, WAKE_ASSIGNEE
+def plant_command(replay: Replay, key: str) -> str:
+    """The ``sh -c`` line that files, blocks and wakes the replay's card in the pod."""
     return _command(
         _PLANT_SCRIPT,
         [
@@ -733,13 +559,11 @@ def plant_command(replay: Replay | Failure, key: str) -> str:
             STUB_CHANNEL,
             STUB_THREAD,
             replay.title,
-            body,
             replay.reason,
-            outcome,
-            assignee,
+            WAKE_ASSIGNEE,
             key,
-            decoy_key(key) if isinstance(replay, Replay) and replay.fresh else "",
-            replay.answer if isinstance(replay, Replay) and replay.clicked else "",
+            decoy_key(key) if replay.fresh else "",
+            replay.answer if replay.clicked else "",
             REPLAY_KEY_PREFIX,
             str(STALE_REPLAY_SECONDS),
         ],
@@ -814,30 +638,25 @@ def _reply(text: str, what: str) -> dict:
         raise ReplayBroken(f"{what}: reply is not JSON ({exc})") from exc
     if not isinstance(payload, dict):
         raise ReplayBroken(f"{what}: reply is not an object")
-    if payload.get("mismatch"):
-        raise ReplayMismatch(f"{what}: {payload['mismatch']}")
     if payload.get("error"):
         raise ReplayBroken(f"{what}: {payload['error']}")
     return payload
 
 
-def plant(
-    shell: Callable[[str, float], str], replay: Replay | Failure, timeout: float, key: str | None = None
-) -> Planted:
-    """File the replay's card, park it, and return the wake the image builds for it.
+def plant(shell: Callable[[str, float], str], replay: Replay, timeout: float, key: str | None = None) -> Planted:
+    """File the replay's card, block it, and return the wake the image builds for it.
 
     ``shell`` is :func:`harness._agent_shell`; ``key`` defaults to
     :func:`new_key`. Raises :class:`ReplayUnavailable` when the script did not
     run to completion, after sweeping any card it filed before the
     ``kubectl exec`` gave out, :class:`ReplayBroken` when its reply is not
-    JSON, it reported an error, or it named no card or wake, and
-    :class:`ReplayMismatch` when the image's failure breaker disagreed with
-    the outcome. The script archives a card it filed before reporting an
+    JSON, it reported an error, or it named no card or wake. The script
+    archives a card it filed before reporting an
     error. An image with the moments module that posts nothing is one such
     error: it would build the plain wake and pass for a red run.
     """
     key = key or new_key()
-    what = "failure wake" if isinstance(replay, Failure) else "question wake"
+    what = "question wake"
     try:
         payload = _reply(shell(plant_command(replay, key), timeout), what)
     except ReplayUnavailable:
@@ -848,11 +667,11 @@ def plant(
         _sweep(shell, key, timeout)
         raise ReplayBroken(f"{what}: no card or no wake in {payload!r}")
     posted, post, decoy = payload.get("posted"), payload.get("post"), payload.get("decoy")
-    if isinstance(replay, Replay) and replay.fresh and not (isinstance(decoy, str) and decoy):
+    if replay.fresh and not (isinstance(decoy, str) and decoy):
         _sweep(shell, key, timeout)
         raise ReplayBroken(f"{what}: no decoy card in {payload!r}")
     click = payload.get("click")
-    if isinstance(replay, Replay) and replay.clicked and not (isinstance(click, str) and click.strip()):
+    if replay.clicked and not (isinstance(click, str) and click.strip()):
         _sweep(shell, key, timeout)
         raise ReplayBroken(f"{what}: no click turn in {payload!r}")
     return Planted(
@@ -1019,17 +838,14 @@ def merge(
     )
 
 
-def tag(
-    planted: Planted, wake: AgentResult, settled: Settled | None = None, key: str = "failure_wake"
-) -> AgentResult:
-    """A replay's one turn, with the card, its wake and ``settled`` kept in metadata under ``key``.
+def tag(planted: Planted, wake: AgentResult, settled: Settled | None = None) -> AgentResult:
+    """A replay whose wake turn errored with no reply (:func:`no_reply`), with the card,
+    its wake and ``settled`` kept in metadata under ``question_wake``.
 
-    The failure replay's turn, or a question replay's whose wake errored with
-    no reply (:func:`no_reply`, ``key="question_wake"``). The reply to the wake is already the run's
-    ``final_message``; the trajectory gains :data:`SETTLED_ENTRY` and nothing
-    else changes.
+    The reply to the wake is already the run's ``final_message``; the trajectory
+    gains :data:`SETTLED_ENTRY` and nothing else changes.
     """
-    metadata = {**wake.metadata, key: _card_metadata(planted, settled)}
+    metadata = {**wake.metadata, "question_wake": _card_metadata(planted, settled)}
     return AgentResult(
         output=wake.output,
         trajectory=[*wake.trajectory, _settled_entry(planted, settled)],

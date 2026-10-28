@@ -11,14 +11,15 @@ so the project's whole footprint is selectable in one query:
 
 ```bash
 kubectl get all,configmap,pvc,serviceaccount,secret -A \
-  -l app.kubernetes.io/part-of=kube-agents
+  -l 'app.kubernetes.io/part-of in (kube-agents,a2a-next)'
 ```
 
-One deliberate carve-out: controller output rendered under the unsupported `mode: next` dev
-toggle carries `part-of: a2a-next` instead, plus a `kubeagents.x-k8s.io/a2a-component` label,
-so the A2A stack is one query of its own
-(`-l app.kubernetes.io/part-of=a2a-next`) and the query above keeps meaning "the supported
-install" exactly.
+The set has two values by design. Controller output rendered under `mode: next`, a first
+install's default, carries `part-of: a2a-next` instead of `kube-agents`, plus a
+`kubeagents.x-k8s.io/a2a-component` label. So the A2A stack is one query of its own
+(`-l app.kubernetes.io/part-of=a2a-next`), and `-l app.kubernetes.io/part-of=kube-agents` keeps
+meaning the components every mode shares. On a `next` install, the second selector alone misses
+the bus, the callout, the verifier, the console and the gateway.
 
 ## The label contract
 
@@ -43,18 +44,19 @@ load-bearing rather than decorative: the Deployment and StatefulSet selectors, t
 that lets only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
 database are all built from them. Do not add `component` anywhere else on the strength of this.
 
-One more source exists in the tree but is dark by default: the a2a chatops gateway
+One more source stamps labels at runtime rather than at install: the a2a chatops gateway
 (`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
-`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns, and it spawns them only
-under `spec.mode: next`, where the operator renders `A2A_SPAWN_SESSIONS`. The values are
+`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns. It spawns them only
+under `spec.mode: next`, a first install's default, where the operator renders
+`A2A_SPAWN_SESSIONS`. The values are
 load-bearing the same way Hindsight's are, and for more consumers: the gateway's
 session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
 admits them to NATS by it, the operator's session egress policy selects them by it, and under the
 operator's `A2A_SESSION_CLUSTER_VIEW` flag the credential broker's ingress policy admits them by it — and a
 NetworkPolicy that selects nothing looks exactly like one that is
 working. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
-runtime rather than installed, so it stays out of the footprint query above and is reaped by its
-ownerReference to the gateway Deployment, not by uninstall.
+runtime rather than installed, so the `kube-agents` half of the footprint query above does not
+list it. It is reaped by its ownerReference to the gateway Deployment, not by uninstall.
 
 `version` is set only by the Helm chart, which fills it from `Chart.AppVersion` — a chart release
 is pinned to exactly one application release, so there is a correct value to write. See
@@ -113,17 +115,17 @@ install:
   kustomization — the only one here with a StatefulSet — therefore sets `includeTemplates: false`
   and patches the two pod templates directly instead.
 
-PersistentVolumeClaims are created once and never updated by the controller, so claims that
-existed before the upgrade stay unlabelled until they are recreated. They will not appear in the
-`-l app.kubernetes.io/part-of=kube-agents` query above. The constraint above means Hindsight's
-claim stays unlabelled permanently, not just until recreation.
+PersistentVolumeClaims are created once; afterwards the controller only grows the two data
+claims' size and never rewrites their labels, so claims that existed before the upgrade stay
+unlabelled until they are recreated. They will not appear in the `kube-agents` half of the
+footprint query above. The constraint above means Hindsight's claim stays unlabelled permanently,
+not just until recreation.
 
-Claims backed by a `volumeClaimTemplates` entry are permanently unlabelled for the same reason
-wherever they come from, not only under Kustomize: the template the operator renders for RWO
-storage sets a name and nothing else on its `metadata`, so an agent declaring RWO
-`spec.deployment.storages` gets claims the part-of query cannot reach either. Claims the controller
-creates directly — `<agent>-data`, `system-metadata`, and non-RWO custom storage — carry the common
-labels.
+Claims backed by a `volumeClaimTemplates` entry carry only what the template sets, wherever they
+come from, not only under Kustomize: the shell sandbox's data claim template sets a name and
+nothing else on its `metadata`, so that claim is permanently outside the part-of query. Claims the
+controller creates directly — `<agent>-data`, `system-metadata`, and `spec.deployment.storages`
+claims — carry the common labels.
 
 ## Query recipes
 
@@ -149,10 +151,12 @@ kubectl get all -A \
 ```
 
 Cluster-scoped RBAC the project owns — the objects most easily orphaned, since a namespaced
-PlatformAgent cannot own a cluster-scoped resource through an owner reference:
+PlatformAgent cannot own a cluster-scoped resource through an owner reference. Both `part-of`
+values again: under `mode: next` the auth callout's ClusterRoleBinding to `system:auth-delegator`
+carries `a2a-next`.
 
 ```bash
-kubectl get clusterrole,clusterrolebinding -l app.kubernetes.io/part-of=kube-agents
+kubectl get clusterrole,clusterrolebinding -l 'app.kubernetes.io/part-of in (kube-agents,a2a-next)'
 ```
 
 ## Where to go next

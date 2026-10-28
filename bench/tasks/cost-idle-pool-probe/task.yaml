@@ -49,9 +49,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: cost
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in
@@ -94,3 +91,9 @@ verification_spec:
       path: spec.taints[?(@.key=='seeded-role')].value
       op: eq
       value: idle-batch
+      # The pool can have more than one node, and without this a second node
+      # failed the check even when nothing changed (#4037). The taint must
+      # survive on every node: fleet_resource_property fails a matched node
+      # with no seeded-role taint left (#4038), where upstream's `every` would
+      # let it drop out.
+      across_matches: every

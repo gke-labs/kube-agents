@@ -147,10 +147,16 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
 
     def test_the_render_answer_honours_the_renders_own_exclusions(self):
         render = self.home / "scope.json"
-        render.write_text(json.dumps({"present": True, "projects": ["payments-prod", "team-sandbox"], "exclude": {"projects": ["*-sandbox"], "clusters": []}}), encoding="utf-8")
+        render.write_text(
+            json.dumps({"present": True, "projects": ["payments-prod", "team-sandbox"], "folders": ["123456789012"], "metricsScopes": ["ops-mon"],
+                        "exclude": {"projects": ["*-sandbox"], "clusters": []}}),
+            encoding="utf-8",
+        )
         with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
             targets = fst.declared_scope_targets(self.home)
             self.assertEqual(targets.unread, (("declared-scope", "unresolved"), ("payments-prod", "unresolved")))
+            self.assertEqual(targets.excluded, ("*-sandbox",))
+            self.assertEqual(targets.declared_containers, ("folders/123456789012", "metricsScopes/ops-mon"))
 
     def test_a_numeric_host_is_not_handed_on_by_the_render_answer(self):
         render = self.home / "scope.json"
@@ -176,6 +182,14 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
                                {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True))
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual((targets.projects, targets.unread), (("ops-mgmt", "payments-prod"), ()))
+        # The entries ride on the targets, so a reader that meets such a
+        # project under another name (a profile still on the volume) can tell
+        # it from one the declaration never named; the match is the reader's.
+        self.assertEqual(targets.excluded, ("*-sandbox", "legacy"))
+        self.assertTrue(targets.excludes("team-sandbox"))
+        self.assertTrue(targets.excludes("legacy"))
+        self.assertFalse(targets.excludes("payments-prod"))
+        self.assertFalse(targets.excludes("legacy-2"))
         # Excluded by number: only the reconcile can match that, and it writes
         # the dropped ids for the reader.
         declared = dict(DECLARED, projects=["payments-prod", "team-prod"], exclude={"projects": ["123456789012"], "clusters": []})
@@ -183,7 +197,10 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
                           {"id": "payments-prod", "outcome": "ok", "state": "in-scope"}], declared=declared, present=True)
         snap["excludedProjects"] = ["team-prod"]
         self._write(snap)
-        self.assertEqual(fst.declared_scope_targets(self.home).unread, ())
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(targets.unread, ())
+        self.assertEqual(targets.excluded, ("123456789012", "team-prod"))
+        self.assertTrue(targets.excludes("team-prod"))
 
     def test_a_carried_tick_on_a_folder_scoped_install_is_partial(self):
         # A carried tick resolves no folder, organisation or selector; a
@@ -215,6 +232,10 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         # Compute and networking ones); denied is a declared project unread.
         self.assertEqual(targets.projects, ("ops-mgmt", "payments-prod", "legacy-api"))
         self.assertEqual(targets.unread, (("payments-staging", "denied"),))
+        # The retiring row is a project the declaration no longer names, kept
+        # until its profiles are pruned: not swept, not unread, and carried by
+        # id for a reader that meets the project under another name.
+        self.assertEqual(targets.retiring, ("payments-legacy",))
         self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt,payments-prod,legacy-api --scope-unread payments-staging=denied")
         self.assertEqual(targets.resolved_at, "2026-10-09T12:00:00Z")
         self.assertEqual(targets.path, str(self.home / fst.SNAPSHOT_FILE))
@@ -237,6 +258,7 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         targets = fst.declared_scope_targets(self.home)
         self.assertEqual((targets.projects, targets.unread), (("ops-mgmt",), (("declared-scope", "unresolved"),)))
         self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt --scope-unread declared-scope=unresolved")
+        self.assertEqual(targets.declared_containers, ("folders/123456789012",))
         # A lookup that succeeded and found nothing is a resolved, empty folder.
         snap["containers"] = [{"id": "folders/123456789012", "outcome": "ok", "projects": 0}]
         self._write(snap)
@@ -253,6 +275,23 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         snap["projects"] = [host] + [{"id": p, "via": ["folders/123456789012"], "outcome": "over-cap", "state": "in-scope"} for p in ("m1", "m2")]
         self._write(snap)
         self.assertEqual(fst.declared_scope_targets(self.home).unread, (("m1", "over-cap"), ("m2", "over-cap")))
+
+    def test_the_declared_containers_ride_as_the_reconcile_keys_their_lookups(self):
+        # The folders, organisations and selectors the declaration names, as
+        # the snapshot's `containers[].id` spells them, sorted, so a reader
+        # that holds a project's cause across a failed lookup can tell a
+        # container the declaration had from one it has gained; never in the
+        # sweep or the collector flags, and none on a declaration of projects.
+        declared = dict(DECLARED, projects=[], folders=["222222222222", "111111111111"], organizations=["333333333333"], sharedVpcHosts=["net-host"], metricsScopes=["ops-mon"])
+        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=declared, present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(
+            targets.declared_containers,
+            ("folders/111111111111", "folders/222222222222", "metricsScopes/ops-mon", "organizations/333333333333", "sharedVpcHosts/net-host"),
+        )
+        self.assertEqual(targets.collector_argv(), ("--scope-projects", "ops-mgmt"))
+        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=dict(DECLARED, folders="123"), present=True))
+        self.assertEqual(fst.declared_scope_targets(self.home).declared_containers, ())
 
     def test_collector_args_without_an_unread_project_carries_the_sweep_alone(self):
         self._write(_snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=dict(DECLARED, projects=[]), present=True))
@@ -322,6 +361,73 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
             os.environ.pop(fst.AGENT_HOME_ENV, None)
             self.assertIsNone(fst.declared_scope_targets(), "HERMES_HOME must not be the key: on the pod it names the profile home")
         self.assertEqual(fst.snapshot_path("/elsewhere"), pathlib.Path("/elsewhere") / fst.SNAPSHOT_FILE)
+
+    # spec.scope.exclude.clusters rides to the collectors (#3081).
+    EXCLUDE_CLUSTERS = {"projects": [], "clusters": [
+        {"projectId": "payments-prod", "location": "us-central1", "clusterName": "lane-b"},
+        {"projectId": "ops-mgmt", "location": "us-east1-b", "clusterName": "kyber-test"},
+    ]}
+    EXCLUDE_ROWS = [{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-prod", "via": ["explicit"], "outcome": "ok", "state": "in-scope"}]
+
+    def test_the_snapshot_declaration_hands_the_excluded_clusters_on(self):
+        self._write(_snapshot(self.EXCLUDE_ROWS, declared=dict(DECLARED, exclude=self.EXCLUDE_CLUSTERS), present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(targets.excluded_clusters, (("ops-mgmt", "us-east1-b", "kyber-test"), ("payments-prod", "us-central1", "lane-b")))
+        self.assertEqual(
+            targets.collector_args(),
+            "--scope-projects ops-mgmt,payments-prod --scope-exclude-clusters ops-mgmt/us-east1-b/kyber-test,payments-prod/us-central1/lane-b",
+        )
+
+    def test_the_render_answer_hands_the_excluded_clusters_on(self):
+        render = self.home / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": [], "exclude": self.EXCLUDE_CLUSTERS}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(len(targets.excluded_clusters), 2)
+        self.assertIn("--scope-exclude-clusters ops-mgmt/us-east1-b/kyber-test,payments-prod/us-central1/lane-b", targets.collector_args())
+
+    def test_an_entry_admission_would_refuse_is_skipped_so_the_args_still_parse(self):
+        exclude = {"clusters": [*self.EXCLUDE_CLUSTERS["clusters"], {"projectId": "p", "location": "x/y", "clusterName": "c"},
+                                {"projectId": "p", "location": "l"}, "not-a-dict"]}
+        self._write(_snapshot(self.EXCLUDE_ROWS, declared=dict(DECLARED, exclude=exclude), present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(len(targets.excluded_clusters), 2)
+        fst.fleet_scope_args.parse_scope_exclude_clusters(targets.collector_args().split("--scope-exclude-clusters ")[1])
+
+    def test_no_exclusion_adds_no_flag(self):
+        self._write(_snapshot(self.EXCLUDE_ROWS, present=True))
+        self.assertNotIn("--scope-exclude-clusters", fst.declared_scope_targets(self.home).collector_args())
+
+    def test_management_project_id_reads_the_management_row_regardless_of_boundary(self):
+        self.assertIsNone(fst.management_project_id(self.home))
+        (self.home / fst.SNAPSHOT_FILE).write_text("<not json>", encoding="utf-8")
+        self.assertIsNone(fst.management_project_id(self.home))
+        empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
+        self._write(_snapshot(
+            [{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+            declared=empty, present=False, boundary=False,
+        ))
+        self.assertEqual(fst.management_project_id(self.home), "ops-mgmt")
+        self._write(_snapshot(
+            [{"id": "old-mgmt", "via": ["management"], "outcome": "ok", "state": "retiring"},
+             {"id": "123456789012", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+            present=True,
+        ))
+        self.assertIsNone(fst.management_project_id(self.home))
+
+
+class CollectorArgvTest(unittest.TestCase):
+    def test_the_argv_form_is_the_pasted_line_tokenised(self):
+        targets = fst.ScopeTargets(projects=("ops-mgmt", "payments-prod"), unread=(("billing", "denied"),), resolved_at=None, path="x")
+        self.assertEqual(targets.collector_argv(), ("--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "billing=denied"))
+        self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt,payments-prod --scope-unread billing=denied")
+        nothing = fst.ScopeTargets(projects=(), unread=(), resolved_at=None, path="x")
+        self.assertEqual(nothing.collector_argv(), ("--scope-unread", "declared-scope=unresolved"))
+        self.assertEqual(nothing.collector_args(), "--scope-unread declared-scope=unresolved")
+        # The exclude entries never reach the collector flags: the sweep and the unread rows are the whole argv.
+        excluding = fst.ScopeTargets(projects=("ops-mgmt",), unread=(), resolved_at=None, path="x", excluded=("*-sandbox",), declared_containers=("folders/1",), retiring=("legacy",))
+        self.assertEqual(excluding.collector_argv(), ("--scope-projects", "ops-mgmt"))
 
 
 if __name__ == "__main__":

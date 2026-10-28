@@ -36,6 +36,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 # it needs to read the managed config is imported inside the function that reads
 # it, and a missing config just means "no sandbox".
 import sandbox_exec  # noqa: E402 — needs the sys.path lines above
+import untrusted_text  # noqa: E402 — needs the sys.path lines above
 import vcs_client  # noqa: E402 — needs the sys.path lines above
 from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
     GITOPS_STATE_READ_TIMEOUT_SECONDS,
@@ -302,6 +303,48 @@ def forge(verb: str, payload: dict, repo: str) -> dict:
     return vcs_client.forge(verb, dict(payload), repository=repo)
 
 
+# The refusals a forge with no issue tracker, or no labels, gives this script's
+# first call, and what `capabilities` then says about it.
+UNTRACKED_REFUSALS = frozenset({"FORGE_UNSUPPORTED", "LABELS_UNSUPPORTED"})
+TRACKER_VERBS = ("issue-list", "issue-view", "issue-comment", "issue-update")
+
+
+# `has_no_tracker`'s answers for this process, so the sweep and the poll ask
+# `capabilities` once per repository. Only a read answer is kept.
+_NO_TRACKER: dict = {}
+
+
+def has_no_tracker(repo: str) -> bool:
+    """True when the forge of `repo` says it has no issue tracker or no labels.
+
+    Asked only after a refusal, so a repository whose forge has both costs
+    no extra call. An answer that cannot be read is False, and the refusal is
+    then reported as before.
+    """
+    if repo not in _NO_TRACKER:
+        answer = _no_tracker(repo)
+        if answer is None:
+            return False
+        _NO_TRACKER[repo] = answer
+    return _NO_TRACKER[repo]
+
+
+def _no_tracker(repo: str):
+    """`has_no_tracker`, with None when `capabilities` could not be read."""
+    try:
+        answer = forge("capabilities", {}, repo)
+    except vcs_client.VcsError:
+        return None
+    if not answer.get("forge") or answer.get("missing"):
+        # A host no forge serves, or one this install has not configured,
+        # also answers with no verbs: that stays a refusal.
+        return False
+    verbs = answer.get("verbs")
+    if isinstance(verbs, list) and not all(verb in verbs for verb in TRACKER_VERBS):
+        return True
+    return answer.get("labels") is False
+
+
 def ensure_labels_exist(repo: str):
     """Make sure this skill's status and governance labels exist.
 
@@ -347,6 +390,10 @@ def sweep_stale_issues(repo: str):
             "issue-list", {"labels": [IN_PROGRESS], "limit": POLL_WINDOW}, repo
         )
     except vcs_client.VcsError as refusal:
+        if refusal.code in UNTRACKED_REFUSALS and has_no_tracker(repo):
+            # A forge with no issue tracker has nothing to sweep, and the
+            # poll names the repository in `untracked_repos`: not a fault.
+            return
         # Not fatal, as the docstring says -- but not silent either. The poll
         # that follows reports the same refusal by code; this is where the
         # message itself survives, for whoever reads the worker's stderr.
@@ -400,44 +447,6 @@ def sweep_stale_issues(repo: str):
             )
 
 
-def _is_safe_char(ch: str) -> bool:
-    """Check whether a character is safe from control/zero-width/bidi smuggling."""
-    # Logically identical to `_is_safe_char` in
-    # agents/platform/scripts/platform_mcp_server.py, which is the canonical
-    # copy: both classify untrusted external text bound for the same model, and
-    # a class stripped in one place but not the other is a hole in whichever
-    # side forgot. Importing it is not an option — that module builds an MCP
-    # server at import time and pulls in `mcp`, `agent_common_server` and
-    # `gke_endpoint`, none of which this script has or needs. The mirror is held
-    # honest by test_resolver.py's drift test, which compares the two as parsed
-    # syntax — so this comment and the docstring may differ from the canonical
-    # copy's, and the logic may not.
-    code = ord(ch)
-    # Preserve newline (\n, 10) and tab (\t, 9)
-    if code in (9, 10):
-        return True
-    # Strip C0 control characters (< 32), DEL (127), and C1 control characters (128-159)
-    if code < 32 or 127 <= code <= 159:
-        return False
-    # Strip zero-width, bidi, and format control characters
-    # U+200B-U+200F (Zero-width space, non-joiner, joiner, LRM, RLM)
-    # U+202A-U+202E (Bidi embedding/override controls: LRE, RLE, PDF, LRO, RLO)
-    # U+2060-U+206F (Word joiner, invisible operators, bidi isolates)
-    # U+FEFF (Zero-width no-break space / BOM)
-    # U+00AD (Soft hyphen), U+034F (Combining grapheme joiner), U+061C (Arabic letter mark), U+180E (Mongolian vowel separator)
-    if (
-        0x200B <= code <= 0x200F
-        or 0x202A <= code <= 0x202E
-        or 0x2060 <= code <= 0x206F
-        or code in (0xFEFF, 0x00AD, 0x034F, 0x061C, 0x180E)
-    ):
-        return False
-    # Strip Unicode tag block and non-printable supplementary blocks (U+E0000 and above)
-    if code >= 0xE0000:
-        return False
-    return True
-
-
 def sanitize_untrusted_text(text: str, max_length: int = 8192) -> str:
     """Sanitizes untrusted external input to neutralize prompt injection attacks."""
     if not text or not isinstance(text, str):
@@ -447,16 +456,9 @@ def sanitize_untrusted_text(text: str, max_length: int = 8192) -> str:
     if is_truncated:
         text = text[:max_length]
 
-    # 1. Strip ANSI escape sequences (7-bit and 8-bit CSI) and carriage returns
-    cleaned = re.sub(r"\r", "", text)
-    cleaned = re.sub(
-        r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])",
-        "",
-        cleaned,
-    )
-
-    # 2. Strip C0/C1 control characters, DEL, zero-width/bidi characters, and Unicode tag blocks
-    cleaned = "".join(ch for ch in cleaned if _is_safe_char(ch))
+    # 1 and 2. Carriage returns, ANSI escape sequences, control, zero-width and bidi
+    #    characters out, with the one filter every path to the model shares.
+    cleaned = untrusted_text.strip_unsafe(text)
 
     # 3. Neutralize prompt injection delimiter tags, instruction markers, and fake system headers.
     #    `[/\s]*` on both sides of the name, not just the front: `</untrusted_title>`,
@@ -641,6 +643,9 @@ def handle_poll(args):
     # forge has stopped accepting from an install pointed at a repository that
     # does not exist, and those two faults belong to different people.
     refusals: dict = {}
+    # Repositories whose forge has no issue tracker, or no labels to claim an
+    # issue with (Bitbucket). Not refusals: there is nothing to poll there.
+    untracked: list = []
     # Repository -> the refusal's own words. The code is what the rules branch
     # on; the message is what names the broker and the errno when there is no
     # code, and throwing it away left "every managed repository refused the
@@ -675,6 +680,9 @@ def handle_poll(args):
             # -- the broker unreachable, its token missing, an answer that was
             # not JSON -- and it gets a code of this side's rather than the
             # broker's word for a forge fault.
+            if refusal.code in UNTRACKED_REFUSALS and has_no_tracker(repo):
+                untracked.append(repo)
+                continue
             refusals[repo] = refusal.code or BROKER_UNREACHABLE
             errors[repo] = str(refusal)
             print(f"resolver: {repo}: {refusals[repo]}: {refusal}", file=sys.stderr)
@@ -686,9 +694,14 @@ def handle_poll(args):
 
     unreachable_repos = [repo for repo in repos if repo in refusals]
 
+    # Only when there are some, so the answer for a forge with a tracker is
+    # exactly what it was.
+    extra = {"untracked_repos": untracked} if untracked else {}
+
     if not all_issues:
-        if len(refusals) == len(repos):
-            # Every managed repository refused, so this is not a quiet fleet.
+        if refusals and len(refusals) + len(untracked) == len(repos):
+            # Every managed repository that has an issue tracker refused, so
+            # this is not a quiet fleet.
             # When they all refused for the same reason that reason is the
             # answer -- a credential the forge has stopped accepting is one
             # fact about the install, not N facts about N repositories -- and
@@ -704,11 +717,14 @@ def handle_poll(args):
             refuse(
                 reason,
                 messages.pop() if len(messages) == 1 else (
-                    "every managed repository refused the listing"
+                    "every managed repository with an issue tracker refused the listing"
+                    if untracked
+                    else "every managed repository refused the listing"
                 ),
                 unreachable_repos=unreachable_repos,
                 refusals=refusals,
                 errors=errors,
+                **extra,
             )
         print(
             json.dumps(
@@ -716,6 +732,7 @@ def handle_poll(args):
                     "status": "NO_ISSUES",
                     "managed_repos": repos,
                     "unreachable_repos": unreachable_repos,
+                    **extra,
                 }
             )
         )
@@ -772,6 +789,7 @@ def handle_poll(args):
                 # rather than conclude from a partial one.
                 "comments_truncated": comments_truncated,
                 "unreachable_repos": unreachable_repos,
+                **extra,
             },
             indent=2,
         )

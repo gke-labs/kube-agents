@@ -5,7 +5,8 @@ This is the index that joins the three documents about upgrade failures.
 which signal shows it before and after the upgrade, where to look, how to mitigate, what this
 repository reads today and what GKE's Recommender publishes.
 [`bench/upgrade-scenarios/README.md`](../../bench/upgrade-scenarios/README.md) holds the harness
-that planted each entry on a throwaway cluster and, for all but entry 15, upgraded it, with its
+that planted each entry with a script on a throwaway cluster (21 to 26 have none) and, for all but
+entry 15, upgraded it, with its
 verdicts and its evidence. This document says, per entry, which scenario script is the reproduction,
 what that run showed in one paragraph, and what the seeded fleet (`bench/tf/fleet/`) holds for the
 entry today, so that a case author knows where a fixture exists and where one would have to be
@@ -72,6 +73,22 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
     form); `scenarios/19c.sh`; `intree-pd-volume` on seeded-a.
 20. [Images on a retired registry](#20-images-on-a-retired-registry): reproduced;
     `scenarios/20d.sh`; `retired-registry-image` on seeded-a.
+21. [The load balancer's connection drain outlasts the node's deregistration
+    wait](#21-the-load-balancers-connection-drain-outlasts-the-nodes-deregistration-wait): not
+    reproduced; no scenario script; `readiness-lb-drain-timeout` on seeded-b.
+22. [A Node object outlives its virtual machine](#22-a-node-object-outlives-its-virtual-machine):
+    not reproduced; no scenario script; nothing on the fleet.
+23. [A control-plane upgrade or resize fails on regional compute
+    capacity](#23-a-control-plane-upgrade-or-resize-fails-on-regional-compute-capacity): not
+    reproduced; no scenario script; nothing on the fleet.
+24. [A cluster held in a long reconcile](#24-a-cluster-held-in-a-long-reconcile): not reproduced;
+    no scenario script; nothing on the fleet.
+25. [The target patch is withdrawn before the
+    window](#25-the-target-patch-is-withdrawn-before-the-window): not reproduced; no scenario
+    script; `version-laggard` on seeded-b carries the running-patch half.
+26. [A known issue in an add-on at the target
+    version](#26-a-known-issue-in-an-add-on-at-the-target-version): not reproduced; no scenario
+    script; nothing on the fleet.
 
 ## The entries
 
@@ -309,7 +326,7 @@ default-deny NetworkPolicy sat unenforced, switching enforcement on changed noth
 pool upgrade rebuilt the node with calico and cut traffic; the trigger is the enforcement switch
 applied at the rebuild, not a version change.
 
-Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in eight of its eleven seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-stall`, `seeded-token`, `seeded-headroom`, `seeded-shapes`, `seeded-defaults`; `seeded-security` and `seeded-intent` have none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
+Fleet: no named role, but seeded-a holds the before-state: default-deny NetworkPolicies in nine of its twelve seeded namespaces (`seeded-reliability`, `seeded-debug`, `seeded-capacity`, `seeded-stall`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-shapes`, `seeded-defaults`; `seeded-security` and `seeded-intent` have none on purpose and `seeded-deprecation` an egress-only policy) with neither the network-policy add-on nor Dataplane V2 enforcing them, which the first Recommender read counted as the catch for this entry.
 
 Reproduction: `bench/upgrade-scenarios/scenarios/16.sh`, evidence
 `bench/upgrade-scenarios/evidence/16/dataplane.txt`, and item 16 of the harness README. Detection,
@@ -382,3 +399,67 @@ Reproduction: `bench/upgrade-scenarios/scenarios/20d.sh` (sources `20.sh`), evid
 `bench/upgrade-scenarios/evidence/20d/registry.txt`, and item 20 of the harness README. Detection,
 where to look, mitigation and what reads it today: [catalogue entry
 20](upgrade-failure-catalogue.md#20-images-on-a-retired-registry).
+
+### 21. The load balancer's connection drain outlasts the node's deregistration wait
+
+Harness: none. The entry comes from one production fleet's support history, read for the readiness
+design's Scope table; no scenario script plants it and no run upgraded a cluster behind it.
+
+Fleet: `readiness-lb-drain-timeout` on seeded-b (`drain-timeout-<prefix>-b`, a backend service on
+the default pool's instance group draining for 720 seconds, a fifth over the 600 seconds GKE waits
+per node, behind a TCP health check and no forwarding rule) carries the before-state once the pool
+projects are re-applied with it.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+21](upgrade-failure-catalogue.md#21-the-load-balancers-connection-drain-outlasts-the-nodes-deregistration-wait).
+
+### 22. A Node object outlives its virtual machine
+
+Harness: none. The entry comes from the same support history; a ghost Node cannot stand on a
+healthy cluster, since the cloud controller deletes it within seconds, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry a recorded node list with the ghost appended.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+22](upgrade-failure-catalogue.md#22-a-node-object-outlives-its-virtual-machine).
+
+### 23. A control-plane upgrade or resize fails on regional compute capacity
+
+Harness: none. The entry comes from the same support history; a capacity failure is the
+provider's and cannot be planted, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry a recorded operations list with one such failure.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+23](upgrade-failure-catalogue.md#23-a-control-plane-upgrade-or-resize-fails-on-regional-compute-capacity).
+
+### 24. A cluster held in a long reconcile
+
+Harness: none. The entry comes from the same support history; a status other than `RUNNING`
+needs a real operation in flight or wedged, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry recorded operations and cluster records.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+24](upgrade-failure-catalogue.md#24-a-cluster-held-in-a-long-reconcile).
+
+### 25. The target patch is withdrawn before the window
+
+Harness: none. The entry comes from the same support history; which patches a channel lists is
+the provider's, so no script plants a withdrawn target.
+
+Fleet: `version-laggard` on seeded-b holds the control plane at a patch the REGULAR channel has
+moved past, the rule's running-patch risk; no withdrawn target.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+25](upgrade-failure-catalogue.md#25-the-target-patch-is-withdrawn-before-the-window).
+
+### 26. A known issue in an add-on at the target version
+
+Harness: none. The entry comes from the same support history; which issues the page lists for a
+current patch is the provider's, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry a recorded add-on inventory and server config.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+26](upgrade-failure-catalogue.md#26-a-known-issue-in-an-add-on-at-the-target-version).

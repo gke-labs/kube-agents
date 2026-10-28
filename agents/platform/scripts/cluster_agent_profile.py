@@ -64,9 +64,10 @@ OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skil
 MAX_NAME_LEN = 63
 
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
-# managed as Cluster Agents: the front-door router (`default`) and the Platform
-# Agent itself (`platform`). Reconciliation must never touch these.
-RESERVED_PROFILES = frozenset({"default", "platform"})
+# managed as Cluster Agents: the front-door router (`default`), the Platform
+# Agent itself (`platform`), and the optional GKE Support Agent (`tse`).
+# Reconciliation must never touch these.
+RESERVED_PROFILES = frozenset({"default", "platform", "tse"})
 
 # How the scaffold checks that gcloud's kubeconfig exists on the side that will
 # read it. An absolute path because a builtin `test` would be the sandbox
@@ -77,6 +78,9 @@ KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 
 # What the reconcile engine and the roster read as "this profile is finished".
 USER_MD_NAME = "USER.md"
+SOUL_MD_NAME = "SOUL.md"
+SOUL_IDENTITY_HEADING = "## Target Cluster Identity"
+SOUL_SECTION_1_ANCHOR = "---\n\n## 1. Core Truths"
 # The one connection attempt the scaffold makes after pinning the kubeconfig,
 # so an unreachable cluster is reported here, with the endpoint it was reached
 # over, rather than discovered by the first Cluster Agent run. `kubectl
@@ -172,6 +176,45 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
         data = {}
     data["cluster_identity"] = {"project": project, "cluster": cluster, "location": location}
     config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _stamp_soul_identity(home: Path, project: str, cluster: str, location: str) -> None:
+    """Stamp the target cluster identity directly into the profile's SOUL.md.
+
+    Hermes always injects SOUL.md into the system prompt via build_context_files_prompt(),
+    whereas USER.md is skipped when user_profile_enabled is false (the Cluster Agent
+    default) or when an external memory provider is active. Stamping project, cluster,
+    and location into SOUL.md gives the worker its identity in turn 1 without spending
+    tool calls searching for USER.md from its kanban task scratch workspace.
+    """
+    soul_path = home / SOUL_MD_NAME
+    if not soul_path.is_file():
+        return
+    text = soul_path.read_text(encoding="utf-8")
+    block = (
+        f"---\n\n{SOUL_IDENTITY_HEADING}\n\n"
+        f"- project: {project}\n"
+        f"- cluster: {cluster}\n"
+        f"- location: {location}\n"
+    )
+    pattern = re.compile(
+        rf"(?:---\n\n)?{re.escape(SOUL_IDENTITY_HEADING)}\n\n(?:- [^\n]+\n)+",
+        re.MULTILINE,
+    )
+    if pattern.search(text):
+        updated = pattern.sub(block, text, count=1)
+    elif SOUL_SECTION_1_ANCHOR in text:
+        updated = text.replace(
+            SOUL_SECTION_1_ANCHOR,
+            f"{block}\n{SOUL_SECTION_1_ANCHOR}",
+            1,
+        )
+    else:
+        updated = text.rstrip("\n") + f"\n\n{block}"
+    if updated != text:
+        tmp_path = soul_path.with_name(soul_path.name + ".tmp")
+        tmp_path.write_text(updated, encoding="utf-8")
+        os.replace(tmp_path, soul_path)
 
 
 def read_cluster_identity(home: Path) -> dict[str, str] | None:
@@ -325,6 +368,12 @@ def _push_sandbox_layout(name: str) -> None:
     entrypoint's job and has a marker of its own. A brand new profile has no
     files to move.
 
+    ``--profile``: this profile's home, plus the machine home and the platform
+    profile (the mirror's FIXED_HOMES, which the sandbox creates as bare roots).
+    Every other cluster home is left to its own scaffold or the entrypoint's
+    start-time pass; re-sending every home on every scaffold made onboarding N
+    clusters O(N^2) (#3701).
+
     Never fatal. An install with no sandbox exits 0 from the script itself, and
     a sandbox that is down leaves a profile whose shell starts in the machine
     home -- which is where it starts anyway.
@@ -334,7 +383,8 @@ def _push_sandbox_layout(name: str) -> None:
     try:
         subprocess.run(
             [sys.executable, str(SANDBOX_MIRROR),
-             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--wait", "30"],
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--profile", name,
+             "--wait", "30"],
             check=True,
             capture_output=True,
             text=True,
@@ -466,8 +516,10 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     _pin_otel_endpoint(home, name)
 
     # 2b. Stamp this cluster's identity into the profile config as structured identity
-    #     metadata — never derived from the sanitized profile name.
+    #     metadata — never derived from the sanitized profile name — and into SOUL.md
+    #     so the worker sees its target cluster identity in the system prompt on turn 1.
     _inject_cluster_identity(home, project, cluster, location)
+    _stamp_soul_identity(home, project, cluster, location)
 
     # 2c. Link any plugin image volumes the operator mounted for this profile.
     # 2d. Apply the operator's config overlays: the cluster class overlay carrying
@@ -672,7 +724,9 @@ def list_profiles() -> list[str]:
     if not PROFILES_BASE.is_dir():
         return []
     return sorted(
-        p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
+        p.name
+        for p in PROFILES_BASE.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in RESERVED_PROFILES
     )
 
 
@@ -695,7 +749,10 @@ def list_ready_profiles() -> list[str]:
     return sorted(
         p.name
         for p in PROFILES_BASE.iterdir()
-        if p.is_dir() and p.name not in RESERVED_PROFILES and is_ready_profile(p)
+        if p.is_dir()
+        and not p.name.startswith(".")
+        and p.name not in RESERVED_PROFILES
+        and is_ready_profile(p)
     )
 
 
@@ -722,6 +779,20 @@ def cmd_name(args: argparse.Namespace) -> None:
     print(profile_name(args.project, args.cluster, args.location))
 
 
+def cmd_stamp_soul(args: argparse.Namespace) -> None:
+    """Re-stamp ``SOUL.md`` in ``--profile-dir`` from its ``config.yaml`` ``cluster_identity``.
+
+    Called by ``docker-entrypoint.sh`` after force-syncing ``SOUL.md`` from
+    ``/opt/cluster-template/SOUL.md`` so existing ``cluster-*`` profiles keep
+    their stamped ``## Target Cluster Identity`` block across gateway restarts.
+    """
+    home = Path(args.profile_dir)
+    identity = read_cluster_identity(home)
+    if identity is None:
+        return
+    _stamp_soul_identity(home, identity["project"], identity["cluster"], identity["location"])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage per-cluster Cluster Agent Hermes profiles.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -743,13 +814,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include incomplete/unscaffolded profiles (default: False, lists only ready profiles)",
     )
+
+    stamp_parser = sub.add_parser(
+        "stamp-soul",
+        help="Re-stamp SOUL.md in an existing cluster profile home from its config.yaml cluster_identity",
+    )
+    stamp_parser.add_argument("--profile-dir", required=True, help="Path to the cluster profile home")
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
+    handlers = {
+        "create": cmd_create,
+        "delete": cmd_delete,
+        "list": cmd_list,
+        "name": cmd_name,
+        "stamp-soul": cmd_stamp_soul,
+    }
     handlers[args.command](args)
 
 

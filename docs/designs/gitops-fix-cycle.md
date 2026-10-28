@@ -285,7 +285,8 @@ Runs 1 to 13 used **env mode** instead: `GITOPS_BASE_BRANCH` set on the Platform
 into the agent container (each change rolled the agent pod, whose cold start took from 7
 to over 10 minutes). That mode is gone: on the shell-sandbox layout every command the
 agent runs executes in `platform-agent-shell-0`, whose environment is built from scratch
-and does not take `spec.deployment.env` (`docs/designs/agent-shell-sandboxing.md`), so the
+and takes no `spec.deployment.env` bar the normalised `KUBEAGENTS_AUDIT_AUTO_PROMOTE`
+(`docs/designs/agent-shell-sandboxing.md`), so the
 variable reaches the gateway container and never the process that opens the PR. A per-run
 base now goes in the GitOps repository's `baseBranch`, which the operator renders into the
 credential broker and never into the sandbox; pinned-base mode (above) sets it per run.
@@ -346,12 +347,22 @@ delegated-work wait, active only when `GITOPS_RUN_BRANCH` is set:
    is `GITOPS_ARGO_APP`, which the wrapper sets to the task and which otherwise defaults
    to the run branch's last segment) until
    `status.sync.status == Synced`, `status.sync.revision == <branch head>` and
-   `status.health.status == Healthy` (`GITOPS_SYNC_TIMEOUT`, 300s) -> `merged`; else
+   `status.health.status == Healthy` (`GITOPS_SYNC_TIMEOUT`, 300s) -> `merged` (or step 4 when `GITOPS_SOAK_SECONDS` is above zero); else
    `sync_timeout`. The head is re-read each poll because it can move after the merge (it
    did, in run 7); `head_moved_after_merge` is recorded when it does.
+4. Only when `GITOPS_SOAK_SECONDS` is above zero (default 0, no soak): keep polling the
+   Application for that many seconds. Every successful read (an `Unknown` sync or health
+   status or malformed status object is counted in `poll_errors` and retried) must still
+   show `Synced` at the revision that settled in step 3 and `Healthy`; the first that does
+   not ends the wait as `soak_regressed`, with the reading in `reason`. The soak passes on a
+   successful read at or after its end; if reads keep failing past the end, that read is
+   retried for up to `GITOPS_SYNC_TIMEOUT` more seconds, then `sync_timeout`. A healthy
+   reading at the sync is one moment: a rollout whose new pods pass readiness once and
+   then crash reads `Healthy` and then `Progressing`, and without a soak it records
+   `merged`.
 
 The outcome and its evidence (PR number and URL, head and merge SHAs, synced revision,
-health, elapsed) go into `result.metadata["gitops"]` and, because devops-bench persists
+health, elapsed, and with a soak `soak_s`, `soak_revision` and any regression's `reason`) go into `result.metadata["gitops"]` and, because devops-bench persists
 `trajectory` but not `metadata`, also into one trajectory entry named `gitops_fix_cycle`.
 The verifiers run only after this wait returns, so they grade the synced cluster (or the
 still-broken one). The pilot records the outcome and does not score it.

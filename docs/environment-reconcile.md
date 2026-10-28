@@ -65,7 +65,11 @@ Because automated release deploys must not silently drop candidate releases or r
 success on an unapplied commit, lease contention fails loudly (`lease_policy: fail`)
 rather than deferring silently.
 
-Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). Locally,
+Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). An apply to an older
+`image_tag` stops when the move leaves behind a commit marked as a breaking change, and names each
+one; set `allow_breaking_downgrade` on that dispatch, or on the `image_tag` dispatch of
+`Autopush: Deploy`, `Autopush-Next: Deploy` or `Staging: Deploy`, to roll the environment back
+anyway. Locally,
 `./upgrade.sh --plan` against any install shows what a reconcile would change;
 [`terraform/examples/full-install/README.md`](../terraform/examples/full-install/README.md#asking-what-an-apply-would-change)
 documents it.
@@ -189,8 +193,8 @@ the `secrets: inherit` gap
 [`scripts/release/README.md`](../scripts/release/README.md) describes for
 `GH_APP_ID`, which drops every secret the same way.
 
-`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, and `HERMES_DASHBOARD_ENABLED` are checked
-there too, for spelling rather than presence. All three reach `install.sh` as
+`ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, `HERMES_DASHBOARD_ENABLED`, and `WEB_CONSOLE_ENABLED` are checked
+there too, for spelling rather than presence. All four reach `install.sh` as
 `--enable-*` flags, whose validator takes `true` or `false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
 `True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into

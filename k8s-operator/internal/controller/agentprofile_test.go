@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -58,6 +59,7 @@ const (
 	agentClosedFixturePath  = "../../../a2a/authcallout/testdata/rendered-agent-closed.json"
 	specDocPath             = "../../../docs/designs/spec-subagent-profiles.md"
 	chatProfileExamplePath  = "../../examples/agentprofile-chat.yaml"
+	tseProfileExamplePath   = "../../examples/agentprofile-tse.yaml"
 	agentProfileCRDBasePath = "../../config/crd/bases/kubeagents.x-k8s.io_agentprofiles.yaml"
 )
 
@@ -165,6 +167,8 @@ func agentProfileSpecPaths() []string {
 		p.Spec.Identity.ServiceAccountName = "sa"
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Cluster: "c", Location: "l"}
 		p.Spec.QueueTimeoutSeconds = 1
+		p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
+		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
@@ -1264,5 +1268,138 @@ func TestAProfileNameTooLongForItsBusIdentityDropsOut(t *testing.T) {
 	at := testAgentProfile(agent.Namespace, strings.Repeat("a", agentProfileNameMax))
 	if _, ok := renderedMapEntries(t, agent, []agentv1alpha1.AgentProfile{at})["profile-"+at.Name]; !ok {
 		t.Errorf("a %d-character profile name, the most that fits, was refused", agentProfileNameMax)
+	}
+}
+
+func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
+	withoutOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	chat := testAgentProfile(agent.Namespace, "chat")
+	auditor := testAgentProfile(agent.Namespace, "auditor")
+	if got := enabledAgentProfileNames(agent, []agentv1alpha1.AgentProfile{chat, auditor}); len(got) != 0 {
+		t.Fatalf("enabledAgentProfileNames(chat, auditor) = %v, want empty (non-optional Hermes profiles must not roll the gateway)", got)
+	}
+
+	tse := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Bus.PublishTopics = []string{"agent.tse.findings"}
+		p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint", "agent.platform.upgrade-readiness"}
+	})
+	now := metav1.Now()
+	deletingTSE := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
+		p.DeletionTimestamp = &now
+		p.Finalizers = []string{"test"}
+	})
+	if got := enabledAgentProfileNames(agent, []agentv1alpha1.AgentProfile{deletingTSE}); len(got) != 0 {
+		t.Fatalf("enabledAgentProfileNames(deleting tse) = %v, want empty", got)
+	}
+	refusedTSE := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Bus.PublishTopics = []string{"agent.platform.x"}
+	})
+	if got := enabledAgentProfileNames(agent, []agentv1alpha1.AgentProfile{refusedTSE}); len(got) != 0 {
+		t.Fatalf("enabledAgentProfileNames(refused tse) = %v, want empty", got)
+	}
+
+	refused := testAgentProfile(agent.Namespace, "bad.name")
+	deleting := testAgentProfile(agent.Namespace, "closing", func(p *agentv1alpha1.AgentProfile) {
+		p.DeletionTimestamp = &now
+	})
+	names := enabledAgentProfileNames(agent, []agentv1alpha1.AgentProfile{chat, auditor, deleting, refused, tse})
+	if !slices.Equal(names, []string{"tse"}) {
+		t.Fatalf("enabledAgentProfileNames = %v, want [tse]", names)
+	}
+
+	dep := buildDeployment(agent, "cfg", "fb", "set", "pol", nil, renderOptions{enabledProfiles: names})
+	if got, _ := envValue(containerNamed(t, dep, appNamePlatformAgent), enabledProfilesEnvVar); got != "tse" {
+		t.Errorf("%s = %q, want %q", enabledProfilesEnvVar, got, "tse")
+	}
+
+	depEmpty := buildDeployment(agent, "cfg", "fb", "set", "pol", nil, renderOptions{})
+	if got, found := envValue(containerNamed(t, depEmpty, appNamePlatformAgent), enabledProfilesEnvVar); found {
+		t.Errorf("%s rendered when enabledProfiles is empty: %q", enabledProfilesEnvVar, got)
+	}
+
+	// 1. Healthy projection path: seed the bound `tse` AgentProfile (with no pre-existing
+	// gateway Deployment) and drive reconcileWorkload on the un-skewed, readable agent so
+	// boundAgentProfiles -> enabledAgentProfileNames projects KUBE_AGENTS_ENABLED_PROFILES=tse.
+	h := newProfileHarness(t, agent, &tse)
+	reconciler := &PlatformAgentReconciler{Client: h.c, Scheme: h.c.Scheme()}
+	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+		t.Fatalf("reconcileWorkload with bound tse AgentProfile: %v", err)
+	}
+	var liveDep appsv1.Deployment
+	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
+		t.Fatalf("getting applied gateway Deployment after healthy reconcile: %v", err)
+	}
+	if got, _ := envValue(containerNamed(t, &liveDep, appNamePlatformAgent), enabledProfilesEnvVar); got != "tse" {
+		t.Fatalf("gateway Deployment %s after healthy reconcileWorkload = %q, want %q", enabledProfilesEnvVar, got, "tse")
+	}
+	held, err := reconciler.heldEnabledProfiles(context.Background(), agent)
+	if err != nil || !slices.Equal(held, []string{"tse"}) {
+		t.Errorf("heldEnabledProfiles = %v, %v; want [tse], nil", held, err)
+	}
+
+	// 2. Delete the `tse` AgentProfile from the fake client, then verify both hold branches
+	// (mode skew and agentProfilesUnreadable) preserve KUBE_AGENTS_ENABLED_PROFILES=tse on
+	// the live gateway Deployment before the healthy removal pass clears it.
+	if err := h.c.Delete(context.Background(), &tse); err != nil {
+		t.Fatalf("deleting tse AgentProfile: %v", err)
+	}
+	skewedAgent := agent.DeepCopy()
+	skewedAgent.Spec.Mode = ptr.To("quantum")
+	if err := reconciler.reconcileWorkload(context.Background(), skewedAgent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+		t.Fatalf("reconcileWorkload under mode skew: %v", err)
+	}
+	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
+		t.Fatalf("getting applied gateway Deployment after skew reconcile: %v", err)
+	}
+	if got, _ := envValue(containerNamed(t, &liveDep, appNamePlatformAgent), enabledProfilesEnvVar); got != "tse" {
+		t.Errorf("gateway Deployment %s after mode-skew reconcileWorkload = %q, want %q", enabledProfilesEnvVar, got, "tse")
+	}
+
+	reconciler.agentProfilesUnreadable = true
+	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+		t.Fatalf("reconcileWorkload under agentProfilesUnreadable: %v", err)
+	}
+	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
+		t.Fatalf("getting applied gateway Deployment after unreadable-profiles reconcile: %v", err)
+	}
+	if got, _ := envValue(containerNamed(t, &liveDep, appNamePlatformAgent), enabledProfilesEnvVar); got != "tse" {
+		t.Errorf("gateway Deployment %s after agentProfilesUnreadable reconcileWorkload = %q, want %q", enabledProfilesEnvVar, got, "tse")
+	}
+
+	// 3. Healthy removal path: once AgentProfile reads succeed again with `tse` deleted,
+	// reconcileWorkload removes KUBE_AGENTS_ENABLED_PROFILES from the gateway Deployment.
+	reconciler.agentProfilesUnreadable = false
+	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
+		t.Fatalf("reconcileWorkload after deleting tse AgentProfile: %v", err)
+	}
+	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
+		t.Fatalf("getting applied gateway Deployment after removal reconcile: %v", err)
+	}
+	if got, found := envValue(containerNamed(t, &liveDep, appNamePlatformAgent), enabledProfilesEnvVar); found {
+		t.Errorf("gateway Deployment %s still set after deleting tse AgentProfile: %q", enabledProfilesEnvVar, got)
+	}
+}
+
+func TestTheTSEProfileExampleIsAStrictAgentProfile(t *testing.T) {
+	raw, err := os.ReadFile(tseProfileExamplePath)
+	if err != nil {
+		t.Fatalf("reading the tse profile: %v", err)
+	}
+	var p agentv1alpha1.AgentProfile
+	if err := yaml.UnmarshalStrict(raw, &p); err != nil {
+		t.Fatalf("the tse profile is not a strict AgentProfile: %v", err)
+	}
+	if p.Kind != "AgentProfile" || p.Name != "tse" {
+		t.Errorf("kind/name = %q/%q, want AgentProfile/tse", p.Kind, p.Name)
+	}
+	if p.Spec.Identity.ServiceAccountName != "" {
+		t.Errorf("the tse profile names ServiceAccount %q; it runs with an operator-created one holding nothing", p.Spec.Identity.ServiceAccountName)
+	}
+	script := a2aProvisionScript(a2aTestAgent())
+	for _, grant := range append(append([]string(nil), p.Spec.Bus.PublishTopics...), p.Spec.Bus.SubscribeTopics...) {
+		if !strings.Contains(script, "a2a.topics."+grant) {
+			t.Errorf("the tse profile grants %q, which the provision script does not provision", grant)
+		}
 	}
 }

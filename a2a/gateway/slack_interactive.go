@@ -1,13 +1,16 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
@@ -84,13 +87,23 @@ type slackClickPayload struct {
 		Attachments json.RawMessage `json:"attachments"`
 	} `json:"message"`
 	Actions []struct {
+		// Type is the element's (button, feedback_buttons), logged with
+		// the ids when a click is dropped.
+		Type     string `json:"type"`
 		ActionID string `json:"action_id"`
+		BlockID  string `json:"block_id"`
 		Value    string `json:"value"`
+		// ActionTS is where a block_actions payload carries the click's
+		// timestamp (interactive copies it to the payload's ActionTS).
+		ActionTS string `json:"action_ts"`
 		Text     struct {
 			Text string `json:"text"`
 		} `json:"text"`
 	} `json:"actions"`
 	ActionTS string `json:"action_ts"`
+	// TriggerID opens a modal for the clicker (a 👎's note,
+	// slack_feedback.go).
+	TriggerID string `json:"trigger_id"`
 }
 
 // slackQuestion is a posted message with choice buttons, as the rewrite
@@ -99,17 +112,28 @@ type slackClickPayload struct {
 type slackQuestion struct {
 	channel, thread, ts, text string
 	blocks, attachments       json.RawMessage
+	// title is the question as the Home tab lists it: its chat message's
+	// headline, or its text when it has none.
+	title string
 }
 
 // slackPending is a message handed to the gateway and not yet verified: a
-// click, with the question it answered and the label it showed, or a typed
+// click, with the question it answered and the label it showed; a typed
 // message, which answers the conversation's open question and may title the
-// thread.
+// thread; or a shortcut, whose text is the message it quotes, which may title
+// the thread, and whose responseURL reaches its clicker alone.
 type slackPending struct {
 	conversation, author, text string
-	click                      bool
-	label                      string
-	question                   slackQuestion
+	// homeType is the channel_type of a top-level channel mention, the one
+	// shape that can set the home channel (noteHomeCandidate); "" otherwise.
+	homeType    string
+	click       bool
+	label       string
+	question    slackQuestion
+	shortcut    bool
+	responseURL string
+	// clicker is a shortcut clicker's Slack name, for the credit line.
+	clicker string
 }
 
 // slackUX is the adapter's click and question state, under s.mu.
@@ -129,13 +153,18 @@ type slackUX struct {
 	// questions is each conversation's open question, the latest posted.
 	questions      map[string]slackQuestion
 	questionsOrder []string
+	// credits is each conversation's verified shortcut credit line until the
+	// shortcut's own task starts there (slack_shortcut.go).
+	credits      map[string]string
+	creditsOrder []string
 }
 
 // uxLocked is s.ux, made on first use. Caller holds s.mu.
 func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
-			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{}}
+			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{},
+			credits: map[string]string{}}
 	}
 	return s.ux
 }
@@ -190,23 +219,38 @@ func (s *SlackAdapter) noteQuestion(conversation string, q slackQuestion) {
 // choices becomes the conversation's open question, a fresh one even when
 // the message was answered before (a card asking again on its update key),
 // and an edit that leaves the open question without them (a card's question
-// settled on the notify route by its update key) closes it. Called once
-// Slack has the message.
+// settled on the notify route by its update key) closes it. Choices that are
+// all an answer's next steps (Choice.Next) ask nothing, so their message is
+// treated as one without choices: a typed reply never answers it, and it
+// never displaces a question that is open. Called once Slack has the message.
 func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	channel, thread, _ := slackChannelThread(conversation)
-	if m.Chat == nil || len(m.Chat.Choices) == 0 {
+	if m.Chat != nil && m.Chat.Plan != nil {
+		// A card moved: the Home tab's running list reads the board again.
+		s.homeChanged(true)
+	}
+	if m.Chat == nil || !asksQuestion(m.Chat.Choices) {
 		s.mu.Lock()
 		ux := s.uxLocked()
+		closed := false
 		if open, ok := ux.questions[conversation]; ok && open.ts == ts {
 			delete(ux.questions, conversation)
+			closed = true
 		}
 		s.mu.Unlock()
+		if closed {
+			s.homeChanged(false)
+		}
 		return
 	}
 	text := toMrkdwn(m.Text)
 	layout, err := renderSlackChat(m.Chat, text)
 	if err != nil {
 		return
+	}
+	if s.rates(m) {
+		// As posted, so a typed answer's rewrite keeps the rating controls.
+		layout = withFeedback(layout, m.Feedback)
 	}
 	blocks, err := json.Marshal(layout.Blocks)
 	if err != nil {
@@ -223,7 +267,23 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	delete(ux.answered, channel+"/"+ts)
 	delete(ux.lines, channel+"/"+ts)
 	s.mu.Unlock()
-	s.noteQuestion(conversation, slackQuestion{channel: channel, thread: thread, ts: ts, text: text, blocks: blocks, attachments: attachments})
+	title := text
+	if strings.TrimSpace(m.Chat.Headline) != "" {
+		title = toMrkdwn(m.Chat.Headline)
+	}
+	s.noteQuestion(conversation, slackQuestion{channel: channel, thread: thread, ts: ts, text: text, title: title,
+		blocks: blocks, attachments: attachments})
+	s.homeChanged(false)
+}
+
+// asksQuestion is whether choices hold one that is not an answer's next step.
+func asksQuestion(choices []chatmsg.Choice) bool {
+	for _, c := range choices {
+		if !c.Next {
+			return true
+		}
+	}
+	return false
 }
 
 // slackAnsweredOptions is slackMessageOptions for a message laid over a
@@ -285,35 +345,96 @@ func (s *SlackAdapter) notePending(msg InboundMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.addPendingLocked(slackPendingKey(msg.Conversation, msg.MessageID),
-		slackPending{conversation: msg.Conversation, author: msg.AuthorID, text: msg.Text})
+		slackPending{conversation: msg.Conversation, author: slackMemberOf(msg.AuthorID), text: msg.Text})
 }
 
+// noteHomeCandidate marks a pending turn that could set the home channel: a
+// top-level message in a channel, a private channel or a group direct message
+// (Kind "group"; a DM is never one). A top-level channel message that reached
+// here mentioned the bot (inboundEvent). InboundVerified acts on the mark
+// once the gateway has verified the sender.
+func (s *SlackAdapter) noteHomeCandidate(msg InboundMessage, m *slackevents.MessageEvent) {
+	if msg.Kind != slackKindGroup || m.ThreadTimeStamp != "" || msg.Unaddressed {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ux := s.uxLocked()
+	key := slackPendingKey(msg.Conversation, msg.MessageID)
+	if p, ok := ux.pending[key]; ok {
+		p.homeType = m.ChannelType
+		ux.pending[key] = p
+	}
+}
+
+// slackMemberOf is the Slack member id behind an author id: the id itself for
+// our own member, the part after the workspace for an admitted guest's
+// "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
+// feeds, the answered line's display name and the Home tab's asker, are Slack
+// API calls that take a member id.
+func slackMemberOf(author string) string {
+	if _, member, found := strings.Cut(author, slackGuestSep); found {
+		return member
+	}
+	return author
+}
+
+// The first entry under a key stands until the gateway's verdict takes it: a
+// shortcut and the typed message it was used on share one key (the message's
+// ts), and a second writer would take the first's verdict. Nothing else
+// writes a key twice: a redelivered message is dropped by alreadySeen, and a
+// click is keyed by its own action_ts.
 func (s *SlackAdapter) addPendingLocked(key string, p slackPending) {
 	ux := s.uxLocked()
-	if _, ok := ux.pending[key]; !ok {
-		remember(&ux.pendingOrder, key, func(k string) {
-			if old, ok := ux.pending[k]; ok && old.click {
-				delete(ux.claims, old.question.channel+"/"+old.question.ts)
-			}
-			delete(ux.pending, k)
-		})
+	if _, ok := ux.pending[key]; ok {
+		return
 	}
+	remember(&ux.pendingOrder, key, func(k string) {
+		if old, ok := ux.pending[k]; ok && old.click {
+			delete(ux.claims, old.question.channel+"/"+old.question.ts)
+		}
+		delete(ux.pending, k)
+	})
 	ux.pending[key] = p
 }
 
 // interactive turns one interactive envelope's payload into a turn, or
 // reports it is not one: a click on a choice button, from a member of the
-// bot's own workspace, on a question not already answered.
+// bot's own workspace or a guest the allowlist names as "T…:U…" (admitGuest),
+// on a question not already answered.
 func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	var p slackClickPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
 		s.log.Warn("slack: unreadable interactive payload", "err", err)
 		return InboundMessage{}, false
 	}
+	if p.ActionTS == "" && len(p.Actions) > 0 {
+		// Slack documents a block_actions payload's action_ts inside each
+		// action, not at the top as a shortcut's is; read without this, a
+		// real click has no timestamp and is dropped.
+		p.ActionTS = p.Actions[0].ActionTS
+	}
+	if p.Type == slackViewSubmission {
+		// A 👎's note, sent from its modal: never a turn.
+		s.feedbackNote(raw)
+		return InboundMessage{}, false
+	}
 	if p.Type != slackBlockActions || len(p.Actions) == 0 {
 		return InboundMessage{}, false
 	}
 	action := p.Actions[0]
+	if action.Type == slackFeedbackButtons && action.ActionID != slackFeedbackAction {
+		// A rating control the gateway did not draw (another app's, or an
+		// action id that changed): logged, so a tap never vanishes unseen.
+		s.log.Info("slack: dropping a rating tap with an unknown action id",
+			"actionType", action.Type, "actionId", action.ActionID, "blockId", action.BlockID, "channel", p.Channel.ID)
+		return InboundMessage{}, false
+	}
+	if action.ActionID == slackFeedbackAction {
+		// A rating: never a turn.
+		s.feedbackClick(p, action.Type, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
 		// A link button (Slack opened the url) or a button not ours.
 		return InboundMessage{}, false
@@ -321,26 +442,26 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if p.User.ID == "" || p.Channel.ID == "" || p.Message.TS == "" || p.ActionTS == "" {
 		return InboundMessage{}, false
 	}
+	conversation, thread, kind := slackClickConversation(p)
+	author := p.User.ID
 	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
-		s.log.Info("slack: ignoring a click from another workspace's member",
-			"userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
-		return InboundMessage{}, false
+		// The message path's rule (foreignSender): a member of another
+		// workspace is admitted only when the allowlist names them by
+		// workspace, and their click then carries the same "T…:U…" author.
+		guest, ok := s.admitGuest(p.User.TeamID, p.Team.ID, p.User.ID)
+		author = guest
+		if !ok {
+			s.log.Info("slack: ignoring a click from another workspace's member",
+				"user", p.User.ID, "userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
+			// The same once-per-sender notice a refused message gets, in the
+			// question's thread: a button that does nothing looks broken.
+			s.noticeForeignSender(p.Channel.ID, thread, p.User.TeamID, p.Team.ID, p.User.ID)
+			return InboundMessage{}, false
+		}
 	}
 	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
 		return InboundMessage{}, false
 	}
-	thread := p.Message.ThreadTS
-	if thread == "" {
-		thread = p.Container.ThreadTS
-	}
-	if thread == "" {
-		thread = p.Message.TS
-	}
-	kind, channelType := "group", "channel"
-	if strings.HasPrefix(p.Channel.ID, slackDMChannelPrefix) {
-		kind, channelType = "dm", slackChannelTypeIM
-	}
-	conversation := slackConversationID(channelType, p.Channel.ID, thread)
 	text := action.Value
 	if text == "" {
 		text = action.Text.Text
@@ -365,11 +486,29 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	return InboundMessage{
 		Conversation: conversation,
 		Kind:         kind,
-		AuthorID:     p.User.ID,
+		AuthorID:     author,
 		MessageID:    p.ActionTS,
 		Text:         text,
 		Click:        true,
 	}, true
+}
+
+// slackClickConversation is the conversation a clicked message is in, the
+// thread it is in (the message itself when it is top-level), and the turn
+// kind a click there is.
+func slackClickConversation(p slackClickPayload) (conversation, thread, kind string) {
+	thread = p.Message.ThreadTS
+	if thread == "" {
+		thread = p.Container.ThreadTS
+	}
+	if thread == "" {
+		thread = p.Message.TS
+	}
+	kind, channelType := "group", "channel"
+	if strings.HasPrefix(p.Channel.ID, slackDMChannelPrefix) {
+		kind, channelType = "dm", slackChannelTypeIM
+	}
+	return slackConversationID(channelType, p.Channel.ID, thread), thread, kind
 }
 
 // InboundVerified acts on a message once the gateway has decided on its
@@ -388,6 +527,40 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 	forget(&ux.pendingOrder, key)
 	if !ok {
 		s.mu.Unlock()
+		return
+	}
+	if verified {
+		// Any verified turn in the conversation: a shortcut's credit line
+		// still waiting for its task is not about the task this turn may
+		// start. A shortcut arms its own below.
+		s.uncreditLocked(conversation)
+	}
+	if verified && p.homeType != "" && !p.click && !p.shortcut && !chattext.IsCommand(p.text) {
+		// A verified ask typed at the top of a channel: the one turn that can
+		// set the home channel (slack_home_channel.go). A command is not an
+		// ask, and a click or a shortcut is not typed there.
+		s.homeCandidate(conversation, p.homeType, p.author)
+	}
+	if p.shortcut {
+		// A shortcut answers no question: it is an ask about a message, so
+		// it titles the thread after that message and credits the clicker
+		// when its task starts, and a clicker the gateway refused is told so
+		// where only they can see it.
+		if verified {
+			s.creditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
+			s.mu.Unlock()
+			s.noteAsk(conversation, p.text)
+			// The clicker asked, so a question the task posts waits on them
+			// (the Home tab's "waiting on you"), as for a typed ask.
+			s.noteAsker(conversation, p.author)
+			return
+		}
+		s.mu.Unlock()
+		s.goSession(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), slackShortcutTimeout)
+			defer cancel()
+			s.respondPrivately(ctx, p.responseURL, unverifiedNotice(slackBackend, p.author))
+		})
 		return
 	}
 	var q slackQuestion
@@ -418,6 +591,14 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		}
 	}
 	s.mu.Unlock()
+	if verified && !p.click && !chattext.IsCommand(p.text) && q.ts == "" {
+		// An ask, not an answer: whoever answers a question, by typing or by
+		// clicking, does not become the one the next question waits on.
+		s.noteAsker(conversation, p.author)
+	}
+	if q.ts != "" {
+		s.homeChanged(false)
+	}
 	if verified && !p.click && !chattext.IsCommand(p.text) && q.ts == "" {
 		// A command neither answers nor titles, and an answer to an open
 		// question is no ask to title the thread after.
@@ -452,19 +633,7 @@ func (s *SlackAdapter) answeredLine(channel, ts string) string {
 // slackTypedWords is a typed answer's words for its line: Slack's entities
 // reduced, whitespace collapsed, clipped to slackTypedAnswerMax code points.
 func slackTypedWords(text string) string {
-	// Slack's entities as the line shows them: a mention dropped (the line
-	// is plain text, and a name needs a lookup), a channel by its name, a
-	// link by its label, or its url when it has none.
-	text = slackTitleMention.ReplaceAllString(text, " ")
-	text = slackTitleChannel.ReplaceAllString(text, "$1")
-	text = slackTitleLink.ReplaceAllStringFunc(text, func(m string) string {
-		sub := slackTitleLink.FindStringSubmatch(m)
-		if sub[2] != "" {
-			return sub[2]
-		}
-		return sub[1]
-	})
-	words := strings.Join(strings.Fields(text), " ")
+	words := strings.Join(strings.Fields(slackEntitiesReduced(text)), " ")
 	if utf8.RuneCountInString(words) <= slackTypedAnswerMax {
 		return words
 	}
@@ -472,10 +641,36 @@ func slackTypedWords(text string) string {
 	return strings.TrimRight(string(r[:slackTypedAnswerMax-utf8.RuneCountInString(slackClipEllipsis)]), " ") + slackClipEllipsis
 }
 
+// slackEntitiesReduced is text with Slack's entities as plain text shows
+// them: a mention dropped (a name needs a lookup), a channel by its name, a
+// link by its label, or its url when it has none.
+func slackEntitiesReduced(text string) string {
+	text = slackTitleMention.ReplaceAllString(text, " ")
+	text = slackTitleChannel.ReplaceAllString(text, "$1")
+	return slackTitleLink.ReplaceAllStringFunc(text, func(m string) string {
+		sub := slackTitleLink.FindStringSubmatch(m)
+		if sub[2] != "" {
+			return sub[2]
+		}
+		return sub[1]
+	})
+}
+
 // slackUserName is how a user is named on an answered line: display name,
 // then real name, then handle, never a mention or an id.
 func (s *SlackAdapter) slackUserName(userID string) string {
 	u, err := s.api.GetUserInfo(userID)
+	return s.slackNameOf(userID, u, err)
+}
+
+// slackUserNameContext is slackUserName under ctx.
+func (s *SlackAdapter) slackUserNameContext(ctx context.Context, userID string) string {
+	u, err := s.api.GetUserInfoContext(ctx, userID)
+	return s.slackNameOf(userID, u, err)
+}
+
+// slackNameOf is the name a users.info answer gives userID.
+func (s *SlackAdapter) slackNameOf(userID string, u *slack.User, err error) string {
 	if err != nil || u == nil {
 		if err != nil {
 			s.log.Debug("slack: users.info failed; naming the answer generically", "user", userID, "err", err)
@@ -558,13 +753,13 @@ func slackAnsweredLayout(rawBlocks, rawAttachments json.RawMessage, line string)
 		var did bool
 		list, did = slackWithoutChoices(list, nil)
 		if did && !placed {
-			list = append(list, note)
+			list = slackWithNote(list, note)
 			placed = true
 		}
 		a["blocks"] = list
 	}
 	if !placed {
-		top = append(top, note)
+		top = slackWithNote(top, note)
 	}
 	// Sent as written, as the renderer sends them (slackRawBlocks):
 	// slack-go's typed blocks drop what they do not model, a fold's
@@ -617,7 +812,18 @@ func slackWithoutChoices(blocks []map[string]any, note map[string]any) ([]map[st
 		out = append(out, b)
 	}
 	if dropped && note != nil {
-		out = append(out, note)
+		out = slackWithNote(out, note)
 	}
 	return out, dropped
+}
+
+// slackWithNote adds the answered line as the last block, or just above an
+// answer's rating controls (slack_feedback.go), which stay the last block.
+func slackWithNote(blocks []map[string]any, note map[string]any) []map[string]any {
+	if n := len(blocks); n > 0 {
+		if t, _ := blocks[n-1]["type"].(string); t == slackContextActionsBlock {
+			return append(blocks[:n-1:n-1], note, blocks[n-1])
+		}
+	}
+	return append(blocks, note)
 }

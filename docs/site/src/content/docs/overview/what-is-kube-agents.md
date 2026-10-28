@@ -33,8 +33,8 @@ The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime]
 
 The Platform Agent talks to an LLM through a **Completions API** proxy so provider choice is a config toggle:
 
-- **[LiteLLM](https://litellm.ai)** for hosted models — Gemini (default), Vertex AI / Model Garden, Anthropic, OpenAI, or a personal ChatGPT subscription. Example manifests: [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini), [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).
-- **[vLLM](https://vllm.ai)** for local, open models on GPU node pools — [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) serves Gemma via GKE's official inference tutorial.
+- **[LiteLLM](https://litellm.ai)** for hosted models — Gemini (default), Vertex AI / Model Garden, Anthropic, OpenAI, or a personal ChatGPT subscription — or for an OpenAI-compatible server you run ([`openai_compatible`](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private)), [SAP AI Core](/kube-agents/concepts/inference-gateway/#sap-ai-core) or any other LiteLLM provider. Example manifests: [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini), [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).
+- **[vLLM](https://vllm.ai)** for local, open models on GPU node pools — [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) serves Gemma 4 26B-A4B through vLLM's OpenAI-compatible server on two L4 GPUs, with a 128k-token context.
 - An optional **inference-replay proxy** in front of either can cache responses from a `PersistentVolumeClaim` so demos and tests replay deterministically — [`examples/inference-replay/`](https://github.com/gke-labs/kube-agents/tree/main/examples/inference-replay).
 
 ### 4. GitHub Token Minter (Minty)
@@ -56,7 +56,7 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 ## What is _not_ included
 
 - **No local Kind install** — the installer and the Terraform composition it drives both target GKE, and a deployment needs a real GKE cluster. A kind cluster exists only as a development path for contributors; see [Helm and Kind](/kube-agents/install/helm-and-kind/). (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
-- **No web UI, and no CLI outside the pod** — chat is the primary user interface. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` is not a way in, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
+- **No web UI by default, and no CLI outside the pod** — chat is the primary user interface. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` does not reach the agent pod, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. The optional [web console](/kube-agents/deploy/web-console/) runs outside the sandbox and is reached through `kubectl port-forward`. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and install path all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 
 ## Where to go next

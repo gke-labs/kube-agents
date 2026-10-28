@@ -21,6 +21,22 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
+# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
+readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The first four bytes of an ELF executable, in hex: step 4.4's check that a file
+# named tirith is a binary before it removes it.
+readonly ELF_MAGIC_HEX=7f454c46
+# The model-call stale bound (providers.custom.stale_timeout_seconds) every profile
+# shipped with before the kanban workers got a shorter one. The cluster loop moves a
+# Cluster Agent profile that still holds it to its template's value
+# (migrate_stale_timeout_from_template).
+readonly OLD_SHIPPED_STALE_TIMEOUT_SECONDS=600
+readonly TSE_TEMPLATE="/opt/tse-template"
+readonly DEFAULTS_PLUGINS_DIR="/opt/defaults/plugins"
+readonly OPTIONAL_PROFILE_STAMP=".optional-profile"
+readonly DELETED_PROFILES_DIR=".deleted"
+readonly OPTIONAL_SYNC_ITEMS="config.yaml SOUL.md AGENTS.md CAPABILITIES.md"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -346,7 +362,7 @@ fi
 # built. There is deliberately no env-var override; a bypass switch would be readable to
 # exactly the caller this is meant to be honest with.
 SKILL_PROVENANCE_SCRIPT="/opt/defaults/scripts/verify_skills_provenance.py"
-for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do
+for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/tse-template/skills /opt/a2a-template/skills; do
     [ -f "$_tree/skills_manifest.sha256" ] || continue
     if [ ! -f "$SKILL_PROVENANCE_SCRIPT" ] || [ ! -x "$INSTALL_DIR/.venv/bin/python3" ]; then
         echo "FATAL: $_tree carries a build-time manifest but nothing here can check it ($SKILL_PROVENANCE_SCRIPT or $INSTALL_DIR/.venv/bin/python3 is missing); refusing to start" >&2
@@ -508,6 +524,21 @@ if [ -d "/opt/defaults/scripts" ]; then
     mkdir -p "$TARGET_DIR/scripts"
     cp -rf /opt/defaults/scripts/. "$TARGET_DIR/scripts/" \
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
+fi
+
+# 2b, continued: the onboarding plugin is image-owned too, and must come from the same image
+# as the delivery script above: its pre_llm_call hook holds the first report behind the greeting
+# and its post_llm_call hook releases it. A stale plugin beside a new bootstrap_delivery.py
+# writes no hold, so the report races the greeting as before the hold existed.
+#
+# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
+# created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
+# the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
+# copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
+if [ -d "/opt/defaults/plugins/bootstrap_onboarding" ]; then
+    { mkdir -p "$TARGET_DIR/plugins/bootstrap_onboarding" \
+        && cp -rf /opt/defaults/plugins/bootstrap_onboarding/. "$TARGET_DIR/plugins/bootstrap_onboarding/"; } \
+        || echo "WARN: could not refresh $TARGET_DIR/plugins/bootstrap_onboarding from the image; the first report may post before the greeting" >&2
 fi
 
 # 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.
@@ -680,6 +711,66 @@ if added:
     os.replace(tmp_path, live_path)
     print(f"[ENTRYPOINT] config backfill: restored {len(added)} key(s) the live file did not hold: {', '.join(added)}")
 PYEOF
+}
+
+# Move a live config.yaml from the stale bound every profile used to ship with to
+# the one its image template sets now, and change nothing else. $1 = the template,
+# $2 = the live file.
+#
+# Hermes reads providers.custom.stale_timeout_seconds to decide how long a model
+# call may send nothing before it drops the stream and retries
+# (hermes_cli/timeouts.py). Every profile shipped with 600s. The kanban workers
+# now ship with a shorter bound (agents/cluster/config.yaml carries the reason),
+# but a Cluster Agent's config.yaml is not force-synced, and the back-fill above
+# only adds keys the file lacks. So a cluster onboarded before the change keeps
+# 600s for the life of the volume, while a cluster onboarded after it gets the
+# new bound.
+#
+# Only the old shipped value moves. A profile that holds any other value has
+# had it set on purpose, and keeps it. The rewrite is atomic for the same reason
+# the back-fill's is: a torn config.yaml loses `cluster_identity`.
+#
+# The caller reports its own failure, as for the back-fill.
+migrate_stale_timeout_from_template() {
+    "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" "$OLD_SHIPPED_STALE_TIMEOUT_SECONDS" <<'STALEEOF'
+import os
+import sys
+
+import yaml
+
+template_path, live_path, old_value = sys.argv[1], sys.argv[2], int(sys.argv[3])
+PROVIDERS_KEY = "providers"
+PROVIDER = "custom"
+STALE_KEY = "stale_timeout_seconds"
+
+
+def stale_block(config):
+    providers = config.get(PROVIDERS_KEY) if isinstance(config, dict) else None
+    provider = providers.get(PROVIDER) if isinstance(providers, dict) else None
+    return provider if isinstance(provider, dict) else None
+
+
+with open(template_path) as fh:
+    template = yaml.safe_load(fh) or {}
+with open(live_path) as fh:
+    live = yaml.safe_load(fh) or {}
+
+template_block = stale_block(template)
+live_block = stale_block(live)
+if template_block is None or live_block is None:
+    raise SystemExit(0)
+target = template_block.get(STALE_KEY)
+current = live_block.get(STALE_KEY)
+if current != old_value or not isinstance(target, int) or target == old_value:
+    raise SystemExit(0)
+
+live_block[STALE_KEY] = target
+tmp_path = live_path + ".stale.tmp"
+with open(tmp_path, "w") as fh:
+    yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
+os.replace(tmp_path, live_path)
+print(f"[ENTRYPOINT] stale timeout migrate: {PROVIDERS_KEY}.{PROVIDER}.{STALE_KEY} {current} -> {target}")
+STALEEOF
 }
 
 # Make a live config.yaml send the User-Agent its image template sends on every remote
@@ -975,7 +1066,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # do, because cron_jobs_sync.py never prunes: its ledger stops a retired job
 # coming BACK, it never removes one the volume already has.
 #
-# `--cron-retire` deletes the governance ids from this roster outright. They ran
+# `--cron-retire` deletes the listed ids from this roster outright. The governance ids ran
 # here only while the platform profile's store had no ticker; now that
 # `profile-cron-tick` gives it one, they are back on the Platform Agent's own
 # roster where the scheduler can reach their `skills`, `model` and `max_turns`
@@ -990,6 +1081,10 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # this image ships it. Retiring it and shipping it on the Platform Agent's roster
 # is the same move, applied late.
 #
+# first-run-quick-value-audit is retired, not moved: `oobe` runs the same first-run audits. A
+# volume that never booted an image shipping it disabled still holds it enabled, and nothing
+# else can reach that copy once the image stops shipping it.
+#
 # It runs BEFORE 2c-bis deliberately, and the two lists must not overlap. The
 # order only decides how fast an accidental overlap bites, not whether it does:
 # retire-last would delete a job the image still ships on every single boot,
@@ -1000,7 +1095,8 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # an id belongs on this list only once no roster in this image ships it.
 #
 # This list shrinks to nothing once no live volume can still be carrying the
-# entries; until then removing a name from it silently restores the double-fire.
+# entries; until then removing a name from it silently restores the double-fire, or for
+# first-run-quick-value-audit an enabled copy nothing can reach.
 #
 # `--home` overlays the default profile in place, because that profile IS
 # $TARGET_DIR and has no entry under profiles/ to name. `--cron-jobs` names the
@@ -1016,7 +1112,7 @@ if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
         --template /opt/defaults \
         --items "cron" \
         --cron-jobs "profile-cron-tick" \
-        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver first-run-quick-value-audit" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
@@ -1037,8 +1133,9 @@ fi
 # Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
 # coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
-# rather than a volume each — every replica's gateway is an owner and several of them run
+# At availability.replicas > 1 — where the operator would give the replicas ONE ReadWriteMany PVC
+# rather than a volume each, a shape it does not render while it caps the gateway at one
+# replica — every replica's gateway is an owner and several of them run
 # this against the same file, with a rolling update overlapping new pods and old. While
 # .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
 # cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
@@ -1052,13 +1149,12 @@ fi
 # be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
 # different reason: an install that onboarded before the job existed must never get it. oobe.py
 # skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
-# it is not owed. `first-run-quick-value-audit` ships disabled; seeding it keeps an onboarded
-# install from gaining even the disabled entry.
+# it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe,first-run-quick-value-audit"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
@@ -1317,8 +1413,9 @@ sync_profile_skills() {
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
-    # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
-    # every replica the SAME PVC (ReadWriteMany; see step 2c-bis and cron_jobs_sync.py's
+    # $_dst lives on the PVC, and at availability.replicas > 1 the operator handed
+    # every replica the SAME PVC (ReadWriteMany; the operator now caps the gateway at
+    # one replica, but this stays for when that lifts; see step 2c-bis and cron_jobs_sync.py's
     # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
     # are shared names on a shared volume. The unconditional `rm -rf` below then
     # reaches into another pod's swap: pod A completes `mv skills skills.old`, so
@@ -1513,13 +1610,54 @@ fi
 # repairs. Kept after 2.6a only because it is the caller — everything here belongs to
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
+# The plugin code a cluster profile copies once, at scaffold time, from the shared
+# plugins tree (cluster_agent_profile.py), and that no later step refreshes. These two
+# hold no per-profile state, unlike hermes_otel, whose config.yaml carries the
+# profile's pinned collector endpoint. The template enables tool_call_audit, and the
+# back-fill below turns it on for a profile already on the volume, so the loop has to
+# give that profile the image's code too: a copy scaffolded before the plugin wrote
+# logs/audit.jsonl logs its records where the sidecar does not ship them.
+CLUSTER_SHARED_PLUGINS="/opt/defaults/plugins"
+CLUSTER_IMAGE_PLUGINS="tool_call_audit common"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
+    CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
+    [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
+        # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
+        # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
+        # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
+        # keep their identity in SOUL.md.
+        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
+                || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
+        fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
+        # Refresh the image-owned plugin code (see CLUSTER_IMAGE_PLUGINS). Each file is
+        # copied to a temporary name beside its target and renamed over it, so a copy
+        # that fails part-way leaves the old file whole, never a truncated module that
+        # stops the plugin loading. The temporary name carries the pod name, because
+        # replicas share this volume. A symlink is an operator-mounted plugin volume
+        # (step 2.65) and is left alone.
+        # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
+        _refresh_tag="${HOSTNAME:-$$}"
+        for _plugin in $CLUSTER_IMAGE_PLUGINS; do
+            _src="$CLUSTER_SHARED_PLUGINS/$_plugin"
+            _dst="$d/plugins/$_plugin"
+            [ -d "$_src" ] || continue
+            [ -L "$_dst" ] && continue
+            if ! (cd "$_src" && find . -type f) | while IFS= read -r _file; do
+                _tmp="$_dst/$_file.refresh.$_refresh_tag"
+                { mkdir -p "$(dirname "$_dst/$_file")" && cp -p "$_src/$_file" "$_tmp" && mv -f "$_tmp" "$_dst/$_file"; } 2>/dev/null \
+                    || { rm -f "$_tmp" 2>/dev/null; exit 1; }
+            done; then
+                echo "WARN: could not refresh the $_plugin plugin in $d; each file not yet replaced keeps the copy it was scaffolded with" >&2
+            fi
+        done
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
@@ -1549,6 +1687,14 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             backfill_config_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
                 || echo "WARN: config back-fill failed for $d/config.yaml; this cluster agent keeps the keys it was scaffolded with" >&2
+        fi
+        # Third targeted self-heal, same file: move the model-call stale bound from the
+        # 600s every profile shipped with to the template's worker bound. Fill-only
+        # cannot do it, because the key is already there. A value other than 600 was
+        # set on purpose and stays. Before the User-Agent repair, after the back-fill.
+        if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
+            migrate_stale_timeout_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
+                || echo "WARN: stale timeout migration failed for $d/config.yaml; this cluster agent keeps its old model-call bound" >&2
         fi
         # Second targeted self-heal, same file, same reason it is not force-synced: the
         # User-Agent the profile's remote MCP calls carry is image-owned, and lives in
@@ -1631,6 +1777,131 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
             || echo "WARN: could not seed profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door has no config of its own" >&2
     fi
 fi
+
+# 2.6c Reconcile optional built-in specialist profiles declared in KUBE_AGENTS_ENABLED_PROFILES.
+#
+# In `mode: next` (and when explicitly opted in via KUBE_AGENTS_ENABLED_PROFILES),
+# the operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
+# custom resources whose names match a built-in optional specialist template
+# baked into the image (currently `tse`, backed by /opt/tse-template).
+# Profiles marked with `.optional-profile` that are removed from KUBE_AGENTS_ENABLED_PROFILES
+# are archived into `$TARGET_DIR/profiles/.deleted/<name>` so the Chat Agent's
+# dynamic roster (`agent_roster.py`) stops advertising them without destroying
+# prior session state.
+reconcile_optional_profiles() {
+    _opt_enabled_raw="$(printf '%s' "${KUBE_AGENTS_ENABLED_PROFILES:-}" | tr ',' ' ')"
+    _opt_enabled_list=" "
+
+    set -f
+    for _opt_token in $_opt_enabled_raw; do
+        set +f
+        [ -n "$_opt_token" ] || continue
+        case "$_opt_token" in
+            tse)
+                ;;
+            *)
+                echo "WARN: ignoring unsupported or reserved optional profile name '$_opt_token' in KUBE_AGENTS_ENABLED_PROFILES" >&2
+                continue
+                ;;
+        esac
+        case "$_opt_enabled_list" in
+            *" $_opt_token "*) ;;
+            *) _opt_enabled_list="${_opt_enabled_list}${_opt_token} " ;;
+        esac
+    done
+    set +f
+
+    for _opt_name in $_opt_enabled_list; do
+        _opt_tpl=""
+        case "$_opt_name" in
+            tse) _opt_tpl="$TSE_TEMPLATE" ;;
+        esac
+        if [ -z "$_opt_tpl" ] || [ ! -d "$_opt_tpl" ]; then
+            echo "WARN: optional profile '$_opt_name' is enabled in KUBE_AGENTS_ENABLED_PROFILES, but template '$_opt_tpl' does not exist; skipping" >&2
+            continue
+        fi
+
+        _opt_home="$TARGET_DIR/profiles/$_opt_name"
+        _opt_deleted="$TARGET_DIR/profiles/$DELETED_PROFILES_DIR/$_opt_name"
+        if [ ! -d "$_opt_home" ] && [ -d "$_opt_deleted" ]; then
+            mkdir -p "$TARGET_DIR/profiles" 2>/dev/null || {
+                echo "WARN: could not create $TARGET_DIR/profiles for '$_opt_name'; continuing" >&2
+                continue
+            }
+            if mv "$_opt_deleted" "$_opt_home" 2>/dev/null; then
+                echo "[ENTRYPOINT] Restored previously archived optional profile '$_opt_name' from $DELETED_PROFILES_DIR/." >&2
+            else
+                echo "WARN: could not restore archived optional profile '$_opt_name' from $_opt_deleted; skipping scaffold so archive is preserved" >&2
+                continue
+            fi
+        fi
+
+        if [ ! -f "$_opt_home/profile.yaml" ] && [ -f "$SCAFFOLD" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            echo "[ENTRYPOINT] Scaffolding optional profile '$_opt_name' from $_opt_tpl..." >&2
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" \
+                --name "$_opt_name" \
+                --template "$_opt_tpl" \
+                --plugins "$DEFAULTS_PLUGINS_DIR" \
+                --description "Optional specialist profile ($_opt_name)" >/dev/null \
+                || echo "WARN: optional profile '$_opt_name' scaffold failed; continuing" >&2
+        fi
+
+        # Gate all post-scaffold writes on profile.yaml (just as step 2.5 and 2.6 do
+        # for `platform`): writing files into an unregistered directory would prevent
+        # `_clear_mount_skeleton` from cleaning it up and leave the profile permanently
+        # unregistered across restarts.
+        if [ ! -f "$_opt_home/profile.yaml" ]; then
+            echo "WARN: optional profile '$_opt_name' has no profile.yaml after scaffold; skipping sync so next start can retry" >&2
+            continue
+        fi
+
+        touch "$_opt_home/$OPTIONAL_PROFILE_STAMP" 2>/dev/null || true
+
+        if [ -f "$SCAFFOLD" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" \
+                --name "$_opt_name" \
+                --template "$_opt_tpl" \
+                --plugins "$DEFAULTS_PLUGINS_DIR" \
+                --items "$OPTIONAL_SYNC_ITEMS" >/dev/null \
+                || echo "WARN: optional profile '$_opt_name' template sync failed; continuing" >&2
+        fi
+
+        sync_profile_skills "$_opt_tpl" "$_opt_home"
+
+        if [ -d "$TARGET_DIR/scripts" ]; then
+            ln -sfn "$TARGET_DIR/scripts" "$_opt_home/scripts" 2>/dev/null || true
+        fi
+    done
+
+    for _opt_dir in "$TARGET_DIR/profiles"/*; do
+        [ -d "$_opt_dir" ] || continue
+        [ -f "$_opt_dir/$OPTIONAL_PROFILE_STAMP" ] || continue
+        _opt_base="$(basename "$_opt_dir")"
+        case "$_opt_enabled_list" in
+            *" $_opt_base "*) ;;
+            *)
+                mkdir -p "$TARGET_DIR/profiles/$DELETED_PROFILES_DIR" 2>/dev/null || {
+                    echo "WARN: could not create $TARGET_DIR/profiles/$DELETED_PROFILES_DIR to archive '$_opt_base'; continuing" >&2
+                    continue
+                }
+                _opt_archived="$TARGET_DIR/profiles/$DELETED_PROFILES_DIR/$_opt_base"
+                if [ -e "$_opt_archived" ]; then
+                    _opt_prev="${_opt_archived}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+                    if mv "$_opt_archived" "$_opt_prev" 2>/dev/null; then
+                        echo "WARN: archive profiles/$DELETED_PROFILES_DIR/$_opt_base already existed; rotated prior archive to $(basename "$_opt_prev")" >&2
+                    else
+                        echo "WARN: archive profiles/$DELETED_PROFILES_DIR/$_opt_base already exists and could not be rotated; leaving both in place" >&2
+                        continue
+                    fi
+                fi
+                mv "$_opt_dir" "$_opt_archived" 2>/dev/null \
+                    && echo "[ENTRYPOINT] Archived disabled optional profile '$_opt_base' to profiles/$DELETED_PROFILES_DIR/$_opt_base." >&2 \
+                    || echo "WARN: could not archive disabled optional profile '$_opt_base'" >&2
+                ;;
+        esac
+    done
+}
+reconcile_optional_profiles
 
 # 2.65 Link profile-targeted plugin image volumes into their profile homes.
 #
@@ -1846,6 +2117,39 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
         echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
         exit 1
     fi
+fi
+
+# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
+# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
+# so with the image's copy there a home's bin/tirith is dead cache, never used
+# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
+# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
+# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
+# or a profile's bin/ that starts with the ELF magic. The file is never run: it
+# sits on a volume workers can write, and this is the bootstrap container. Each
+# removal is logged with its size, so an operator can see where the space went.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
+        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_tirith"; then
+            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+        fi
+    done
+fi
+
+# 4.4b Point npm in every home on the volume at one cache, <agentHome>/.cache/npm,
+# through a ~/.npm symlink in each home. Each profile's processes run with HOME at
+# profiles/<name>/home, so npm kept a ~100 MiB cache per profile (gke-labs#3376).
+# The scaffolder links each profile it creates; this sweep covers the homes created
+# before it did. It also removes each old per-profile ~/.npm directory and logs its
+# size. The scaffolder leaves an old cache in place, because a process of the
+# profile can be using it. A symlink a user made stays. Image copy of the script,
+# as for step 2.5.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" --share-npm-cache \
+        || echo "WARN: could not point npm at the shared cache; each profile keeps its own" >&2
 fi
 
 # Everything that writes shared volume state is done; release the bootstrap lock

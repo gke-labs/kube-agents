@@ -194,10 +194,13 @@ print("the answer")
 		}
 	}
 
-	// Order on the wire: the trace precedes the result, and the result the
-	// final; the first activity part opens the artifact, the second appends.
+	// Order on the wire: the trace precedes the turn's usage, the usage the
+	// result, and the result the final; the first activity part opens the
+	// artifact, the second appends. Each plan step goes out when it closes:
+	// kubectl's at the next tool's call, the last one at the drain, still
+	// ahead of the result (activity_steps.go).
 	trail := eventTrail(t, replayEvents(t, url, "task-activity"))
-	want := []string{"submitted", "working", "activity", "activity", "result", "completed/final"}
+	want := []string{"submitted", "working", "activity", "steps", "activity", "usage", "steps", "result", "completed/final"}
 	if strings.Join(trail, " ") != strings.Join(want, " ") {
 		t.Fatalf("event trail = %v, want %v", trail, want)
 	}
@@ -358,7 +361,7 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	if !strings.Contains(out, "DIR="+want) {
 		t.Fatalf("child scope dir: %s", out)
 	}
-	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}
@@ -467,7 +470,7 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 	var d hookDelivery
 	d.Event, d.ToolName, d.Timestamp = hookPostToolCall, long, long
 	d.Extra.ToolCallID, d.Extra.Status = long, "ok"
-	e, ok := a.observe(d)
+	e, ok, _ := a.observe(d)
 	if !ok || len(e.Tool) != activityToolNameCap || len(e.CallID) != activityCallIDCap || len(e.At) != activityWordCap {
 		t.Fatalf("entry fields not bounded: ok=%v tool=%d callId=%d at=%d", ok, len(e.Tool), len(e.CallID), len(e.At))
 	}
@@ -501,7 +504,7 @@ func TestActivity_UnreadableSignedDeliveryIsNotCounted(t *testing.T) {
 	if err := json.Unmarshal(good, &d); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
+	if e, ok, _ := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
 		t.Fatalf("post without an open pre was not published whole: %+v %v", e, ok)
 	}
 }
@@ -621,13 +624,13 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 		return d
 	}
 	a := newActivityState(false)
-	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
+	if e, _, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
 		t.Fatalf("blocked -> %+v", e)
 	}
-	if e, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
+	if e, _, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
 		t.Fatalf("error/tool_error -> %+v", e)
 	}
-	if e, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
+	if e, _, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
 		t.Fatalf("ok -> %+v", e)
 	}
 }
@@ -1197,7 +1200,8 @@ func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
 		if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","delivery_id":"`+id+`","extra":{"tool_call_id":"`+id+`","status":"ok"}}`), &d); err != nil {
 			t.Fatal(err)
 		}
-		return a.observe(d)
+		e, ok, _ := a.observe(d)
+		return e, ok
 	}
 	for i := 0; i < activitySeenCap+1; i++ {
 		if _, ok := post(fmt.Sprintf("d-%d", i)); !ok {
@@ -1224,7 +1228,7 @@ func TestActivity_OneFieldsTypeDoesNotDropTheDelivery(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","tool_input":{"command":"ls"},"timestamp":{"x":1},"delivery_id":12,"extra":{"tool_call_id":7,"duration_ms":"fast","status":"ok","error_type":null}}`), &d); err != nil {
 		t.Fatalf("a field's type dropped the delivery: %v", err)
 	}
-	e, ok := a.observe(d)
+	e, ok, _ := a.observe(d)
 	if !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted || e.DurationMs != 0 || e.CallID != "7" || e.At != "" {
 		t.Fatalf("observed %+v %v", e, ok)
 	}

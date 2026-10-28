@@ -203,8 +203,12 @@ def _headline(text: Any) -> str:
     return _presenter._clip(_line(_presenter._plain(str(text or ""))), _presenter.HEADLINE_MAX)
 
 
-def _choice(label: str, reply: str = "", primary: bool = False) -> dict | None:
-    """One choice, or None when it cannot be one: empty, too long to reply, or a command word."""
+def _choice(label: str, reply: str = "", primary: bool = False, next_step: bool = False) -> dict | None:
+    """One choice, or None when it cannot be one: empty, too long to reply, or a command word.
+
+    ``next_step`` marks it ``next``: a finished answer's optional follow-up, which a typed
+    reply never answers.
+    """
     text = _presenter._clip(_line(label), _presenter.BUTTON_TEXT_MAX)
     if not text:
         return None
@@ -218,6 +222,8 @@ def _choice(label: str, reply: str = "", primary: bool = False) -> dict | None:
         choice["reply"] = reply
     if primary:
         choice["primary"] = True
+    if next_step:
+        choice["next"] = True
     return choice
 
 
@@ -386,7 +392,15 @@ def answer_message(markdown: str) -> dict | None:
     detail is its opening paragraph, each option's shown line and the question,
     and the rest goes under "why". A choice the gateway would read as a command,
     or a detail past :data:`DETAIL_MAX`, keeps the layout above.
+
+    An answer is laid out without any step-shaped line at its end
+    (``slack_moments.visible_text``), since the line is plumbing no surface shows.
+    The step it declares (``slack_moments.next_step``) is its one choice, unless
+    the answer offers options, which win, or the gateway would read the step as a
+    command, which makes it no choice.
     """
+    step = _moments.next_step(markdown)[1]
+    markdown = _moments.visible_text(markdown)
     headline, body = _presenter.split_answer(markdown)
     if not headline:
         return None
@@ -401,9 +415,11 @@ def answer_message(markdown: str) -> dict | None:
         if all(choices) and len(detail) <= DETAIL_MAX:
             fold = {"title": FOLD_TITLE_DEFAULT, "text": folded} if folded else None
             return message(headline=headline, detail=detail, fold=fold, choices=choices)
+    choice = _choice(step, next_step=True) if step else None
+    choices = [choice] if choice else None
     if len(text) > DETAIL_MAX:
-        return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text})
-    return message(headline=headline, detail=text)
+        return message(headline=headline, fold={"title": FOLD_TITLE_DEFAULT, "text": text}, choices=choices)
+    return message(headline=headline, detail=text, choices=choices)
 
 
 def _row(row: Any) -> dict:
@@ -451,6 +467,7 @@ def report_message(
     after_rows: str = "",
     fold_title: str = "",
     fold_rows: Sequence[Any] = (),
+    replies: Mapping[str, str] | None = None,
 ) -> dict:
     """:func:`slack_presenter.blocks_report`'s report: the first choice primary, links after.
 
@@ -459,7 +476,11 @@ def report_message(
     ``detail``, as a needs-you question keeps an option it cannot offer.
     ``fold_rows`` go under ``fold_title`` as the fold's text, a row each
     (its severity as inline code, its detail on the line under it).
+    ``replies`` gives a choice, by its label, the longer turn its click posts;
+    a reply :func:`_choice` refuses leaves the choice's label as its turn.
     """
+    # Keyed as `kept` spells the labels, by the same function, so a lookup by a kept label finds its reply.
+    replies = {spelled: reply for label, reply in (replies or {}).items() for spelled in _presenter._choice_labels([label])}
     shown = _presenter._shown(rows)[:ROWS_MAX]
     kept, left = _usable(choices)
     detail_line = _presenter._clip(_line(_presenter._plain(detail or "")), _presenter.ROW_TEXT_MAX)
@@ -480,7 +501,10 @@ def report_message(
         rows=[_row(row) for row in shown],
         after=after[:AFTER_MAX],
         fold=fold,
-        choices=[_choice(label, primary=not i) for i, label in enumerate(kept[:CHOICES_MAX])],
+        choices=[
+            _choice(label, reply=replies.get(label, ""), primary=not i) or _choice(label, primary=not i)
+            for i, label in enumerate(kept[:CHOICES_MAX])
+        ],
         links=_links(links),
     )
 
@@ -550,18 +574,21 @@ def needs_you_settled(chat: Mapping[str, Any]) -> dict:
     return {name: value for name, value in chat.items() if name != "choices"}
 
 
-def failure_message(reply: str, offer: bool) -> dict | None:
-    """A failure wake's reply: its first sentence as the headline, the rest as detail, Try again with ``offer``.
+def failure_message(reply: str, offer: bool, label: str = "") -> dict | None:
+    """A failure wake's reply: its first sentence as the headline, the rest as detail, an offer with ``offer``.
 
-    ``offer`` is whether ``slack_ux_failure.present`` found the closing yes/no
-    question it turns into the button. None when the rest is past
+    ``offer`` is whether the reply gets its button: ``slack_ux_failure.present``
+    found the closing yes/no question, or the reply declared its next step,
+    which ``label`` then is (``reply`` without the step's line); with no
+    ``label`` the button reads Try again. None when the rest is past
     :data:`DETAIL_MAX`, or there is no headline, and the reply posts as text.
     """
     headline, body = _presenter.split_answer(reply)
     detail = "\n\n".join(body).strip()
     if not headline or len(detail) > DETAIL_MAX:
         return None
-    return message(headline=headline, detail=detail, choices=[_choice(OFFER_LABEL)] if offer else None)
+    choice = _choice(label or OFFER_LABEL, next_step=bool(label)) if offer else None
+    return message(headline=headline, detail=detail, choices=[choice] if choice else None)
 
 
 def _triage_reply(label: str, reply: str) -> str:

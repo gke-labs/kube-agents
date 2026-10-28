@@ -12,6 +12,10 @@ locals {
     # credential broker's relay on the Trace role granted below; the API has
     # to be on for the grant to buy anything.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences on the GKE Hub role granted below; the API has
+    # to be on for the grant to buy anything.
+    "gkehub.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -57,6 +61,13 @@ locals {
   # scripts/installer/installer_common.sh.
   vertex_location = var.vertex_location != "" ? var.vertex_location : "global"
   litellm_ksa     = "kubeagents-litellm"
+
+  use_openai_compatible = var.model_provider == "openai_compatible"
+  # The providers the chart knows a default model for; any other slug needs
+  # model_default_name, checked below so the plan fails rather than the render.
+  model_provider_has_default = contains(["gemini", "anthropic", "openai", "vertex_ai", "sap"], var.model_provider)
+  # The key the CA bundle Secret holds the PEM under, as for the GitLab CA.
+  openai_compatible_ca_key = "ca.crt"
 
   # The minter chart values need the GitOps repository split into owner and
   # name. Accepts the same forms integration.github.gitRepo takes: owner/repo,
@@ -110,12 +121,14 @@ locals {
       }
     } : {},
     var.enable_slack ? {
-      slack = {
+      slack = merge({
         enabled         = true
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      }
+        }, var.slack_home_channel_policy != "" ? {
+        homeChannelPolicy = var.slack_home_channel_policy
+      } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
@@ -149,6 +162,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -185,6 +199,9 @@ locals {
       ANTHROPIC_API_KEY       = var.anthropic_api_key
       GEMINI_API_KEY          = var.gemini_api_key
       OPENAI_API_KEY          = var.openai_api_key
+      # Read by the gateway for openai_compatible only, and sent to that
+      # server alone.
+      OPENAI_COMPATIBLE_API_KEY = var.openai_compatible_api_key
     } : key => value if value != ""
   }
 
@@ -217,11 +234,9 @@ locals {
   }
 
   # The registry third-party images are pulled from on a mirrored install:
-  # third_party_image_registry, falling back to image_registry, the same
-  # precedence the chart's kube-agents.thirdPartyImageRegistry helper applies.
-  # Empty means the upstream registries.
+  # third_party_image_registry. Empty means the upstream registries.
   third_party_registry = trimsuffix(
-    var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
+    var.third_party_image_registry,
     "/"
   )
 
@@ -320,6 +335,26 @@ locals {
       try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
     )
   )
+
+  # Whether the release will deploy the web console, by either door that
+  # reaches the field (web_console_enabled or extra_helm_values.webConsole.enabled).
+  web_console_requested = (
+    var.web_console_enabled ||
+    try(tobool(var.extra_helm_values.webConsole.enabled) == true, false)
+  )
+}
+
+# A warning rather than a precondition: setting image_registry without
+# third_party_image_registry is a valid configuration if the operator only
+# intends to mirror first-party images. But third-party images (cert-manager,
+# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# will remain on upstream public registries. On restricted or air-gapped clusters,
+# operators must be informed so deployments do not fail on ImagePullBackOff.
+check "unmirrored_third_party_images" {
+  assert {
+    condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+  }
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -840,6 +875,15 @@ locals {
   alert_daily_limits = { for bucket, limit in var.alert_daily_limits : bucket => limit if limit != null }
 }
 
+# The operator's own data volume size (agentDataStorageSize), which is also the
+# platform_agent_storage_size default. That value passes the chart nothing, so
+# the CR carries no spec.storage and the operator default applies.
+# tests/test_platform_agent_storage_size_defaults.py pins this local, the
+# variable default and install.defaults.env to the operator constant.
+locals {
+  platform_agent_default_storage_size = "50Gi"
+}
+
 resource "helm_release" "kube_agents" {
   name             = "kube-agents"
   chart            = "${path.module}/../../../charts/kube-agents"
@@ -858,17 +902,17 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the three the chart
-    # does not render itself — the agent Deployment, the shell sandbox
-    # StatefulSet, and the fluent-bit sidecar the operator resolves at
-    # reconcile time. See the chart README's "Installing from a mirrored
-    # registry".
+    # Reaches every image this release pulls, including the two the chart
+    # does not render itself — the agent Deployment and the shell sandbox
+    # StatefulSet the operator resolves at reconcile time (the fluent-bit
+    # sidecar follows thirdPartyImageRegistry). See the chart README's
+    # "Installing from a mirrored registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
-    # local.cert_manager_mirror_values carries the same registry to that
-    # release's image repositories, so a mirrored install pulls every image —
-    # cert-manager's included — from the mirror.
+    # When third_party_image_registry is set, local.cert_manager_mirror_values
+    # carries it to that release's image repositories, so a fully mirrored
+    # install pulls cert-manager from the mirror too.
     global = {
       imageRegistry           = var.image_registry
       thirdPartyImageRegistry = var.third_party_image_registry
@@ -906,6 +950,10 @@ resource "helm_release" "kube_agents" {
         modelDefaultName = var.model_default_name
         maxTokens        = var.model_max_tokens
       },
+      # Only when named, so an install without one renders the values it did.
+      var.litellm_env_secret_name != "" ? {
+        envFromSecret = var.litellm_env_secret_name
+      } : {},
       local.use_vertex ? {
         vertex = {
           serviceAccountName = local.litellm_ksa
@@ -914,6 +962,20 @@ resource "helm_release" "kube_agents" {
           }
           projectId = local.vertex_project
           location  = local.vertex_location
+        }
+      } : {},
+      # Only for this provider, so every other install renders the values it
+      # did before. A target port of 0 is the variable's "unset", which the
+      # chart spells null.
+      local.use_openai_compatible ? {
+        openaiCompatible = {
+          apiBase     = var.openai_compatible_api_base
+          targetPort  = var.openai_compatible_target_port == 0 ? null : var.openai_compatible_target_port
+          egressCIDRs = var.openai_compatible_egress_cidrs
+          caBundleSecretRef = {
+            name = var.openai_compatible_ca_secret_name
+            key  = local.openai_compatible_ca_key
+          }
         }
       } : {},
       # Only while on, so an install that never turns redaction on renders the
@@ -932,7 +994,9 @@ resource "helm_release" "kube_agents" {
     )
     # merge(), so "today" adds no key and the values this composition hands the
     # chart stay what they were before platform_agent_mode existed; the chart
-    # leaves spec.mode out of the CR while its value is null.
+    # leaves spec.mode out of the CR while its value is null. The storage size
+    # works the same way: the default adds no key, and the CR carries no
+    # spec.storage.
     platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
@@ -1055,6 +1119,8 @@ resource "helm_release" "kube_agents" {
         data   = local.credentials
       }
       integration = local.platform_agent_integration
+      }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
+      storage = { size = var.platform_agent_storage_size }
       }, var.platform_agent_mode == "today" ? {} : {
       mode = var.platform_agent_mode
     })
@@ -1088,6 +1154,18 @@ resource "helm_release" "kube_agents" {
         gsaName = module.github_minter[0].service_account_id
       } : {}
     )
+    # The browser chat page for installs with no chat platform. Its image
+    # follows platformAgent.deployment.image.tag and global.imageRegistry,
+    # and its Service is ClusterIP by construction. agentIdentity is what the
+    # console's identity box shows: the console holds no credentials to read
+    # IAM, so the agent's GSA and project roles are recorded here at apply.
+    webConsole = {
+      enabled = var.web_console_enabled
+      agentIdentity = {
+        gcpServiceAccount = module.kube_agents_iam.service_account_email
+        roles             = sort(module.kube_agents_iam.agent_project_roles)
+      }
+    }
     plugins = {
       pubsubPlatform = merge(
         {
@@ -1148,6 +1226,23 @@ resource "helm_release" "kube_agents" {
   ]
 
   lifecycle {
+    # The chart refuses to render openai_compatible without these, and a
+    # render failure inside helm_release arrives after the cluster and IAM
+    # have been built; a precondition fails the plan instead. The egress rules
+    # (a target port for a Service, CIDRs otherwise) are the chart's to judge.
+    precondition {
+      condition     = !local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"openai_compatible\" requires model_default_name, the model the server serves; the provider has no default."
+    }
+    precondition {
+      condition     = !local.use_openai_compatible || var.openai_compatible_api_base != ""
+      error_message = "model_provider = \"openai_compatible\" requires openai_compatible_api_base, the server's base URL including /v1."
+    }
+    precondition {
+      condition     = local.model_provider_has_default || local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"${var.model_provider}\" is a LiteLLM provider slug outside the chart's table, which has no default model: set model_default_name to the model it serves."
+    }
+
     precondition {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
@@ -1254,6 +1349,16 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.extra_helm_values_countermands_detector
       error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
+    }
+
+    # The web console holds the Platform Agent's API key with no login of its
+    # own; its deny-all-ingress NetworkPolicy is what confines access to
+    # kubectl port-forward. On a cluster that enforces no NetworkPolicy
+    # (create_cluster = false with accept_no_network_policy = true), any pod in
+    # the cluster could reach the console Service and drive the agent.
+    precondition {
+      condition     = !local.web_console_requested || module.gke_cluster.network_policy_enforced
+      error_message = "the web console requires a cluster that enforces NetworkPolicy (web_console_enabled = true or webConsole.enabled in extra_helm_values cannot be used when NetworkPolicy is not enforced, such as create_cluster = false with accept_no_network_policy = true): its deny-all-ingress NetworkPolicy is what confines access to kubectl port-forward, and without enforcement any pod in the cluster can reach the console Service and drive the agent."
     }
   }
 }

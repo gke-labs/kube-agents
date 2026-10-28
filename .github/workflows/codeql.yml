@@ -1,0 +1,162 @@
+name: CodeQL
+
+# CodeQL as an advanced setup, so that it runs on pull requests from forks.
+#
+# GitHub's default setup scans pushes to `main` and the protected branches, a
+# weekly schedule, and pull requests "excluding pull requests from forks"
+# (docs: About setup types for code scanning). Every pull request here comes
+# from a fork, so default setup's first look at a change was the push to
+# `main` after the squash merge, and the alerts it opened landed after the
+# fact. A `pull_request` workflow runs for a fork too, and code scanning
+# "always allows the uploading of results when the `pull_request` event
+# triggers the action run" even though the fork's token is read-only (docs:
+# Error: 403 "Resource not accessible by integration").
+#
+# This workflow replaces default setup rather than running beside it: GitHub
+# rejects an advanced-setup upload while default setup is enabled for the
+# repository ("CodeQL analyses from advanced configurations cannot be
+# processed when the default setup is enabled"), so default setup has to be
+# switched off in the repository's Code security settings before the first
+# run can upload. It keeps default setup's events (narrowed by a path
+# filter), languages, `default` query suite and `/language:<name>`
+# categories, so the alert baseline on `main` carries over and no alert is
+# re-opened under a new category.
+#
+# Go never autobuilds. The autobuilder finds the root Makefile and runs
+# `make`, whose default target is the Docker build of the platform image. On
+# a runner that build fails within seconds on an empty image tag and the
+# extractor falls through to loading the packages itself, so it works today
+# by accident; on a machine where the tag resolves it is a half-hour image
+# build inside a scanner. `build-mode: manual` with `go build ./...` per
+# module names the build instead.
+#
+# No `merge_group` trigger: the check is not required, the queue's commit is
+# analysed moments later by the push to `main`, and a queue run would add a
+# full analysis per group for nothing new.
+
+on:
+  push:
+    branches: [main, "release/**"]
+    paths:
+      - "**.py"
+      - "**.go"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**.js"
+      - "**.mjs"
+      - "**.cjs"
+      - "**.jsx"
+      - "**.ts"
+      - "**.tsx"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main, "release/**"]
+    # The same list: a documentation-only pull request runs no analysis. The
+    # filter decides whether the workflow runs, not which files it analyses;
+    # a run that starts analyses the whole tree, as default setup did.
+    paths:
+      - "**.py"
+      - "**.go"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**.js"
+      - "**.mjs"
+      - "**.cjs"
+      - "**.jsx"
+      - "**.ts"
+      - "**.tsx"
+      - ".github/workflows/**"
+  schedule:
+    - cron: "0 5 * * 1" # Weekly, an hour after security-scan.yml's Monday run
+
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of analyses behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # The fork guard the repository rule asks of credentialed push- and
+    # schedule-triggered workflows. This one holds no secret, so the guard is
+    # by convention: a fork that syncs `main` inherits the triggers and would
+    # spend four analyses' runner-minutes on every sync. On a pull
+    # request from a fork `github.repository` is this repository, the base,
+    # so the guard does not skip the run this workflow exists for.
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    # Local timings on 8 vCPUs: Python about 10 minutes, Go about 9 with the
+    # explicit build. A standard runner has 4, so an hour leaves room for a
+    # slow extraction without holding a runner all day.
+    timeout-minutes: 60
+    permissions:
+      # The upload-sarif step needs this; on a fork's pull request the token
+      # is read-only and code scanning accepts the upload anyway (see above).
+      # No `actions: read`: the action needs it in private repositories only.
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+          - language: go
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-operator/go.mod"
+          cache: true
+          # Every module's go.sum, however many modules there are; a module
+          # with no dependencies has no go.sum, which the glob skips.
+          cache-dependency-path: "**/go.sum"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # No `queries:` and no `config:`: the action's default is the
+          # `default` suite over the whole tree, which is what default setup
+          # ran, so the result set matches the alerts already on `main`.
+
+      # One `go build ./...` per module, under the CodeQL tracer `init` has
+      # installed. Never `autobuild` here: see the header. The modules are
+      # the tracked go.mod files rather than a list kept by hand: a module
+      # added later is extracted without anyone remembering this step, where
+      # a hand-kept list would fail silently by analysing none of it.
+      - name: Build the Go modules
+        if: matrix.language == 'go'
+        run: |
+          set -euo pipefail
+          for modfile in $(git ls-files -- 'go.mod' '*/go.mod'); do
+            module=$(dirname "$modfile")
+            echo "::group::go build ./... in $module"
+            (cd "$module" && go build ./...)
+            echo "::endgroup::"
+          done
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          # Default setup's category names, so each upload supersedes the
+          # same language's baseline instead of opening a second set.
+          category: "/language:${{ matrix.language }}"

@@ -1,0 +1,79 @@
+name: k8s-api-proxy Tests
+
+# gofmt, go vet and go test -race for the k8s-api-proxy/ Go module. No cluster
+# and no credentials. A test that needs a real API server adds setup-envtest
+# here in the same change, and fails rather than skips when the binaries are
+# missing.
+#
+# The trigger arrangement is a2a-test.yml's, for the reasons its header
+# comment gives: `Run k8s-api-proxy Tests` is meant to be a required check, so
+# on a pull request and in the merge queue the job always starts and the
+# `Detect changes` step decides whether to test; on a push to main the
+# `paths:` filter decides instead. Keep the `paths:` list and the
+# `k8sapiproxy:` filter below identical.
+on:
+  pull_request:
+    branches: [main, "release/**"]
+  merge_group:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "k8s-api-proxy/**"
+      - ".github/workflows/k8sapiproxy-test.yml"
+  workflow_dispatch:
+
+# a2a-test.yml's concurrency block; its comment says why the key falls back to
+# github.run_id.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run k8s-api-proxy Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: k8s-api-proxy
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          # No token, so the action diffs with git: .agents/rules/github_actions.md,
+          # "Detect changed files with git, not the API".
+          token: ""
+          filters: |
+            k8sapiproxy:
+              - "k8s-api-proxy/**"
+              - ".github/workflows/k8sapiproxy-test.yml"
+
+      - name: Set up Go
+        if: steps.filter.outputs.k8sapiproxy == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-api-proxy/go.mod"
+          # The module has no go.sum yet; turn the cache on with its first
+          # dependency.
+          cache: false
+
+      - name: Check formatting
+        if: steps.filter.outputs.k8sapiproxy == 'true'
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        if: steps.filter.outputs.k8sapiproxy == 'true'
+        run: go vet ./...
+
+      - name: Test
+        if: steps.filter.outputs.k8sapiproxy == 'true'
+        run: go test -race -count=1 ./...

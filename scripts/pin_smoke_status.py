@@ -58,9 +58,36 @@ is the POST itself. One pull request failing
 -- a head force-pushed away mid-sweep, a call out of retries -- is logged and
 the sweep goes on, because every pull request after it would otherwise wait
 for the next merge; the failure still sets the exit status.
+
+A green from before the gate changed what it grades is not pinned at all.
+When the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time
+(`2026-10-20T14:00:00Z`), a status created before it is never re-pinned, and
+one Tide still credits -- its base already the head of `main`, because it ran
+there or was pinned there before the change, and the change itself, in
+oss-test-infra, moves nothing on `main` -- is expired: re-posted with no base
+and EXPIRED_NOTE, which Tide reads as stale and this never pins again. So
+Tide retests the pull request rather than merging it on a verdict about the
+other mode. The time compared is the build's first report, the earliest
+success status on the commit naming the same build, not the newest status:
+every re-pin is a fresh copy with its own creation time, and a copy made
+after the cutoff must not pass for a verdict from after it. That is one more
+read per green while the variable is set. What this cannot reach is a live
+ProwJob: Tide also credits a successful job at the head of `main` for its
+48h life, so a retest that started under the old mode merges on it until
+`main` moves; the swap procedure moves `main` once right after setting the
+variable. The time has to be later than the blocking job's spec.mode change
+(the swap to next, or a rollback to today) AND than the last run that started
+under the old mode can report, because a re-pin made before the variable was
+set, and a run in flight at the change, both create their status after the
+change: set it, right after the change merges, to that merge time plus the
+job's timeout. Later only costs retests. The sweep a push to `main` starts
+and the manual dispatch of the workflow both expire what they find, and a
+late status event expires its own commit. Leaving the variable set afterwards
+is harmless. An unparsable value pins nothing and exits non-zero.
 """
 
 import argparse
+import datetime
 import os
 import re
 import sys
@@ -87,6 +114,10 @@ USER_AGENT = "kube-agents-smoke-test-sticky"
 POOL_LABELS = frozenset({"lgtm", "approved"})
 HOLD_LABEL_PREFIX = "do-not-merge"
 SHORT_SHA = 8
+#: The cutoff (module docstring): a status created before this UTC time is not pinned.
+NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
+#: What an expired status says in place of a base; a status carrying it is never pinned again.
+EXPIRED_NOTE = "(predates SMOKE_PIN_NOT_BEFORE: retest)"
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -118,12 +149,66 @@ def pinned_description(description, main_sha):
     return noted + suffix
 
 
-def skip_reason(status, main_sha):
+def parse_utc(value):
+    """A GitHub-style UTC time (`...Z` or an explicit offset) as an aware datetime; ValueError otherwise."""
+    parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{value!r} carries no time zone")
+    return parsed
+
+
+def not_before_from_env(environ=os.environ):
+    """The cutoff from NOT_BEFORE_ENV, None when unset or empty; ValueError when unparsable."""
+    raw = (environ.get(NOT_BEFORE_ENV) or "").strip()
+    return parse_utc(raw) if raw else None
+
+
+def predates(status, not_before):
+    """Whether `status` was created before the cutoff; an unreadable creation time counts as before."""
+    if not_before is None or status is None:
+        return False
+    try:
+        return parse_utc(status.get("created_at") or "") < not_before
+    except ValueError:
+        return True
+
+
+def first_reported(api, sha, status):
+    """The earliest creation time among the success statuses on `sha` that name
+    the same build as `status` (its target URL), `status` included; "" when any
+    of them carries no readable time, which `predates` counts as before."""
+    url = status.get("target_url") or ""
+    copies = [status]
+    if url:
+        copies += [
+            s
+            for s in api.get_all(f"/repos/{api.repo}/commits/{sha}/statuses")
+            if s.get("context") == CONTEXT and s.get("state") == SUCCESS and s.get("target_url") == url
+        ]
+    try:
+        return min((s.get("created_at") or "" for s in copies), key=parse_utc)
+    except ValueError:
+        return ""
+
+
+def expired_description(description):
+    """The same human-readable text with EXPIRED_NOTE and no base, within GitHub's limit."""
+    human, _ = split_description(description)
+    human = " ".join(human.replace(EXPIRED_NOTE, "").split())
+    room = MAX_DESCRIPTION - len(EXPIRED_NOTE) - 1
+    return f"{human[:room].rstrip()} {EXPIRED_NOTE}".strip()
+
+
+def skip_reason(status, main_sha, not_before=None):
     """Why a status is left alone, or None when it should be pinned."""
     if status is None:
         return f"no {CONTEXT} status on the commit"
     if status.get("state") != SUCCESS:
         return f"state is {status.get('state')!r}, not {SUCCESS}"
+    if EXPIRED_NOTE in (status.get("description") or ""):
+        return f"expired under {NOT_BEFORE_ENV}; a retest replaces it"
+    if predates(status, not_before):
+        return f"created {status.get('created_at') or 'at an unreadable time'}, before {NOT_BEFORE_ENV} ({not_before.isoformat()})"
     _, base_sha = split_description(status.get("description") or "")
     if base_sha == main_sha:
         return "already pinned to the head of main"
@@ -161,7 +246,7 @@ def _resolve(main_sha):
     return main_sha() if callable(main_sha) else main_sha
 
 
-def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True, expected_main=None):
+def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True, expected_main=None, not_before=None):
     """Re-pin one commit's smoke status. Returns what happened, for the log.
 
     `main_sha` is a SHA or a callable returning one. `expected_main` is the head
@@ -177,7 +262,11 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
     status = latest_status(api, sha)
     if status_id is not None and status is not None and str(status.get("id")) != str(status_id):
         return f"{sha[:SHORT_SHA]}: status {status_id} is no longer the latest (now {status.get('id')}); leaving it"
-    reason = skip_reason(status, _NO_MAIN)
+    if not_before is not None and status is not None and status.get("state") == SUCCESS:
+        status = dict(status, created_at=first_reported(api, sha, status))
+    reason = skip_reason(status, _NO_MAIN, not_before)
+    if reason and status is not None and status.get("state") == SUCCESS and predates(status, not_before):
+        return _expire(api, sha, status, main_sha, expected_main, reason, dry_run)
     if reason:
         return f"{sha[:SHORT_SHA]}: {reason}"
     main_now = expected_main if expected_main is not None else _resolve(main_sha)
@@ -203,13 +292,34 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
     return f"{sha[:SHORT_SHA]}: pinned to {main_sha[:SHORT_SHA]}: {payload['description']}"
 
 
+def _expire(api, sha, status, main_sha, expected_main, reason, dry_run):
+    """Make a pre-cutoff green stale if Tide still credits it (its base is the head of main)."""
+    _, base_sha = split_description(status.get("description") or "")
+    main_now = expected_main if expected_main is not None else _resolve(main_sha)
+    if base_sha is None or base_sha != main_now:
+        return f"{sha[:SHORT_SHA]}: {reason}; already stale, so Tide retests it"
+    latest = latest_status(api, sha)
+    if latest is None or str(latest.get("id")) != str(status.get("id")):
+        newer = latest.get("id") if latest else "none"
+        return f"{sha[:SHORT_SHA]}: status {status.get('id')} was superseded while deciding (now {newer}); leaving it"
+    payload = {
+        "state": SUCCESS,
+        "context": CONTEXT,
+        "target_url": status.get("target_url") or "",
+        "description": expired_description(status.get("description")),
+    }
+    if not dry_run:
+        api.post(f"/repos/{api.repo}/statuses/{sha}", payload)
+    return f"{sha[:SHORT_SHA]}: {reason}; expired: {payload['description']}"
+
+
 def in_tide_pool(pull_request):
     """Carries the labels Tide merges on and no hold: the ones a stale base costs a retest."""
     labels = {label.get("name") for label in pull_request.get("labels") or []}
     return POOL_LABELS <= labels and not any(str(name).startswith(HOLD_LABEL_PREFIX) for name in labels)
 
 
-def sweep(api, main_sha, dry_run=False):
+def sweep(api, main_sha, dry_run=False, not_before=None):
     """Every open pull request's head, after a push to main; the pool first.
 
     Returns (outcomes, failures). One pull request's failure does not end the
@@ -226,7 +336,9 @@ def sweep(api, main_sha, dry_run=False):
     for pull_request in pulls:
         sha = pull_request["head"]["sha"]
         try:
-            outcome = pin_head(api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected)
+            outcome = pin_head(
+                api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected, not_before=not_before
+            )
         except Exception as error:  # noqa: BLE001 -- one pull request must not end the sweep
             failures += 1
             outcome = f"{sha[:SHORT_SHA]}: failed, moving on: {error}"
@@ -261,12 +373,17 @@ def main(argv=None):
     if not args.repo or not token:
         print("GITHUB_REPOSITORY (or --repo) and GITHUB_TOKEN are required", file=sys.stderr)
         return 2
+    try:
+        not_before = not_before_from_env()
+    except ValueError as error:
+        print(f"{NOT_BEFORE_ENV} is not a UTC time, so nothing is pinned: {error}", file=sys.stderr)
+        return 2
     api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
     main_sha = args.main_sha or (lambda: main_head(api))
     if args.mode == "status":
-        log(pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run))
+        log(pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run, not_before=not_before))
         return 0
-    _, failures = sweep(api, main_sha, dry_run=args.dry_run)
+    _, failures = sweep(api, main_sha, dry_run=args.dry_run, not_before=not_before)
     return 1 if failures else 0
 
 

@@ -1352,9 +1352,13 @@ class UnitTest(unittest.TestCase):
         for state, icon in harness.STATUS_ICONS.items():
             const = "lib.State" + "".join(part.capitalize() for part in state.split("-"))
             self.assertRegex(relay, rf'{const}:\s+"{icon}",', state)
-        for post in ('"❌ failed: "+reason', '"❌ the task failed"', '"🛑 canceled"', '"🚫 the executor rejected the task: "+reason',
-                     '"🚫 the executor rejected the task"'):
-            self.assertIn(f"g.post(rec.Key, {post})", relay)
+        # The terminal notices are worded in one place, terminalNotice, which
+        # the relay posts through (and a console conversation's terminal
+        # frame carries); pin the wording there and the posts that use it.
+        for notice in ('"❌ failed: " + reason', '"❌ the task failed"', '"🛑 canceled"',
+                       '"🚫 the executor rejected the task: " + reason', '"🚫 the executor rejected the task"'):
+            self.assertIn(f"return {notice}", relay)
+        self.assertEqual(relay.count("g.post(rec.Key, terminalNotice(s.Status.State, reason))"), 2)
 
     def test_not_started_grammar_matches_the_gateway_source(self):
         # Every "not started:" the gateway can post, read off the source, is one the
@@ -1387,8 +1391,10 @@ class UnitTest(unittest.TestCase):
             self.assertNotIn("tail", redactor.redact(f"x {printed} y"), printed)
 
     def test_refusal_marker_matches_the_gateway_source(self):
-        gateway = (REPO / "a2a" / "gateway" / "gateway.go").read_text()
-        self.assertIn('"⛔ ' + harness.REFUSAL_NOTICE_MARKER.replace("slack", '"+backend+'), gateway)
+        # unverifiedNotice, which the gateway posts and the Slack adapter
+        # sends a shortcut's clicker privately.
+        gchat = (REPO / "a2a" / "gateway" / "gchat.go").read_text()
+        self.assertIn('"⛔ ' + harness.REFUSAL_NOTICE_MARKER.replace("slack", '" + backend + '), gchat)
 
     def test_turn_subtypes_match_the_gateway_source(self):
         slack = (REPO / "a2a" / "gateway" / "slack.go").read_text()

@@ -18,8 +18,8 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
-bar the two on `"all"`. That routes the report through the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does.
+That routes the report through the
 relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
@@ -56,7 +56,15 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
+`spec.mode: next` `/sethome` does not reach the gateway, so for the platform the gateway holds the CR
+field is the only way. The operator renders the Google Chat field into the gateway as
+`A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
+`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
+only chat platform is the gateway's and has no home channel gets no send at all: the error names the
+platform and the field, as in
+`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
+A malformed home channel gets the same refusal without the platform. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
 so an install without a home channel loses those events entirely rather than seeing them late.
@@ -205,7 +213,8 @@ Three properties of the listing follow from what a suppressed event is:
   printed as a fact about every row in it. A session server predating the Info gate wrote
   `notified = 1` on informational events, so for a day or two after an upgrade a group can hold both
   outcomes; the key splits them rather than announcing a delivered event under a heading that says
-  it never arrived.
+  it never arrived. A row folded into its workload's open incident is keyed as one that went out,
+  since its incident was admitted.
 
 ## What this recap does not report
 
@@ -254,7 +263,7 @@ informational churn. Each is **counted**, on its own line above the body:
 A third class exists on a headless install (`platforms.google_chat.enabled: false` and
 `platforms.slack.enabled: false` with no `A2A_NOTIFY_PLATFORM` route): **alerts dispatched without
 a chat platform** (`notified = 2`, `NOTIFIED_HEADLESS`). `trigger_agent_troubleshooter` stamps `2`
-via `mark_delivery_headless` and starts the triage turn without attempting a chat post, and
+via `mark_delivery_headless` and queues the triage start without attempting a chat post, and
 `filter_and_aggregate_events` tallies those rows in `dispatched_headless` rather than
 `alerts_posted` or `delivery_failed`. Because no chat post was attempted or refused and the
 read-only activity feed (`/v1/intercepted-events`, `/v1/tasks`) is the intended consumer,
@@ -300,6 +309,13 @@ print. So a day whose only withheld traffic was excluded informational events pr
 grades 🟢, and what bounds that claim is the qualifier line rather than the emoji. What an exclusion
 cannot do is any of the above to a ceiling drop or a failed delivery, which is the property that
 matters and is the paragraph above.
+
+One more class of `Critical` or `Warning` row never reached chat and is neither named nor counted:
+one folded into its workload's open incident (`duplicate_of` set, with
+`INCIDENT_WORKLOAD_DEDUP_SECONDS` on). An incident for that workload was admitted, so nothing was
+withheld. The row adds to the headline's forwarded total, and its group is keyed as one that went
+out, so it adds to the group count only when its reason or severity differs from its anchor's, or
+its anchor's chat post failed.
 
 ## Running it by hand
 

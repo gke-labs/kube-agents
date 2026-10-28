@@ -259,6 +259,21 @@ func (s *sideDoorAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// PostTerminal reaches the primary for its own conversations when it
+// implements TerminalPoster; a door's conversations take no frames
+// (errNoTerminalFrames), and their callers read results through the
+// observer calls.
+func (s *sideDoorAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	if s.doorFor(conversation) != nil {
+		return errNoTerminalFrames
+	}
+	poster, ok := s.primary.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
 // ShowsTaskStatus answers for the primary's own conversations; a door keeps
 // its rolling line, which its caller reads.
 func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
@@ -371,6 +386,15 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	}
 }
 
+// SetHome hands the Home tab's admission rule and board reader to the
+// primary, the half with a home view; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	if sink, ok := s.primary.(HomeSink); ok {
+		sink.SetHome(admits, board)
+	}
+}
+
 // SetSessionLookup hands the gateway's session lookup, and the idle TTL it
 // is bounded by, to the primary, which is the half that wants them (the
 // Slack adapter's session-thread rule; the door keys every conversation
@@ -380,5 +404,13 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	if sink, ok := s.primary.(SessionLookupSink); ok {
 		sink.SetSessionLookup(lookup, idleTTL)
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to the primary, the
+// chat half that draws rating controls; a door's callers are programs.
+func (s *sideDoorAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	if sink, ok := s.primary.(FeedbackSink); ok {
+		sink.SetFeedbackRecorder(r)
 	}
 }

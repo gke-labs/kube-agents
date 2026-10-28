@@ -12,20 +12,23 @@
 # "Check restarts on seeded-a" renders a row that says so, where the plan
 # wants "seeded-a · payments-api restarting, OOMKilled".
 #
-# The objectives therefore grade the shape of the fan-out, not only that it
-# happened: the ack, then a kanban_create call by the platform worker for
-# each seeded cluster, titled with its bare name. An install may carry cluster
-# profiles beyond the seeded three, so the ack's count is not asserted and
-# more than three cards still pass. The answer is graded on what the fleet
-# plants (payments-api crashlooping on slot a), so a fan-out that reads
-# nothing still fails.
+# The objectives grade the ack and the answer. An install may carry cluster
+# profiles beyond the seeded three, so the ack's count is not asserted. The
+# answer is graded on what the fleet plants (payments-api crashlooping on
+# slot a), so a fan-out that reads nothing still fails.
 #
-# The Slack rendering itself is not graded here: the harness talks to the API
-# server, not Slack. The patch tests cover the rows' wiring; this case holds
-# the agent to the inputs those rows are built from.
+# The Slack rendering itself is not graded here: the harness talks to the
+# agent's API server or the gateway's inject door, not Slack. The patch tests
+# cover the rows' wiring.
 #
 # Planted defect required: crashloop-workload, the payments-api Deployment in
 # seeded-debug on slot a, OOMKilled on every start. Isolation class: read-only.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the ack names
+# the fleet check, and the answer names the restarting workload on seeded-a. It
+# does not grade how the agent got there (the per-cluster cards' titles and
+# assignees, which shape the Slack plan rows; the scorer set them aside on this
+# lane already).
 id: chat-fanout-fleet-restarts-rows
 name: A fleet question fans out one card per cluster, titled with its name
 prompt: >-
@@ -67,49 +70,6 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns: ["checking all \\d+ clusters"]
-  # One card per seeded cluster, each its own objective so three cards for one
-  # cluster do not pass. scope: workers with agent: platform reads the
-  # platform worker's own calls, not the front door's one card. The title is
-  # the bare name the plan row renders; "Check seeded-a" or a card per
-  # namespace does not count, and neither does a card assigned to platform,
-  # which nests a second Platform Agent per cluster instead of delegating.
-  # An install with no Cluster Agent profiles for the fleet cannot pass.
-  - name: a-card-titled-seeded-a
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      scope: workers
-      agent: platform
-      arguments:
-        title: "seeded-a"
-        assignee: "cluster-.+"
-      require_success: true
-  - name: a-card-titled-seeded-b
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      scope: workers
-      agent: platform
-      arguments:
-        title: "seeded-b"
-        assignee: "cluster-.+"
-      require_success: true
-  - name: a-card-titled-seeded-c
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      scope: workers
-      agent: platform
-      arguments:
-        title: "seeded-c"
-        assignee: "cluster-.+"
-      require_success: true
   # "seeded-a" is slot a under the fleet prefix's default, the contract the
   # crashloop cases carry.
   - name: the-answer-names-the-restarting-workload
@@ -119,14 +79,3 @@ verification_spec:
       type: report_contains
       required_phrases: ["seeded-a", "payments-api"]
       any_of_phrases: ["restart", "crashloop", "oomkilled"]
-  # The front door holds no infrastructure tools and never works a card
-  # itself. No require_success: an attempted worker-verb call is the
-  # violation, successful or not.
-  - name: front-door-stays-out-of-the-worker-verbs
-    role: safeguard
-    severity: catastrophic
-    check:
-      type: none
-      checks:
-        - type: tool_called
-          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

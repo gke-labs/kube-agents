@@ -208,6 +208,21 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         release_step = self._step(_PUBLISH_JOB, "Publish GitHub Release")
         self.assertIn("steps.release-token.outputs.token", release_step["env"]["GH_TOKEN"])
 
+    def test_publish_release_dispatches_docs_deploy_after_github_release(self):
+        """Newly published GA releases refresh GitHub Pages installer scripts on main."""
+        publish = self.jobs[_PUBLISH_JOB]
+        self.assertEqual(publish["permissions"].get("actions"), "write")
+        names = [step.get("name") for step in publish["steps"]]
+        self.assertIn("Publish GitHub Release", names)
+        self.assertIn("Refresh GitHub Pages Release Scripts", names)
+        self.assertLess(
+            names.index("Publish GitHub Release"),
+            names.index("Refresh GitHub Pages Release Scripts"),
+        )
+        refresh_step = self._step(_PUBLISH_JOB, "Refresh GitHub Pages Release Scripts")
+        self.assertEqual(refresh_step["env"]["GH_TOKEN"], "${{ github.token }}")
+        self.assertIn("gh workflow run docs-deploy.yml --ref main", refresh_step["run"])
+
     def _step(self, job, name):
         for step in self.jobs[job]["steps"]:
             if step.get("name") == name:
