@@ -624,11 +624,14 @@ def week_cases(counted: dict[datetime.date, list[dict]], days: list[datetime.dat
     return out
 
 
-def removed_cases(cases: set[str], domain_of: dict[str, str]) -> set[str]:
-    """The cases with no area: no task.yaml on this checkout (renamed or
-    deleted, old runs still on record), or no ``domain:`` line collect can
-    read, which ``nightly.domains`` both file as DOMAIN_UNKNOWN."""
-    return {c for c in cases if domain_of.get(c, nightly.DOMAIN_UNKNOWN) == nightly.DOMAIN_UNKNOWN}
+def removed_cases(cases: set[str], domain_of: dict[str, str], expected: set[str]) -> set[str]:
+    """The cases no longer in the suite: no area (no task.yaml on this
+    checkout, renamed or deleted, old runs still on record) and off the
+    nightly matrix (``expected``, ``nightly.expected_cases``). A case still
+    on the matrix whose ``domain:`` line collect cannot read (a quoted
+    value) is not removed: it stays compared, the area rows miss it, and
+    WHY_ROWS refuses the week rather than dropping a live case."""
+    return {c for c in cases if domain_of.get(c, nightly.DOMAIN_UNKNOWN) == nightly.DOMAIN_UNKNOWN and c not in expected}
 
 
 def week_models(counted: dict, days: list[datetime.date], models: dict[str, set[str]]) -> tuple[list[str], list[datetime.date]]:
@@ -716,7 +719,7 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     this_cases, prev_cases = week_cases(counted, days), week_cases(counted, prev_days)
     domain_of = nightly.domains(data)
     graded = set(this_cases) | set(prev_cases)
-    removed = removed_cases(graded, domain_of)
+    removed = removed_cases(graded, domain_of, set(nightly.expected_cases(data)))
     common = sorted((set(this_cases) & set(prev_cases)) - removed)
     trend_ok = len(this_nights) >= MIN_COUNTED_NIGHTS and len(prev_nights) >= MIN_COUNTED_NIGHTS
     models = store_models(store)
@@ -883,7 +886,7 @@ def integrity_failures(week: dict, domain_rows: list[dict], bugs: dict | None,
     this_cases = week_cases(counted, [datetime.date.fromisoformat(d) for d in week["days"]])
     prev_cases = week_cases(counted, [datetime.date.fromisoformat(d) for d in week["prev_days"]])
     domain_of = nightly.domains(data)
-    if common != (set(this_cases) & set(prev_cases)) - removed_cases(set(this_cases) | set(prev_cases), domain_of):
+    if common != (set(this_cases) & set(prev_cases)) - removed_cases(set(this_cases) | set(prev_cases), domain_of, set(nightly.expected_cases(data))):
         out.append(FAIL_SAME_CASES.format(what=WHY_NOT_COMMON))
     else:
         for key, source in (("passed", this_cases), ("graded", this_cases), ("prev_passed", prev_cases), ("prev_graded", prev_cases)):

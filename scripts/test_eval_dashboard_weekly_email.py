@@ -85,9 +85,9 @@ def split_runs(days=THIS_WEEK + LAST_WEEK, absent=(), truncated=()):
             for d in sorted(days) for job, cases in SPLIT.items() if (job, d) not in absent]
 
 
-def data_of(runs, cases=CASES):
+def data_of(runs, cases=CASES, off_matrix=()):
     return {"schema_version": 1, "generated_at": "2026-10-19T12:00:00+00:00",
-            "cases": [{"name": c, "domain": dom, "active": False, "nightly_active": True} for c, dom in cases.items()],
+            "cases": [{"name": c, "domain": dom, "active": False, "nightly_active": c not in off_matrix} for c, dom in cases.items()],
             "runs": runs}
 
 
@@ -391,20 +391,33 @@ class SameCases(Base):
         # which is no area row, so it is left out of the tile too.
         cases = dict(CASES, **{"gone-1": "unknown"})
         runs = [run(d, [task(c, passes_for(c, d)) for c in cases]) for d in THIS_WEEK + LAST_WEEK]
-        week = self.week(data_of(runs, cases), store_of(runs))
+        week = self.week(data_of(runs, cases, off_matrix={"gone-1"}), store_of(runs))
         self.assertNotIn("gone-1", week["cases"])
         self.assertEqual(week["removed"], ["gone-1"])
         self.assertEqual(week["one_week_only"], [])
         self.assertEqual(week["overall"]["scenarios"], len(CASES))
         self.assertEqual(sum(r["scenarios"] for r in week["rows"]), week["overall"]["scenarios"])
-        page, failures = self.produce(data_of(runs, cases), store_of(runs))
+        page, failures = self.produce(data_of(runs, cases, off_matrix={"gone-1"}), store_of(runs))
         self.assertEqual(failures, [])
         self.assertIn("1 no longer in the suite are left out", page)
+
+    def test_a_live_case_whose_domain_cannot_be_read_refuses_the_week(self):
+        # A quoted `domain: "chat"` reads as unknown, but the case is still on
+        # the nightly matrix: it is not "no longer in the suite", so it stays
+        # compared, no area row holds it, and the week is refused.
+        cases = dict(CASES, **{"quoted-1": "unknown"})
+        runs = [run(d, [task(c, passes_for(c, d)) for c in cases]) for d in THIS_WEEK + LAST_WEEK]
+        data = data_of(runs, cases)
+        week = self.week(data, store_of(runs))
+        self.assertEqual(week["removed"], [])
+        self.assertIn("quoted-1", week["cases"])
+        _, failures = self.produce(data, store_of(runs))
+        self.assertRefused(failures, "the area rows hold 8 scenarios but 9 were compared")
 
     def test_a_removed_case_counted_in_the_tile_refuses(self):
         cases = dict(CASES, **{"gone-1": "unknown"})
         runs = [run(d, [task(c, passes_for(c, d)) for c in cases]) for d in THIS_WEEK + LAST_WEEK]
-        data = data_of(runs, cases)
+        data = data_of(runs, cases, off_matrix={"gone-1"})
         week = self.week(data, store_of(runs))
         week["cases"].append("gone-1")
         week["overall"]["scenarios"] += 1
