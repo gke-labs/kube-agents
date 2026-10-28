@@ -47,7 +47,7 @@ EVENTS_READ = "__INTERCEPTED_EVENTS_READ__"
 # just wrote are in the page however long the ledger is.
 ROW_LIMIT = 500
 # The fields of a row a verdict reads; the rest stays in the pod.
-ROW_FIELDS = ("id", "timestamp", "namespace", "kind", "name", "reason", "status", "duplicate_of")
+ROW_FIELDS = ("id", "timestamp", "namespace", "kind", "name", "reason", "status", "duplicate_of", "pull_request")
 # The feed statuses of a row the daemon admitted: posted (or dispatched
 # headless), or posted and then refused by chat. session_kv_server.py anchors a
 # workload's window on exactly these.
@@ -162,6 +162,11 @@ class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
     is still checked once: an anchor older than ``started_at`` less
     ``max_age_sec`` is from an earlier run, and is a fail.
 
+    With ``requires_pull_request``, only a folded row that names the open
+    pull request it was held for (``pull_request``) counts: the case grades an
+    event recorded against an incident whose fix is waiting for review, not one
+    that merely landed inside the fold window.
+
     No admitted row, a stale anchor, or too few folded rows is a fail; a daemon
     that does not fold at all leaves every replica's row admitted and the newest
     with nothing folded into it. An unreadable pod, a server that refused the
@@ -177,6 +182,7 @@ class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
     # a 300s wait for the watcher in bench/tf/prebuilt/autoops-incident), plus
     # the runner and the agent pod being two clocks.
     max_age_sec: float = Field(default=900.0, gt=0)
+    requires_pull_request: bool = False
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()
@@ -210,11 +216,17 @@ class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
                 f"is older than this run's window, which opens at {since:%Y-%m-%d %H:%M:%S} UTC",
                 raw,
             )
-        folded = [row for row in rows if row.get("duplicate_of") == anchor.get("id")]
+        folded = [
+            row
+            for row in rows
+            if row.get("duplicate_of") == anchor.get("id")
+            and (not self.requires_pull_request or isinstance(row.get("pull_request"), str) and row["pull_request"])
+        ]
         summary = (
             f"the newest incident for {workload} (ledger row {anchor.get('id')}) has {len(folded)} event(s) "
             f"folded into it, and {len(recent)} incident(s) were admitted for it in this run's window"
         )
         if len(folded) < self.min_folded:
-            return "fail", f"{summary}; at least {self.min_folded} folded event(s) were expected", raw
+            held = " held for an open pull request" if self.requires_pull_request else ""
+            return "fail", f"{summary}; at least {self.min_folded} folded event(s){held} were expected", raw
         return "pass", summary, raw

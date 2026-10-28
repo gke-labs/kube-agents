@@ -97,6 +97,7 @@ _INTERPOLATIONS = {
     # The OOM shape and the incident wait: what the incumbent case plants.
     "var.crash_seconds": "0",
     "var.wait_for": "incident",
+    "var.gitops_manifest_path": "",
     "var.start_settle_seconds": "0",
 }
 
@@ -254,6 +255,18 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             ["bash", "-n", str(self._script)], capture_output=True, text=True
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_a_recurrence_without_the_repository_fails_before_touching_a_pod(self):
+        # wait_for = recurrence grades the replaced pod against an open fix, so
+        # with no repository or token to find that fix in it must stop rather
+        # than replace the pod and grade a recurrence nobody can attribute.
+        recurring = self._plant.replace('[ "incident" = "recurrence" ]', '[ "recurrence" = "recurrence" ]')
+        self.assertNotEqual(recurring, self._plant, "the recurrence step's guard moved; update this test")
+        self._script.write_text(recurring)
+        completed, calls = self._run(BENCH_GITOPS_REPO="", BENCH_GITHUB_TOKEN="", GITHUB_TOKEN="")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("wait_for = recurrence needs BENCH_GITOPS_REPO", completed.stderr)
+        self.assertEqual(self._indices(calls, "delete pod"), [], f"a pod was replaced:\n{chr(10).join(calls)}")
 
     def test_healthy_run_deletes_nothing(self):
         completed, calls = self._run()
