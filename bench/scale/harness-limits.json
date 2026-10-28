@@ -528,7 +528,8 @@
         "churn: CommandError: kubectl --context gke_<project>_us-central1-c_scale-01 apply --server-side --force-conflicts... exited 1: error: unable to decode \"STDIN\": json: cannot unmarshal number into Go struct field ObjectMeta.metadata.labels of type string",
         "churn: CommandError: kubectl --context gke_<project>_us-central1-c_scale-01 apply --server-side --force-conflicts... exited 1: error: unable to decode \"STDIN\": json: cannot unmarshal number into Go struct field ObjectMeta.metadata.labels of type string",
         "churn: CommandError: kubectl --context gke_<project>_us-central1-c_scale-01 apply --server-side --force-conflicts... exited 1: error: unable to decode \"STDIN\": json: cannot unmarshal number into Go struct field ObjectMeta.metadata.labels of type string"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|fleet_audit|1",
@@ -1073,7 +1074,8 @@
       ],
       "errors": [
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|fleet_audit|3",
@@ -1600,7 +1602,8 @@
       ],
       "errors": [
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|fan_out|1",
@@ -2141,7 +2144,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|fan_out|2",
@@ -2682,7 +2686,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|fan_out|3",
@@ -3223,7 +3228,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|upgrade_readiness|1",
@@ -3768,7 +3774,8 @@
       ],
       "errors": [
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|upgrade_readiness|3",
@@ -4314,7 +4321,8 @@
       "errors": [
         "churn: CommandError: kubectl --context gke_<project>_us-central1-c_scale-02 apply --server-side --force-conflicts... exited 1: error: context \"gke_<project>_us-central1-c_scale-02\" does not exist",
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|fleet_audit|2",
@@ -4851,7 +4859,8 @@
       ],
       "errors": [
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|upgrade_readiness|2",
@@ -5397,7 +5406,8 @@
       "errors": [
         "churn: CommandError: kubectl --context gke_<project>_us-central1-c_scale-01 delete pods -n... exited 1: error: You must be logged in to the server (Unauthorized)",
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|boot_burst|1",
@@ -5922,7 +5932,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|boot_burst|2",
@@ -6447,7 +6458,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|boot_burst|3",
@@ -6972,7 +6984,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|listing|1",
@@ -7513,7 +7526,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|listing|2",
@@ -8054,7 +8068,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|listing|3",
@@ -8597,7 +8612,8 @@
       "excluded_from": [
         "response_seconds"
       ],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|nodes|100|watcher_soak|1",
@@ -9122,7 +9138,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|objects|4000|fleet_audit|1",
@@ -9667,7 +9684,8 @@
       ],
       "errors": [
         "prompt unfinished: no answer recorded (written before answers were kept), so completion cannot be checked"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|churn_per_minute|1000|watcher_soak|1",
@@ -10192,7 +10210,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|onboarding|1",
@@ -10719,7 +10738,8 @@
       "excluded_from": [],
       "errors": [
         "IAM bindings missing for 28s of this run (an organization IAM automation removed them; a guard restored them)"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|fleet_audit|1",
@@ -11069,6 +11089,10 @@
           "value": 248373.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 1.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33333248.0,
           "container": "manager"
@@ -11247,10 +11271,6 @@
           "name": "cpu_seconds",
           "value": 1.222228227699634,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -11276,7 +11296,7 @@
       "errors": [
         "prompt unfinished: the agent did not perform the operation (explicitly excluded from the audit scope)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|fleet_audit|2",
@@ -11626,6 +11646,10 @@
           "value": 700348.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 1.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33337344.0,
           "container": "manager"
@@ -11804,10 +11828,6 @@
           "name": "cpu_seconds",
           "value": 1.5941756071725801,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -11833,7 +11853,7 @@
       "errors": [
         "prompt unfinished: the agent did not perform the operation (no registered GitOps repository)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|fleet_audit|3",
@@ -12183,6 +12203,10 @@
           "value": 404957.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 1.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33337344.0,
           "container": "manager"
@@ -12361,10 +12385,6 @@
           "name": "cpu_seconds",
           "value": 1.826475724499706,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -12390,7 +12410,7 @@
       "errors": [
         "prompt unfinished: the agent did not perform the operation (audit cancelled)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|fan_out|1",
@@ -12748,6 +12768,10 @@
           "value": 310516.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33345536.0,
           "container": "manager"
@@ -12926,10 +12950,6 @@
           "name": "cpu_seconds",
           "value": 3.324896302820044,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -12938,7 +12958,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|fan_out|2",
@@ -13296,6 +13316,10 @@
           "value": 201827.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33341440.0,
           "container": "manager"
@@ -13474,10 +13498,6 @@
           "name": "cpu_seconds",
           "value": 9.998031490897006,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -13496,7 +13516,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|fan_out|3",
@@ -13854,6 +13874,10 @@
           "value": 310510.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33345536.0,
           "container": "manager"
@@ -14032,10 +14056,6 @@
           "name": "cpu_seconds",
           "value": 136.58949969649416,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -14054,7 +14074,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|upgrade_readiness|1",
@@ -14412,6 +14432,10 @@
           "value": 799397.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33349632.0,
           "container": "manager"
@@ -14590,10 +14614,6 @@
           "name": "cpu_seconds",
           "value": 247.0632477830953,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 4,
@@ -14604,7 +14624,7 @@
         "response_seconds"
       ],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|upgrade_readiness|2",
@@ -14962,6 +14982,10 @@
           "value": 546185.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 1.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33353728.0,
           "container": "manager"
@@ -15140,10 +15164,6 @@
           "name": "cpu_seconds",
           "value": 5.347333322177382,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -15169,7 +15189,7 @@
       "errors": [
         "prompt unfinished: the agent did not perform the operation (NO_REGISTERED_REPO)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|upgrade_readiness|3",
@@ -15527,6 +15547,10 @@
           "value": 870662.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33394688.0,
           "container": "manager"
@@ -15705,10 +15729,6 @@
           "name": "cpu_seconds",
           "value": 216.31570778544122,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -15717,7 +15737,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|objects|4000|fleet_audit|3",
@@ -16075,6 +16095,10 @@
           "value": 1062840.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33599488.0,
           "container": "manager"
@@ -16253,10 +16277,6 @@
           "name": "cpu_seconds",
           "value": 3.1234429633144827,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -16267,7 +16287,7 @@
       "errors": [
         "profiles of deleted test clusters still present: 8 profiles for 2 test clusters"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|100|watcher_soak|1",
@@ -16792,7 +16812,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|100|boot_burst|1",
@@ -17317,7 +17338,8 @@
       "provider_429s": 5,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|100|boot_burst|2",
@@ -17842,7 +17864,8 @@
       "provider_429s": 5,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|100|boot_burst|3",
@@ -18369,7 +18392,8 @@
       "excluded_from": [],
       "errors": [
         "IAM bindings missing for 7s of this run (an organization IAM automation removed them; a guard restored them)"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|15|fan_out|1",
@@ -18727,6 +18751,10 @@
           "value": 519928.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33763328.0,
           "container": "manager"
@@ -18905,10 +18933,6 @@
           "name": "cpu_seconds",
           "value": 4.387198255823023,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -18931,7 +18955,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|15|fan_out|2",
@@ -19289,6 +19313,10 @@
           "value": 965830.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33296384.0,
           "container": "manager"
@@ -19467,10 +19495,6 @@
           "name": "cpu_seconds",
           "value": 3.2552861247014864,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -19499,7 +19523,7 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|15|fan_out|3",
@@ -19857,6 +19881,10 @@
           "value": 464939.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33042432.0,
           "container": "manager"
@@ -20035,10 +20063,6 @@
           "name": "cpu_seconds",
           "value": 14.961497518737376,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -20067,7 +20091,7 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|fleet_audit|1",
@@ -20425,6 +20449,10 @@
           "value": 2873084.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33828864.0,
           "container": "manager"
@@ -20603,10 +20631,6 @@
           "name": "cpu_seconds",
           "value": 155.53510439609755,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -20625,7 +20649,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|fleet_audit|2",
@@ -20983,6 +21007,10 @@
           "value": 1113716.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33644544.0,
           "container": "manager"
@@ -21161,10 +21189,6 @@
           "name": "cpu_seconds",
           "value": 82.35302329003795,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -21173,7 +21197,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|fleet_audit|3",
@@ -21531,6 +21555,10 @@
           "value": 4091656.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 1.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33697792.0,
           "container": "manager"
@@ -21709,10 +21737,6 @@
           "name": "cpu_seconds",
           "value": 191.55817426795966,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 1.0
         }
       ],
       "provider_429s": 0,
@@ -21740,7 +21764,7 @@
         "prompt unfinished: the delegation wait ran out; the answer is the acknowledgement only",
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|listing|1",
@@ -22098,6 +22122,10 @@
           "value": 167101.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33759232.0,
           "container": "manager"
@@ -22276,10 +22304,6 @@
           "name": "cpu_seconds",
           "value": 5.556894615765304,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -22288,7 +22312,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|listing|2",
@@ -22646,6 +22670,10 @@
           "value": 186853.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33759232.0,
           "container": "manager"
@@ -22824,10 +22852,6 @@
           "name": "cpu_seconds",
           "value": 3.786253494667911,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -22836,7 +22860,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|listing_pods|4000|listing|3",
@@ -23194,6 +23218,10 @@
           "value": 311141.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33726464.0,
           "container": "manager"
@@ -23372,10 +23400,6 @@
           "name": "cpu_seconds",
           "value": 37.462212698132134,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -23394,7 +23418,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|onboarding|1",
@@ -23919,7 +23943,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|objects|4000|onboarding|1",
@@ -24446,7 +24471,8 @@
       "excluded_from": [],
       "errors": [
         "IAM bindings missing for 103s of this run (an organization IAM automation removed them; a guard restored them)"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|objects|4000|fleet_audit|2",
@@ -24804,6 +24830,10 @@
           "value": 1683569.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33910784.0,
           "container": "manager"
@@ -24982,10 +25012,6 @@
           "name": "cpu_seconds",
           "value": 27.278717965483217,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -24994,7 +25020,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|proxy_load|1",
@@ -25552,7 +25578,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|proxy_load|2",
@@ -26163,7 +26190,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|proxy_load|3",
@@ -26774,7 +26802,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|4|proxy_load|1",
@@ -27385,7 +27414,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|4|proxy_load|2",
@@ -28011,7 +28041,7 @@
       "errors": [
         "brokered commands from outside the load ran during it: 51"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|4|proxy_load|3",
@@ -28637,7 +28667,7 @@
       "errors": [
         "brokered commands from outside the load ran during it: 60"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|8|proxy_load|1",
@@ -29248,7 +29278,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|8|proxy_load|2",
@@ -29859,7 +29890,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|8|proxy_load|3",
@@ -30485,7 +30517,7 @@
       "errors": [
         "brokered commands from outside the load ran during it: 11"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|16|proxy_load|1",
@@ -31096,7 +31128,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|16|proxy_load|2",
@@ -31707,7 +31740,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|16|proxy_load|3",
@@ -32333,7 +32367,7 @@
       "errors": [
         "brokered commands from outside the load ran during it: 25"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|32|proxy_load|1",
@@ -32944,7 +32978,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|32|proxy_load|2",
@@ -33555,7 +33590,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|proxy_concurrency|32|proxy_load|3",
@@ -34166,7 +34202,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|8|fan_out|1",
@@ -34586,6 +34623,10 @@
           "value": 332991.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 32796672.0,
           "container": "manager"
@@ -34744,10 +34785,6 @@
           "name": "cpu_seconds",
           "value": 35.45901197489443,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -34773,7 +34810,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|8|fan_out|2",
@@ -35193,6 +35230,10 @@
           "value": 458318.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 32796672.0,
           "container": "manager"
@@ -35371,10 +35412,6 @@
           "name": "cpu_seconds",
           "value": 2.9145749912349856,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -35390,7 +35427,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|8|fan_out|3",
@@ -35810,6 +35847,10 @@
           "value": 680663.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33005568.0,
           "container": "manager"
@@ -35988,10 +36029,6 @@
           "name": "cpu_seconds",
           "value": 2.990007147138264,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -36007,7 +36044,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|10|fan_out|1",
@@ -36427,6 +36464,10 @@
           "value": 514033.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33009664.0,
           "container": "manager"
@@ -36605,10 +36646,6 @@
           "name": "cpu_seconds",
           "value": 3.0627025030704167,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -36626,7 +36663,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|10|fan_out|2",
@@ -37046,6 +37083,10 @@
           "value": 451235.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -37224,10 +37265,6 @@
           "name": "cpu_seconds",
           "value": 2.1625420976726675,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -37245,7 +37282,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|10|fan_out|3",
@@ -37665,6 +37702,10 @@
           "value": 452490.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -37843,10 +37884,6 @@
           "name": "cpu_seconds",
           "value": 4.200288847725187,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -37864,7 +37901,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|12|fan_out|1",
@@ -38284,6 +38321,10 @@
           "value": 420228.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33271808.0,
           "container": "manager"
@@ -38462,10 +38503,6 @@
           "name": "cpu_seconds",
           "value": 2.923148119536563,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -38488,7 +38525,7 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|12|fan_out|2",
@@ -38908,6 +38945,10 @@
           "value": 482527.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -39086,10 +39127,6 @@
           "name": "cpu_seconds",
           "value": 2.8822691339593045,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -39112,7 +39149,7 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|concurrent|12|fan_out|3",
@@ -39532,6 +39569,10 @@
           "value": 248453.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33013760.0,
           "container": "manager"
@@ -39710,10 +39751,6 @@
           "name": "cpu_seconds",
           "value": 74.306642653222,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -39745,7 +39782,7 @@
         "prompt failed: KUBE_AGENTS_INFRA_FAILURE: the opening turn failed in transport 3 times running; last failure: HTTP 429 from agent endpoint: Too many concurrent runs (max 10); tunnel log: (log unavailable)",
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|10|watcher_soak|1",
@@ -40332,7 +40369,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|10|boot_burst|1",
@@ -40919,7 +40957,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|10|boot_burst|2",
@@ -41506,7 +41545,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|10|boot_burst|3",
@@ -42093,7 +42133,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|30|watcher_soak|1",
@@ -42680,7 +42721,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|30|boot_burst|1",
@@ -43267,7 +43309,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|30|boot_burst|2",
@@ -43854,7 +43897,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|failing_pods|30|boot_burst|3",
@@ -44433,7 +44477,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|combined|1|onboarding|1",
@@ -45020,7 +45065,8 @@
       "provider_429s": 4,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|combined|1|watcher_soak|1",
@@ -45607,7 +45653,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|combined|1|fan_out|1",
@@ -46027,6 +46074,10 @@
           "value": 258538.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 34152448.0,
           "container": "manager"
@@ -46205,10 +46256,6 @@
           "name": "cpu_seconds",
           "value": 110.51180358505674,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -46217,7 +46264,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|combined|1|fan_out|2",
@@ -46637,6 +46684,10 @@
           "value": 227363.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 34381824.0,
           "container": "manager"
@@ -46815,10 +46866,6 @@
           "name": "cpu_seconds",
           "value": 135.57979863616748,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -46827,7 +46874,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|combined|1|fan_out|3",
@@ -47247,6 +47294,10 @@
           "value": 0.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 34377728.0,
           "container": "manager"
@@ -47425,10 +47476,6 @@
           "name": "cpu_seconds",
           "value": 401.2050041886723,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -47437,7 +47484,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|22|onboarding|1",
@@ -48026,7 +48073,8 @@
       "excluded_from": [],
       "errors": [
         "profiles of deleted test clusters still present: ['scale-23']"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|onboarding_30m|1",
@@ -48612,7 +48660,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|audits_30m|1",
@@ -49204,7 +49253,8 @@
         "obtainability-audit running at the end of the window",
         "stockout-prevention failed at the end of the window",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|fan_out|1",
@@ -49623,6 +49673,10 @@
           "value": 353200.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33468416.0,
           "container": "manager"
@@ -49801,10 +49855,6 @@
           "name": "cpu_seconds",
           "value": 64.40640685178656,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -49823,7 +49873,7 @@
       "errors": [
         "obtainability-audit, started by the previous run's audit window, was still running until 2026-10-27T19:02:40Z (read from the Platform Agent's cron run log after the run)"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|fan_out|2",
@@ -50242,6 +50292,10 @@
           "value": 396992.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33472512.0,
           "container": "manager"
@@ -50420,10 +50474,6 @@
           "name": "cpu_seconds",
           "value": 117.32376878530846,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -50443,7 +50493,7 @@
         "obtainability-audit, started by the previous run's audit window, was still running until 2026-10-27T19:02:40Z (read from the Platform Agent's cron run log after the run)",
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|fan_out|3",
@@ -50862,6 +50912,10 @@
           "value": 397479.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33472512.0,
           "container": "manager"
@@ -51040,10 +51094,6 @@
           "name": "cpu_seconds",
           "value": 97.54951823843112,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -51062,7 +51112,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|onboarding_30m_proxy_raised|1",
@@ -51648,7 +51698,8 @@
       "provider_429s": 54,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|16|audits_30m_proxy_raised|1",
@@ -52237,7 +52288,8 @@
       "errors": [
         "could not mark every job due: kubectl --context gke_<project>_us-central1-c_scale-host exec -n kubeagents-system... exited 1: not marked: upgrade-retrospective\ncommand terminated with exit code 1",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|onboarding_30m|1",
@@ -52823,7 +52875,8 @@
       "provider_429s": 16,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|8|audits_30m|1",
@@ -53412,7 +53465,8 @@
       "errors": [
         "could not mark every job due: kubectl --context gke_<project>_us-central1-c_scale-host exec -n kubeagents-system... exited 1: not marked: upgrade-retrospective\ncommand terminated with exit code 1",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|6|onboarding_30m|1",
@@ -53998,7 +54052,8 @@
       "provider_429s": 4,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|6|audits_30m|1",
@@ -54588,7 +54643,8 @@
         "could not mark every job due: kubectl --context gke_<project>_us-central1-c_scale-host exec -n kubeagents-system... exited 1: not marked: upgrade-retrospective\ncommand terminated with exit code 1",
         "stockout-prevention skipped at the end of the window",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|6|fan_out|1",
@@ -55007,6 +55063,10 @@
           "value": 272911.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33792000.0,
           "container": "manager"
@@ -55185,10 +55245,6 @@
           "name": "cpu_seconds",
           "value": 6.543617371153952,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -55197,7 +55253,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|6|fan_out|2",
@@ -55616,6 +55672,10 @@
           "value": 327194.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 34185216.0,
           "container": "manager"
@@ -55794,10 +55854,6 @@
           "name": "cpu_seconds",
           "value": 2.376771730245097,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -55816,7 +55872,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|6|fan_out|3",
@@ -56235,6 +56291,10 @@
           "value": 594051.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 34131968.0,
           "container": "manager"
@@ -56413,10 +56473,6 @@
           "name": "cpu_seconds",
           "value": 151.38083009556235,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -56435,7 +56491,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|4|onboarding_30m|1",
@@ -57036,7 +57092,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|4|audits_30m|1",
@@ -57625,7 +57682,8 @@
       "errors": [
         "could not mark every job due: kubectl --context gke_<project>_us-central1-c_scale-host exec -n kubeagents-system... exited 1: not marked: upgrade-retrospective\ncommand terminated with exit code 1",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|4|fan_out|1",
@@ -58044,6 +58102,10 @@
           "value": 255327.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33808384.0,
           "container": "manager"
@@ -58222,10 +58284,6 @@
           "name": "cpu_seconds",
           "value": 61.38963721520869,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -58244,7 +58302,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|4|fan_out|2",
@@ -58663,6 +58721,10 @@
           "value": 336441.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 33812480.0,
           "container": "manager"
@@ -58841,10 +58903,6 @@
           "name": "cpu_seconds",
           "value": 42.272065668939064,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -58863,7 +58921,7 @@
       "errors": [
         "the Stall Watch's half-hourly read of every cluster overlapped the run"
       ],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|clusters|4|fan_out|3",
@@ -59282,6 +59340,10 @@
           "value": 232251.0
         },
         {
+          "name": "unfinished_prompts",
+          "value": 0.0
+        },
+        {
           "name": "memory_peak_bytes",
           "value": 34074624.0,
           "container": "manager"
@@ -59460,10 +59522,6 @@
           "name": "cpu_seconds",
           "value": 3.3105317228682507,
           "container": "shell"
-        },
-        {
-          "name": "unfinished_prompts",
-          "value": 0.0
         }
       ],
       "provider_429s": 0,
@@ -59472,7 +59530,7 @@
       ],
       "excluded_from": [],
       "errors": [],
-      "remonitored": ""
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|onboarding_30m|1",
@@ -60058,7 +60116,8 @@
       "provider_429s": 12,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|audits_30m|1",
@@ -60647,7 +60706,8 @@
       "errors": [
         "could not mark every job due: kubectl --context gke_<project>_us-central1-c_scale-host exec -n kubeagents-system... exited 1: not marked: upgrade-retrospective\ncommand terminated with exit code 1",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|onboarding_30m_proxy_raised|1",
@@ -61233,7 +61293,8 @@
       "provider_429s": 0,
       "answers": [],
       "excluded_from": [],
-      "errors": []
+      "errors": [],
+      "remonitored": "c0c44c17aaaa"
     },
     {
       "key": "eeb8a95c|next|base|0|audits_30m_proxy_raised|1",
@@ -61822,7 +61883,8 @@
       "errors": [
         "could not mark every job due: kubectl --context gke_<project>_us-central1-c_scale-host exec -n kubeagents-system... exited 1: not marked: upgrade-retrospective\ncommand terminated with exit code 1",
         "upgrade-retrospective unclaimed at the end of the window"
-      ]
+      ],
+      "remonitored": "c0c44c17aaaa"
     }
   ]
 }
