@@ -899,6 +899,20 @@ def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
     assert peaks == {"memory_peak_bytes": 300.0, "cpu_peak_cores": 0.4, "cpu_seconds": 90.0}
 
 
+def test_cpu_seconds_count_only_the_first_points_share_inside_the_window(monkeypatch):
+    install = collect.Install("p", "ctx", "ns", "host", "zone")
+
+    # A first point ending 15 s into the window, then a full one.
+    def series(query, aligner, start, end):
+        return [{"resource": {"labels": {"container_name": "litellm-container"}},
+                 "points": [{"value": {"doubleValue": 60.0}, "interval": {"endTime": "2026-10-27T00:01:15Z"}},
+                            {"value": {"doubleValue": 60.0}, "interval": {"endTime": "2026-10-27T00:00:15Z"}}]}]
+    monkeypatch.setattr(install, "_time_series", series)
+    window_start = 1793059200.0  # 2026-10-27T00:00:00Z
+    peaks = install.container_peaks(window_start, window_start + 1800.0)["litellm-container"]
+    assert peaks["cpu_seconds"] == 75.0
+
+
 def test_the_minute_before_a_window_is_not_its_work():
     # An aligned point ending 15 s after the window starts covers 45 s from before it.
     point = {"value": {"doubleValue": 60.0}, "interval": {"endTime": "2026-10-27T00:00:15.000000Z"}}
@@ -912,16 +926,37 @@ def test_a_plan_can_run_its_base_last():
     assert load_plan(PHASE2, environ=ENV).matrix()[0].factor == "base"
 
 
-def test_the_runner_waits_for_triggered_jobs_and_notes_one_still_running(monkeypatch, tmp_path):
+def test_the_runner_waits_for_triggered_jobs_and_marks_runs_they_still_load(monkeypatch, tmp_path):
     run = runner.Runner(load_plan(PHASE3, environ=ENV), tmp_path / "data.json")
     run.install = type("Install", (), {"context": "ctx", "namespace": "ns"})()
     op = next(o for o in run.plan.operations if o.kind == "trigger_soak")
-    answers = iter([{"a-audit": "running", "b-audit": "completed"}, {"a-audit": "completed", "b-audit": "completed"}])
+    answers = iter([{"a-audit": "running", "b-audit": "claimed"}, {"a-audit": "completed", "b-audit": "claimed"},
+                    {"a-audit": "completed", "b-audit": "completed"}, {"a-audit": "completed", "b-audit": "completed"}])
     monkeypatch.setattr(runner.operations, "job_statuses", lambda *a: next(answers))
     monkeypatch.setattr(runner.time, "sleep", lambda s: None)
     run.drain_jobs(op, "2026-10-27T00:00:00Z")
-    assert run.carry_errors == []
+    assert run.carried_work() == ([], [])
+    assert run.triggered is None
+    # A job that outlives the drain marks every later run until it finishes; one never marked does not.
     run.settings["trigger_drain_seconds"] = 0
-    monkeypatch.setattr(runner.operations, "job_statuses", lambda *a: {"a-audit": "running"})
+    statuses = {"a-audit": "running", "b-audit": "unclaimed"}
+    monkeypatch.setattr(runner.operations, "job_statuses", lambda *a: statuses)
     run.drain_jobs(op, "2026-10-27T00:00:00Z")
-    assert run.carry_errors == ["a-audit, started by the previous run, was still running"]
+    for _ in range(2):
+        notes, fits = run.carried_work()
+        assert notes == ["a-audit, started by an earlier run, was running"]
+        assert "cpu_seconds" in fits and "proxy_commands" in fits
+    statuses["a-audit"] = "completed"
+    assert run.carried_work() == ([], [])
+
+
+def test_a_resumed_runner_checks_the_latest_trigger_soaks_jobs(tmp_path):
+    data = tmp_path / "data.json"
+    data.write_text(json.dumps({"schema": 1, "records": [
+        {"key": "k1", "operation": "audits_30m", "started": "2026-10-27T01:00:00Z"},
+        {"key": "k2", "operation": "audits_30m", "started": "2026-10-27T03:00:00Z"},
+        {"key": "k3", "operation": "fan_out", "started": "2026-10-27T04:00:00Z"},
+    ]}))
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), data)
+    op, since = run.last_trigger()
+    assert (op.name, since) == ("audits_30m", "2026-10-27T03:00:00Z")

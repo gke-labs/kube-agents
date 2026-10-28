@@ -1708,11 +1708,11 @@ class CpuRun:
 
 
 def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
-    """``container``'s CPU, grouped by operation, point and CPU limit."""
+    """``container``'s CPU, grouped by operation, point and CPU limit; runs left out of a metric's fit are left out here."""
     groups: dict[tuple[str, float, str, float, float], list[Record]] = {}
     for record in records:
         clusters = record.totals.get(CLUSTERS)
-        if record.value(CPU_PEAK, container) is None and record.value(CPU_SECONDS, container) is None:
+        if _cpu_reading(record, CPU_PEAK, container) is None and _cpu_reading(record, CPU_SECONDS, container) is None:
             continue
         if not clusters:
             continue
@@ -1721,11 +1721,11 @@ def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
         groups.setdefault((record.operation, clusters, record.factor, record.level, limit), []).append(record)
     rows = []
     for (operation, clusters, factor, level, limit), runs in sorted(groups.items()):
-        peaks = [value for run in runs if (value := run.value(CPU_PEAK, container)) is not None]
+        peaks = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, container)) is not None]
         averages = [
             seconds / (_minutes(run) * SECONDS_PER_MINUTE)
             for run in runs
-            if (seconds := run.value(CPU_SECONDS, container)) is not None
+            if (seconds := _cpu_reading(run, CPU_SECONDS, container)) is not None
         ]
         rows.append(
             CpuRun(
@@ -1736,11 +1736,15 @@ def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
                 limit or None,
                 len(runs),
                 max(peaks) if peaks else None,
-                any(capped(run, CPU_PEAK, container) for run in runs),
+                any(capped(run, CPU_PEAK, container) for run in runs if not run.excluded(CPU_PEAK)),
                 _mean(averages) if averages else None,
             )
         )
     return rows
+
+
+def _cpu_reading(record: Record, metric: str, container: str) -> float | None:
+    return None if record.excluded(metric) else record.value(metric, container)
 
 
 def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
@@ -1780,6 +1784,8 @@ def proxy_demand(records: Iterable[Record]) -> list[ProxyDemand]:
     groups: dict[tuple[str, str, float], list[Record]] = {}
     for record in records:
         if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None:
+            continue
+        if record.excluded(PROXY_COMMANDS) or record.excluded(PROXY_COMMAND_SECONDS):
             continue
         if not record.totals.get(CLUSTERS):
             continue

@@ -133,6 +133,9 @@ JOB_RUNS_SCRIPT = (
 JOB_TIMEOUT_SECONDS = 120
 JOB_COMPLETED = "completed"
 JOB_RUNNING = "running"
+# A run is claimed when the tick takes it and running once a worker starts it; both are unfinished.
+JOB_CLAIMED = "claimed"
+JOB_ACTIVE = (JOB_CLAIMED, JOB_RUNNING)
 JOB_UNCLAIMED = "unclaimed"
 # What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
 RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")

@@ -32,7 +32,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kube_agents_bench.scale import collect, fixtures, kube, operations, records
-from kube_agents_bench.scale.config import BASE_FACTOR, COMBINED_FACTOR, Operation, Plan, RunSpec, load_plan
+from kube_agents_bench.scale.config import (
+    BASE_FACTOR, COMBINED_FACTOR, TRIGGER_SOAK_KIND, Operation, Plan, RunSpec, load_plan,
+)
 
 LOG = logging.getLogger("harness-scale")
 
@@ -49,6 +51,9 @@ WATCHER_POLL_SECONDS = 30
 # How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
 TRIGGER_DRAIN_SECONDS = 1800
 DRAIN_POLL_SECONDS = 60
+# The fits a run leaves out when jobs an earlier run started are still loading the harness.
+CARRIED_WORK_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
+                     "proxy_wait_max_seconds", "proxy_wait_p50_seconds")
 RESPONSE_FITS = ["response_seconds"]
 LEVEL_LABEL = "harness-scale/level"
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -138,8 +143,8 @@ class Runner:
         self.relay_port = 0
         # The fleet values of the level applied last, so a level that keeps them skips the settle.
         self.applied_fleet: dict[str, float] | None = None
-        # Notes for the next record from work the previous run left running.
-        self.carry_errors: list[str] = []
+        # The latest trigger_soak's operation and start, until every job it started has finished.
+        self.triggered: tuple[Operation, str] | None = None
 
     # --- the fleet ----------------------------------------------------------------------------
 
@@ -439,8 +444,8 @@ class Runner:
         if mode != self.plan.target["mode"]:
             self.watch_errors.append(f"install runs mode {mode!r}, plan says {self.plan.target['mode']!r}")
         commit = commit_of(image)
-        errors = list(self.watch_errors) + self.carry_errors
-        self.carry_errors = []
+        carried, carried_fits = self.carried_work()
+        errors = list(self.watch_errors) + carried
         if not commit:
             errors.append(f"image {image!r} is not pinned by commit; the record is keyed by its tag")
             commit = image.rsplit(":", 1)[-1] or "unknown"
@@ -460,7 +465,7 @@ class Runner:
             concurrency = int(values.get(PROXY_CONCURRENCY, 1))
             kubeconfig_glob = PROFILE_KUBECONFIG_GLOB.format(project=self.project, cluster=self.cluster_names(count)[0])
             outcome = operations.proxy_load(self.install.context, self.install.namespace, op, concurrency, kubeconfig_glob)
-        elif op.kind == "trigger_soak":
+        elif op.kind == TRIGGER_SOAK_KIND:
             # Work the install would start later (the OOBE first-run audits) is started now, so a
             # short window holds its peak; jobs still running at the window's end are noted.
             outcome = operations.OperationResult()
@@ -513,7 +518,7 @@ class Runner:
             started=started_iso, ended=ended_iso, image=image, values=values, totals=totals,
             limits=limits, requests=requests, replicas=replicas, metrics=metrics,
             provider_429s=provider_429s, answers=[self.scrub(a) for a in outcome.previews],
-            excluded_from=list(excluded), errors=errors,
+            excluded_from=list(excluded) + carried_fits, errors=errors,
         )
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
@@ -541,6 +546,7 @@ class Runner:
     def run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> bool:
         """Run the specs; False when it stopped at a level it could not apply."""
         self.backfill_peaks()
+        self.triggered = self.last_trigger()
         pending = specs if force else self.pending(specs)
         todo = pending[:limit] if limit else pending
         LOG.info("%s runs to do (%s pending of %s)", len(todo), len(pending), len(specs))
@@ -573,7 +579,7 @@ class Runner:
                         continue
                     # Merged at once without its peaks, so a crash loses nothing; merged again with them.
                     records.merge(self.data_file, [record])
-                    if spec.operation.kind == "trigger_soak":
+                    if spec.operation.kind == TRIGGER_SOAK_KIND:
                         self.drain_jobs(spec.operation, record.started)
                     awaiting.append((time.time(), record))
                     awaiting = self.flush_peaks(awaiting, wait=False)
@@ -585,25 +591,51 @@ class Runner:
         return not stopped
 
     def drain_jobs(self, op: Operation, since: str) -> None:
-        """Wait for the jobs a trigger_soak started, so they do not load the next run.
+        """Wait up to ``trigger_drain_seconds`` for the jobs a trigger_soak started, so they do not load the next run.
 
-        A job still running after ``trigger_drain_seconds`` is noted on the next record.
+        Every later run checks them again (``carried_work``) until they have finished.
         """
+        self.triggered = (op, since)
         deadline = time.monotonic() + float(self.settings.get("trigger_drain_seconds", TRIGGER_DRAIN_SECONDS))
-        running: list[str] = []
-        while True:
+        while time.monotonic() < deadline:
             try:
                 statuses = operations.job_statuses(self.install.context, self.install.namespace, op.jobs_home,
                                                    op.jobs, since)
-            except kube.CommandError as exc:
-                self.carry_errors.append(f"could not tell whether the previous run's jobs finished: {exc}")
+            except kube.CommandError:
                 return
-            running = [job for job, status in statuses.items() if status == operations.JOB_RUNNING]
-            if not running or time.monotonic() >= deadline:
-                break
-            LOG.info("waiting for %s to finish before the next run", ", ".join(running))
+            active = [job for job, status in statuses.items() if status in operations.JOB_ACTIVE]
+            if not active:
+                return
+            LOG.info("waiting for %s to finish before the next run", ", ".join(active))
             time.sleep(DRAIN_POLL_SECONDS)
-        self.carry_errors += [f"{job}, started by the previous run, was still running" for job in running]
+
+    def carried_work(self) -> tuple[list[str], list[str]]:
+        """Notes and fit exclusions for a run that jobs the latest trigger_soak started are still loading.
+
+        A job marked due is claimed at the next cron tick, within a minute, so a job with no run
+        after the window was never marked (it is not on the roster) and is not waited for.
+        """
+        if not self.triggered:
+            return [], []
+        op, since = self.triggered
+        try:
+            statuses = operations.job_statuses(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
+        except kube.CommandError as exc:
+            return [f"could not tell whether the jobs an earlier run started had finished: {exc}"], list(CARRIED_WORK_FITS)
+        active = [job for job, status in statuses.items() if status in operations.JOB_ACTIVE]
+        if not active:
+            self.triggered = None
+            return [], []
+        return [f"{job}, started by an earlier run, was {statuses[job]}" for job in active], list(CARRIED_WORK_FITS)
+
+    def last_trigger(self) -> tuple[Operation, str] | None:
+        """The latest stored trigger_soak run of this plan, so a resumed runner still checks its jobs."""
+        kinds = {op.name: op for op in self.plan.operations if op.kind == TRIGGER_SOAK_KIND}
+        runs = [r for r in records.load(self.data_file)["records"] if r["operation"] in kinds]
+        if not runs:
+            return None
+        latest = max(runs, key=lambda r: r["started"])
+        return kinds[latest["operation"]], latest["started"]
 
     def flush_peaks(self, awaiting: list[tuple[float, records.Record]], wait: bool) -> list[tuple[float, records.Record]]:
         """Add Cloud Monitoring peaks to the records whose window is old enough, and merge them again.

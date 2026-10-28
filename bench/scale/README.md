@@ -69,7 +69,9 @@ An operation's `kind` says what a run does:
   from as many workers at once as the point's `proxy_concurrency` value, for `window_seconds`, with
   no model call;
 - `trigger_soak` marks the cron `jobs` on the roster under `jobs_home` due at the window's start, as
-  the OOBE job marks its first-run audits, and notes the ones not finished when the window ends.
+  the OOBE job marks its first-run audits, and notes the ones not finished when the window ends. The
+  next run waits up to `trigger_drain_seconds` (default 1800) for them; a later run that one still
+  loads says so in `errors` and is left out of the resource fits.
 
 A factor named `combined` has points rather than values as levels: level N applies the plan's Nth
 `combined` point, which sets several factors at once. The levels run in the order the plan lists the
@@ -91,6 +93,7 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
   default one;
 - `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
+- `trigger_drain_seconds`: how long the run after a `trigger_soak` waits for its jobs to finish.
 
 The agent API is reached through the repository's `kubectl exec` relay
 (`scripts/hermes-dashboard-tunnel.py`), because the agent pod runs under gVisor
@@ -167,7 +170,8 @@ what the test clusters really had, summed over the fleet; fits use the totals fo
 `replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>`, so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
 run. `excluded_from` names the fits the record is left out of: `["response_seconds"]` when a prompt
 run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade readiness record written
-before answers were kept, when its completion cannot be checked. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records, and `remonitor` reads every stored record's Cloud
+before answers were kept, when its completion cannot be checked; the CPU, memory and proxy metrics when
+jobs an earlier `trigger_soak` started were still running. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records, and `remonitor` reads every stored record's Cloud
 Monitoring metrics again with the current queries, within Monitoring's retention. `errors` lists what made the run differ from its plan: a failed prompt, a
 cluster the event watcher did not watch, a churn batch that failed, a monitoring read that failed.
 

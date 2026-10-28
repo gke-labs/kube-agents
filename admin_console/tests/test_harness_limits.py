@@ -1344,6 +1344,16 @@ class ProxyCapacityTest(unittest.TestCase):
         self.assertEqual((concurrent.factor, concurrent.runs, concurrent.commands_per_minute), ("concurrent", 2, 20.0))
         self.assertIsNone(concurrent.per_cluster_per_minute)
 
+    def test_a_run_left_out_of_the_proxy_fits_adds_no_demand(self):
+        loaded = (hl.PROXY_COMMANDS, hl.PROXY_COMMAND_SECONDS)
+        records = parse(
+            record("clusters", 16, "fan_out", 1, metrics=((hl.PROXY_COMMANDS, None, 900.0),), totals={"clusters": 16},
+                   excluded=loaded),
+            record("clusters", 16, "fan_out", 2, metrics=((hl.PROXY_COMMANDS, None, 60.0),), totals={"clusters": 16}),
+        )
+        [demand] = hl.proxy_demand(records)
+        self.assertEqual((demand.runs, demand.commands_per_minute), (1, 2.0))
+
 
 class CappedCpuTest(unittest.TestCase):
     def test_a_cpu_peak_at_the_limit_stays_out_of_the_line(self):
@@ -1377,6 +1387,27 @@ class CappedCpuTest(unittest.TestCase):
         # 1,440 and 1,080 CPU-seconds over 30-minute windows: 0.8 and 0.6 cores on average.
         self.assertAlmostEqual(default.average, 0.7)
         self.assertEqual((raised.limit, raised.peak, raised.capped), (4.0, 2.2, False))
+
+    def test_cpu_runs_keep_two_points_of_one_size_apart(self):
+        proxy = "envoy-credential-proxy"
+        records = parse(
+            record(operation="fan_out", totals={"clusters": 2}, metrics=((hl.CPU_PEAK, proxy, 0.2),)),
+            record("concurrent", 10, "fan_out", totals={"clusters": 2}, metrics=((hl.CPU_PEAK, proxy, 0.9),)),
+        )
+        rows = hl.cpu_runs(records, proxy)
+        self.assertEqual([(row.factor, row.peak) for row in rows], [("base", 0.2), ("concurrent", 0.9)])
+
+    def test_cpu_runs_leave_out_a_run_left_out_of_the_cpu_fits(self):
+        proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
+        records = parse(
+            record("clusters", 16, "fan_out", 1, totals={"clusters": 16}, limits=limits,
+                   metrics=((hl.CPU_PEAK, proxy, 1.0), (hl.CPU_SECONDS, proxy, 1500.0)),
+                   excluded=(hl.CPU_PEAK, hl.CPU_SECONDS)),
+            record("clusters", 16, "fan_out", 3, totals={"clusters": 16}, limits=limits,
+                   metrics=((hl.CPU_PEAK, proxy, 0.26),)),
+        )
+        [row] = hl.cpu_runs(records, proxy)
+        self.assertEqual((row.peak, row.capped, row.average), (0.26, False, None))
 
 
 class UnanchoredOperationTest(unittest.TestCase):
