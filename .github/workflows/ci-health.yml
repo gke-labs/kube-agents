@@ -594,7 +594,8 @@ jobs:
           # ends where the runs' window does, however late this step runs
           # or however long the collect has been failing.
           clock=$(python3 -c 'import json; print(json.load(open("work/data.json")).get("generated_at") or "")' 2>/dev/null || true)
-          python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json ${clock:+--now "$clock"}
+          if [ -n "$clock" ]; then set -- --now "$clock"; fi
+          python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json "$@"
 
       - name: Adjudicate
         run: |
