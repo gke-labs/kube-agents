@@ -55,16 +55,19 @@ class Result:
         self.returncode, self.stdout, self.stderr = rc, stdout, stderr
 
 
-class FakeGsutil:
-    """``gsutil cat`` / ``cp`` against one in-memory object."""
+class FakeGcloudStorage:
+    """``gcloud storage cat`` / ``cp`` against one in-memory object; any other
+    command fails the test (the job has no working gsutil)."""
 
-    def __init__(self, content=None, cat_error="CommandException: No URLs matched: " + GS_STATE):
+    def __init__(self, content=None, cat_error="ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\n-" + GS_STATE):
         self.content = content
         self.cat_error = cat_error
         self.calls = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
+        if argv[:2] != ["gcloud", "storage"]:
+            raise AssertionError(f"not a gcloud storage call: {argv}")
         if "cat" in argv:
             if self.content is None:
                 return Result(rc=1, stderr=self.cat_error)
@@ -92,7 +95,7 @@ class Base(unittest.TestCase):
         argv = ["--message", str(self.message), "--state", state or str(self.state), "--now", now]
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             rc = wc.main(argv, environ=ENV if env is None else env, opener=opener or self.opener,
-                         runner=runner or (lambda *a, **k: self.fail("no gsutil for a local state")))
+                         runner=runner or (lambda *a, **k: self.fail("no gcloud storage call for a local state")))
         self.log = err.getvalue()
         return rc
 
@@ -174,7 +177,7 @@ class WhenNothingIsPosted(Base):
 
 class GsState(Base):
     def test_a_missing_object_is_a_first_post_and_is_then_written(self):
-        gs = FakeGsutil()
+        gs = FakeGcloudStorage()
         self.assertEqual(self.tick(DUE, state=GS_STATE, runner=gs), 0)
         self.assertEqual(self.opener.texts, [TEXT])
         self.assertEqual(json.loads(gs.content)["week_end"], WEEK_END)
@@ -182,13 +185,13 @@ class GsState(Base):
         self.assertEqual(self.opener.texts, [TEXT])
 
     def test_an_unreadable_object_posts_nothing(self):
-        gs = FakeGsutil(cat_error="AccessDeniedException: 403")
+        gs = FakeGcloudStorage(cat_error="AccessDeniedException: 403")
         self.assertEqual(self.tick(DUE, state=GS_STATE, runner=gs), 1)
         self.assertEqual(self.opener.texts, [])
         self.assertIn("not posting this tick", self.log)
 
     def test_a_corrupt_object_posts_nothing(self):
-        gs = FakeGsutil(content="{not json")
+        gs = FakeGcloudStorage(content="{not json")
         self.assertEqual(self.tick(DUE, state=GS_STATE, runner=gs), 1)
         self.assertEqual(self.opener.texts, [])
 
@@ -198,7 +201,7 @@ class GsState(Base):
         self.assertEqual(self.opener.texts, [])
 
     def test_a_record_that_fails_to_write_posts_nothing_and_the_next_tick_posts_once(self):
-        gs = FakeGsutil()
+        gs = FakeGcloudStorage()
 
         def failing_cp(argv, **kwargs):
             if "cp" in argv:

@@ -36,7 +36,9 @@ const (
 
 // MaxTurnWait is the longest a turn tool holds a request: the wait for the
 // lock and the gateway's submission, plus the longest answer wait a caller
-// may ask for. Every turn call is held to it, whatever the client allows.
+// may ask for. The noticeSettle window after the submission is spent inside
+// it: noticeGrace is slack on that path. Every turn call is held to it,
+// whatever the client allows.
 const MaxTurnWait = submissionWait + noticeGrace + maxWaitSeconds*time.Second
 
 // TurnBus is what the turn tools need from the bus.

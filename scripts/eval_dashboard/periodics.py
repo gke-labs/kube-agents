@@ -154,14 +154,18 @@ SUPERSEDED_KEY_RECOVERY = "recovery"
 # The superseding run a recovery was decided on: what the clear cites, read
 # or not on the tick that sends it.
 SUPERSEDED_KEY_BY = "by"
-# gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
-# settled on for the Prow archive; the same wording here. Never a bare 404,
-# because gsutil echoes the failing URL and a 19-digit build id can contain
-# those digits.
-NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexception: 404")
+# gcloud storage's absent-object wording, the set
+# scripts/release/poll_rc_eval_verdict.py settled on for the Prow archive;
+# the same wording here. An absent object is "matched no objects" on every
+# verb; an absent bucket is "<gs://bucket> not found: 404". Never a bare
+# 404, because gcloud echoes the failing URL and a 19-digit build id can
+# contain those digits; "not found: 404" is anchored on the words before it.
+NOT_FOUND_PATTERNS = ("matched no objects", "not found: 404")
 # A NotFound that names the bucket rather than an object: every job reads as
-# "never ran" for as long as it lasts, so it is warned, unlike an absent pointer.
-BUCKET_MISSING_MARKER = "bucket does not exist"
+# "never ran" for as long as it lasts, so it is warned, unlike an absent
+# pointer. `cat` never says this of an absent object (that is "matched no
+# objects"), so on a read it is the bucket.
+BUCKET_MISSING_MARKER = "not found: 404"
 # GitHub Actions renders a line with this prefix as a workflow warning, as the
 # sibling pool-pressure step's `echo "::warning::..."` does.
 WARNING_PREFIX = "::warning::"
@@ -304,7 +308,7 @@ class Unreadable(Exception):
 def _finished(job: str, build: str, runner) -> dict | None:
     """The build's finished.json, None when it has none (still running or
     aborted); Unreadable when the read itself failed."""
-    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
     if out is None:
         if _not_found(err):
             return None
@@ -321,7 +325,7 @@ def _finished(job: str, build: str, runner) -> dict | None:
 
 
 def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
-    out, err = collect._gsutil_call(["-q", "ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
+    out, err = collect._gcloud_storage_call(["ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
     if out is None:
         log(f"{WARNING_PREFIX}could not list {job}'s builds behind a running {newest}: {err.strip()}", file=sys.stderr)
         return []
@@ -348,7 +352,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     None is also what a pointer that cannot be read for a reason other than
     NotFound returns, after a warning: the bot has gone blind on this job, and
     an absent reading holds any open note rather than ending it."""
-    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
     if out is None:
         if not _not_found(err):
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
@@ -391,7 +395,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # than never. Any other failure is unreadable and the tick is blind
             # on this job, as for finished.json: a note is posted once, and one
             # written without its projects would stay so.
-            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -414,7 +418,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # not an object is said in its own lines; a read that fails for
             # another reason follows the main report's rule above: a failed
             # build's note is posted once, so it goes out whole or not yet.
-            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)

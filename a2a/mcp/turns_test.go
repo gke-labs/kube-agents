@@ -119,6 +119,11 @@ type gatewayScenario struct {
 	// lateStart delays the root's first event after its submission, as an
 	// executor's cold start does.
 	lateStart time.Duration
+	// lateNotice, when set, posts the acknowledgement notice after the
+	// root's submission, by this much: the order the two connections the
+	// gateway publishes on can produce. A delay inside noticeSettle is the
+	// notice the window exists to catch; past it, the notice is dropped.
+	lateNotice time.Duration
 }
 
 // runFakeGateway answers console frames the way the console door does: a
@@ -155,7 +160,9 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		// console relay does (kind "result"), is not a notice about this
 		// turn and must not be taken for one.
 		_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "r-task-earlier", Text: "an earlier answer", Kind: "result"}))
-		notice("Working on it…")
+		if sc.lateNotice == 0 {
+			notice("Working on it…")
+		}
 		root := fmt.Sprintf("task-root%d", i)
 		text := f.Text
 		if rest, ok := strings.CutPrefix(text, "delegate "); ok {
@@ -169,6 +176,10 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			pub(t, js, lib.TaskInSubject(fakeAddressee, "task-running"), cancel)
 		}
 		publishSubmission(t, js, fakeAddressee, root, conv, text, "")
+		if sc.lateNotice > 0 {
+			time.Sleep(sc.lateNotice)
+			notice("Working on it…")
+		}
 		switch {
 		case sc.delegate:
 			publishRun(t, js, fakeAddressee, root, "", false)
@@ -949,6 +960,18 @@ func TestATurnWhoseFirstEventIsLateIsWaitedOn(t *testing.T) {
 	}
 	mustContain(t, res.Content[0].Text, answerText)
 	mustNotContain(t, res.Content[0].Text, "no events yet")
+}
+
+// The gateway's acknowledgement can reach the server after the submission it
+// precedes (two connections, one of them unflushed); a turn whose notice trails
+// its submission still shows the notice.
+func TestANoticeThatTrailsTheSubmissionIsStillShown(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, lateNotice: noticeSettle / 4})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "wait_seconds": 10})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, "Working on it", fakeAddressee+"/task-root1", answerText)
 }
 
 // A turn whose task was read as nothing yet is still the conversation's

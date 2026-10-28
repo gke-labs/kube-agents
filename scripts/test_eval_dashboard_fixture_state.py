@@ -795,7 +795,7 @@ class Workflow(unittest.TestCase):
         scan = next(step for step in steps if "fixture_state.py" in step.get("run", ""))
         self.assertIn("--prior work/fixture-state-prior.json", scan["run"])
         self.assertIn('--workers "$FIXTURE_STATE_WORKERS"', scan["run"])
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/fixture-state.json"', upload["run"])
         import re
 
@@ -812,7 +812,7 @@ class Workflow(unittest.TestCase):
         import sys
 
         steps = self.jobs["fixture-state-scan"]["steps"]
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         run = upload["run"]
         code = run[run.index("python3 -c '") + len("python3 -c '") :]
         code = code[: code.index("\n'")]
@@ -837,7 +837,7 @@ class Workflow(unittest.TestCase):
     def test_the_tick_reads_the_published_scan(self):
         steps = self.jobs["refresh-and-adjudicate"]["steps"]
         fetch = next(step for step in steps if "fixture-state.json" in step.get("run", "") and "health-prev.json" in step["run"])
-        self.assertIn('gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true', fetch["run"])
+        self.assertIn('gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true', fetch["run"])
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--fixture-state work/fixture-state.json", adjudicate["run"])
 

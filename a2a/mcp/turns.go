@@ -59,6 +59,17 @@ const (
 	// submission cannot be mistaken for a later turn's, whose text differs.
 	submissionWait = 30 * time.Second
 	noticeGrace    = 10 * time.Second
+	// noticeSettle is how long, once the turn's own submission has matched,
+	// notices are still read before the turn is returned. The gateway posts
+	// its acknowledgement unflushed on the console connection and the
+	// submission synchronously through JetStream on another, so the
+	// acknowledgement can reach this server after the submission it
+	// precedes; returned at the match, the turn would show without it. A
+	// steered turn's acknowledgement is the second producer: the gateway
+	// posts it after the follow-up is published and after a read of the
+	// task's stream, so one that read takes longer than the window to post
+	// is missed, as every acknowledgement was before the window.
+	noticeSettle = 200 * time.Millisecond
 	// maxFollowedTasks bounds the delegated tasks one wait follows.
 	maxFollowedTasks = 8
 
@@ -432,6 +443,7 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 				res.Task = &ref
 				convs.setRunning(token, &ref)
 				go w.follow()
+				res.Notices = w.settleNotices(ctx, res.Notices)
 				return res, w, nil
 			}
 		case m := <-w.notices:
@@ -453,6 +465,28 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		case <-ctx.Done():
 			w.close()
 			return res, nil, ctx.Err()
+		}
+	}
+}
+
+// settleNotices reads the gateway's notices about the turn for noticeSettle
+// after its submission matched, and returns them appended to notices: the
+// acknowledgement may still be in flight at the match (see noticeSettle), and
+// with both channels ready the select above picks either at random. The
+// follower drains the submissions meanwhile; ctx cuts the window short.
+func (w *turnWatch) settleNotices(ctx context.Context, notices []string) []string {
+	settle := time.NewTimer(noticeSettle)
+	defer settle.Stop()
+	for {
+		select {
+		case m := <-w.notices:
+			if n := noticeText(m); n != "" {
+				notices = append(notices, n)
+			}
+		case <-settle.C:
+			return notices
+		case <-ctx.Done():
+			return notices
 		}
 	}
 }

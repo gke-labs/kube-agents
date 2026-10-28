@@ -56,9 +56,10 @@ MUTE_ENV = "CI_HEALTH_MUTE"
 MUTE_ON = "true"
 STATE_WEEK_KEY = "week_end"
 STATE_POSTED_KEY = "posted_at"
-# gsutil's words for an object that does not exist, as the workflow's
-# history step reads them; any other failure is not "never posted".
-NOT_FOUND_RE = re.compile(r"NotFound|No URLs matched|404")
+# `gcloud storage cat`'s words for an object that does not exist ("One or
+# more URLs matched no objects", as collect.py reads them); any other failure
+# is not "never posted".
+NOT_FOUND_RE = re.compile(r"matched no objects|NotFound|404")
 
 
 def log(message: str) -> None:
@@ -74,7 +75,7 @@ def read_posted(location: str, runner=subprocess.run) -> tuple[dict, bool]:
     """``(state, read)``: the last posted week, ``{}`` when none is on
     record; ``read`` is False when the object exists but could not be read."""
     if location.startswith(post_health.GS_PREFIX):
-        result = runner([post_health.GSUTIL, "-q", "cat", location], capture_output=True, text=True)
+        result = runner([post_health.GCLOUD, post_health.STORAGE_GROUP, "cat", location], capture_output=True, text=True)
         if result.returncode != 0:
             return {}, bool(NOT_FOUND_RE.search(result.stderr or ""))
         text = result.stdout

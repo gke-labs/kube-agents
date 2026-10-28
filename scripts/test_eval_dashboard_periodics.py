@@ -40,8 +40,8 @@ def epoch(when: datetime) -> int:
     return int(when.timestamp())
 
 
-class FakeGsutil:
-    """Answers `gsutil -q cat|ls <path>` from a dict of gs:// paths to text;
+class FakeGcloud:
+    """Answers `gcloud storage cat|ls <path>` from a dict of gs:// paths to text;
     a missing path is a NotFound unless `denied` names it."""
 
     def __init__(self, objects: dict, denied=()):
@@ -53,11 +53,11 @@ class FakeGsutil:
         self.calls.append(cmd)
         verb, path = cmd[2], cmd[3]
         if path in self.denied:
-            return subprocess.CompletedProcess(cmd, 1, "", "AccessDeniedException: 403 caller does not have storage.objects.get access")
+            return subprocess.CompletedProcess(cmd, 1, "", "ERROR: (gcloud.storage.cat) HTTPError 403: caller does not have storage.objects.get access to the Google Cloud Storage object.")
         if verb == "cat":
             if path in self.objects:
                 return subprocess.CompletedProcess(cmd, 0, self.objects[path], "")
-            return subprocess.CompletedProcess(cmd, 1, "", f"CommandException: No URLs matched: {path}")
+            return subprocess.CompletedProcess(cmd, 1, "", f"ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\n{path}")
         if verb == "ls":
             names = sorted({key[len(path):].split("/", 1)[0] for key in self.objects if key.startswith(path)})
             return subprocess.CompletedProcess(cmd, 0, "".join(f"{path}{name}/\n" for name in names), "")
@@ -85,9 +85,9 @@ class FetchTest(unittest.TestCase):
     def test_the_latest_finished_build_is_read_with_its_artifact(self):
         report = {"schema_version": 1, "mode": "all", "dry_run": True, "exit": "failed", "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "1 to add; not a create: delete x"}}}
         objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
-        gsutil = FakeGsutil(objects)
+        gcloud = FakeGcloud(objects)
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=gsutil)
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=gcloud)
             written = json.loads((pathlib.Path(tmp) / f"{DAILY.job}.json").read_text())
         self.assertEqual(readings[DAILY.job], written)
         self.assertEqual((written["build"], written["passed"], written["result"]), ("100", False, "FAILURE"))
@@ -100,7 +100,7 @@ class FetchTest(unittest.TestCase):
         objects = archive(SWEEP.job, {"100": (finished(NOW - timedelta(minutes=5), passed=False), github)})
         objects[f"{periodics.LOGS_ROOT}/{SWEEP.job}/100/{periodics.ARTIFACTS_DIR}/{periodics.GITLAB_SWEEP_ARTIFACT}"] = json.dumps(gitlab)
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects))
         reading = readings[SWEEP.job]
         self.assertEqual(reading["artifact"], github)
         self.assertEqual(reading["extra_artifacts"], {periodics.GITLAB_SWEEP_ARTIFACT: gitlab})
@@ -108,7 +108,7 @@ class FetchTest(unittest.TestCase):
         logged = []
         objects = archive(SWEEP.job, {"100": (finished(NOW - timedelta(minutes=5), passed=False), github)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: logged.append(a))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects), log=lambda *a, **k: logged.append(a))
         self.assertNotIn("extra_artifacts", readings[SWEEP.job])
         self.assertEqual(logged, [])
         # A GitLab report that fails to read for a reason other than NotFound
@@ -117,18 +117,18 @@ class FetchTest(unittest.TestCase):
         # yet); on a passed build the reading stands.
         gitlab_path = f"{periodics.LOGS_ROOT}/{SWEEP.job}/100/{periodics.ARTIFACTS_DIR}/{periodics.GITLAB_SWEEP_ARTIFACT}"
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects, denied=(gitlab_path,)), log=lambda *a, **k: logged.append(a))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects, denied=(gitlab_path,)), log=lambda *a, **k: logged.append(a))
         self.assertNotIn(SWEEP.job, readings, "blind on the job this tick")
         self.assertEqual(len(logged), 1)
         objects = archive(SWEEP.job, {"100": (finished(NOW - timedelta(minutes=5), passed=True), github)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects, denied=(gitlab_path,)), log=lambda *a, **k: None)
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects, denied=(gitlab_path,)), log=lambda *a, **k: None)
         self.assertIn(SWEEP.job, readings, "a passed build's reading stands without it")
 
     def test_a_running_newest_build_falls_back_to_the_one_before_it(self):
         objects = archive(POST.job, {"101": (None, None), "100": (finished(NOW - timedelta(minutes=50)), None), "99": (finished(NOW - timedelta(hours=2)), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(POST,), runner=FakeGsutil(objects))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(POST,), runner=FakeGcloud(objects))
         self.assertEqual(readings[POST.job]["build"], "100")
         self.assertIsNone(readings[POST.job]["artifact"], "the postsubmit wrote no artifact for that build")
 
@@ -136,11 +136,11 @@ class FetchTest(unittest.TestCase):
         # One listing per job per tick over a prefix that only grows, and the
         # newest build has finished most of the time: it is not made then.
         objects = archive(SWEEP.job, {"8": (finished(NOW - timedelta(minutes=3)), None), "7": (finished(NOW - timedelta(minutes=13)), None)})
-        gsutil = FakeGsutil(objects)
+        gcloud = FakeGcloud(objects)
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=gsutil)
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=gcloud)
         self.assertEqual(readings[SWEEP.job]["build"], "8")
-        self.assertEqual([c[2] for c in gsutil.calls], ["cat", "cat", "cat", "cat"], "pointer, finished.json, the report and the GitLab report; no ls")
+        self.assertEqual([c[2] for c in gcloud.calls], ["cat", "cat", "cat", "cat"], "pointer, finished.json, the report and the GitLab report; no ls")
 
     def test_an_aborted_newest_build_is_walked_past_not_reported_as_failed(self):
         # Prow's sidecar writes finished.json with result ABORTED when it
@@ -148,24 +148,24 @@ class FetchTest(unittest.TestCase):
         aborted = {"timestamp": epoch(NOW - timedelta(minutes=30)), "passed": False, "result": "ABORTED"}
         objects = archive(DAILY.job, {"101": (aborted, None), "100": (finished(NOW - timedelta(days=1)), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(objects))
         self.assertEqual((readings[DAILY.job]["build"], readings[DAILY.job]["passed"]), ("100", True))
         self.assertEqual(periodics.assess(readings, NOW, {}), {})
         # Every build aborted: nothing to read, no note.
         only_aborted = archive(DAILY.job, {"101": (aborted, None)})
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(only_aborted)), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(only_aborted)), {})
 
     def test_a_job_that_never_ran_or_whose_pointer_is_denied_writes_nothing(self):
         objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
         with tempfile.TemporaryDirectory() as tmp:
             out = pathlib.Path(tmp)
             (out / f"{POST.job}.json").write_text("stale from last tick")
-            readings = periodics.fetch(out, watched=(SWEEP, POST), runner=FakeGsutil(objects))
+            readings = periodics.fetch(out, watched=(SWEEP, POST), runner=FakeGcloud(objects))
             self.assertEqual(sorted(readings), [SWEEP.job])
             self.assertFalse((out / f"{POST.job}.json").exists(), "last tick's file does not survive a job with no build")
             warnings = []
-            denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{SWEEP.job}/{periodics.POINTER}"})
+            denied = FakeGcloud(objects, denied={f"{periodics.LOGS_ROOT}/{SWEEP.job}/{periodics.POINTER}"})
             readings = periodics.fetch(out, watched=(SWEEP,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
         self.assertEqual(readings, {})
         self.assertEqual(len(warnings), 1, "a denied pointer is said, a NotFound is not")
@@ -175,7 +175,7 @@ class FetchTest(unittest.TestCase):
         # A 503 on the newest finished build must not walk back to last
         # week's and report that: nothing is written, with a warning.
         objects = archive(DAILY.job, {"101": (finished(NOW - timedelta(days=1)), None), "100": (finished(NOW - timedelta(days=8, hours=1)), None)})
-        denied = FakeGsutil(objects, denied={f"{periodics.LOGS_ROOT}/{DAILY.job}/101/{periodics.FINISHED}"})
+        denied = FakeGcloud(objects, denied={f"{periodics.LOGS_ROOT}/{DAILY.job}/101/{periodics.FINISHED}"})
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
@@ -184,21 +184,21 @@ class FetchTest(unittest.TestCase):
         self.assertIn("101/finished.json", warnings[0])
 
     def test_a_build_id_containing_404_in_an_error_is_not_read_as_absent(self):
-        # gsutil echoes the failing URL; a 503 on .../1404/finished.json is
+        # gcloud echoes the failing URL; a 503 on .../1404/finished.json is
         # not a NotFound, and the walk must not report the build before it.
         objects = archive(DAILY.job, {"1404": (finished(NOW - timedelta(hours=1), passed=False), None), "1400": (finished(NOW - timedelta(days=1)), None)})
-        class Flaky(FakeGsutil):
+        class Flaky(FakeGcloud):
             def __call__(self, cmd, **kwargs):
                 if cmd[3].endswith("/1404/finished.json"):
-                    return subprocess.CompletedProcess(cmd, 1, "", f"ServiceException: 503 Backend error reading {cmd[3]}")
+                    return subprocess.CompletedProcess(cmd, 1, "", f"ERROR: (gcloud.storage.cat) HTTPError 503: Backend error reading {cmd[3]}")
                 return super().__call__(cmd, **kwargs)
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=Flaky(objects), log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertEqual(len(warnings), 1)
-        self.assertTrue(periodics._not_found("CommandException: No URLs matched: gs://x/y"))
-        self.assertTrue(periodics._not_found("NotFoundException: 404 gs://x/y does not exist."))
-        self.assertFalse(periodics._not_found("ServiceException: 503 on gs://kube-agents-prow/logs/j/2097891568546404123/started.json"))
+        self.assertTrue(periodics._not_found("ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\ngs://x/y"))
+        self.assertTrue(periodics._not_found("ERROR: (gcloud.storage.cat) gs://x not found: 404."))
+        self.assertFalse(periodics._not_found("ERROR: (gcloud.storage.cat) HTTPError 503: on gs://kube-agents-prow/logs/j/2097891568546404123/started.json"))
 
     def test_a_present_but_unparseable_finished_json_is_a_blind_tick(self):
         # An empty or truncated object is not "still running": walking past it
@@ -208,18 +208,18 @@ class FetchTest(unittest.TestCase):
         objects[f"{root}/101/{periodics.FINISHED}"] = ""
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertEqual(readings, {})
         self.assertEqual(len(warnings), 1)
         self.assertIn("101/finished.json: not JSON", warnings[0])
         objects[f"{root}/101/{periodics.FINISHED}"] = "[]"
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects), log=lambda *a, **k: None), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(objects), log=lambda *a, **k: None), {})
 
     def test_an_absurd_timestamp_is_no_finish_time_not_a_crash(self):
         objects = archive(POST.job, {"5": ({"timestamp": 10**20, "passed": True, "result": "SUCCESS"}, None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(POST,), runner=FakeGsutil(objects))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(POST,), runner=FakeGcloud(objects))
         self.assertIsNone(readings[POST.job]["finished_at"])
         self.assertEqual(periodics.assess(readings, NOW, {})[POST.job]["verdict"], periodics.VERDICT_STALE)
 
@@ -237,7 +237,7 @@ class FetchTest(unittest.TestCase):
         # there, it is read as listed rather than rebuilt through int().
         objects = archive(DAILY.job, {"200": (None, None), "0099": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(objects))
         self.assertEqual(readings[DAILY.job]["build"], "0099")
 
     def test_a_passed_builds_unreadable_report_keeps_the_reading(self):
@@ -246,7 +246,7 @@ class FetchTest(unittest.TestCase):
         # stands without it, where a failed build's would blind the tick.
         root = f"{periodics.LOGS_ROOT}/{DAILY.job}"
         objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), {"summary": {"applied": 1}})})
-        denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
+        denied = FakeGcloud(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=denied, log=lambda *a, **k: warnings.append(a[0]))
@@ -256,7 +256,7 @@ class FetchTest(unittest.TestCase):
     def test_a_missing_bucket_is_warned_not_read_as_never_ran(self):
         class NoBucket:
             def __call__(self, cmd, **kwargs):
-                return subprocess.CompletedProcess(cmd, 1, "", f"BucketNotFoundException: 404 gs://{cmd[3].split('/')[2]} bucket does not exist.")
+                return subprocess.CompletedProcess(cmd, 1, "", f"ERROR: (gcloud.storage.cat) gs://{cmd[3].split('/')[2]} not found: 404.")
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=NoBucket(), log=lambda *a, **k: warnings.append(a[0])), {})
@@ -588,19 +588,19 @@ class AssessTest(unittest.TestCase):
         objects[f"{root}/{periodics.POINTER}"] = "\u00b2\n"
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects), log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertIn("not a build id", warnings[0])
         objects = archive(SWEEP.job, {"9": (None, None), "8": (finished(NOW - timedelta(minutes=13)), None)})
         objects[f"{root}/\u2460/started.json"] = "{}"
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects))
         self.assertEqual(readings[SWEEP.job]["build"], "8")
 
     def test_an_unreadable_artifact_is_a_blind_tick_and_a_cut_one_is_said(self):
         root = f"{periodics.LOGS_ROOT}/{DAILY.job}"
         report = {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "x"}}}
         objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
-        denied = FakeGsutil(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
+        denied = FakeGcloud(objects, denied={f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"})
         warnings = []
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
@@ -610,18 +610,18 @@ class AssessTest(unittest.TestCase):
         objects[f"{root}/100/{periodics.ARTIFACTS_DIR}/{periodics.RECONCILE_ARTIFACT}"] = '{"outcomes": {'
         warnings.clear()
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0]))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(objects), log=lambda *a, **k: warnings.append(a[0]))
         self.assertIn("not a JSON object", warnings[0])
         self.assertEqual(periodics.reconcile_detail(readings[DAILY.job]["artifact"]), [f"run: {periodics.REPORT_UNREADABLE}"])
         # A passed build's report is read too: the recovery message says what the run did.
-        passed = FakeGsutil(archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
+        passed = FakeGcloud(archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=True), report)}))
         with tempfile.TemporaryDirectory() as tmp:
             readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=passed)
         self.assertEqual(readings[DAILY.job]["artifact"], report)
         # A run that wrote no artifact is a reading without one.
         absent = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), None)})
         with tempfile.TemporaryDirectory() as tmp:
-            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGsutil(absent))
+            readings = periodics.fetch(pathlib.Path(tmp), watched=(DAILY,), runner=FakeGcloud(absent))
         self.assertIsNone(readings[DAILY.job]["artifact"])
 
     def test_a_stale_note_without_a_finish_time_says_the_window_cannot_be_measured(self):
@@ -635,7 +635,7 @@ class AssessTest(unittest.TestCase):
         root = f"{periodics.LOGS_ROOT}/{SWEEP.job}"
         objects = archive(SWEEP.job, {"9": (None, None), "8": (finished(NOW - timedelta(minutes=13)), None)})
         warnings = []
-        denied = FakeGsutil(objects, denied={f"{root}/"})
+        denied = FakeGcloud(objects, denied={f"{root}/"})
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=denied, log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertEqual(len(warnings), 1)
@@ -643,7 +643,7 @@ class AssessTest(unittest.TestCase):
         objects[f"{root}/{periodics.POINTER}"] = "\n"
         warnings.clear()
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGsutil(objects), log=lambda *a, **k: warnings.append(a[0])), {})
+            self.assertEqual(periodics.fetch(pathlib.Path(tmp), watched=(SWEEP,), runner=FakeGcloud(objects), log=lambda *a, **k: warnings.append(a[0])), {})
         self.assertIn("not a build id", warnings[0])
 
     def test_streaks_count_consecutive_failed_checks_per_project_and_per_run(self):
@@ -804,7 +804,7 @@ class WorkflowWiring(unittest.TestCase):
     def test_main_names_what_it_wrote(self):
         objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()) as out:
-            rc = periodics.main(["fetch", "--out-dir", tmp, "--job", SWEEP.job, "--job", POST.job], runner=FakeGsutil(objects))
+            rc = periodics.main(["fetch", "--out-dir", tmp, "--job", SWEEP.job, "--job", POST.job], runner=FakeGcloud(objects))
         self.assertEqual(rc, 0)
         self.assertIn(f"{SWEEP.job}: build 7 SUCCESS", out.getvalue())
         self.assertIn(f"{POST.job}: no finished build", out.getvalue())
