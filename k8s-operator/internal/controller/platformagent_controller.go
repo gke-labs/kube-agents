@@ -4756,7 +4756,7 @@ func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannel
 			return msg + fmt.Sprintf(homeChannelUnsetStaleNoReaderFormat, rec.recorded, a2aGatewayName(agent), agent.Namespace)
 		case rec.pending:
 			return msg + fmt.Sprintf(homeChannelUnsetPendingFormat, rec.recorded, rec.appliesAt.UTC().Format(time.RFC3339), homeChannelAdmitDelay)
-		case rec.recorded != "":
+		case rec.stale:
 			return msg + fmt.Sprintf(homeChannelUnsetStaleFormat, rec.recorded, rec.readerShown,
 				boundedRunes(a2aGatewayImage(), homeChannelRecordImageMax), a2aGatewayName(agent), agent.Namespace)
 		case rec.refused != "":

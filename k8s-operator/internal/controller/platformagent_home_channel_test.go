@@ -273,6 +273,10 @@ func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
 	if len([]rune(long)) <= homeChannelRecordImageMax {
 		t.Fatalf("test image is %d runes, not over the display bound", len([]rune(long)))
 	}
+	// A reference over the display bound prints as its first 157 runes and
+	// the three-rune marker; the 158th rune never prints.
+	shown := func(s string) string { return string([]rune(s)[:157]) + "..." }
+	unshown := func(s string) string { return string([]rune(s)[:158]) }
 	record := func(data map[string]string) *corev1.ConfigMap { return &corev1.ConfigMap{Data: data} }
 	now := time.Now()
 	ago := func(d time.Duration) string { return now.Add(-d).UTC().Format(time.RFC3339) }
@@ -302,13 +306,14 @@ func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
 		{"manual ignores the record", "", "manual", record(learned), "", "", true, []string{"manual"}, nil},
 		{"manual with the cr set", "C0CR", "manual", record(learned), "", "C0CR", false, nil, nil},
 		{"manual is named before a malformed record", "", "manual", record(map[string]string{homeChannelRecordSlackKey: "D0DM", homeChannelRecordReaderKey: image}), "", "", true, []string{"manual"}, []string{"not a channel id"}},
-		{"stale reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: "ghcr.io/x/a2a-gateway:old"}), "", "", true, []string{"C0LEARNED", "ghcr.io/x/a2a-gateway:old", image, restart}, nil},
+		{"stale reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: "ghcr.io/x/a2a-gateway:old"}), "", "", true, []string{"C0LEARNED", "ghcr.io/x/a2a-gateway:old", image, restart}, []string{"old...", image + "..."}},
 		{"stale with no reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}), "", "", true, []string{"C0LEARNED", "no confirming gateway image", restart}, nil},
-		{"stale reader over the display bound is cut, not echoed", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: strings.Repeat("x", 40000)}), "", "", true, []string{"C0LEARNED", restart}, nil},
+		{"stale reader over the display bound is cut, not echoed, and the cut is marked", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: strings.Repeat("x", 40000)}), "", "", true, []string{"C0LEARNED", shown(strings.Repeat("x", 40000)), restart}, []string{unshown(strings.Repeat("x", 40000))}},
 		{"stale reader with control characters is printed without them", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: "ghcr.io/x/a2a-gateway:old\n\x1b[31mred"}), "", "", true, []string{"ghcr.io/x/a2a-gateway:old", "red"}, []string{"\n", "\x1b"}},
+		{"reader equal but for a non-printable rune is compared without it", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: image + "\u200b"}), "", "C0LEARNED", false, nil, nil},
 		{"writer alone does not admit", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", "writer": image}), "", "", true, []string{"no confirming gateway image"}, nil},
 		{"reader equal in full past the display bound", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: long}), long, "C0LEARNED", false, nil, nil},
-		{"reader differing past the display bound", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: long + "!"}), long, "", true, []string{"C0LEARNED"}, nil},
+		{"reader differing past the display bound prints both cut and marked", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: long + "!"}), long, "", true, []string{"C0LEARNED", shown(long)}, []string{unshown(long)}},
 		{"recorded channel the gateway refused", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: image, homeChannelRecordRefusedKey: "archived"}), "", "", true, []string{"C0LEARNED", "archived", "replaces it"}, nil},
 		{"recorded channel refused as malformed", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: image, homeChannelRecordRefusedKey: "malformed"}), "", "", true, []string{"C0LEARNED", "not a channel id"}, nil},
 		{"refused candidate, known reason", "", "", record(map[string]string{homeChannelRecordRefusedKey: "shared"}), "", "", true, []string{"refused", "Slack Connect"}, nil},
@@ -375,17 +380,37 @@ func TestHomeChannelRequeue(t *testing.T) {
 	}
 }
 
-// TestHomeChannelFutureTimestampWaitsTheDelayAtMost: a slack.setAt ahead of
-// the operator's clock (a skewed writer, a hand edit) holds the admission for
-// one delay from now, not until that future time plus the delay.
-func TestHomeChannelFutureTimestampWaitsTheDelayAtMost(t *testing.T) {
+// TestHomeChannelFutureTimestamp: a slack.setAt ahead of the operator's
+// clock (a writer clock fast, a hand edit) waits until its own delay has
+// passed, however far ahead: every pass names the same admission time, a read
+// at that time admits it, and no read before it does.
+func TestHomeChannelFutureTimestamp(t *testing.T) {
 	now := time.Date(2026, 10, 28, 18, 30, 0, 0, time.UTC)
 	a := slackTestAgent("next", true)
-	cm := &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: a2aGatewayImage(),
-		homeChannelRecordSetAtKey: now.Add(24 * time.Hour).Format(time.RFC3339)}}
-	rec := readHomeChannelRecord(a, cm, a2aGatewayImage(), now)
-	if !rec.pending || rec.appliesIn != homeChannelAdmitDelay || !rec.appliesAt.Equal(now.Add(homeChannelAdmitDelay)) {
-		t.Fatalf("future timestamp: pending=%v appliesIn=%s appliesAt=%s, want pending for exactly %s from now", rec.pending, rec.appliesIn, rec.appliesAt, homeChannelAdmitDelay)
+	read := func(ahead time.Duration, at time.Time) homeChannelRecord {
+		cm := &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: a2aGatewayImage(),
+			homeChannelRecordSetAtKey: now.Add(ahead).Format(time.RFC3339)}}
+		return readHomeChannelRecord(a, cm, a2aGatewayImage(), at)
+	}
+	first := read(time.Minute, now)
+	if want := now.Add(time.Minute + homeChannelAdmitDelay); !first.pending || !first.appliesAt.Equal(want) || first.appliesIn != time.Minute+homeChannelAdmitDelay {
+		t.Fatalf("a minute ahead: pending=%v appliesAt=%s appliesIn=%s, want pending until %s", first.pending, first.appliesAt, first.appliesIn, want)
+	}
+	if again := read(time.Minute, now.Add(homeChannelAdmitDelay)); !again.pending || !again.appliesAt.Equal(first.appliesAt) {
+		t.Fatalf("a minute ahead, read one delay later: pending=%v appliesAt=%s, want the same %s", again.pending, again.appliesAt, first.appliesAt)
+	}
+	if admitted := read(time.Minute, first.appliesAt); admitted.pending || admitted.channel != "C0LEARNED" {
+		t.Fatalf("a minute ahead, read at the named time: pending=%v channel=%q, want admitted", admitted.pending, admitted.channel)
+	}
+	far := read(24*time.Hour, now)
+	if want := now.Add(24*time.Hour + homeChannelAdmitDelay); !far.pending || !far.appliesAt.Equal(want) || far.appliesIn != 24*time.Hour+homeChannelAdmitDelay {
+		t.Fatalf("a day ahead: pending=%v appliesAt=%s appliesIn=%s, want pending until %s", far.pending, far.appliesAt, far.appliesIn, want)
+	}
+	if early := read(24*time.Hour, far.appliesAt.Add(-time.Minute)); !early.pending || early.channel != "" {
+		t.Fatalf("a day ahead, read a minute before the named time: pending=%v channel=%q, want still pending", early.pending, early.channel)
+	}
+	if admitted := read(24*time.Hour, far.appliesAt); admitted.pending || admitted.channel != "C0LEARNED" {
+		t.Fatalf("a day ahead, read at the named time: pending=%v channel=%q, want admitted", admitted.pending, admitted.channel)
 	}
 }
 
