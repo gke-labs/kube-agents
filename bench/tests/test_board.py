@@ -589,6 +589,39 @@ def test_read_session_cards_extracts_errors_from_tasks_and_runs(
     assert read.cards[CHILD]["error"] == "quota exceeded (failure_reason=rate_limit)"
 
 
+def test_as_shown_keeps_error_distinct_from_summary_and_omits_deliverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT, CHILD])
+    set_card(tmp_path, FRONT, "blocked")
+    set_card(tmp_path, CHILD, "done", summary="node pool resized")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("worker turn failed and the run ended", FRONT),
+        )
+    shell = local_shell(tmp_path, monkeypatch)
+    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
+    assert read is not None
+    entry_front = read.as_shown(FRONT)
+    assert entry_front is not None
+    shown_front = json.loads(entry_front["result"])
+    assert shown_front["runs"] == [{"error": "worker turn failed and the run ended"}]
+    assert "summary" not in shown_front["runs"][0]
+
+    # delivered_results must not treat error text as a delivered result
+    delivered = parsing.delivered_results([entry_front], [FRONT])
+    assert delivered == {}
+
+    entry_child = read.as_shown(CHILD)
+    assert entry_child is not None
+    shown_child = json.loads(entry_child["result"])
+    assert shown_child["runs"] == [{"summary": "node pool resized"}]
+    delivered_child = parsing.delivered_results([entry_child], [CHILD])
+    assert delivered_child == {CHILD: "node pool resized"}
+
+
 # --- a card paused on a question (#4004) ----------------------------------------
 
 QUESTION = "payments-api is OOMKilled against its 64Mi limit. Which fix?\n- raise the limit\n- set a request"

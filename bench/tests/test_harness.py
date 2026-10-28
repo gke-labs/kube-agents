@@ -5262,6 +5262,40 @@ def test_settle_delegated_worker_triage_rate_limit_is_infra(
     )
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+
+
+def test_settle_delegated_worker_triage_rate_limit_from_run_error_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a card ends in triage carrying the rate limit error in runs[].error, it is marked infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog("ok", "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "triage"},
+            "runs": [{"error": rate_limit_text}],
+        }),
+    }
+    harness.KubeAgentsHarness._settle(
+        res,
+        [show],
+        ["t_1"],
+        board_messages=[],
+    )
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "card on board recorded rate_limit" in res.errors[0]
 
 

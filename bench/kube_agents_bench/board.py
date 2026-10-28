@@ -497,10 +497,19 @@ class SessionCards:
         task: dict[str, Any] = {"id": task_id, "status": card.get("status"), "result": card.get("result")}
         if card.get("block"):
             task["block"] = card["block"]
-        summary = card.get("summary") or card.get("error")
+        summary = card.get("summary")
+        error = card.get("error")
+        runs: list[dict[str, Any]] = []
+        if summary or error:
+            run: dict[str, Any] = {}
+            if summary:
+                run["summary"] = summary
+            if error:
+                run["error"] = error
+            runs.append(run)
         payload: dict[str, Any] = {
             "task": task,
-            "runs": [{"summary": summary}] if summary else [],
+            "runs": runs,
         }
         return {
             "name": "kanban_show",

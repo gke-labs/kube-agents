@@ -2768,6 +2768,47 @@ def test_inject_transport_delegated_worker_rate_limit_triage_marks_run_infra(
     assert "card on board recorded rate_limit" in result.errors[0]
 
 
+def test_inject_transport_delegated_worker_rate_limit_triage_from_error_column_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a triage card carries the rate limit failure reason in an error column and no summary, mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "triage")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
+        conn.execute("ALTER TABLE task_runs ADD COLUMN error TEXT")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            (rate_limit_msg, CARD_A),
+        )
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+
+
 def test_inject_transport_delegated_worker_mid_wait_rate_limit_triage_marks_run_infra(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3050,6 +3091,112 @@ def test_inject_transport_card_filed_later_in_triage_is_fetched_in_loop(
     assert len(reads) == 4
     # CARD_B retired immediately via in-loop _fetch_triage without entering another wait cycle
     assert f"on delegated tasks: {CARD_B}" not in caplog.text
+
+
+def test_inject_transport_blocked_card_with_error_and_no_summary_delivers_nothing_and_preserves_sibling_ceiling(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card blocked with an error and no summary delivers nothing as a result and does not drop sibling ceiling marker."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_A, "blocked")
+    set_card(tmp_path, CARD_B, "running")
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("worker turn failed and the run ended; any comment this run left on the card carries the error Hermes reported", CARD_A),
+        )
+
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[{"name": "terminal", "args": {"command": "echo test"}, "result": "ok"}],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    # Sibling CARD_B outrunning the budget must receive the ceiling marker because CARD_A delivered no answer
+    assert any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    # The error message from CARD_A must not be delivered into output as a task result
+    assert "Result of delegated task" not in result.output
+    assert "worker turn failed" not in result.output
+
+
+def test_inject_transport_capped_overflow_triage_card_is_not_refetched_in_poll_loop(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cards past _MAX_AWAITED_TASKS in triage are not repeatedly re-read in the loop via _fetch_triage."""
+    card_ids = [f"t_{i:08x}" for i in range(33)]
+    overflow_card = card_ids[-1]
+    awaited_cards = card_ids[:32]
+
+    build_session_store(tmp_path, created=card_ids)
+    for cid in awaited_cards:
+        set_card(tmp_path, cid, "running")
+    set_card(tmp_path, overflow_card, "triage")
+
+    def advance(n: int) -> None:
+        if n == 3:
+            for cid in awaited_cards:
+                set_card(tmp_path, cid, "done", result="all done")
+            set_card(tmp_path, overflow_card, "done", result="all done")
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return "".join(f"{harness._LOG_PRESENT} {cid} 0\n" for cid in card_ids)
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    reads: list[str] = getattr(real_shell, "reads", [])
+    # Reads:
+    # 0: initial read
+    # 1: initial triage fetch for overflow_card before loop
+    # 2: poll 1 loop read (awaited_cards)
+    # 3: final read for settled cards
+    # In the buggy code, poll 1 would issue a 2nd read for overflow_card via _fetch_triage,
+    # resulting in >= 5 reads with [overflow_card] queried in the loop.
+    assert len(reads) == 4, f"expected 4 reads, got {len(reads)}"
+    # Verify that in-loop poll read (reads[2]) and final read (reads[3]) never queried overflow_card
+    for r in reads[2:]:
+        want_args = r.split()[10:]
+        assert want_args != [overflow_card], f"overflow card {overflow_card} was queried in loop read: {r}"
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

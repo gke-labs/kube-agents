@@ -2953,6 +2953,8 @@ class KubeAgentsHarness(AgentHarness):
                 "still waiting on: " + (", ".join(still) or "nothing (reading results)")
             )
 
+        outstanding: list[str] = []
+
         def _fetch_triage(card_ids: Sequence[str]) -> None:
             if read is None:
                 return
@@ -2966,12 +2968,13 @@ class KubeAgentsHarness(AgentHarness):
             if triage_need:
                 fresh_triage = _read(triage_need)
                 if fresh_triage is None:
-                    raise _exhausted(triage_need)
+                    raise _exhausted(outstanding or triage_need)
                 read.cards.update(
                     {t: c for t, c in fresh_triage.cards.items() if t in triage_need}
                 )
 
         _fetch_triage(read.card_ids)
+        prev_card_ids: set[str] = set(read.card_ids)
 
         # Cards the board has had no row for on consecutive reads, and the
         # ones dropped for it: a create on another board, or a card deleted
@@ -3013,7 +3016,10 @@ class KubeAgentsHarness(AgentHarness):
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
-            _fetch_triage([t for t in read.card_ids if t not in awaited])
+            new_cards = [t for t in read.card_ids if t not in prev_card_ids]
+            if new_cards:
+                _fetch_triage(new_cards)
+                prev_card_ids.update(new_cards)
             outstanding = _merge()
 
         # Only a card the board shows terminal is read back, as the status-turn
