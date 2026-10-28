@@ -333,13 +333,18 @@ type SlackSpec struct {
 	// +optional
 	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 
-	// HomeChannelPolicy ("auto", also absent, or "manual") is accepted and
-	// recorded in this release but has no effect yet: the A2A gateway does not
-	// learn a home channel, so HomeChannel alone decides. It is rendered to
-	// the gateway as A2A_SLACK_HOME_POLICY for a gateway that learns the
-	// channel of the first admitted mention under "auto". No schema default:
-	// the API server would apply one to every stored object it reads, so
-	// absent is read as "auto" by the operator instead.
+	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
+	// A2A gateway may learn the Slack home channel under spec.mode next when
+	// HomeChannel is empty. Under "auto" the channel of the first top-level
+	// mention of the agent in a channel becomes the home channel: the gateway
+	// records it in the <agent>-home-channel ConfigMap and, five minutes
+	// later, the operator renders it to the agent as if HomeChannel named it
+	// (the agent pod restarts once for that, after the conversation that
+	// learned the channel) and clears HomeChannelUnset. Under "manual"
+	// HomeChannel alone decides. A set
+	// HomeChannel wins under either. No schema default: the API server would
+	// apply one to every stored object it reads, so absent is read as "auto"
+	// by the operator instead.
 	// +kubebuilder:validation:Enum=auto;manual
 	// +optional
 	HomeChannelPolicy string `json:"homeChannelPolicy,omitempty"`

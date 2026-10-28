@@ -436,6 +436,10 @@ type PlatformAgentReconciler struct {
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
 
+	// now is the reconcile's clock, time.Now when nil; a test injects one to
+	// hold the home-channel admit delay still (homeChannelRecordFor).
+	now func() time.Time
+
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
 	// so each generation logs them once. Keyed by ObjectKey, value int64;
@@ -995,7 +999,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+	// The home-channel record, read once per pass: the agent render below
+	// and both condition writers after the A2A render take this value, so
+	// the env and the condition never disagree within one pass.
+	homeRec, err := r.homeChannelRecordFor(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled, homeRec); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1044,6 +1055,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 	}
+	// The record travels with the render state to every status writer below,
+	// the failed and parked paths included, so the condition follows the same
+	// read the agent env did.
+	a2aState.homeRecord = homeRec
 
 	// The version this pass rendered, for the deferred write at 2d. Empty on
 	// every path that did not get here, where the write reads it back off the
@@ -1175,6 +1190,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	requeueAfter = homeChannelRequeue(requeueAfter, homeRec)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
@@ -2366,11 +2382,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool, homeRec homeChannelRecord) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
-	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled, slackHomeRecord: homeRec}
 	held, err := r.heldGitHubOrg(ctx, agent)
 	if err != nil {
 		return err
@@ -4156,7 +4172,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// The home-channel advisory rides here too: a rendered stack parked
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
-	homeMsg := homeChannelUnsetMessage(agent)
+	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
@@ -4166,7 +4182,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
 	}) {
 		return nil
@@ -4461,9 +4477,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	replicasLimitedMsg := replicasLimitedMessage(agent)
 	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
 
-	// The home-channel advisory, from the spec alone, compared on its message
-	// for the same reason EventWatcher's is.
-	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
+	// The home-channel advisory, from the spec and the record this pass read,
+	// compared on its message for the same reason EventWatcher's is.
+	homeChannelUnsetMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
 	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
@@ -4711,17 +4727,42 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 }
 
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
-// spec, or "" when the condition is to be absent: the next stack holds no chat
-// backend, or the one it holds has a home channel. A malformed home channel is
-// not this condition's: the gateway refuses it at start and says so.
-func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent) string {
+// spec and the home-channel record, or "" when the condition is to be absent:
+// the next stack holds no chat backend, or the one it holds has a home
+// channel, from the CR or admitted from the record. A malformed home channel
+// is not this condition's: the gateway refuses it at start and says so. On
+// Slack with the CR field empty the base sentence carries at most one more:
+// why the record did not stand in (manual, not an id, refused, stale), or
+// that a mention sets it.
+func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	switch {
 	case a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "":
 		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
 			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)")
 	case a2aSlackArmed(agent) && strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "":
-		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
+		if rec.channel != "" {
+			return ""
+		}
+		msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
 			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)")
+		switch {
+		case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
+			return msg + homeChannelUnsetManualSuffix
+		case rec.recorded == homeChannelRecordMalformed:
+			return msg + homeChannelUnsetMalformedSuffix
+		case rec.recorded != "" && rec.refused != "":
+			return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.recorded, rec.refused)
+		case rec.recorded != "" && rec.reader == "":
+			return msg + fmt.Sprintf(homeChannelUnsetStaleNoReaderFormat, rec.recorded, a2aGatewayName(agent), agent.Namespace)
+		case rec.pending:
+			return msg + fmt.Sprintf(homeChannelUnsetPendingFormat, rec.recorded, rec.appliesAt.UTC().Format(time.RFC3339), homeChannelAdmitDelay)
+		case rec.recorded != "":
+			return msg + fmt.Sprintf(homeChannelUnsetStaleFormat, rec.recorded, rec.readerShown,
+				boundedRunes(a2aGatewayImage(), homeChannelRecordImageMax), a2aGatewayName(agent), agent.Namespace)
+		case rec.refused != "":
+			return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.refused)
+		}
+		return msg + homeChannelUnsetLearnSuffix
 	}
 	return ""
 }

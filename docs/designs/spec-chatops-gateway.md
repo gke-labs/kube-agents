@@ -1581,14 +1581,25 @@ one platform is ever routed.
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
-record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. In this
-release the agent's env and the `HomeChannelUnset` condition follow `homeChannel` alone. The change
-that makes the operator render the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the
-CR, else the record" and the switch that arms the gateway's learn ship as one, so no release holds a
-signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
-switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
-that change merges after the gateway code, never before it. With the switch set, the policy `auto`
-and `homeChannel` empty, the gateway reads the record at boot: a recorded channel is checked again
+record's name as `A2A_HOME_CHANNEL_RECORD`, the gateway's own image as `A2A_SELF_IMAGE` and the switch
+that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway. The
+operator renders the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the CR, else the
+record" and the `HomeChannelUnset` condition from the same read (one read per reconcile, carried to the
+render and to both condition writers), so the admission and the learn shipped as one and no release
+holds a signal nothing answers. The operator admits a recorded channel only under policy `auto`, when
+the value is a channel id of at most 32 runes, when no `slack.refused` stands beside it, when its
+`reader` equals the gateway image the operator renders, and once five minutes have passed since
+`slack.setAt` (the channel reaches the agent as pod env, so the admission replaces the agent pod, and
+the conversation that learned the channel runs through the bridge in that pod: admitted at once, the
+roll failed the user's own first message; the reconcile requeues for the remainder, and a record with
+no readable timestamp applies at once); otherwise the condition's base sentence carries
+one more: the channel is recorded and applies at a named time, the policy is `manual`, the recorded value is not a channel id, the gateway refused the
+channel (and the next admitted mention replaces it), or another image last confirmed it, with the way
+out named (the gateway re-checks and re-stamps the record when it starts, so a restart of its
+Deployment; a boot check that could not be made, or a re-stamp that failed, is not retried before
+that), and with an empty record it says that a mention in a channel sets it. The gateway's half
+(`a2a/gateway/slack_home_channel.go`), with the switch set, the policy `auto` and `homeChannel` empty,
+reads the record at boot: a recorded channel is checked again
 with `conversations.info` and adopted, with `reader` re-stamped to the gateway's own image and a stale
 `slack.refused` cleared; one that is shared, archived, not joined, or not a channel id is written to
 `slack.refused` as one of the four words the operator matches, `shared`, `archived`, `not-member` or
@@ -1604,10 +1615,13 @@ refusal; while a channel is recorded, `slack.refused` describes it, only the boo
 and a refused candidate writes nothing) and the next mention may learn; a record another writer
 filled first is adopted after the same check, with `reader` re-stamped, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
-candidate. One hand-reachable
-state exists: `kubectl set env` of that switch on the gateway Deployment survives the operator's
-server-side apply, and the gateway then learns, writes and posts while the agent env stays unrouted
-and `HomeChannelUnset` stays True. `reader` compares the image reference only: under a floating tag
+candidate. A hand-set value
+of the switch on the gateway Deployment is a no-op: the operator owns the key, and its server-side
+apply restores the rendered value on the next pass. A learned channel stays in the record while
+`homeChannel` is set, so clearing the field returns to it; deleting the ConfigMap, waiting
+for the operator to re-create it empty, and then restarting the gateway forgets it and arms the
+learn again, since the learner arms only at gateway start and a start that finds no record arms
+nothing. `reader` compares the image reference only: under a floating tag
 such as `latest` the same tag can name a different image, which the key cannot tell. `patch` on the
 object is the RBAC bound; data-only merge patches with the read `resourceVersion` as the precondition
 are the gateway's contract.
