@@ -2431,7 +2431,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "0f040b723f2a5dbc",
+      "version": "c9758a1e4fe6862b",
       "identities": [
         {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-provision",
@@ -2440,6 +2440,7 @@ data:
           "grants": {
             "publish": [
               "a2a.topics.agent.platform.upgrade-readiness",
+              "a2a.topics.agent.platform.topology-skew",
               "a2a.topics.shared.blueprint",
               "a2a.topics.shared.annotations",
               "$JS.API.INFO",
@@ -2486,6 +2487,7 @@ data:
           "grants": {
             "publish": [
               "a2a.topics.agent.platform.upgrade-readiness",
+              "a2a.topics.agent.platform.topology-skew",
               "a2a.topics.shared.blueprint",
               "a2a.topics.shared.annotations",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -2527,7 +2529,7 @@ data:
 kind: ConfigMap
 metadata:
   annotations:
-    kubeagents.x-k8s.io/a2a-authmap-version: 0f040b723f2a5dbc
+    kubeagents.x-k8s.io/a2a-authmap-version: c9758a1e4fe6862b
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -2829,6 +2831,7 @@ stringData:
               publish {
                 allow = [
                   "a2a.topics.agent.platform.upgrade-readiness",
+                  "a2a.topics.agent.platform.topology-skew",
                   "a2a.topics.shared.blueprint",
                   "a2a.topics.shared.annotations",
                   "$JS.API.INFO",
@@ -4171,7 +4174,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-a413cf83
+  name: platformagent-a2a-provision-e7cdd42c
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -4310,21 +4313,21 @@ spec:
               --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
               --discard=old --replicas=1 --max-consumers=64 --defaults\n\n# TOPICS-STATE:
               current answer plus short history, no age limit. 1GiB cap.\n# State-class
-              topics (provisioned registry): upgrade-readiness, blueprint, probe.\n#\n#
-              The probe subject is the one here with NO writer, deliberately, and it is
-              the\n# single exception to the rule that a topic's subject list and its
-              writer's\n# grant travel together. It exists so that an authorization probe
-              has a real\n# provisioned subject to be refused ON: a refusal against an
-              unprovisioned\n# subject proves only that the subject does not exist, while
-              a refusal here\n# proves the grant. The web rail ships that probe as a button,
-              so it is pressed\n# in front of an audience rather than living in a test
-              file.\n#\n# It was aimed at the blueprint topic first. That works right
-              up until the\n# grant is wrong, at which point the probe writes junk into
-              a state-class\n# topic the fleet actually reads - and \"it cannot happen
+              topics (provisioned registry): upgrade-readiness, topology-skew, blueprint,
+              probe.\n#\n# The probe subject is the one here with NO writer, deliberately,
+              and it is the\n# single exception to the rule that a topic's subject list
+              and its writer's\n# grant travel together. It exists so that an authorization
+              probe has a real\n# provisioned subject to be refused ON: a refusal against
+              an unprovisioned\n# subject proves only that the subject does not exist,
+              while a refusal here\n# proves the grant. The web rail ships that probe
+              as a button, so it is pressed\n# in front of an audience rather than living
+              in a test file.\n#\n# It was aimed at the blueprint topic first. That works
+              right up until the\n# grant is wrong, at which point the probe writes junk
+              into a state-class\n# topic the fleet actually reads - and \"it cannot happen
               while the grants\n# hold\" is the assumption the web user already broke
               once. A writerless\n# subject makes the failure mode land nowhere.\n$NATS
               stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE
-              --allow-direct \\\n  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe'
+              --allow-direct \\\n  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe'
               \\\n  --storage=file --retention=limits \\\n  --max-msgs-per-subject=8 --max-bytes=1073741824
               --discard=old --replicas=1 --max-consumers=64 --defaults\n\n# TOPICS-JOURNAL:
               append-only, ages out at 30d. 5GiB cap.\n# Journal-class topics: annotations.\n$NATS
@@ -4403,9 +4406,10 @@ spec:
               operator, as one line of JSON written\n# to the container's termination
               message below: the pod log goes with the\n# Job's TTL, and the reconcile
               reads this off the pod and records it as an\n# Event on the PlatformAgent
-              (reportA2AProvisionFindings). An empty object\n# says the check ran and
-              found nothing.\nreport='{}'\nif [ \"${live_subject_cap}\" = \"-1\" ] ||
-              [ \"${live_subject_cap}\" = \"0\" ]; then\n  report=\"{\\\"tasks_subject_cap\\\":{\\\"live\\\":${live_subject_cap},\\\"want\\\":4096}}\"\n
+              (reportA2AProvisionFindings). An empty object\n# says the checks ran and
+              found nothing. Each check appends its own finding;\n# the object is closed
+              once every check has run.\nreport_findings=''\nif [ \"${live_subject_cap}\"
+              = \"-1\" ] || [ \"${live_subject_cap}\" = \"0\" ]; then\n  report_findings=\"\\\"tasks_subject_cap\\\":{\\\"live\\\":${live_subject_cap},\\\"want\\\":4096}\"\n
               \ echo \"NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} -
               no per-subject limit; this render creates it at 4096.\" >&2\n  echo \"  The
               stream predates the limit and provisioning does not edit an existing stream,
@@ -4423,19 +4427,42 @@ spec:
               >&2\n  echo \"  stream and does not assume the difference is unintended.
               To align it anyway, knowing that\" >&2\n  echo \"  lowering it evicts every
               subject already over the new value, oldest event first:\" >&2\n  echo \"
-              \   nats stream edit TASKS --max-msgs-per-subject=4096\" >&2\nfi\n# Written
-              only where the kubelet has mounted the file: outside a pod there is\n# nothing
-              to write to, and a copy of a report is not a reason to fail a fully\n# provisioned
-              bus. Nor is a write that fails (a full or faulting disk under\n# the kubelet's
-              file): under set -e that would exit 1 on a bus this script\n# just finished
-              provisioning, and exit 1 matches no podFailurePolicy rule, so\n# the Job
-              would burn its backoff into BackoffLimitExceeded. A pod that has no\n# file,
-              or whose write failed, leaves no message, and the reconcile logs that\n#
-              rather than reading it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n
-              \ printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    || echo \"WARNING:
-              could not write the provision report to the termination log; the log above
-              is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
-              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
+              \   nats stream edit TASKS --max-msgs-per-subject=4096\" >&2\nfi\n# TOPICS-STATE
+              older than this render: check that the topology-skew subject is\n# in its
+              subject list. Provisioning is create-only convergence, so an existing\n#
+              stream keeps the subject list it was created with, and a publisher of the\n#
+              new topic gets \"no stream matches subject\" until an operator appends it.\n#
+              Same stance as the TASKS extractor above: an answer with no readable\n#
+              subject list FAILS rather than passing as \"nothing to report\" (a mirror
+              or\n# sourced stream has an empty list and is not a shape this render creates).\n#
+              The finding goes to stderr for the pod log and into the report for the\n#
+              Event, like the cap gap; the subject list is quoted on stderr only, where\n#
+              an operator can copy it, and not in the report, which never steers an Event.\ntopics_state_json=\"$($NATS
+              stream info TOPICS-STATE --json | tr -d ' \\t\\r\\n')\"\ntopics_state_subjects=\"$(printf
+              '%s' \"${topics_state_json}\" \\\n  | grep -o '\"subjects\":\\[[^]]*\\]'
+              | head -n1 | sed 's/^\"subjects\":\\[//;s/\\]$//;s/\"//g' || true)\"\nif
+              [ -z \"${topics_state_subjects}\" ]; then\n  echo \"could not read subjects
+              off the TOPICS-STATE stream; refusing to report this install as provisioned\"
+              >&2\n  exit 1\nfi\nif ! printf '%s' \"${topics_state_json}\" | grep -Eq
+              '\"a2a\\.topics\\.(>|agent\\.(>|platform\\.(>|\\*|topology-skew)))\"'; then\n
+              \ report_findings=\"${report_findings}${report_findings:+,}\\\"topics_state_subject\\\":{\\\"missing\\\":1}\"\n
+              \ echo \"NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew.\"
+              >&2\n  echo \"  Provisioning does not edit an existing stream; to append
+              the subject to its current subjects:\" >&2\n  echo \"    nats stream edit
+              TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
+              >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only where the kubelet
+              has mounted the file: outside a pod there is\n# nothing to write to, and
+              a copy of a report is not a reason to fail a fully\n# provisioned bus. Nor
+              is a write that fails (a full or faulting disk under\n# the kubelet's file):
+              under set -e that would exit 1 on a bus this script\n# just finished provisioning,
+              and exit 1 matches no podFailurePolicy rule, so\n# the Job would burn its
+              backoff into BackoffLimitExceeded. A pod that has no\n# file, or whose write
+              failed, leaves no message, and the reconcile logs that\n# rather than reading
+              it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n  printf '%s' \"${report}\"
+              > \"/dev/termination-log\" \\\n    || echo \"WARNING: could not write the
+              provision report to the termination log; the log above is this run's only
+              record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf '%s'
+              \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_consumers}\" ]; then\n
               \ echo \"could not read max_consumers off the TASKS stream; refusing to
               report this install as provisioned\" >&2\n  exit 1\nfi\nif [ \"${live_consumers}\"
