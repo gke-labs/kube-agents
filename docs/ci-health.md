@@ -158,7 +158,11 @@ runs that finished in the last 2 hours, #1225 / #1214), a delegation-ceiling
 wave (15+ repetitions across 3+ pull requests, among the runs that finished in
 the last 2 hours, ended at the harness's delegation wait with the worker still
 running, #1874; the dispatcher stall of #1879 is its usual cause, and it ranks
-below a storm because a 429-starved worker hits the same wait; and, when `vertex_429.py` has a fresh reading, the pool's peak hourly Vertex 429 share over the hours those runs made their calls clears 5 % — the repetitions' own words cannot tell a quota storm from a batch of teardown deaths, and without the reading the runs decide as before and the evidence says the storm is unconfirmed), or setup
+below a storm because a 429-starved worker hits the same wait; the storm
+also needs the pool's peak hourly Vertex 429 share to clear 5 % over the hours
+those runs spent on their calls, when the 429 reading below covers them; a
+reading that does not, and no reading, leaves the runs to decide and the
+evidence says the storm is unconfirmed), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
@@ -1292,13 +1296,19 @@ prior scan's `scanned_at` and its `{project: [finding ids]}` map.
 
 **The 429 reading.** Rule 2's evidence is read by the same identity, each tick,
 from Cloud Monitoring: per pool project, Vertex AI calls by response code in
-ten-minute buckets over the last three hours (`serviceruntime.googleapis.com/api/request_count`
-on the `consumed_api` resource), summed pool-wide into `work/vertex-429.json`,
-and reported in `health.json`'s `vertex_429` (`read`, `peak`, `requests`,
-`hour_end`, `reason`). It needs `roles/monitoring.viewer` on each pool project,
-the same loop as below with that one role; a project that refuses the read is
-recorded in the reading's `errors` and the rest are summed, and no project
-read at all leaves the storm rule to the runs.
+ten-minute buckets over the last five hours (`serviceruntime.googleapis.com/api/request_count`
+on the `consumed_api` resource; the rule's two-hour window plus the three
+hours of calls a run makes before it finishes), summed pool-wide into
+`work/vertex-429.json`. `health.json`'s `vertex_429` reports it every tick
+(`read`, `projects_read`, `projects_failed`, `read_at`, and the peak hourly
+share with its `requests` and `hour_end`), so a broken grant shows before a
+storm needs it; the share judges only when the repetitions would fire. It
+needs `roles/monitoring.viewer` on each pool project, the same loop as below
+with that one role. A project that refuses the read is recorded in the
+reading's `errors` and the rest are summed. The reading confirms nothing, and
+the runs decide, when it covered no project, is older than three hours, does
+not reach the hours the hit runs spent on their calls, or has no hour of 200
+or more calls; `reason` says which.
 
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,

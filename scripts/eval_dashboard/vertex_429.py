@@ -14,7 +14,7 @@ storm is unconfirmed.
 
 Identity: the token command's account, `gcloud auth print-access-token` in
 the workflow (the dashboard publisher), which needs `roles/monitoring.viewer`
-on each pool project (docs/ci-health.md, "A quota storm"). A project that
+on each pool project (docs/ci-health.md, "The 429 reading"). A project that
 refuses the read is recorded with its error and the rest are summed.
 
 Stdlib only, like the rest of this directory.
@@ -23,6 +23,7 @@ Stdlib only, like the rest of this directory.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import pathlib
 import subprocess
@@ -44,12 +45,17 @@ MONITORING_ROOT = "https://monitoring.googleapis.com/v3"
 METRIC_FILTER = 'metric.type="serviceruntime.googleapis.com/api/request_count" AND resource.type="consumed_api" AND resource.labels.service="aiplatform.googleapis.com"'
 RESPONSE_CODE_LABEL = "response_code"
 RATE_LIMITED_CODE = "429"
-# Ten-minute buckets over the last three hours: the storm rule's two-hour
-# window plus the hour of model calls a run makes before it finishes.
+# Ten-minute buckets over the last five hours: the storm rule's two-hour
+# window (health.STORM_WINDOW) plus the three hours of model calls a hit
+# run makes before it finishes (health.STORM_429_LOOKBACK); the rule rejects
+# a reading that falls short of that, and a test pins the sum.
 BUCKET_SECONDS = 600
-LOOKBACK = timedelta(hours=3)
-# One Monitoring call per project; a whole-pool read must fit the tick.
+LOOKBACK = timedelta(hours=5)
+# One Monitoring call per project, READ_WORKERS at a time; a whole-pool
+# read must fit the workflow step (40 projects, 20 s each, 8 abreast: 100 s
+# at worst).
 CALL_TIMEOUT_S = 20
+READ_WORKERS = 8
 # Where the pool's project list lives (fixture_state reads the same file).
 CI_DEPLOY_FILE = pathlib.Path(__file__).resolve().parents[2] / "hack" / "ci-deploy.sh"
 DEFAULT_TOKEN_COMMAND = "gcloud auth print-access-token"
@@ -155,8 +161,9 @@ def read_pool(projects: list[str], now: datetime, token: str | None, opener=urll
     if token is None:
         errors = {project: "no access token" for project in projects}
     else:
-        for project in projects:
-            document, err = read_project(project, start, end, token, opener)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=READ_WORKERS) as workers:
+            answers = list(workers.map(lambda project: read_project(project, start, end, token, opener), projects))
+        for project, (document, err) in zip(projects, answers):
             if err or document is None:
                 errors[project] = err or "no document"
                 continue
@@ -188,7 +195,7 @@ def main(argv=None, runner=subprocess.run, opener=urllib.request.urlopen) -> int
     args = parse_args(argv)
     try:
         projects = fixture_state.pool_projects(args.ci_deploy.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # unreadable, or no project mapping in it
         log(f"error: {args.ci_deploy}: {exc}")
         return EXIT_USAGE
     now = args.now or datetime.now(timezone.utc)

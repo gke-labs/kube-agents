@@ -227,9 +227,11 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # teardown deaths (2026-09-24: five ceiling runs' teardown read as a storm at
 # a 1-5 % pool rate; a real storm runs 6-30 %). A storm needs the peak
 # hourly share over STORM_429_MIN_RATE in the window the hit runs spent on
-# their model calls; a reading older than VERTEX_429_MAX_AGE, or one with
-# fewer than STORM_429_MIN_REQUESTS calls in its best hour, confirms nothing
-# and the rule stands as before, saying so.
+# their model calls; a reading older than VERTEX_429_MAX_AGE, one that does
+# not cover those hours (a hit run finishes up to STORM_429_LOOKBACK after
+# the burst that killed it, so the reader looks back STORM_WINDOW further
+# than that), or one with fewer than STORM_429_MIN_REQUESTS calls in its
+# best hour, confirms nothing and the rule stands as before, saying so.
 STORM_429_MIN_RATE = 0.05
 STORM_429_MIN_REQUESTS = 200
 STORM_429_HOUR = timedelta(hours=1)
@@ -1001,14 +1003,11 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
     """Rule 1. Returns {fires, cases, evidence, pr_caused, signature_runs}."""
     window = _in_window(full_runs, now, SHARED_BREAK_WINDOW)
     collapses: dict[str, list] = {}
-    passes: dict[str, set] = {}
     for run in window:
         admitted = roster.at(run.started or run.finished)
         for case in run.collapsed_cases():
             if case in admitted:
                 collapses.setdefault(case, []).append(run)
-        for case in run.passing_cases():
-            passes.setdefault(case, set()).add(run.pr)
 
     cases = sorted(
         case
@@ -1078,18 +1077,29 @@ def vertex_429_rate(vertex: dict | None, now: datetime, start: datetime | None, 
     """The pool's peak hourly 429 share over the hours the hit runs made their
     model calls. Returns {read, peak, requests, hour_end, reason}: `read` False
     (with the reason) when there is no fresh reading to judge on."""
-    out = {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": None}
+    out = {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": None, "read_at": None, "projects_read": 0, "projects_failed": 0}
     if not isinstance(vertex, dict):
         out["reason"] = "no Vertex 429 reading"
         return out
     read_at = parse_iso(vertex.get("read_at"))
+    errors = vertex.get("errors") if isinstance(vertex.get("errors"), dict) else {}
+    out.update({"read_at": iso(read_at), "projects_read": len(vertex.get("read") or []), "projects_failed": len(errors)})
     if read_at is None or now - read_at > VERTEX_429_MAX_AGE:
         out["reason"] = f"the Vertex 429 reading is {'of unknown age' if read_at is None else 'stale'}"
         return out
     if not vertex.get("read"):
-        errors = vertex.get("errors") or {}
-        sample = next(iter(errors.values()), "") if isinstance(errors, dict) else ""
+        sample = next(iter(errors.values()), "")
         out["reason"] = f"the Vertex 429 reading covered no project ({sample})" if sample else "the Vertex 429 reading covered no project"
+        return out
+    # The reading must reach the hours the hit runs spent on their calls: a
+    # run finishes hours after the burst that killed it, and a reading that
+    # starts after the burst reads its quiet aftermath as "no storm".
+    covers_from, covers_to = parse_iso(vertex.get("window_start")), parse_iso(vertex.get("window_end"))
+    short_at_start = start is not None and (covers_from is None or covers_from > start - STORM_429_LOOKBACK)
+    short_at_end = end is not None and (covers_to is None or covers_to < end)
+    if short_at_start or short_at_end:
+        span = f"{hhmm(covers_from) if covers_from else '?'}–{hhmm(covers_to) if covers_to else '?'} UTC"
+        out["reason"] = f"the Vertex 429 reading ({span}) does not cover the hours the hit runs spent on their calls"
         return out
     buckets = []
     for bucket in vertex.get("buckets") or []:
@@ -1123,7 +1133,9 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
     start = min((run.finished for run in hit), default=None)
     end = max((run.finished for run in hit), default=None)
     reps_fire = reps >= STORM_MIN_REPS and len(prs) >= STORM_MIN_PRS
-    rate = vertex_429_rate(vertex, now, start, end) if reps_fire else {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": None}
+    # Read every tick, so health.json shows whether the reading works
+    # before a storm needs it; it judges only when the reps would fire.
+    rate = vertex_429_rate(vertex, now, start, end)
     confirmed = rate["read"] and rate["peak"] >= STORM_429_MIN_RATE
     fires = reps_fire and (confirmed or not rate["read"])
     evidence = []
@@ -1398,6 +1410,7 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind, applying=
     # not read for firing: this scan's units are being applied, and last
     # scan's cannot make this scan's a repeat.
     out["applying"] = sorted(project for project in current if project in set(applying))
+    out["applying_previous"] = sorted(set(previously_applying))
     for project in out["applying"]:
         out["evidence"].append(f"{project} is being applied by the fleet reconcile (Boskos hold near the {hhmm(scanned_at)} UTC scan); its {scan.label} reading is not counted")
     current = {project: units for project, units in current.items() if project not in set(applying)}
@@ -2702,7 +2715,14 @@ def adjudicate(
     """
     if runs is None:
         runs = load_runs(data)
-    previously_applying = ((prev or {}).get("fixture_state") or {}).get("applying") or []
+    # The reconcile's holds around the previous scan, from the last tick's
+    # block: its `applying` when that tick read the scan before this one,
+    # its `applying_previous` when it had already read this scan (ticks run
+    # four to a scan).
+    prev_fleet = (prev or {}).get("fixture_state") or {}
+    this_scan = parse_iso(fixture_state_doc.get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
+    same_scan = this_scan is not None and parse_iso(prev_fleet.get("scanned_at")) == this_scan
+    previously_applying = prev_fleet.get("applying_previous" if same_scan else "applying") or []
     assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying, vertex_429)
     decided = transition(prev, assessed, now)
     issue = None
@@ -2913,6 +2933,7 @@ def scan_block(scan_result: dict) -> dict | None:
         "stale": scan_result["stale"],
         "partial": bool(scan_result.get("partial")),
         "applying": list(scan_result.get("applying") or []),
+        "applying_previous": list(scan_result.get("applying_previous") or []),
         "reason": scan_result["reason"],
     }
 

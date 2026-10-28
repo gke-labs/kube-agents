@@ -823,20 +823,18 @@ def parse_podinfo(text: str | None) -> dict | None:
     }
 
 
-def parse_base_sha(repos) -> str | None:
+def parse_base_sha(repos, repo: str = GH_PR_REPO) -> str | None:
     """The main commit a run was built on, from started.json's `repos`: the
-    sha of the first (base) segment, HEAD_SHA_CHARS long; None when the map
-    is absent or carries no sha-shaped value there."""
-    if not isinstance(repos, dict) or not repos:
+    sha of the first (base) segment of `repo`'s entry, HEAD_SHA_CHARS long;
+    None when the map or the entry is absent or carries no sha-shaped value
+    there. Only that repo's entry: an extra_ref's commit would read the same
+    on every run of the day and make any two of them "the same base"."""
+    value = repos.get(repo) if isinstance(repos, dict) else None
+    if not isinstance(value, str):
         return None
-    for value in repos.values():
-        if not isinstance(value, str):
-            continue
-        first = value.split(REPOS_SEGMENT_SEP, 1)[0]
-        _, _, sha = first.rpartition(REPOS_REF_SEP)
-        if _SHA_SHAPE.match(sha):
-            return sha[:HEAD_SHA_CHARS]
-    return None
+    first = value.split(REPOS_SEGMENT_SEP, 1)[0]
+    _, _, sha = first.rpartition(REPOS_REF_SEP)
+    return sha[:HEAD_SHA_CHARS] if _SHA_SHAPE.match(sha) else None
 
 
 def parse_clone_records(text: str | None) -> bool | None:

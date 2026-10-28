@@ -1468,8 +1468,10 @@ class TestNightlySource(_MergeBase):
     def test_base_sha_is_the_base_segment_of_started_repos(self):
         self.assertEqual(collect.parse_base_sha({"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}), "147b063")
         self.assertEqual(collect.parse_base_sha({"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43"}), "147b063", "a periodic: the base alone")
-        for absent in (None, {}, {"gke-labs/kube-agents": "main"}, {"gke-labs/kube-agents": 5}, "main:abc"):
+        for absent in (None, {}, {"gke-labs/kube-agents": "main"}, {"gke-labs/kube-agents": 5}, "main:abc", {"a-org/extra": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43"}):
             self.assertIsNone(collect.parse_base_sha(absent), absent)
+        # An extra_ref sorting first is not the base: only this repo's entry is.
+        self.assertEqual(collect.parse_base_sha({"a-org/extra": "main:0000000e2c0f60738adb93da1ae93a2569e5ce43", "gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}), "147b063")
         run = collect.build_run("1", {"finished.json": json.dumps({"timestamp": 1, "passed": False, "result": "FAILURE"}), "started.json": json.dumps({"timestamp": 0, "repos": {"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}}), "build-log.txt": ""}.get, pr_hint=1118)
         self.assertEqual(run["base_sha"], "147b063")
 

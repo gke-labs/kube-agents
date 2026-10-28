@@ -428,7 +428,7 @@ class Storm(unittest.TestCase):
         """vertex_429.py's document: ten-minute pool buckets back from T0 with
         `requests` calls each, `share` of them 429s."""
         buckets = [{"end": health.iso(T0 - timedelta(minutes=10 * i)), "requests": requests, "429": int(requests * share)} for i in range(hours * 6)]
-        return {"schema_version": 1, "read_at": health.iso(read_at), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
+        return {"schema_version": 1, "read_at": health.iso(read_at), "window_start": health.iso(T0 - timedelta(hours=hours)), "window_end": health.iso(T0), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
 
     def judge(self, doc, vertex):
         return health.assess(health.load_runs(doc), T0, health.Roster.fixed(ADMITTED), vertex_429=vertex)
@@ -455,15 +455,19 @@ class Storm(unittest.TestCase):
             (dict(self.reading(0.01), read=[], errors={"p": "HTTP 403"}), "the Vertex 429 reading covered no project (HTTP 403)"),
             (self.reading(0.01, requests=10), "fewer than 200 Vertex calls in any hour of the window"),
             (dict(self.reading(0.01), buckets=[{"end": health.iso(T0 - timedelta(hours=9)), "requests": 1000, "429": 0}]), "fewer than 200 Vertex calls in any hour of the window"),
+            # Two hours back from the tick: the runs that finished 40 minutes ago were calling three hours before that.
+            (self.reading(0.01, hours=2), "the Vertex 429 reading (22:00–00:00 UTC) does not cover the hours the hit runs spent on their calls"),
+            (dict(self.reading(0.01), window_end=health.iso(T0 - timedelta(hours=1))), "the Vertex 429 reading (20:00–23:00 UTC) does not cover the hours the hit runs spent on their calls"),
         ):
             with self.subTest(reason=reason):
                 result = self.judge(doc, vertex)
                 self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "storm"))
                 self.assertTrue(result["cause"].endswith("(429 rate not read)"))
                 self.assertTrue(any(line.endswith(f"; unconfirmed: {reason}") for line in result["evidence"]), result["evidence"])
-        # Below the rep floors nothing is read at all.
+        # Below the rep floors the reading is still published, and judges nothing.
         quiet = self.judge(self.stormy([1, 2], 6), self.reading(0.5))
-        self.assertEqual((quiet["state"], quiet["vertex_429"]["read"], quiet["vertex_429"]["reason"]), ("GREEN", False, None))
+        self.assertEqual((quiet["state"], quiet["vertex_429"]["read"], quiet["vertex_429"]["peak"], quiet["vertex_429"]["projects_read"]), ("GREEN", True, 0.5, 1))
+        self.assertEqual(self.judge(self.stormy([1, 2], 6), None)["vertex_429"], {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": "no Vertex 429 reading", "read_at": None, "projects_read": 0, "projects_failed": 0})
         self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", result["evidence"][0])
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
@@ -3444,9 +3448,14 @@ class OpenConditions(unittest.TestCase):
         # No artifact, or no `held` in it: as before.
         self.assertEqual(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
         # Held around the previous scan: last scan's reading cannot make this one a repeat.
-        prev_doc = {"fixture_state": {"applying": [project(1), project(2), project(3)]}, "state": "GREEN"}
+        prev_doc = {"fixture_state": {"scanned_at": health.iso(at - timedelta(hours=1)), "applying": sorted(three), "applying_previous": []}, "state": "GREEN"}
         not_yet = health.adjudicate(green, T0, prev_doc, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
-        self.assertEqual(not_yet["state"], "GREEN")
+        self.assertEqual((not_yet["state"], not_yet["fixture_state"]["applying_previous"]), ("GREEN", sorted(three)))
+        # The next tick reads the same scan: the previous scan's holds come from the last tick's applying_previous, not its applying.
+        same_scan = {"fixture_state": {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)}, "state": "GREEN"}
+        self.assertEqual(health.adjudicate(green, T0, same_scan, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["state"], "GREEN")
+        turned = {"fixture_state": {"scanned_at": health.iso(at), "applying": sorted(three), "applying_previous": []}, "state": "GREEN"}
+        self.assertEqual(health.adjudicate(green, T0, turned, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
 
     def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
         green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
