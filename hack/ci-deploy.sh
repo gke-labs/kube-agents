@@ -982,7 +982,7 @@ fi
 
 # The mode flip exists for the runs that grade next or roll it back: a pull
 # request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
-# lane's periodic and the main and GitLab nightlies on main, the blocking presubmit
+# lane's periodic and the main, GitLab and GHES nightlies on main, the blocking presubmit
 # in a batch Tide ran, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh

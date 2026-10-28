@@ -2601,7 +2601,9 @@ if [ -z "${INJECT_LANE_REPO}" ]; then
   echo "ERROR: no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the run does not start." >&2
   exit 1
 fi
-if [ "${EVAL_FORGE:-github}" = "github" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
+# The kind, not the row: a GitHub Enterprise row grades through the GitHub
+# reader too. The row stands in where this block runs lifted without the table.
+if [ "${EVAL_FORGE_KIND:-${EVAL_FORGE:-github}}" = "github" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
     && [ -z "${BENCH_GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
   echo "ERROR: no GitHub read credential: EVAL_LEDGER_APP_KEY_FILE is unset and neither BENCH_GITHUB_TOKEN nor GITHUB_TOKEN is set; the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot read the repository, so the run does not start. Export a token that can read ${INJECT_LANE_REPO} as BENCH_GITHUB_TOKEN." >&2
   exit 1

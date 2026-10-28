@@ -45,12 +45,13 @@ STUB_GCLOUD = textwrap.dedent(
         [ -e "$state/list-fails" ] && { echo "listing failed" >&2; exit 1; }
         [ -e "$state/leftovers" ] && cat "$state/leftovers"; exit 0 ;;
       *"compute instances get-serial-port-output"*)
+        [ -e "$state/serial-fails" ] && { echo "ERROR: (gcloud.compute.instances.get-serial-port-output) PERMISSION_DENIED: compute.instances.getSerialPortOutput" >&2; exit 1; }
         [ -e "$state/serial" ] && cat "$state/serial"; exit 0 ;;
       *"builds submit"*)
         [ -e "$state/build-hangs" ] && exec sleep 5
         [ -e "$state/build-fails" ] && exit 1; exit 0 ;;
       *"compute instances create"*) exit 0 ;;
-      *"compute instances remove-metadata"*) exit 0 ;;
+      *"compute instances remove-metadata"*) [ -e "$state/remove-metadata-fails" ] && { echo "ERROR: setMetadata denied" >&2; exit 1; }; exit 0 ;;
       *"compute instances delete"*) exit 0 ;;
       *"container clusters get-credentials"*) [ -e "$state/no-credentials" ] && exit 1; exit 0 ;;
     esac
@@ -135,6 +136,8 @@ class ForgeScriptTest(unittest.TestCase):
         self.gstate = self.dir / "gcloud-state"
         self.gstate.mkdir()
         self.state_dir = self.dir / "forge-state"
+        self.scratch = self.dir / "scratch"  # TMPDIR for the run: the key and the startup script must not outlive it
+        self.scratch.mkdir()
 
     # The project with every once-per-project piece in place.
     def provision(self, ip: str = FORGE_IP, record_ip: str = None, serial: str = READY_SERIAL):
@@ -155,6 +158,7 @@ class ForgeScriptTest(unittest.TestCase):
                 "GCLOUD_STATE": str(self.gstate),
                 "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
                 "FORGE_READY_POLL_SECONDS": "0",
+                "TMPDIR": str(self.scratch),
                 "BUILD_ID": "1234",
                 "PULL_NUMBER": "99",
                 **env,
@@ -227,6 +231,7 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertEqual((self.state_dir / "forge-vm").read_text().strip(), "forge-ghes us-central1-a")
         self.assertIn("Forge up finished", proc.stdout)
         self.assertNotIn("BEGIN PRIVATE KEY", proc.stdout + proc.stderr)
+        self.assertEqual(list(self.scratch.iterdir()), [], "the key and the startup script are gone after a successful up")
 
     def test_up_deletes_what_an_earlier_run_left_before_creating(self):
         self.provision()
@@ -305,6 +310,26 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertTrue(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a"))
         self.assertFalse(self.state_dir.exists())
         self.assertFalse(self.calls_of("kubectl run"))
+
+    def test_up_names_a_failed_serial_read_instead_of_blaming_the_vm(self):
+        self.provision()
+        (self.gstate / "serial-fails").write_text("")
+        proc = self.run_forge("up", GHES_READY_TIMEOUT_SECONDS="1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("serial-console read(s) failed; the last error:", proc.stderr)
+        self.assertIn("PERMISSION_DENIED: compute.instances.getSerialPortOutput", proc.stderr)
+        self.assertTrue(self.calls_of("compute instances delete forge-ghes"))
+        self.assertEqual(list(self.scratch.iterdir()), [], "the key and the startup script are gone after a failed up")
+
+    def test_up_stops_when_the_key_cannot_leave_the_vms_metadata(self):
+        self.provision()
+        (self.gstate / "remove-metadata-fails").write_text("")
+        proc = self.run_forge("up")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("the key must not stay readable there", proc.stderr)
+        self.assertFalse(self.calls_of("kubectl run"), "no in-cluster check on a forge whose key is still in metadata")
+        self.assertTrue(self.calls_of("compute instances delete forge-ghes"))
+        self.assertFalse(self.state_dir.exists())
 
     def test_up_takes_the_vm_down_when_the_serial_console_reports_a_failure(self):
         self.provision(serial="startup-script: FORGE script-start t=1s\nstartup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n")

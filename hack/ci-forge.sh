@@ -59,6 +59,9 @@ readonly FORGE_VM_ZONE_SUFFIX="-a"
 readonly FORGE_CERT_DAYS=1
 readonly FORGE_READY_POLL_SECONDS="${FORGE_READY_POLL_SECONDS:-5}"
 readonly FORGE_SERIAL_TAIL_LINES=40
+# Where the certificates and the startup script live until the VM has them:
+# the caller's TMPDIR, so a test can own and inspect it.
+readonly FORGE_SCRATCH_DIR="${TMPDIR:-/tmp}"
 # The metadata item the server key rides in to the VM, removed once it is up.
 readonly FORGE_KEY_METADATA_KEY="tls-key"
 readonly FORGE_BUILD_TIMEOUT_SECONDS="${FORGE_BUILD_TIMEOUT_SECONDS:-900}"
@@ -216,9 +219,7 @@ preflight_project_pieces() {
 
 # ─── up: certificates, from the repo's own helper, Linux only ────────────────
 make_certificates() {
-  FORGE_CERT_DIR="$(mktemp -d /tmp/forge-certs.XXXXXX)" # 0700; make-certs.sh takes an empty directory
-  # The server key lives here until write_state_dir; no exit leaves it behind.
-  trap 'rm -rf "${FORGE_CERT_DIR}"' EXIT
+  FORGE_CERT_DIR="$(mktemp -d "${FORGE_SCRATCH_DIR}/forge-certs.XXXXXX")" # 0700; make-certs.sh takes an empty directory
   bash "${SCRIPT_DIR}/ghes-proxy/make-certs.sh" "${EVAL_FORGE_HOST}" "${FORGE_CERT_DIR}" "${FORGE_CERT_DAYS}"
   # The deploy's gate would refuse this later; refuse it here, before a VM.
   if ! openssl x509 -noout -text -in "${FORGE_CERT_DIR}/ca.crt" 2>/dev/null | grep -q 'CA:TRUE'; then
@@ -286,7 +287,8 @@ EOF
 # projects have no Cloud NAT, and the proxy forwards every request there.
 create_ghes_vm() {
   local startup
-  startup="$(mktemp /tmp/forge-startup.XXXXXX)"
+  startup="$(mktemp "${FORGE_SCRATCH_DIR}/forge-startup.XXXXXX")"
+  FORGE_STARTUP_FILE="${startup}"
   ghes_startup_script > "${startup}"
   echo "=== [$(stamp)] Creating ${FORGE_VM_NAME} (${GHES_PROXY_MACHINE_TYPE}, ${FORGE_VM_ZONE}, ${FORGE_IP}, ephemeral external address) ==="
   gcloud compute instances create "${FORGE_VM_NAME}" \
@@ -312,9 +314,14 @@ create_ghes_vm() {
 # through the loopback with the CA. `FORGE ready` within the deadline, or
 # `FORGE failed`, or the deadline; the last lines are shown on either failure.
 wait_for_serial_ready() { # <timeout seconds>
-  local deadline=$(( SECONDS + $1 )) serial
+  local deadline=$(( SECONDS + $1 )) serial failed_reads=0 last_read_error=""
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    serial="$(gcloud compute instances get-serial-port-output "${FORGE_VM_NAME}" --zone="${FORGE_VM_ZONE}" --project="${PROJECT_ID}" 2>/dev/null || true)"
+    # A read that fails is not an empty console: it is counted, and its error
+    # is what the deadline message shows, so a refused read is not blamed on
+    # the VM.
+    if ! serial="$(gcloud compute instances get-serial-port-output "${FORGE_VM_NAME}" --zone="${FORGE_VM_ZONE}" --project="${PROJECT_ID}" 2>&1)"; then
+      failed_reads=$((failed_reads + 1)); last_read_error="$(tail -n 1 <<<"${serial}")"; serial=""
+    fi
     if grep -q 'FORGE ready' <<<"${serial}"; then
       echo "✓ ${FORGE_VM_NAME} reports ready: $(grep -oE 'FORGE (ready|header:).*' <<<"${serial}" | tr '\n' ' ')"
       return 0
@@ -327,6 +334,9 @@ wait_for_serial_ready() { # <timeout seconds>
     sleep "${FORGE_READY_POLL_SECONDS}"
   done
   echo "ERROR: ${FORGE_VM_NAME} did not report ready within $1s; the serial console's last lines follow." >&2
+  if [ "${failed_reads}" -gt 0 ]; then
+    echo "ERROR: ${failed_reads} serial-console read(s) failed; the last error: ${last_read_error}" >&2
+  fi
   gcloud compute instances get-serial-port-output "${FORGE_VM_NAME}" --zone="${FORGE_VM_ZONE}" --project="${PROJECT_ID}" 2>/dev/null \
     | grep -E 'FORGE|startup-script' | tail -n "${FORGE_SERIAL_TAIL_LINES}" >&2 || true
   return 1
@@ -383,6 +393,9 @@ write_state_dir() {
 
 forge_up() {
   local started=${SECONDS}
+  # The server key and the startup script live in scratch until the VM has
+  # them; no exit, refused or failed, leaves either behind.
+  trap 'rm -rf "${FORGE_CERT_DIR:-}" "${FORGE_STARTUP_FILE:-}"' EXIT
   echo "=== [$(stamp)] Forge up: ${EVAL_FORGE} at ${EVAL_FORGE_HOST} in ${PROJECT_ID} (${FORGE_VM_NAME}) ==="
   if [ -e "${FORGE_CA_FILE}" ]; then
     echo "ERROR: ${FORGE_CA_FILE} already exists; a forge from an earlier run is still recorded in ${EVAL_FORGE_STATE_DIR}. Run '$0 down' first, so no stale CA reaches the deploy." >&2
