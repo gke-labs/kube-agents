@@ -589,8 +589,8 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 	}
 	s := &durableSub{c: c, cfg: cfg}
 	set(s)
-	if s.held == nil {
-		// The held mode skips the envelopeId dedup (see deliver).
+	if s.held == nil && s.deferred == nil {
+		// The held and deferred modes skip the envelopeId dedup (see deliver).
 		s.seen = newDedupSet(dedupWindow)
 	}
 	// Register before starting so a rebuild racing this call cannot snapshot
@@ -663,6 +663,8 @@ type durableSub struct {
 	stopped atomic.Bool
 	// held is the held-delivery mode (held.go); nil for auto-ack.
 	held *heldState
+	// deferred is the deferred-ack mode (deferred.go); nil for the others.
+	deferred *deferredState
 
 	mu sync.Mutex
 	cc jetstream.ConsumeContext
@@ -692,6 +694,9 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 	cons, err := js.CreateOrUpdateConsumer(ctx, s.cfg.Stream, consCfg)
 	if err != nil {
 		return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
+	}
+	if s.deferred != nil {
+		s.deferred.bound(cons)
 	}
 	return s.consume(cons)
 }
@@ -758,6 +763,11 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		s.held.dispatch(msg, env)
 		return
 	}
+	if s.deferred != nil {
+		// Deferred mode: the same, but in order on this goroutine.
+		s.deferred.dispatch(msg, env)
+		return
+	}
 	// Assertion 5: at most once per envelopeId across redeliveries.
 	if !s.seen.add(env.EnvelopeID) {
 		_ = msg.Ack()
@@ -791,6 +801,9 @@ func (s *durableSub) stopLocal() {
 	s.stopIntake()
 	if s.held != nil {
 		s.held.cancel()
+	}
+	if s.deferred != nil {
+		s.deferred.giveBack()
 	}
 }
 
