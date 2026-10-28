@@ -671,6 +671,15 @@ const (
 	a2aProvisionReportTasksSubjectCapKey = "tasks_subject_cap"
 	a2aProvisionReportLiveKey            = "live"
 	a2aProvisionReportWantKey            = "want"
+	// The second finding the closing block reports: an existing TOPICS-STATE
+	// stream whose subject list predates the topology-skew topic. The report
+	// carries only a marker (`missing: 1`); the subject the Event names is
+	// this binary's a2aTopologySkewSubject, on the same rule as the TASKS
+	// remedy -- a report that could steer the remedy could steer it to any
+	// subject.
+	a2aProvisionReportTopicsStateSubjectKey = "topics_state_subject"
+	a2aProvisionReportMissingKey            = "missing"
+	a2aTopologySkewSubject                  = "a2a.topics.agent.platform.topology-skew"
 	// a2aProvisionContainerName is the Job pod's one container, named because
 	// the report reader looks its termination state up by name.
 	a2aProvisionContainerName = "provision"
@@ -710,6 +719,17 @@ const (
 		"this render creates it at %d and provisioning does not edit an existing stream, so one task's events can still evict another session's history. " +
 		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
 	tasksSubjectCapRenderedDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
+	// reasonTopicsStateSubjectMissing is the Warning Event's reason when the
+	// live TOPICS-STATE stream, created by an earlier render, does not carry
+	// the topology-skew subject; topicsStateSubjectEventMessage is its
+	// message. Format arguments: Job name, subject, subject. The current
+	// subject list is not quoted from the pod: the operator reads it with
+	// `nats stream info TOPICS-STATE` and appends to it, and the Event says so.
+	reasonTopicsStateSubjectMissing = "TopicsStateSubjectMissing"
+	topicsStateSubjectEventMessage  = "provision Job %s found the TOPICS-STATE stream without subject %s; " +
+		"this render creates the stream with it and provisioning does not edit an existing stream, so nothing can publish to that topic " +
+		"until an operator appends it to the stream's current subject list (read it with nats stream info TOPICS-STATE): " +
+		"nats stream edit TOPICS-STATE --subjects=\"<current subjects>,%s\""
 
 	// The condition that reports the verifier, and the reason it is a
 	// condition rather than a Ready row.
@@ -2786,7 +2806,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 }
 
 // a2aProvisionScript is the provisioning payload: the four streams, four KV
-// buckets, and three starter topics from the deployment spec, created
+// buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
@@ -3040,7 +3060,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
-# State-class topics (provisioned registry): upgrade-readiness, blueprint, probe.
+# State-class topics (provisioned registry): upgrade-readiness, topology-skew, blueprint, probe.
 #
 # The probe subject is the one here with NO writer, deliberately, and it is the
 # single exception to the rule that a topic's subject list and its writer's
@@ -3056,7 +3076,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
 # hold" is the assumption the web user already broke once. A writerless
 # subject makes the failure mode land nowhere.
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
-  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
+  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
@@ -3150,10 +3170,11 @@ fi
 # to the container's termination message below: the pod log goes with the
 # Job's TTL, and the reconcile reads this off the pod and records it as an
 # Event on the PlatformAgent (reportA2AProvisionFindings). An empty object
-# says the check ran and found nothing.
-report='{}'
+# says the checks ran and found nothing. Each check appends its own finding;
+# the object is closed once every check has run.
+report_findings=''
 if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
-  report="{\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}}"
+  report_findings="\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}"
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
   echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
   echo "  an operator applies it one task's events can still evict another session's history." >&2
@@ -3169,6 +3190,30 @@ elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
 fi
+# TOPICS-STATE older than this render: check that the topology-skew subject is
+# in its subject list. Provisioning is create-only convergence, so an existing
+# stream keeps the subject list it was created with, and a publisher of the
+# new topic gets "no stream matches subject" until an operator appends it.
+# Same stance as the TASKS extractor above: an answer with no readable
+# subject list FAILS rather than passing as "nothing to report" (a mirror or
+# sourced stream has an empty list and is not a shape this render creates).
+# The finding goes to stderr for the pod log and into the report for the
+# Event, like the cap gap; the subject list is quoted on stderr only, where
+# an operator can copy it, and not in the report, which never steers an Event.
+topics_state_json="$($NATS stream info TOPICS-STATE --json | tr -d ' \t\r\n')"
+topics_state_subjects="$(printf '%s' "${topics_state_json}" \
+  | grep -o '"subjects":\[[^]]*\]' | head -n1 | sed 's/^"subjects":\[//;s/\]$//;s/"//g' || true)"
+if [ -z "${topics_state_subjects}" ]; then
+  echo "could not read subjects off the TOPICS-STATE stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+if ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|platform\.(>|\*|topology-skew)))"'; then
+  report_findings="${report_findings}${report_findings:+,}\"` + a2aProvisionReportTopicsStateSubjectKey + `\":{\"` + a2aProvisionReportMissingKey + `\":1}"
+  echo "NOTE: TOPICS-STATE does not carry subject ` + a2aTopologySkewSubject + `." >&2
+  echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
+  echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},` + a2aTopologySkewSubject + `\"" >&2
+fi
+report="{${report_findings}}"
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
 # provisioned bus. Nor is a write that fails (a full or faulting disk under
@@ -3492,12 +3537,19 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 		// reports the gap again while it stands.
 		log.Info("the A2A provision Job's succeeded pod is gone, and its termination message with it; nothing from this Job run reaches the PlatformAgent's Events")
 		outcome = a2aProvisionReportOutcomeUnreadable
-	} else if finding, err := parseA2AProvisionReport(message); err != nil {
+	} else if findings, err := parseA2AProvisionReport(message); err != nil {
 		log.Error(err, "the A2A provision pod's termination message is not a report; nothing from this Job run reaches the PlatformAgent's Events")
 		outcome = a2aProvisionReportOutcomeUnreadable
-	} else if finding != nil {
-		r.recordEvent(agent, corev1.EventTypeWarning, reasonTasksSubjectCapMissing, finding.eventMessage(job.Name))
-		outcome = a2aProvisionReportOutcomeReported
+	} else {
+		if findings.tasksSubjectCap != nil {
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonTasksSubjectCapMissing, findings.tasksSubjectCap.eventMessage(job.Name))
+			outcome = a2aProvisionReportOutcomeReported
+		}
+		if findings.topicsStateSubjectMissing {
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonTopicsStateSubjectMissing,
+				fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
+			outcome = a2aProvisionReportOutcomeReported
+		}
 	}
 	patch := client.MergeFrom(job.DeepCopy())
 	if job.Annotations == nil {
@@ -3537,46 +3589,62 @@ func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 	return message
 }
 
+// a2aProvisionFindings is what parseA2AProvisionReport read out of one
+// report: each finding the reader knows, absent when the script did not
+// write it. Both nil/false is the clean report, {}.
+type a2aProvisionFindings struct {
+	tasksSubjectCap           *tasksSubjectCapFinding
+	topicsStateSubjectMissing bool
+}
+
 // parseA2AProvisionReport reads the termination message and returns the
-// per-subject-cap finding in it, nil when the report is clean, and an error
-// when the message is not a report the reader can act on. An empty message
-// is an error rather than an empty report: the script writes {} when it
-// found nothing, so nothing at all means the script never got to write, and
-// the caller should say so rather than call the install clean. A finding
-// with no live cap, or a live cap other than the two the script writes under
-// this key (0 and -1, the two spellings of no limit; anything positive is a
-// bound, not the gap, and any other negative is nothing nats reports), is an
-// error too, with the message quoted: the reader does not fill in a field
-// the pod left out, because the field it would fill in steers the remedy,
-// and it does not quote a number the script has no way to have written. A
-// bare JSON null is an error and not a clean report: it decodes to no
-// object at all, and the script's clean report is {}.
-func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
+// findings in it, none when the report is clean, and an error when the
+// message is not a report the reader can act on. An empty message is an
+// error rather than an empty report: the script writes {} when it found
+// nothing, so nothing at all means the script never got to write, and the
+// caller should say so rather than call the install clean. A per-subject-cap
+// finding with no live cap, or a live cap other than the two the script
+// writes under this key (0 and -1, the two spellings of no limit; anything
+// positive is a bound, not the gap, and any other negative is nothing nats
+// reports), is an error too, with the message quoted: the reader does not
+// fill in a field the pod left out, because the field it would fill in
+// steers the remedy, and it does not quote a number the script has no way
+// to have written. The TOPICS-STATE finding is a marker and nothing else
+// (`missing: 1`); any other value under its key is not a report the script
+// writes. A bare JSON null is an error and not a clean report: it decodes to
+// no object at all, and the script's clean report is {}.
+func parseA2AProvisionReport(message string) (a2aProvisionFindings, error) {
+	var findings a2aProvisionFindings
 	if strings.TrimSpace(message) == "" {
-		return nil, fmt.Errorf("empty termination message; the provision script wrote no report")
+		return findings, fmt.Errorf("empty termination message; the provision script wrote no report")
 	}
 	report := a2aProvisionReport{}
 	if err := json.Unmarshal([]byte(message), &report); err != nil {
-		return nil, fmt.Errorf("parsing the provision pod's termination message %q: %w", message, err)
+		return findings, fmt.Errorf("parsing the provision pod's termination message %q: %w", message, err)
 	}
-	fields, present := report[a2aProvisionReportTasksSubjectCapKey]
-	if !present {
-		if report == nil {
-			// json.Unmarshal reads a bare null into a nil map, which a key
-			// lookup cannot tell from {} on its own.
-			return nil, fmt.Errorf("the provision pod's termination message is JSON null, not a report the script writes")
+	if report == nil {
+		// json.Unmarshal reads a bare null into a nil map, which a key
+		// lookup cannot tell from {} on its own.
+		return findings, fmt.Errorf("the provision pod's termination message is JSON null, not a report the script writes")
+	}
+	if fields, present := report[a2aProvisionReportTasksSubjectCapKey]; present {
+		live, ok := fields[a2aProvisionReportLiveKey]
+		if !ok {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding with no %q field; not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey)
 		}
-		return nil, nil
+		if live != 0 && live != -1 {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding with %s=%d, not the gap the key names (0 or -1); not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey, live)
+		}
+		want, hasWant := fields[a2aProvisionReportWantKey]
+		findings.tasksSubjectCap = &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}
 	}
-	live, ok := fields[a2aProvisionReportLiveKey]
-	if !ok {
-		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with no %q field; not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey)
+	if fields, present := report[a2aProvisionReportTopicsStateSubjectKey]; present {
+		if missing, ok := fields[a2aProvisionReportMissingKey]; !ok || missing != 1 {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding without %s=1; not a report the script writes", message, a2aProvisionReportTopicsStateSubjectKey, a2aProvisionReportMissingKey)
+		}
+		findings.topicsStateSubjectMissing = true
 	}
-	if live != 0 && live != -1 {
-		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with %s=%d, not the gap the key names (0 or -1); not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey, live)
-	}
-	want, hasWant := fields[a2aProvisionReportWantKey]
-	return &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}, nil
+	return findings, nil
 }
 
 // a2aProvisionPodVanished says whether a Complete Job whose succeeded
@@ -5178,6 +5246,23 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		var err error
 		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
 			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
+		}
+	}
+	// A profile's identities are ServiceAccounts in the profile namespace,
+	// so without that namespace (marked as the chart's) there are none to
+	// render: whoever made a namespace of that name must not get them. A
+	// failed read returns, as a failed list does above, and leaves the
+	// applied map as it is. Dropping the entries instead would revoke every
+	// profile's identity on an API-server blip, and the map lives in the
+	// agent's namespace, so the profile-namespace rule (skip and carry on)
+	// doesn't apply to it.
+	if len(profiles) > 0 {
+		ready, err := r.profileNamespaceExists(ctx, agent)
+		if err != nil {
+			return state, fmt.Errorf("failed to read the profile namespace for the identity map: %w", err)
+		}
+		if !ready {
+			profiles = nil
 		}
 	}
 	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)

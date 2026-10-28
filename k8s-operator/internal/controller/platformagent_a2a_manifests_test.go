@@ -304,7 +304,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: four streams, four KV buckets, three starter
+// The provisioning payload: four streams, four KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()
@@ -328,9 +328,10 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"TASKS", "a2a.tasks.>", "--max-age=72h", "21474836480",
 		// DIRECTORY: last-value, 1GiB
 		"DIRECTORY", "a2a.agents.>", "--max-msgs-per-subject=1",
-		// TOPICS-STATE: 8-deep, no age, the two state topics
+		// TOPICS-STATE: 8-deep, no age, the state topics
 		"TOPICS-STATE", "--max-msgs-per-subject=8",
-		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint",
+		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint",
+		"nats stream edit TOPICS-STATE --subjects=",
 		// TOPICS-JOURNAL: 30d, 5GiB, the journal topic
 		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
 		// max_bytes discipline
@@ -3527,7 +3528,7 @@ func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
 // publishes a card at all today, so the grant this removes had no caller.
 //
 // Both halves of the A5 split are asked, and the agent is the one that matters:
-// it is the container running model output, and its three topic grants are the
+// it is the container running model output, and its four topic grants are the
 // literal list a consolidating wildcard would replace. The bridge is asked too
 // because it is the principal that was holding those grants until A5.
 //
@@ -4614,7 +4615,7 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 // grants PURGE, DELETE, MSG.DELETE, RESTORE and UPDATE on every stream — contains
 // none of them; the web user's test in this file records the same lesson.
 //
-//  1. The publish allow-list is pinned exactly: the three starter topics, the
+//  1. The publish allow-list is pinned exactly: the four starter topics, the
 //     grants a2aSeedJetStreamGrants renders, and seed's own inbox. Any other
 //     entry, in any spelling, is a diff.
 //  2. Every route architecture A3's write-surface enumeration calls an
@@ -4635,6 +4636,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	want := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
@@ -4861,6 +4863,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.tasks.session-abc123.t1.events",
 		"a2a.tasks.session-abc123.t1.in",
 		"a2a.tasks."+a2aBridgeAddressee+".t1.in",
@@ -4922,6 +4925,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 
 	wantPublish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}

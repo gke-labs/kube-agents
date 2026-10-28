@@ -68,6 +68,7 @@ const profileMap = `{
       "account": "APP",
       "narrowing": "profile",
       "profile": "auditor",
+      "tier": "read",
       "topics": {"publish": ["agent.auditor.findings"], "subscribe": ["shared.blueprint"]},
       "grants": {"publish": [], "subscribe": []}
     },
@@ -111,6 +112,20 @@ func TestAProfilePodReachesEverythingItsOwnWorkNeeds(t *testing.T) {
 		consumerSubject("INFO", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerOrigin)):                                               false,
 		consumerSubject("DELETE", lib.SessionConsumerName(auditorPod1, lib.SessionConsumerEvents)):                                             false,
 
+		// The dispatcher hand-off and the lease, at the entry's tier, for
+		// this pod alone (#3655).
+		lib.DispatchAcceptSubject(auditor, "read", auditorPod1):       false,
+		lib.DispatchLeaseSubject(auditor, "read", auditorPod1):        false,
+		lib.DispatchAcceptSubject(auditor, "unattended", auditorPod1): true,
+		lib.DispatchLeaseSubject(auditor, "unattended", auditorPod1):  true,
+		lib.DispatchAcceptSubject(auditor, "read", auditorPod2):       true,
+		// A renewal on another pod's subject is refused at the bus.
+		lib.DispatchLeaseSubject(auditor, "read", auditorPod2): true,
+		// No grant on the lease bucket: a put on any key, with a rollup
+		// header, would purge every lease.
+		lib.ProfileLeaseSubject(lib.ProfileLeaseKey(auditor, "read", auditorPod1, "task-1")): true,
+		"$JS.API.STREAM.INFO.KV_" + lib.ProfileLeaseBucket:                                   true,
+
 		"a2a.topics." + auditorPublishTopic:                                                      false,
 		"$JS.API.STREAM.INFO." + lib.StreamTopicsState:                                           false,
 		"$JS.API.STREAM.INFO." + lib.StreamTopicsJournal:                                         false,
@@ -120,9 +135,14 @@ func TestAProfilePodReachesEverythingItsOwnWorkNeeds(t *testing.T) {
 		"_INBOX." + auditorPod1 + ".reply-1": false,
 	})
 
-	for _, subject := range []string{"_INBOX." + auditorPod1 + ".>", "a2a.topics." + auditorSubscribeTopic} {
+	for _, subject := range []string{"_INBOX." + auditorPod1 + ".>", "a2a.topics." + auditorSubscribeTopic, lib.DispatchSubject(auditor, "read", auditorPod1)} {
 		if subscribeRefused(t, nc, violations, subject) {
-			t.Errorf("subscribe %s was refused; a profile pod needs its inbox and its subscribed topics", subject)
+			t.Errorf("subscribe %s was refused; a profile pod needs its inbox, its subscribed topics and its dispatch subject", subject)
+		}
+	}
+	for _, subject := range []string{lib.DispatchSubject(auditor, "unattended", auditorPod1), lib.DispatchSubject(auditor, "read", auditorPod2)} {
+		if !subscribeRefused(t, nc, violations, subject) {
+			t.Errorf("subscribe %s was allowed; a worker's dispatch subject is its own tier's and pod's", subject)
 		}
 	}
 }
@@ -221,7 +241,7 @@ func TestTwoPodsOfOneProfileShareTheAddresseeAndNothingElse(t *testing.T) {
 // grant that any profile with a topic gets. Both sides are still non-empty, which is
 // what keeps the mint from reading an empty side as unrestricted.
 func TestAProfileWithNoTopicsReachesNoTopic(t *testing.T) {
-	g, err := profileGrants(cluster, clusterPod, TopicGrants{})
+	g, err := profileGrants(cluster, "", clusterPod, TopicGrants{})
 	if err != nil {
 		t.Fatalf("profileGrants: %v", err)
 	}
@@ -293,10 +313,10 @@ func TestTheMapRefusesProfileEntriesItCannotServe(t *testing.T) {
 // without passing the map cannot mint a non-topic subject.
 func TestProfileGrantsRefusesANonTopicRatherThanMintingIt(t *testing.T) {
 	for _, bad := range []string{">", "a2a.tasks.>", "shared.>", "agent.x", ""} {
-		if _, err := profileGrants(auditor, auditorPod1, TopicGrants{Subscribe: []string{bad}}); err == nil {
+		if _, err := profileGrants(auditor, "", auditorPod1, TopicGrants{Subscribe: []string{bad}}); err == nil {
 			t.Errorf("profileGrants accepted topic %q", bad)
 		}
-		if _, err := profileGrants(auditor, auditorPod1, TopicGrants{Publish: []string{bad}}); err == nil {
+		if _, err := profileGrants(auditor, "", auditorPod1, TopicGrants{Publish: []string{bad}}); err == nil {
 			t.Errorf("profileGrants accepted publish topic %q", bad)
 		}
 	}
@@ -404,7 +424,7 @@ func TestANarrowedPodNamedAfterAMappedPrincipalIsRefused(t *testing.T) {
 // A profile that only publishes still opens the topic streams: `a2a topics
 // write` resolves through TopicRegistry before it publishes.
 func TestAPublishOnlyProfileCanResolveItsTopic(t *testing.T) {
-	g, err := profileGrants(auditor, auditorPod1, TopicGrants{Publish: []string{auditorPublishTopic}})
+	g, err := profileGrants(auditor, "", auditorPod1, TopicGrants{Publish: []string{auditorPublishTopic}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,10 +438,10 @@ func TestAPublishOnlyProfileCanResolveItsTopic(t *testing.T) {
 // An agent-scoped topic has one writer, the agent it names. A profile may read
 // another agent's topic but not publish on it, refused at parse and at mint.
 func TestAProfileMayNotPublishAnotherAgentsTopic(t *testing.T) {
-	if _, err := profileGrants(auditor, auditorPod1, TopicGrants{Publish: []string{"agent.platform.upgrade-readiness"}}); err == nil {
+	if _, err := profileGrants(auditor, "", auditorPod1, TopicGrants{Publish: []string{"agent.platform.upgrade-readiness"}}); err == nil {
 		t.Error("profileGrants minted a publish on the platform agent's topic for the auditor profile")
 	}
-	if _, err := profileGrants(auditor, auditorPod1, TopicGrants{Subscribe: []string{"agent.platform.upgrade-readiness"}, Publish: []string{"shared.blueprint", auditorPublishTopic}}); err != nil {
+	if _, err := profileGrants(auditor, "", auditorPod1, TopicGrants{Subscribe: []string{"agent.platform.upgrade-readiness"}, Publish: []string{"shared.blueprint", auditorPublishTopic}}); err != nil {
 		t.Errorf("reading another agent's topic or publishing a shared or own topic was refused: %v", err)
 	}
 	raw := `{"version":"v","identities":[{"serviceAccount":"` + auditorSA + `","user":"profile-auditor","account":"APP","narrowing":"profile","profile":"auditor","topics":{"publish":["agent.platform.upgrade-readiness"]},"grants":{}}]}`
@@ -462,6 +482,104 @@ func TestTheRefusalForAPodNamedAfterAProfileNamesItsTaskSubjects(t *testing.T) {
 	for _, want := range []string{string(reservedProfile), "its task subjects are that addressee's"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q lacks %q", err, want)
+		}
+	}
+}
+
+// natsMatch reports whether a grant pattern covers a subject, by NATS's token
+// rules: "*" is one token, ">" one or more at the end.
+func natsMatch(pattern, subject string) bool {
+	p, s := strings.Split(pattern, "."), strings.Split(subject, ".")
+	for i, tok := range p {
+		if tok == ">" {
+			return len(s) > i
+		}
+		if i >= len(s) || (tok != "*" && tok != s[i]) {
+			return false
+		}
+	}
+	return len(p) == len(s)
+}
+
+func grantsCover(patterns []string, subject string) bool {
+	for _, p := range patterns {
+		if natsMatch(p, subject) {
+			return true
+		}
+	}
+	return false
+}
+
+// A worker's dispatch and lease grants are its own (profile, tier, pod)'s:
+// they cover none of another tier's, another pod's or another profile's
+// subjects. (The task subjects carry no tier, so .in and .events can't be
+// scoped by it: #3889.) An entry with no tier gets no dispatch or lease grant.
+func TestAWorkersDispatchAndLeaseGrantsAreItsOwn(t *testing.T) {
+	g, err := profileGrants(auditor, "read", auditorPod1, TopicGrants{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := map[string]bool{
+		lib.DispatchAcceptSubject(auditor, "read", auditorPod1): true,
+		lib.DispatchLeaseSubject(auditor, "read", auditorPod1):  true,
+	}
+	for subject := range own {
+		if !grantsCover(g.Publish, subject) {
+			t.Errorf("publish %s is not granted; it's the worker's own", subject)
+		}
+	}
+	if !grantsCover(g.Subscribe, lib.DispatchSubject(auditor, "read", auditorPod1)) {
+		t.Error("the worker's own dispatch subject is not granted")
+	}
+	for _, other := range []struct{ profile, tier, pod string }{
+		{auditor, "unattended", auditorPod1},
+		{auditor, "read", auditorPod2},
+		{cluster, "read", auditorPod1},
+	} {
+		for _, subject := range []string{
+			lib.DispatchAcceptSubject(other.profile, other.tier, other.pod),
+			lib.DispatchLeaseSubject(other.profile, other.tier, other.pod),
+		} {
+			if grantsCover(g.Publish, subject) {
+				t.Errorf("publish %s is granted to %s/read/%s", subject, auditor, auditorPod1)
+			}
+		}
+		if grantsCover(g.Subscribe, lib.DispatchSubject(other.profile, other.tier, other.pod)) {
+			t.Errorf("subscribe %s is granted to %s/read/%s", lib.DispatchSubject(other.profile, other.tier, other.pod), auditor, auditorPod1)
+		}
+	}
+	// No grant on the lease bucket at all: a worker never writes it.
+	for _, p := range append(append([]string{}, g.Publish...), g.Subscribe...) {
+		if strings.Contains(p, lib.ProfileLeaseBucket) {
+			t.Errorf("a grant on the lease bucket: %s", p)
+		}
+	}
+
+	tierless, err := profileGrants(auditor, "", auditorPod1, TopicGrants{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range append(append([]string{}, tierless.Publish...), tierless.Subscribe...) {
+		if strings.HasPrefix(p, "a2a.dispatch.") || strings.Contains(p, lib.ProfileLeaseBucket) {
+			t.Errorf("an entry with no tier is granted %s", p)
+		}
+	}
+}
+
+// A tier is a profile entry's alone, and one of the profile tiers.
+func TestAProfileEntrysTierIsCheckedAtParse(t *testing.T) {
+	for name, entry := range map[string]string{
+		"an unknown tier":          `{"serviceAccount":"system:serviceaccount:ns:p","user":"profile-p","account":"APP","narrowing":"profile","profile":"p","tier":"admin","grants":{"publish":[],"subscribe":[]}}`,
+		"a tier on a static entry": `{"serviceAccount":"system:serviceaccount:ns:s","user":"s","account":"APP","tier":"read","grants":{"publish":["x"],"subscribe":["y"]}}`,
+	} {
+		if _, err := ParseIdentityMap([]byte(`{"version":"v","identities":[` + entry + `]}`)); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	for _, tier := range []string{"", "read", "unattended"} {
+		entry := `{"serviceAccount":"system:serviceaccount:ns:p","user":"profile-p","account":"APP","narrowing":"profile","profile":"p","tier":"` + tier + `","grants":{"publish":[],"subscribe":[]}}`
+		if _, err := ParseIdentityMap([]byte(`{"version":"v","identities":[` + entry + `]}`)); err != nil {
+			t.Errorf("tier %q was refused: %v", tier, err)
 		}
 	}
 }

@@ -962,12 +962,13 @@ granted as one wildcard at connection time. Not built; recorded so the door has 
 
 Worked examples:
 
-| Subject                                       | Class   | Writer                 | Content                                          |
-| --------------------------------------------- | ------- | ---------------------- | ------------------------------------------------ |
-| `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent         | DataPart: current per-cluster readiness verdicts |
-| `a2a.topics.agent.platform.version-skew`      | state   | platform agent         | DataPart: skew summary across the fleet          |
-| `a2a.topics.shared.blueprint`                 | state   | designated writer, TBD | DataPart: the shared environment model           |
-| `a2a.topics.shared.annotations`               | journal | any agent              | TextPart/DataPart: dated observations            |
+| Subject                                       | Class   | Writer                 | Content                                                                                         |
+| --------------------------------------------- | ------- | ---------------------- | ----------------------------------------------------------------------------------------------- |
+| `a2a.topics.agent.platform.upgrade-readiness` | state   | platform agent         | DataPart: current per-cluster readiness verdicts                                                |
+| `a2a.topics.agent.platform.topology-skew`     | state   | platform agent         | DataPart: the latest `leeway.report/v1alpha1` document (per-cluster topology and rank findings) |
+| `a2a.topics.agent.platform.version-skew`      | state   | platform agent         | DataPart: skew summary across the fleet                                                         |
+| `a2a.topics.shared.blueprint`                 | state   | designated writer, TBD | DataPart: the shared environment model                                                          |
+| `a2a.topics.shared.annotations`               | journal | any agent              | TextPart/DataPart: dated observations                                                           |
 
 ### Payload
 

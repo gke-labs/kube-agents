@@ -216,6 +216,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 type toolBus interface {
 	mcp.Bus
 	mcp.TurnBus
+	mcp.TopicsBus
 }
 
 func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) []mcp.Tool {
@@ -223,6 +224,7 @@ func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) [
 		mcp.ConnectionStatusTool(bus),
 		mcp.SendMessageTool(bus, convs),
 		mcp.TaskControlTool(bus, convs),
+		mcp.ReadTopicsTool(bus),
 	}
 	if broker != nil {
 		tools = append(tools, mcp.InspectPRTool(broker))

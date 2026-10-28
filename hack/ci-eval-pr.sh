@@ -39,6 +39,7 @@ readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
+readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
 # The stack-bearing cases of the nightly's main part that run in main-b, when
 # EVAL_NIGHTLY_PART splits that part in two (#3384).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
@@ -466,27 +467,71 @@ source "${SCRIPT_DIR}/ci-env.sh"
 # (docs/ci-pool-projects.md 5.6). The names are pinned equal to
 # hack/ci-deploy.sh's by scripts/test_ci_gitlab_forge.py.
 EVAL_FORGE="${EVAL_FORGE:-github}"
-case "${EVAL_FORGE}" in
-  github) ;;
-  gitlab)
-    # The deploy builds the GitLab forge from the mapping alone and ignores
-    # EVAL_GITOPS_REPO, so a developer's override would steer the resets and
-    # the lane at a repository the agent was not told to write to.
-    if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
-      echo "ERROR: EVAL_FORGE=gitlab does not take EVAL_GITOPS_REPO (the deploy ignores it); unset it, the GitLab project follows the leased PROJECT_ID." >&2
-      exit 1
-    fi
-    ;;
-  *) echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this eval knows; use github (default) or gitlab." >&2; exit 1 ;;
+# The forge table is hack/ci-deploy.sh's forge_profile (kube-agents#3682), one
+# row per EVAL_FORGE value: the kind (github or gitlab), the host, and whether
+# the forge is self-managed (a private host whose CA the run supplies). Lifted
+# rather than sourced, as the project tables are, so the two scripts read one
+# table and the eval refuses exactly what the deploy refuses.
+eval_forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no>"
+  local body
+  body="$(sed -n '/^forge_profile() {/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+  [ -n "${body}" ] || return 1
+  eval "$(sed -n 's/^\(EVAL_FORGE_DEFAULT_[A-Z_]*HOST=.*\)$/\1/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+  eval "${body}"
+  forge_profile "$1"
+}
+EVAL_FORGE_PROFILE_RC=0
+EVAL_FORGE_PROFILE="$(eval_forge_profile "${EVAL_FORGE}")" || EVAL_FORGE_PROFILE_RC=$?
+if [ "${EVAL_FORGE_PROFILE_RC}" -ne 0 ]; then
+  # 2 is a host override that is not a bare hostname; forge_profile said so itself.
+  [ "${EVAL_FORGE_PROFILE_RC}" -eq 2 ] || echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this eval knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
+  exit 1
+fi
+read -r EVAL_FORGE_KIND EVAL_FORGE_HOST EVAL_FORGE_SELF_MANAGED <<<"${EVAL_FORGE_PROFILE}"
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ] && [ -n "${EVAL_GITOPS_REPO:-}" ]; then
+  # The deploy builds the GitLab forge from the mapping alone and ignores
+  # EVAL_GITOPS_REPO, so a developer's override would steer the resets and
+  # the lane at a repository the agent was not told to write to.
+  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} does not take EVAL_GITOPS_REPO (the deploy ignores it); unset it, the GitLab project follows the leased PROJECT_ID." >&2
+  exit 1
+fi
+# What the deploy left for this run on a self-managed forge (its
+# EVAL_FORGE_STATE_DIR, the same default): the private CA the grader and the
+# helpers trust for that host, and on a per-run GitLab the token pair the
+# lane step minted. Never under the artifacts.
+EVAL_FORGE_STATE_DIR="${EVAL_FORGE_STATE_DIR:-/tmp/eval-forge}"
+case "${EVAL_FORGE_STATE_DIR}" in
+  /*) ;;
+  *) echo "ERROR: EVAL_FORGE_STATE_DIR='${EVAL_FORGE_STATE_DIR}' must be an absolute path: the grader runs under bench/ and reads the CA by this path (kube-agents#3682)." >&2; exit 1 ;;
 esac
+EVAL_FORGE_CA_FILE=""
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  EVAL_FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
+  if [ ! -s "${EVAL_FORGE_CA_FILE}" ]; then
+    echo "ERROR: EVAL_FORGE=${EVAL_FORGE} is a self-managed forge at ${EVAL_FORGE_HOST}, but ${EVAL_FORGE_CA_FILE} (its private CA) is missing or empty; the deploy would have refused the same (kube-agents#3682)." >&2
+    exit 1
+  fi
+  if ! openssl x509 -noout -text -in "${EVAL_FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
+    echo "ERROR: ${EVAL_FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    exit 1
+  fi
+fi
 GITLAB_SECRETS_PROJECT="kube-agents-prow"
 GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
 GITLAB_LEDGER_SM_SECRET="gitlab-ledger-token"
 GITLAB_BOT_LOGIN="kube-agents-eval-bot"
-GITLAB_FORGE_HOST="gitlab.com"
-# What the two reset helpers are told; empty under github.
+# The GitLab host the resets, the probe and the grader name: the table's.
+GITLAB_FORGE_HOST="${EVAL_FORGE_HOST}"
+GITLAB_FORGE_AGENT_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/agent-token"
+GITLAB_FORGE_LEDGER_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/ledger-token"
+# What the two reset helpers and the sweep's siblings are told; empty under
+# the github kind. The host rides along so a self-managed instance is reached
+# and not gitlab.com, and the CA so its certificate is trusted.
 EVAL_FORGE_HELPER_ARGS=()
-[ "${EVAL_FORGE}" = "gitlab" ] && EVAL_FORGE_HELPER_ARGS=(--forge gitlab)
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  EVAL_FORGE_HELPER_ARGS=(--forge gitlab --host "${GITLAB_FORGE_HOST}")
+  [ -n "${EVAL_FORGE_CA_FILE}" ] && EVAL_FORGE_HELPER_ARGS+=(--ca-file "${EVAL_FORGE_CA_FILE}")
+fi
 
 # ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
 # Re-renders and republishes the eval dashboard at the very end of every
@@ -1139,9 +1184,10 @@ _ledger_token_mint() {
 # LEDGER_MINT_LAST_FAILURE is left holding the mint's last diagnostic line
 # either way, for the caller's record.
 mint_ledger_token() { # <label>
-  # Under gitlab the grading token is the pool's, read once at preflight by
-  # read_gitlab_tokens; it lasts a year, so there is nothing to mint per unit.
-  if [ "${EVAL_FORGE:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  # Under the gitlab kind the grading token is read once at preflight by
+  # read_gitlab_tokens (the pool's pair, or the run's own on a self-managed
+  # instance); nothing is minted per unit.
+  if [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     return 0
   fi
   # The token never reaches argv, where ps would show it: python writes it to
@@ -1272,15 +1318,38 @@ stop_ledger_token_renewal() { # <file>
 # Neither touches argv or a file. A read that fails stops the run here, as a
 # mint that fails does: grading without the token would prove nothing.
 EVAL_GITLAB_AGENT_TOKEN=""
+# Where the pair comes from, per forge: the pool's Secret Manager secrets on
+# gitlab.com; on a per-run instance (gitlab-ce) the files the lane step left in
+# the forge state directory, a pair that dies with the lease.
+gitlab_token_source() { # <agent|ledger> -> a description for the log
+  if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+    [ "$1" = "agent" ] && echo "${GITLAB_FORGE_AGENT_TOKEN_FILE}" || echo "${GITLAB_FORGE_LEDGER_TOKEN_FILE}"
+  else
+    [ "$1" = "agent" ] && echo "${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}" || echo "${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET}"
+  fi
+}
+read_gitlab_token() { # <agent|ledger> -> the token on stdout, newline stripped
+  if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+    tr -d '\r\n' 2>/dev/null <"$(gitlab_token_source "$1")"
+  else
+    local secret="${GITLAB_AGENT_SM_SECRET}"
+    [ "$1" = "ledger" ] && secret="${GITLAB_LEDGER_SM_SECRET}"
+    gcloud secrets versions access latest --secret="${secret}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n'
+  fi
+}
 read_gitlab_tokens() {
   local agent ledger
-  agent="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n')" || agent=""
-  ledger="$(gcloud secrets versions access latest --secret="${GITLAB_LEDGER_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" | tr -d '\r\n')" || ledger=""
+  agent="$(read_gitlab_token agent)" || agent=""
+  ledger="$(read_gitlab_token ledger)" || ledger=""
   local missing=()
-  [ -n "${agent}" ] || missing+=("${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}")
-  [ -n "${ledger}" ] || missing+=("${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET}")
+  [ -n "${agent}" ] || missing+=("$(gitlab_token_source agent)")
+  [ -n "${ledger}" ] || missing+=("$(gitlab_token_source ledger)")
   if [ "${#missing[@]}" -gt 0 ]; then
-    echo "ERROR: preflight: could not read ${missing[*]} as this runner (docs/ci-pool-projects.md 5.6: the pair and the runner's secretAccessor grant are hand steps)." >&2
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      echo "ERROR: preflight: could not read ${missing[*]}; the lane step that stands the per-run GitLab up writes the pair there (kube-agents#3683)." >&2
+    else
+      echo "ERROR: preflight: could not read ${missing[*]} as this runner (docs/ci-pool-projects.md 5.6: the pair and the runner's secretAccessor grant are hand steps)." >&2
+    fi
     echo "       Grading a GitLab ledger needs the ledger token and the resets need the agent token; not running without them." >&2
     return 1
   fi
@@ -1288,14 +1357,18 @@ read_gitlab_tokens() {
   # would spend the whole lease to meet a 401 in the resets and the bench;
   # prove both now, as the GitHub preflight proves the mint. The token goes
   # to the probe in its environment, never on argv.
-  local which secret login
+  local which login
   for which in agent ledger; do
-    [ "${which}" = "agent" ] && secret="${GITLAB_AGENT_SM_SECRET}" || secret="${GITLAB_LEDGER_SM_SECRET}"
-    if ! login="$(GITLAB_PROBE_TOKEN="${!which}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" whoami --host "${GITLAB_FORGE_HOST}")"; then
-      echo "ERROR: preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} does not authenticate at ${GITLAB_FORGE_HOST} (docs/ci-pool-projects.md 5.6: create a new one and store it); not running with it." >&2
+    if ! login="$(GITLAB_PROBE_TOKEN="${!which}" GITLAB_CA_FILE="${EVAL_FORGE_CA_FILE}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" whoami --host "${GITLAB_FORGE_HOST}")"; then
+      echo "ERROR: preflight: the ${which} token in $(gitlab_token_source "${which}") does not authenticate at ${GITLAB_FORGE_HOST} (docs/ci-pool-projects.md 5.6: create a new one and store it); not running with it." >&2
       return 1
     fi
-    echo "Preflight: the ${which} token in ${GITLAB_SECRETS_PROJECT}/${secret} authenticates as ${login}"
+    echo "Preflight: the ${which} token in $(gitlab_token_source "${which}") authenticates as ${login}"
+    if [ "${which}" = "agent" ] && [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
+      # A per-run instance's bot is whatever the lane step created; the bench
+      # grades by the login, so it follows the token rather than the pool's name.
+      GITLAB_BOT_LOGIN="${login}"
+    fi
     if [ "${which}" = "agent" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
       echo "WARNING: preflight: the agent token belongs to ${login}, not ${GITLAB_BOT_LOGIN}; the bench grades the agent's ledgers and merge requests by the latter (GITLAB_BOT_LOGIN)." >&2
     fi
@@ -1308,10 +1381,24 @@ read_gitlab_tokens() {
   export BENCH_GITLAB_TOKEN="${ledger}"
   export BENCH_GITLAB_HOST="${GITLAB_FORGE_HOST}"
   export BENCH_GITLAB_AGENT_LOGIN="${GITLAB_BOT_LOGIN}"
-  echo "Ledger token: the pool's GitLab ledger token from ${GITLAB_SECRETS_PROJECT}/${GITLAB_LEDGER_SM_SECRET} (BENCH_FORGE=gitlab, agent login ${GITLAB_BOT_LOGIN}); the agent token from ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} drives the resets"
+  [ -n "${EVAL_FORGE_CA_FILE}" ] && export BENCH_FORGE_CA_FILE="${EVAL_FORGE_CA_FILE}"
+  echo "Ledger token: the GitLab ledger token from $(gitlab_token_source ledger) (BENCH_FORGE=gitlab, host ${GITLAB_FORGE_HOST}, agent login ${GITLAB_BOT_LOGIN}); the agent token from $(gitlab_token_source agent) drives the resets"
 }
 
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+# A GitHub forge at a self-managed host (ghes): the pool's App mints as on
+# github.com and the data is read from api.github.com, so the token path is
+# the GitHub one; what the grader needs to know is the host the agent's links
+# carry and the CA that signed it.
+export_github_forge_host() {
+  export BENCH_GITHUB_HOST="${EVAL_FORGE_HOST}"
+  export BENCH_FORGE_CA_FILE="${EVAL_FORGE_CA_FILE}"
+  echo "GitHub forge host: ${EVAL_FORGE_HOST} (BENCH_GITHUB_HOST; its CA ${EVAL_FORGE_CA_FILE} in BENCH_FORGE_CA_FILE); the data is read from api.github.com"
+}
+
+if [ "${EVAL_FORGE_KIND}" = "github" ] && [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  export_github_forge_host
+fi
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   read_gitlab_tokens || exit 1
 elif [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
   echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
@@ -1368,9 +1455,19 @@ eval_gitops_repo() { # <project-id>
 }
 
 eval_gitlab_project() { # <project-id>
-  # The GitLab table beside it, lifted the same way; under EVAL_FORGE=gitlab
-  # this is the repository the resets and the write safeguard name.
+  # The GitLab table beside it, lifted the same way; under the gitlab kind
+  # this is the repository the resets and the write safeguard name. On a
+  # per-run instance there is no table: the project is the one the lane step
+  # seeded, the pool layout's `<group>/<PROJECT_ID><suffix>` (the deploy's
+  # constants, lifted too).
   local body
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    # Two expressions, not one alternation: BSD sed has no \| in a basic regex.
+    eval "$(sed -n -e 's/^\(GITLAB_FORGE_GROUP=.*\)$/\1/p' -e 's/^\(GITLAB_FORGE_PROJECT_SUFFIX=.*\)$/\1/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+    [ -n "${GITLAB_FORGE_GROUP:-}" ] && [ -n "${GITLAB_FORGE_PROJECT_SUFFIX:-}" ] || return 1
+    echo "${GITLAB_FORGE_GROUP}/$1${GITLAB_FORGE_PROJECT_SUFFIX}"
+    return 0
+  fi
   body="$(sed -n '/^gitlab_project_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
   [ -n "${body}" ] || return 1
   eval "${body}"
@@ -1381,7 +1478,7 @@ eval_gitlab_project() { # <project-id>
 # preflight; under github one minted narrowed to the repository (and to the
 # permissions named, issues: write when none are).
 forge_write_token() { # <owner/repo> [permissions JSON]
-  if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+  if [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ]; then
     [ -n "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || return 1
     printf '%s\n' "${EVAL_GITLAB_AGENT_TOKEN}"
     return 0
@@ -1475,7 +1572,7 @@ reset_audit_ledgers() { # <label> [audit-id]
   local label="$1" audit_id="${2:-}" scope token out rc=0
   scope="every audit stream"
   [ -n "${audit_id}" ] && scope="the ${audit_id} stream"
-  if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Ledger reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; ${scope} keeps whatever ledger is open"
     return 0
   fi
@@ -1484,8 +1581,8 @@ reset_audit_ledgers() { # <label> [audit-id]
     return 0
   fi
   if ! token="$(forge_write_token "${EVAL_LEDGER_REPO}")"; then
-    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
-      echo "WARNING: Ledger reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); ${scope} keeps whatever ledger is open." >&2
+    if [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ]; then
+      echo "WARNING: Ledger reset (${label}): the GitLab agent token is not in hand (read_gitlab_tokens at preflight); ${scope} keeps whatever ledger is open." >&2
     else
       echo "WARNING: Ledger reset (${label}): App ${EVAL_LEDGER_APP_ID} could not mint issues: write narrowed to ${EVAL_LEDGER_REPO}; ${scope} keeps whatever ledger is open. A 422 above means the installation no longer holds issues: write, which it was granted on 2026-09-22 (docs/ci-pool-projects.md 5.4)." >&2
     fi
@@ -1512,16 +1609,16 @@ reset_audit_ledgers() { # <label> [audit-id]
 # environment, never on argv.
 probe_gitlab_ledger_path() { # <label>
   local label="$1" out rc=0
-  [ "${EVAL_FORGE:-github}" = "gitlab" ] || return 0
+  [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ] || return 0
   if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
     echo "Ledger probe (${label}): skipped, PROJECT_ID=${PROJECT_ID:-unset} maps to no GitLab project (gitlab_project_for_project in hack/ci-deploy.sh)"
     return 0
   fi
   if [ -z "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || [ -z "${BENCH_GITLAB_TOKEN:-}" ]; then
-    echo "ERROR: Ledger probe (${label}): the pool's token pair is not in hand (read_gitlab_tokens at preflight); not running without the probe." >&2
+    echo "ERROR: Ledger probe (${label}): the GitLab token pair is not in hand (read_gitlab_tokens at preflight); not running without the probe." >&2
     return 1
   fi
-  out="$(GITLAB_PROBE_TOKEN="${EVAL_GITLAB_AGENT_TOKEN}" GITLAB_PROBE_LEDGER_TOKEN="${BENCH_GITLAB_TOKEN}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" probe-ledger --path "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" --host "${GITLAB_FORGE_HOST}" 2>&1)" || rc=$?
+  out="$(GITLAB_PROBE_TOKEN="${EVAL_GITLAB_AGENT_TOKEN}" GITLAB_PROBE_LEDGER_TOKEN="${BENCH_GITLAB_TOKEN}" GITLAB_CA_FILE="${EVAL_FORGE_CA_FILE}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" probe-ledger --path "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" --host "${GITLAB_FORGE_HOST}" 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger probe (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "ERROR: Ledger probe (${label}): the GitLab ledger path is broken in ${EVAL_LEDGER_REPO} (the lines above say which step); a ledger the agent published could not be graded here, so this run stops (kube-agents#2920, docs/ci-pool-projects.md 5.6)." >&2
@@ -1555,7 +1652,7 @@ probe_gitlab_ledger_path() { # <label>
 # in hand.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero when a unit must not run on it
   local label="$1" token out rc=0 slug record diagnostics mint_rc=0
-  if [ "${EVAL_FORGE:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
   fi
@@ -1568,9 +1665,9 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
   token="$(forge_write_token "${EVAL_LEDGER_REPO}" "${AGENT_PULLS_RESET_PERMISSIONS}" 2>"${diagnostics}")" || mint_rc=$?
   cat "${diagnostics}" >&2
   if [ "${mint_rc}" -ne 0 ]; then
-    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    if [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ]; then
       rm -f "${diagnostics}"
-      echo "WARNING: Agent pulls reset (${label}): the pool's GitLab agent token is not in hand (read_gitlab_tokens at preflight); a unit that requests a merge request does not run on a project this could not clean." >&2
+      echo "WARNING: Agent pulls reset (${label}): the GitLab agent token is not in hand (read_gitlab_tokens at preflight); a unit that requests a merge request does not run on a project this could not clean." >&2
       return 1
     fi
     AGENT_PULLS_RESET_LAST_FAILURE="$(tail -n 1 "${diagnostics}")"
@@ -1906,7 +2003,7 @@ ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
   done
 }
 
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 else
   EVAL_LEDGER_REPO="$(eval_gitops_repo "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
@@ -2152,7 +2249,25 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
-GITLAB_CASES_FILE="${SCRIPT_DIR}/${EVAL_GITLAB_CASES_FILE}"
+# Which lane list a forge runs (kube-agents#3682): the GitLab list on either
+# GitLab, gitlab.com or a self-managed instance, since the cases grade the
+# forge and not where it is; the GHES list on ghes (eval/ghes-cases.txt, which
+# arrives with the GHES lane, kube-agents#3684). github runs the catalogue. A
+# forge whose list this checkout lacks stops here by name, not at the roster
+# reader's message for a missing file.
+lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
+  case "$1" in
+    gitlab|gitlab-ce) echo "${EVAL_GITLAB_CASES_FILE}" ;;
+    ghes) echo "${EVAL_GHES_CASES_FILE}" ;;
+    *) return 1 ;;
+  esac
+}
+LANE_CASES_REL="$(lane_cases_file "${EVAL_FORGE}" 2>/dev/null)" || LANE_CASES_REL=""
+LANE_CASES_FILE="${LANE_CASES_REL:+${SCRIPT_DIR}/${LANE_CASES_REL}}"
+if [ -n "${LANE_CASES_FILE}" ] && [ ! -f "${LANE_CASES_FILE}" ]; then
+  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} runs the lane list ${LANE_CASES_REL}, which this checkout does not have; the lane that adds it is kube-agents#3684." >&2
+  exit 1
+fi
 
 # One roster file's entries, one per line: `#` to end of line is a comment,
 # blank lines are skipped, surrounding whitespace is trimmed. Called inside a
@@ -2265,13 +2380,13 @@ EVAL_TIER="${EVAL_TIER:-presubmit}"
 # decision below the matrix says why).
 GITLAB_LANE_DROPPED=""
 gitlab_lane_matrix() { # <tier word, for the log line>
-  GITLAB_LANE_ENTRIES="$(roster_entries "${GITLAB_CASES_FILE}")"
+  GITLAB_LANE_ENTRIES="$(roster_entries "${LANE_CASES_FILE}")"
   GITLAB_LANE_TASKS=()
   while IFS= read -r ENTRY; do
     if [ -n "${ENTRY}" ]; then GITLAB_LANE_TASKS+=("${ENTRY}"); fi
   done <<< "${GITLAB_LANE_ENTRIES}"
   if [ "${#GITLAB_LANE_TASKS[@]}" -eq 0 ]; then
-    echo "ERROR: ${GITLAB_CASES_FILE} names no case; the GitLab lane would run nothing and report green." >&2
+    echo "ERROR: ${LANE_CASES_FILE} names no case; the ${EVAL_FORGE} lane would run nothing and report green." >&2
     exit 1
   fi
   # Every entry must be a registered case, a presubmit or nightly entry,
@@ -2280,7 +2395,7 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # register.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
     if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
-      echo "ERROR: ${GITLAB_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the GitLab lane runs registered cases only." >&2
+      echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
       exit 1
     fi
   done
@@ -2291,16 +2406,16 @@ gitlab_lane_matrix() { # <tier word, for the log line>
     fi
   done
   TASKS=("${GITLAB_LANE_TASKS[@]}")
-  echo "EVAL_FORGE=gitlab: the GitLab lane runs ${#TASKS[@]} case(s) on the $1 tier (${EVAL_GITLAB_CASES_FILE}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
+  echo "EVAL_FORGE=${EVAL_FORGE}: the ${EVAL_FORGE} lane runs ${#TASKS[@]} case(s) on the $1 tier (${LANE_CASES_REL}); presubmit cases left out: $(printf '%s' "${GITLAB_LANE_DROPPED}" | paste -sd, -)"
 }
 case "${EVAL_TIER}" in
   presubmit)
-    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    if [ -n "${LANE_CASES_FILE}" ]; then
       gitlab_lane_matrix presubmit
     fi
     ;;
   nightly)
-    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    if [ -n "${LANE_CASES_FILE}" ]; then
       gitlab_lane_matrix nightly
     else
       TASKS+=("${NIGHTLY_TASKS[@]}")
@@ -2333,8 +2448,8 @@ case "${EVAL_NIGHTLY_PART}" in
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
       exit 1
     fi
-    if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
-      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} is the GitHub nightly's split; the GitLab nightly runs ${EVAL_GITLAB_CASES_FILE} whole. Unset it, or set it to 'all'." >&2
+    if [ -n "${LANE_CASES_FILE}" ]; then
+      echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} is the GitHub nightly's split; the ${EVAL_FORGE} nightly runs ${LANE_CASES_REL} whole. Unset it, or set it to 'all'." >&2
       exit 1
     fi
     ;;
@@ -3007,7 +3122,7 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # when the part holds no roster case, and is not the lane's doing.
 if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   if [ -n "${GITLAB_LANE_DROPPED:-}" ]; then
-    echo "ERROR: every blocking-roster case in ${EVAL_GITLAB_CASES_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+    echo "ERROR: every blocking-roster case in ${LANE_CASES_REL} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   else
     echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   fi
@@ -3021,7 +3136,7 @@ fi
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
-  echo "EVAL_FORGE=gitlab: no blocking-roster case is in the GitLab lane, so rung 4 is disarmed on this lane (rungs 1-3 still red it); a forge-grading case arms it by earning a roster seat."
+  echo "EVAL_FORGE=${EVAL_FORGE}: no blocking-roster case is in the ${EVAL_FORGE} lane, so rung 4 is disarmed on this lane (rungs 1-3 still red it); a forge-grading case arms it by earning a roster seat."
 fi
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
@@ -3080,7 +3195,7 @@ fi
 # and version key, not per forge, so a GitLab night would pool its evidence
 # with the GitHub nights' under the same key. The lane reads the store like
 # a presubmit; a record of its own is a decision for later (#2832).
-if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+if [ "${EVAL_FORGE:-github}" != "github" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
@@ -4362,7 +4477,7 @@ report_github_leftovers() {
   # Named by forge: under EVAL_FORGE=gitlab BENCH_GITOPS_REPO is a GitLab
   # project and the listing is of its merge requests.
   local forge="GitHub" kind="repository"
-  if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+  if [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ]; then
     forge="GitLab" kind="project"
   fi
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${forge} writes this run left on the ${forge} ${kind} ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
