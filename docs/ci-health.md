@@ -1296,10 +1296,14 @@ prior scan's `scanned_at` and its `{project: [finding ids]}` map.
 
 **The 429 reading.** Rule 2's evidence is read by the same identity, each tick,
 from Cloud Monitoring: per pool project, Vertex AI calls by response code in
-ten-minute buckets over the last five hours (`serviceruntime.googleapis.com/api/request_count`
-on the `consumed_api` resource; the rule's two-hour window plus the three
-hours of calls a run makes before it finishes), summed pool-wide into
-`work/vertex-429.json`. `health.json`'s `vertex_429` reports it every tick
+ten-minute buckets over the last six hours (`serviceruntime.googleapis.com/api/request_count`
+on the `consumed_api` resource; the rule's two-hour window, the three hours
+of calls a run makes before it finishes, and an hour for the tick's own clock
+gap, since the rule's clock is the collect step's), summed pool-wide into
+`work/vertex-429.json` and published beside `health.json` as
+`vertex-429.json`. A read that reaches no project keeps the previous tick's
+reading, so a storm the last reading denied is not re-declared on a blind
+tick. `health.json`'s `vertex_429` reports it every tick
 (`read`, `projects_read`, `projects_failed`, `read_at`, and the peak hourly
 share with its `requests` and `hour_end`), so a broken grant shows before a
 storm needs it; the share judges only when the repetitions would fire. It

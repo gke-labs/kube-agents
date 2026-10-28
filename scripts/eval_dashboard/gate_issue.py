@@ -231,7 +231,7 @@ Filed automatically by the smoke health bot; edit freely. Fix PRs: reference thi
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
 FIXTURE_DRIFT_BODY = """\
-The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. The presubmit and the nightly run the same check on their own lease and record each case whose grade depends on a drifted role as infrastructure (`fixture-drift:<role>`) instead of running it, so while the drift lasts those cases red no pull request and guard nothing either. A red on such a case comes only from a run whose own scan could not read the role; that red is the fixture's, not the pull request's. The repair below puts the cases back in the gate.
+The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans. The presubmit and the nightly run the same check on their own lease and record each case whose grade depends on a drifted role as infrastructure (`fixture-drift:<role>`) instead of running it, so while the drift lasts those cases red no pull request and guard nothing either. A red on such a case comes only from a run whose own scan could not read the role; that red is the fixture's, not the pull request's. The repair below puts the cases back in the gate.
 
 **Drifted roles**
 

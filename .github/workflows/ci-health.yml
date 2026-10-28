@@ -570,6 +570,9 @@ jobs:
           # No state yet is the first tick, not an error.
           gcloud storage cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
           gcloud storage cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
+          # The previous tick's Vertex 429 reading: the read step below keeps
+          # it when its own read reaches no project (rule 2 ages it itself).
+          gcloud storage cp "$DASHBOARD_BUCKET/vertex-429.json" work/vertex-429.json || true
           # The hourly seeded-fleet scan's latest document (the scan job
           # below); none yet means the scan has not run, and the adjudicator
           # then has no fixture_state to report.
@@ -612,6 +615,12 @@ jobs:
       - name: Upload health.json next to data.json
         run: |
           gcloud storage cp --cache-control=no-cache work/health.json "$DASHBOARD_BUCKET/health.json"
+
+      - name: Publish the Vertex 429 reading next to health.json
+        run: |
+          if [ -f work/vertex-429.json ]; then
+            gcloud storage cp --cache-control=no-cache work/vertex-429.json "$DASHBOARD_BUCKET/vertex-429.json"
+          fi
 
       - name: Append this tick to health-history.jsonl
         continue-on-error: true

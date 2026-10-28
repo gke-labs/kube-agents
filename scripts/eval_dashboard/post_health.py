@@ -52,8 +52,8 @@ the same cases -- gate_issue.py files one with the workflow's GitHub token
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
-designed state on two consecutive hourly scans or on three pool projects at
-once, #1550) files one for the fleet owner the same way, unless an open
+designed state on two consecutive hourly scans, #1550) files one for the
+fleet owner the same way, unless an open
 issue already names the drifted roles. A new `pool_drift`
 condition (#1967) files one for the pool owner, with the repair per project,
 unless an open issue's title names every finding. A new `deadline_kill`

@@ -239,6 +239,12 @@ STORM_429_MIN_REQUESTS = 200
 STORM_429_HOUR = timedelta(hours=1)
 # How far before the first hit run's finish its model calls reach.
 STORM_429_LOOKBACK = timedelta(hours=3)
+# The adjudicator's clock is data.json's generated_at, stamped by the collect
+# step; the 429 reading is taken later in the tick (the periodics and store
+# reads, two auths), and after a failed collect data.json is the previous
+# tick's. The reader looks back this much further than the rule's window so
+# a reading taken late still covers a hit run at the window's trailing edge.
+STORM_429_READ_SLACK = timedelta(hours=1)
 VERTEX_429_MAX_AGE = timedelta(hours=3)
 VERTEX_429_KEY = "vertex_429"
 # A finished run carrying at least this many storm repetitions is still
@@ -386,13 +392,14 @@ NOON = 12
 # it is a few cases on some projects, with the fix in someone's hands.
 #
 # The rule: the same role drifted on the same project in
-# FIXTURE_DRIFT_CONSECUTIVE_SCANS consecutive scans, or on
-# FIXTURE_DRIFT_MIN_PROJECTS projects in one scan. One scan on one project is
-# not enough: in #1278's retest sweep the crashloop fixture lagged the node
-# repair by about 40 minutes on one project (it needs its first restart
-# before OOMKilled evidence exists), and one hourly scan can land inside that
-# window; the second scan is an hour later. Three projects at once is the
-# fleet-wide shape (#1278 was all 30) and waits for nothing. A scan older than
+# FIXTURE_DRIFT_CONSECUTIVE_SCANS consecutive scans, however many projects
+# one scan covers. One scan is not enough: in #1278's retest sweep the
+# crashloop fixture lagged the node repair by about 40 minutes on one project
+# (it needs its first restart before OOMKilled evidence exists), a reconcile
+# rolling a patch holds each batch half-applied for about an hour, and one
+# hourly scan can land inside either window; the second scan is an hour
+# later. (The pool scan keeps its FIXTURE_DRIFT_MIN_PROJECTS-in-one-scan
+# shortcut: a misgrant is read correctly the first time.) A scan older than
 # FIXTURE_STATE_MAX_AGE (three missed hourly scans) is the scan job being
 # broken, not the fleet, and is ignored with a note. A scan that could check
 # no project at all (the bot's grant missing) is `unknown`: said once by the
@@ -411,9 +418,10 @@ RECONCILE_OWNER_PREFIX = "fleet-reconcile"
 RECONCILE_HOLD_WINDOW = timedelta(minutes=65)
 POOL_HELD_KEY = "held"
 POOL_HELD_OWNER_KEY = "owner"
-# Rule 3e, pool drift, is the same rule over pool-state.json with the same
-# thresholds: the same finding failing on the same project in two
-# consecutive scans, or on three projects in one (#1927's shape was all 30).
+# Rule 3e, pool drift, is the same rule over pool-state.json with one
+# threshold more: the same finding failing on the same project in two
+# consecutive scans, or on three projects in one (#1927's shape was all 30;
+# nothing applies a pool grant in batches).
 # A run that leases a drifted project fails on the missing grant with a 403
 # in the agent's transcript, not on the change; the run-based rules see that
 # red, this one names the cause and carries the repair. A finding the verifier
@@ -2242,11 +2250,14 @@ def assess(
     pool_pressure: dict | None = None,
     previously_applying=(),
     vertex_429: dict | None = None,
+    carried_applying=(),
 ) -> dict:
     """Apply rules 1-4 to the runs visible at `now`, rule 3c to the fleet
     scan and rule 3e to the pool scan when one was given; no hysteresis yet.
     `pool_pressure` is the periodic's artifact, read for the projects the
-    reconcile holds (reconcile_held); `previously_applying` the ones it held
+    reconcile holds (reconcile_held), unioned with `carried_applying`, the
+    ones an earlier tick on this same scan saw held (a hold that ended
+    between two hourly reads is not forgotten); `previously_applying` the ones it held
     around the previous scan, from the previous health.json; `vertex_429` is
     vertex_429.py's reading, rule 2's evidence."""
     visible = [run for run in runs if run.finished <= now]
@@ -2257,7 +2268,7 @@ def assess(
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
     scanned_at = parse_iso((fixture_state_doc or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
-    r3c = fixture_drift(fixture_state_doc, now, reconcile_held(pool_pressure, scanned_at), previously_applying)
+    r3c = fixture_drift(fixture_state_doc, now, sorted(set(reconcile_held(pool_pressure, scanned_at)) | set(carried_applying)), previously_applying)
     r3d = deadline_kills(visible, now)
     r3e = pool_drift(pool_state_doc, now)
 
@@ -2717,15 +2728,23 @@ def adjudicate(
     """
     if runs is None:
         runs = load_runs(data)
-    # The reconcile's holds around the previous scan, from the last tick's
-    # block: its `applying` when that tick read the scan before this one,
-    # its `applying_previous` when it had already read this scan (ticks run
-    # four to a scan).
+    # The reconcile's holds, keyed by scan, from the last tick's block. A
+    # tick that already read this scan carries its `applying` forward (a
+    # hold seen by an earlier tick on this scan still covers it) and its
+    # `applying_previous` is the previous scan's; a tick that read the scan
+    # this document calls `previous` gives its `applying` as the previous
+    # scan's; a tick that read any other scan (an hour of lost ticks) says
+    # nothing about either.
     prev_fleet = (prev or {}).get("fixture_state") or {}
+    prev_scan = parse_iso(prev_fleet.get("scanned_at"))
     this_scan = parse_iso(fixture_state_doc.get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
-    same_scan = this_scan is not None and parse_iso(prev_fleet.get("scanned_at")) == this_scan
-    previously_applying = prev_fleet.get("applying_previous" if same_scan else "applying") or []
-    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying, vertex_429)
+    last_scan = parse_iso((fixture_state_doc.get(fixture_state.KEY_PREVIOUS) or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) and isinstance(fixture_state_doc.get(fixture_state.KEY_PREVIOUS), dict) else None
+    previously_applying, carried_applying = [], []
+    if prev_scan is not None and prev_scan == this_scan:
+        previously_applying, carried_applying = prev_fleet.get("applying_previous") or [], prev_fleet.get("applying") or []
+    elif prev_scan is not None and prev_scan == last_scan:
+        previously_applying = prev_fleet.get("applying") or []
+    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying, vertex_429, carried_applying)
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:

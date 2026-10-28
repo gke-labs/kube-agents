@@ -56,14 +56,14 @@ class BucketsTest(unittest.TestCase):
         doc = vertex_429.read_pool(["p-a", "p-b", "p-c"], NOW, "tok", opener)
         self.assertEqual((doc["read"], doc["errors"]), (["p-a", "p-b"], {"p-c": "HTTP 403"}))
         self.assertEqual(doc["buckets"], [{"end": "2026-10-22T13:00:00Z", "requests": 200, "429": 10}])
-        self.assertEqual((doc["window_start"], doc["window_end"], doc["bucket_seconds"], doc["projects"]), ("2026-10-22T09:00:00+00:00", "2026-10-22T14:00:00+00:00", 600, 3))
+        self.assertEqual((doc["window_start"], doc["window_end"], doc["bucket_seconds"], doc["projects"]), ("2026-10-22T08:00:00+00:00", "2026-10-22T14:00:00+00:00", 600, 3))
         first = sorted(opener.urls)[0]
-        self.assertIn("interval.startTime=2026-10-22T09%3A00%3A00%2B00%3A00", first)
+        self.assertIn("interval.startTime=2026-10-22T08%3A00%3A00%2B00%3A00", first)
         self.assertIn("alignmentPeriod=600s", first)
         self.assertIn("groupByFields=metric.labels.response_code", first)
 
     def test_the_reading_reaches_back_as_far_as_the_storm_rule_looks(self):
-        self.assertGreaterEqual(vertex_429.LOOKBACK, health.STORM_WINDOW + health.STORM_429_LOOKBACK)
+        self.assertGreaterEqual(vertex_429.LOOKBACK, health.STORM_WINDOW + health.STORM_429_LOOKBACK + health.STORM_429_READ_SLACK)
 
     def test_no_token_reads_nothing_and_says_why(self):
         doc = vertex_429.read_pool(["p-a"], NOW, None, FakeOpener({}))
@@ -90,6 +90,17 @@ class MainTest(unittest.TestCase):
             out = pathlib.Path(tmp, "v.json")
             code = vertex_429.main(["--out", str(out), "--ci-deploy", str(deploy)], runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "tok\n", ""), opener=FakeOpener({}))
         self.assertEqual((code, out.exists()), (vertex_429.EXIT_USAGE, False))
+
+    def test_a_read_that_reaches_no_project_keeps_the_previous_reading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            deploy = pathlib.Path(tmp, "ci-deploy.sh")
+            deploy.write_text('gitops_repo_for_project() {\n  case "$1" in\n    kube-agents-evals) echo x ;;\n  esac\n}\n')
+            out = pathlib.Path(tmp, "v.json")
+            out.write_text('{"previous": true}')
+            runner = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "tok\n", "")
+            code = vertex_429.main(["--out", str(out), "--ci-deploy", str(deploy), "--now", NOW.isoformat()], runner=runner, opener=FakeOpener({}))
+            kept = out.read_text()
+        self.assertEqual((code, kept), (0, '{"previous": true}'))
 
     def test_a_failed_token_command_is_a_warning_not_a_crash(self):
         with tempfile.TemporaryDirectory() as tmp:

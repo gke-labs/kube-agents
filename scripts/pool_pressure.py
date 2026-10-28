@@ -1524,6 +1524,8 @@ def fetch_held(via: str, context: str, from_dir: Optional[str] = None) -> Source
             document = json.loads(payload.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             return Source(error=f"could not parse {payload}: {exc}")
+        if not isinstance(document, dict):
+            return Source(error=f"{payload} is not a JSON object")
         return Source(value=_held_from(document))
     if via == BOSKOS_VIA_NONE:
         return Source(error="Boskos was not queried (--boskos-via none)")
@@ -1531,17 +1533,21 @@ def fetch_held(via: str, context: str, from_dir: Optional[str] = None) -> Source
         document, err = _read_in_cluster(BOSKOS_RESOURCES_API_PATH)
         if err:
             return Source(error=f"could not list Boskos resources in-cluster: {err}")
+        if not isinstance(document, dict):
+            return Source(error="could not list Boskos resources in-cluster: the API server's answer is not a JSON object")
         return Source(value=_held_from(document))
     if shutil.which(KUBECTL_BINARY) is None:
         return Source(error="kubectl is not on PATH, so Boskos resources cannot be listed")
-    code, out, err = run_cmd([KUBECTL_BINARY, "--context", context, "-n", BOSKOS_NAMESPACE, "get", BOSKOS_RESOURCES_KIND, "-o", "json"])
+    code, out, err = run_cmd([KUBECTL_BINARY, "--context", context, "-n", BOSKOS_NAMESPACE, "get", BOSKOS_RESOURCES_KIND, "-o", "json"], timeout=BOSKOS_TIMEOUT_SECONDS)
     if code != 0:
         return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: {(err or '').strip() or f'exit {code}'}")
     try:
         document = json.loads(out)
     except json.JSONDecodeError as exc:
         return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not JSON ({exc})")
-    return Source(value=_held_from(document if isinstance(document, dict) else {}))
+    if not isinstance(document, dict):
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not a JSON object")
+    return Source(value=_held_from(document))
 
 
 def _pool_state_from(document: dict) -> PoolState:

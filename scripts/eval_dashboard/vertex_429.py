@@ -45,12 +45,14 @@ MONITORING_ROOT = "https://monitoring.googleapis.com/v3"
 METRIC_FILTER = 'metric.type="serviceruntime.googleapis.com/api/request_count" AND resource.type="consumed_api" AND resource.labels.service="aiplatform.googleapis.com"'
 RESPONSE_CODE_LABEL = "response_code"
 RATE_LIMITED_CODE = "429"
-# Ten-minute buckets over the last five hours: the storm rule's two-hour
-# window (health.STORM_WINDOW) plus the three hours of model calls a hit
-# run makes before it finishes (health.STORM_429_LOOKBACK); the rule rejects
-# a reading that falls short of that, and a test pins the sum.
+# Ten-minute buckets over the last six hours: the storm rule's two-hour
+# window (health.STORM_WINDOW), the three hours of model calls a hit run
+# makes before it finishes (health.STORM_429_LOOKBACK), and an hour for the
+# tick's own clock gap (health.STORM_429_READ_SLACK: the rule's `now` is the
+# collect step's, this read comes later); the rule rejects a reading that
+# falls short of that, and a test pins the sum.
 BUCKET_SECONDS = 600
-LOOKBACK = timedelta(hours=5)
+LOOKBACK = timedelta(hours=6)
 # One Monitoring call per project, READ_WORKERS at a time; a whole-pool
 # read must fit the workflow step (40 projects, 20 s each, 8 abreast: 100 s
 # at worst).
@@ -200,9 +202,16 @@ def main(argv=None, runner=subprocess.run, opener=urllib.request.urlopen) -> int
         return EXIT_USAGE
     now = args.now or datetime.now(timezone.utc)
     document = read_pool(projects, now, access_token(args.token_command, runner), opener)
+    log(f"vertex 429: read {len(document['read'])} of {document['projects']} projects, {len(document['buckets'])} buckets; {len(document['errors'])} error(s)")
+    if not document["read"] and args.out.is_file():
+        # A read that reached no project (no token, Monitoring down) does not
+        # replace the previous tick's reading, which the workflow fetched to
+        # --out: the rule ages and bounds that one itself, and a storm it
+        # denied stays denied rather than re-declared on a blind tick.
+        log(f"vertex 429: kept the previous reading at {args.out}")
+        return 0
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(document, indent=1) + "\n", encoding="utf-8")
-    log(f"vertex 429: read {len(document['read'])} of {document['projects']} projects, {len(document['buckets'])} buckets; {len(document['errors'])} error(s)")
     return 0
 
 

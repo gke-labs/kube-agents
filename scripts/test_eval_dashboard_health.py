@@ -29,7 +29,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import health, post_health
+import pool_pressure  # noqa: E402  -- the holder map's keys, pinned against health's
+from eval_dashboard import health, post_health, vertex_429
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
@@ -471,7 +472,17 @@ class Storm(unittest.TestCase):
         # health.json carries the coverage too, so a refused grant shows on a quiet day.
         published = health.adjudicate(self.stormy([1, 2], 6), T0, None, health.Roster.fixed(ADMITTED), vertex_429=dict(self.reading(0.5), read=[], errors={"p": "HTTP 403", "q": "HTTP 403"}))["vertex_429"]
         self.assertEqual((published["read"], published["read_at"], published["projects_read"], published["projects_failed"], published["reason"]), (False, health.iso(T0), 0, 2, "the Vertex 429 reading covered no project (HTTP 403)"))
-        self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", result["evidence"][0])
+        self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", self.judge(doc, None)["evidence"][0])
+
+    def test_a_reading_taken_after_the_collect_still_covers_the_window(self):
+        # The rule's clock is the collect step's; the read comes 20 minutes
+        # later, and the first hit run finished 1 h 50 min before the tick.
+        late = self.stormy([1, 2, 3], 6, spread_minutes=55)
+        read_at = T0 + timedelta(minutes=20)
+        buckets = [{"end": health.iso(read_at - timedelta(minutes=10 * i)), "requests": 100, "429": 2} for i in range(int(vertex_429.LOOKBACK / timedelta(minutes=10)))]
+        reading = {"schema_version": 1, "read_at": health.iso(read_at), "window_start": health.iso(read_at - vertex_429.LOOKBACK), "window_end": health.iso(read_at), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
+        result = self.judge(late, reading)
+        self.assertEqual((result["state"], result["vertex_429"]["read"], round(result["vertex_429"]["peak"], 2)), ("GREEN", True, 0.02))
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
         self.assertEqual(assess(self.stormy([1, 2, 3], 6, letter="i"), T0)["state"], "DEGRADED")
@@ -3457,8 +3468,15 @@ class OpenConditions(unittest.TestCase):
         # The next tick reads the same scan: the previous scan's holds come from the last tick's applying_previous, not its applying.
         same_scan = {"fixture_state": {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)}, "state": "GREEN"}
         self.assertEqual(health.adjudicate(green, T0, same_scan, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["state"], "GREEN")
-        turned = {"fixture_state": {"scanned_at": health.iso(at), "applying": sorted(three), "applying_previous": []}, "state": "GREEN"}
-        self.assertEqual(health.adjudicate(green, T0, turned, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
+        # A tick that read neither this scan nor the one before (an hour of lost ticks) says nothing about the previous scan's holds.
+        lost = {"fixture_state": {"scanned_at": health.iso(at - timedelta(hours=2)), "applying": sorted(three), "applying_previous": sorted(three)}, "state": "GREEN"}
+        self.assertEqual(health.adjudicate(green, T0, lost, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
+        # A hold an earlier tick on this scan saw still covers the project once the next hourly read shows it released.
+        carried = {"fixture_state": {"scanned_at": health.iso(at), "applying": [project(1)], "applying_previous": []}, "state": "GREEN"}
+        kept = health.adjudicate(green, T0, carried, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
+        self.assertEqual((kept["incident"]["projects"], kept["fixture_state"]["applying"]), ([project(2), project(3)], [project(1)]))
+        # The two halves of the contract name the holder the same way.
+        self.assertEqual((pool_pressure.HELD_KEY_OWNER, health.POOL_HELD_KEY), (health.POOL_HELD_OWNER_KEY, "held"))
 
     def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
         green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
