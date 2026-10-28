@@ -132,6 +132,8 @@ JOB_RUNS_SCRIPT = (
 )
 JOB_TIMEOUT_SECONDS = 120
 JOB_COMPLETED = "completed"
+JOB_RUNNING = "running"
+JOB_UNCLAIMED = "unclaimed"
 # What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
 RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
 RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
@@ -397,23 +399,28 @@ def trigger_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...])
     return []
 
 
-def unfinished_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> list[str]:
-    """The jobs whose run since ``since`` (ISO, UTC) had not finished: still running, failed or never claimed."""
+def job_statuses(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> dict[str, str]:
+    """Each job's latest run status since ``since`` (ISO, UTC): completed, running, failed, unclaimed."""
     pod = _gateway_pod(context, namespace)
     if not pod:
-        return [f"no gateway pod to read the runs of {', '.join(jobs)} in"]
-    try:
-        out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env",
-                           f"HERMES_HOME={home}", JOB_PYTHON, "-c", JOB_RUNS_SCRIPT, since.replace("Z", ""), *jobs,
-                           timeout=JOB_TIMEOUT_SECONDS)
-    except kube.CommandError as exc:
-        return [f"could not read the job runs: {exc}"]
-    notes = []
+        raise kube.CommandError(f"no gateway pod to read the runs of {', '.join(jobs)} in")
+    out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env",
+                       f"HERMES_HOME={home}", JOB_PYTHON, "-c", JOB_RUNS_SCRIPT, since.replace("Z", ""), *jobs,
+                       timeout=JOB_TIMEOUT_SECONDS)
+    statuses = {}
     for line in out.splitlines():
         job, status, *_ = line.split() + [""]
-        if status != JOB_COMPLETED:
-            notes.append(f"{job} {status or 'unclaimed'} at the end of the window")
-    return notes
+        statuses[job] = status or JOB_UNCLAIMED
+    return statuses
+
+
+def unfinished_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> list[str]:
+    """The jobs whose run since ``since`` had not finished: still running, failed or never claimed."""
+    try:
+        statuses = job_statuses(context, namespace, home, jobs, since)
+    except kube.CommandError as exc:
+        return [f"could not read the job runs: {exc}"]
+    return [f"{job} {status} at the end of the window" for job, status in statuses.items() if status != JOB_COMPLETED]
 
 
 def wait_gateway_ready(context: str, namespace: str, timeout: float = RESET_TIMEOUT_SECONDS) -> None:

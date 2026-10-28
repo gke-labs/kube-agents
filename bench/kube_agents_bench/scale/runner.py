@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kube_agents_bench.scale import collect, fixtures, kube, operations, records
-from kube_agents_bench.scale.config import BASE_FACTOR, COMBINED_FACTOR, Plan, RunSpec, load_plan
+from kube_agents_bench.scale.config import BASE_FACTOR, COMBINED_FACTOR, Operation, Plan, RunSpec, load_plan
 
 LOG = logging.getLogger("harness-scale")
 
@@ -46,6 +46,9 @@ REGISTRATION_POLL_SECONDS = 60
 # Time for a restarted watcher to list and sync every cluster before it is asked what it watches.
 WATCHER_START_SECONDS = 180
 WATCHER_POLL_SECONDS = 30
+# How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
+TRIGGER_DRAIN_SECONDS = 1800
+DRAIN_POLL_SECONDS = 60
 RESPONSE_FITS = ["response_seconds"]
 LEVEL_LABEL = "harness-scale/level"
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -135,6 +138,8 @@ class Runner:
         self.relay_port = 0
         # The fleet values of the level applied last, so a level that keeps them skips the settle.
         self.applied_fleet: dict[str, float] | None = None
+        # Notes for the next record from work the previous run left running.
+        self.carry_errors: list[str] = []
 
     # --- the fleet ----------------------------------------------------------------------------
 
@@ -434,7 +439,8 @@ class Runner:
         if mode != self.plan.target["mode"]:
             self.watch_errors.append(f"install runs mode {mode!r}, plan says {self.plan.target['mode']!r}")
         commit = commit_of(image)
-        errors = list(self.watch_errors)
+        errors = list(self.watch_errors) + self.carry_errors
+        self.carry_errors = []
         if not commit:
             errors.append(f"image {image!r} is not pinned by commit; the record is keyed by its tag")
             commit = image.rsplit(":", 1)[-1] or "unknown"
@@ -567,6 +573,8 @@ class Runner:
                         continue
                     # Merged at once without its peaks, so a crash loses nothing; merged again with them.
                     records.merge(self.data_file, [record])
+                    if spec.operation.kind == "trigger_soak":
+                        self.drain_jobs(spec.operation, record.started)
                     awaiting.append((time.time(), record))
                     awaiting = self.flush_peaks(awaiting, wait=False)
                     self.backfill_peaks(skip={pending.key for _, pending in awaiting})
@@ -575,6 +583,27 @@ class Runner:
             relay.stop()
             self.flush_peaks(awaiting, wait=True)
         return not stopped
+
+    def drain_jobs(self, op: Operation, since: str) -> None:
+        """Wait for the jobs a trigger_soak started, so they do not load the next run.
+
+        A job still running after ``trigger_drain_seconds`` is noted on the next record.
+        """
+        deadline = time.monotonic() + float(self.settings.get("trigger_drain_seconds", TRIGGER_DRAIN_SECONDS))
+        running: list[str] = []
+        while True:
+            try:
+                statuses = operations.job_statuses(self.install.context, self.install.namespace, op.jobs_home,
+                                                   op.jobs, since)
+            except kube.CommandError as exc:
+                self.carry_errors.append(f"could not tell whether the previous run's jobs finished: {exc}")
+                return
+            running = [job for job, status in statuses.items() if status == operations.JOB_RUNNING]
+            if not running or time.monotonic() >= deadline:
+                break
+            LOG.info("waiting for %s to finish before the next run", ", ".join(running))
+            time.sleep(DRAIN_POLL_SECONDS)
+        self.carry_errors += [f"{job}, started by the previous run, was still running" for job in running]
 
     def flush_peaks(self, awaiting: list[tuple[float, records.Record]], wait: bool) -> list[tuple[float, records.Record]]:
         """Add Cloud Monitoring peaks to the records whose window is old enough, and merge them again.

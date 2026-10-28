@@ -1691,10 +1691,12 @@ def _minutes(record: Record) -> float:
 
 @dataclass(frozen=True)
 class CpuRun:
-    """The CPU of one container in an operation's runs at one cluster count and one CPU limit:
+    """The CPU of one container in an operation's runs at one point and one CPU limit:
     the highest peak, whether the limit capped any run, and the mean average."""
 
     operation: str
+    factor: str
+    level: float
     clusters: float
     limit: float | None
     runs: int
@@ -1706,8 +1708,8 @@ class CpuRun:
 
 
 def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
-    """``container``'s CPU, grouped by operation, cluster count and CPU limit."""
-    groups: dict[tuple[str, float, float], list[Record]] = {}
+    """``container``'s CPU, grouped by operation, point and CPU limit."""
+    groups: dict[tuple[str, float, str, float, float], list[Record]] = {}
     for record in records:
         clusters = record.totals.get(CLUSTERS)
         if record.value(CPU_PEAK, container) is None and record.value(CPU_SECONDS, container) is None:
@@ -1715,9 +1717,10 @@ def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
         if not clusters:
             continue
         limit = record.limits.get(container, {}).get(LIMIT_CPU) or 0.0
-        groups.setdefault((record.operation, clusters, limit), []).append(record)
+        # The cluster count sorts the rows; the factor and level keep two points of one size apart.
+        groups.setdefault((record.operation, clusters, record.factor, record.level, limit), []).append(record)
     rows = []
-    for (operation, clusters, limit), runs in sorted(groups.items()):
+    for (operation, clusters, factor, level, limit), runs in sorted(groups.items()):
         peaks = [value for run in runs if (value := run.value(CPU_PEAK, container)) is not None]
         averages = [
             seconds / (_minutes(run) * SECONDS_PER_MINUTE)
@@ -1727,6 +1730,8 @@ def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
         rows.append(
             CpuRun(
                 operation,
+                factor,
+                level,
                 clusters,
                 limit or None,
                 len(runs),

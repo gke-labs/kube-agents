@@ -887,13 +887,22 @@ def test_remonitor_replaces_only_the_monitoring_metrics(monkeypatch, tmp_path):
 def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
     install = collect.Install("p", "ctx", "ns", "host", "zone")
 
+    # Two replicas, one point each, ending 10 minutes into a window that starts at 00:00.
     def series(query, aligner, start, end):
         points = {"ALIGN_MAX": (100.0, 300.0), "ALIGN_RATE": (0.2, 0.4), "ALIGN_DELTA": (30.0, 60.0)}[aligner]
         return [{"resource": {"labels": {"container_name": "litellm-container"}},
-                 "points": [{"value": {"doubleValue": value}}]} for value in points]
+                 "points": [{"value": {"doubleValue": value},
+                             "interval": {"endTime": "2026-10-27T00:10:00Z"}}]} for value in points]
     monkeypatch.setattr(install, "_time_series", series)
-    peaks = install.container_peaks(0.0, 1800.0)["litellm-container"]
+    window_start = 1793059200.0  # 2026-10-27T00:00:00Z
+    peaks = install.container_peaks(window_start, window_start + 1800.0)["litellm-container"]
     assert peaks == {"memory_peak_bytes": 300.0, "cpu_peak_cores": 0.4, "cpu_seconds": 90.0}
+
+
+def test_the_minute_before_a_window_is_not_its_work():
+    # An aligned point ending 15 s after the window starts covers 45 s from before it.
+    point = {"value": {"doubleValue": 60.0}, "interval": {"endTime": "2026-10-27T00:00:15.000000Z"}}
+    assert collect._share_inside(point, 1793059200.0) == 0.25
 
 
 def test_a_plan_can_run_its_base_last():
@@ -901,3 +910,18 @@ def test_a_plan_can_run_its_base_last():
     levels = list(dict.fromkeys((s.factor, s.level) for s in plan.matrix()))
     assert levels == [("clusters", 16), ("clusters", 8), ("clusters", 6), ("clusters", 4), ("base", 0)]
     assert load_plan(PHASE2, environ=ENV).matrix()[0].factor == "base"
+
+
+def test_the_runner_waits_for_triggered_jobs_and_notes_one_still_running(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), tmp_path / "data.json")
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns"})()
+    op = next(o for o in run.plan.operations if o.kind == "trigger_soak")
+    answers = iter([{"a-audit": "running", "b-audit": "completed"}, {"a-audit": "completed", "b-audit": "completed"}])
+    monkeypatch.setattr(runner.operations, "job_statuses", lambda *a: next(answers))
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    run.drain_jobs(op, "2026-10-27T00:00:00Z")
+    assert run.carry_errors == []
+    run.settings["trigger_drain_seconds"] = 0
+    monkeypatch.setattr(runner.operations, "job_statuses", lambda *a: {"a-audit": "running"})
+    run.drain_jobs(op, "2026-10-27T00:00:00Z")
+    assert run.carry_errors == ["a-audit, started by the previous run, was still running"]

@@ -12,6 +12,7 @@ pod's totals nor hides what the new one did.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import re
@@ -39,6 +40,8 @@ MIN_WINDOW_SECONDS = 1
 QUOTA_PROJECT_HEADER = "x-goog-user-project"
 HTTP_TIMEOUT_SECONDS = 60
 RFC3339_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A point's time to the second, before any fraction or zone suffix.
+POINT_TIME_CHARS = 19
 LOCALHOST = "127.0.0.1"
 METRICS_PATH = "/metrics"
 PYTHON_FETCH = "import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1]).read().decode())"
@@ -399,7 +402,13 @@ class Install:
         for name, query, aligner, reduce in queries:
             for series in self._time_series(query, aligner, start, end):
                 container = series["resource"]["labels"].get("container_name", "")
-                values = [_point_value(point) for point in series.get("points", [])]
+                points = series.get("points", [])
+                if reduce is max:
+                    values = [_point_value(point) for point in points]
+                else:
+                    # An aligned point holds the minute before its end, so the first one reaches back
+                    # before the window: count only the share of it that falls inside.
+                    values = [_point_value(point) * _share_inside(point, start) for point in points]
                 if container and values:
                     current = peaks.setdefault(container, {}).get(name, 0.0)
                     # One series per replica: the peak is the highest, the work the sum.
@@ -451,6 +460,12 @@ def _metrics_port(pod: dict[str, Any], container_name: str, env_name: str | None
         ports = [p["containerPort"] for p in container.get("ports", []) if "containerPort" in p]
         return ports[0] if ports else None
     return None
+
+
+def _share_inside(point: dict[str, Any], start: float) -> float:
+    """The share of an aligned point's interval that falls after ``start``."""
+    ended = calendar.timegm(time.strptime(point["interval"]["endTime"][:POINT_TIME_CHARS] + "Z", RFC3339_FORMAT))
+    return min(1.0, max(0.0, (ended - start) / ALIGNMENT_SECONDS))
 
 
 def _point_value(point: dict[str, Any]) -> float:

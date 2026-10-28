@@ -48,7 +48,7 @@ def _count(value: float | None) -> str:
     return hl._optional_number(value)
 
 
-def _point(item: hl.ProxyDemand) -> str:
+def _point(item: hl.ProxyDemand | hl.CpuRun) -> str:
     return hl.BASE_LEVEL if item.factor == hl.BASE_FACTOR else f"{hl.factor_label(item.factor)} {_count(item.level)}"
 
 
@@ -129,11 +129,11 @@ def proxy_section(records: Sequence[hl.Record]) -> str:
             "The broker's CPU per run. A peak at its limit is the limit, not the need, and stays out of the "
             "CPU line; the average over the window is the work, which keeps growing.\n\n"
             + _table(
-                ("Operation", "Clusters", "CPU limit", "Runs", "Highest peak (cores)", "Capped",
+                ("Operation", "Point", "Clusters", "CPU limit", "Runs", "Highest peak (cores)", "Capped",
                  "Average over the window (cores)"),
                 (
-                    (run.operation, _count(run.clusters), _number(run.limit), str(run.runs), _number(run.peak),
-                     "yes" if run.capped else "no", _number(run.average))
+                    (run.operation, _point(run), _count(run.clusters), _number(run.limit), str(run.runs),
+                     _number(run.peak), "yes" if run.capped else "no", _number(run.average))
                     for run in cpu
                 ),
             )
