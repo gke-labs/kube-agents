@@ -464,6 +464,39 @@ func TestTheConsoleCredentialCannotReachTheVerifyPlane(t *testing.T) {
 	}
 }
 
+// The principals the callout mints, a session pod and an AgentProfile pod,
+// cannot join the verifier's queue group either. The operator's render test
+// checks only the identities it renders; these grants are built here
+// (sessionGrants, profileGrants), so a widening in either would otherwise
+// ship with no test asking this question.
+func TestCalloutMintedPrincipalsCannotJoinTheVerifyQueue(t *testing.T) {
+	for _, c := range []struct {
+		name, pod, token string
+		idmap            string
+		tokens           map[string]Attested
+	}{
+		{"session pod", podA, tokenPodA, sessionMap, sessionTokens()},
+		{"profile pod", auditorPod1, tokenAuditorPod1, profileMap, profileTokens()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := startHarness(t, c.idmap, c.tokens)
+			nc, violations := h.connectAs(t, c.pod, c.token)
+			// The wildcard and literal verify subjects: queue members share a
+			// group by name across subjects, so an exact grant on one
+			// delegate's subject joins the verifier's group for it.
+			for _, subject := range []string{
+				capability.VerifySubscribe,
+				strings.Replace(capability.VerifySubscribe, "*", bridgeAddressee, 1),
+				strings.Replace(capability.VerifySubscribe, "*", c.pod, 1),
+			} {
+				if !queueSubscribeRefused(t, nc, violations, subject, capability.VerifyQueue) {
+					t.Errorf("%s joined queue group %q on %s", c.name, capability.VerifyQueue, subject)
+				}
+			}
+		})
+	}
+}
+
 // The bridge -- the executor a stock install actually runs -- can verify, and
 // cannot ask in anybody else's name.
 //

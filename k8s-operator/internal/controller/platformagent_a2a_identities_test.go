@@ -128,6 +128,10 @@ func TestPrincipalsAreDistinct(t *testing.T) {
 func TestOnlyTheVerifierReceivesVerifyRequests(t *testing.T) {
 	const verify, probe = "a2a.cap.verify.*", "a2a.cap.verify.probe"
 	reaches := func(grant string) bool { return subjectMatches(grant, probe) || subjectMatches(verify, grant) }
+	// The operator's principal renders only with its namespace and
+	// ServiceAccount set, which TestMain unsets; set them so it is checked too.
+	t.Setenv(operatorNamespaceEnvVar, testOperatorNamespace)
+	t.Setenv(operatorServiceAccountEnvVar, testOperatorSA)
 	for _, id := range a2aIdentities(identityTestAgent()) {
 		if id.user == a2aVerifierUser {
 			continue
@@ -136,8 +140,12 @@ func TestOnlyTheVerifierReceivesVerifyRequests(t *testing.T) {
 			if !reaches(grant) {
 				continue
 			}
+			// A deny counts only if it covers the verify pattern itself or the
+			// whole grant. A literal deny such as a2a.cap.verify.probe filters
+			// delivery of that one subject, and the principal could still
+			// subscribe a2a.cap.verify.* and join the queue.
 			denied := slices.ContainsFunc(id.denySubscribe, func(d string) bool {
-				return subjectMatches(d, probe) || subjectMatches(d, grant)
+				return subjectMatches(d, verify) || subjectMatches(d, grant)
 			})
 			if !denied {
 				t.Errorf("%s can subscribe %s, which reaches %s, so it can join queue group %q; deny a2a.cap.> on its subscribe side",
