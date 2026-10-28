@@ -2385,6 +2385,14 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self._board(cards=[("t-pr", session, self.FIX_URL)])
             self.assertEqual(self._inject("critfix-api-6cfdb6b98b-bbbbb", reason="CrashLoopBackOff")["status"], "injected")
 
+    def test_another_reason_is_a_new_incident_while_the_fix_is_open(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _anchor, session = self._first_incident("reasonfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            self.assertEqual(self._inject("reasonfix-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "injected")
+        state.assert_not_called()
+
     def test_with_folding_off_nothing_is_held_or_looked_up(self):
         with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
             self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")
