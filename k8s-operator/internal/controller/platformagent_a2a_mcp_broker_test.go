@@ -445,8 +445,9 @@ func TestAnUnownedMCPServiceAccountRemovesTheServerAndReportsIt(t *testing.T) {
 
 // TestAnUnownedMCPTokenSecretRemovesTheServerAndReportsIt (#3871): the token
 // Secret is the MCP server's other reserved name. With the door on and an
-// unowned Secret under it, the pass completes, the server is not rendered,
-// and the CR carries the condition with the token's reason.
+// unowned Secret under it, the pass completes, a server rendered earlier is
+// removed rather than left mounting a token that is not ours, and the CR
+// carries the condition with the token's reason.
 func TestAnUnownedMCPTokenSecretRemovesTheServerAndReportsIt(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	t.Setenv(a2aAgentDoorEnvVar, "")
@@ -454,12 +455,25 @@ func TestAnUnownedMCPTokenSecretRemovesTheServerAndReportsIt(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatalf("precondition: the stack with the MCP door on renders: %v", err)
+	}
+	mcpKey := types.NamespacedName{Name: a2aMCPName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, mcpKey, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: the MCP server was not rendered: %v", err)
+	}
+	// The render owns its token; a foreign one under the name can only
+	// exist in its place, so swap it.
 	tokenKey := types.NamespacedName{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}
+	if err := cl.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenKey.Name, Namespace: tokenKey.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := cl.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenKey.Name, Namespace: tokenKey.Namespace},
 		Data: map[string][]byte{a2aMCPAccessKey: []byte("theirs")}}); err != nil {
 		t.Fatal(err)
 	}
-	theCalloutIsServing(t, ctx, cl, r, agent)
+
 	state, err := r.reconcileA2A(ctx, agent)
 	if err != nil {
 		t.Fatalf("an unowned MCP token Secret stopped the next reconcile: %v", err)
@@ -467,8 +481,8 @@ func TestAnUnownedMCPTokenSecretRemovesTheServerAndReportsIt(t *testing.T) {
 	if state.mcpNotRendered != a2aMCPTokenUnownedReason {
 		t.Fatalf("mcpNotRendered = %q, want %q", state.mcpNotRendered, a2aMCPTokenUnownedReason)
 	}
-	if err := cl.Get(ctx, types.NamespacedName{Name: a2aMCPName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the MCP server was rendered over a token that is not ours: %v", err)
+	if err := cl.Get(ctx, mcpKey, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the MCP server stayed rendered over a token that is not ours: %v", err)
 	}
 	got := &corev1.Secret{}
 	if err := cl.Get(ctx, tokenKey, got); err != nil || string(got.Data[a2aMCPAccessKey]) != "theirs" || len(got.OwnerReferences) != 0 {
