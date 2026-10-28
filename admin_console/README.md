@@ -206,30 +206,26 @@ connection. Until that file exists, the page shows
 sample. The plan, metrics and thresholds are those of the
 [harness bottlenecks design](../docs/designs/agent-harness-bottlenecks.md).
 
-For the selected commit and mode, the page plots each metric against one
-factor, one operation at a time. A factor sits at its measured value from the
-run's totals, per cluster for nodes and objects; churn sits at the rate the
-fixture achieved; any other factor sits at the run's planned value. Each chart has a straight-line fit and
-its dashed prediction. A line through two distinct planned points is a two-point
-estimate; past the largest measured value it is predicted, not measured. A run
-with a provider 429, a failed prompt or an unfinished one stays out of the response-time fit, a run
-that shared the broker with other work stays out of the resource fits and tables (both from the record's
-`excluded_from`), and a CPU peak at 90% or more of the
-container's CPU limit stays out of the CPU fit: it shows the limit, not what the container needed. A factor that is a load the
-runner applies, such as the credential proxy load's workers, is charted against
-its runs but is not a fleet input. Runs at a combined point, which move several
-factors at once, are listed against the page's prediction for the same fleet; a
-ratio above 1 is an interaction that the sum of single-factor lines misses.
+The page starts from a fleet: one of four example fleets, S (4 clusters), M (45), L (250)
+and XL (2,500, the benchmark size), built from customer fleets with rounded figures and no
+names, or inputs of your own. For that fleet it answers the design's two questions. Question 1
+checks each container's predicted peak against its limit (the defaults, or values you enter)
+and the limits no resource moves, and names the first limit reached. Question 2 gives a limit
+per container with its `PlatformAgent` field, the node pool, and the data volume. When one
+install cannot hold the fleet, it gives how many installs it needs: one install holds clusters
+up to the first limit that no setting raises, such as the sandbox shell's fixed CPU. A chart
+shows each key limit as a share of its default as the fleet grows, with the example fleets
+marked.
 
-For the fleet entered on the page, the page answers the design's two questions:
-are the container limits enough, and which limits, machine type and node count
-does the fleet need. The machine type is the smallest that holds the largest
-pod's recommended requests; the node count holds every long-running pod,
-replicas included (a Job's or an init container's peak holds no node).
-The raw records, with each run's errors, are in a collapsed section.
-
-The page's limits default to the ones most runs had, so a short experiment under
-other limits does not change them.
+The collapsed **Measured runs** section plots each metric against one factor, one operation
+at a time. A factor sits at its measured value from the run's totals, per cluster for nodes
+and objects; churn sits at the rate the fixture achieved; any other factor sits at the run's
+planned value. Each chart has a straight-line fit and its dashed prediction; past the largest
+measured value it is predicted, not measured. A run with a provider 429, a failed prompt or an
+unfinished one stays out of the response-time fit, a run that shared the broker with other
+work stays out of the resource fits (both from the record's `excluded_from`), and a CPU peak at
+90% or more of the container's CPU limit stays out of the CPU fit: it shows the limit, not
+what the container needed. The page's limits default to the ones most runs had.
 
 `python3 -m admin_console.estimate` prints the same model as Markdown:
 
