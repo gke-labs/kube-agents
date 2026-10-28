@@ -3314,7 +3314,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "3"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "4"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
