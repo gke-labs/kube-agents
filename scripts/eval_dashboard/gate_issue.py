@@ -19,9 +19,8 @@ told. So:
     -> create one addressed to the cluster owner, and say "Tracking #NNN"
 
 The third shape (#1550): the hourly seeded-fleet scan finds a fixture role out
-of its designed state on the same project two scans running, or on three
-projects at once, and every case depending on it reds on the runs that
-lease those projects. So:
+of its designed state on the same project two scans running, and every case
+depending on it reds on the runs that lease those projects. So:
 
     the condition becomes `fixture_drift`
     and no OPEN issue already names every drifted role

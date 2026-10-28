@@ -239,11 +239,12 @@ STORM_429_MIN_REQUESTS = 200
 STORM_429_HOUR = timedelta(hours=1)
 # How far before the first hit run's finish its model calls reach.
 STORM_429_LOOKBACK = timedelta(hours=3)
-# The adjudicator's clock is data.json's generated_at, stamped by the collect
-# step; the 429 reading is taken later in the tick (the periodics and store
-# reads, two auths), and after a failed collect data.json is the previous
-# tick's. The reader looks back this much further than the rule's window so
-# a reading taken late still covers a hit run at the window's trailing edge.
+# The adjudicator's clock is data.json's generated_at, and the workflow reads
+# the 429s on that same clock (vertex_429.py --now), so a fresh reading ends
+# where the runs' window does however late the step runs or however long the
+# collect has been failing. A reading kept from an earlier blind tick trails
+# it; the rule allows a kept reading this much short at either edge (a run's
+# calls end before its finish), and the reader looks back this much further.
 STORM_429_READ_SLACK = timedelta(hours=1)
 VERTEX_429_MAX_AGE = timedelta(hours=3)
 VERTEX_429_KEY = "vertex_429"
@@ -418,6 +419,10 @@ RECONCILE_OWNER_PREFIX = "fleet-reconcile"
 RECONCILE_HOLD_WINDOW = timedelta(minutes=65)
 POOL_HELD_KEY = "held"
 POOL_HELD_OWNER_KEY = "owner"
+# health.json's memory of those holds, keyed by the scan they belong to, kept
+# across a tick that read no scan (a failed fetch publishes no fixture_state
+# block, and must not forget what the ticks before it saw).
+FIXTURE_HOLDS_KEY = "fixture_holds"
 # Rule 3e, pool drift, is the same rule over pool-state.json with one
 # threshold more: the same finding failing on the same project in two
 # consecutive scans, or on three projects in one (#1927's shape was all 30;
@@ -1106,7 +1111,7 @@ def vertex_429_rate(vertex: dict | None, now: datetime, start: datetime | None, 
     # starts after the burst reads its quiet aftermath as "no storm".
     covers_from, covers_to = parse_iso(vertex.get("window_start")), parse_iso(vertex.get("window_end"))
     short_at_start = start is not None and (covers_from is None or covers_from > start - STORM_429_LOOKBACK)
-    short_at_end = end is not None and (covers_to is None or covers_to < end)
+    short_at_end = end is not None and (covers_to is None or covers_to < end - STORM_429_READ_SLACK)
     if short_at_start or short_at_end:
         span = f"{hhmm(covers_from) if covers_from else '?'}–{hhmm(covers_to) if covers_to else '?'} UTC"
         out["reason"] = f"the Vertex 429 reading ({span}) does not cover the hours the hit runs spent on their calls"
@@ -2728,14 +2733,15 @@ def adjudicate(
     """
     if runs is None:
         runs = load_runs(data)
-    # The reconcile's holds, keyed by scan, from the last tick's block. A
-    # tick that already read this scan carries its `applying` forward (a
-    # hold seen by an earlier tick on this scan still covers it) and its
+    # The reconcile's holds, keyed by scan, from the last tick's memory
+    # (FIXTURE_HOLDS_KEY, carried across ticks that read no scan). A tick
+    # that already read this scan carries its `applying` forward (a hold seen
+    # by an earlier tick on this scan still covers it) and its
     # `applying_previous` is the previous scan's; a tick that read the scan
     # this document calls `previous` gives its `applying` as the previous
     # scan's; a tick that read any other scan (an hour of lost ticks) says
     # nothing about either.
-    prev_fleet = (prev or {}).get("fixture_state") or {}
+    prev_fleet = (prev or {}).get(FIXTURE_HOLDS_KEY) or {}
     prev_scan = parse_iso(prev_fleet.get("scanned_at"))
     this_scan = parse_iso(fixture_state_doc.get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
     last_scan = parse_iso((fixture_state_doc.get(fixture_state.KEY_PREVIOUS) or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) and isinstance(fixture_state_doc.get(fixture_state.KEY_PREVIOUS), dict) else None
@@ -2904,6 +2910,13 @@ def adjudicate(
         },
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
+        # The holds' memory: this scan's when one was read, else the last
+        # tick's, so a blind tick forgets nothing.
+        FIXTURE_HOLDS_KEY: (
+            {"scanned_at": iso(assessed["fixture"]["scanned_at"]), "applying": list(assessed["fixture"].get("applying") or []), "applying_previous": list(assessed["fixture"].get("applying_previous") or [])}
+            if assessed["fixture"].get("known") and "applying" in assessed["fixture"]
+            else (prev_fleet or None)
+        ),
         "pool_state": scan_block(assessed["pool_state"]),
         "slow": slow,
         "near_deadline": near_deadline_note,

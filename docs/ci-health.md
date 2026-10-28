@@ -1299,11 +1299,12 @@ from Cloud Monitoring: per pool project, Vertex AI calls by response code in
 ten-minute buckets over the last six hours (`serviceruntime.googleapis.com/api/request_count`
 on the `consumed_api` resource; the rule's two-hour window, the three hours
 of calls a run makes before it finishes, and an hour for the tick's own clock
-gap, since the rule's clock is the collect step's), summed pool-wide into
-`work/vertex-429.json` and published beside `health.json` as
-`vertex-429.json`. A read that reaches no project keeps the previous tick's
-reading, so a storm the last reading denied is not re-declared on a blind
-tick. `health.json`'s `vertex_429` reports it every tick
+gap), read on `data.json`'s clock so the window ends where the runs' does,
+summed pool-wide into `work/vertex-429.json` and published beside
+`health.json` as `vertex-429.json`. A read that reaches no project keeps the
+previous tick's reading when that one reached a project, so a storm the last
+reading denied is not re-declared on a blind tick; a kept reading may trail
+the runs' window by up to an hour at either edge. `health.json`'s `vertex_429` reports it every tick
 (`read`, `projects_read`, `projects_failed`, `read_at`, and the peak hourly
 share with its `requests` and `hour_end`), so a broken grant shows before a
 storm needs it; the share judges only when the repetitions would fire. It
@@ -1398,7 +1399,7 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `open_conditions`, `vertex_429`, `stale`, `slow`, `pool`, `fixture_state`,
+`evidence`, `advice`, `recovering`, `open_conditions`, `vertex_429`, `stale`, `slow`, `pool`, `fixture_state`, `fixture_holds`,
 `pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
 `periodics_since`, `metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line

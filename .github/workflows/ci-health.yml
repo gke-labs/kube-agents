@@ -589,7 +589,12 @@ jobs:
       - name: Read the pool's Vertex 429 rate
         continue-on-error: true
         timeout-minutes: 5
-        run: python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json
+        run: |
+          # On data.json's clock, which is the adjudicator's: the reading
+          # ends where the runs' window does, however late this step runs
+          # or however long the collect has been failing.
+          clock=$(python3 -c 'import json; print(json.load(open("work/data.json")).get("generated_at") or "")' 2>/dev/null || true)
+          python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json ${clock:+--now "$clock"}
 
       - name: Adjudicate
         run: |

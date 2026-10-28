@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-import pool_pressure  # noqa: E402  -- the holder map's keys, pinned against health's
+import pool_pressure  # the holder map's keys, pinned against health's
 from eval_dashboard import health, post_health, vertex_429
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
@@ -458,7 +458,7 @@ class Storm(unittest.TestCase):
             (dict(self.reading(0.01), buckets=[{"end": health.iso(T0 - timedelta(hours=9)), "requests": 1000, "429": 0}]), "fewer than 200 Vertex calls in any hour of the window"),
             # Two hours back from the tick: the runs that finished 40 minutes ago were calling three hours before that.
             (self.reading(0.01, hours=2), "the Vertex 429 reading (22:00–00:00 UTC) does not cover the hours the hit runs spent on their calls"),
-            (dict(self.reading(0.01), window_end=health.iso(T0 - timedelta(hours=1))), "the Vertex 429 reading (20:00–23:00 UTC) does not cover the hours the hit runs spent on their calls"),
+            (dict(self.reading(0.01), window_end=health.iso(T0 - timedelta(minutes=70))), "the Vertex 429 reading (20:00–22:50 UTC) does not cover the hours the hit runs spent on their calls"),
         ):
             with self.subTest(reason=reason):
                 result = self.judge(doc, vertex)
@@ -483,6 +483,13 @@ class Storm(unittest.TestCase):
         reading = {"schema_version": 1, "read_at": health.iso(read_at), "window_start": health.iso(read_at - vertex_429.LOOKBACK), "window_end": health.iso(read_at), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": buckets}
         result = self.judge(late, reading)
         self.assertEqual((result["state"], result["vertex_429"]["read"], round(result["vertex_429"]["peak"], 2)), ("GREEN", True, 0.02))
+
+    def test_a_reading_kept_from_the_previous_tick_still_judges(self):
+        # This tick's read reached no project, so the file is the previous
+        # tick's reading, 30 minutes behind the runs' window; it still denies.
+        kept = dict(self.reading(0.01), read_at=health.iso(T0 - timedelta(minutes=30)), window_end=health.iso(T0 - timedelta(minutes=30)))
+        result = self.judge(self.stormy([1, 2, 3], 6), kept)
+        self.assertEqual((result["state"], result["vertex_429"]["read"]), ("GREEN", True))
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
         self.assertEqual(assess(self.stormy([1, 2, 3], 6, letter="i"), T0)["state"], "DEGRADED")
@@ -3462,19 +3469,26 @@ class OpenConditions(unittest.TestCase):
         # No artifact, or no `held` in it: as before.
         self.assertEqual(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
         # Held around the previous scan: last scan's reading cannot make this one a repeat.
-        prev_doc = {"fixture_state": {"scanned_at": health.iso(at - timedelta(hours=1)), "applying": sorted(three), "applying_previous": []}, "state": "GREEN"}
+        prev_doc = {"fixture_holds": {"scanned_at": health.iso(at - timedelta(hours=1)), "applying": sorted(three), "applying_previous": []}, "state": "GREEN"}
         not_yet = health.adjudicate(green, T0, prev_doc, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
         self.assertEqual((not_yet["state"], not_yet["fixture_state"]["applying_previous"]), ("GREEN", sorted(three)))
+        self.assertEqual(not_yet["fixture_holds"], {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)})
         # The next tick reads the same scan: the previous scan's holds come from the last tick's applying_previous, not its applying.
-        same_scan = {"fixture_state": {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)}, "state": "GREEN"}
+        same_scan = {"fixture_holds": {"scanned_at": health.iso(at), "applying": [], "applying_previous": sorted(three)}, "state": "GREEN"}
         self.assertEqual(health.adjudicate(green, T0, same_scan, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["state"], "GREEN")
         # A tick that read neither this scan nor the one before (an hour of lost ticks) says nothing about the previous scan's holds.
-        lost = {"fixture_state": {"scanned_at": health.iso(at - timedelta(hours=2)), "applying": sorted(three), "applying_previous": sorted(three)}, "state": "GREEN"}
+        lost = {"fixture_holds": {"scanned_at": health.iso(at - timedelta(hours=2)), "applying": sorted(three), "applying_previous": sorted(three)}, "state": "GREEN"}
         self.assertEqual(health.adjudicate(green, T0, lost, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
         # A hold an earlier tick on this scan saw still covers the project once the next hourly read shows it released.
-        carried = {"fixture_state": {"scanned_at": health.iso(at), "applying": [project(1)], "applying_previous": []}, "state": "GREEN"}
+        carried = {"fixture_holds": {"scanned_at": health.iso(at), "applying": [project(1)], "applying_previous": []}, "state": "GREEN"}
         kept = health.adjudicate(green, T0, carried, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
         self.assertEqual((kept["incident"]["projects"], kept["fixture_state"]["applying"]), ([project(2), project(3)], [project(1)]))
+        # A tick that read no scan publishes no block but carries the memory, so the tick after it still knows.
+        blind = health.adjudicate(green, T0, carried, health.Roster.fixed(ADMITTED), fixture_state_doc=None, pool_pressure=pressure(window_end=at))
+        self.assertEqual((blind["fixture_state"], blind["fixture_holds"]), (None, carried["fixture_holds"]))
+        after_blind = health.adjudicate(green, T0, blind, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
+        self.assertEqual(after_blind["incident"]["projects"], [project(2), project(3)])
+        self.assertIsNone(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=None)["fixture_holds"])
         # The two halves of the contract name the holder the same way.
         self.assertEqual((pool_pressure.HELD_KEY_OWNER, health.POOL_HELD_KEY), (health.POOL_HELD_OWNER_KEY, "held"))
 

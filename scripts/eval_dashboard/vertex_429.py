@@ -114,11 +114,14 @@ def read_project(project: str, start: datetime, end: datetime, token: str, opene
     request = urllib.request.Request(query_url(project, start, end), headers={"Authorization": f"Bearer {token}"})
     try:
         with opener(request, timeout=CALL_TIMEOUT_S) as response:
-            return json.loads(response.read().decode("utf-8")), None
+            document = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return None, f"HTTP {exc.code}"
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(document, dict):
+        return None, "not a JSON object"
+    return document, None
 
 
 def buckets_from(document: dict) -> dict[str, dict[str, int]]:
@@ -189,8 +192,17 @@ def parse_args(argv):
     parser.add_argument("--out", type=pathlib.Path, required=True, help="where to write vertex-429.json")
     parser.add_argument("--ci-deploy", type=pathlib.Path, default=CI_DEPLOY_FILE, help="hack/ci-deploy.sh, for the pool's project list")
     parser.add_argument("--token-command", default=DEFAULT_TOKEN_COMMAND, help="prints the bearer token to read Monitoring with")
-    parser.add_argument("--now", type=parse_iso, default=None, help="the read's clock (ISO 8601; default: now)")
+    parser.add_argument("--now", type=parse_iso, default=None, help="the clock the window ends at (ISO 8601; the workflow passes data.json's generated_at, so the reading ends where the runs' window does; default: now)")
     return parser.parse_args(argv)
+
+
+def previous_reading_reached_a_project(path: pathlib.Path) -> bool:
+    """Whether the document at `path` is a reading with a non-empty `read`."""
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(previous, dict) and bool(previous.get("read"))
 
 
 def main(argv=None, runner=subprocess.run, opener=urllib.request.urlopen) -> int:
@@ -203,11 +215,13 @@ def main(argv=None, runner=subprocess.run, opener=urllib.request.urlopen) -> int
     now = args.now or datetime.now(timezone.utc)
     document = read_pool(projects, now, access_token(args.token_command, runner), opener)
     log(f"vertex 429: read {len(document['read'])} of {document['projects']} projects, {len(document['buckets'])} buckets; {len(document['errors'])} error(s)")
-    if not document["read"] and args.out.is_file():
+    if not document["read"] and previous_reading_reached_a_project(args.out):
         # A read that reached no project (no token, Monitoring down) does not
-        # replace the previous tick's reading, which the workflow fetched to
+        # replace a previous reading that did, which the workflow fetched to
         # --out: the rule ages and bounds that one itself, and a storm it
-        # denied stays denied rather than re-declared on a blind tick.
+        # denied stays denied rather than re-declared on a blind tick. A
+        # previous reading that was itself blind is replaced, so the
+        # published errors and read_at stay current until the grant lands.
         log(f"vertex 429: kept the previous reading at {args.out}")
         return 0
     args.out.parent.mkdir(parents=True, exist_ok=True)

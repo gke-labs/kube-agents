@@ -52,11 +52,11 @@ class BucketsTest(unittest.TestCase):
     def test_the_pool_document_sums_projects_and_records_the_refused(self):
         a = {"timeSeries": [series("200", [("2026-10-22T13:00:00Z", 90)]), series("429", [("2026-10-22T13:00:00Z", 10)])]}
         b = {"timeSeries": [series("200", [("2026-10-22T13:00:00Z", 100)])]}
-        opener = FakeOpener({"p-a": a, "p-b": b, "p-c": 403})
-        doc = vertex_429.read_pool(["p-a", "p-b", "p-c"], NOW, "tok", opener)
-        self.assertEqual((doc["read"], doc["errors"]), (["p-a", "p-b"], {"p-c": "HTTP 403"}))
+        opener = FakeOpener({"p-a": a, "p-b": b, "p-c": 403, "p-d": []})
+        doc = vertex_429.read_pool(["p-a", "p-b", "p-c", "p-d"], NOW, "tok", opener)
+        self.assertEqual((doc["read"], doc["errors"]), (["p-a", "p-b"], {"p-c": "HTTP 403", "p-d": "not a JSON object"}))
         self.assertEqual(doc["buckets"], [{"end": "2026-10-22T13:00:00Z", "requests": 200, "429": 10}])
-        self.assertEqual((doc["window_start"], doc["window_end"], doc["bucket_seconds"], doc["projects"]), ("2026-10-22T08:00:00+00:00", "2026-10-22T14:00:00+00:00", 600, 3))
+        self.assertEqual((doc["window_start"], doc["window_end"], doc["bucket_seconds"], doc["projects"]), ("2026-10-22T08:00:00+00:00", "2026-10-22T14:00:00+00:00", 600, 4))
         first = sorted(opener.urls)[0]
         self.assertIn("interval.startTime=2026-10-22T08%3A00%3A00%2B00%3A00", first)
         self.assertIn("alignmentPeriod=600s", first)
@@ -96,11 +96,16 @@ class MainTest(unittest.TestCase):
             deploy = pathlib.Path(tmp, "ci-deploy.sh")
             deploy.write_text('gitops_repo_for_project() {\n  case "$1" in\n    kube-agents-evals) echo x ;;\n  esac\n}\n')
             out = pathlib.Path(tmp, "v.json")
-            out.write_text('{"previous": true}')
+            out.write_text('{"read": ["kube-agents-evals"], "previous": true}')
             runner = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "tok\n", "")
             code = vertex_429.main(["--out", str(out), "--ci-deploy", str(deploy), "--now", NOW.isoformat()], runner=runner, opener=FakeOpener({}))
             kept = out.read_text()
-        self.assertEqual((code, kept), (0, '{"previous": true}'))
+            # A previous reading that was itself blind is replaced, so the errors and read_at stay current.
+            out.write_text('{"read": [], "errors": {"kube-agents-evals": "HTTP 403"}, "read_at": "2026-10-01T00:00:00+00:00"}')
+            vertex_429.main(["--out", str(out), "--ci-deploy", str(deploy), "--now", NOW.isoformat()], runner=runner, opener=FakeOpener({}))
+            replaced = json.loads(out.read_text())
+        self.assertEqual((code, kept), (0, '{"read": ["kube-agents-evals"], "previous": true}'))
+        self.assertEqual((replaced["read"], replaced["read_at"]), ([], NOW.isoformat()))
 
     def test_a_failed_token_command_is_a_warning_not_a_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
