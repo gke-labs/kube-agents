@@ -34,6 +34,60 @@ SATURATED_DIR = os.path.join(TESTDATA, "saturated")
 SATURATED_AS_OF = datetime(2026, 10, 8, 18, 30, tzinfo=timezone.utc)
 
 
+RESOURCES_DOC = {"items": [
+    {"metadata": {"name": "kube-agents-evals-3"}, "status": {"state": "reconciling", "owner": "fleet-reconcile", "lastUpdate": "2026-10-27T08:31:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-4"}, "status": {"state": "busy", "owner": "pull-kube-agents-smoke-test-2115", "lastUpdate": "2026-10-27T08:40:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-5"}, "status": {"state": "free", "owner": "", "lastUpdate": "2026-10-27T08:00:00Z"}},
+    "not an object",
+    {"metadata": {}, "status": {"owner": "x"}},
+]}
+
+
+class HeldProjectsTest(unittest.TestCase):
+    def test_the_held_map_names_each_holders_project(self):
+        self.assertEqual(pp._held_from(RESOURCES_DOC), {
+            "kube-agents-evals-3": {"owner": "fleet-reconcile", "state": "reconciling", "since": "2026-10-27T08:31:00Z"},
+            "kube-agents-evals-4": {"owner": "pull-kube-agents-smoke-test-2115", "state": "busy", "since": "2026-10-27T08:40:00Z"},
+        })
+
+    def test_from_dir_reads_the_resources_file_or_says_it_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp).ok)
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+            self.assertTrue(source.ok)
+            self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+
+    def test_the_kubectl_path_lists_the_resource_objects(self):
+        calls = []
+        def fake_run(cmd, timeout=0):
+            calls.append(list(cmd))
+            return 0, json.dumps(RESOURCES_DOC), ""
+        with unittest.mock.patch.object(pp, "run_cmd", fake_run), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            source = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertTrue(source.ok)
+        self.assertEqual(calls, [["kubectl", "--context", "my-ctx", "-n", "boskos", "get", "resources.boskos.k8s.io", "-o", "json"]])
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (1, "", "Error from server (Forbidden)")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            denied = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertFalse(denied.ok)
+        self.assertIn("Forbidden", denied.error)
+
+    def test_the_in_cluster_path_needs_the_pods_environment(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+        self.assertFalse(source.ok)
+        self.assertIn("not running in a cluster", source.error)
+        self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_NONE, "ctx").ok)
+
+    def test_measure_publishes_held_and_its_error(self):
+        code, out = run(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertIn("held", summary)
+        self.assertIsNone(summary["held"])
+        self.assertIn(pp.BOSKOS_RESOURCES_FILE, summary["held_error"])
+
+
 def run(**kwargs):
     """measure() with its output captured, returning (exit_code, stdout)."""
     buffer = io.StringIO()

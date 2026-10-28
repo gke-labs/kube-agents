@@ -3383,6 +3383,29 @@ class OpenConditions(unittest.TestCase):
         reds = [graded(400 + i, 40 + i, T0 - timedelta(minutes=30 * i), verdict="RED") for i in range(3)]
         self.assertNotIn("deadline_kill", self.judge(data(*kills, *reds), scan(), pool_scan())["open_conditions"], "three reds with a verdict end the kills (and open a break of their own)")
 
+    def test_a_project_the_reconcile_holds_is_being_applied_not_drifted(self):
+        green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
+        three = {project(i): [DRIFT_ROLE] for i in (1, 2, 3)}
+        at = T0 - timedelta(minutes=5)
+        holds = {project(1): {"owner": "fleet-reconcile", "state": "reconciling", "since": health.iso(at - timedelta(minutes=20))}, project(2): {"owner": "pull-kube-agents-smoke-test-123", "state": "busy", "since": health.iso(at)}}
+        # Held by the reconcile at a read 10 minutes before the scan: project 1 is not counted, 2 and 3 fire.
+        out = health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at - timedelta(minutes=10), held=holds))
+        self.assertEqual((out["condition"], out["incident"]["projects"], out["fixture_state"]["applying"]), ("fixture_drift", [project(2), project(3)], [project(1)]))
+        self.assertIn(f"{project(1)} is being applied by the fleet reconcile (Boskos hold near the 23:55 UTC scan); its fixture-state reading is not counted", out["evidence"])
+        # Every drifted project held: nothing fires, the block still shows the drift.
+        all_held = {p: {"owner": "fleet-reconcile", "state": "reconciling", "since": ""} for p in three}
+        quiet = health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at, held=all_held))
+        self.assertEqual((quiet["state"], quiet["fixture_state"]["drifted"], quiet["fixture_state"]["applying"]), ("GREEN", three, sorted(three)))
+        # A read more than the hold window away from the scan says nothing about it.
+        stale_hold = health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at - timedelta(minutes=70), held=all_held))
+        self.assertEqual(stale_hold["condition"], "fixture_drift")
+        # No artifact, or no `held` in it: as before.
+        self.assertEqual(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))["condition"], "fixture_drift")
+        # Held around the previous scan: last scan's reading cannot make this one a repeat.
+        prev_doc = {"fixture_state": {"applying": [project(1), project(2), project(3)]}, "state": "GREEN"}
+        not_yet = health.adjudicate(green, T0, prev_doc, health.Roster.fixed(ADMITTED), fixture_state_doc=scan(drifted=three, previous=three, at=at), pool_pressure=pressure(window_end=at))
+        self.assertEqual(not_yet["state"], "GREEN")
+
     def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
         green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
         self.assertEqual(self.judge(green, scan(), pool_scan())["open_conditions"], [])

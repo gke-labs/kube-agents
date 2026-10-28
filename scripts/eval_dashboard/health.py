@@ -381,6 +381,16 @@ NOON = 12
 FIXTURE_DRIFT_MIN_PROJECTS = 3
 FIXTURE_DRIFT_CONSECUTIVE_SCANS = 2
 FIXTURE_STATE_MAX_AGE = timedelta(hours=3)
+# A project the fleet reconcile holds in Boskos is being applied, and its
+# fixtures spend up to the reconcile's hold time half-applied; a scan that
+# lands inside that window reads it as drift. pool-pressure.json's `held` says
+# who holds what at its read time; a hold seen within this much of the scan
+# covers it, which is the reconcile's own hold ceiling plus the two jobs'
+# hourly cadences not lining up.
+RECONCILE_OWNER_PREFIX = "fleet-reconcile"
+RECONCILE_HOLD_WINDOW = timedelta(minutes=65)
+POOL_HELD_KEY = "held"
+POOL_HELD_OWNER_KEY = "owner"
 # Rule 3e, pool drift, is the same rule over pool-state.json with the same
 # thresholds: the same finding failing on the same project in two
 # consecutive scans, or on three projects in one (#1927's shape was all 30).
@@ -1228,7 +1238,23 @@ FIXTURE_SCAN = ScanKind(fixture_state, FIXTURE_STATE_LABEL, "drifted on", lambda
 POOL_SCAN = ScanKind(pool_state, POOL_STATE_LABEL, "found on", pool_state.check_of, widespread_fires=True)
 
 
-def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
+def reconcile_held(pool_pressure: dict | None, scanned_at: datetime | None) -> list[str]:
+    """The projects the fleet reconcile held in Boskos at a pool-pressure
+    read within RECONCILE_HOLD_WINDOW of the scan: being applied, not drifted."""
+    if not isinstance(pool_pressure, dict) or scanned_at is None:
+        return []
+    measured = parse_iso(pool_pressure.get("window_end"))
+    held = pool_pressure.get(POOL_HELD_KEY)
+    if measured is None or not isinstance(held, dict) or abs(scanned_at - measured) > RECONCILE_HOLD_WINDOW:
+        return []
+    return sorted(
+        project
+        for project, entry in held.items()
+        if isinstance(entry, dict) and str(entry.get(POOL_HELD_OWNER_KEY) or "").startswith(RECONCILE_OWNER_PREFIX)
+    )
+
+
+def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind, applying=(), previously_applying=()) -> dict:
     """Rules 3c and 3e over a scan document. Returns {fires, known, stale,
     unknown, scanned_at, roles, projects, drift, repairs, reads, current,
     read, checked, total, reason, evidence}.
@@ -1305,6 +1331,14 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     current = module.drift_map(state_doc)
     previous = module.previous_drift_map(state_doc)
     out["current"] = current
+    # A project under the reconcile's hold at this scan or the one before is
+    # not read for firing: this scan's units are being applied, and last
+    # scan's cannot make this scan's a repeat.
+    out["applying"] = sorted(project for project in current if project in set(applying))
+    for project in out["applying"]:
+        out["evidence"].append(f"{project} is being applied by the fleet reconcile (Boskos hold near the {hhmm(scanned_at)} UTC scan); its {scan.label} reading is not counted")
+    current = {project: units for project, units in current.items() if project not in set(applying)}
+    previous = {project: units for project, units in previous.items() if project not in set(previously_applying)}
     passes_leases = getattr(module, "passes_leases", None)
     out["passes_leases"] = sorted(
         {unit for units in current.values() for unit in units if passes_leases is not None and passes_leases(unit)}
@@ -1355,9 +1389,11 @@ def _scan_drift(state_doc: dict | None, now: datetime, scan: ScanKind) -> dict:
     return out
 
 
-def fixture_drift(state_doc: dict | None, now: datetime) -> dict:
-    """Rule 3c over fixture-state.json (see _scan_drift)."""
-    return _scan_drift(state_doc, now, FIXTURE_SCAN)
+def fixture_drift(state_doc: dict | None, now: datetime, applying=(), previously_applying=()) -> dict:
+    """Rule 3c over fixture-state.json (see _scan_drift); `applying` are the
+    projects the reconcile holds around this scan, `previously_applying`
+    around the scan before (reconcile_held)."""
+    return _scan_drift(state_doc, now, FIXTURE_SCAN, applying, previously_applying)
 
 
 def pool_drift(state_doc: dict | None, now: datetime) -> dict:
@@ -2119,9 +2155,20 @@ def _pool_drift_advice(incident: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None = None, pool_state_doc: dict | None = None) -> dict:
+def assess(
+    runs,
+    now: datetime,
+    roster: Roster,
+    fixture_state_doc: dict | None = None,
+    pool_state_doc: dict | None = None,
+    pool_pressure: dict | None = None,
+    previously_applying=(),
+) -> dict:
     """Apply rules 1-4 to the runs visible at `now`, rule 3c to the fleet
-    scan and rule 3e to the pool scan when one was given; no hysteresis yet."""
+    scan and rule 3e to the pool scan when one was given; no hysteresis yet.
+    `pool_pressure` is the periodic's artifact, read for the projects the
+    reconcile holds (reconcile_held); `previously_applying` the ones it held
+    around the previous scan, from the previous health.json."""
     visible = [run for run in runs if run.finished <= now]
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
@@ -2129,7 +2176,8 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
     r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
-    r3c = fixture_drift(fixture_state_doc, now)
+    scanned_at = parse_iso((fixture_state_doc or {}).get(fixture_state.KEY_SCANNED_AT)) if isinstance(fixture_state_doc, dict) else None
+    r3c = fixture_drift(fixture_state_doc, now, reconcile_held(pool_pressure, scanned_at), previously_applying)
     r3d = deadline_kills(visible, now)
     r3e = pool_drift(pool_state_doc, now)
 
@@ -2585,7 +2633,8 @@ def adjudicate(
     """
     if runs is None:
         runs = load_runs(data)
-    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc)
+    previously_applying = ((prev or {}).get("fixture_state") or {}).get("applying") or []
+    assessed = assess(runs, now, roster, fixture_state_doc, pool_state_doc, pool_pressure, previously_applying)
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
@@ -2785,6 +2834,7 @@ def scan_block(scan_result: dict) -> dict | None:
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],
         "partial": bool(scan_result.get("partial")),
+        "applying": list(scan_result.get("applying") or []),
         "reason": scan_result["reason"],
     }
 

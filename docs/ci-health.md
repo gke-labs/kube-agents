@@ -352,6 +352,32 @@ which lengthens the queue being reported. Unlike the slow note it is **not**
 held back outside GREEN — a different job reading different data cannot be
 this incident's own symptom.
 
+The same artifact carries `held`, which project each Boskos lease holder has
+at the read (`{project: {owner, state, since}}`), read from Boskos's own
+resource objects through the API server as the job's pod. The seeded-fleet
+rule reads it to tell a project the fleet reconcile is applying from one that
+drifted (below). The pod's service account needs the Boskos namespace's
+`boskos-crd-reader` role bound to it, once, by someone with cluster access:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: boskos-crd-reader-prowjob
+  namespace: boskos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: boskos-crd-reader
+subjects:
+  - kind: ServiceAccount
+    name: prowjob-default-sa
+    namespace: test-pods
+```
+
+Until it is, `held` is `null` and `held_error` says why, and the fleet rule
+reads every project as it did before.
+
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
 causes have four different remedies and one of them spends money:
@@ -1151,7 +1177,11 @@ Until the grant is in place the scan pre-flights one token mint per project,
 fails it, and records every role as "not checked" with gcloud's own words.
 
 **The condition.** `health.py`'s `fixture_drift` fires when the same role is
-drifted on the same project in two consecutive scans. One scan is not enough,
+drifted on the same project in two consecutive scans. A project the fleet
+reconcile holds in Boskos within 65 minutes of the scan (the pool-pressure
+artifact's `held`, above) is being applied, not drifted: its reading is left
+out of that scan and cannot make the next scan's a repeat, and the evidence
+says so. One scan is not enough,
 however many projects it covers: in #1278's retest sweep the crashloop fixture
 lagged the node repair by about 40 minutes on one project (it needs its first
 restart before OOMKilled evidence exists), and one hourly scan can land inside
