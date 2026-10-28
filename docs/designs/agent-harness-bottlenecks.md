@@ -6,7 +6,9 @@ kube-agents runs the Platform Agent and its supporting components in one GKE clu
 
 This research measures the harness on small fleets. Each experiment increases one stress point. A stress point is one property of the fleet or of its use, for example the number of clusters. The research fits a model to the data and predicts the breaking points for larger fleets. The result is a chart that answers two questions. First: are the current container limits enough for a given fleet? Second: which node size and container limits does a given fleet need?
 
-The first measurement, Phase 1, found no container near its memory limit at 8 clusters. It found that Warning events make the event watcher open many sessions, one for each event. It also found that the credential proxy reaches its CPU limit at 8 clusters. The credential proxy is the component that runs the agent's kubectl and gcloud commands.
+The measurements cover fleets of 2 to 22 small clusters. The credential proxy is the first limit. The credential proxy is the component that runs the agent's kubectl and gcloud commands. With the default limits, its CPU is full from about 6 clusters, and then commands wait. At 16 to 22 clusters a command waits up to 60 seconds, the time after which the proxy refuses it. The proxy's memory reaches its limit at about 18 to 25 clusters. At 16 clusters the proxy needs about 2.5 CPU cores, and its default limit is 1. The agent container and the event watcher stay far below their limits.
+
+Some limits do not change with more resources. The agent runs at most 10 conversations at once. Commands through the sandbox shell stop at about 1.4 per second. A question that checks the fleet takes more than 2 minutes at every fleet size. Failing Pods and HPAs make the event watcher open thousands of sessions an hour.
 
 # Context
 
@@ -263,6 +265,80 @@ Not measured yet:
 
 Each limit the data shows below a realistic fleet size gets an issue, linked from the Known Issues table.
 
+# Answers for a default install
+
+This section answers the two questions in Delivery / Success Criteria for a default install: the operator's default resources, on a Standard host cluster, in mode `next`, with image `eeb8a95c`. The test fleet's clusters are small: 2 to 4 nodes and about 300 objects each. The Harness limits page and `python3 -m admin_console.estimate` give the same answers for other fleets and other limits; the numbers here come from the Phase 1, 2 and 3 records.
+
+The default resources, read from the install's pods:
+
+| Container                        | Request           | Limit          | Set by                                      |
+| -------------------------------- | ----------------- | -------------- | ------------------------------------------- |
+| Agent (`platform-agent`)         | 1 CPU, 2 GiB      | 3 CPU, 8 GiB   | `spec.deployment.resources`                 |
+| Credential proxy                 | 0.5 CPU, 1 GiB    | 1 CPU, 2 GiB   | `spec.deployment.credentialProxy.resources` |
+| Event watcher (`agent-api-auth`) | 0.15 CPU, 384 MiB | 1 CPU, 2 GiB   | `spec.deployment.agentAPIAuth.resources`    |
+| Sandbox shell                    | 0.2 CPU, 512 MiB  | 2 CPU, 2 GiB   | no field: fixed in the operator             |
+| LiteLLM, 2 replicas              | 0.1 CPU, 2 GiB    | 0.5 CPU, 3 GiB | Helm value `litellm.resources`              |
+
+## Question 1: are the default limits enough for this fleet?
+
+For a fleet of small clusters like the test fleet, the default limits carry about 4 to 8 clusters before commands start to wait. Past that the credential proxy is the limit. Its CPU is full and commands queue, up to the 60-second refusal bound at about 16 to 22 clusters, and its memory reaches its 2 GiB limit at about 18 to 25 clusters. No other container comes close in the measured range.
+
+| Limit                               | When the fleet reaches it                                                                                                                                                  | What happens                                                                                       |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Credential proxy CPU, 1 core        | During onboarding, from about 6 clusters. With the five first-run audits running at once, at every size from 2 clusters; with them one after another, at about 8 clusters. | Commands wait for the proxy: up to 30 s at 4 and 6 clusters with the audits at once, 10–15 s at 8. |
+| Credential proxy refusal, 60 s wait | Waits reached it at 16 clusters with the audits at once, and at 22 clusters with them one after another.                                                                   | A command that waits 60 s is refused. No command was refused yet at 16 or 22 clusters.             |
+| Credential proxy memory, 2 GiB      | 1.5 GiB at 16 clusters and 1.8 GiB at 22. The line through the measured points reaches 2 GiB at about 18 to 25 clusters.                                                   | An OOMKill of the proxy stops every brokered command until it restarts.                            |
+| Sandbox shell CPU, 2 cores          | With 4 brokered commands at once, at any fleet size. In the onboarding and audit windows the line reaches 2 cores at about 22 clusters.                                    | The command path carries at most about 1.4 commands per second.                                    |
+| Agent CPU, 3 cores                  | The line reaches it at about 28 clusters.                                                                                                                                  | Slower turns.                                                                                      |
+| Agent memory, 8 GiB                 | 2.3 GiB at 16 clusters; the line reaches it at about 80 clusters.                                                                                                          | OOMKill.                                                                                           |
+| Event watcher memory, 2 GiB         | 0.2 GiB at 22 clusters; far beyond the measured range.                                                                                                                     | —                                                                                                  |
+
+Limits that no container resource moves:
+
+- **Response time.** A fan-out question took 130 to 145 seconds at every size from 2 to 16 clusters, against the 60-second investigate gate ([#3140](https://github.com/gke-labs/kube-agents/issues/3140)).
+- **Run slots.** The agent runs 10 conversations at once. With 10 questions sent together all were answered; with 12, two were refused in every run ([#3724](https://github.com/gke-labs/kube-agents/issues/3724)).
+- **The command path.** Every brokered command costs about 0.85 s of sandbox shell CPU, two thirds of it compiling the Python standard library ([#4027](https://github.com/gke-labs/kube-agents/issues/4027)). The shell's 2 cores are fixed, and the proxy runs at most 8 commands at once, also fixed.
+- **Stall Watch.** It reads every cluster one at a time every 30 minutes, within a 25-minute budget. At 22 clusters, during onboarding, it read 19 clusters in one run.
+- **Warning events.** The event watcher opens a session for each new incident, and Pods or HPAs that keep failing make many incidents. Sessions start between 10 and 30 Pods failing at once. With 4,800 HPAs and 9,600 Pods in an 8-cluster fleet and nothing made to fail, it opened 7,483 sessions in an hour; the daily alert ceiling suppressed all of them, but that hour still used 3.2 million input tokens ([#3567](https://github.com/gke-labs/kube-agents/issues/3567)).
+- **Model quota.** The onboarding scan used 7 to 13 million input tokens in its first 30 minutes at 2 to 16 clusters, and the 2-hour onboarding window 9 to 22 million.
+
+On GKE Autopilot without room to burst, each container gets only its request. The credential proxy then passes its 1 GiB request at about 3 to 4 clusters, the agent its 2 GiB at about 6 and the shell its 512 MiB at about 8, and each of them risks an OOMKill there. Their CPU is above its request already at 2 clusters, so they run slower than on a Standard node from the start.
+
+## Question 2: what node size and container limits does this fleet need?
+
+Each limit below is the peak the data shows or predicts, plus the 30% margin of Decision 2. Fleets past 22 clusters are predicted, not measured.
+
+| Fleet                  | Agent: memory, CPU | Credential proxy: memory, CPU | Sandbox shell: need plus margin | Node pool          |
+| ---------------------- | ------------------ | ----------------------------- | ------------------------------- | ------------------ |
+| 8 clusters             | 2.8 GiB, 2.2 CPU   | 1.7 GiB, 2.6 CPU              | 0.7 GiB, 1.6 CPU                | 2 × e2-standard-4  |
+| 16 clusters            | 3.6 GiB, 2.9 CPU   | 2.4 GiB, 3.4 CPU              | 1.1 GiB, 2.1 CPU                | 3 × e2-standard-4  |
+| 32 clusters, predicted | 5.3 GiB, 4.2 CPU   | 3.8 GiB, 5.0 CPU              | 1.9 GiB, 3.3 CPU                | 2 × e2-standard-8  |
+| 64 clusters, predicted | 8.6 GiB, 6.9 CPU   | 6.7 GiB, 8.1 CPU              | 3.4 GiB, 5.6 CPU                | 2 × n2-standard-16 |
+
+- **Credential proxy CPU** comes from the runs with the proxy's limits raised to 4 CPU and 4 GiB. Every audit run at the default limit sat at 1 core, so it shows the limit, not the need. With the five audits at once the proxy needed 1.6 cores at 2 clusters and 2.5 at 16, and the line through those points gives the rows above. With the audits one after another, as a new install runs them, the proxy still sat at its 1-core limit from 8 clusters (Phase 2), so its need there is not measured, and these rows are the safe side.
+- **The event watcher and LiteLLM** keep their defaults at every size here: the event watcher would use under 0.5 GiB at 64 clusters.
+- **The sandbox shell's** 2 CPU and 2 GiB are fixed. With the margin it would want more than 2 CPU from about 16 clusters, and it would need all 2 at about 22. Nothing in the `PlatformAgent` raises that.
+- **The node pool** holds every long-running pod at the limits above, from the machine types in Decision 3. On Autopilot, set the requests to these values instead.
+
+For 16 clusters, in the `PlatformAgent`. `resources` replaces the agent container's whole block, so it keeps the default requests; `credentialProxy.resources` replaces only the keys it sets:
+
+```yaml
+spec:
+  deployment:
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { cpu: "3", memory: 4Gi }
+    credentialProxy:
+      resources:
+        limits: { cpu: "3500m", memory: 2560Mi }
+```
+
+What no setting changes, and what it would take:
+
+- The shell's 2 cores and the proxy's 8 command slots are fixed in the operator. From about 22 clusters, where the shell needs all its cores, the brokered command path needs code changes: a compiled standard library in the sandbox ([#4027](https://github.com/gke-labs/kube-agents/issues/4027)), a slot count that follows the proxy's limits, or more than one proxy replica ([#2637](https://github.com/gke-labs/kube-agents/issues/2637)).
+- The 10 run slots, Stall Watch's per-cluster loop and the session per incident are code, not resources.
+- The data volume: the agent's profiles used under 200 MiB at 22 clusters, so the default 50 GiB volume is not a limit in this range ([#3704](https://github.com/gke-labs/kube-agents/issues/3704) estimates about 3,200 clusters).
+
 # Phase 1 results
 
 The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `eeb8a95c`, mode `next`, 2 test clusters at the base); the admin console's Harness limits page charts them and answers the two sizing questions. This section states what they show; the page and the file hold every number.
@@ -292,6 +368,56 @@ The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `ee
 - **Soaks and onboarding ran once per point,** so their points have no spread, and the prompt operations' response times varied by up to 4.8 times between runs of one point.
 - **The runner restarts the gateway** when the watcher does not watch exactly the test fleet ([#3932](https://github.com/gke-labs/kube-agents/issues/3932)), so each such run starts on a fresh agent process.
 - **The admission wait is a histogram bucket bound,** not an exact time: 15 s means between 10 and 15 s.
+
+# Phase 2 and Phase 3 results
+
+The Phase 2 and Phase 3 records are in `bench/scale/harness-limits.json` beside the Phase 1 records: the same image `eeb8a95c` and mode `next`. The Harness limits page charts them; this section states what they show.
+
+## What the data shows
+
+**The credential proxy is the first limit, and the first-run audits are what reach it.** In the 30-minute windows (Phase 3, default limits):
+
+| Clusters | Onboarding: proxy CPU peak | Audits at once: proxy CPU peak | Audits at once: longest wait | Audits at once: proxy memory peak | Onboarding: agent memory peak |
+| -------- | -------------------------- | ------------------------------ | ---------------------------- | --------------------------------- | ----------------------------- |
+| 2        | 0.65                       | 1.02 (at its limit)            | 0.1 s                        | 705 MiB                           | 1,484 MiB                     |
+| 4        | 0.81                       | 0.97 (at its limit)            | 30 s                         | 689 MiB                           | 1,987 MiB                     |
+| 6        | 1.00 (at its limit)        | 1.03 (at its limit)            | 30 s                         | 871 MiB                           | 2,005 MiB                     |
+| 8        | 1.04 (at its limit)        | 1.12 (at its limit)            | 10 s                         | 496 MiB                           | 2,118 MiB                     |
+| 16       | 0.75                       | 1.12 (at its limit)            | 60 s                         | 1,506 MiB                         | 2,316 MiB                     |
+
+The 2-hour Phase 2 window at 22 clusters, with the audits one after another, showed the same limit: the proxy at 1.11 cores, waits up to 60 s and 1,779 MiB of memory, with 3,711 commands at 6.3 s each.
+
+**With its limits raised, the proxy shows what it needs.** At 16 clusters, with 4 CPU and 4 GiB instead of 1 CPU and 2 GiB, the audit window peaked at 2.54 cores, the longest wait fell from 60 s to 10 s, the proxy ran 36 commands per minute at 3 s each instead of 22 at 17 s, and all four audits finished inside the window. Its memory peak did not change (1,490 MiB against 1,506 MiB). In the onboarding window it peaked at 1.24 cores, and its memory stayed at 229 MiB against 874 MiB with the default limit: a proxy short of CPU keeps commands alive longer, and they hold memory.
+
+**The work grows with the fleet even where the peak cannot.** The CPU the proxy used over a 30-minute window, divided by the window, went from 0.12 cores at 2 clusters to 0.35 at 8 and 0.47 at 16 (limits raised) in onboarding, and from 0.12 to 0.9 in the audit window. The peak stops at the limit; this average does not.
+
+**The command path carries at most about 1.4 commands per second, and the sandbox shell sets that.** Workers in the shell ran `kubectl get pods --all-namespaces` through the proxy with no model call. One worker got 0.76 commands per second at 1.3 s each. From 4 workers the shell was at its 2-core limit while the proxy stayed near 0.8 cores and its queue empty; from 8 to 32 workers throughput stayed at 1.4 per second and each command took longer: 5.6 s at 8 workers, 11 s at 16 and 22 s at 32. Each command costs about 0.85 s of shell CPU, two thirds of it compiling the Python standard library; with a bytecode cache it costs 0.39 s ([#4027](https://github.com/gke-labs/kube-agents/issues/4027)).
+
+**Run slots stop at exactly 10.** With 8 or 10 questions sent at once, every one was answered in all 3 runs (median 130–137 s). With 12, each run had exactly 2 refused with `HTTP 429` (`Too many concurrent runs`).
+
+**Fan-out questions take the same time from 2 to 16 clusters:** a median of 134 to 144 seconds.
+
+**The session storm starts between 10 and 30 Pods failing at once.** In an hour the event watcher opened no session at 1 and 10 failing Pods, 3 at 30 and 208 at 100 (Phase 1). A restart of the gateway opened 0, 4 to 7 and 63 to 68 sessions in the next 15 minutes. At 8 clusters × 4,000 objects (4,808 HPAs and about 9,600 Pods) it opened 7,483 sessions in an hour with nothing made to fail; the daily alert ceiling suppressed every one, and the hour still used 3.2 million input tokens and 1,848 brokered commands ([#3567](https://github.com/gke-labs/kube-agents/issues/3567)).
+
+**The factors add up, except the credential proxy's memory.** At 8 clusters × 4,000 objects the measured peaks were within a few percent of the sum of the single-factor lines for the agent and the event watcher, and the proxy's and the shell's CPU sat at their limits. The proxy's memory was 1.25 times the sum: 1,102 MiB against 880 MiB.
+
+**Stall Watch runs out of time at about 20 clusters during onboarding.** It reads every cluster one at a time every 30 minutes, within a 25-minute budget; at 22 clusters it read 19 in one run and continued from there in the next.
+
+## Findings filed
+
+- [#4027](https://github.com/gke-labs/kube-agents/issues/4027): every brokered command recompiles the Python standard library in the sandbox shell's client, which caps the command path at about 1.4 commands per second.
+- [#4106](https://github.com/gke-labs/kube-agents/issues/4106): the credential proxy's default 1-core CPU limit is full from about 6 clusters, and at 16 clusters the proxy needs about 2.5 cores.
+- The measured session storms and run-slot refusals are added to [#3567](https://github.com/gke-labs/kube-agents/issues/3567) and [#3724](https://github.com/gke-labs/kube-agents/issues/3724).
+
+## What limits the result
+
+- **22 clusters at most.** The project's default network has room for the Pod ranges of about 30 clusters, and the zone ran out of E2 and N2 machines for hours. Larger fleets are predicted, not measured; a queue grows faster than a straight line once it fills.
+- **Two methods.** The 22-cluster point is a 2-hour window with the audits one after another; the Phase 3 points are 30-minute windows with the audits at once, which is harder on the proxy. A plan error deleted the 22-cluster fleet before Phase 3 reached it.
+- **The audit window is a worst case.** Five audits at once is more than a new install runs. On this build only four of OOBE's five audits exist: `upgrade-retrospective` is not on the Platform Agent's roster.
+- **Small clusters, 2 nodes each.** Every Phase 3 point and the 22-cluster point have 2 nodes per cluster and no fixture pool; the Phase 1 points and the earlier Phase 2 points have 3 or 4.
+- **One run per onboarding and audit window,** so those points have no spread. The proxy's onboarding peaks move up and down between neighbouring points: its memory between 297 and 926 MiB from 2 to 16 clusters.
+- **An outside IAM automation** removed the install's bindings again during the 16-cluster audit window. Two audits failed on a model call 20 minutes in, after the window's peaks.
+- **The raised-limit runs met model quota limits:** 54 provider 429s in the 16-cluster onboarding window.
 
 # Out of scope
 
@@ -326,14 +452,15 @@ Each row is a GitHub issue that reports a scale bottleneck with evidence. "Scale
 
 ### Credential proxy: one broker for every command
 
-| Issue                                                        | Bottleneck                                                                                                         | Scale                                   | Evidence                                                                                                                                    |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| [#2324](https://github.com/gke-labs/kube-agents/issues/2324) | 8 concurrent `gcloud` children exceed the broker's memory limit                                                    | 143 clusters, 36 projects               | The Stall Watch cron fans out 8 at once; `memory.peak` 948MB against 1Gi                                                                    |
-| [#2045](https://github.com/gke-labs/kube-agents/issues/2045) | `kubectl` children are capped by count, not by size                                                                | 4,000 pods                              | One `-o yaml` listing takes 1,281 MiB; the cgroup v2 group OOM killer stops the whole container                                             |
-| [#2652](https://github.com/gke-labs/kube-agents/issues/2652) | An audit retries large-cluster reads into the proxy it crashed; `collect.py` runs 8-wide against 4 admission slots | 7-cluster audit on the 26-cluster fleet | Proxy at 827Mi, 6+ OOMKills; the audit never finishes                                                                                       |
-| [#2637](https://github.com/gke-labs/kube-agents/issues/2637) | One replica handles all brokered execs; the admission budget turns the OOM into a queue                            | 143 clusters                            | ~6,000 execs/hour at the CPU limit; up to 1,225 queued requests, p50 wait 22.5s, max 56.7s; the broker refuses at 60s, the preflight at 15s |
-| [#3142](https://github.com/gke-labs/kube-agents/issues/3142) | The agent reads CRDs one at a time through the broker                                                              | 233 Config Connector CRDs               | 769s at 3.3s per RPC; batched reads take 30s                                                                                                |
-| [#4027](https://github.com/gke-labs/kube-agents/issues/4027) | Every brokered command recompiles the Python standard library in the sandbox shell's client                        | any fleet                               | 0.85 s of shell CPU per command; the shell's 2-core limit caps the command path at about 1.4 commands per second                            |
+| Issue                                                        | Bottleneck                                                                                                                  | Scale                                   | Evidence                                                                                                                                    |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [#2324](https://github.com/gke-labs/kube-agents/issues/2324) | 8 concurrent `gcloud` children exceed the broker's memory limit                                                             | 143 clusters, 36 projects               | The Stall Watch cron fans out 8 at once; `memory.peak` 948MB against 1Gi                                                                    |
+| [#2045](https://github.com/gke-labs/kube-agents/issues/2045) | `kubectl` children are capped by count, not by size                                                                         | 4,000 pods                              | One `-o yaml` listing takes 1,281 MiB; the cgroup v2 group OOM killer stops the whole container                                             |
+| [#2652](https://github.com/gke-labs/kube-agents/issues/2652) | An audit retries large-cluster reads into the proxy it crashed; `collect.py` runs 8-wide against 4 admission slots          | 7-cluster audit on the 26-cluster fleet | Proxy at 827Mi, 6+ OOMKills; the audit never finishes                                                                                       |
+| [#2637](https://github.com/gke-labs/kube-agents/issues/2637) | One replica handles all brokered execs; the admission budget turns the OOM into a queue                                     | 143 clusters                            | ~6,000 execs/hour at the CPU limit; up to 1,225 queued requests, p50 wait 22.5s, max 56.7s; the broker refuses at 60s, the preflight at 15s |
+| [#3142](https://github.com/gke-labs/kube-agents/issues/3142) | The agent reads CRDs one at a time through the broker                                                                       | 233 Config Connector CRDs               | 769s at 3.3s per RPC; batched reads take 30s                                                                                                |
+| [#4027](https://github.com/gke-labs/kube-agents/issues/4027) | Every brokered command recompiles the Python standard library in the sandbox shell's client                                 | any fleet                               | 0.85 s of shell CPU per command; the shell's 2-core limit caps the command path at about 1.4 commands per second                            |
+| [#4106](https://github.com/gke-labs/kube-agents/issues/4106) | The default 1-core CPU limit is full from about 6 clusters; the first-run audits need 1.6 cores at 2 clusters and 2.5 at 16 | 2 to 22 test clusters                   | Waits up to 60 s at 16 and 22 clusters; 1.8 GiB of memory at 22 against a 2 GiB limit                                                       |
 
 ### Event volume: fan-out per pod, not per fault
 
