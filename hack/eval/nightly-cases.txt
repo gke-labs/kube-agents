@@ -784,7 +784,7 @@
 # consistency-drift-outlier holds it since 2026-10-26). Green on
 # the SOUL.md drift row (#3398, #3609); ran as expected_fail from #3135 until
 # then.
-./tasks/drift-chat-request-runs-collector/task.yaml
+# SCRATCH: moved to presubmit-cases.txt for the measuring run.
 
 # A plain chat request about the security of the fleet's AI and
 # model-serving workloads runs the AI security audit's collector (#2386), and
@@ -956,7 +956,7 @@
 # lands, and the case passes the roster's bar, 90% over 20 runs, on the
 # Gemini nightly (#3598). The domain's roster seat is consistency-drift-outlier
 # since 2026-10-26.
-./tasks/consistency-authorized-networks-probe/task.yaml
+# SCRATCH: moved to presubmit-cases.txt for the measuring run.
 
 # A request cut on named workloads names the dependency each cut would change
 # (#3199): the HPA scaling inference-server (hpa-saturated) and ledger-writer's
