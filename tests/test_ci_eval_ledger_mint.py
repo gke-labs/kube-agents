@@ -285,13 +285,17 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 "  return 0",
                 "}",
                 # The renewer calls plain `sleep` once per tick and inherits
-                # this function, so TICK_FILE counts its ticks: the retry step
-                # is visible as a count, whatever the wall clock does. The
-                # bodies' own waits use `command sleep` and are not counted;
-                # the stub's refusal is terminal, so mint_ledger_token's own
-                # retry sleep never runs here.
+                # this function, which writes a `tick` line to its stderr
+                # ahead of each sleep. The renewer's stderr is RENEWER_LOG, so
+                # the ticks land in order with its own lines, and the ticks
+                # before its "renewed after" line are a count the renewer
+                # alone decides: the retry step is visible there whatever the
+                # scheduler does to the stop. The bodies' own waits use
+                # `command sleep` and are not counted; the stub's refusal is
+                # terminal, so mint_ledger_token's own retry sleep never runs
+                # here (and the renewer discards the mint's stderr anyway).
                 "sleep() {",
-                '  echo tick >> "${TICK_FILE}"',
+                "  echo tick >&2",
                 '  command sleep "$@"',
                 "}",
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
@@ -324,7 +328,6 @@ class LedgerTokenRenewalTest(unittest.TestCase):
             "TOKEN_FILE": str(self.tmp / "unit.ledger-token"),
             "COUNT_FILE": str(self.tmp / "mint-count"),
             "RENEWER_LOG": str(log_file),
-            "TICK_FILE": str(self.tmp / "renewer-ticks"),
         }
         overrides.update(env)
         with log_file.open("w", encoding="utf-8") as log:
@@ -371,10 +374,14 @@ class LedgerTokenRenewalTest(unittest.TestCase):
     def test_a_failed_renewal_is_retried_soon_rather_than_a_period_later(self):
         # Two refusals, then a mint. The renewer sleeps one tick per second:
         # at the retry step the mint that succeeds is on the fourth tick (two
-        # for the period, one per retry), and the stop lands during the fifth;
-        # with the retry at a whole period it would be on the sixth, with the
-        # stop in the seventh. The tick count is what tells the two apart; the
-        # wait bound is slack, not the discriminator.
+        # for the period, one per retry); with the retry at a whole period it
+        # would be on the sixth. The ticks the renewer writes before its
+        # "renewed after" line are what tell the two apart, and that count
+        # is the renewer's own: the fifth tick follows the line at once and
+        # the sixth a second later, so a count taken at stop time would
+        # depend on how fast the stop lands, but one taken from the log
+        # ahead of the line does not. The wait bound is slack, not the
+        # discriminator.
         #
         # The wait is on the renewer's "renewed after" line, not on the token
         # file: the renewer moves the new token into the file and only then
@@ -388,7 +395,6 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 wait_until grep -q "renewed after" "${RENEWER_LOG}"
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 stop_ledger_token_renewal "${TOKEN_FILE}"
-                echo "TICKS=$(grep -c tick "${TICK_FILE}")"
                 """
             ),
             MINT_FAILURES="2",
@@ -396,10 +402,9 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("RENEWED=tok-renewed", proc.stdout)
         self.assertIn("renewed after 2 failed attempt(s)", proc.stderr)
-        ticks = int(re.search(r"^TICKS=(\d+)$", proc.stdout, re.M).group(1))
-        # Below the whole-period figure, rather than exactly five: whether the
-        # fifth tick is on record depends on whether the stop beats it.
-        self.assertLess(ticks, 6, proc.stdout)
+        before_the_line = proc.stderr.split("renewed after", 1)[0]
+        ticks = len(re.findall(r"^tick$", before_the_line, re.M))
+        self.assertEqual(4, ticks, proc.stderr)
 
     def test_a_failure_streak_warns_once_without_the_mints_error_block(self):
         # The mint's ERROR block says grading cannot proceed, which is false
