@@ -18,6 +18,9 @@ console's Harness limits page reads `harness-limits.json`.
   reuses the Phase 1 base runs.
 - `phase3.yaml`: the Phase 3 plan: every window 30 minutes, with the first-run audits that a new
   install starts late moved into a window of their own.
+- `phase3-proxy-raised.yaml`: Phase 3's two windows at 2 and 16 clusters with the credential proxy's
+  limits raised, so its CPU peak shows what it needs; set the limits before the runs and remove them
+  after.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
@@ -56,19 +59,37 @@ python3 -m kube_agents_bench.scale.runner teardown <plan>             # remove f
 python3 -m kube_agents_bench.scale.runner teardown <plan> --delete-fleet
 ```
 
-An operation's `kind` says what a run does: `prompt` sends the operation's `prompt` (and, above a
-concurrency of 1, its `follow_up`) through the agent API; `soak` waits `window_seconds`;
-`restart_soak` restarts the gateway pod first; `reset_soak` resets the install's state volumes
-first; `proxy_load` runs the operation's `command` through `credential-proxy-exec` in the sandbox
-shell, from `proxy_concurrency` workers at once for `window_seconds`, with no model call;
-`trigger_soak` marks the cron `jobs` on the roster under `jobs_home` due at the window's start, as
-the OOBE job marks its first-run audits, and notes the ones not finished when the window ends. A factor
-named `combined` has points rather than values as levels: level N applies the plan's Nth `combined`
-point, which sets several factors at once. The levels run in the order the plan lists the factors.
-In `settings`, `trigger_reconcile` runs the Cluster Agent reconcile when the profiles differ from
-the test fleet instead of waiting for its hourly run, `cluster_create_parallelism` bounds how many
-clusters are created at once, and `watcher_wait_seconds` is how long a restarted event watcher may
-take to report every test cluster.
+An operation's `kind` says what a run does:
+
+- `prompt` sends the operation's `prompt` through the agent API, and above a concurrency of 1 its
+  `follow_up` beside it;
+- `soak` waits `window_seconds`; `restart_soak` restarts the gateway pod first; `reset_soak` resets
+  the install's state volumes first;
+- `proxy_load` runs the operation's `command` through `credential-proxy-exec` in the sandbox shell,
+  from `proxy_concurrency` workers at once for `window_seconds`, with no model call;
+- `trigger_soak` marks the cron `jobs` on the roster under `jobs_home` due at the window's start, as
+  the OOBE job marks its first-run audits, and notes the ones not finished when the window ends.
+
+A factor named `combined` has points rather than values as levels: level N applies the plan's Nth
+`combined` point, which sets several factors at once. The levels run in the order the plan lists the
+factors; with `base_last: true` the base point runs after them, so a plan whose levels shrink the
+fleet ends at its smallest. The runner checks the plan before it starts, skips the settle time when
+a level keeps the fleet of the one before, and stops with exit status 2 when a level cannot be
+applied, so neither the next level nor a script's next step reshapes a half-applied fleet.
+
+Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, `fixture_pool` and
+`pods_per_node`. The others:
+
+- `settle_seconds`: the wait after a level is applied;
+- `trigger_reconcile`: run the Cluster Agent reconcile when the profiles differ from the test fleet,
+  instead of waiting for its hourly run;
+- `cluster_create_parallelism`: how many clusters or node pools change at once;
+- `watcher_wait_seconds`: how long a restarted event watcher may take to report every test cluster;
+- `default_pool_pods`: how many fixture Pods each cluster's default pool holds before a fixture pool
+  is needed;
+- `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
+  default one;
+- `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
 
 The agent API is reached through the repository's `kubectl exec` relay
 (`scripts/hermes-dashboard-tunnel.py`), because the agent pod runs under gVisor

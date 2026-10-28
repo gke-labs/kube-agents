@@ -216,7 +216,7 @@ with a provider 429, a failed prompt or an unfinished one (the record's
 `excluded_from`) stays out of the response-time fit, and a CPU peak at 90% or more of the
 container's CPU limit stays out of the CPU fit: it shows the limit, not what the container needed. A factor that is a load the
 runner applies, such as the credential proxy load's workers, is charted against
-its runs but is no fleet input. Runs at a combined point, which move several
+its runs but is not a fleet input. Runs at a combined point, which move several
 factors at once, are listed against the page's prediction for the same fleet; a
 ratio above 1 is an interaction that the sum of single-factor lines misses.
 
@@ -227,12 +227,23 @@ pod's recommended requests; the node count holds every long-running pod,
 replicas included (a Job's or an init container's peak holds no node).
 The raw records, with each run's errors, are in a collapsed section.
 
-`python3 -m admin_console.estimate` prints the same model as Markdown: for each
-check, the cluster count at which it fails for clusters shaped like the base
-point, and the value at which it fails for each factor alone; the measured onset
-of each count that has to stay at zero; and the credential proxy's throughput
-against the commands each operation sent. `--limits` reads other limits, such as
-the requests an Autopilot cluster guarantees, from a JSON or YAML file.
+The page's limits default to the ones most runs had, so a short experiment under
+other limits does not change them. A CPU peak at 90% or more of a container's
+CPU limit stays out of the CPU line, because it shows the limit, not the need.
+
+`python3 -m admin_console.estimate` prints the same model as Markdown:
+
+- for each check, the cluster count at which it fails for clusters shaped like
+  the base point, and the value at which it fails for each factor alone;
+- the limits and node pool for 8 to 128 clusters;
+- the measured onset of each count that has to stay at zero;
+- the credential proxy's throughput, the commands each operation sent, and its
+  CPU per operation and fleet size.
+
+`--against requests` checks against the requests instead, which is what an
+Autopilot cluster without bursting gives each container; `--limits` reads other
+limits from a JSON or YAML file; `--data`, `--commit` and `--mode` pick the data
+file, the build and the mode.
 
 ## Chat
 
