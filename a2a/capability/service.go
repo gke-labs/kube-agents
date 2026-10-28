@@ -56,9 +56,9 @@ const (
 	// Living under `a2a.` rather than `_INBOX` has a consequence that an
 	// earlier revision of this comment got wrong, and the way it was wrong
 	// is worth keeping. `a2a.>` is a real subscribe grant on this bus — the
-	// read-only `web` user, the one credential published to a browser,
-	// holds it — and that grant covers both subjects above. The comment
-	// used to reason about what a browser could OBSERVE there (caller, key,
+	// read-only `web` user and the `console` user, the two credentials
+	// published to a browser, hold it — and that grant covers both
+	// subjects above. The comment used to reason about what a browser could OBSERVE there (caller, key,
 	// revision, verb, verdict; never a capability, since neither message
 	// carries one) and accept it as a subset of what `web` already reads
 	// off `a2a.tasks.>`.
@@ -74,7 +74,8 @@ const (
 	// task on the bus and rejected some of them. A subscriber on a
 	// request subject intercepts; it does not merely watch.
 	//
-	// So `web` is denied `a2a.cap.>` outright (webIdentity, in
+	// So `web` and `console` are denied `a2a.cap.>` outright (webIdentity
+	// and consoleIdentity, in
 	// k8s-operator/internal/controller/platformagent_a2a_identities.go).
 	// The general rule this leaves behind: any future grant wide enough to
 	// cover VerifySubscribe has to be checked against queue-group theft,

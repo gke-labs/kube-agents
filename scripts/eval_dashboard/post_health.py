@@ -339,11 +339,12 @@ POOL_JOB_HISTORY_URL = (
     f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{POOL_PRESSURE_JOB}"
 )
 
-# gsutil is how the state object is read and written; publish.py uses the
-# same header so a reader never gets an hour-stale copy.
-GSUTIL = "gsutil"
+# `gcloud storage` is how the state object is read and written; publish.py
+# sets the same Cache-Control so a reader never gets an hour-stale copy.
+GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
 GS_PREFIX = "gs://"
-CACHE_CONTROL = "Cache-Control: no-cache"
+CACHE_CONTROL_FLAG = "--cache-control=no-cache"
 
 UTC = timezone.utc
 
@@ -360,7 +361,7 @@ def log(message: str) -> None:
 def read_state(location: str, runner=subprocess.run) -> dict | None:
     """The last posted state, or None when there is none yet."""
     if location.startswith(GS_PREFIX):
-        result = runner([GSUTIL, "-q", "cat", location], capture_output=True, text=True)
+        result = runner([GCLOUD, STORAGE_GROUP, "cat", location], capture_output=True, text=True)
         if result.returncode != 0:
             return None
         text = result.stdout
@@ -383,7 +384,7 @@ def write_state(location: str, state: dict, runner=subprocess.run) -> None:
             handle.write(text)
             name = handle.name
         try:
-            runner([GSUTIL, "-q", "-h", CACHE_CONTROL, "cp", name, location], check=True)
+            runner([GCLOUD, STORAGE_GROUP, "cp", CACHE_CONTROL_FLAG, name, location], check=True)
         finally:
             os.unlink(name)
         return

@@ -329,18 +329,18 @@ jobs:
           service_account: ${{ env.COLLECT_SA }}
 
       # setup-gcloud registers a credential only if one exists when it runs,
-      # and it runs before either auth step. gcloud honours the credential
-      # file the auth step exports through an environment variable; gsutil
-      # does not, and without this login every gsutil call in the job ran as
-      # an anonymous caller (401 on the bucket, 40 failed ticks on
-      # 2026-09-10). `gcloud auth login --cred-file` is what setup-gcloud
-      # would have done, and it makes the credential the active account for
-      # gcloud, gsutil and `gcloud auth print-access-token` alike. Moving
+      # and it runs before either auth step. `gcloud auth login --cred-file`
+      # is what setup-gcloud would have done: it makes the credential the
+      # active account for every gcloud call in the job, the `gcloud storage`
+      # reads and `gcloud auth print-access-token` alike. (The reads were
+      # gsutil's until 2026-10; gsutil ignored the credential file the auth
+      # step exports, and without this login every call ran as an anonymous
+      # caller: 401 on the bucket, 40 failed ticks on 2026-09-10.) Moving
       # setup-gcloud below this auth step would fix only this half; the
       # publisher half below needs the same login (or a second SDK download),
       # so one mechanism serves both. An empty path would send gcloud to the
       # interactive browser flow and hang the job, hence the `:?` guard.
-      - name: Make the Prow-archive reader credential active for gsutil
+      - name: Make the Prow-archive reader credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Collect (incremental, onto the published data.json)
@@ -355,7 +355,7 @@ jobs:
           # No prior document means a cold sweep, which this job does not
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
-          if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
+          if ! gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
             echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
@@ -380,12 +380,12 @@ jobs:
           # is the staging deploy, not this dashboard, and it must not be able
           # to stall it: an RC listing that fails leaves
           # releases[] carried forward from the prior and stales nothing, and
-          # `gsutil ls` exits non-zero on a prefix with no objects, so a week
+          # `gcloud storage ls` exits non-zero on a prefix with no objects, so a week
           # with no release candidate would otherwise stop every publish. Both
           # RC warning shapes (the ls failure and the timeout) name the glob,
           # so dropping lines that mention the job name drops exactly those.
           if grep -v "post-kube-agents-eval-rc" work/collect.log \
-            | grep -Eq "warning: gsutil (ls|cat) .*(failed|timed out)"; then
+            | grep -Eq "warning: gcloud storage (ls|cat) .*(failed|timed out)"; then
             echo "::error::collect.py could not list or read the Prow archive; not publishing"
             exit 1
           fi
@@ -404,19 +404,22 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p work
-          # A NotFound is "the periodic has never run", which is what no note
+          # A NotFound ("matched no objects" from `cat` or `cp` of an absent
+          # object, "not found: 404" of an absent bucket; `objects describe`
+          # below says the latter of an absent object too, and is read by
+          # exit code alone) is "the periodic has never run", which is what no note
           # is meant to look like. Anything else -- a denied read above all --
           # would otherwise ship the whole feature dark: no note, no digest
           # figure, and no ⚪ either, because the dead-man's switch only ages
           # an artifact it managed to read. The two sibling reads below tell
           # the same two apart the same way.
-          if ! build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gsutil.err); then
-            grep -Eq "NotFound|No URLs matched|404" gsutil.err \
-              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
-            rm -f gsutil.err
+          if ! build=$(gcloud storage cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gcloud.err); then
+            grep -Eq "matched no objects|not found: 404" gcloud.err \
+              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gcloud.err)"
+            rm -f gcloud.err
             exit 0
           fi
-          rm -f gsutil.err
+          rm -f gcloud.err
           [ -n "$build" ] || exit 0
           # The pointer moves at job start, so for the ~8 minutes the periodic
           # runs it names a build with no artifact. finished.json lands with
@@ -424,20 +427,20 @@ jobs:
           # before it holds a reading at most an hour old, well inside
           # POOL_STALE_AFTER. Skipping instead would drop the note from
           # health.json, the Brief and the digest for that tick.
-          if ! gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json"; then
+          if ! gcloud storage objects describe --format=none "$POOL_PRESSURE_LOGS/$build/finished.json" 2>/dev/null; then
             # Compared as Python ints, not by sort or awk: a build id is 19
             # digits, which a float rounds until neighbouring builds collide.
             # The one before it has to have finished too. An aborted build --
             # evicted pod, lost node -- publishes neither finished.json nor an
             # artifact, and reading it would write the sentinel and announce
             # that the periodic had stopped while it was minutes from
-            # publishing. Walking back costs one stat a build and lands on a
+            # publishing. Walking back costs one describe a build and lands on a
             # real reading, which ages on its own window_end if it is old.
             newest=$build
             build=""
             while read -r prior; do
-              if gsutil -q stat "$POOL_PRESSURE_LOGS/$prior/finished.json"; then build=$prior; break; fi
-            done < <(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
+              if gcloud storage objects describe --format=none "$POOL_PRESSURE_LOGS/$prior/finished.json" 2>/dev/null; then build=$prior; break; fi
+            done < <(gcloud storage ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
             # Nothing finished behind it: the periodic's first build is still
             # running, or every build in reach was aborted. Neither is the
             # periodic publishing nothing, so say nothing.
@@ -447,7 +450,7 @@ jobs:
           # so a crash publishes a 0-byte object that copies fine. Parsing is
           # the only check that catches it, and it costs nothing on the object
           # health.py is about to parse anyway.
-          if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
+          if ! gcloud storage cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
             || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' work/pool-pressure.json 2>/dev/null; then
             # The build finished and published nothing usable, so the periodic
             # is running and failing. Ageing `window_end` cannot catch
@@ -506,17 +509,17 @@ jobs:
         if: steps.collect.outcome == 'success'
         continue-on-error: true
         run: |
-          # `gsutil stat` exits 1 for a missing object and for a failed
-          # call alike, so the error text is read (as the health-history
-          # step below does).
+          # `gcloud storage objects describe` exits 1 for a missing object
+          # and for a failed call alike, so the error text is read (as the
+          # health-history step below does).
           prior=unreachable
           for attempt in 1 2 3; do
-            if gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json 2>gsutil.err; then prior=present; break; fi
-            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then prior=absent; break; fi
-            echo "::warning::attempt $attempt: could not download the prior store.json (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            if gcloud storage cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json 2>gcloud.err; then prior=present; break; fi
+            if grep -Eq "matched no objects|not found: 404" gcloud.err; then prior=absent; break; fi
+            echo "::warning::attempt $attempt: could not download the prior store.json (not a NotFound): $(tr '\n' ' ' <gcloud.err)"
             if [ "$attempt" -lt 3 ]; then sleep 15; fi
           done
-          rm -f gsutil.err
+          rm -f gcloud.err
           case "$prior" in
             absent) echo "no published store.json yet; reading the whole span" ;;
             unreachable)
@@ -549,8 +552,8 @@ jobs:
           service_account: ${{ env.CI_HEALTH_SA }}
 
       # Same as the reader's login above: make this credential the active
-      # account for gsutil (and the Chat token mint) too.
-      - name: Make the publisher credential active for gsutil
+      # account for the `gcloud storage` writes (and the Chat token mint) too.
+      - name: Make the publisher credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Fetch data.json (after a failed collect) and the last-posted state
@@ -562,18 +565,18 @@ jobs:
           # to be published; after a failed one it is whatever the bucket
           # holds, which the adjudicator ages against the clock.
           if [ "$COLLECT_OUTCOME" != "success" ]; then
-            gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+            gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/data.json
           fi
           # No state yet is the first tick, not an error.
-          gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
-          gsutil -q cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
           # The hourly seeded-fleet scan's latest document (the scan job
           # below); none yet means the scan has not run, and the adjudicator
           # then has no fixture_state to report.
-          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true
           # The same job's pool-state scan (pool-state.json); none yet means
           # it has not run, and there is no pool_state to report.
-          gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true
 
       - name: Adjudicate
         run: |
@@ -596,7 +599,7 @@ jobs:
 
       - name: Upload health.json next to data.json
         run: |
-          gsutil -q -h "Cache-Control: no-cache" cp work/health.json "$DASHBOARD_BUCKET/health.json"
+          gcloud storage cp --cache-control=no-cache work/health.json "$DASHBOARD_BUCKET/health.json"
 
       - name: Append this tick to health-history.jsonl
         continue-on-error: true
@@ -605,26 +608,27 @@ jobs:
           # object does not exist (the first tick) starts the feed empty; any
           # other failure -- a 5xx, a timeout, a permission denial -- stops
           # here, before an upload could replace the whole feed with one
-          # line. (`gsutil stat` cannot tell the two apart: it exits 1 for
-          # both, which is why the error text is read instead.)
+          # line. (`gcloud storage objects describe` cannot tell the two
+          # apart: it exits 1 for both, which is why the error text is read
+          # instead.)
           set +e
-          gsutil -q cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gsutil.err
+          gcloud storage cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gcloud.err
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
-            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then
+            if grep -Eq "matched no objects|not found: 404" gcloud.err; then
               echo "no health-history.jsonl yet; starting the feed"
               : > work/health-history.jsonl
             else
               echo "::warning::could not download health-history.jsonl (not a NotFound); not appending this tick:"
-              cat gsutil.err
-              rm -f gsutil.err
+              cat gcloud.err
+              rm -f gcloud.err
               exit 1
             fi
           fi
-          rm -f gsutil.err
+          rm -f gcloud.err
           python3 scripts/eval_dashboard/health_history.py --health work/health.json --history work/health-history.jsonl
-          if ! gsutil -q -h "Cache-Control: no-cache" cp work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
+          if ! gcloud storage cp --cache-control=no-cache work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
             echo "::warning::health-history.jsonl was not updated this tick"
             exit 1
           fi
@@ -782,7 +786,7 @@ jobs:
           store_args=()
           [ -f work/store.json ] && store_args+=(--store work/store.json)
           python3 scripts/eval_dashboard/weekly_email.py --data work/data.json "${store_args[@]}" --out work/health-email.html
-          gsutil -q -h "Cache-Control: no-cache" cp work/health-email.html "$DASHBOARD_BUCKET/health-email.html"
+          gcloud storage cp --cache-control=no-cache work/health-email.html "$DASHBOARD_BUCKET/health-email.html"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'
@@ -841,10 +845,11 @@ jobs:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.CI_HEALTH_SA }}
 
-      # The same login the tick does (its comment explains why): gsutil and
+      # The same login the tick does (its comment explains why): the
+      # `gcloud storage` writes and
       # `gcloud auth print-access-token --impersonate-service-account` both
-      # need the credential to be the active account.
-      - name: Make the publisher credential active for gsutil and gcloud
+      # take the credential from the active account.
+      - name: Make the publisher credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Fetch the previous scan
@@ -853,7 +858,7 @@ jobs:
           # The previous document rides along as `previous` in the new one,
           # which is how the adjudicator asks "drifted last scan too?" from
           # one file. None yet is the first scan.
-          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state-prior.json || echo "no previous fixture-state.json; first scan"
+          gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state-prior.json || echo "no previous fixture-state.json; first scan"
 
       # Never reds on what it finds: a project the publisher cannot read, a
       # missing grant, a hung API server are all "not checked" with a reason
@@ -871,7 +876,7 @@ jobs:
       - name: Upload fixture-state.json next to health.json
         id: fleet_upload
         run: |
-          gsutil -q -h "Cache-Control: no-cache" cp work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
+          gcloud storage cp --cache-control=no-cache work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
           python3 -c '
           import json
           doc = json.load(open("work/fixture-state.json"))
@@ -890,7 +895,7 @@ jobs:
       - name: Fetch the previous pool-state scan
         if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
-          gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
+          gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
 
       # Never reds on what it finds: a project the publisher cannot read, a
       # missing role, a hung API are all "not checked" with a reason in the
@@ -918,7 +923,7 @@ jobs:
         if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
           test -s work/pool-state.json || { echo "::error::the pool-state scan wrote no document"; exit 1; }
-          gsutil -q -h "Cache-Control: no-cache" cp work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"
+          gcloud storage cp --cache-control=no-cache work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"
           python3 -c '
           import json
           doc = json.load(open("work/pool-state.json"))

@@ -62,9 +62,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "k8s-api-proxy/go.mod"
-          # The module has no go.sum yet; turn the cache on with its first
-          # dependency.
-          cache: false
+          cache-dependency-path: "k8s-api-proxy/go.sum"
 
       - name: Check formatting
         if: steps.filter.outputs.k8sapiproxy == 'true'

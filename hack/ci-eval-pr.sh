@@ -538,7 +538,7 @@ fi
 # MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
 # CONTRACT: the dashboard must never break the job it observes, so every
 # failure mode -- the sibling dashboard PRs not merged yet (no
-# scripts/eval_dashboard/), the IAM grant not applied, a gsutil error, a
+# scripts/eval_dashboard/), the IAM grant not applied, a gcloud storage error, a
 # python crash, a hung upload -- logs exactly ONE
 # "eval-dashboard publish skipped: <reason>" line and never changes the job's
 # exit code.
@@ -624,14 +624,14 @@ publish_eval_dashboard() {
   local dash_tmp dash_rc=0
   dash_tmp="$(mktemp -d)" || { echo "eval-dashboard publish skipped: mktemp -d failed"; return 0; }
   # One timeout over the whole collect -> render -> publish pipeline so a hung
-  # gsutil cannot eat the job's tail. errexit lives inside the child only; out
+  # gcloud storage call cannot eat the job's tail. errexit lives inside the child only; out
   # here any failure becomes the one skip line. The array idiom is the
   # PROFILE_ROWS one above: no `timeout` binary (a laptop) must degrade to
   # running unbounded, not to breaking the trap.
   #
   # The budget must be LARGER than the 300s collect.py grants each individual
-  # gsutil call, or the one hung call the collector is willing to wait out
-  # kills the whole pipeline instead -- and the sweep is 1 + 3N gsutil
+  # gcloud storage call, or the one hung call the collector is willing to wait out
+  # kills the whole pipeline instead -- and the sweep is 1 + 3N gcloud storage
   # processes over every archived build (READ_WORKERS at a time), so it
   # needs real headroom on top. 900s covers both and only ever taxes the
   # nightly's tail (the gate
@@ -644,8 +644,8 @@ publish_eval_dashboard() {
   # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
   # The zero-runs floor between collect and render is the evidence_store
   # lesson (StoreUnreachable vs "empty store"): collect.py WARNS and
-  # continues when a gsutil listing fails, so a total source outage -- a 403
-  # before the read grant lands, no gsutil on PATH -- still yields a
+  # continues when a gcloud storage listing fails, so a total source outage -- a 403
+  # before the read grant lands, no gcloud on PATH -- still yields a
   # well-formed document with runs: [] and exit 0. Publishing that would
   # overwrite a good dashboard with an empty one and log success; the floor
   # turns it into the skip line instead.
@@ -667,9 +667,9 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     # keeps the page on the last read instead of blanking it.
     case "$3" in
       gs://*)
-        gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
-        gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
-        gsutil cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
+        gcloud storage cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
+        gcloud storage cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        gcloud storage cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
         ;;
       *)
         [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true
