@@ -40,9 +40,11 @@ const (
 	// the recorded channel, stamped at every learn and every boot adopt. A
 	// record another image confirmed is stale: the gateway this operator
 	// renders has not stood behind it yet, so it arms nothing and no post is
-	// dropped under a clear condition. Compared in full; a floating tag such
-	// as latest can name two images under one reference, which the compare
-	// cannot tell.
+	// dropped under a clear condition. Compared in full with the
+	// non-printable runes dropped, the form the condition prints, so the
+	// message never shows two equal images for an unequal compare; a
+	// floating tag such as latest can name two images under one reference,
+	// which the compare cannot tell.
 	homeChannelRecordReaderKey = "reader"
 
 	// slackHomeChannelPolicyAuto and slackHomeChannelPolicyManual are the
@@ -67,11 +69,13 @@ const (
 	// is echoed verbatim: the learned id is named only when it is a channel id
 	// within homeChannelRecordIDMax runes (Slack ids are about eleven, and the
 	// grammar alone has no upper bound), the reader image is cut to
-	// homeChannelRecordImageMax runes for display, and a refusal is one of the
-	// fixed words below, mapped to a fixed sentence.
-	homeChannelRecordIDMax     = 32
-	homeChannelRecordImageMax  = 160
-	homeChannelRecordMalformed = "<not a channel id>"
+	// homeChannelRecordImageMax runes for display with the ellipsis marking
+	// the cut, and a refusal is one of the fixed words below, mapped to a
+	// fixed sentence.
+	homeChannelRecordIDMax         = 32
+	homeChannelRecordImageMax      = 160
+	homeChannelRecordImageEllipsis = "..."
+	homeChannelRecordMalformed     = "<not a channel id>"
 
 	// homeChannelAdmitDelay is how long after the learn (slack.setAt) an
 	// otherwise admitted record reaches the agent. The channel reaches the
@@ -81,6 +85,10 @@ const (
 	// ("bridge-shutdown", 2026-10-28). The delay lets that conversation
 	// finish first; the reconcile requeues for the remainder. A record with
 	// no readable timestamp was not written by a learn and applies at once.
+	// A stamp ahead of this clock (a writer clock fast, a hand edit) waits
+	// until its own delay has passed, however far ahead that is: the
+	// condition names the time, and an admission never reverses while the
+	// record stands.
 	homeChannelAdmitDelay = 5 * time.Minute
 
 	// The refusal vocabulary the gateway writes into slack.refused.
@@ -124,9 +132,9 @@ type homeChannelRecord struct {
 	// recorded is the raw learned id, admitted or not, or
 	// homeChannelRecordMalformed when it is not a channel id.
 	recorded string
-	// reader is the image that last confirmed the record, compared in full;
-	// stale says it is not the one this operator renders for the gateway.
-	// readerShown is the copy the condition prints: printable runes only,
+	// reader is the image that last confirmed the record, printable runes
+	// only, compared in full; stale says it is not the one this operator
+	// renders for the gateway. readerShown is the copy the condition prints,
 	// cut for display.
 	reader      string
 	readerShown string
@@ -179,7 +187,7 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 		return rec
 	}
 	raw := strings.TrimSpace(cm.Data[homeChannelRecordSlackKey])
-	rec.reader = strings.TrimSpace(cm.Data[homeChannelRecordReaderKey])
+	rec.reader = printableRunes(strings.TrimSpace(cm.Data[homeChannelRecordReaderKey]))
 	rec.readerShown = boundedRunes(rec.reader, homeChannelRecordImageMax)
 	if reason := strings.TrimSpace(cm.Data[homeChannelRecordRefusedKey]); reason != "" {
 		rec.refused = homeChannelRefusedReasons[reason]
@@ -197,18 +205,14 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 		rec.recorded = homeChannelRecordMalformed
 		return rec
 	}
-	rec.stale = rec.reader != gatewayImage
+	rec.stale = rec.reader != printableRunes(gatewayImage)
 	if slackHomeChannelPolicy(agent) != slackHomeChannelPolicyAuto || rec.stale || rec.refused != "" {
 		return rec
 	}
-	if setAt, err := time.Parse(time.RFC3339, strings.TrimSpace(cm.Data[homeChannelRecordSetAtKey])); err == nil && now.Before(setAt.Add(homeChannelAdmitDelay)) {
+	setAt, err := time.Parse(time.RFC3339, strings.TrimSpace(cm.Data[homeChannelRecordSetAtKey]))
+	if err == nil && now.Before(setAt.Add(homeChannelAdmitDelay)) {
 		rec.pending = true
 		rec.appliesAt = setAt.Add(homeChannelAdmitDelay)
-		// A timestamp ahead of this clock (a skewed writer, a hand edit)
-		// waits the delay from now, never longer.
-		if cap := now.Add(homeChannelAdmitDelay); rec.appliesAt.After(cap) {
-			rec.appliesAt = cap
-		}
 		rec.appliesIn = rec.appliesAt.Sub(now)
 		return rec
 	}
@@ -216,20 +220,25 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 	return rec
 }
 
-// boundedRunes is s with its non-printable runes dropped (a hand-edited
-// record can carry a newline or a terminal escape) and cut to at most n runes.
+// printableRunes is s with its non-printable runes dropped: a hand-edited
+// record can carry a newline or a terminal escape.
+func printableRunes(s string) string {
+	return strings.Map(func(c rune) rune {
+		if unicode.IsPrint(c) {
+			return c
+		}
+		return -1
+	}, s)
+}
+
+// boundedRunes is s cut to at most n runes, the cut marked with
+// homeChannelRecordImageEllipsis as the tree's other status cuts mark theirs.
 func boundedRunes(s string, n int) string {
-	r := make([]rune, 0, n)
-	for _, c := range s {
-		if !unicode.IsPrint(c) {
-			continue
-		}
-		if len(r) == n {
-			break
-		}
-		r = append(r, c)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
 	}
-	return string(r)
+	return string(r[:n-len([]rune(homeChannelRecordImageEllipsis))]) + homeChannelRecordImageEllipsis
 }
 
 // homeChannelRecordFor reads the record from the cache, once per reconcile
