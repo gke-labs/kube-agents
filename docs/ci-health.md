@@ -159,7 +159,7 @@ wave (15+ repetitions across 3+ pull requests, among the runs that finished in
 the last 2 hours, ended at the harness's delegation wait with the worker still
 running, #1874; the dispatcher stall of #1879 is its usual cause, and it ranks
 below a storm because a 429-starved worker hits the same wait; the storm
-also needs the pool's peak hourly Vertex 429 share to clear 5 % over the hours
+also needs the pool's peak hourly Vertex 429 share to clear 10 % over the hours
 those runs spent on their calls, when the 429 reading below covers them; a
 reading that does not, and no reading, leaves the runs to decide and the
 evidence says the storm is unconfirmed), or setup

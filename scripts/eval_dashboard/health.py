@@ -224,15 +224,17 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # Rule 2's evidence outside the runs (scripts/eval_dashboard/vertex_429.py):
 # the pool-wide share of Vertex AI calls that returned 429, in ten-minute
 # buckets. The reps' own phrasings cannot tell a quota storm from a batch of
-# teardown deaths (2026-09-24: five ceiling runs' teardown read as a storm at
-# a 1-5 % pool rate; a real storm runs 6-30 %). A storm needs the peak
+# teardown deaths. The bar is a confirmation, not a trigger: the reps must
+# fire too. Over the 42 days to 2026-10-28 the pool's hourly share cleared
+# 5 % on 25 days (a quiet afternoon peaks near 6 %), 10 % on 14 days and
+# 20 % on 6 (the 2026-10-08 storm ran 25-27 %). A storm needs the peak
 # hourly share over STORM_429_MIN_RATE in the window the hit runs spent on
 # their model calls; a reading older than VERTEX_429_MAX_AGE, one that does
 # not cover those hours (a hit run finishes up to STORM_429_LOOKBACK after
 # the burst that killed it, so the reader looks back STORM_WINDOW further
 # than that), or one with fewer than STORM_429_MIN_REQUESTS calls in its
 # best hour, confirms nothing and the rule stands as before, saying so.
-STORM_429_MIN_RATE = 0.05
+STORM_429_MIN_RATE = 0.10
 STORM_429_MIN_REQUESTS = 200
 STORM_429_HOUR = timedelta(hours=1)
 # How far before the first hit run's finish its model calls reach.

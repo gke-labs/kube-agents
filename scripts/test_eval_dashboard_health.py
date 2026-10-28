@@ -443,10 +443,10 @@ class Storm(unittest.TestCase):
         # The same reps under a 2 % pool share: infra deaths, not a quota storm.
         denied = self.judge(doc, self.reading(0.02))
         self.assertEqual((denied["state"], denied["condition"]), ("GREEN", None))
-        self.assertTrue(any("under the 5 % a storm needs: infra deaths, not a quota storm" in line for line in denied["evidence"]), denied["evidence"])
+        self.assertTrue(any("under the 10 % a storm needs: infra deaths, not a quota storm" in line for line in denied["evidence"]), denied["evidence"])
         self.assertEqual("storm" in denied["open_conditions"], False)
         # Exactly the threshold confirms.
-        self.assertEqual(self.judge(doc, self.reading(0.05))["condition"], "storm")
+        self.assertEqual(self.judge(doc, self.reading(0.10))["condition"], "storm")
 
     def test_a_reading_that_cannot_judge_leaves_the_rule_to_the_runs(self):
         doc = self.stormy([1, 2, 3], 6)
