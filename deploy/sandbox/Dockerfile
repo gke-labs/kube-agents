@@ -155,10 +155,15 @@ RUN pip install --no-cache-dir pyyaml requests
 # costing ~0.85s of CPU per command in the shell.
 # Precompiled bytecode is baked into /usr/local/lib/python3.14/ and never touches
 # /opt/defaults, so PYTHONDONTWRITEBYTECODE=1 can safely stay.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# An `-o` or `-oN` would write `.opt-N.pyc` files that nothing loads, quietly
+# putting the runtime back to compiling from source.
 RUN STDLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
     [ -d "$STDLIB" ] && \
     { python3 -m compileall -q -j 0 "$STDLIB" || true; } && \
-    [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
+    [ "$(find "$STDLIB" -name '*.pyc' ! -name '*.opt-*.pyc' | head -500 | wc -l)" -ge 500 ]
 
 # A real git with no credential and no way to reach a host.
 #

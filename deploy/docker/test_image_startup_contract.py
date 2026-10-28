@@ -49,6 +49,13 @@ MANIFESTS_GO = (
 # operator's diverge, the agent starts in a directory its own shims reject.
 DEFAULT_AGENT_HOME = "/opt/data"
 
+# Flags to python -m compileall that request optimized bytecode (.opt-1.pyc or
+# .opt-2.pyc). Neither runtime image sets PYTHONOPTIMIZE or -O, so producing
+# optimized bytecode leaves the interpreter with no valid cache and forces it
+# back to compiling from source on every import. Matches both separated (-o 1,
+# --optimize 1, --optimize=1) and attached (-o1, -qo1) flag forms.
+OPTIMIZE_FLAG_RE = r"\s-o\d*\b|\s-[a-z]*o\d*|\s--optimize\b"
+
 
 def stage_body(dockerfile_text: str, target: str) -> str:
     """The Dockerfile text belonging to one `FROM … AS <target>` stage."""
@@ -598,9 +605,7 @@ class BytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
         # The runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
         # plain .cpython-NNN.pyc. An `-o` here would write .opt-N files that
         # nothing loads.
-        self.assertNotRegex(
-            self.compileall_command(), r"\s-o\b|\s--optimize\b"
-        )
+        self.assertNotRegex(self.compileall_command(), OPTIMIZE_FLAG_RE)
 
     def test_a_module_that_will_not_compile_does_not_break_the_build(self):
         # Large vendored trees carry the odd file that cannot be compiled. The
@@ -640,9 +645,15 @@ class SandboxBytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
         self.assertIn("python3 -m compileall", self.compileall_command())
 
     def test_it_does_not_ask_for_optimized_bytecode(self):
-        self.assertNotRegex(
-            self.compileall_command(), r"\s-o\b|\s--optimize\b"
-        )
+        self.assertNotRegex(self.compileall_command(), OPTIMIZE_FLAG_RE)
+
+    def test_optimize_flag_regex_rejects_attached_and_separated_forms(self):
+        for flag in ("-o 1", "-o1", "-o2", "-qo1", "--optimize=1", "--optimize 1", "--optimize"):
+            with self.subTest(flag=flag):
+                self.assertRegex(f"python3 -m compileall {flag} /path", OPTIMIZE_FLAG_RE)
+        for valid in ("-q -j 0", "-j0", "--invalidation-mode=timestamp"):
+            with self.subTest(valid=valid):
+                self.assertNotRegex(f"python3 -m compileall {valid} /path", OPTIMIZE_FLAG_RE)
 
     def test_it_verifies_minimum_pyc_count(self):
         self.assertRegex(self.compileall_command(), r"find\s+.*\.pyc.*-ge\s+\d+")
