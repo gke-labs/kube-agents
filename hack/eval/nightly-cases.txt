@@ -952,10 +952,12 @@
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
 # named the wrong facet, or (once) a tool error. The Claude nightlies pass
-# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
-# lands, and the case passes the roster's bar, 90% over 20 runs, on the
-# Gemini nightly (#3598). The domain's roster seat is consistency-drift-outlier
-# since 2026-10-26.
+# it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
+# 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
+# reverted (#4116), so a presubmit seat could not fail when the fix is undone:
+# the case stays nightly by decision (#3605), where the today lane grades its
+# route check. The domain's roster seat is consistency-drift-outlier since
+# 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change

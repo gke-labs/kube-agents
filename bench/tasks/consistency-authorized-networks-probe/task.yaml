@@ -5,9 +5,11 @@
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} as
 # configured or open); `consistency` was on the coverage allowlist in
 # docs/designs/domains.yaml from then until consistency-drift-outlier took
-# the domain's roster seat on 2026-10-26. This case returns after #3448
-# merges, the agent-side fix (#3605) lands and it passes the roster's bar on
-# the Gemini nightly.
+# the domain's roster seat on 2026-10-26. The agent-side fix landed in #3609
+# (2026-10-23); the case stays nightly by decision (#3605): with that route
+# reverted it still passed 10/10 on the inject lane (#4116), where the route
+# check is set aside, so a presubmit seat could not fail when the fix is
+# undone. The today lane grades the route.
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
@@ -103,9 +105,10 @@ verification_spec:
       any_of_phrases:
         ["authorized network", "authorizednetworks", "authorized-networks"]
   # The route (#3605, #3609): the comparison is the drift collector's run.
-  # Graded on api-lane runs (the nightly, where this case lives since #3598);
-  # an inject-lane run sets worker_commands checks aside as not applicable
-  # (#2039), so there the reply check alone grades. Same shape as
+  # Graded on api-lane runs only (the today lanes, which grade over the
+  # agent API); an inject-lane run (the blocking presubmit since #3156, the
+  # main nightly since #3783) sets worker_commands checks aside as not
+  # applicable (#2039), so there the reply check alone grades. Same shape as
   # drift-chat-request-runs-collector's the-drift-collector-ran.
   - name: the-comparison-ran-the-drift-collector
     role: objective

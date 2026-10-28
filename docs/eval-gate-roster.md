@@ -153,8 +153,19 @@ with a filed issue naming the exit condition:
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
   list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal left
   `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
-  consistency-drift-outlier took a roster seat on 2026-10-26 (below). Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
-  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
+  consistency-drift-outlier took a roster seat on 2026-10-26 (below). The agent-side fix landed
+  in [#3609](https://github.com/gke-labs/kube-agents/pull/3609) on 2026-10-23: a named-cluster
+  comparison starts with the drift collector, whose rule reads the leftover block as off, and a
+  second objective grades that the collector ran; #3448 was closed unmerged on 2026-10-26.
+  Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26, agent on
+  Claude): 9/9 scored on the inject lane and 10/10 on the api lane with the route objective
+  graded. Its roster line was withdrawn the same week
+  ([#3605](https://github.com/gke-labs/kube-agents/issues/3605)): with #3609's route reverted the
+  probe still passed 10/10 on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
+  2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
+  current models read the block correctly on their own, so a presubmit seat could not fail when
+  the fix it guards is undone. It stays a nightly case, where the today lane grades the route;
+  the domain's seat is consistency-drift-outlier's.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
