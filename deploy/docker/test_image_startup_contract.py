@@ -658,7 +658,12 @@ class SandboxBytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
                 self.assertNotRegex(f"python3 -m compileall {valid} /path", OPTIMIZE_FLAG_RE)
 
     def test_it_verifies_minimum_pyc_count(self):
-        self.assertRegex(self.compileall_command(), r"find\s+.*\.pyc.*-ge\s+\d+")
+        cmd = self.compileall_command()
+        self.assertRegex(cmd, r"find\s+.*\.pyc.*-ge\s+\d+")
+        # The count must not be satisfiable by .opt-N files, which the runtime
+        # never loads. This exclusion is the one guard that covers every route
+        # to them (-o, -oN, -O, PYTHONOPTIMIZE), not only the flag the regex sees.
+        self.assertIn("! -name '*.opt-*.pyc'", cmd)
 
 
 class BytecodePremiseTest(unittest.TestCase):
