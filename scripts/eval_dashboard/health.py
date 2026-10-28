@@ -2868,10 +2868,14 @@ def adjudicate(
         "advice": advice,
         "recovering": decided["recovering"],
         "open_conditions": assessed["open_conditions"],
-        # Rule 2's evidence: the pool's peak hourly Vertex 429 share over the
-        # storm's hours when a fresh reading exists, else why not.
+        # Rule 2's evidence: how much of the pool the Vertex 429 reading
+        # covered, and its peak hourly share over the storm's hours when it
+        # can judge, else why not.
         VERTEX_429_KEY: {
             "read": assessed["vertex_429"]["read"],
+            "read_at": assessed["vertex_429"]["read_at"],
+            "projects_read": assessed["vertex_429"]["projects_read"],
+            "projects_failed": assessed["vertex_429"]["projects_failed"],
             "peak": assessed["vertex_429"]["peak"],
             "requests": assessed["vertex_429"]["requests"],
             "hour_end": iso(assessed["vertex_429"]["hour_end"]),

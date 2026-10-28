@@ -468,6 +468,9 @@ class Storm(unittest.TestCase):
         quiet = self.judge(self.stormy([1, 2], 6), self.reading(0.5))
         self.assertEqual((quiet["state"], quiet["vertex_429"]["read"], quiet["vertex_429"]["peak"], quiet["vertex_429"]["projects_read"]), ("GREEN", True, 0.5, 1))
         self.assertEqual(self.judge(self.stormy([1, 2], 6), None)["vertex_429"], {"read": False, "peak": None, "requests": 0, "hour_end": None, "reason": "no Vertex 429 reading", "read_at": None, "projects_read": 0, "projects_failed": 0})
+        # health.json carries the coverage too, so a refused grant shows on a quiet day.
+        published = health.adjudicate(self.stormy([1, 2], 6), T0, None, health.Roster.fixed(ADMITTED), vertex_429=dict(self.reading(0.5), read=[], errors={"p": "HTTP 403", "q": "HTTP 403"}))["vertex_429"]
+        self.assertEqual((published["read"], published["read_at"], published["projects_read"], published["projects_failed"], published["reason"]), (False, health.iso(T0), 0, 2, "the Vertex 429 reading covered no project (HTTP 403)"))
         self.assertIn("quota storm: 18 infra/empty-record reps across 3 PRs", result["evidence"][0])
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
