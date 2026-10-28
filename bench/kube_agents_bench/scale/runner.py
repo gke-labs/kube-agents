@@ -66,6 +66,9 @@ TOKEN_FITS = ("tokens_input", "tokens_output", "tokens_cached", "run_tokens_inpu
 STALL_WATCH_PERIOD_SECONDS = 1800
 STALL_WATCH_BASE_SECONDS = 120
 STALL_WATCH_SECONDS_PER_CLUSTER = 30
+# A trigger_soak's jobs: the slowest one's run time and how many completed, both read after the drain.
+JOB_SECONDS_METRIC = "job_seconds"
+JOBS_COMPLETED_METRIC = "jobs_completed"
 STALL_WATCH_NOTE = "the Stall Watch's half-hourly read of every cluster overlapped the run"
 # The operation kinds whose windows are shorter than the period; an hour-long soak holds two ticks every time.
 STALL_WATCH_KINDS = ("prompt", "restart_soak")
@@ -641,6 +644,7 @@ class Runner:
                     records.merge(self.data_file, [record])
                     if spec.operation.kind == TRIGGER_SOAK_KIND:
                         self.drain_jobs(spec.operation, record.started)
+                        record.metrics += self.job_metrics(spec.operation, record.started)
                     awaiting.append((time.time(), record))
                     awaiting = self.flush_peaks(awaiting, wait=False)
                     self.backfill_peaks(skip={pending.key for _, pending in awaiting})
@@ -668,6 +672,18 @@ class Runner:
                 return
             LOG.info("waiting for %s to finish before the next run", ", ".join(active))
             time.sleep(DRAIN_POLL_SECONDS)
+
+    def job_metrics(self, op: Operation, since: str) -> list[records.Metric]:
+        """How long the slowest job the run started took, and how many completed, read after the drain."""
+        try:
+            durations = operations.job_seconds(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
+        except kube.CommandError as exc:
+            LOG.warning("could not read how long the jobs took: %s", exc)
+            return []
+        metrics = [records.Metric(JOBS_COMPLETED_METRIC, float(len(durations)))]
+        if durations:
+            metrics.append(records.Metric(JOB_SECONDS_METRIC, max(durations.values())))
+        return metrics
 
     def carried_work(self) -> tuple[list[str], list[str]]:
         """Notes and fit exclusions for a run that jobs the latest trigger_soak started are still loading.

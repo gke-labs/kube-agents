@@ -115,6 +115,9 @@ RUN_SLOT_REFUSALS = "run_slot_refusals"
 FAILED_PROMPTS = "failed_prompts"
 UNFINISHED_PROMPTS = "unfinished_prompts"
 RESPONSE = "response_seconds"
+# How long the slowest job a triggered window started took to run.
+JOB_SECONDS = "job_seconds"
+JOBS_COMPLETED = "jobs_completed"
 TOKENS_INPUT = "tokens_input"
 TOKENS_OUTPUT = "tokens_output"
 TOKENS_CACHED = "tokens_cached"
@@ -338,6 +341,8 @@ METRICS = MappingProxyType(
         FAILED_PROMPTS: MetricSpec("Failed prompts"),
         UNFINISHED_PROMPTS: MetricSpec("Prompts answered without the operation"),
         RESPONSE: MetricSpec("Response time", "s"),
+        JOB_SECONDS: MetricSpec("Scheduled job run time", "s"),
+        JOBS_COMPLETED: MetricSpec("Scheduled jobs completed"),
         TOKENS_INPUT: MetricSpec("Input tokens, every caller (whole prompt)"),
         TOKENS_OUTPUT: MetricSpec("Output tokens, every caller"),
         TOKENS_CACHED: MetricSpec("Cached tokens, every caller"),
@@ -1564,11 +1569,24 @@ def install_plan(
 
 
 @dataclass(frozen=True)
+class MeasuredShare:
+    """One run's reading as a share of the same threshold the line uses."""
+
+    clusters: float
+    share: float
+    key: str
+    excluded: bool
+
+
+@dataclass(frozen=True)
 class BottleneckSeries:
     label: str
     clusters: tuple[float, ...]
     # The prediction as a share of the threshold: 1.0 is the limit.
     shares: tuple[float, ...]
+    # The whole fleet at each point, for the tooltip.
+    fleets: tuple[dict[str, float], ...] = ()
+    measured: tuple[MeasuredShare, ...] = ()
 
 
 def bottleneck_series(
@@ -1590,13 +1608,26 @@ def bottleneck_series(
         if not threshold:
             continue
         shares = []
-        for clusters in counts:
-            prediction = predict(records, metric, container, scaled_fleet(fleet, clusters))
+        fleets = tuple(scaled_fleet(fleet, clusters) for clusters in counts)
+        for point in fleets:
+            prediction = predict(records, metric, container, point)
             shares.append(prediction.value / threshold if prediction else math.nan)
         if all(math.isnan(share) for share in shares):
             continue
+        measured = tuple(
+            MeasuredShare(
+                record.totals[CLUSTERS],
+                value / threshold,
+                record.key,
+                record.excluded(metric) or capped(record, metric, container),
+            )
+            for record in records
+            if record.totals.get(CLUSTERS) and (value := record.value(metric, container)) is not None
+        )
         name = metric_spec(metric).label
-        series.append(BottleneckSeries(f"{name} · {container}" if container else name, counts, tuple(shares)))
+        series.append(
+            BottleneckSeries(f"{name} · {container}" if container else name, counts, tuple(shares), fleets, measured)
+        )
     return series
 
 

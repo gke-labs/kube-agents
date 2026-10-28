@@ -16,6 +16,13 @@ from admin_console.harness_limits import (
     LIMIT_LABEL,
     PREDICTED_LABEL,
     TWO_POINT_LABEL,
+    CHURN,
+    CLUSTERS,
+    CONCURRENT,
+    FAILING_PODS,
+    LISTING_PODS,
+    NODES,
+    OBJECTS,
     BottleneckSeries,
     FleetProfile,
     MetricChart,
@@ -45,6 +52,8 @@ LIMIT_SHARE_LABEL = "limit"
 MEASURED_RANGE_LABEL = "measured"
 MEASURED_RANGE_OPACITY = 0.12
 PROFILE_LINE_WIDTH = 1
+MEASURED_KEY = "measured run"
+BOTTLENECK_TICKS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
 
 
 def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
@@ -420,34 +429,72 @@ def harness_limit_chart(chart: MetricChart, colors: Mapping[str | None, str]) ->
     return _base_layout(figure, height=HARNESS_CHART_HEIGHT)
 
 
+def _fleet_hover(fleet: Mapping[str, float]) -> str:
+    """The fleet behind one point of the bottleneck chart, as tooltip lines."""
+    clusters = fleet[CLUSTERS]
+    return "<br>".join(
+        (
+            f"{clusters:,.0f} clusters, {clusters * fleet[NODES]:,.0f} nodes ({fleet[NODES]:.1f} per cluster)",
+            f"{clusters * fleet[OBJECTS]:,.0f} objects ({fleet[OBJECTS]:,.0f} per cluster)",
+            f"{fleet[CHURN]:,.0f} Pods created per minute, {fleet[FAILING_PODS]:,.0f} failing at once",
+            f"{fleet[CONCURRENT]:,.0f} concurrent requests, {fleet[LISTING_PODS]:,.0f} Pods in the largest listing",
+        )
+    )
+
+
 def bottleneck_chart(
     series: list[BottleneckSeries],
     profiles: tuple[FleetProfile, ...],
     measured: float,
     fleet_clusters: float,
     colors: list[str],
+    nodes_per_cluster: float,
+    log_axis: bool = True,
 ) -> go.Figure:
-    """Each key check against its limit as the fleet grows, with the example fleet sizes marked."""
+    """Each key check against its limit as the fleet grows, with the runs and the example fleets marked."""
     figure = go.Figure()
     for index, item in enumerate(series):
+        color = colors[index % len(colors)]
+        label = escape(item.label)
         figure.add_trace(
             go.Scatter(
                 x=list(item.clusters),
                 y=list(item.shares),
                 mode="lines",
                 name=item.label,
-                line={"color": colors[index % len(colors)], "width": HARNESS_LINE_WIDTH},
-                hovertemplate=(
-                    f"<b>{escape(item.label)}</b><br>%{{x:,.0f}} clusters · %{{y:.0%}} of its limit"
-                    "<extra></extra>"
-                ),
+                legendgroup=item.label,
+                line={"color": color, "width": HARNESS_LINE_WIDTH},
+                customdata=[_fleet_hover(fleet) for fleet in item.fleets],
+                hovertemplate=f"<b>{label}</b>: %{{y:.0%}} of its limit<br>%{{customdata}}<extra></extra>",
             )
         )
+        for excluded in (False, True):
+            points = [point for point in item.measured if point.excluded is excluded]
+            if not points:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=[point.clusters for point in points],
+                    y=[point.share for point in points],
+                    mode="markers",
+                    name=f"{item.label} (measured)",
+                    legendgroup=item.label,
+                    showlegend=False,
+                    marker={"color": color, "size": HARNESS_MARKER_SIZE, "symbol": EXCLUDED_SYMBOL if excluded else MEASURED_SYMBOL},
+                    customdata=[point.key for point in points],
+                    hovertemplate=(
+                        f"<b>{label}</b>, measured: %{{y:.0%}} of the limit<br>%{{x:,.0f}} clusters · %{{customdata}}"
+                        + (f" ({EXCLUDED_LABEL})" if excluded else "")
+                        + "<extra></extra>"
+                    ),
+                )
+            )
     first = series[0].clusters[0] if series else LIMIT_SHARE
     # On a log axis, shapes take data values and annotations take their logarithm.
+    position = math.log10 if log_axis else (lambda value: value)
     figure.add_vrect(x0=first, x1=max(measured, first), fillcolor=PALETTE.neutral, opacity=MEASURED_RANGE_OPACITY, line_width=0)
     figure.add_annotation(
-        x=math.log10(max(measured, first)), y=1, xref="x", yref="paper", text=MEASURED_RANGE_LABEL,
+        x=position(max(measured, first)), y=1, xref="x", yref="paper", text=MEASURED_RANGE_LABEL,
         showarrow=False, xanchor="right", yanchor="top", font={"color": TEXT},
     )
     figure.add_hline(
@@ -463,7 +510,7 @@ def bottleneck_chart(
             line={"color": PALETTE.neutral, "width": PROFILE_LINE_WIDTH, "dash": PREDICTION_DASH},
         )
         figure.add_annotation(
-            x=math.log10(profile.clusters), y=1, xref="x", yref="paper", text=escape(profile.name),
+            x=position(profile.clusters), y=1, xref="x", yref="paper", text=escape(profile.name),
             showarrow=False, yanchor="bottom", font={"color": TEXT},
         )
     figure.add_vline(
@@ -471,7 +518,17 @@ def bottleneck_chart(
         line={"color": PALETTE.accent, "width": HARNESS_LINE_WIDTH, "dash": FLEET_DASH},
     )
     _style_key(figure, FLEET_LABEL, dash=FLEET_DASH)
-    figure.update_xaxes(title="Clusters", type="log", showgrid=True, gridcolor=GRID, zeroline=False)
+    _style_key(figure, MEASURED_KEY, symbol=MEASURED_SYMBOL)
+    ticks = [value for value in BOTTLENECK_TICKS if first <= value <= series[0].clusters[-1]] if series else []
+    figure.update_xaxes(
+        title="Clusters, and the nodes they hold",
+        type="log" if log_axis else "linear",
+        tickvals=ticks,
+        ticktext=[f"{value:,.0f}<br>{value * nodes_per_cluster:,.0f} nodes" for value in ticks],
+        showgrid=True,
+        gridcolor=GRID,
+        zeroline=False,
+    )
     figure.update_yaxes(
         title="Share of the limit",
         tickformat=".0%",

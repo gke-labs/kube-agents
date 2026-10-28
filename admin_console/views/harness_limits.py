@@ -44,10 +44,18 @@ NEED_CAPTION = (
     "the keys they set. On Autopilot, set the requests to these values."
 )
 BOTTLENECK_CAPTION = (
-    "Each line is a prediction against the default limit, for this fleet's cluster shape at every "
-    "size. A line above 100% is past its limit. The shaded range is measured; the rest is predicted "
-    "from straight lines, and a queue grows faster than a straight line once it fills. Dashed lines "
-    "mark the example fleets."
+    "Each line is a container's or the broker's predicted peak as a share of its limit, for this "
+    "fleet's cluster shape at every size; above 100% it is past the limit. Dots are measured runs "
+    "(open dots are left out of the fit). The shaded range is measured, the rest predicted; dashed "
+    "lines mark the example fleets. Hover a line for the whole fleet at that point."
+)
+CURVE_NOTE = (
+    "Why the lines curve upward: they are not exponential. The model is a straight line in each "
+    "input, a base plus a cost per cluster, per Pod created per minute and per failing Pod, and the "
+    "last two grow with the fleet. The axis is logarithmic, so a straight line bends upward on it. "
+    "Turn the logarithmic axis off to see the lines straight. A real queue, such as the broker's "
+    "8 command slots, grows faster than a straight line once it fills, so past the measured range "
+    "the lines are a lower bound."
 )
 CHART_CAPTION = (
     "Filled points are runs; open points are left out of the fit (a failed or declined prompt, work "
@@ -206,6 +214,7 @@ table(hl.unfixable_rows(hl.threshold_checks(records, plan.fleet, containers)))
 
 st.divider()
 section_title("Why: the limits as the fleet grows", BOTTLENECK_CAPTION)
+log_axis = st.toggle("Logarithmic axis", value=True, key=f"{KEY_PREFIX}:log_axis")
 st.plotly_chart(
     bottleneck_chart(
         hl.bottleneck_series(records, fleet, limits),
@@ -213,11 +222,14 @@ st.plotly_chart(
         hl.measured_clusters(records),
         fleet[hl.CLUSTERS],
         PALETTE.series_colors,
+        fleet[hl.NODES],
+        log_axis,
     ),
     width="stretch",
     config=CHART_CONFIG,
-    key=f"{KEY_PREFIX}:bottlenecks:{scope}",
+    key=f"{KEY_PREFIX}:bottlenecks:{scope}:{log_axis}",
 )
+st.caption(CURVE_NOTE)
 
 with st.expander("Measured runs"):
     operation_column, factor_column = st.columns(2)
