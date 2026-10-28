@@ -2942,6 +2942,9 @@ stringData:
                   "chat.console.*.out",
                   "_INBOX.console.>"
                 ]
+                deny = [
+                  "a2a.cap.>"
+                ]
               }
             }
           }
