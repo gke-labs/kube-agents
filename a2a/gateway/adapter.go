@@ -574,6 +574,23 @@ type ConversationState struct {
 	// it. Nil when the stream was not read, when no turn published usage,
 	// and when a link's stream could not be read. Each executor publishes a
 	// turn's usage before its terminal, so a read that shows the root final
-	// carries all of it.
+	// carries all of it. Set only on a probe whose context asked for it
+	// (withChainUsage): summing a chain reads one stream per link, which a
+	// caller polling the read route has no use for on every poll.
 	Usage *lib.Usage
+}
+
+// chainUsageKey marks a probe's context as asking for
+// ConversationState.Usage (withChainUsage).
+type chainUsageKey struct{}
+
+// withChainUsage asks the probe run under ctx to sum the front door's usage.
+func withChainUsage(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chainUsageKey{}, true)
+}
+
+// chainUsageAsked reports whether ctx asks the probe for usage.
+func chainUsageAsked(ctx context.Context) bool {
+	asked, _ := ctx.Value(chainUsageKey{}).(bool)
+	return asked
 }

@@ -118,6 +118,12 @@ const (
 	// costs, so it gets a turn's bound.
 	probeParam   = "probe"
 	probeTimeout = turnTimeout
+	// usageParam=usageChain asks a probed read for the front door's usage
+	// (ConversationState.Usage). The per-poll probe leaves it out because
+	// summing a delegation chain reads one stream per link; a caller asks
+	// once, after the terminal.
+	usageParam = "usage"
+	usageChain = "chain"
 
 	// injectSeenCap bounds the dedupe memory for accepted POSTs, keyed by
 	// the caller's backend message id -- the same shape and size as the
@@ -480,10 +486,11 @@ type probeReport struct {
 	// Usage is what the front door's own turns cost at the read
 	// (ConversationState.Usage): the task's usage parts summed with, for a
 	// delegation chain's root, every wake's that continued it, and never a
-	// child's. Absent when no turn published usage, when a stream could not
-	// be read, and on a door older than the field. A read that shows the
-	// task final carries every turn's, since each executor publishes a
-	// turn's usage before its terminal.
+	// child's. Present only on a read that asked for it (usageParam), and
+	// absent then when no turn published usage, when a stream could not be
+	// read, and on a door older than the field. A read after the terminal
+	// carries every turn's, since each executor publishes a turn's usage
+	// before its terminal.
 	Usage *lib.Usage `json:"usage,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
@@ -1825,6 +1832,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 		wait = injectMaxWait
 	}
 	taskID := r.URL.Query().Get("task")
+	chainUsage := r.URL.Query().Get(usageParam) == usageChain
 	probeAsked, err := intParam(r, probeParam)
 	if err != nil {
 		injectError(w, http.StatusBadRequest, err.Error())
@@ -1832,7 +1840,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 	}
 	var probed *probeReport
 	if probeAsked != 0 {
-		probed = a.runProbe(r.Context(), key, taskID)
+		probed = a.runProbe(r.Context(), key, taskID, chainUsage)
 		probed.LastPost = a.lastPost(key)
 		if probed.Final {
 			// A terminal on the stream is the answer; nothing the relay
@@ -1850,7 +1858,7 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 			if probeAsked != 0 && waited {
 				// Time moved on under the wait; the probe has to describe
 				// where the stream is now, beside the entries that are.
-				probed = a.runProbe(r.Context(), key, taskID)
+				probed = a.runProbe(r.Context(), key, taskID, chainUsage)
 				probed.LastPost = a.lastPost(key)
 			}
 			writeJSON(w, http.StatusOK, conversationResponse{
@@ -1881,9 +1889,12 @@ func (a *InjectAdapter) handleConversation(w http.ResponseWriter, r *http.Reques
 // Never a failure status: the transcript half of the reply is good whatever
 // the probe found, and a caller reads "could not look" out of the report's
 // error rather than out of a 5xx it would retry the whole poll for.
-func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probeReport {
+func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string, chainUsage bool) *probeReport {
 	if a.probe == nil {
 		return &probeReport{Error: "the gateway offered this door no probe"}
+	}
+	if chainUsage {
+		ctx = withChainUsage(ctx)
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()

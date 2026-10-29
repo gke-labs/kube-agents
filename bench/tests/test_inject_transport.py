@@ -221,7 +221,8 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
         probe: dict[str, Any] | None = None
         if probed:
             self.server.calls.append("probe" if self.server.submissions else "preflight")
-            probe = self.server.probe_report(task)
+            chain = query.get(inject.USAGE_PARAM, [""])[0] == inject.USAGE_CHAIN
+            probe = self.server.probe_report(task, chain)
         fresh = [e for e in self.server.entries if e["seq"] > after]
         # The gateway serves at most what it has; a page cap is what makes the
         # `after` contract worth testing at all.
@@ -326,9 +327,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # The conversation's contextId, which the door reports from the session
     # record on every probed read; "" is a door older than the field.
     probe_context_id: str = ""
-    # The task's usage as a door that reports it carries it on a read that
-    # names the task (``usage``); None is a door older than the field, or a
-    # turn that published none, and sends no key.
+    # The front door's usage as a door that reports it carries it on a read
+    # that names the task and asks (``usage=chain``); None is a door older
+    # than the field, or a turn that published none, and sends no key.
     probe_usage: dict[str, Any] | None = None
 
     def poll_fails(self) -> bool:
@@ -344,7 +345,7 @@ class _StubGatewayServer(ThreadingHTTPServer):
         self.failed_polls += 1
         return True
 
-    def probe_report(self, task: str = "") -> dict[str, Any]:
+    def probe_report(self, task: str = "", chain: bool = False) -> dict[str, Any]:
         self.probed_reads += 1
         finished = any(
             e["kind"] == inject.ENTRY_TERMINAL and e.get("taskId") == self.task_id
@@ -371,7 +372,7 @@ class _StubGatewayServer(ThreadingHTTPServer):
                 report["activityDropped"] = self.probe_activity_dropped
             if self.probe_progress:
                 report["progress"] = self.probe_progress
-        if self.probe_usage is not None and task == self.task_id:
+        if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
         if active:
@@ -3344,56 +3345,45 @@ def test_usage_with_no_readable_count_leaves_the_buckets_null() -> None:
     assert harness._inject_tokens({"input": 1200, "output": None})["total"] == 1200
 
 
-def test_usage_is_read_again_after_a_terminal_its_probe_predates(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The door probes before it snapshots the transcript, so the read that
-    carries the relay's terminal can hold a probe from before the executor's
-    terminal, and before the usage published ahead of it. One more probed
-    read follows the terminal and carries it; a wait whose probe already
-    showed the task final makes no such read."""
+def test_usage_is_read_once_after_the_terminal_and_asks_for_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-poll probe carries no usage; once the relay's terminal ends the
+    wait, one probed read asks the door for the chain's sum
+    (``usage=chain``) and the fold takes it from that read alone."""
     task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
     monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
-    reads: list[bool] = []
+    polls = iter([
+        {
+            "entries": running_transcript("task-1"),
+            "lastSeq": 3,
+            "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
+        },
+        {
+            "entries": [
+                entry(4, inject.ENTRY_POST, text="done", messageId=RESULT_ID),
+                entry(5, inject.ENTRY_TERMINAL, taskId="task-1", state="completed",
+                      source=inject.TERMINAL_SOURCE_EXECUTOR),
+            ],
+            "lastSeq": 5,
+            "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
+        },
+    ])
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: next(polls))
+    asked: list[str] = []
 
-    def scripted(bodies: list[dict[str, Any]]):
-        replies = list(bodies)
+    def request(url: str, timeout: float, token: str, payload: Any = None) -> dict[str, Any]:
+        asked.append(url)
+        return probe_body(final=True, executorState="completed", usage=USAGE)
 
-        def _poll(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
-            reads.append(probe)
-            return replies.pop(0) if len(replies) > 1 else replies[0]
-
-        return _poll
-
-    running = {
-        "entries": running_transcript("task-1"),
-        "lastSeq": 3,
-        "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
-    }
-    relay_terminal = {
-        "entries": [
-            entry(4, inject.ENTRY_POST, text="done", messageId=RESULT_ID),
-            entry(5, inject.ENTRY_TERMINAL, taskId="task-1", state="completed",
-                  source=inject.TERMINAL_SOURCE_EXECUTOR),
-        ],
-        "lastSeq": 5,
-        "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
-    }
-    settled = probe_body(final=True, executorState="completed", usage=USAGE)
-    settled["lastSeq"] = 5
-    monkeypatch.setattr(task, "_poll", scripted([running, relay_terminal, settled]))
+    monkeypatch.setattr(inject, "_request", request)
     exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
     assert exchange.outcome == inject.OUTCOME_TERMINAL
     assert exchange.fold.usage == {"input": 1500, "output": 200}
-    assert reads == [True, True, True]
-
-    reads.clear()
-    final_with_usage = {
-        **relay_terminal,
-        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed", "usage": USAGE},
-    }
-    monkeypatch.setattr(task, "_poll", scripted([running, final_with_usage]))
-    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
-    assert exchange.fold.usage == {"input": 1500, "output": 200}
-    assert reads == [True, True]
+    assert len(asked) == 1
+    query = parse_qs(urlparse(asked[0]).query)
+    assert query[inject.USAGE_PARAM] == [inject.USAGE_CHAIN]
+    assert query[inject.PROBE_PARAM] == ["1"] and query["task"] == ["task-1"] and query["after"] == ["5"]
 
 
 def test_the_inject_total_adds_the_workers_as_the_api_lanes_does(
@@ -3436,11 +3426,10 @@ def test_the_workers_total_folds_into_a_null_or_counted_front_door() -> None:
 
 def test_no_usage_read_follows_a_terminal_past_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     """The usage read after a relay terminal is made only inside the wait's
-    deadline: a run already late spends no more time on it, and keeps the
-    counts the earlier reads had (none here)."""
+    deadline: a run already late spends no more time on it, and its counts
+    stay unknown."""
     task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
     monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
-    reads: list[bool] = []
     relay_terminal = {
         "entries": [
             *running_transcript("task-1"),
@@ -3453,12 +3442,36 @@ def test_no_usage_read_follows_a_terminal_past_the_deadline(monkeypatch: pytest.
     }
 
     def late(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
-        reads.append(probe)
         time.sleep(0.3)
         return relay_terminal
 
+    asked: list[str] = []
     monkeypatch.setattr(task, "_poll", late)
+    monkeypatch.setattr(inject, "_request", lambda url, *args, **kwargs: asked.append(url) or {})
     exchange = task.await_terminal("task-1", deadline=time.monotonic() + 0.1)
     assert exchange.outcome == inject.OUTCOME_TERMINAL
     assert exchange.fold.usage is None
-    assert reads == [True]
+    assert asked == []
+
+
+def test_a_timeouts_cancel_settle_carries_the_usage_onto_the_record(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graded timeout has no terminal to read usage after, so its counts
+    come from the cancel's settle: the read after the terminal it confirmed.
+    The record takes them with the terminal, a turn that finished between
+    the deadline and the cancel included, rather than leaving them on the
+    settle's fold."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.on_cancel = [
+        entry(5, inject.ENTRY_POST, text="🛑 cancel sent", messageId="inj-5"),
+        entry(6, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="canceled",
+              source=inject.TERMINAL_SOURCE_EXECUTOR, reason="reason: canceled-by-request"),
+    ]
+    stub_gateway.probe_usage = USAGE
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert result.metadata["terminal_state"] == "canceled"
+    assert (result.tokens["input"], result.tokens["output"], result.tokens["total"]) == (1500, 200, 1700)

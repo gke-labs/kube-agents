@@ -1272,9 +1272,10 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 }
 
 // TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain: a harness reads the
-// front door's cost off the root, so the probe sums the usage of the root's
-// own turn and of every wake that continued it, whichever link the read
-// follows, and never a child's, which is another addressee's work.
+// front door's cost off the root, so a probe that asks for it sums the usage
+// of the root's own turn and of every wake that continued it, whichever link
+// the read follows, and never a child's, which is another addressee's work.
+// A probe that did not ask reads no extra streams and carries none.
 func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 	r, spawn, obs := startObservedRig(t, doorDelegation(t))
 	ctx := context.Background()
@@ -1343,7 +1344,10 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 		rec, _ := r.g.reg.Get(ctx, conv)
 		return rec.ActiveTask == nil
 	})
-	st, err := r.g.probeConversation(ctx, conv, origin.TaskID)
+	if plain, err := r.g.probeConversation(ctx, conv, origin.TaskID); err != nil || plain.Usage != nil {
+		t.Fatalf("a probe that did not ask carries usage %+v (err %v); want none", plain.Usage, err)
+	}
+	st, err := r.g.probeConversation(withChainUsage(ctx), conv, origin.TaskID)
 	if err != nil {
 		t.Fatal(err)
 	}

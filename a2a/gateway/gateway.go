@@ -1713,11 +1713,13 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
-	readTask := task
-	if terr != nil {
-		readTask = nil
+	if chainUsageAsked(ctx) {
+		readTask := task
+		if terr != nil {
+			readTask = nil
+		}
+		state.Usage = g.frontDoorUsage(ctx, rec, taskID, read, readTask)
 	}
-	state.Usage = g.frontDoorUsage(ctx, rec, taskID, read, readTask)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a

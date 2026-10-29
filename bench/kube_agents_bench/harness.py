@@ -2445,7 +2445,8 @@ class KubeAgentsHarness(AgentHarness):
             whose word it is and its reason -- for the record, never for the
             verdict (the supervisor completing a requester's stop for a
             worker that exited without its own terminal is still the
-            timeout). The
+            timeout), and the front door's usage as the read after that
+            terminal found it, which the deadline read could not hold. The
             deliverable stays what the task produced inside its budget --
             the cancel acknowledgement the gateway posts after it is not the
             agent's answer -- and anything else the settle says (a transient
@@ -2474,6 +2475,11 @@ class KubeAgentsHarness(AgentHarness):
                         settled.fold.terminal_source,
                         settled.fold.terminal_reason,
                     )
+                    # The settle's usage read follows the terminal, so it
+                    # holds every turn the front door ran, one that finished
+                    # between the deadline and the cancel included.
+                    if settled.fold.usage is not None:
+                        exchange.fold.usage = settled.fold.usage
             return timed_out, stop_pending
 
         def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:
