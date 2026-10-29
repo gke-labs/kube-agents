@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,8 +27,13 @@ const (
 	MCPTokenSecretSuffix = "-a2a-mcp-token"
 	// MCPTokenSecretKey is the Secret data key holding the MCP bearer token.
 	MCPTokenSecretKey = "token"
-	// EnvMCPToken is the environment variable that overrides the MCP bearer token.
+	// EnvMCPToken is the environment variable that overrides the MCP bearer token. EnvMCPTokenFor
+	// is its only reader: with one deployment configured the token is that deployment's; with
+	// several it is the one EnvMCPTokenDeployment names.
 	EnvMCPToken = "KUBE_AGENTS_MCP_TOKEN"
+	// EnvMCPTokenDeployment names the saved deployment profile EnvMCPToken belongs to when more
+	// than one deployment is configured. Unset, or naming none of them, the token is sent nowhere.
+	EnvMCPTokenDeployment = "KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT"
 
 	// DefaultUpstreamRepoURL and friends are the canonical upstream GitHub documentation links.
 	DefaultUpstreamRepoURL         = "https://github.com/gke-labs/kube-agents"
@@ -571,4 +577,37 @@ func fetchCommitsBehindStatus(ctx context.Context, installedRef, latestTag strin
 	releaseCache.compareCache[key] = res
 	releaseCacheMu.Unlock()
 	return res.aheadBy, res.compared
+}
+
+var envTokenNotSentWarning sync.Once
+
+// EnvMCPTokenFor returns the KUBE_AGENTS_MCP_TOKEN override when it belongs to prof, and ""
+// otherwise. configured names the saved deployment profiles. With prof the only one, the token is
+// prof's. With several, the token belongs to the one KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT names; with
+// that unset or naming none of them, it is sent nowhere and one warning says so. A token read from
+// one install's Secret is so never sent to another install.
+func EnvMCPTokenFor(prof DeploymentProfile, configured []string) string {
+	token := strings.TrimSpace(os.Getenv(EnvMCPToken))
+	if token == "" {
+		return ""
+	}
+	names := map[string]bool{strings.TrimSpace(prof.Name): true}
+	for _, n := range configured {
+		names[strings.TrimSpace(n)] = true
+	}
+	if len(names) == 1 {
+		return token
+	}
+	scope := strings.TrimSpace(os.Getenv(EnvMCPTokenDeployment))
+	if scope == "" || !names[scope] {
+		envTokenNotSentWarning.Do(func() {
+			slog.Warn(EnvMCPToken+" is not sent to any deployment: more than one is configured, and "+
+				EnvMCPTokenDeployment+" does not name one of them", "deployment_selector", scope)
+		})
+		return ""
+	}
+	if scope != strings.TrimSpace(prof.Name) {
+		return ""
+	}
+	return token
 }

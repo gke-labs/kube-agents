@@ -216,7 +216,9 @@ func validateDirectMCPURL(rawURL string) (string, error) {
 	}
 }
 
-func connectGatewayBridge(ctx context.Context, cluster ClusterAccess, prof DeploymentProfile) (*gatewayBridgeSession, error) {
+// connectGatewayBridge connects to prof. configured names every saved deployment profile, so
+// EnvMCPTokenFor can tell whether the KUBE_AGENTS_MCP_TOKEN override is prof's.
+func connectGatewayBridge(ctx context.Context, cluster ClusterAccess, prof DeploymentProfile, configured []string) (*gatewayBridgeSession, error) {
 	direct := strings.TrimSpace(prof.DirectMCPURL)
 	var tun Tunnel
 	var baseURL string
@@ -229,11 +231,11 @@ func connectGatewayBridge(ctx context.Context, cluster ClusterAccess, prof Deplo
 		}
 		baseURL = validatedURL
 		// Never populate or attach cluster-fetched Secret tokens to a DirectMCPURL; only use
-		// an explicit in-memory token or KUBE_AGENTS_MCP_TOKEN.
-		bearer = FirstNonEmptyStr(strings.TrimSpace(prof.MCPToken), strings.TrimSpace(os.Getenv(EnvMCPToken)))
+		// an explicit in-memory token or the KUBE_AGENTS_MCP_TOKEN override that is prof's.
+		bearer = FirstNonEmptyStr(strings.TrimSpace(prof.MCPToken), EnvMCPTokenFor(prof, configured))
 	} else {
 		if strings.TrimSpace(prof.MCPToken) == "" {
-			if envTok := strings.TrimSpace(os.Getenv(EnvMCPToken)); envTok != "" {
+			if envTok := EnvMCPTokenFor(prof, configured); envTok != "" {
 				prof.MCPToken = envTok
 			} else if prof.KubeContext != "" && prof.Namespace != "" {
 				if err := cluster.PopulateDeploymentCredentials(ctx, &prof); err != nil {
@@ -1723,7 +1725,13 @@ func (s *Server) connectSession(ctx context.Context, prof DeploymentProfile) (*g
 }
 
 func (s *Server) connectSessionLocked(ctx context.Context, prof DeploymentProfile) (*gatewayBridgeSession, error) {
-	newSess, err := connectGatewayBridge(ctx, s.cluster, prof)
+	var configured []string
+	if s.store != nil {
+		for name := range s.store.Snapshot().Deployments {
+			configured = append(configured, name)
+		}
+	}
+	newSess, err := connectGatewayBridge(ctx, s.cluster, prof, configured)
 	if err != nil {
 		return nil, err
 	}

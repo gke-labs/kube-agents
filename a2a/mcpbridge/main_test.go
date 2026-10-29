@@ -26,6 +26,7 @@ func TestMain(m *testing.M) {
 	for _, name := range []string{
 		envConfigPath,
 		EnvMCPToken,
+		EnvMCPTokenDeployment,
 		envGHToken,
 		envGitHubToken,
 	} {

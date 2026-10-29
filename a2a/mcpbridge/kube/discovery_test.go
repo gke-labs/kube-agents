@@ -179,6 +179,9 @@ current-context: %s
 	if len(p.AgentProfiles) != 1 || p.AgentProfiles[0] != "default" {
 		t.Errorf("expected only interactive AgentProfile 'default', got %v", p.AgentProfiles)
 	}
+	// KUBE_AGENTS_MCP_TOKEN is the bridge's to apply (mcpbridge.EnvMCPTokenFor), never read
+	// here, so the Secret is read whatever the env holds.
+	t.Setenv(mcpbridge.EnvMCPToken, "token-from-env")
 	if err := PopulateDeploymentCredentials(context.Background(), &p); err != nil {
 		t.Fatalf("PopulateDeploymentCredentials: %v", err)
 	}

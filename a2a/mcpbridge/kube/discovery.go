@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -315,15 +314,12 @@ func describeAPIError(err error, body []byte) string {
 	return err.Error()
 }
 
-// PopulateDeploymentCredentials reads the in-cluster a2a-mcp bearer token from
-// KUBE_AGENTS_MCP_TOKEN or the deployment's <agent>-a2a-mcp-token Secret (key "token")
-// into prof.MCPToken (held in memory only).
+// PopulateDeploymentCredentials reads the in-cluster a2a-mcp bearer token from the
+// deployment's <agent>-a2a-mcp-token Secret (key "token") into prof.MCPToken (held in
+// memory only). It does not read KUBE_AGENTS_MCP_TOKEN: the bridge applies that override,
+// through mcpbridge.EnvMCPTokenFor, before it asks for the Secret.
 func PopulateDeploymentCredentials(ctx context.Context, prof *mcpbridge.DeploymentProfile) error {
 	if prof == nil {
-		return nil
-	}
-	if envTok := strings.TrimSpace(os.Getenv(mcpbridge.EnvMCPToken)); envTok != "" {
-		prof.MCPToken = envTok
 		return nil
 	}
 	if prof.KubeContext == "" || prof.Namespace == "" {

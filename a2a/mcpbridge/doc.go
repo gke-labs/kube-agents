@@ -23,7 +23,12 @@
 //	KUBE_AGENTS_MCP_CONFIG         bridge state file
 //	                               (default ~/.config/kube-agents/mcp-config.json)
 //	KUBE_AGENTS_MCP_TOKEN          explicit Bearer token override for the
-//	                               in-cluster a2a-mcp listener
+//	                               in-cluster a2a-mcp listener: the
+//	                               deployment's when only one is configured
+//	KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT
+//	                               with several deployments configured, the
+//	                               saved profile name the token belongs to;
+//	                               unset, the token is sent nowhere
 //	GH_TOKEN / GITHUB_TOKEN        GitHub token for inspect_pr; when neither is
 //	                               set the bridge falls back to the github.com
 //	                               entry in ~/.git-credentials, if present

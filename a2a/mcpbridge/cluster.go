@@ -28,7 +28,7 @@ type ClusterAccess interface {
 	// kubeconfig itself cannot be loaded or no context at all could be scanned.
 	DiscoverDeployments(ctx context.Context, kubeContextFilter string) ([]DeploymentProfile, error)
 	// PopulateDeploymentCredentials fills the in-memory MCP Bearer token of prof
-	// from the deployment's <agent>-a2a-mcp-token Secret (or KUBE_AGENTS_MCP_TOKEN)
+	// from the deployment's <agent>-a2a-mcp-token Secret
 	// when connecting to that deployment.
 	PopulateDeploymentCredentials(ctx context.Context, prof *DeploymentProfile) error
 	// StartGatewayPortForward opens a supervised local port-forward to the

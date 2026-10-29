@@ -22,5 +22,6 @@ const (
 
 func TestMain(m *testing.M) {
 	os.Unsetenv(mcpbridge.EnvMCPToken)
+	os.Unsetenv(mcpbridge.EnvMCPTokenDeployment)
 	os.Exit(m.Run())
 }
