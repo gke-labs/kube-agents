@@ -116,9 +116,14 @@ def _findings(report):
 class ExampleReportTest(unittest.TestCase):
     def test_vocabulary_matches_the_leeway_version_pinned_in_the_sandbox_dockerfile(self):
         dockerfile = SANDBOX_DOCKERFILE.read_text(encoding="utf-8")
-        match = re.search(r"go-steer/leeway/releases/download/(v[0-9.]+)/", dockerfile)
-        self.assertIsNotNone(match, "deploy/sandbox/Dockerfile should pin a go-steer/leeway release download URL")
-        self.assertEqual(match.group(1), LEEWAY_VERSION)
+        match = re.search(r"ARG LEEWAY_VERSION=([0-9.]+)", dockerfile)
+        if match:
+            version = "v" + match.group(1)
+        else:
+            match = re.search(r"go-steer/leeway/releases/download/(v[0-9.]+)/", dockerfile)
+            version = match.group(1) if match else None
+        self.assertIsNotNone(version, "deploy/sandbox/Dockerfile should pin a go-steer/leeway release version")
+        self.assertEqual(version, LEEWAY_VERSION)
 
     def test_both_copies_carry_the_same_report(self):
         cluster = (SKILLS["cluster"] / "references/report-example.json").read_bytes()
