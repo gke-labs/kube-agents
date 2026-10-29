@@ -3,6 +3,10 @@ package mcpbridge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -125,5 +129,56 @@ func TestTaskControlActionsTheServerLacksAreHiddenAndRefused(t *testing.T) {
 	case c := <-gw.calls:
 		t.Fatalf("a refused task_control action reached the gateway: %v", c)
 	default:
+	}
+}
+
+func TestCallRemoteToolMetaCarriesOnlyTheCalledConversation(t *testing.T) {
+	metas := make(chan map[string]any, 4)
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req rpcRequest
+		_ = json.Unmarshal(body, &req)
+		var params struct {
+			Meta map[string]any `json:"_meta"`
+		}
+		_ = json.Unmarshal(req.Params, &params)
+		metas <- params.Meta
+		w.Header().Set("Content-Type", contentTypeJSON)
+		_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
+			Content: []TextContent{{Type: contentTypeText, Text: "ok"}},
+		}))
+	}))
+	defer gw.Close()
+
+	sess := &gatewayBridgeSession{baseURL: gw.URL, httpClient: &http.Client{}}
+	snap := PersistentConfig{
+		ActiveConversation: "other",
+		Conversations: map[string]ConversationEntry{
+			"called": {Alias: "called", Token: "tok-called"},
+			"other":  {Alias: "other", Token: "tok-other"},
+		},
+	}
+	call := func(args string) map[string]any {
+		t.Helper()
+		if _, _, _, err := sess.callRemoteTool(context.Background(), ToolSendMessage, json.RawMessage(args), CallMeta{}, snap, nil); err != nil {
+			t.Fatal(err)
+		}
+		return <-metas
+	}
+
+	meta := call(`{"text":"hi","conversation":"called"}`)
+	for _, key := range []string{"conversations", "kube-agents/conversations"} {
+		convs, _ := meta[key].(map[string]any)
+		if len(convs) != 1 || convs["called"] == nil {
+			t.Fatalf("_meta[%q] = %v; want the called conversation's entry only", key, meta[key])
+		}
+	}
+	if raw, _ := json.Marshal(meta); strings.Contains(string(raw), "tok-other") || strings.Contains(string(raw), `"other"`) {
+		t.Fatalf("_meta names a conversation the call did not: %s", raw)
+	}
+
+	meta = call(`{"action":"get","task":"task-1"}`)
+	if _, ok := meta["conversations"]; ok {
+		t.Fatalf("_meta of a call naming no conversation carries %v", meta["conversations"])
 	}
 }

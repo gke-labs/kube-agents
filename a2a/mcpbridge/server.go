@@ -334,11 +334,19 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	snap PersistentConfig,
 	onProgress func(step int, msg string),
 ) (string, string, string, error) {
-	metaMap := map[string]any{
-		"conversations":                   snap.Conversations,
-		"active_conversation":             snap.ActiveConversation,
-		"kube-agents/conversations":       snap.Conversations,
-		"kube-agents/active_conversation": snap.ActiveConversation,
+	var argsAny any = map[string]any{}
+	if len(rawArgs) > 0 {
+		_ = json.Unmarshal(rawArgs, &argsAny)
+	}
+	// Only the called conversation's entry goes upstream, never the rest of the local table
+	// (the in-cluster server reads nothing from _meta today).
+	metaMap := map[string]any{}
+	if alias := calledConversation(argsAny); alias != "" {
+		if entry, ok := snap.Conversations[alias]; ok {
+			one := map[string]ConversationEntry{alias: entry}
+			metaMap["conversations"] = one
+			metaMap["kube-agents/conversations"] = one
+		}
 	}
 	for k, v := range meta.Raw {
 		metaMap[k] = v
@@ -355,10 +363,6 @@ func (g *gatewayBridgeSession) callRemoteTool(
 		metaMap["progressToken"] = "bridge-progress"
 	}
 
-	var argsAny any = map[string]any{}
-	if len(rawArgs) > 0 {
-		_ = json.Unmarshal(rawArgs, &argsAny)
-	}
 	rpcPayload, err := json.Marshal(map[string]any{
 		"jsonrpc": jsonRPCVersion,
 		"id":      1,
@@ -471,6 +475,18 @@ func (g *gatewayBridgeSession) callRemoteTool(
 		return text, customTitle, customMarkdown, fmt.Errorf("%s", text)
 	}
 	return text, customTitle, customMarkdown, nil
+}
+
+// calledConversation is the local conversation alias a forwarded call names: its conversation
+// argument, or manage_session's alias.
+func calledConversation(args any) string {
+	m, _ := args.(map[string]any)
+	for _, key := range []string{"conversation", "alias"} {
+		if v, _ := m[key].(string); strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func (g *gatewayBridgeSession) queryRemoteSwarm(ctx context.Context, swarmReq any, swarmResp any) error {
