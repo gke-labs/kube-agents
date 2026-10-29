@@ -26,7 +26,8 @@ RUNS_LISTED = 20
 # 360-minute ceiling, plus the time Prow takes to write
 # finished.json. Past that it is a pod that died without uploading, which
 # the collector keeps on pending_builds for two days (render.py's Grid
-# columns and nightly.py's running nights draw the same line).
+# columns draw the same line; nightly.py's running nights a longer one, for
+# the nightly's 12-hour budget).
 RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"

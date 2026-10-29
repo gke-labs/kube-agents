@@ -199,7 +199,7 @@ class NightDocumentTest(unittest.TestCase):
         data["pending_builds"] = [
             {"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
             {"build_id": "3000000000000000004", "first_seen": "2026-09-08T14:10:00+00:00"},  # the presubmit's
-            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13 h ago
+            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13.5 h ago
             {"build_id": "bogus", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
         ]
         now = datetime.datetime.fromisoformat(NOW)
@@ -282,7 +282,9 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
         # A last night on record outranks a build in flight: the numbers are there.
         self.assertIn("newly failing: case-b", self.line(data))
-        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=10)).isoformat()
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=30)).isoformat()
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Wed 8:30 PM ET) · the report follows when it finishes", "past its 12-hour budget, inside the upload slack: still running")
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=13, minutes=1)).isoformat()
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "past the budget: not running")
         self.assertEqual(self.line({"runs": [], "cases": []}), "🌙 Nightly: no run on record yet")
         self.assertEqual(self.line({}), "🌙 Nightly: no data.json to read a night from")
