@@ -1066,11 +1066,20 @@ The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
 the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
-per graded repetition and its change from last week when both weeks have a
-median and the week has a trend), a "Needs attention" box, one row per area with
+per graded repetition and its change from last week when the week has a
+trend), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
+
+A repetition's tokens are its record's `total`
+([`SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md), `reps[].tokens`). With no
+`total`, input plus output stands in, but that sum misses what the workers
+billed, so it counts as partial like a record marked `partial`. Partial counts
+are left out of the median and their number is shown. The change compares
+the two weeks' medians over the scenarios with a full count in both, so a
+scenario whose counts went partial does not move it. The tokens tile and the Chat line are
+left out when no repetition the week compared carries a count.
 
 The page is written only when every check passes; otherwise the script prints
 each reason and exits 1, the step logs a warning, and the last published copy
@@ -1114,14 +1123,7 @@ and the area with the slowest median) and the tile's tokens line, buttons to the
 all open nightly bugs, and the models the week ran. The message carries the
 same week in a few lines of text, without Chat's markup, as the card's
 fallback for notifications; that text also names the three strongest areas and
-the median's change when the week has a trend.
-
-A repetition's tokens are its record's `total`
-([`SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md), `reps[].tokens`). With no
-`total`, input plus output stands in, but that sum misses what the workers
-billed, so it counts as partial like a record marked `partial`. Partial counts
-are left out of the median and their number is shown. The tile and the line
-are left out when no repetition the week compared carries a count. If Chat refuses the card (HTTP
+the median's change when the week has a trend. If Chat refuses the card (HTTP
 400, so nothing was posted), the step posts that text, with its links, instead.
 The
 render step writes both (`--chat-out`) only when the page passes, from the

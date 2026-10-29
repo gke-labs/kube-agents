@@ -506,8 +506,8 @@ def percentile(values: list[float], pct: int) -> float | None:
 def rep_tokens(rep: dict) -> tuple[int | None, bool] | None:
     """``(count, short)`` for a repetition's token record, or None when it
     has none. The count is ``total``, else ``input + output`` (short: it
-    misses the workers); short too when the record says ``partial`` or
-    carries no count at all."""
+    misses the workers); short too when the record says ``partial``. A
+    record with neither is None, like no record."""
     tokens = rep.get(TOKENS_KEY)
     if not isinstance(tokens, dict):
         return None
@@ -521,25 +521,40 @@ def rep_tokens(rep: dict) -> tuple[int | None, bool] | None:
         return total, tokens.get(TOKENS_PARTIAL) is True
     if inp is not None and out is not None:
         return inp + out, True
-    return None, True
+    return None
 
 
 def tokens_text(count: float) -> str:
-    """135000 -> "135k", 1250000 -> "1.2M"."""
-    if count >= MILLION:
+    """135000 -> "135k", 1250000 -> "1.2M"; rounded before the unit is
+    picked, so 999600 is "1.0M", not "1000k"."""
+    if round(count / THOUSAND) >= THOUSAND:
         return TOKENS_MILLIONS.format(count=count / MILLION)
-    if count >= THOUSAND:
+    if round(count) >= THOUSAND:
         return TOKENS_THOUSANDS.format(count=round(count / THOUSAND))
     return TOKENS_UNITS.format(count=round(count))
 
 
 def tokens_change(overall: dict) -> int | None:
-    """The typical run's tokens against last week's, in whole percent; None
-    without a trend this week or a median in either week."""
-    now, before = overall["tokens_median"], overall["prev_tokens_median"]
+    """This week's tokens against last week's, in whole percent, over the
+    scenarios with a full count in both weeks, so a scenario whose counts
+    went partial does not move it; None without a trend this week or such
+    a scenario."""
+    now, before = overall["paired_tokens_median"], overall["prev_paired_tokens_median"]
     if overall["trend"] is None or now is None or not before:
         return None
     return round((now - before) * PERCENT / before)
+
+
+def tokens_figures(overall: dict) -> dict | None:
+    """What the tile and the Chat line both print: ``{typical, pct, partial,
+    counted}`` (``typical`` None with only partial counts); None when no
+    repetition the week compared carries a count."""
+    partial = overall["tokens_partial"]
+    if overall["tokens_median"] is None and not partial:
+        return None
+    typical = tokens_text(overall["tokens_median"]) if overall["tokens_median"] is not None else None
+    return {"typical": typical, "pct": tokens_change(overall) if typical else None, "partial": partial,
+            "counted": overall["counted_runs"]}
 
 
 def short_date(day: datetime.date) -> str:
@@ -887,9 +902,12 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     overall["prev_agent_s_median"] = statistics.median(prev_times) if prev_times else None
     overall["timed_runs"] = len(times)
     tokens = [n for c in common for n in this_cases[c]["tokens"]]
-    prev_tokens = [n for c in common for n in prev_cases[c]["tokens"]]
     overall["tokens_median"] = statistics.median(tokens) if tokens else None
-    overall["prev_tokens_median"] = statistics.median(prev_tokens) if prev_tokens else None
+    paired = [c for c in common if this_cases[c]["tokens"] and prev_cases[c]["tokens"]]
+    paired_tokens = [n for c in paired for n in this_cases[c]["tokens"]]
+    prev_paired_tokens = [n for c in paired for n in prev_cases[c]["tokens"]]
+    overall["paired_tokens_median"] = statistics.median(paired_tokens) if paired_tokens else None
+    overall["prev_paired_tokens_median"] = statistics.median(prev_paired_tokens) if prev_paired_tokens else None
     overall["counted_runs"] = len(tokens)
     overall["tokens_partial"] = sum(this_cases[c]["tokens_partial"] for c in common)
     week["overall"] = overall
@@ -1164,7 +1182,7 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
         time_sub = TILE_TIME_SUB.format(count=overall["timed_runs"], p90=minutes(overall["agent_s_p90"]))
     else:
         time_value, time_sub = TILE_TIME_NONE, TILE_TIME_NONE_SUB
-    tokens_tile = tokens_tile_text(overall)
+    tokens_tile = tokens_tile_text(tokens_figures(overall))
     tile = {"rule": RULE, "ink": INK, "faint": FAINT, "width": TILE_WIDTH_FOUR if tokens_tile else TILE_WIDTH}
     tiles = TILES_ROW.format(tiles="".join([
         TILE.format(value=f"{overall['pct']}%", label=TILE_RATE_LABEL, sub=change, **tile),
@@ -1216,16 +1234,17 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
                        rows=ROWS_JOIN.join([header, intro, tiles, attention, by_area, fix, close]))
 
 
-def tokens_tile_text(overall: dict) -> tuple[str, str] | None:
-    """The tokens tile's ``(value, sub)``, or None when no repetition the
-    week compared carries a count (the tile is left out)."""
-    partial = overall["tokens_partial"]
-    if overall["tokens_median"] is None:
-        return (TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)) if partial else None
-    pct = tokens_change(overall)
+def tokens_tile_text(figures: dict | None) -> tuple[str, str] | None:
+    """The tokens tile's ``(value, sub)`` from ``tokens_figures``, or None
+    (the tile is left out)."""
+    if figures is None:
+        return None
+    partial, pct = figures["partial"], figures["pct"]
+    if figures["typical"] is None:
+        return TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)
     change = "" if pct is None else TILE_TOKENS_UP.format(pct=pct) if pct > 0 else TILE_TOKENS_DOWN.format(pct=-pct) if pct < 0 else TILE_TOKENS_SAME
-    sub = TILE_TOKENS_SUB.format(count=overall["counted_runs"]) + change + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
-    return tokens_text(overall["tokens_median"]), sub
+    sub = TILE_TOKENS_SUB.format(count=figures["counted"]) + change + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
+    return figures["typical"], sub
 
 
 def attention_state(row: dict) -> str:
@@ -1273,15 +1292,16 @@ def chat_time(week: dict) -> str:
 
 def chat_tokens(week: dict) -> str | None:
     """The tokens line of the card and its text fallback, from the numbers
-    the page's tile printed; None when the tile is left out."""
-    overall = week["overall"]
-    partial = overall["tokens_partial"]
+    the page's tile printed (``tokens_figures``); None when the tile is left out."""
+    figures = tokens_figures(week["overall"])
+    if figures is None:
+        return None
+    partial, pct = figures["partial"], figures["pct"]
     partial_text = CHAT_TOKENS_PARTIAL.format(count=partial) if partial else ""
-    if overall["tokens_median"] is None:
-        return CHAT_TOKENS_NONE.format(partial=partial_text) if partial else None
-    pct = tokens_change(overall)
+    if figures["typical"] is None:
+        return CHAT_TOKENS_NONE.format(partial=partial_text)
     change = "" if pct is None else CHAT_TOKENS_UP.format(pct=pct) if pct > 0 else CHAT_TOKENS_DOWN.format(pct=-pct) if pct < 0 else CHAT_TOKENS_SAME
-    return CHAT_TOKENS.format(typical=tokens_text(overall["tokens_median"]), change=change, partial=partial_text)
+    return CHAT_TOKENS.format(typical=figures["typical"], change=change, partial=partial_text)
 
 
 def chat_text(week: dict) -> str:
