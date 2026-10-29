@@ -153,8 +153,9 @@ layout and are collected from the moment they start running.
     entry per indented `rep N: <verdict> -- <text>` grading line under the
     task's verdict line, in log order:
     `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
-    plus `"excerpt": <string>` when the log carried one, and `"agent_s"` /
-    `"turn1_s"` when the log carried them (below).
+    plus `"excerpt": <string>` when the log carried one, `"agent_s"` /
+    `"turn1_s"` when the log carried them, and `"tokens"` when the log
+    carried a count (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -227,6 +228,30 @@ layout and are collected from the moment they start running.
       when the line did not carry it, when the log has no such line (every
       build graded before it existed), or when the line follows no grading
       line of that repetition: absence means unknown.
+    - `tokens` — **optional, additive**: what the repetition billed, from the
+      `rep N tokens: input=<n> output=<n> total=<n> [partial=1]` line
+      `bench-gate case` prints right under the timing line, as
+      `{"input": <int|null>, "output": <int|null>, "total": <int|null>, "partial": <bool>}`.
+      The counts are `results.json`'s top-level `tokens.input`,
+      `tokens.output` and `tokens.total`. `total` is everything the run
+      billed on both transports: on the api transport the front door's
+      session plus its delegated workers; on the inject transport the front
+      door's turns plus the chain's child tasks plus the workers (and null
+      when the gateway reported no usage, whatever the workers billed).
+      `input` and `output` differ by transport: on the api transport they
+      include the workers and `input` excludes cached reads (unless the
+      front door's session row could not be read); on the inject
+      transport they are the front door's turns alone and `input` counts
+      cached reads. `partial` is true when the record says its counts are
+      short: the inject transport could not read a link of the chain
+      (`tokens.usage_partial`), or a worker session reported no counts
+      (`tokens.workers.unbilled`). A count the line did not carry, or one
+      that is not a whole number at or above zero, is `null`; zero is a
+      count. The collector consumes the line whole, like the timing line.
+      The key is **absent** when the line carried no count, when the log has
+      no such line (every build graded before it existed, and any record
+      with no token accounting), or when the line follows no grading line
+      of that repetition: absence means unknown.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
