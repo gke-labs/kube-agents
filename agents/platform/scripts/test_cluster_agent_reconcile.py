@@ -70,6 +70,7 @@ class _Stall:
 # gcloud path (the fallback when the helper cannot run), and the relay tests patch
 # `_relay_reads` themselves.
 _no_relay = mock.patch.object(rec, "_relay_reads", return_value=None)
+_real_relay_reads = rec._relay_reads
 
 
 def setUpModule():
@@ -3166,7 +3167,7 @@ class ScopeTest(HomesMixin):
     def _key(self, cluster, project=None):
         return f"{project or self.MGMT}/us-central1/{cluster}"
 
-    def _relayed_run(self, relay, profiles, identities, lister=None):
+    def _relayed_run(self, relay, profiles, identities, lister=None, scope=None):
         gcloud_lists: list = []
         gcloud_describes: list = []
 
@@ -3178,7 +3179,7 @@ class ScopeTest(HomesMixin):
             gcloud_describes.append(cluster)
             return True
         with mock.patch.object(rec, "_relay_reads", side_effect=relay):
-            report, _, deleted = self._run(None, gcloud_list, profiles=profiles, identities=identities,
+            report, _, deleted = self._run(scope, gcloud_list, profiles=profiles, identities=identities,
                                            exists=gcloud_describe)
         return report, deleted, gcloud_lists, gcloud_describes
 
@@ -3266,9 +3267,14 @@ class ScopeTest(HomesMixin):
         self.assertEqual(["a", "b"], sorted(describes))
         self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
 
-    def test_the_helper_gets_half_the_budget_and_each_call_less(self):
-        # A stalled helper leaves gcloud the other half; a stalled call is one row's
-        # "unknown", answered inside the helper's own wait.
+    def test_the_helper_gets_a_share_of_the_budget_and_its_own_deadline_under_it(self):
+        # A stalled helper leaves gcloud the rest; the helper's own deadline sits under
+        # the wait, so a slow call is one row's "unknown" and the batch comes back whole.
+        with mock.patch.object(rec.time, "monotonic", return_value=1000.0):
+            wait, helper = rec._relay_budget(1100.0)
+            self.assertIsNone(rec._relay_budget(1000.0 + 2 * (rec.RELAY_MIN_BATCH_SECONDS + rec.RELAY_STARTUP_SECONDS) - 1))
+        self.assertEqual((100.0 * rec.RELAY_BUDGET_SHARE, 100.0 * rec.RELAY_BUDGET_SHARE - rec.RELAY_STARTUP_SECONDS),
+                         (wait, helper))
         waits: list = []
         profiles, identities = self._profiles("gone")
         batches, relay = self._relay(lists={self.MGMT: self._ok_list()},
@@ -3277,13 +3283,66 @@ class ScopeTest(HomesMixin):
         def timed(request, timeout):
             waits.append(timeout)
             return relay(request, timeout)
-        with mock.patch.object(rec.time, "monotonic", return_value=1000.0):
-            batch, call = rec._relay_budget(1100.0)
-        self.assertEqual((50.0, 50.0 - rec.RELAY_CALL_MARGIN_SECONDS), (batch, call))
         self._relayed_run(timed, profiles, identities)
         self.assertEqual(2, len(batches))
         for request, wait in zip(batches, waits):
-            self.assertLess(request["call_timeout"], wait)
+            self.assertLess(request["budget_seconds"], wait)
+
+    def test_a_spent_budget_skips_the_relay_and_leaves_it_on(self):
+        with mock.patch.object(rec, "_relay_reads", side_effect=AssertionError("relay tried")):
+            rec._relay_unusable_this_run = False
+            self.assertIsNone(rec._relay_lists(["p"], time.monotonic()))
+        self.assertFalse(rec._relay_unusable_this_run)
+
+    def test_a_read_the_broker_refused_alone_goes_to_gcloud_and_the_relay_stays_on(self):
+        # An over-cap list (a project with hundreds of clusters) and a path the table does
+        # not take are answers about one read: that read goes to gcloud, the batch's other
+        # answers stand, and PRUNE still describes through the relay.
+        profiles, identities = self._profiles("a", "b", "c")
+        identities["cluster-c"] = dict(identities["cluster-c"], project="p2")
+        batches, relay = self._relay(
+            lists={self.MGMT: {"status": 502, "error": {"code": "UPSTREAM_RESPONSE_TOO_LARGE"}},
+                   "p2": self._ok_list()},
+            gets={self._key("a"): {"status": 403, "error": {"code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.path"}},
+                  self._key("b"): {"status": 200}, self._key("c", "p2"): {"status": 200}})
+        report, deleted, lists, describes = self._relayed_run(
+            relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)}, scope={"projects": ["p2"]})
+        self.assertEqual([self.MGMT], lists)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b", "cluster-c"])
+        self.assertTrue(any(b.get("clusters") for b in batches))
+
+    def test_a_read_the_helper_never_started_goes_to_gcloud(self):
+        profiles, identities = self._profiles("a", "b")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
+            self._key("a"): {"status": 0, "error": {"skipped": "budget"}},
+            self._key("b"): {"status": 200}})
+        report, _, _, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
+
+    def test_a_helper_out_of_time_costs_the_batch_and_one_that_cannot_run_the_run(self):
+        logged: list = []
+        broken = subprocess.CalledProcessError(1, ["python3"], output="",
+                                               stderr="Traceback ...\nModuleNotFoundError: No module named 'requests'\n")
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            for failure, off in ((subprocess.TimeoutExpired(["python3"], 30), False), (broken, True)):
+                with self.subTest(failure=type(failure).__name__), \
+                        mock.patch.object(rec.sandbox_exec, "run", side_effect=failure):
+                    rec._relay_unusable_this_run = False
+                    self.assertIsNone(_real_relay_reads({}, 30))
+                    self.assertEqual(off, rec._relay_unusable_this_run)
+        rec._relay_unusable_this_run = False
+        self.assertIn("No module named 'requests'", logged[-1])
+
+    def test_a_list_with_no_http_answer_is_logged_with_its_reason(self):
+        logged: list = []
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            self.assertEqual((None, rec.OUTCOME_UNREACHABLE),
+                             rec._read_list("p2", {"status": 0, "error": {"exception": "ConnectTimeout"}}))
+        self.assertIn("p2", logged[0])
+        self.assertIn("ConnectTimeout", logged[0])
 
 
 class ProjectSourceTest(unittest.TestCase):

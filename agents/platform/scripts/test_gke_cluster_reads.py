@@ -89,13 +89,23 @@ class GkeClusterReadsTest(unittest.TestCase):
         out, _ = self._run({url: (404, "<html>no</html>")}, {"clusters": [["p1", "us-central1", "a"]]})
         self.assertEqual({"status": 404, "error": {"text": "<html>no</html>"}}, out["gets"]["p1/us-central1/a"])
 
-    def test_each_call_reads_under_the_callers_timeout(self):
+    def test_a_call_reads_for_no_longer_than_the_budget_left(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"
-        for asked, used in ((25.0, 25.0), (None, reads.MAX_READ_TIMEOUT), (900, reads.MAX_READ_TIMEOUT),
-                            (0, reads.MAX_READ_TIMEOUT), (True, reads.MAX_READ_TIMEOUT)):
-            with self.subTest(asked=asked):
-                _, session = self._run({url: (200, {})}, {"projects": ["p1"], "call_timeout": asked})
-                self.assertEqual([used], [t[1] for t in session.timeouts])
+        for asked, budget in ((25.0, 25.0), (None, reads.DEFAULT_BUDGET_SECONDS), (0, reads.DEFAULT_BUDGET_SECONDS),
+                              (True, reads.DEFAULT_BUDGET_SECONDS)):
+            with self.subTest(asked=asked), mock.patch.object(reads.time, "monotonic", return_value=1000.0):
+                _, session = self._run({url: (200, {})}, {"projects": ["p1"], "budget_seconds": asked})
+                (connect, read), = session.timeouts
+                self.assertAlmostEqual(min(budget, connect + reads.MAX_READ_TIMEOUT), connect + read)
+
+    def test_a_call_the_budget_cannot_cover_is_not_started(self):
+        # The read starts 24.5 s into a 25 s budget: it is not sent, and the row says why,
+        # so the caller can read that one some other way.
+        url = f"{self.API}/projects/p1/locations/-/clusters"
+        with mock.patch.object(reads.time, "monotonic", side_effect=[1000.0, 1024.5]):
+            out, session = self._run({url: (200, {})}, {"projects": ["p1"], "budget_seconds": 25})
+        self.assertEqual([], session.urls)
+        self.assertEqual({"status": 0, "error": {"skipped": "budget"}}, out["lists"]["p1"])
 
     def test_a_long_json_error_is_passed_back_whole(self):
         # A long Google error keeps its reason, which sits after the message.
@@ -115,10 +125,15 @@ class GkeClusterReadsTest(unittest.TestCase):
             with self.subTest(raw=raw), mock.patch.object(sys, "stdin", io.StringIO(raw)):
                 self.assertEqual(2, reads.main())
 
-    def test_the_reconcile_calls_the_copy_the_sandbox_image_ships(self):
+    def test_the_reconcile_runs_the_root_owned_copy(self):
+        # `hermes` runs it, so it is the trusted copy and never one an agent-writable
+        # directory supplies; test_sandbox_delivery holds that copy staged and closed.
+        self.assertEqual(reads.SANDBOX_GKE_READS, cluster_agent_reconcile.GKE_READS_HELPER)
+        self.assertTrue(reads.SANDBOX_GKE_READS.startswith("/opt/vcs/libexec/platform/"))
         dockerfile = (REPO / "deploy/sandbox/Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("agents/platform/scripts/gke_cluster_reads.py", dockerfile)
-        self.assertEqual("/opt/defaults/scripts/gke_cluster_reads.py", cluster_agent_reconcile.GKE_READS_HELPER)
+        defaults = dockerfile[dockerfile.index("COPY agents/platform/scripts/sandbox_exec.py"):]
+        defaults = defaults[:defaults.index("/opt/defaults/scripts/")]
+        self.assertNotIn("gke_cluster_reads.py", defaults)
 
 
 if __name__ == "__main__":

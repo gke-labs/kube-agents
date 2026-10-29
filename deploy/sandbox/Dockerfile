@@ -508,10 +508,6 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          only and deliberately so — the sidecar imports it
 #                          across the credential boundary, so it may not reach
 #                          for anything that shells out
-#   gke_cluster_reads.py   the Cluster Agent reconcile's GKE list and get reads, one
-#                          process a batch, through the broker's read-only relay (#3703).
-#                          The reconcile runs in the agent pod and sends it the batch
-#                          over sandbox_exec; it imports only credential_proxy_client
 #   forge.py               the typed layer over the version-control verbs —
 #                          pull requests, comments, identity, permission —
 #                          imported by pr_conversation. Not a REST client and no
@@ -635,7 +631,6 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
-     agents/platform/scripts/gke_cluster_reads.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
@@ -697,7 +692,8 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 #
 # The pull-request and issue crons run in the agent pod, hold the forge
 # credential, and do their forge work by sshing in as `hermes` and running a
-# script here. Two of them cross: forge.py for every forge verb
+# script here. The Cluster Agent reconcile does the same for its GKE reads
+# (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
 # /opt/data is root-owned and, under the operator, a read-only mount, but it
@@ -737,6 +733,7 @@ COPY agents/platform/scripts/forge.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/untrusted_text.py \
+     agents/platform/scripts/gke_cluster_reads.py \
      /opt/vcs/libexec/platform/
 COPY deploy/sandbox/trusted-closure-guard.py /opt/vcs/libexec/trusted-closure-guard.py
 RUN set -e; \
