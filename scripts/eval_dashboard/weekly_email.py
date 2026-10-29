@@ -60,7 +60,8 @@ reason:
 
 The rendered page goes next to ``data.json`` as ``health-email.html`` (the
 workflow's render step). With ``--chat-out``, a page that passed also
-writes the week's Chat summary (``chat_text``: the same week, tiles,
+writes the week's Chat summary (``chat_card``, a Chat card, with
+``chat_text`` as its plain-text fallback: the same week, tiles,
 needs-attention rows and open-bug counts the page printed, plus the task
 time's 90th percentile and slowest area), which ``weekly_chat.py`` posts to
 the CI-health space once a week; a refused week writes none, so nothing is
@@ -289,6 +290,7 @@ REPORT_URL = f"{DASHBOARD_SITE}/{OUT_NAME}"
 # The --chat-out file's keys, which weekly_chat.py reads.
 CHAT_WEEK_KEY = "week_end"
 CHAT_TEXT_KEY = "text"
+CHAT_CARD_KEY = "card"
 CHAT_TITLE = "*kube-agents weekly health · {range}*"
 CHAT_LEAD = "{pct}% of nightly test runs passed ({passed} of {graded}) across {scenarios} scenarios{change}."
 CHAT_CHANGE_UP = ", up {pts} points from last week"
@@ -318,6 +320,46 @@ CHAT_TIME_NONE = "⏱ Task time: no timing on record"
 CHAT_LINKS = "<{report}|full report> · <{dashboard}|dashboard>"
 CHAT_JOIN = " · "
 CHAT_BLOCK_JOIN = "\n\n"
+
+# The same post as a Google Chat card (cardsV2; ``chat_card``). Card text is
+# Chat's HTML subset (<b>, <font color>), so names are escaped.
+CARD_ID = "weekly-health"
+CARD_TITLE = "kube-agents · weekly health"
+CARD_SUBTITLE = "Nightly evals · {range}"
+CARD_IMAGE_TYPE = "SQUARE"
+CARD_LEAD = "<b>{pct}% of test runs passed</b>"
+CARD_COUNTS = "{passed} of {graded} runs · {scenarios} scenarios"
+CARD_CHANGE_UP = f'<font color="{GOOD}">▲ {{pts}} points from last week</font>'
+CARD_CHANGE_DOWN = f'<font color="{BAD}">▼ {{pts}} points from last week</font>'
+CARD_CHANGE_STEADY = "→ steady with last week"
+CARD_NO_TREND = "No trend this week: {counted} of {dates} nights counted ({why})"
+CARD_NO_TREND_PREV = "No trend this week: {counted} of last week's {dates} nights counted ({why})"
+CARD_ATTENTION_TITLE = ATTENTION_TITLE
+CARD_ATTENTION_ITEM = "{dot} {name} {state} · {bugs}"
+# Below LESS_THAN_HALF_PCT red, otherwise orange.
+CARD_DOT_LOW = "🔴"
+CARD_DOT = "🟠"
+CARD_VIEW = "View"
+CARD_BY_AREA_TITLE = BY_AREA_TITLE
+CARD_AREA_ITEM = "{name}  {bar}  {pct}%"
+# Ten steps, a step per full 10%: only 100% fills the bar.
+CARD_BAR_STEPS = 10
+CARD_BAR_FULL = "▰"
+CARD_BAR_EMPTY = "▱"
+# Chat collapses a section to its first N widgets (it cannot keep the last).
+CARD_AREAS_SHOWN = 3
+CARD_TIME_TITLE = "Task time"
+CARD_TIME = "⏱ Typical {typical} min · " + SLOWEST_SHARE + " over {p90} min{slowest}"
+CARD_TIME_SLOWEST = " · Slowest area: {name} ({minutes} min)"
+CARD_TIME_NONE = "⏱ No timing on record"
+CARD_REPORT = "Full report"
+CARD_DASHBOARD = "Dashboard"
+CARD_ALL_BUGS = "All open bugs"
+ALL_BUGS_QUERY = "is:issue is:open label:{label}"
+# The nightly tier runs on a spec.mode: next install (nightly.py).
+CARD_FOOTER = f'<font color="{FAINT}">{{label}}: {{models}} · next mode</font>'
+CARD_MODEL = "Model"
+CARD_MODELS = "Models"
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title}</title></head>
 <body style="margin:0;padding:0;background:{page_bg};">
@@ -992,11 +1034,14 @@ def recheck_footer(week: dict, data: dict, store: dict | None) -> list[str]:
 
 
 def footer_text(week: dict) -> str:
+    start, end = (datetime.date.fromisoformat(d) for d in week["footer"]["range"])
+    return FOOTER.format(range=date_range(start, end), models=html.escape(footer_models(week)), rendered=week.get("rendered", ""))
+
+
+def footer_models(week: dict) -> str:
     footer = week["footer"]
-    start, end = (datetime.date.fromisoformat(d) for d in footer["range"])
     this, prev = NAMES_JOIN.join(footer["models"]), NAMES_JOIN.join(footer["prev_models"])
-    models = this if this == prev or not prev else FOOTER_MODELS.format(this=this, prev=prev)
-    return FOOTER.format(range=date_range(start, end), models=html.escape(models), rendered=week.get("rendered", ""))
+    return this if this == prev or not prev else FOOTER_MODELS.format(this=this, prev=prev)
 
 
 def change_label(trend: str | None, change: int | None) -> tuple[str, str]:
@@ -1096,7 +1141,7 @@ def attention_state(row: dict) -> str:
 # the Chat post
 
 
-def chat_no_trend(week: dict) -> str:
+def chat_no_trend(week: dict, this_template: str = CHAT_NO_TREND, prev_template: str = CHAT_NO_TREND_PREV) -> str:
     """Why no change is called: the short week's counted nights and why the
     rest are left out, this week's when it is the short one."""
     this_short = len(week["counted"]) < MIN_COUNTED_NIGHTS
@@ -1108,7 +1153,7 @@ def chat_no_trend(week: dict) -> str:
             whys[why] = whys.get(why, 0) + 1
     why = NAMES_JOIN.join(CHAT_LEFT_OUT.format(count=count, why=CHAT_WHY.get(reason, reason))
                           for reason, count in sorted(whys.items(), key=lambda item: (-item[1], item[0])))
-    return (CHAT_NO_TREND if this_short else CHAT_NO_TREND_PREV).format(counted=len(counted), dates=len(days), why=why)
+    return (this_template if this_short else prev_template).format(counted=len(counted), dates=len(days), why=why)
 
 
 def chat_time(week: dict) -> str:
@@ -1161,6 +1206,81 @@ def chat_text(week: dict) -> str:
     return CHAT_BLOCK_JOIN.join(ROWS_JOIN.join(block) for block in (head, attention, tail, [links]))
 
 
+def card_bar(pct: int) -> str:
+    filled = pct * CARD_BAR_STEPS // PERCENT
+    return CARD_BAR_FULL * filled + CARD_BAR_EMPTY * (CARD_BAR_STEPS - filled)
+
+
+def card_link(text: str, url: str) -> dict:
+    return {"text": text, "onClick": {"openLink": {"url": url}}}
+
+
+def card_text(text: str) -> dict:
+    return {"textParagraph": {"text": text}}
+
+
+def chat_card(week: dict) -> dict:
+    """The weekly Chat post as a cardsV2 card, from the same week, numbers
+    and open-bug counts as ``chat_text`` (which travels as its fallback)."""
+    def esc(text: str) -> str:
+        return html.escape(text, quote=False)
+
+    overall = week["overall"]
+    rows_by_slug = {r["slug"]: r for r in week["rows"]}
+    days = [datetime.date.fromisoformat(d) for d in week["days"]]
+
+    lead = [card_text(CARD_LEAD.format(pct=overall["pct"])),
+            card_text(CARD_COUNTS.format(passed=overall["passed"], graded=overall["graded"], scenarios=overall["scenarios"]))]
+    if overall["trend"] == TREND_UP:
+        lead.append(card_text(CARD_CHANGE_UP.format(pts=overall["change"])))
+    elif overall["trend"] == TREND_DOWN:
+        lead.append(card_text(CARD_CHANGE_DOWN.format(pts=-overall["change"])))
+    elif overall["trend"] == TREND_STEADY:
+        lead.append(card_text(CARD_CHANGE_STEADY))
+    if not week["trend_ok"]:
+        lead.append(card_text(esc(chat_no_trend(week, CARD_NO_TREND, CARD_NO_TREND_PREV))))
+    lead += [card_text(esc(claim_text(c, rows_by_slug))) for c in week["claims"] if c["kind"] == CLAIM_MODEL_CHANGE]
+    sections = [{"widgets": lead}]
+
+    if week["attention"]:
+        items = []
+        for slug in week["attention"]:
+            row, count = rows_by_slug[slug], week["shown_bugs"][slug]
+            text = CARD_ATTENTION_ITEM.format(dot=CARD_DOT_LOW if row["pct"] < LESS_THAN_HALF_PCT else CARD_DOT, name=esc(row["name"]),
+                                              state=attention_state(row), bugs=CHAT_BUG if count == 1 else CHAT_BUGS.format(count=count))
+            items.append({"decoratedText": {"text": text, "wrapText": True, "button": card_link(CARD_VIEW, bugs_url(week["repo"], slug))}})
+        sections.append({"header": CARD_ATTENTION_TITLE, "widgets": items})
+
+    areas = {"header": CARD_BY_AREA_TITLE, "widgets": [
+        {"decoratedText": {"text": CARD_AREA_ITEM.format(name=esc(r["name"]), bar=card_bar(r["pct"]), pct=r["pct"]), "wrapText": True}} for r in week["rows"]]}
+    if len(week["rows"]) > CARD_AREAS_SHOWN:
+        areas.update(collapsible=True, uncollapsibleWidgetsCount=CARD_AREAS_SHOWN)
+    sections.append(areas)
+
+    if overall["agent_s_median"] is None:
+        time = CARD_TIME_NONE
+    else:
+        slowest = ""
+        if overall["slowest_area"] is not None:
+            row = rows_by_slug[overall["slowest_area"]]
+            slowest = CARD_TIME_SLOWEST.format(name=esc(row["name"]), minutes=minutes(row["agent_s_median"]))
+        time = CARD_TIME.format(typical=minutes(overall["agent_s_median"]), p90=minutes(overall["agent_s_p90"]), slowest=slowest)
+    sections.append({"header": CARD_TIME_TITLE, "widgets": [card_text(time)]})
+
+    footer = week["footer"]
+    all_bugs = ISSUES_SEARCH_URL.format(repo=week["repo"], query=urllib.parse.quote(ALL_BUGS_QUERY.format(label=BUG_LABEL), safe=""))
+    sections.append({"widgets": [
+        {"buttonList": {"buttons": [card_link(CARD_REPORT, REPORT_URL), card_link(CARD_DASHBOARD, DASHBOARD_URL),
+                                    card_link(CARD_ALL_BUGS, all_bugs)]}},
+        card_text(CARD_FOOTER.format(label=CARD_MODELS if len(set(footer["models"]) | set(footer["prev_models"])) > 1 else CARD_MODEL,
+                                     models=esc(footer_models(week)))),
+    ]})
+    return {"cardId": CARD_ID, "card": {
+        "header": {"title": CARD_TITLE, "subtitle": CARD_SUBTITLE.format(range=date_range(days[0], days[-1])),
+                   "imageUrl": ROBOT_URL, "imageType": CARD_IMAGE_TYPE},
+        "sections": sections}}
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1194,7 +1314,7 @@ def parse_args(argv=None):
     parser.add_argument("--week-end", type=datetime.date.fromisoformat, help="the week's last nightly date (default: the Sunday before today, UTC)")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
     parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding domains.yaml and bench/tasks")
-    parser.add_argument("--chat-out", type=pathlib.Path, help="also write the week's Chat summary here (JSON: week_end, text) for weekly_chat.py; not written when the page is refused")
+    parser.add_argument("--chat-out", type=pathlib.Path, help="also write the week's Chat summary here (JSON: week_end, text, card) for weekly_chat.py; not written when the page is refused")
     return parser.parse_args(argv)
 
 
@@ -1228,7 +1348,8 @@ def main(argv=None, gh_runner=None, now: datetime.datetime | None = None) -> int
     print(f"weekly health email for the week ending {week_end}: wrote {args.out}")
     if args.chat_out:
         args.chat_out.parent.mkdir(parents=True, exist_ok=True)
-        args.chat_out.write_text(json.dumps({CHAT_WEEK_KEY: week_end.isoformat(), CHAT_TEXT_KEY: chat_text(week)}, ensure_ascii=False) + "\n")
+        args.chat_out.write_text(json.dumps({CHAT_WEEK_KEY: week_end.isoformat(), CHAT_TEXT_KEY: chat_text(week),
+                                             CHAT_CARD_KEY: chat_card(week)}, ensure_ascii=False) + "\n")
         print(f"weekly Chat summary for the week ending {week_end}: wrote {args.chat_out}")
     return 0
 

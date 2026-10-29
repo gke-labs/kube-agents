@@ -539,6 +539,9 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 		},
 	}
 
+	if err := ctrl.SetControllerReference(agent, partial, scheme); err != nil {
+		t.Fatal(err)
+	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, partial).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
@@ -3687,7 +3690,7 @@ func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 	for i, key := range a2aCredsKeys {
 		data[key] = []byte(strings.Repeat(nibble, 31) + fmt.Sprintf("%x", i))
 	}
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "test-agent-a2a-nats-creds",
 			Namespace:       "test-ns",
@@ -3695,6 +3698,12 @@ func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 		},
 		Data: data,
 	}
+	// Controlled by the test agent, as the operator creates it: the operator
+	// refuses a credentials Secret it doesn't own.
+	if err := ctrl.SetControllerReference(a2aTestAgent(), secret, setupScheme()); err != nil {
+		panic(err)
+	}
+	return secret
 }
 
 // a2aPasswordDigestNeedles returns, for one password, every form of it that

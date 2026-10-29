@@ -113,6 +113,8 @@ hand-written. Never edit inside the markers — edit the source and regenerate.
 | --- | --- | --- |
 | `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->` | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
 | `docs/site/src/content/docs/concepts/autonomous-watchdogs.md`, `docs/site/src/content/docs/concepts/skills.md`, `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-job-example -->` | The `compliance-audit` entry of `agents/platform/cron/jobs.json`, rendered as fenced JSON |
+| `docs/site/src/content/docs/concepts/autonomous-watchdogs.md` | `<!-- BEGIN GENERATED: cron-helper-jobs -->` | The enabled entries of `agents/platform/cron/jobs.json` that do not carry the `fleet-audit` skill, in roster order, cadence glossed by `CRON_CADENCE` in `scripts/generate_docs.py` |
+| `docs/site/src/content/docs/concepts/governance-sops.md` | `<!-- BEGIN GENERATED: governance-audits -->` | The enabled entries of `agents/platform/cron/jobs.json` that carry the `fleet-audit` skill, with the SOP each prompt names, cadence glossed by `CRON_CADENCE` in `scripts/generate_docs.py` |
 | `docs/site/src/content/docs/skills/index.mdx` | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
 | `docs/site/src/content/docs/deploy/docker-images.md` | `<!-- BEGIN GENERATED: container-images -->` | `images.json` |
 | `docs/site/src/content/docs/operator/platformagent-fields.md` | `<!-- BEGIN GENERATED: crd-fields-platformagent -->` | The `PlatformAgent` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
