@@ -143,6 +143,32 @@ standby. So:
 No routing object moves on a handover, so none needs a grant. A port-forward to the old pod breaks
 when that pod goes, and the client re-resolves the holder.
 
+#### Keeping port-forwards smooth
+
+Today people, scripts and the eval harness run `kubectl port-forward svc/<agent>-a2a-inject` (or
+`-a2a-door`), and at two replicas that lands on the standby about half the time. Three things keep
+that from being a trap:
+
+- **The 503 says exactly what to run.** Its body names the holder and gives the command, for
+  example `kubectl -n kubeagents-system port-forward pod/<holder> 8699`, so a person who hits the
+  standby copies one line.
+- **A one-liner and a helper resolve the holder.**
+  `kubectl -n <ns> port-forward pod/$(kubectl -n <ns> get lease <agent>-a2a-gateway -o jsonpath='{.spec.holderIdentity}') <port>`
+  does it by hand, and a small script in `hack/` wraps it, re-resolving when the port-forward drops
+  on a handover.
+- **Every caller is updated in the same change as the standby's 503:** the bench harness's
+  inject transport (`bench/kube_agents_bench/harness.py` and `inject_transport.py`), which
+  drives the required smoke gate, resolves the holder and re-resolves on a 503 or a dropped
+  tunnel; `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` and `hack/rollback-roundtrip.sh`; and
+  `bench/README.md` and the docs that show a door port-forward. That change lands before the
+  operator renders a second replica, so the gate never sees a standby it can't route around.
+
+Two surfaces aren't affected. The console page's port-forward goes to the console server, its own
+Deployment, which proxies to the bus rather than to a gateway pod. The MCP server runs as its own
+Deployment on the bus as the console principal. Both reach the active gateway through core NATS
+subjects only the active replica subscribes to, so the one thing they see on a handover is the
+ingress gap above.
+
 ### Alternatives considered
 
 - **Electing through a NATS KV key** instead of a Kubernetes Lease. It needs no Kubernetes grant,
@@ -201,8 +227,9 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    bind after a takeover from an expired lease; release on SIGTERM. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
    takeover renders the dead leader's held events before newer ones.
-3. **The standby's doors:** 503 with the holder's pod name, and the scripts and the eval harness
-   port-forwarding to the holder.
+3. **The standby's doors:** 503 with the holder and the exact port-forward command, the `hack/`
+   helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
+   step 4, so nothing meets a standby it can't route around.
 4. **Operator:** replicas, the readiness probe, the strategy, the PDB, the spread, the Lease and
    its Role. Its tests pin each.
 5. **The cards-pending mark on the record** (planned separately).
