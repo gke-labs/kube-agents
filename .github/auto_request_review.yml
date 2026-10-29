@@ -26,8 +26,9 @@ reviewers:
       - stalhaali
       - Fuxiao-Gao
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
-    # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
-    # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request
+    # change to hack/eval/presubmit-cases.txt, hack/eval/blocking-roster.txt
+    # (#1546) or hack/ci-eval-pr.sh (#1560; hack/OWNERS). Keep the two lists
+    # identical. A mixed pull request
     # routes here alone, so a member who is not a root approver can clear the
     # roster half and the rest still waits on a root approver's /approve.
     eval-crew:
@@ -46,6 +47,8 @@ files:
   "hack/eval/presubmit-cases.txt":
     - eval-crew
   "hack/eval/blocking-roster.txt":
+    - eval-crew
+  "hack/ci-eval-pr.sh":
     - eval-crew
 
 options:

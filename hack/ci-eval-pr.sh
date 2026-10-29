@@ -88,6 +88,12 @@ readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=30
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# What a pull request is graded by (the merge target's grader, section 6):
+# this tree at PULL_BASE_SHA, with the change's own cases subdirectory in
+# place of the target's. Both relative to the repository root.
+readonly EVAL_GRADER_TREE="bench"
+readonly EVAL_GRADER_CASES_DIR="tasks"
+
 # A repetition the launcher could not start because GitHub's token endpoint
 # failed transiently (record_unit_not_run, beside run_one_unit). The unit
 # writes a record in place of the run that carries the harness's own
@@ -2233,8 +2239,8 @@ fi
 # after that, is what every case on either lane carries beside its own
 # checks (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
-# under the eval-crew alias and lets the nightly file and this script fall
-# through to the root approvers. Each file's header says what belongs in it;
+# under the eval-crew alias and lets the nightly file fall through to the
+# root approvers (this script is under eval-crew too, for the grader pin). Each file's header says what belongs in it;
 # docs/designs/bench-case-format.md "Registration" is the rule.
 #
 # Paths in the files are relative to BENCH_DIR, which is where devops-bench
@@ -2547,6 +2553,101 @@ if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_
     exit 1
   fi
 fi
+
+# ─── Grade with the merge target's grader (#1560, section 6) ─────────────────
+# A pull request is graded by main's grader, not its own: everything under
+# bench/ but bench/tasks/ -- harness, verifiers, bench-gate, the devops-bench
+# pin in uv.lock, the fleet and the case stacks under bench/tf/ -- comes from
+# PULL_BASE_SHA, the commit clonerefs merged the change onto, and the cases
+# come from the change. Otherwise a change could edit what grades it. The two
+# trees are joined in a scratch directory, and BENCH_DIR points there for
+# every `uv run` after this, so no call site below needs to know. The
+# nightly, the postsubmit and the release-candidate run grade from HEAD,
+# where the two are the same commit.
+#
+# A case main's grader cannot read -- a check type or field it does not know,
+# a stack it does not have -- stops the job red here, before the fan-out,
+# rather than running and losing the check to rung 2 (or a missing stack to
+# infrastructure). So a grader change lands on main before the case that
+# needs it (decided 2026-10-28). A new case lands in the nightly, which grades
+# from HEAD, so only a change to a presubmit case is held to that order.
+#
+# hack/OWNERS puts this script under the eval-crew alias, so a change that
+# takes the pin out needs an eval-crew approval. EVAL_GRADER_SHA names the
+# commit that graded the run; `bench-gate suite` writes it into
+# eval-verdict.json and the verdict markdown, and a grader that predates it
+# ignores the variable.
+grader_pin_applies() { # -> 0 when this run grades a change against a merge target
+  [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
+}
+
+# main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
+# extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
+# is gone, and one it adds is there.
+pin_grader() { # <repo root> <sha> <out>
+  local repo="$1" sha="$2" out="$3"
+  git -C "${repo}" archive "${sha}" "${EVAL_GRADER_TREE}" | tar -x -C "${out}" || return 1
+  [ -d "${out}/${EVAL_GRADER_TREE}" ] || return 1
+  rm -rf "${out:?}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
+  cp -R "${repo}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}" "${out}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
+}
+
+# One `<task file>: <reason>` line per thing the grader in BENCH_DIR cannot
+# read in the named task files, nothing when it reads them all. Three reads,
+# each the one the run would make: devops-bench's task loader, its
+# verification-spec parser (which skips an entry it cannot parse and lets the
+# run go on), and bench-gate's case loader; plus whether a declared stack is
+# under tf/. Exits non-zero only when the check itself could not run.
+grader_unreadable_cases() { # <task file>... (relative to BENCH_DIR)
+  (cd "${BENCH_DIR}" && uv run python -c '
+import sys
+from pathlib import Path
+
+from devops_bench.tasks.loader import FileSystemTaskLoader
+from devops_bench.verification.spec import parse_entries
+from kube_agents_bench.cases import load_case
+
+for path in sys.argv[1:]:
+    try:
+        tasks = FileSystemTaskLoader().load_tasks(path)
+        load_case(path)
+    except Exception as exc:
+        print(f"{path}: {exc}")
+        continue
+    for task in tasks:
+        for error in parse_entries(task.verification_spec)[1]:
+            print(path + ": verification entry " + str(error.get("name")) + ": " + str(error.get("reason")))
+        stack = (task.infrastructure or {}).get("stack")
+        if stack and not (Path("tf") / str(stack)).is_dir():
+            print(f"{path}: its stack tf/{stack} is not in this grader")
+' "$@")
+}
+
+EVAL_GRADER_SHA="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)"
+if grader_pin_applies; then
+  if [ -z "${PULL_BASE_SHA:-}" ] || ! git -C "${SCRIPT_DIR}/.." cat-file -e "${PULL_BASE_SHA}^{commit}" 2>/dev/null; then
+    echo "ERROR: this run grades a change (PULL_NUMBER or JOB_TYPE=${JOB_TYPE:-unset}) but PULL_BASE_SHA='${PULL_BASE_SHA:-}' names no commit in this checkout, so main's grader cannot be extracted; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  GRADER_ROOT="$(mktemp -d)"
+  if ! pin_grader "${SCRIPT_DIR}/.." "${PULL_BASE_SHA}" "${GRADER_ROOT}"; then
+    echo "ERROR: could not extract ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA} into ${GRADER_ROOT}; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  BENCH_DIR="${GRADER_ROOT}/${EVAL_GRADER_TREE}"
+  EVAL_GRADER_SHA="${PULL_BASE_SHA}"
+  echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
+  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${TASKS[@]}")"; then
+    echo "ERROR: could not check that main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) reads this change's cases (above); the run does not start." >&2
+    exit 1
+  fi
+  if [ -n "${GRADER_UNREADABLE}" ]; then
+    echo "ERROR: main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) cannot read these cases: this case needs a grader change that is not on main yet; land the grader change first, then the case." >&2
+    sed 's/^/  /' <<< "${GRADER_UNREADABLE}" >&2
+    exit 1
+  fi
+fi
+export EVAL_GRADER_SHA
 
 # ─── The lanes' safeguards (#2079) ───────────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
