@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# fleet-audit's harness, which writes the reports this module reads; appended, so
+# this directory's modules still win.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "skills" / "fleet-audit" / "scripts"))
 
+import audit_report
 import slack_audit_report as sar
 
 LEDGER = "https://github.com/acme/fleet-config/issues/231"
@@ -1359,10 +1363,7 @@ class SummaryCardTest(unittest.TestCase):
         self.assertIsNone(sar.summary_card(report))
 
     def test_a_rerun_label_above_the_summary_is_dropped(self):
-        for label in (
-            "Re-run in this audit after an earlier finish published and stopped; counts are against what it published.",
-            "Re-run in this audit after an earlier finish published and stopped; counts cover the whole run.",
-        ):
+        for label in (audit_report.CHAT_REPORT_RERUN_RELATIVE_LABEL, audit_report.CHAT_REPORT_RERUN_LABEL):
             with self.subTest(label=label[-30:]):
                 report = f"{label}\n{SUMMARY}"
                 self.assertEqual(sar.summary_card(report), sar.summary_card(SUMMARY))
@@ -1371,7 +1372,7 @@ class SummaryCardTest(unittest.TestCase):
                 self.assertNotIn(label, sar.blocks_from_summary(report)[1])
 
     def test_a_rerun_label_alone_or_over_another_shape_posts_as_written(self):
-        label = "Re-run in this audit after an earlier finish published and stopped; counts cover the whole run."
+        label = audit_report.CHAT_REPORT_RERUN_LABEL
         for report in (label, f"{label}\nHere's the audit.\n{sar.NO_LEDGER_NOTES[0]}"):
             with self.subTest(report=report[-20:]):
                 self.assertIsNone(sar.summary_card(report))

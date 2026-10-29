@@ -1126,8 +1126,6 @@ SUMMARY_BREAKDOWN_SEPARATOR = ", "
 SUMMARY_HELD_MORE = ", and {count} more saved on the install"
 # The finding kind whose object is the cluster itself, which a row names once.
 CLUSTER_OBJECT_KIND = "Cluster"
-# The finding kind whose object is the namespace itself, which a row names once.
-NAMESPACE_OBJECT_KIND = "Namespace"
 # The placeholder a phrase carries for the object it judged.
 PHRASE_OBJECT = "{object}"
 # The chat summary's and the chat report's headline: the count of the most
@@ -20618,13 +20616,15 @@ def _object_name(finding: dict) -> str:
 
 
 def _row_namespace(finding: dict) -> str:
-    """The finding's namespace as a row names it, or "" when it has none or the object is the namespace or the cluster."""
+    """The finding's namespace as a row names it, or "" when it has none or the object is the namespace.
+
+    A namespace object in any spelling the join accepts (`NAMESPACE_KIND_SPELLINGS`).
+    """
     namespace = str(finding.get("namespace") or "").strip()
     if namespace == ID_EMPTY_SEGMENT:
         return ""
     kind, _, name = str(finding.get("object") or "").rpartition("/")
-    kind = kind.rpartition("/")[2]
-    if kind in (NAMESPACE_OBJECT_KIND, CLUSTER_OBJECT_KIND) or (not kind and name == namespace):
+    if kind.rpartition("/")[2].lower() in NAMESPACE_KIND_SPELLINGS or (not kind and name == namespace):
         return ""
     return namespace
 

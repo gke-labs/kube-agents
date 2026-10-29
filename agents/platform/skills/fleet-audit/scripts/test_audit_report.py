@@ -31997,8 +31997,18 @@ class TestPlainChatLines(unittest.TestCase):
             ],
         )
 
+    def test_a_namespaced_custom_resource_called_cluster_keeps_its_namespace(self):
+        finding = make_finding(check="not-a-check", cluster="seeded-a", namespace="db", obj="Cluster/pg", title="Postgres has no backup")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a/db: Postgres has no backup")
+
     def test_a_row_names_no_namespace_for_the_namespace_itself_or_its_placeholder(self):
-        for obj, namespace in (("Namespace/payments", "payments"), ("payments", "payments"), ("Deployment/api", "_")):
+        for obj, namespace in (
+            ("Namespace/payments", "payments"),
+            ("namespace/payments", "payments"),
+            ("ns/payments", "payments"),
+            ("payments", "payments"),
+            ("Deployment/api", "_"),
+        ):
             with self.subTest(obj=obj, namespace=namespace):
                 finding = make_finding(check="netpol-missing", cluster="seeded-a", namespace=namespace, obj=obj)
                 self.assertTrue(audit_report.summary_row(finding).startswith("`critical` seeded-a: "))
@@ -32006,7 +32016,7 @@ class TestPlainChatLines(unittest.TestCase):
     def test_a_row_without_a_phrase_keeps_the_title(self):
         unknown = make_finding(check="not-a-check", title="Something  odd")
         self.assertEqual(audit_report.summary_row(unknown), "`critical` prod-us-east: Something odd")
-        objectless = make_finding(check="privileged-container", obj="Cluster/prod-us-east", title="A privileged pod")
+        objectless = make_finding(check="privileged-container", obj="Cluster/prod-us-east", namespace="", title="A privileged pod")
         self.assertEqual(audit_report.summary_row(objectless), "`critical` prod-us-east: A privileged pod")
 
     def test_a_row_is_redacted(self):
