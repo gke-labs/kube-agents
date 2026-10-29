@@ -376,11 +376,14 @@ INCIDENT_PR_BRANCH_NEEDLE = "`{branch}`"
 # in the session the triage start opened for the alert, so this is the card
 # the hold after an unanswered turn waits for. A session is not always one
 # turn (the watcher's `--mode=shared` sends every incident into one), so the
-# read is floored at the turn's start and narrowed to the body naming the
-# turn's branch: a card an earlier turn of the session filed, or one a
-# concurrent turn on another branch filed, is not this turn's. Hermes stamps
-# `created_at` in whole seconds, so the floor is the whole second the turn
-# began in (`_attempt_triage_start`).
+# read is floored and narrowed to the body naming the turn's branch: a card
+# an earlier turn of the session filed, or one a concurrent turn on another
+# branch filed, is not this turn's. The floor is the whole second after the
+# one the turn began in (`_attempt_triage_start`): Hermes stamps `created_at`
+# in whole seconds, and the previous same-branch turn's card was stamped
+# before this turn took the branch lock, so it can share the second the turn
+# began in but never a later one; this turn's own card lands after a model
+# call, in a later second.
 INCIDENT_PR_OWN_CARD_SQL = """
     SELECT t.id
       FROM tasks t
@@ -2956,8 +2959,11 @@ def _own_pull_request_card(session_id: str, branch: str, since: float) -> str:
     Read-only, any status: the question is whether the turn's Call 2 has landed,
     not whether the card is live. The floor and the branch make the read about
     this turn rather than about the session, which `--mode=shared` reuses for
-    every incident: a card the session filed before this turn began, or for
-    another branch, is some other turn's. A board that is missing or cannot be
+    every incident: a card the session filed before this turn began (the
+    caller's floor is the second after the one the turn began in, so the
+    previous turn's card is below it even when that turn's `/chat` returned in
+    the same second this one took the lock), or for another branch, is some
+    other turn's. A board that is missing or cannot be
     read answers "" too, which to the one caller (`_hold_for_unanswered_turn`)
     means "not yet": the hold goes on polling, bounded by
     INCIDENT_START_UNKNOWN_HOLD_S, rather than releasing on a read it could not
@@ -4012,7 +4018,7 @@ def _incident_start_lock(payload: Dict[str, Any], session_id: str):
     return _INCIDENT_START_LOCKS[zlib.crc32(branch.encode("utf-8")) % INCIDENT_START_LOCK_STRIPES]
 
 
-def _hold_for_unanswered_turn(session_id: str, branch: str, turn_began: float) -> None:
+def _hold_for_unanswered_turn(session_id: str, branch: str, cards_since: float) -> None:
     """Keep the branch's start lock while a turn `/chat` did not answer may still be filing.
 
     `_attempt_triage_start_unlocked` treats START_UNKNOWN as started, since a
@@ -4021,17 +4027,18 @@ def _hold_for_unanswered_turn(session_id: str, branch: str, turn_began: float) -
     sibling lookup before they are. So the stripe stays held until the
     pull-request card this turn filed is on the board
     (`_own_pull_request_card`: this session's, for this branch, created at or
-    after `turn_began`, the whole second the turn began in, so the read is
-    keyed on the one fact the hold needs, and neither another card settling,
-    nor a poll the board refused, nor a card of another session, nor a card
-    this session filed in an earlier turn or for another branch ends it), or
+    after `cards_since`, the whole second after the one the turn began in, so
+    the read is keyed on the one fact the hold needs, and neither another card
+    settling, nor a poll the board refused, nor a card of another session, nor
+    a card this session filed in an earlier turn, in the second this turn
+    began in included, or for another branch ends it), or
     INCIDENT_START_UNKNOWN_HOLD_S has passed. Past that, a turn still running
     is the window the lock does not cover, and the log line says which way the
     hold ended.
     """
     deadline = time.monotonic() + INCIDENT_START_UNKNOWN_HOLD_S
     while True:
-        if _own_pull_request_card(session_id, branch, turn_began):
+        if _own_pull_request_card(session_id, branch, cards_since):
             logger.info(f"INCIDENT_START_HELD session={session_id} until=card")
             return
         now = time.monotonic()
@@ -4051,12 +4058,19 @@ def _attempt_triage_start(start: _TriageStart) -> None:
         waited = time.monotonic() - began
         if waited >= INCIDENT_START_WAIT_LOG_S:
             logger.info(f"INCIDENT_START_SERIALIZED session={start.session_id} waited={waited:.0f}s")
-        # The hold's floor, taken before the turn so every card the turn files
-        # is at or after it: the whole second, as Hermes stamps `created_at`.
-        turn_began = math.floor(time.time())
+        # The hold's floor, taken before the turn: the whole second after the
+        # one the turn begins in. Hermes stamps `created_at` in whole seconds,
+        # and the previous same-branch turn's card was stamped before this
+        # start took the stripe, so that card can carry the second this turn
+        # began in (its `/chat` returned, or its own hold ended, in that
+        # second) but never a later one; the turn's own Call 2 lands after a
+        # model call, in a later second. A card of this turn stamped in its
+        # first second would be missed and the hold would run to its timeout,
+        # which errs on the side of holding.
+        cards_since = math.floor(time.time()) + 1
         outcome = _attempt_triage_start_unlocked(start)
         if serialized and outcome == START_UNKNOWN:
-            _hold_for_unanswered_turn(start.session_id, _incident_branch(start.session_id, start.payload), turn_began)
+            _hold_for_unanswered_turn(start.session_id, _incident_branch(start.session_id, start.payload), cards_since)
 
 
 def _attempt_triage_start_unlocked(start: _TriageStart) -> str:

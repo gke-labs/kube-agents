@@ -3372,14 +3372,18 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
 
     def test_an_unanswered_turn_holds_the_lock_until_its_card_is_on_the_board(self):
         # The board the first start's prompt saw: a live same-branch sibling
-        # filed by an earlier session, and a settled pull-request card the
-        # first start's own session filed in an earlier turn (the watcher's
-        # `--mode=shared` sends every incident into one session), which is not
-        # this turn's card and must not end the hold.
-        before_the_turn = time.time() - 10.0
+        # filed by an earlier session, and the pull-request card the first
+        # start's own session filed in its previous same-branch turn (the
+        # watcher's `--mode=shared` sends every incident into one session),
+        # stamped with the whole second this turn begins in, as Hermes stamps
+        # it when that turn's `/chat` returned and the stripe changed hands
+        # inside one second. It is not this turn's card and must not end the
+        # hold. Every card filed below is stamped the way Hermes stamps one
+        # filed after a model call: in the second after the turn began.
+        this_second = math.floor(time.time())
         self.make_board(
-            self.card(self.SIBLING, "running", created_at=before_the_turn, session_id="k8s-evt-0"),
-            self.card("t_0a000000", "done", created_at=before_the_turn, session_id="k8s-evt-a"),
+            self.card(self.SIBLING, "running", created_at=this_second - 10, session_id="k8s-evt-0"),
+            self.card("t_0a000000", "done", created_at=this_second, session_id="k8s-evt-a"),
         )
         turns, patches = self._unanswered_turn(10.0)
         with ExitStack() as stack:
@@ -3404,12 +3408,12 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self._assert_still_held(first, second, turns)
             self._board_write(
                 "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                self.card("t_2b000002", "running", created_at=time.time(), session_id="k8s-evt-z"),
+                self.card("t_2b000002", "running", created_at=math.floor(time.time()) + 1, session_id="k8s-evt-z"),
             )
             self._assert_still_held(first, second, turns)
             self._board_write(
                 "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                self.card("t_3c000003", "todo", branch=self.branch() + "-other", created_at=time.time(), session_id="k8s-evt-a"),
+                self.card("t_3c000003", "todo", branch=self.branch() + "-other", created_at=math.floor(time.time()) + 1, session_id="k8s-evt-a"),
             )
             self._assert_still_held(first, second, turns)
             with patch.object(session_kv_server, "_read_kanban", side_effect=session_kv_server.HTTPException(503, "locked")):
@@ -3417,7 +3421,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             # The first start's own turn files its Call 2 card.
             self._board_write(
                 "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                self.card("t_1a000001", "todo", created_at=time.time(), session_id="k8s-evt-a"),
+                self.card("t_1a000001", "todo", created_at=math.floor(time.time()) + 1, session_id="k8s-evt-a"),
             )
             first.join(5)
             second.join(5)
@@ -3493,8 +3497,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         )
         self.assertEqual(own_card(), "")
         # Once filed it counts in any status, settled included: the question is
-        # whether Call 2 landed, not whether the card is live. Hermes stamps
-        # whole seconds, so a card stamped with the floor's own second counts.
+        # whether Call 2 landed, not whether the card is live. A card stamped
+        # with the floor's own second counts: the caller's floor is the second
+        # after the one the turn began in, and Hermes stamps whole seconds.
         for status in ("todo", "running", "blocked", "done", "archived"):
             with self.subTest(status=status):
                 self._board_write("DELETE FROM tasks WHERE id = 't_1a000001'")
@@ -11900,13 +11905,15 @@ class TestTriageStartRetry(unittest.TestCase):
         wall_before = math.floor(time.time())
         own_card, logs = self._unanswered_chat_with_the_opt_in_on(["", "", "t_1a000001"], TimeoutError("timed out"))
         self.assertEqual(own_card.call_count, 3)
-        # Keyed on this turn: the session, its branch, and the whole second the
-        # turn began in, so a card the session filed earlier does not count.
-        session_id, branch, turn_began = own_card.call_args_list[0].args
+        # Keyed on this turn: the session, its branch, and the whole second
+        # after the one the turn began in, so a card the session filed earlier
+        # does not count, the previous turn's card stamped in the turn's first
+        # second included.
+        session_id, branch, cards_since = own_card.call_args_list[0].args
         self.assertEqual(session_id, "k8s-evt-1")
         self.assertEqual(branch, session_kv_server._incident_branch("k8s-evt-1", dict(self.INCIDENT)))
-        self.assertIsInstance(turn_began, int)
-        self.assertTrue(wall_before <= turn_began <= math.floor(time.time()), (wall_before, turn_began))
+        self.assertIsInstance(cards_since, int)
+        self.assertTrue(wall_before + 1 <= cards_since <= math.floor(time.time()) + 1, (wall_before, cards_since))
         self.assertIn("INCIDENT_START_HELD session=k8s-evt-1 until=card", logs)
         self.assertAlmostEqual(self.clock.now - began, 2 * session_kv_server.INCIDENT_START_UNKNOWN_POLL_S)
 
