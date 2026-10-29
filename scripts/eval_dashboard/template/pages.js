@@ -163,7 +163,7 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
-const ui = { sort: null, show: null, window: null, rows: null, domain: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, openTables: new Set() };
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, openTables: new Set() };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -1394,6 +1394,9 @@ function caseGroups(cases, sort) {
 const casesView = (link) => (link.casesView || PAGE.casesViews.reliability);
 const casesViewHref = (view) => `${PAGE.pages.cases}#view=${view}`;
 const scenariosHref = () => casesViewHref(PAGE.casesViews.scenarios);
+// The scenarios view scoped to one domain, or the whole view for null.
+const SCENARIOS_ALL_DOMAINS = "all";
+const scenariosDomainHref = (slug) => (slug ? `${scenariosHref()}&domain=${enc(slug)}` : scenariosHref());
 function casesSubnav(view) {
   const item = (key, label) => `<a href="${esc(casesViewHref(key))}"${view === key ? ' class="on"' : ""}>${esc(label)}</a>`;
   return `<nav class="subnav">${item(PAGE.casesViews.reliability, "How reliable is each test")}${item(PAGE.casesViews.scenarios, "What kube-agents can do")}</nav>`;
@@ -1982,12 +1985,13 @@ function scenariosHtml(link) {
     return head + `<div class="sec"><p class="mut">No scenario to show: the checkout this view was rendered from has no <code>bench/tasks</code> for the ${plural(every.length, "case")} on record.</p></div>` + footHtml();
   }
   const groups = scenarioGroups(cases);
-  const picked = ui.domain || link.domain;
-  const shown = groups.some((g) => g.slug === picked) ? groups.filter((g) => g.slug === picked) : groups;
+  // The filter is the URL's `domain=` alone (linkState); a slug no section has shows every one.
+  const filtered = groups.find((g) => g.slug === link.domain) || null;
+  const shown = filtered ? [filtered] : groups;
   const counts = { proven: 0, proving: 0, in_development: 0 };
   for (const c of cases) counts[levelOf(c)] += 1;
-  const chips = [chip("domain", "all", `all · ${cases.length}`, shown.length === groups.length)]
-    .concat(groups.map((g) => chip("domain", g.slug, `${g.name} · ${g.cases.length}`, shown.length === 1 && shown[0].slug === g.slug, g.meaning || "")));
+  const chips = [chip("domain", SCENARIOS_ALL_DOMAINS, `all · ${cases.length}`, !filtered)]
+    .concat(groups.map((g) => chip("domain", g.slug, `${g.name} · ${g.cases.length}`, filtered != null && filtered.slug === g.slug, g.meaning || "")));
   // With nothing Proven yet, say why in one line: the earliest night any
   // card's current record reaches back to.
   const starts = cases.map((c) => parseIso(confidenceOf(c).since)).filter((ms) => ms != null);
@@ -2446,7 +2450,14 @@ function onClick(event) {
   else if (d.show) ui.show = d.show;
   else if (d.window) ui.window = d.window;
   else if (d.rows) ui.rows = d.rows;
-  else if (d.domain) ui.domain = d.domain;  // the scenarios view's filter; "all" matches no section and shows every one
+  else if (d.domain) {
+    // The scenarios view's domain chips navigate, as the Trend page's do:
+    // the fragment is the one source of truth, so a chip's choice is a link
+    // that can be pasted and does not outlive the next navigation.
+    const href = scenariosDomainHref(d.domain === SCENARIOS_ALL_DOMAINS ? null : d.domain);
+    location.hash = href.slice(href.indexOf("#"));
+    return;
+  }
   else if (d.marker) ui.markers[d.marker] = !ui.markers[d.marker];
   else if (d.toggle === "held") ui.showHeld = true;
   else if (d.toggle === "retired") ui.showRetired = true;

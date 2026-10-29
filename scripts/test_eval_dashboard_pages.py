@@ -322,6 +322,24 @@ def freshness_badge(html: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
+CHIP_NAVIGATION_SUFFIX = "-chipnav"
+# Clicks the domain chip `slug` after boot, records the fragment, the
+# section count and the active chips the click produced on
+# <body data-after-chip>, then navigates to the unscoped scenarios view the
+# way the sub-nav does. The final DOM shows what the URL says if the chip
+# wrote the URL and nothing else.
+CHIP_NAVIGATION_SHIM = ('<script>setTimeout(() => {{ document.querySelector(\'button[data-domain="{slug}"]\').click(); '
+                        'setTimeout(() => {{ document.body.dataset.afterChip = location.hash + "|" + document.querySelectorAll(".sec[id^=domain-]").length '
+                        '+ "|" + [...document.querySelectorAll("button[data-domain].on")].map((b) => b.dataset.domain).join(","); '
+                        'location.hash = "view=scenarios"; }}, 300); }}, 300);</script>')
+
+
+def chip_navigation_page(page: pathlib.Path, slug: str) -> pathlib.Path:
+    copy = page.with_name(page.stem + CHIP_NAVIGATION_SUFFIX + page.suffix)
+    copy.write_text(page.read_text().replace("</body>", CHIP_NAVIGATION_SHIM.format(slug=slug) + "</body>", 1))
+    return copy
+
+
 def clock_page(page: pathlib.Path, now_iso: str) -> pathlib.Path:
     """A copy of the rendered page whose wall clock is pinned to
     ``now_iso``, so the badge's age and staleness are the test's, not the
@@ -2241,6 +2259,16 @@ class ScenariosPageTest(unittest.TestCase):
         self.assertIn("3 scenarios in 2 domains", app, "the totals stay the page's")
         app = dom_text(self.page, fragment="#view=scenarios&domain=nonesuch")
         self.assertIn('id="domain-reliability"', app, "an unknown domain shows every section")
+        self.assertIn('data-domain="all" class="on"', app, "and only the all chip is active")
+        # A chip writes the URL and nothing else: after clicking `cost` the
+        # fragment carries domain=cost and one section shows; a later
+        # navigation to the unscoped view shows every section again.
+        html = dom_html(chip_navigation_page(self.page, "cost"), fragment="#view=scenarios")
+        self.assertIn('data-after-chip="#view=scenarios&amp;domain=cost|1|cost"', html, "the fragment, one section, and only the cost chip active")
+        after = html[html.find('<div id="app">'):]
+        self.assertIn('id="domain-reliability"', after, "the chip's choice did not outlive the navigation")
+        self.assertIn('id="domain-cost"', after)
+        self.assertIn('data-domain="all" class="on"', after)
         bare = dom_text(self.bare / "cases.html", fragment="#view=scenarios")
         self.assertIn('task finished <b>2 min 20 s</b></span> · <span class="hint" data-tip="from the last recorded night, Tue 12:00 AM ET: no repetition in the current window carries timing yet">older night</span></span><span class="more">', bare)
         self.assertNotIn("more needed before it can read Proven · marked expected_fail", bare, "a known gap is not told it can read Proven")

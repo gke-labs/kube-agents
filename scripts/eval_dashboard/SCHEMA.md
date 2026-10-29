@@ -814,8 +814,10 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
   markers. No parameter is the overview of every domain.
 - On the Cases page `view=scenarios` opens the scenarios view (any other
   value is the reliability table); there `domain=<slug>` (the case-id
-  grammar) shows that domain's section alone, as the view's domain chips
-  do, and a slug no section has shows every one. The sections carry
+  grammar) shows that domain's section alone, and a slug no section has
+  shows every one. The view's domain chips write this fragment rather than
+  a page state, as the Trend page's chips do, so the URL is the one source
+  of the filter and a chip's choice is a link. The sections carry
   `id="domain-<slug>"`.
 
 ### `brief.json` (written by `render.py`)
