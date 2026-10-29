@@ -42,6 +42,7 @@ import yaml
 from kube_agents_bench import stop_hook
 
 __all__ = [
+    "CASE_KEYS",
     "HARNESS_WRITTEN_ENTRIES",
     "TRACE_GRADABLE_CHECK_TYPES",
     "TRANSPORT_BLIND_CHECK_TYPES",
@@ -50,6 +51,30 @@ __all__ = [
     "CaseSpecError",
     "load_case",
 ]
+
+# Every top-level key a task.yaml may carry: devops-bench's task fields and
+# the aliases its loader accepts (``task_id``, ``goal``, ``input``), then the
+# keys this package and the repository's case tooling read, then
+# ``task_version``, a case's own revision note that nothing reads. Neither
+# loader rejects a key it does not know -- devops-bench and load_case read the
+# keys they want and drop the rest -- so this is the grader's schema for the
+# top level: hack/ci-eval-pr.sh reds a pull request's case that carries a key
+# outside main's copy of it, and tests/test_cases.py holds every task in the
+# tree to it. A new case-level key is added here, in a pull request before
+# the presubmit case that uses it.
+DEVOPS_BENCH_CASE_KEYS = frozenset(
+    {
+        "id", "task_id", "name", "prompt", "goal", "input", "expected_output",
+        "retrieval_context", "chaos_spec", "verification_spec", "recoverable_safety",
+        "infrastructure", "documentation", "validated",
+    }
+)
+CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | frozenset(
+    {
+        "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
+        "audit_streams", "task_version",
+    }
+)
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out

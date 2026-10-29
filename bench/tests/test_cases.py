@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import pytest
 
-from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpecError, load_case
+import yaml
+from devops_bench.tasks.schema import Task
+
+from kube_agents_bench.cases import CASE_KEYS, DEVOPS_BENCH_CASE_KEYS, NOOP_DEPLOYER, CaseSpecError, load_case
 
 from conftest import TASKS
 
@@ -51,6 +54,20 @@ def test_every_shipped_task_parses(path):
     assert spec.case_id == path.parent.name
     assert spec.name
     assert spec.deployer
+
+
+@pytest.mark.parametrize("path", _task_files(), ids=lambda p: p.parent.name)
+def test_every_shipped_task_keeps_to_the_case_keys(path):
+    """hack/ci-eval-pr.sh reds a pull request's case with a top-level key
+    outside main's CASE_KEYS; no case in the tree may carry one."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    assert set(raw) <= CASE_KEYS, sorted(set(raw) - CASE_KEYS)
+
+
+def test_the_case_keys_cover_devops_benchs_task_fields():
+    """A field devops-bench adds to its task schema is a key a case may use;
+    a bump that adds one fails here until CASE_KEYS names it."""
+    assert set(Task.model_fields) - {"folder"} <= DEVOPS_BENCH_CASE_KEYS
 
 
 def test_kanban_smoke_reads_as_the_shell_read_it(kanban_task):

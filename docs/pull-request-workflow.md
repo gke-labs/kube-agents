@@ -599,7 +599,8 @@ The two labels are the two people:
   the changed paths — [`OWNERS`](../OWNERS) at the root,
   [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
   [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
-  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/ci-eval-pr.sh`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/ci-eval-pr.sh` with the files that run inside it
+  ([`docs/eval-gate-roster.md`](eval-gate-roster.md) lists them; one is under `scripts/installer/OWNERS`), with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs, what blocks, or what grades it; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
@@ -618,7 +619,7 @@ only `lgtm`, so the draw is the whole pool at equal weight; any other change sti
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
 settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt`,
-`hack/eval/blocking-roster.txt` and `hack/ci-eval-pr.sh` entries send a change there to its own `eval-crew` group, so the
+`hack/eval/blocking-roster.txt` and grader-pin entries send a change there to its own `eval-crew` group, so the
 reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
 member is a root approver, so a change that also touches root-owned paths still waits on a root
 approver's `/approve` after that review. The bot never requests the author, so a member's own case

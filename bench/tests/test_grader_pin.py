@@ -223,6 +223,12 @@ def test_a_field_the_grader_does_not_know_is_reported(mutated):
     assert "field_not_on_main" in proc.stdout
 
 
+def test_a_top_level_key_the_grader_does_not_know_is_reported(mutated):
+    proc = mutated(lambda spec: spec.update(case_key_not_on_main={"x": 1}))
+    assert proc.returncode == 0, proc.stderr
+    assert f"./tasks/{SMOKE}/task.yaml: top-level key case_key_not_on_main is not in this grader" in proc.stdout
+
+
 def test_a_stack_the_grader_does_not_have_is_reported(mutated):
     def stack(spec):
         spec["infrastructure"] = {"deployer": "tofu", "stack": "prebuilt/stack-not-on-main"}
@@ -239,34 +245,27 @@ def test_a_case_bench_gate_refuses_is_reported(mutated):
 
 
 # --------------------------------------------------------------------------
-# The step: which runs pin, and what a red says
+# The extraction at the fleet step: which runs pin, and the fleet catalog
 # --------------------------------------------------------------------------
 
+SCRUBBED = ("PULL_NUMBER", "JOB_TYPE", "PULL_BASE_SHA", "FLEET_CATALOG", "BENCH_DIR", "GRADER_BENCH_DIR")
 
-def _step(repo: Path, env: dict, unreadable: str = "") -> subprocess.CompletedProcess:
-    block = _lift(r"^# ─── Grade with the merge target's grader.*?^export EVAL_GRADER_SHA$")
-    head, sep, tail = block.partition('\nEVAL_GRADER_SHA="$(git')
-    assert sep, "the step's main line moved"
-    stub = f"grader_unreadable_cases() {{ printf '%s' {unreadable!r}; }}"
-    body = "\n".join(
-        [
-            _constants(),
-            _function("grader_pin_applies"),
-            f'SCRIPT_DIR="{repo / "hack"}"',
-            f'BENCH_DIR="{repo / "hack"}/../bench"',
-            "TASKS=(./tasks/kept/task.yaml ./tasks/added/task.yaml)",
-            head,
-            stub,
-            sep.lstrip("\n") + tail,
-            'echo "BENCH_DIR=${BENCH_DIR}"',
-            'echo "EVAL_GRADER_SHA=${EVAL_GRADER_SHA}"',
-        ]
-    )
-    scrubbed = {k: v for k, v in os.environ.items() if k not in ("PULL_NUMBER", "JOB_TYPE", "PULL_BASE_SHA")}
+
+def _run(body: str, env: dict) -> subprocess.CompletedProcess:
+    scrubbed = {k: v for k, v in os.environ.items() if k not in SCRUBBED}
     return subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + body],
         capture_output=True, text=True, check=False, env={**scrubbed, **env},
     )
+
+
+def _extract(repo: Path, env: dict) -> subprocess.CompletedProcess:
+    block = _lift(r"^# ─── Extract the merge target's grader.*?^GRADER_BENCH_DIR=\"\"\nif grader_pin_applies; then.*?^fi$")
+    body = "\n".join(
+        [_constants(), f'SCRIPT_DIR="{repo / "hack"}"', block,
+         'echo "GRADER_BENCH_DIR=${GRADER_BENCH_DIR}"', 'echo "FLEET_CATALOG=${FLEET_CATALOG:-}"']
+    )
+    return _run(body, env)
 
 
 def _out(proc: subprocess.CompletedProcess, key: str) -> str:
@@ -276,74 +275,143 @@ def _out(proc: subprocess.CompletedProcess, key: str) -> str:
 @pytest.mark.parametrize("env", [{"JOB_TYPE": "presubmit"}, {"JOB_TYPE": "batch"}, {"PULL_NUMBER": "7"}])
 def test_a_change_is_graded_by_the_base_bench(change, env):
     repo, base = change
-    proc = _step(repo, {**env, "PULL_BASE_SHA": base})
+    proc = _extract(repo, {**env, "PULL_BASE_SHA": base})
     assert proc.returncode == 0, proc.stderr
-    bench = Path(_out(proc, "BENCH_DIR"))
-    assert bench != repo / "bench"
+    bench = Path(_out(proc, "GRADER_BENCH_DIR"))
     assert (bench / "kube_agents_bench" / "grader.py").read_text(encoding="utf-8") == "main\n"
     assert (bench / "tasks" / "added" / "task.yaml").is_file()
-    assert _out(proc, "EVAL_GRADER_SHA") == base
-    assert f"Grader: bench/ at PULL_BASE_SHA={base}" in proc.stdout
+    # The fleet catalog the fleet step and the lease scan read is main's.
+    assert Path(_out(proc, "FLEET_CATALOG")).read_text(encoding="utf-8") == '{"catalog": "main"}\n'
+
+
+def test_a_catalog_from_the_environment_does_not_survive_the_pin(change):
+    repo, base = change
+    proc = _extract(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": base, "FLEET_CATALOG": "/elsewhere.json"})
+    assert proc.returncode == 0, proc.stderr
+    assert _out(proc, "FLEET_CATALOG") == f"{_out(proc, 'GRADER_BENCH_DIR')}/tf/fleet/fixtures.json"
 
 
 @pytest.mark.parametrize("env", [{}, {"JOB_TYPE": "periodic"}, {"JOB_TYPE": "postsubmit"}])
-def test_the_nightly_and_postsubmit_grade_from_head(change, env):
+def test_the_nightly_and_postsubmit_extract_nothing(change, env):
     repo, _ = change
-    proc = _step(repo, {**env, "PULL_BASE_SHA": "ignored"})
+    proc = _extract(repo, {**env, "PULL_BASE_SHA": "ignored"})
     assert proc.returncode == 0, proc.stderr
-    assert _out(proc, "BENCH_DIR") == f"{repo / 'hack'}/../bench"
-    assert _out(proc, "EVAL_GRADER_SHA") == _git(repo, "rev-parse", "HEAD")
+    assert _out(proc, "GRADER_BENCH_DIR") == ""
+    assert _out(proc, "FLEET_CATALOG") == ""
 
 
 @pytest.mark.parametrize("base_sha", ["", "0" * 40])
 def test_a_change_with_no_base_commit_stops_rather_than_grading_itself(change, base_sha):
     repo, _ = change
-    proc = _step(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": base_sha})
+    proc = _extract(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": base_sha})
     assert proc.returncode == 1
     assert "main's grader cannot be extracted" in proc.stderr
 
 
-def test_a_case_main_cannot_read_reds_the_job(change):
-    repo, base = change
+def test_the_lease_scan_imports_fixture_drift_from_the_grader():
+    assert 'PYTHONPATH="${GRADER_BENCH_DIR:-${SCRIPT_DIR}/../bench}"' in CI_EVAL_PR.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Section 6: BENCH_DIR, the venv sync, the read check, the grader SHA
+# --------------------------------------------------------------------------
+
+
+def _step(repo: Path, grader_bench: str, *, unreadable: str = "", uv: str = "uv() { :; }",
+          env: dict | None = None) -> subprocess.CompletedProcess:
+    block = _lift(r"^# ─── Grade with the merge target's grader.*?^export EVAL_GRADER_SHA$")
+    head, sep, tail = block.partition('\nEVAL_GRADER_SHA="$(git')
+    assert sep, "the step's main line moved"
+    body = "\n".join(
+        [
+            _constants(),
+            f'SCRIPT_DIR="{repo / "hack"}"',
+            f'BENCH_DIR="{repo / "hack"}/../bench"',
+            f'GRADER_BENCH_DIR="{grader_bench}"',
+            "PULL_BASE_SHA=base0",
+            "TASKS=(./tasks/kept/task.yaml ./tasks/added/task.yaml)",
+            uv,
+            head,
+            f"grader_unreadable_cases() {{ printf '%s' {unreadable!r}; }}",
+            sep.lstrip("\n") + tail,
+            'echo "BENCH_DIR=${BENCH_DIR}"',
+            'echo "EVAL_GRADER_SHA=${EVAL_GRADER_SHA}"',
+        ]
+    )
+    return _run(body, env or {})
+
+
+def test_a_pinned_run_grades_from_the_grader_and_names_its_sha(change, tmp_path):
+    repo, _ = change
+    proc = _step(repo, str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert _out(proc, "BENCH_DIR") == str(tmp_path)
+    assert _out(proc, "EVAL_GRADER_SHA") == "base0"
+    assert "Grader: bench/ at PULL_BASE_SHA=base0" in proc.stdout
+
+
+def test_an_unpinned_run_names_head(change):
+    repo, _ = change
+    proc = _step(repo, "")
+    assert proc.returncode == 0, proc.stderr
+    assert _out(proc, "BENCH_DIR") == f"{repo / 'hack'}/../bench"
+    assert _out(proc, "EVAL_GRADER_SHA") == _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_case_main_cannot_read_reds_the_job(change, tmp_path):
+    repo, _ = change
     reason = "./tasks/added/task.yaml: verification entry x: unknown verifier type 'y'"
-    proc = _step(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": base}, unreadable=reason)
+    proc = _step(repo, str(tmp_path), unreadable=reason)
     assert proc.returncode == 1
     assert MESSAGE in proc.stderr
     assert f"  {reason}" in proc.stderr
 
 
-# --------------------------------------------------------------------------
-# The fleet catalog, read before the extraction, comes from the base too
-# --------------------------------------------------------------------------
-
-
-def _catalog_step(repo: Path, env: dict) -> subprocess.CompletedProcess:
-    block = _lift(r'^if \[ -z "\$\{FLEET_CATALOG:-\}" \] && grader_pin_applies; then.*?^fi$')
-    body = "\n".join(
-        [_constants(), _function("grader_pin_applies"), f'SCRIPT_DIR="{repo / "hack"}"', block,
-         'echo "FLEET_CATALOG=${FLEET_CATALOG:-}"']
-    )
-    scrubbed = {k: v for k, v in os.environ.items() if k not in ("PULL_NUMBER", "JOB_TYPE", "PULL_BASE_SHA", "FLEET_CATALOG")}
-    return subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True,
-                          check=False, env={**scrubbed, **env})
-
-
-def test_a_change_reads_the_base_fleet_catalog(change):
-    repo, base = change
-    proc = _catalog_step(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": base})
-    assert proc.returncode == 0, proc.stderr
-    assert Path(_out(proc, "FLEET_CATALOG")).read_text(encoding="utf-8") == '{"catalog": "main"}\n'
-
-
-def test_the_nightly_reads_its_own_fleet_catalog(change):
+def test_one_failed_venv_sync_is_retried(change, tmp_path):
     repo, _ = change
-    proc = _catalog_step(repo, {"JOB_TYPE": "periodic"})
+    count = tmp_path / "syncs"
+    uv = f'uv() {{ echo x >> "{count}"; [ "$(wc -l < "{count}")" -ge 2 ]; }}'
+    proc = _step(repo, str(tmp_path), uv=uv)
     assert proc.returncode == 0, proc.stderr
-    assert _out(proc, "FLEET_CATALOG") == ""
+    assert count.read_text().count("x") == 2
 
 
-def test_a_change_with_no_base_catalog_stops(change):
+def test_two_failed_venv_syncs_stop_the_job(change, tmp_path):
     repo, _ = change
-    proc = _catalog_step(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": "0" * 40})
+    proc = _step(repo, str(tmp_path), uv="uv() { return 1; }")
     assert proc.returncode == 1
-    assert "main's fleet catalog" in proc.stderr
+    assert "could not sync main's grader's venv" in proc.stderr
+
+
+# --------------------------------------------------------------------------
+# Run directories: collected from where devops-bench wrote them
+# --------------------------------------------------------------------------
+
+
+def _collect(script_dir: Path, artifacts: Path, bench_dir: str | None) -> subprocess.CompletedProcess:
+    src = (REPO_ROOT / "hack" / "ci-env.sh").read_text(encoding="utf-8")
+    fn = re.search(r"^collect_bench_results\(\) \{.*?^\}", src, re.M | re.S).group(0)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f'SCRIPT_DIR="{script_dir}"', f'ARTIFACTS="{artifacts}"']
+    if bench_dir is not None:
+        lines.append(f'BENCH_DIR="{bench_dir}"')
+    return _run("\n".join([*lines, fn, "collect_bench_results"]), {})
+
+
+def test_run_directories_are_collected_from_the_grader_bench_dir(tmp_path):
+    grader = tmp_path / "grader" / "bench"
+    _write(grader / "results" / "run_1" / "results.json", "{}")
+    _write(tmp_path / "repo" / "bench" / "results" / "stale" / "results.json", "{}")
+    artifacts = tmp_path / "artifacts"
+    proc = _collect(tmp_path / "repo" / "hack", artifacts, str(grader))
+    assert proc.returncode == 0, proc.stderr
+    assert (artifacts / "run_1" / "results.json").is_file()
+    assert not (artifacts / "stale").exists()
+
+
+def test_without_a_bench_dir_the_checkouts_results_are_collected(tmp_path):
+    _write(tmp_path / "repo" / "bench" / "results" / "run_1" / "results.json", "{}")
+    artifacts = tmp_path / "artifacts"
+    proc = _collect(tmp_path / "repo" / "hack", artifacts, None)
+    assert proc.returncode == 0, proc.stderr
+    assert (artifacts / "run_1" / "results.json").is_file()
