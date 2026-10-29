@@ -41,6 +41,10 @@ import (
 )
 
 const (
+	// componentName prefixes the profile scan's log lines, as the binary's
+	// name, and skipConsequence finishes their "its cluster will NOT be ...".
+	componentName   = "k8s-event-watcher"
+	skipConsequence = "watched"
 	// memoryLimitEnv carries the container's memory limit in bytes. The
 	// operator sets it through the Downward API from the agent-api-auth
 	// container's limits.memory (see buildAgentAPIAuthSidecar), so the watcher
@@ -456,8 +460,8 @@ var discovery clusterprofiles.Discoverer
 // being fatal.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
 	scan, err := clusterprofiles.DiscoverAndBuild(ctx, discovery, dir, clusterprofiles.ScanOptions{
-		Component:   "k8s-event-watcher",
-		Consequence: "watched",
+		Component:   componentName,
+		Consequence: skipConsequence,
 		OnSkip: func(profile string, _ error) {
 			m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
 		},

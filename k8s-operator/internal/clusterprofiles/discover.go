@@ -151,7 +151,8 @@ type Discoverer struct {
 	// profile it came from — or NoProfile, when the profiles directory itself
 	// could not be read. A skip is not an error return (see Discover), so this
 	// is the only channel through which "this cluster is not being watched"
-	// becomes visible. nil discards them.
+	// becomes visible. nil discards them. DiscoverAndBuild replaces it with its
+	// own; a caller of that reports through ScanOptions.OnSkip.
 	OnSkip func(profile string, err error)
 }
 

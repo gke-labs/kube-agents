@@ -175,6 +175,10 @@ func applyJoinThrottle(cfg *rest.Config) {
 // same directory the same way is the reason the scan is a package.
 var profilesDiscovery clusterprofiles.Discoverer
 
+// skipConsequence finishes a skipped profile's log line, "its cluster will NOT
+// be ...": what this binary does with a cluster the scan loses.
+const skipConsequence = "joined"
+
 // profileCluster is one fleet cluster the join can read, discovered from a
 // Cluster Agent profile rather than from a credential flag.
 type profileCluster struct {
@@ -270,15 +274,13 @@ func identityFromProfile(id clusterprofiles.Identity) clusterIdentity {
 // that fails names a real gap: the profile is skipped and reported with the
 // API's answer like any other.
 //
-// Failure policy is internal/clusterprofiles's, and it is the watcher's: a
-// missing directory, or a credential proxy that cannot be reached or answers
-// with an error about itself, is fatal because discovery runs once and a restart
-// fixes it, an unreadable directory degrades, and a single bad profile is skipped so that
-// one unparseable config.yaml cannot cost the whole fleet. What this adds is
-// the second half of that last rule -- a cluster whose dynamic client will not
-// build is skipped too, for the same reason.
+// Failure policy is clusterprofiles.DiscoverAndBuild's, shared with the
+// watcher: a missing directory or a failing credential proxy is fatal, an
+// unreadable directory degrades, and a bad profile -- or a cluster whose
+// dynamic client will not build -- is skipped, logged and counted. What this
+// function supplies is the dynamic client, the Want predicate and Absorbed.
 //
-// Every skip is logged and counted. The count is what the startup line reports,
+// The skip count is what the startup line reports,
 // because a fan-in that silently reached six of seven clusters looks exactly
 // like a fleet with six clusters in it. The unreadable directory is the one
 // failure that is reported as a flag instead of a count -- see
@@ -331,7 +333,7 @@ func discoverProfileClusters(ctx context.Context, dir string, directlyReached *c
 	d.Want = want
 	built, err := clusterprofiles.DiscoverAndBuild(ctx, d, dir, clusterprofiles.ScanOptions{
 		Component:   commandName,
-		Consequence: "joined",
+		Consequence: skipConsequence,
 	}, func(c clusterprofiles.Cluster) (profileCluster, error) {
 		applyJoinThrottle(c.Config)
 		client, err := dynamic.NewForConfig(c.Config)

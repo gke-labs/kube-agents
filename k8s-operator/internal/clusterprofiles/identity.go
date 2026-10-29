@@ -24,9 +24,11 @@
 // credential attached.
 //
 // It builds no Kubernetes client. The caller picks the client type, and this
-// package stops at the configuration every client type is built from. The
-// event watcher builds an informer-backed kubernetes.Interface from it and the
-// drift detector a dynamic.Interface (cmd/drift-detector/cluster.go); the
+// package stops at the configuration every client type is built from. Both
+// fleet-wide binaries go through DiscoverAndBuild, which owns the failure
+// policy and the skip logging and calls the caller's build function per
+// cluster: the event watcher builds an informer-backed kubernetes.Interface and
+// the drift detector a dynamic.Interface (cmd/drift-detector/cluster.go). The
 // detector's scope also lists the identities alone, through ReadIdentities,
 // without addressing anything.
 package clusterprofiles
