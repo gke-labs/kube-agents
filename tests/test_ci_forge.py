@@ -2,12 +2,11 @@
 run and takes it down (kube-agents#3683, #3684).
 
 The script runs whole, against stubs for gcloud, kubectl, curl and openssl on
-PATH, a stub make-certs.sh and a stub ci_gitlab_forge.py in a staged
-SCRIPT_DIR that also carries the real ci-env.sh and ci-deploy.sh (the forge
-table and the GitLab project names are lifted from the latter) and the real
-provisioning script (the manifest seed is lifted from it). Every call is
-recorded, so the tests pin the shape of the create, the tunnel and the delete
-rather than their effect.
+PATH and a stub make-certs.sh in a staged SCRIPT_DIR that also carries the
+real ci-env.sh and ci-deploy.sh (the forge table and the GitLab project names
+are lifted from the latter) and the real provisioning script (the manifest
+seed is lifted from it). Every call is recorded, so the tests pin the shape of
+the create, the tunnel and the delete rather than their effect.
 """
 
 import os
@@ -55,8 +54,11 @@ STUB_GCLOUD = textwrap.dedent(
         [ -e "$state/build-hangs" ] && exec sleep 5
         [ -e "$state/build-fails" ] && exit 1; exit 0 ;;
       *"compute instances create"*)
-        # Keep the startup script the VM would run, so a test can read it.
-        for a in "$@"; do case "$a" in --metadata-from-file=startup-script=*) f="${a#--metadata-from-file=startup-script=}"; cp "${f%%,*}" "$state/startup-script" ;; esac; done
+        # Keep the startup script and the seed the VM would get, so a test can read them.
+        for a in "$@"; do case "$a" in --metadata-from-file=*)
+          for kv in $(printf '%s' "${a#--metadata-from-file=}" | tr ',' ' '); do
+            case "$kv" in startup-script=*|manifest-content=*|manifest-path=*) cp "${kv#*=}" "$state/${kv%%=*}" ;; esac
+          done ;; esac; done
         exit 0 ;;
       *"compute instances remove-metadata"*) [ -e "$state/remove-metadata-fails" ] && { echo "ERROR: setMetadata denied" >&2; exit 1; }; exit 0 ;;
       *"compute instances delete"*) exit 0 ;;
@@ -73,7 +75,7 @@ FORGE_KNOBS_ABSENT = (
     "JOB_NAME", "EVAL_GHES_HOST", "EVAL_GITLAB_CE_HOST", "FORGE_SKIP_CLUSTER_CHECK", "FORGE_VM_ZONE", "AR_REPO",
     "FORGE_IMAGE_TAG", "GHES_READY_TIMEOUT_SECONDS", "GITLAB_CE_READY_TIMEOUT_SECONDS", "FORGE_BUILD_TIMEOUT_SECONDS",
     "FORGE_BUILD_CLIENT_BOUND_SECONDS", "FORGE_READY_POLL_SECONDS", "FORGE_TUNNEL_HOSTS_FILE",
-    "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "SEED_EXIT", "MAKE_CERTS_LEAF_ONLY",
+    "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "MAKE_CERTS_LEAF_ONLY",
 )
 
 # kubectl: the in-cluster check answers the code the test puts in KUBECTL_CODE
@@ -103,16 +105,6 @@ STUB_CURL = textwrap.dedent(
     """
 )
 
-# ci_gitlab_forge.py: the seed; records its argv and what it was fed.
-STUB_GITLAB_FORGE = textwrap.dedent(
-    """\
-    import os, sys
-    with open(os.environ["STUB_CALLS"], "a") as fh:
-        fh.write("ci_gitlab_forge " + " ".join(sys.argv[1:]) + " token-set=" + str(bool(os.environ.get("GITLAB_SEED_TOKEN"))) + " ca=" + os.environ.get("GITLAB_CA_FILE", "") + "\\n")
-        fh.write("seed-stdin " + sys.stdin.read().replace("\\n", " ")[:200] + "\\n")
-    sys.exit(int(os.environ.get("SEED_EXIT", "0")))
-    """
-)
 
 # openssl: the CA:TRUE gate reads basicConstraints; a PEM file passes. `rand
 # -hex N` mints the tokens: N bytes of a fixed pattern.
@@ -169,7 +161,6 @@ class ForgeScriptTest(unittest.TestCase):
         installer.mkdir(parents=True)
         shutil.copy(REPO_ROOT / "scripts" / "installer" / "gke_dns_endpoint.sh", installer / "gke_dns_endpoint.sh")
         _write(self.hack / "ghes-proxy" / "make-certs.sh", STUB_MAKE_CERTS)
-        _write(self.hack / "ci_gitlab_forge.py", STUB_GITLAB_FORGE, 0o644)
         shutil.copy(REPO_ROOT / "scripts" / "provision_ci_pool_project.sh", self.dir / "scripts" / "provision_ci_pool_project.sh")
         self.hosts = self.dir / "hosts"
         self.hosts.write_text("127.0.0.1 localhost\n")
@@ -431,15 +422,20 @@ class ForgeScriptTest(unittest.TestCase):
             "--labels=kube-agents-forge=gitlab-ce,kube-agents-build=1234", "host=gitlab.eval.internal",
             "image=gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5",
             "group=gke-agentic", f"project={PROJECT}-infra", "bot-login=kube-agents-eval-bot", "token-days=1",
-            "block-project-ssh-keys=TRUE", "tls-key=", "agent-token=", "ledger-token=",
+            "block-project-ssh-keys=TRUE", "tls-key=", "agent-token=", "ledger-token=", "manifest-path=", "manifest-message=", "manifest-content=",
         ):
             self.assertIn(flag, create)
-        # The startup script the VM runs: the bot, its two tokens set to the given values, the group and the project, readiness last.
+        # The seed the VM gets: the provisioning script's path and manifest.
+        self.assertEqual((self.gstate / "manifest-path").read_text(), "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml")
+        self.assertIn("name: checkout-gateway", (self.gstate / "manifest-content").read_text())
+        # The startup script the VM runs: root makes the bot (a Developer), its two tokens set to the given values, the group, the project and the file; readiness last.
         startup = (self.gstate / "startup-script").read_text()
         for marker in ("gitlab-rails runner", "Users::CreateService", "set_token", '"agent" => ["api", "write_repository"]', '"ledger" => ["api"]',
-                       '"$API/groups"', "initialize_with_readme=true", "gitlab_signup_enabled']=false", "/users/sign_in"):
+                       "Groups::CreateService.new(admin", "Projects::CreateService.new(admin", "initialize_with_readme: true", "add_developer(u)",
+                       "Files::CreateService.new(p, admin", "gitlab_signup_enabled']=false", "/users/sign_in"):
             self.assertIn(marker, startup)
-        self.assertLess(startup.index("mark seeded"), startup.index("mark ready"), "ready is printed only once the project exists")
+        self.assertNotIn("api/v4", startup, "no API call with a token on the VM; rails does it all as root")
+        self.assertLess(startup.index("mark seeded"), startup.index("mark ready"), "ready is printed only once the project and the file exist")
         # The secrets leave metadata together, then the cluster check reads the sign-in page.
         self.assertIn("--keys=tls-key,agent-token,ledger-token", self.calls_of("remove-metadata")[0])
         log = self.calls.read_text()
@@ -455,11 +451,6 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertEqual((self.state_dir / "forge-tunnel-context").read_text().strip(), "host-ctx", "the context the relay lives in, for down")
         self.assertIn("127.0.0.1 gitlab.eval.internal", self.hosts.read_text())
         self.assertTrue(any("--resolve gitlab.eval.internal:443:127.0.0.1" in c and "https://gitlab.eval.internal/users/sign_in" in c for c in self.calls_of("curl ")))
-        # The seed: the helper, the agent token in the environment, the manifest on stdin.
-        seed = self.calls_of("ci_gitlab_forge seed-file")[0]
-        for part in (f"--project-id {PROJECT}", "--path clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "--host gitlab.eval.internal", "token-set=True"):
-            self.assertIn(part, seed)
-        self.assertIn("name: checkout-gateway", self.calls_of("seed-stdin")[0])
         # The state directory: the CA, the two tokens (private), the record; no token in the output.
         for name in ("agent-token", "ledger-token"):
             token = (self.state_dir / name).read_text().strip()
@@ -492,15 +483,6 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce"))
         self.assertTrue(self.calls_of("kubectl delete pod forge-relay"))
         self.assertNotIn("gitlab.eval.internal", self.hosts.read_text())
-        self.assertFalse(self.state_dir.exists())
-        self.assertFalse(self.calls_of("ci_gitlab_forge seed-file"), "no seed through a tunnel that does not answer")
-
-    def test_up_on_gitlab_ce_takes_everything_down_when_the_seed_fails(self):
-        self.provision()
-        proc = self.run_forge("up", forge="gitlab-ce", SEED_EXIT="1")
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn(f"seeding clusters/seeded-a/seeded-reliability/checkout-gateway.yaml into gke-agentic/{PROJECT}-infra on gitlab.eval.internal failed", proc.stderr)
-        self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce"))
         self.assertFalse(self.state_dir.exists())
 
     def test_down_on_gitlab_ce_twice_is_clean(self):

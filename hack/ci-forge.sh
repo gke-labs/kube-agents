@@ -3,8 +3,9 @@
 # it down after (kube-agents#3682, #3683, #3684). A GitHub Enterprise Server
 # row (`EVAL_FORGE=ghes`) gets the forwarding proxy in hack/ghes-proxy on a
 # small VM in the leased project; a self-managed GitLab row
-# (`EVAL_FORGE=gitlab-ce`) gets GitLab CE on a larger one, with the bot, its
-# two tokens, the group and the project the eval expects made on the VM. Both
+# (`EVAL_FORGE=gitlab-ce`) gets GitLab CE on a larger one, with the bot (a
+# Developer, as on gitlab.com), its two tokens, the group, the project and the
+# manifest the cases read made on the VM by root. Both
 # stand at the host the forge table names, with a private CA made here and
 # kept nowhere else. The two public rows need nothing and this script exits at
 # once on them.
@@ -16,8 +17,8 @@
 #                           project's reserved address, waits until the forge
 #                           answers over TLS with the CA, proves a pod in the
 #                           host cluster reaches it, on gitlab-ce opens the
-#                           tunnel the job pod needs and seeds the manifest the
-#                           cases read, and writes ca.crt (and the tokens) into
+#                           tunnel the job pod needs, and writes ca.crt (and
+#                           the tokens) into
 #                           EVAL_FORGE_STATE_DIR, the files the deploy and the
 #                           eval refuse to run without.
 #   hack/ci-forge.sh down   after hack/ci-eval-pr.sh, from the job's cleanup
@@ -119,6 +120,12 @@ readonly GITLAB_CE_BOT_EMAIL="eval-bot@eval.internal"
 readonly GITLAB_CE_TOKEN_DAYS=1
 readonly GITLAB_CE_TOKEN_PREFIX="glpat-"
 readonly GITLAB_CE_TOKEN_RANDOM_BYTES=10
+# The manifest the remediation cases read rides to the VM in metadata (public
+# content, the provisioning script's seed) and root commits it there, so the
+# bot stays a Developer, as on gitlab.com, and no Owner token exists.
+readonly FORGE_MANIFEST_PATH_METADATA_KEY="manifest-path"
+readonly FORGE_MANIFEST_MESSAGE_METADATA_KEY="manifest-message"
+readonly FORGE_MANIFEST_CONTENT_METADATA_KEY="manifest-content"
 # The tunnel from the job pod to the private host: a relay pod in the host
 # cluster (socat, pinned) listening on an unprivileged port and forwarding to
 # the forge's 443, a port-forward to it on the job pod's loopback 443 (every
@@ -416,8 +423,9 @@ md() { curl -sf -H 'Metadata-Flavor: Google' "http://metadata.google.internal/co
 T0=$(date +%s); mark() { echo "FORGE $1 t=$(( $(date +%s) - T0 ))s"; }
 HOST=$(md host); IMAGE=$(md image); GROUP=$(md group); PROJECT=$(md project)
 BOT=$(md bot-login); BOT_EMAIL=$(md bot-email); TOKEN_DAYS=$(md token-days)
-mkdir -p /var/gitlab/config/ssl /var/gitlab/logs /var/gitlab/data /var/gitlab/private
+mkdir -p /var/gitlab/config/ssl /var/gitlab/logs /var/gitlab/data /var/gitlab/private /var/gitlab/seed
 chmod 700 /var/gitlab/private
+md manifest-path > /var/gitlab/seed/path; md manifest-message > /var/gitlab/seed/message; md manifest-content > /var/gitlab/seed/content
 # First boot copies the secrets out of metadata; `up` then removes them from
 # metadata, so a reboot keeps the copies on disk.
 [ -s "/var/gitlab/config/ssl/${HOST}.crt" ] || md tls-crt > "/var/gitlab/config/ssl/${HOST}.crt"
@@ -425,7 +433,6 @@ chmod 700 /var/gitlab/private
 [ -s /var/gitlab/ca.crt ] || md ca-crt > /var/gitlab/ca.crt
 [ -s /var/gitlab/private/agent-token ] || md agent-token > /var/gitlab/private/agent-token
 [ -s /var/gitlab/private/ledger-token ] || md ledger-token > /var/gitlab/private/ledger-token
-printf 'PRIVATE-TOKEN: %s\n' "$(cat /var/gitlab/private/agent-token)" > /var/gitlab/private/agent-header
 chmod 600 "/var/gitlab/config/ssl/${HOST}.key" /var/gitlab/private/*
 mark script-start
 docker pull "$IMAGE" >/dev/null 2>&1 && mark image-pulled || { echo "FORGE failed pull ${IMAGE}"; exit 1; }
@@ -436,7 +443,7 @@ else
   # below runs as root inside the container, and sign-up is off.
   ROOT_PW=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
   docker run -d --name gitlab --hostname "$HOST" --restart unless-stopped -p 443:443 --shm-size 256m \
-    -v /var/gitlab/config:/etc/gitlab -v /var/gitlab/logs:/var/log/gitlab -v /var/gitlab/data:/var/opt/gitlab -v /var/gitlab/private:/var/gitlab/private:ro \
+    -v /var/gitlab/config:/etc/gitlab -v /var/gitlab/logs:/var/log/gitlab -v /var/gitlab/data:/var/opt/gitlab -v /var/gitlab/private:/var/gitlab/private:ro -v /var/gitlab/seed:/var/gitlab/seed:ro \
     -e GITLAB_OMNIBUS_CONFIG="external_url 'https://${HOST}'; letsencrypt['enable']=false; nginx['redirect_http_to_https']=false; nginx['ssl_certificate']='/etc/gitlab/ssl/${HOST}.crt'; nginx['ssl_certificate_key']='/etc/gitlab/ssl/${HOST}.key'; gitlab_rails['initial_root_password']='${ROOT_PW}'; gitlab_rails['gitlab_signup_enabled']=false; prometheus_monitoring['enable']=false; gitlab_kas['enable']=false" \
     "$IMAGE" >/dev/null && mark container-started
 fi
@@ -447,8 +454,13 @@ for i in $(seq 1 240); do
 done
 [ "${code:-}" = "200" ] || { echo "FORGE failed never-ready code=${code:-none}"; docker logs gitlab 2>&1 | tail -5; exit 1; }
 if [ ! -e /var/gitlab/private/seeded ]; then
-  # The tokens reach rails from the mounted files, never through argv or the environment.
-  docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" gitlab gitlab-rails runner '
+  # One rails call as root: the bot (a Developer, as on gitlab.com), its two
+  # tokens set to the values in the mounted files (never argv or the
+  # environment), the group, the project with its README, the bot's
+  # membership, and the manifest committed to the default branch, which keeps
+  # GitLab's default protection, so the bot cannot push it and opens merge
+  # requests instead.
+  docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" -e GROUP="$GROUP" -e PROJECT="$PROJECT" gitlab gitlab-rails runner '
 admin = User.find_by_username("root")
 pw = SecureRandom.hex(24)
 res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10).execute
@@ -458,14 +470,17 @@ raise "user create failed: #{res.inspect}" unless u && u.persisted?
   t = u.personal_access_tokens.build(name: name, scopes: scopes, expires_at: ENV["TOKEN_DAYS"].to_i.days.from_now)
   t.set_token(File.read("/var/gitlab/private/" + name + "-token").strip); t.save!
 end
-puts "rails-ok"' >/tmp/rails.out 2>&1 && mark rails-done || { echo "FORGE failed rails"; grep -vE '^\s+from ' /tmp/rails.out | head -12; exit 1; }
-  API="https://${HOST}/api/v4"
-  api() { curl -s --cacert /var/gitlab/ca.crt --resolve "${HOST}:443:127.0.0.1" -H @/var/gitlab/private/agent-header "$@"; }
-  GID=$(api -X POST "$API/groups" -d "name=${GROUP}" -d "path=${GROUP}" -d visibility=private | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
-  [ -n "$GID" ] || { echo "FORGE failed group-create"; exit 1; }
-  code=$(api -X POST "$API/projects" -d "name=${PROJECT}" -d "path=${PROJECT}" -d "namespace_id=${GID}" -d visibility=private -d initialize_with_readme=true -o /dev/null -w '%{http_code}')
-  [ "$code" = "201" ] || { echo "FORGE failed project-create http=${code}"; exit 1; }
-  touch /var/gitlab/private/seeded; mark seeded
+g = Groups::CreateService.new(admin, name: ENV["GROUP"], path: ENV["GROUP"], visibility_level: Gitlab::VisibilityLevel::PRIVATE).execute
+g = g.payload[:group] if g.respond_to?(:payload)
+g = g[:group] if g.is_a?(Hash)
+raise "group create failed: #{g.inspect}" unless g && g.persisted?
+p = Projects::CreateService.new(admin, name: ENV["PROJECT"], path: ENV["PROJECT"], namespace_id: g.id, visibility_level: Gitlab::VisibilityLevel::PRIVATE, initialize_with_readme: true).execute
+raise "project create failed: #{p.inspect}" unless p && p.persisted?
+p.add_developer(u)
+r = Files::CreateService.new(p, admin, start_branch: p.default_branch, branch_name: p.default_branch, commit_message: File.read("/var/gitlab/seed/message").strip, file_path: File.read("/var/gitlab/seed/path").strip, file_content: File.read("/var/gitlab/seed/content")).execute
+raise "seed failed: #{r.inspect}" unless r[:status] == :success
+puts "rails-ok"' >/tmp/rails.out 2>&1 && mark seeded || { echo "FORGE failed rails"; grep -vE '^\s+from ' /tmp/rails.out | head -12; exit 1; }
+  touch /var/gitlab/private/seeded
 fi
 mark ready
 echo "FORGE done total=$(( $(date +%s) - T0 ))s"
@@ -635,18 +650,14 @@ open_tunnel() {
   echo "✓ Tunnel open: ${EVAL_FORGE_HOST} answers on 127.0.0.1:${FORGE_TUNNEL_LOCAL_PORT} through ${FORGE_RELAY_POD} (pid $(cat "${FORGE_TUNNEL_PID_FILE}"))"
 }
 
-# The manifest the remediation cases read, into the per-run project through
-# the tunnel with the agent token (the project's creator, so an Owner): the
-# provisioning script's seed, by the same helper and the same path.
-seed_gitlab_manifest() {
-  manifest_seed_lifted || { echo "ERROR: could not lift the manifest seed from scripts/provision_ci_pool_project.sh." >&2; return 1; }
-  printf '%s\n' "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" | GITLAB_SEED_TOKEN="$(tr -d '\r\n' < "${FORGE_CERT_DIR}/${FORGE_AGENT_TOKEN_FILE_NAME}")" GITLAB_CA_FILE="${FORGE_CERT_DIR}/ca.crt" \
-    python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" seed-file --project-id "${PROJECT_ID}" --path "${GITOPS_WORKLOAD_MANIFEST_PATH}" \
-      --message "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" --content-file - --host "${EVAL_FORGE_HOST}" || {
-    echo "ERROR: seeding ${GITOPS_WORKLOAD_MANIFEST_PATH} into ${FORGE_GITLAB_PROJECT} on ${EVAL_FORGE_HOST} failed." >&2
-    return 1
-  }
-  echo "✓ ${GITOPS_WORKLOAD_MANIFEST_PATH} seeded into ${FORGE_GITLAB_PROJECT}"
+# The manifest the remediation cases read, written to scratch for the VM's
+# metadata: the provisioning script's seed, root commits it on the VM.
+write_manifest_seed() {
+  manifest_seed_lifted || { echo "ERROR: could not lift the manifest seed from scripts/provision_ci_pool_project.sh." >&2; exit 1; }
+  printf '%s' "${GITOPS_WORKLOAD_MANIFEST_PATH}" > "${FORGE_CERT_DIR}/manifest-path"
+  printf '%s' "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" > "${FORGE_CERT_DIR}/manifest-message"
+  printf '%s\n' "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" > "${FORGE_CERT_DIR}/manifest-content"
+  echo "✓ ${GITOPS_WORKLOAD_MANIFEST_PATH} staged for the VM to seed into ${FORGE_GITLAB_PROJECT}"
 }
 
 write_state_dir() {
@@ -693,8 +704,10 @@ forge_up() {
     FORGE_ROW_METADATA="image=${GHES_PROXY_IMAGE},enterprise-version=${GHES_PROXY_ENTERPRISE_VERSION}"
   else
     mint_gitlab_tokens
+    write_manifest_seed
     FORGE_ROW_METADATA="image=${GITLAB_CE_IMAGE},group=${group},project=${PROJECT_ID}${suffix},bot-login=${GITLAB_CE_BOT_LOGIN},bot-email=${GITLAB_CE_BOT_EMAIL},token-days=${GITLAB_CE_TOKEN_DAYS}"
     FORGE_ROW_METADATA_FILES=",${FORGE_AGENT_TOKEN_METADATA_KEY}=${FORGE_CERT_DIR}/${FORGE_AGENT_TOKEN_FILE_NAME},${FORGE_LEDGER_TOKEN_METADATA_KEY}=${FORGE_CERT_DIR}/${FORGE_LEDGER_TOKEN_FILE_NAME}"
+    FORGE_ROW_METADATA_FILES="${FORGE_ROW_METADATA_FILES},${FORGE_MANIFEST_PATH_METADATA_KEY}=${FORGE_CERT_DIR}/manifest-path,${FORGE_MANIFEST_MESSAGE_METADATA_KEY}=${FORGE_CERT_DIR}/manifest-message,${FORGE_MANIFEST_CONTENT_METADATA_KEY}=${FORGE_CERT_DIR}/manifest-content"
   fi
   delete_forge_vms "leftover forge"
   create_forge_vm
@@ -704,7 +717,7 @@ forge_up() {
     forge_down
     exit 1
   fi
-  if [ "${EVAL_FORGE_KIND}" = "gitlab" ] && { ! open_tunnel || ! seed_gitlab_manifest; }; then
+  if [ "${EVAL_FORGE_KIND}" = "gitlab" ] && ! open_tunnel; then
     forge_down
     exit 1
   fi
