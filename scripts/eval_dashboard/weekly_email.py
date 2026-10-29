@@ -63,7 +63,8 @@ workflow's render step). With ``--chat-out``, a page that passed also
 writes the week's Chat summary (``chat_card``, a Chat card, with
 ``chat_text`` as its plain-text fallback: the same week, tiles,
 needs-attention rows and open-bug counts the page printed, plus the task
-time's 90th percentile and slowest area), which ``weekly_chat.py`` posts to
+time's 90th percentile and slowest area, and the tokens line when the week
+has counts), which ``weekly_chat.py`` posts to
 the CI-health space once a week; a refused week writes none, so nothing is
 posted. TODO(#3440): mailing the page -- to whom, from which account -- is
 not built; it needs a mail route and permissions a maintainer decides.
@@ -125,6 +126,20 @@ SECONDS_PER_MINUTE = 60
 # read as "the slowest 10%".
 TIME_PERCENTILE = 90
 SLOWEST_SHARE = f"slowest {PERCENT - TIME_PERCENTILE}%"
+# Tokens: a repetition's count is its record's ``total`` (SCHEMA.md,
+# ``reps[].tokens``); with no total, input + output, which misses what the
+# workers billed, so that sum is short like a ``partial`` record. A short
+# count is kept out of the median and counted apart.
+TOKENS_KEY = "tokens"
+TOKENS_TOTAL = "total"
+TOKENS_INPUT = "input"
+TOKENS_OUTPUT = "output"
+TOKENS_PARTIAL = "partial"
+THOUSAND = 1_000
+MILLION = 1_000_000
+TOKENS_UNITS = "{count}"
+TOKENS_THOUSANDS = "{count}k"
+TOKENS_MILLIONS = "{count:.1f}M"
 
 TREND_UP = "up"
 TREND_DOWN = "down"
@@ -211,6 +226,17 @@ TILE_TIME_VALUE = "{minutes} min"
 TILE_TIME_SUB = "middle of {count} timed runs; " + SLOWEST_SHARE + " over {p90} min"
 TILE_TIME_NONE = "n/a"
 TILE_TIME_NONE_SUB = "no timing on record"
+TILE_TOKENS_LABEL = "typical tokens per run"
+TILE_TOKENS_SUB = "middle of {count} counted runs"
+TILE_TOKENS_UP = "; &#9650; {pct}% vs last week"
+TILE_TOKENS_DOWN = "; &#9660; {pct}% vs last week"
+TILE_TOKENS_SAME = "; same as last week"
+TILE_TOKENS_PARTIAL = "; {count} partial left out"
+TILE_TOKENS_NONE = "n/a"
+TILE_TOKENS_NONE_SUB = "no full count; {count} partial left out"
+# Three tiles share the row, or four with the tokens tile.
+TILE_WIDTH = "33%"
+TILE_WIDTH_FOUR = "25%"
 CHANGE_UP = "&#9650; {pts} pts vs last week"
 CHANGE_DOWN = "&#9660; {pts} pts vs last week"
 CHANGE_STEADY = "&#8594; steady vs last week"
@@ -317,6 +343,14 @@ CHAT_TIME_DOWN = " (down {minutes} min from last week)"
 CHAT_TIME_SAME = " (same as last week)"
 CHAT_TIME_SLOWEST = " · slowest area: {name} ({minutes} min)"
 CHAT_TIME_NONE = "⏱ Task time: no timing on record"
+# The tokens line, the same on the card and in its text fallback; left out
+# of both when no repetition the week compared carries a count.
+CHAT_TOKENS = "🔢 Tokens: typical {typical} per run{change}{partial}"
+CHAT_TOKENS_NONE = "🔢 Tokens: no full count{partial}"
+CHAT_TOKENS_UP = " (▲ {pct}% from last week)"
+CHAT_TOKENS_DOWN = " (▼ {pct}% from last week)"
+CHAT_TOKENS_SAME = " (same as last week)"
+CHAT_TOKENS_PARTIAL = " · {count} partial"
 CHAT_LINKS = "<{report}|full report> · <{dashboard}|dashboard>"
 CHAT_JOIN = " · "
 CHAT_BLOCK_JOIN = "\n\n"
@@ -381,7 +415,7 @@ INTRO_ROW = """<tr><td style="padding:24px 32px 0;"><div style="font-size:15px;l
 TILES_ROW = """<tr><td style="padding:20px 26px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
 {tiles}
 </tr></table></td></tr>"""
-TILE = """<td style="width:33%;padding:0 6px;vertical-align:top;"><div style="border:1px solid {rule};border-radius:12px;padding:16px;">
+TILE = """<td style="width:{width};padding:0 6px;vertical-align:top;"><div style="border:1px solid {rule};border-radius:12px;padding:16px;">
 <div style="font-size:28px;font-weight:600;letter-spacing:-0.5px;color:{ink};line-height:32px;">{value}</div>
 <div style="font-size:13px;color:{ink};padding-top:4px;">{label}</div><div style="font-size:12px;color:{faint};padding-top:2px;">{sub}</div></div></td>"""
 ATTENTION_ROW = """<tr><td style="padding:24px 32px 0;"><div style="background:{bg};border-radius:12px;padding:16px 18px;">
@@ -467,6 +501,45 @@ def percentile(values: list[float], pct: int) -> float | None:
     if len(values) == 1:
         return values[0]
     return statistics.quantiles(values, n=PERCENT, method="inclusive")[pct - 1]
+
+
+def rep_tokens(rep: dict) -> tuple[int | None, bool] | None:
+    """``(count, short)`` for a repetition's token record, or None when it
+    has none. The count is ``total``, else ``input + output`` (short: it
+    misses the workers); short too when the record says ``partial`` or
+    carries no count at all."""
+    tokens = rep.get(TOKENS_KEY)
+    if not isinstance(tokens, dict):
+        return None
+
+    def count(key):
+        value = tokens.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    total, inp, out = count(TOKENS_TOTAL), count(TOKENS_INPUT), count(TOKENS_OUTPUT)
+    if total is not None:
+        return total, tokens.get(TOKENS_PARTIAL) is True
+    if inp is not None and out is not None:
+        return inp + out, True
+    return None, True
+
+
+def tokens_text(count: float) -> str:
+    """135000 -> "135k", 1250000 -> "1.2M"."""
+    if count >= MILLION:
+        return TOKENS_MILLIONS.format(count=count / MILLION)
+    if count >= THOUSAND:
+        return TOKENS_THOUSANDS.format(count=round(count / THOUSAND))
+    return TOKENS_UNITS.format(count=round(count))
+
+
+def tokens_change(overall: dict) -> int | None:
+    """The typical run's tokens against last week's, in whole percent; None
+    without a trend this week or a median in either week."""
+    now, before = overall["tokens_median"], overall["prev_tokens_median"]
+    if overall["trend"] is None or now is None or not before:
+        return None
+    return round((now - before) * PERCENT / before)
 
 
 def short_date(day: datetime.date) -> str:
@@ -626,8 +699,10 @@ def nights_by_date(data: dict) -> tuple[dict[datetime.date, list[dict]], dict[da
 
 
 def night_reps(night: dict[str, dict]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s: [...]}}`` for every case the night
-    graded; a case both parts recorded counts as the main part recorded it."""
+    """``{case: {passed, graded, agent_s: [...], tokens: [...], tokens_partial}}``
+    for every case the night graded (``rep_tokens``: full counts listed,
+    short ones counted); a case both parts recorded counts as the main part
+    recorded it."""
     out: dict[str, dict] = {}
     for run in nightly.night_parts(night):
         for task in classify.run_tasks(run):
@@ -638,9 +713,11 @@ def night_reps(night: dict[str, dict]) -> dict[str, dict]:
             graded = counts["pass"] + counts["fail"]
             if not graded:
                 continue
-            times = [rep["agent_s"] for rep in classify.task_reps(task)
-                     if classify.rep_kind(rep) in (classify.REP_PASS, classify.REP_FAIL) and isinstance(rep.get("agent_s"), (int, float))]
-            out[name] = {"passed": counts["pass"], "graded": graded, "agent_s": times}
+            reps = [rep for rep in classify.task_reps(task) if classify.rep_kind(rep) in (classify.REP_PASS, classify.REP_FAIL)]
+            times = [rep["agent_s"] for rep in reps if isinstance(rep.get("agent_s"), (int, float))]
+            tokens = [t for t in map(rep_tokens, reps) if t is not None]
+            out[name] = {"passed": counts["pass"], "graded": graded, "agent_s": times,
+                         "tokens": [n for n, short in tokens if not short], "tokens_partial": sum(short for _, short in tokens)}
     return out
 
 
@@ -655,14 +732,17 @@ def date_reps(nights: list[dict]) -> dict[str, dict]:
 
 
 def week_cases(counted: dict[datetime.date, list[dict]], days: list[datetime.date]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s}}`` summed over the week's counted dates."""
+    """``{case: {passed, graded, agent_s, tokens, tokens_partial}}`` summed
+    over the week's counted dates."""
     out: dict[str, dict] = {}
     for day in days:
         for name, reps in date_reps(counted.get(day, [])).items():
-            row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": []})
+            row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": [], "tokens": [], "tokens_partial": 0})
             row["passed"] += reps["passed"]
             row["graded"] += reps["graded"]
             row["agent_s"] += reps["agent_s"]
+            row["tokens"] += reps["tokens"]
+            row["tokens_partial"] += reps["tokens_partial"]
     return out
 
 
@@ -806,6 +886,12 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     overall["agent_s_p90"] = percentile(times, TIME_PERCENTILE)
     overall["prev_agent_s_median"] = statistics.median(prev_times) if prev_times else None
     overall["timed_runs"] = len(times)
+    tokens = [n for c in common for n in this_cases[c]["tokens"]]
+    prev_tokens = [n for c in common for n in prev_cases[c]["tokens"]]
+    overall["tokens_median"] = statistics.median(tokens) if tokens else None
+    overall["prev_tokens_median"] = statistics.median(prev_tokens) if prev_tokens else None
+    overall["counted_runs"] = len(tokens)
+    overall["tokens_partial"] = sum(this_cases[c]["tokens_partial"] for c in common)
     week["overall"] = overall
 
     known = {row["slug"]: row for row in domain_rows}
@@ -1078,12 +1164,13 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
         time_sub = TILE_TIME_SUB.format(count=overall["timed_runs"], p90=minutes(overall["agent_s_p90"]))
     else:
         time_value, time_sub = TILE_TIME_NONE, TILE_TIME_NONE_SUB
-    tile = {"rule": RULE, "ink": INK, "faint": FAINT}
+    tokens_tile = tokens_tile_text(overall)
+    tile = {"rule": RULE, "ink": INK, "faint": FAINT, "width": TILE_WIDTH_FOUR if tokens_tile else TILE_WIDTH}
     tiles = TILES_ROW.format(tiles="".join([
         TILE.format(value=f"{overall['pct']}%", label=TILE_RATE_LABEL, sub=change, **tile),
         TILE.format(value=overall["scenarios"], label=TILE_SCENARIOS_LABEL, sub=TILE_SCENARIOS_SUB, **tile),
         TILE.format(value=time_value, label=TILE_TIME_LABEL, sub=time_sub, **tile),
-    ]))
+    ] + ([TILE.format(value=tokens_tile[0], label=TILE_TOKENS_LABEL, sub=tokens_tile[1], **tile)] if tokens_tile else [])))
 
     shown = {}
     items = []
@@ -1129,6 +1216,18 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
                        rows=ROWS_JOIN.join([header, intro, tiles, attention, by_area, fix, close]))
 
 
+def tokens_tile_text(overall: dict) -> tuple[str, str] | None:
+    """The tokens tile's ``(value, sub)``, or None when no repetition the
+    week compared carries a count (the tile is left out)."""
+    partial = overall["tokens_partial"]
+    if overall["tokens_median"] is None:
+        return (TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)) if partial else None
+    pct = tokens_change(overall)
+    change = "" if pct is None else TILE_TOKENS_UP.format(pct=pct) if pct > 0 else TILE_TOKENS_DOWN.format(pct=-pct) if pct < 0 else TILE_TOKENS_SAME
+    sub = TILE_TOKENS_SUB.format(count=overall["counted_runs"]) + change + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
+    return tokens_text(overall["tokens_median"]), sub
+
+
 def attention_state(row: dict) -> str:
     if row["few"]:
         return ATTENTION_FEW.format(pct=row["pct"])
@@ -1172,6 +1271,19 @@ def chat_time(week: dict) -> str:
     return CHAT_TIME.format(typical=typical, change=change, p90=minutes(overall["agent_s_p90"]), slowest=slowest)
 
 
+def chat_tokens(week: dict) -> str | None:
+    """The tokens line of the card and its text fallback, from the numbers
+    the page's tile printed; None when the tile is left out."""
+    overall = week["overall"]
+    partial = overall["tokens_partial"]
+    partial_text = CHAT_TOKENS_PARTIAL.format(count=partial) if partial else ""
+    if overall["tokens_median"] is None:
+        return CHAT_TOKENS_NONE.format(partial=partial_text) if partial else None
+    pct = tokens_change(overall)
+    change = "" if pct is None else CHAT_TOKENS_UP.format(pct=pct) if pct > 0 else CHAT_TOKENS_DOWN.format(pct=-pct) if pct < 0 else CHAT_TOKENS_SAME
+    return CHAT_TOKENS.format(typical=tokens_text(overall["tokens_median"]), change=change, partial=partial_text)
+
+
 def chat_text(week: dict) -> str:
     """The weekly Chat post, from the week ``render`` printed: the same
     numbers, needs-attention rows and open-bug counts (``shown_bugs``)."""
@@ -1202,6 +1314,7 @@ def chat_text(week: dict) -> str:
     if strongest:
         tail.append(CHAT_STRONGEST.format(items=CHAT_JOIN.join(CHAT_STRONGEST_ITEM.format(name=r["name"], pct=r["pct"]) for r in strongest)))
     tail.append(chat_time(week))
+    tail += [line for line in [chat_tokens(week)] if line]
     links = CHAT_LINKS.format(report=REPORT_URL, dashboard=DASHBOARD_URL)
     return CHAT_BLOCK_JOIN.join(ROWS_JOIN.join(block) for block in (head, attention, tail, [links]))
 
@@ -1265,7 +1378,7 @@ def chat_card(week: dict) -> dict:
             row = rows_by_slug[overall["slowest_area"]]
             slowest = CARD_TIME_SLOWEST.format(name=esc(row["name"]), minutes=minutes(row["agent_s_median"]))
         time = CARD_TIME.format(typical=minutes(overall["agent_s_median"]), p90=minutes(overall["agent_s_p90"]), slowest=slowest)
-    sections.append({"header": CARD_TIME_TITLE, "widgets": [card_text(time)]})
+    sections.append({"header": CARD_TIME_TITLE, "widgets": [card_text(time)] + [card_text(line) for line in [chat_tokens(week)] if line]})
 
     footer = week["footer"]
     all_bugs = ISSUES_SEARCH_URL.format(repo=week["repo"], query=urllib.parse.quote(ALL_BUGS_QUERY.format(label=BUG_LABEL), safe=""))
