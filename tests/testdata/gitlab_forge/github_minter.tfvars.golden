@@ -102,6 +102,7 @@ slack_app_token         = ""
 slack_allowed_users     = []
 slack_home_channel      = ""
 slack_home_channel_name = ""
+slack_home_channel_policy = ""
 
 github_repo = "acme/infra"
 enable_github_minter = false

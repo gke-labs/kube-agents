@@ -586,6 +586,7 @@ jobs:
           SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
           SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
           SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+          SLACK_HOME_CHANNEL_POLICY: ${{ vars.SLACK_HOME_CHANNEL_POLICY }}
           CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}

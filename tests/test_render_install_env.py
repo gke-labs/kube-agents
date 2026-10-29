@@ -413,6 +413,10 @@ class RenderingTest(unittest.TestCase):
         _, _, text = render({**_COORDS, "GOOGLE_CHAT_HOME_CHANNEL": "spaces/TEST12345"})
         self.assertEqual(parse(text)["GOOGLE_CHAT_HOME_CHANNEL"], "spaces/TEST12345")
 
+    def test_slack_home_channel_policy_is_mapped(self):
+        _, _, text = render({**_COORDS, "SLACK_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(parse(text)["SLACK_HOME_CHANNEL_POLICY"], "manual")
+
     def test_the_file_is_not_readable_by_anyone_else(self):
         """It carries the model provider's API key and the Slack tokens."""
         with tempfile.TemporaryDirectory() as tmp:

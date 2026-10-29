@@ -355,6 +355,9 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
     INSTALL_ARGS+=(--slack-home-channel-name="${SLACK_HOME_CHANNEL_NAME}")
   fi
+  if [ -n "${SLACK_HOME_CHANNEL_POLICY:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel-policy="${SLACK_HOME_CHANNEL_POLICY}")
+  fi
 fi
 
 if [ -n "${ENABLE_GKE_BACKUP_PLAN:-}" ]; then
