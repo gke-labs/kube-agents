@@ -933,6 +933,10 @@ main() {
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
   export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""
+  # The serving-project switch, likewise: the generator refuses a misspelt
+  # value, and the destroy removes the two serving-project resources in state
+  # whichever way the key renders.
+  export VERTEX_MANAGE_SERVING_PROJECT=""
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
