@@ -2446,12 +2446,23 @@ class KubeAgentsHarness(AgentHarness):
                 return "cancelled"
             return "no cancel was published (see the log), so it may still be running"
 
+        task = inject.InjectTask(
+            base_url=base_url,
+            conversation=conversation,
+            prompt=prompt,
+            token=token,
+            author=author,
+            message_id=message_id,
+        )
+
         # A stopped ask waits on nothing it filed: the stop is the point. Sent
-        # after the opening turn ends, or, for a mid-turn stop, while it runs.
+        # after the opening turn ends, or, for a mid-turn stop, while it runs,
+        # on the door's own key for the conversation, which the opening task
+        # holds once its POST is answered.
         def _send_stop() -> tuple[bool, str]:
             stopper = inject.InjectTask(
                 base_url=base_url,
-                conversation=conversation,
+                conversation=task.conversation,
                 prompt=stop_hook.STOP_WORD,
                 token=token,
                 author=author,
@@ -2469,7 +2480,7 @@ class KubeAgentsHarness(AgentHarness):
                     failures += 1
                     _log.warning(
                         "inject: stop on %s failed in transport (%d/%d): %s",
-                        conversation,
+                        task.conversation,
                         failures,
                         _MAX_TRANSPORT_FAILURES,
                         exc,
@@ -2515,14 +2526,6 @@ class KubeAgentsHarness(AgentHarness):
                 return
             mid_turn_sent.append((sent, detail, None))
 
-        task = inject.InjectTask(
-            base_url=base_url,
-            conversation=conversation,
-            prompt=prompt,
-            token=token,
-            author=author,
-            message_id=message_id,
-        )
         try:
             exchange = _exchange(task, timeout, opening=True, on_poll=_stop_mid_turn)
             opening_ended = time.monotonic()
