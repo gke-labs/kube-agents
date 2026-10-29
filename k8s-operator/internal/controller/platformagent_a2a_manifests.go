@@ -3899,10 +3899,12 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	return defaultA2AMaxSessions
 }
 
-// a2aNATSReplicas is the bus's server count: spec.tuning.busReplicas, or
-// DefaultBusReplicas when absent. The CRD admits only 1 and 3; anything else
-// that reaches here (a CR written past the schema) falls back to the
-// default rather than rendering a two-server cluster, which has no JetStream
+// a2aNATSReplicas is the bus's server count: spec.harness.tuning.busReplicas
+// when set, otherwise status.busReplicas (which resolveA2ABusReplicas derives
+// from the running bus at the start of every pass), otherwise
+// DefaultBusReplicas. Only 1 and 3 are counts: the CRD admits nothing else,
+// and anything else that reaches here (a CR written past the schema) falls
+// through rather than rendering a two-server cluster, which has no JetStream
 // quorum to lose a server from.
 func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.BusReplicas != nil {
@@ -3910,8 +3912,71 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 			return r
 		}
 	}
+	if r := int(agent.Status.BusReplicas); r == 1 || r == 3 {
+		return r
+	}
 	return agentv1alpha1.DefaultBusReplicas
 }
+
+// resolveA2ABusReplicas sets status.busReplicas to the server count this pass
+// renders, before anything renders. The field set wins. Unset, the bus keeps
+// what it has, because changing the count empties it (the field's doc and
+// spec-nats-deployment.md): the running StatefulSet's replicas when there is
+// one; failing that, the data claims a bus left behind (a StatefulSet deleted
+// by hand keeps its claims, and the next one must come back at their count, or
+// it would convert them); and three only when there is no bus at all.
+//
+// When the field asks for a count other than the one running, the pass about
+// to convert the bus says so on the PlatformAgent, since the conversion is
+// what empties it.
+func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	running := 0
+	sts := &appsv1.StatefulSet{}
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
+	case err == nil && sts.Spec.Replicas != nil:
+		running = int(*sts.Spec.Replicas)
+	case err == nil, errors.IsNotFound(err):
+		for ordinal := a2aNATSMaxReplicas - 1; ordinal >= 0 && running == 0; ordinal-- {
+			pvc := &corev1.PersistentVolumeClaim{}
+			switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSDataClaimName(agent, ordinal)}, pvc); {
+			case err == nil:
+				if pvc.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+					running = ordinal + 1
+				}
+			case !errors.IsNotFound(err):
+				return err
+			}
+		}
+		if running == 2 {
+			// Claims for ordinals 0 and 1 and not 2 are a three-server
+			// bus that lost one, not a two-server bus, which never existed.
+			running = 3
+		}
+	default:
+		return err
+	}
+	if running != 1 && running != 3 {
+		running = 0
+	}
+
+	want := running
+	if limits := agentTuning(agent); limits != nil && limits.BusReplicas != nil && (*limits.BusReplicas == 1 || *limits.BusReplicas == 3) {
+		want = *limits.BusReplicas
+	}
+	if want == 0 {
+		want = agentv1alpha1.DefaultBusReplicas
+	}
+	if running != 0 && want != running && int(agent.Status.BusReplicas) != want {
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
+			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
+	}
+	agent.Status.BusReplicas = int32(want)
+	return nil
+}
+
+// reasonA2ABusConverting is the Warning resolveA2ABusReplicas records when a
+// set busReplicas converts a running bus.
+const reasonA2ABusConverting = "A2ABusConverting"
 
 // a2aStreamReplicas is the replica count every JetStream stream and bucket
 // is created with: one per server, up to JetStream's useful maximum of 3.
@@ -5511,6 +5576,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 
 func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error) (a2aProvisionState, error) {
 	state := a2aProvisionState{}
+
+	// First: everything below renders from the server count, and a count
+	// read before this would be last pass's, or the default.
+	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
+	}
 
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
 	if err != nil {

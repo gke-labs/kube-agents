@@ -842,16 +842,19 @@ type TuningSpec struct {
 	// runs a cluster with R3 streams, which keeps the bus up through a node
 	// drain, upgrade or eviction that moves one server; 1 runs a single
 	// server with R1 streams, which is down for as long as its pod restarts.
-	// Absent means DefaultBusReplicas. 1 is for a throwaway or cost-bound
-	// install that accepts that outage; it saves two NATS pods and two 40Gi
-	// volumes.
+	// 1 is for a throwaway, single-node or cost-bound install that accepts
+	// that outage; it saves two NATS pods and two 40Gi volumes.
 	//
-	// Raising it on an existing install grows the cluster, and streams
-	// created from then on take the new replica count. Streams that already
-	// exist keep the count they were created with: no workload may edit a
-	// stream, so raising them is an admin action (docs/designs/spec-nats-deployment.md).
-	// Lowering it from 3 to 1 is not supported: R3 streams cannot be served
-	// by one server.
+	//
+	// Unset, an install keeps the count its bus already runs, so an install
+	// from before the three-server default stays on one server, and a new bus
+	// gets three (status.busReplicas shows which applies).
+	//
+	// Setting it to a count other than the one the bus runs CONVERTS the bus,
+	// and conversion empties it: NATS cannot carry a single server's streams
+	// into a cluster or a cluster's into a single server, so every stream and
+	// bucket is recreated empty, losing task history, the topics journal and
+	// the KV buckets once (docs/designs/spec-nats-deployment.md).
 	// +kubebuilder:validation:Enum=1;3
 	// +optional
 	BusReplicas *int `json:"busReplicas,omitempty"`
@@ -884,8 +887,9 @@ type ProfileTuning struct {
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
 
-// DefaultBusReplicas is the NATS server count when spec.tuning.busReplicas is
-// absent: a three-server cluster with R3 streams.
+// DefaultBusReplicas is the NATS server count of a new bus when
+// spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
+// streams. An existing bus keeps its own count.
 const DefaultBusReplicas = 3
 
 // The ProfileTuning defaults.
@@ -2198,6 +2202,13 @@ type AgentStatus struct {
 	// StorageStatus tracks PVC binding state.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
+
+	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
+	// spec.harness.tuning.busReplicas when set; otherwise the count the bus
+	// already runs, or 3 for a new bus. Re-derived from the cluster on every
+	// reconcile, so it is a reading of the bus rather than a setting.
+	// +optional
+	BusReplicas int32 `json:"busReplicas,omitempty"`
 
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs

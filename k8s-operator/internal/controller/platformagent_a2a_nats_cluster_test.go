@@ -18,11 +18,14 @@ import (
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -198,7 +201,7 @@ func TestTheRouteUserLivesOnlyInTheClusterBlock(t *testing.T) {
 		t.Errorf("the cluster block has no route user and password:\n%s", block)
 	}
 	rest := a2aClusterBlockRe.ReplaceAllString(conf, "")
-	if regexp.MustCompile(`user: `+a2aNATSRouteUser+`\b`).MatchString(rest) {
+	if regexp.MustCompile(`user: ` + a2aNATSRouteUser + `\b`).MatchString(rest) {
 		t.Error("the route user appears outside the cluster block")
 	}
 	if strings.Contains(rest, "pw-"+a2aRoutePasswordKey) {
@@ -491,4 +494,76 @@ func a2aRoutePeers(t *testing.T, s *natsserver.Server) []string {
 	}
 	slices.Sort(peers)
 	return peers
+}
+
+// The server count is sticky: a set field wins, an existing bus keeps what it
+// runs (from its StatefulSet, or from the claims a deleted StatefulSet left),
+// and only a bus that does not exist yet gets three. Converting a running bus
+// says so once, because conversion empties it.
+func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
+	ctx := context.Background()
+	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int, labelled bool) *corev1.PersistentVolumeClaim {
+		c := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}}
+		if labelled {
+			c.Labels = buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+		}
+		return c
+	}
+	sts := func(agent *agentv1alpha1.PlatformAgent, replicas int32) *appsv1.StatefulSet {
+		s := buildA2ANATSStatefulSet(agent, "h")
+		s.Spec.Replicas = ptr.To(replicas)
+		return s
+	}
+	for _, tc := range []struct {
+		name      string
+		spec      *int
+		objects   func(*agentv1alpha1.PlatformAgent) []client.Object
+		want      int32
+		wantEvent bool
+	}{
+		{"a new bus", nil, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 3, false},
+		{"an existing single-server bus", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, false},
+		{"an existing cluster", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, false},
+		{"a deleted single-server bus's claim", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, true)} }, 1, false},
+		{"a deleted cluster's claims, one missing", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
+		}, 3, false},
+		{"an unlabelled squatter claim", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, false)} }, 3, false},
+		{"set to 3 on a single-server bus converts it", ptr.To(3), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 3, true},
+		{"set to 1 on a cluster converts it", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 1, true},
+		{"set to what runs is no conversion", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			objs := append([]client.Object{agent}, tc.objects(agent)...)
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.want {
+				t.Errorf("status.busReplicas = %d, want %d", agent.Status.BusReplicas, tc.want)
+			}
+			if got := a2aNATSReplicas(agent); got != int(tc.want) {
+				t.Errorf("a2aNATSReplicas = %d, want %d", got, tc.want)
+			}
+			if got := len(rec.Events) > 0; got != tc.wantEvent {
+				t.Errorf("conversion Event recorded = %v, want %v", got, tc.wantEvent)
+			}
+			// The Event is once per conversion: a second pass that already
+			// reads the new count says nothing more.
+			for len(rec.Events) > 0 {
+				<-rec.Events
+			}
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if len(rec.Events) != 0 {
+				t.Error("the conversion Event repeated on the next pass")
+			}
+		})
+	}
 }
