@@ -219,8 +219,8 @@ PROBE_PROGRESS_KEY = "progress"
 # artifact (``ConversationState.Usage``), absent when the executor published
 # none and on a door older than the field. The executor publishes each turn's
 # usage before its terminal, so a read that shows the task final carries all
-# of it. On a delegation chain's root the door reads the running or last link,
-# so the counts are that link's, as the trace is. Hermes reports the prompt whole, cached reads included, with no
+# of it. On a delegation chain's root the door sums the root's own turn and
+# every wake that continued it, never a child's. Hermes reports the prompt whole, cached reads included, with no
 # split, so the harness maps ``inputTokens`` and ``outputTokens`` alone.
 PROBE_USAGE_KEY = "usage"
 USAGE_INPUT_KEY = "inputTokens"
@@ -1557,7 +1557,7 @@ class InjectTask:
         probe: Probe | None = None
         while True:
             if fold.final:
-                return self._ended(fold, task_id, after, probe)
+                return self._ended(fold, task_id, after, probe, deadline=deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return self._classify(fold, task_id, after)
@@ -1587,10 +1587,12 @@ class InjectTask:
             if not fresh and not fold.final:
                 time.sleep(POLL_PAUSE_SECONDS)
 
-    def _ended(self, fold: Fold, task_id: str, after: int, probe: Probe | None) -> Exchange:
+    def _ended(
+        self, fold: Fold, task_id: str, after: int, probe: Probe | None, *, deadline: float
+    ) -> Exchange:
         if fold.never_started:
             return Exchange(fold, OUTCOME_NEVER_STARTED, self.conversation, task_id, probe)
-        if not fold.usage_settled:
+        if not fold.usage_settled and time.monotonic() < deadline:
             self._settle_usage(fold, task_id, after)
         return Exchange(fold, OUTCOME_TERMINAL, self.conversation, task_id, probe)
 
@@ -1601,9 +1603,10 @@ class InjectTask:
         carried the relay's terminal can hold a probe taken before the
         executor's terminal, and with it before the turn's usage. A read made
         now follows the terminal, and so the usage. Best effort: a read that
-        fails leaves the counts as the earlier reads had them. It is made
-        whatever budget is left, so on the deadline and cancel paths it can
-        run past the budget by one probed read's timeout.
+        fails leaves the counts as the earlier reads had them. Made only
+        inside the wait's deadline (:meth:`_ended`), so a run already past
+        its budget, or a cancel past its settle bound, spends no more time
+        on it.
         """
         try:
             answered = Probe.from_body(self._poll(task_id, after, 0))
@@ -1718,7 +1721,8 @@ class InjectTask:
             "inject: deadline read on %s for %s: %s", self.conversation, task_id, probe.describe()
         )
         if fold.final:
-            return self._ended(fold, task_id, after, probe)
+            # The deadline read: the budget is spent, so no usage read follows.
+            return self._ended(fold, task_id, after, probe, deadline=0.0)
         if not probe.could_look:
             return self._classify_from_the_polls(fold, task_id, probe)
         if not probe.concerns(task_id):

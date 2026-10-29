@@ -3394,3 +3394,71 @@ def test_usage_is_read_again_after_a_terminal_its_probe_predates(monkeypatch: py
     exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
     assert exchange.fold.usage == {"input": 1500, "output": 200}
     assert reads == [True, True]
+
+
+def test_the_inject_total_adds_the_workers_as_the_api_lanes_does(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``total`` is the front door plus its workers on both lanes: the
+    workers' total joins the front door's, while ``input`` and ``output``
+    stay the front door's own and ``front_door`` keeps its buckets."""
+    api_executor.probe_usage = USAGE
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    _capture_one_worker_call(monkeypatch)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    assert result.tokens["workers"]["total"] == 12
+    assert (result.tokens["input"], result.tokens["output"]) == (1500, 200)
+    assert result.tokens["total"] == 1712
+    assert result.tokens["front_door"]["total"] == 1700
+
+
+def test_the_workers_total_folds_into_a_null_or_counted_front_door() -> None:
+    """With no front-door usage the total is the workers'; a workers' total of
+    zero adds nothing and leaves a null total null rather than a zero the
+    scorer reads as no model call."""
+    tokens = harness._inject_tokens(None)
+    tokens["workers"] = {"total": 12}
+    harness._fold_worker_total(tokens)
+    assert tokens["total"] == 12 and tokens["input"] is None
+
+    tokens = harness._inject_tokens(None)
+    tokens["workers"] = {"total": 0}
+    harness._fold_worker_total(tokens)
+    assert tokens["total"] is None and "front_door" not in tokens
+
+
+def test_no_usage_read_follows_a_terminal_past_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The usage read after a relay terminal is made only inside the wait's
+    deadline: a run already late spends no more time on it, and keeps the
+    counts the earlier reads had (none here)."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    reads: list[bool] = []
+    relay_terminal = {
+        "entries": [
+            *running_transcript("task-1"),
+            entry(4, inject.ENTRY_POST, text="done", messageId=RESULT_ID),
+            entry(5, inject.ENTRY_TERMINAL, taskId="task-1", state="completed",
+                  source=inject.TERMINAL_SOURCE_EXECUTOR),
+        ],
+        "lastSeq": 5,
+        "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
+    }
+
+    def late(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
+        reads.append(probe)
+        time.sleep(0.3)
+        return relay_terminal
+
+    monkeypatch.setattr(task, "_poll", late)
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 0.1)
+    assert exchange.outcome == inject.OUTCOME_TERMINAL
+    assert exchange.fold.usage is None
+    assert reads == [True]

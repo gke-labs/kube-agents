@@ -149,7 +149,8 @@ the presubmit exports nothing new until it chooses to. The exchange:
    `final_message`); map `activity` artifacts into the trajectory when the executor publishes them
    (the `progress` artifact's last line goes to the harness result's `metadata`, which devops-bench
    does not write to the record, so it reaches the log and nothing graded). The front door's
-   token counts come from the read route's probe, which sums the task's `usage` artifact
+   token counts come from the read route's probe, which sums the `usage` artifact of the root
+   turn and every wake that continued its chain
    (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), and
    leaves them null when it carries none. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the

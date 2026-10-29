@@ -1686,16 +1686,6 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 		state.Progress = lastTextPart(artifactParts(task, lib.ArtifactProgress))
-		var turns []lib.Usage
-		for _, p := range artifactParts(task, lib.ArtifactUsage) {
-			if u, ok := lib.UsageOf(p); ok {
-				turns = append(turns, u)
-			}
-		}
-		if len(turns) != 0 {
-			total := lib.UsageTotal(turns)
-			state.Usage = &total
-		}
 		if state.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the
@@ -1723,6 +1713,11 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
+	readTask := task
+	if terr != nil {
+		readTask = nil
+	}
+	state.Usage = g.frontDoorUsage(ctx, rec, taskID, read, readTask)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -1746,6 +1741,56 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 	}
 	return state, nil
+}
+
+// frontDoorUsage is what the front door's own turns of taskID cost: the
+// usage artifact's parts of taskID's stream and, when taskID is a delegation
+// chain's root, of every wake that continued it, summed (lib.UsageTotal). A
+// child is another addressee's work and is never counted. The stream the
+// probe already folded (read, readTask; nil when it found no events) is not
+// read twice. Nil when no turn published usage, and when a link's stream
+// could not be read: a sum short of a turn would under-report, and nil says
+// "not known" instead.
+func (g *Gateway) frontDoorUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) *lib.Usage {
+	links := []TaskRef{{ID: taskID}}
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		links[0] = ref
+		if ref.Role != taskRoleChild && ref.rootID() == taskID {
+			for _, other := range rec.Tasks {
+				if other.Role == taskRoleWake && other.rootID() == taskID {
+					links = append(links, other)
+				}
+			}
+		}
+	}
+	var turns []lib.Usage
+	for _, link := range links {
+		folded := readTask
+		if link.ID != read {
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			switch {
+			case err == nil:
+				folded = t
+			case isTaskNotFound(err):
+				folded = nil
+			default:
+				return nil
+			}
+		}
+		if folded == nil {
+			continue
+		}
+		for _, p := range artifactParts(folded, lib.ArtifactUsage) {
+			if u, ok := lib.UsageOf(p); ok {
+				turns = append(turns, u)
+			}
+		}
+	}
+	if len(turns) == 0 {
+		return nil
+	}
+	total := lib.UsageTotal(turns)
+	return &total
 }
 
 // retireIncarnation deletes the record's lingering session pod before a

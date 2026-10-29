@@ -305,12 +305,16 @@ _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
 # ``a2a.status-update`` entry in the trajectory as the liveness signal then).
 # The delegated workers are another matter: when the delegation wait found
 # the cards in the session store, ``_settle`` reads the workers' sessions and
-# their counts land under ``tokens["workers"]``, beside the top-level buckets.
+# their counts land under ``tokens["workers"]``. Their total is added into
+# the top-level ``total`` (:func:`_fold_worker_total`), so ``total`` is the
+# front door plus its workers on both transports, while ``input`` and
+# ``output`` stay the front door's own and ``front_door`` keeps its buckets.
 _INJECT_TOKENS_NOTE = (
-    "the inject transport's top-level buckets are the front door's turn as the gateway "
-    "reported it: input counts cached reads too, and cached and reasoning are null since "
-    "Hermes reports no split; every bucket is null when the gateway reported no usage; "
-    "tokens.workers holds the delegated workers' counts when the delegation wait read them"
+    "the inject transport's input and output buckets are the front door's turns as the "
+    "gateway reported them: input counts cached reads too, and cached and reasoning are "
+    "null since Hermes reports no split; they are null when the gateway reported no usage; "
+    "tokens.workers holds the delegated workers' counts when the delegation wait read them, "
+    "and total adds the workers' total to the front door's, as on the api transport"
 )
 # The case and repetition the presubmit is running (hack/ci-eval-pr.sh exports
 # both), which with the run id become the conversation key and the backend
@@ -1369,6 +1373,29 @@ def _fold_worker_tokens(tokens: dict[str, Any]) -> None:
         tokens[bucket] = extra if current is None else current + extra
 
 
+def _fold_worker_total(tokens: dict[str, Any]) -> None:
+    """The inject transport's half of :func:`_fold_worker_tokens`: the workers'
+    total into the run's, so ``total`` means the front door plus its workers
+    on both transports.
+
+    The other buckets stay the front door's own (:func:`_inject_tokens`), and
+    the front door's buckets are copied under ``front_door`` first, as on the
+    api path. A run with no billed workers is left alone, and so is a workers'
+    total of zero, which adds nothing and would otherwise turn a null total
+    into the zero the scorer reads as "no model call was billed".
+    """
+    workers = tokens.get("workers")
+    if not isinstance(workers, dict):
+        return
+    extra = workers.get("total")
+    if not isinstance(extra, int) or isinstance(extra, bool) or extra <= 0:
+        return
+    buckets = [bucket for bucket, _ in _SESSION_TOKEN_KEYS] + ["total"]
+    tokens["front_door"] = {bucket: tokens.get(bucket) for bucket in buckets}
+    current = tokens.get("total")
+    tokens["total"] = extra if current is None else current + extra
+
+
 def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
     """Add ``extra``'s token buckets into ``base`` in place.
 
@@ -1827,7 +1854,9 @@ class KubeAgentsHarness(AgentHarness):
                 f"AGENT_TRANSPORT must be one of {sorted(_TRANSPORTS)}, got {transport!r}"
             )
         if transport == TRANSPORT_INJECT:
-            return self._execute_inject(prompt)
+            result = self._execute_inject(prompt)
+            _fold_worker_total(result.tokens)
+            return result
         if stop_hook.is_stopped_ask(prompt):
             return AgentResult.errored(
                 f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
@@ -3422,8 +3451,9 @@ class KubeAgentsHarness(AgentHarness):
         could be billed. On the api transport they are added into the run's
         top-level buckets later, in :meth:`_execute`, after the front door's
         session row is read (:func:`_fold_worker_tokens` says why the order
-        matters). On the inject transport the top-level buckets stay the front
-        door's (:func:`_inject_tokens`) and the counts stay under ``workers``.
+        matters). On the inject transport only their total is added, into the
+        run's ``total`` (:func:`_fold_worker_total`); the other top-level
+        buckets stay the front door's (:func:`_inject_tokens`).
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)

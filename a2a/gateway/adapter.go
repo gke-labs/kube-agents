@@ -567,12 +567,13 @@ type ConversationState struct {
 	// which is the line the relay's rolling edit shows.
 	Activity []json.RawMessage
 	Progress string
-	// Usage is the total of the task's usage artifact (lib.UsageTotal over
-	// its parts), read like Activity whenever the stream was read and from
-	// the same stream: for a delegation chain's root, the link the read
-	// follows, not the chain's sum. Nil when the stream was not read or the
-	// executor published no usage. The executor publishes a turn's usage
-	// before its terminal, so a read that shows the task final carries all
-	// of it.
+	// Usage is what the front door's own turns cost: the usage artifact's
+	// parts summed (lib.UsageTotal) over TaskID's stream and, for a
+	// delegation chain's root, every wake that continued it, whichever link
+	// the read follows. A child is another addressee's work and is not in
+	// it. Nil when the stream was not read, when no turn published usage,
+	// and when a link's stream could not be read. Each executor publishes a
+	// turn's usage before its terminal, so a read that shows the root final
+	// carries all of it.
 	Usage *lib.Usage
 }

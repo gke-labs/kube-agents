@@ -477,14 +477,13 @@ type probeReport struct {
 	// Progress is the last text part of the progress artifact -- the line
 	// the relay's rolling edit shows -- at the instant of the read.
 	Progress string `json:"progress,omitempty"`
-	// Usage is what the task's turns cost as its stream holds it at the
-	// read: the sum of its usage artifact's parts (ConversationState.Usage),
-	// from the stream the read follows, which for a delegation chain's root
-	// is its running or last link, as for Activity.
-	// Absent when the executor published none, when the stream was not
-	// read, and on a door older than the field. A read that shows the task
-	// final carries every turn's, since the executor publishes each before
-	// its terminal.
+	// Usage is what the front door's own turns cost at the read
+	// (ConversationState.Usage): the task's usage parts summed with, for a
+	// delegation chain's root, every wake's that continued it, and never a
+	// child's. Absent when no turn published usage, when a stream could not
+	// be read, and on a door older than the field. A read that shows the
+	// task final carries every turn's, since each executor publishes a
+	// turn's usage before its terminal.
 	Usage *lib.Usage `json:"usage,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
