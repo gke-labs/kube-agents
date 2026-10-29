@@ -2161,8 +2161,9 @@ KCC_DEPENDENCY_PATTERN = re.compile(
 KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
 KCC_STALLED_NOTE = (
     KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}. "
-    "The change in this file is correct, but the cloud resource does not change after the merge "
-    "until Config Connector applies the object again, and this finding comes back on each run until then."
+    "The cloud resource does not change after the merge until Config Connector applies the object again. "
+    "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
+    "effect when Config Connector applies the object again, and this finding comes back on each run until then."
 )
 # An earlier copy of that note, which a worker can copy from the previous
 # ledger. The pass removes it from every note and writes it again when the
@@ -2170,15 +2171,22 @@ KCC_STALLED_NOTE = (
 KCC_STALLED_NOTE_PATTERN = re.compile(r"[ \t]*" + re.escape(KCC_STALLED_NOTE_MARK) + r"[^\n]*")
 # What the merged-but-persisting line and comment say in place of the two
 # causes they guess at, when the finding's object is one of those objects.
+# They state the fact and the reason only: the merged change itself can be
+# what Config Connector rejects (a node pool with both `max_node_count` and
+# `total_max_node_count` set fails with `UpdateFailed`), and the comment is
+# posted once and never updated.
 KCC_STALLED_PERSISTS_LINE = (
     "  The proposed fix was merged and this finding still reproduces. "
-    "Config Connector is not applying the declaration: it reported {objects} — the merged {noun} is not reopened."
+    "Config Connector is not applying the declaration: it reported {objects}. "
+    "If that reason rejects the change this fix made, correct the declaration; otherwise the change "
+    "takes effect when Config Connector applies the object again. The merged {noun} is not reopened."
 )
 KCC_STALLED_PERSISTS_COMMENT = (
     "Config Connector is not applying the declaration this fix changed: when the audit ran, it "
-    "reported {objects}. The change stays in the repository and takes effect when Config Connector "
-    "applies the object again. This {noun} is **not** reopened: it merged, and reopening it would "
-    "misrepresent history. The finding stays on the ledger, flagged, until it stops reproducing."
+    "reported {objects}. If that reason rejects the change this fix made, correct the declaration "
+    "in a new change. Otherwise the change takes effect when Config Connector applies the object "
+    "again. This {noun} is **not** reopened: it merged, and reopening it would misrepresent "
+    "history. The finding stays on the ledger, flagged, until it stops reproducing."
 )
 # The finding field `disclose_stalled_kcc_remediations` writes for the two
 # texts above: the objects, as the note names them. Only `finish` writes it:
@@ -18941,9 +18949,11 @@ def disclose_stalled_kcc_remediations(
     controller gave, and the unready objects it waits on when the reason is
     `DependencyNotReady` (`_kcc_dependencies`).
 
-    Discloses, never degrades: the fix is correct and belongs in that file.
-    What is wrong is the reader's inference that the merge changes something,
-    and the stall is usually gone by the time someone reads the ledger. The
+    Discloses, never degrades: the fix belongs in that file, and the stall is
+    usually gone by the time someone reads the ledger. What is wrong is the
+    reader's inference that the merge changes something. The note does not
+    say the change is correct: the reason can reject the change itself, and
+    the note tells the reader to correct the declaration then. The
     `kind` stays `manifest`, and the sweep and `/remediate` treat the fix as
     before.
 

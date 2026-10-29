@@ -22787,6 +22787,9 @@ class TestStalledKccRemediations(unittest.TestCase):
         self.assertTrue(last.startswith("**Config Connector is not applying this file.**"), last)
         self.assertIn("`Ready=False` on `ContainerCluster infra/prod-usc1` (`UpdateFailed: Error 403`)", last)
         self.assertIn("does not change after the merge", last)
+        # The reason can reject the change itself, so the note does not call it correct.
+        self.assertNotIn("is correct", last)
+        self.assertIn("If the reason rejects the change in this file, correct the declaration.", last)
         self.assertIn("ContainerCluster infra/prod-usc1", finding[audit_report.KCC_STALLED_FINDING_FIELD])
 
     def test_a_fix_whose_file_declares_nothing_unready_gets_no_note(self):
@@ -23111,6 +23114,7 @@ class TestStalledKccPersists(unittest.TestCase):
         lines = "\n".join(
             audit_report.render_finding(self.stalled_finding(), state=audit_report.STATE_PR_MERGED_PERSISTS)
         )
+        self.assertIn("If that reason rejects the change this fix made, correct the declaration", lines)
         self.assertIn("Config Connector is not applying the declaration", lines)
         self.assertIn("`ContainerCluster infra/prod-usc1`", lines)
         self.assertNotIn(self.GUESS, lines)
@@ -23123,6 +23127,9 @@ class TestStalledKccPersists(unittest.TestCase):
     def test_the_comment_states_the_stall(self):
         text = audit_report.render_persists_comment(AUDIT, self.stalled_finding(), NOW)
         self.assertIn("Config Connector is not applying the declaration this fix changed", text)
+        # Posted once and never updated, so it states the reason and both outcomes.
+        self.assertIn("If that reason rejects the change this fix made, correct the declaration", text)
+        self.assertNotIn("The change stays in the repository", text)
         self.assertIn("**not** reopened", text)
         self.assertNotIn(self.GUESS, text)
         self.assertIn(audit_report.persists_marker("a"), text)
