@@ -23,12 +23,22 @@ ship.
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
+
 import pytest
 
 import yaml
 from devops_bench.tasks.schema import Task
 
-from kube_agents_bench.cases import CASE_KEYS, DEVOPS_BENCH_CASE_KEYS, NOOP_DEPLOYER, CaseSpecError, load_case
+from kube_agents_bench.cases import (
+    CASE_KEYS,
+    DEVOPS_BENCH_CASE_KEYS,
+    NOOP_DEPLOYER,
+    REPOSITORY_CASE_KEYS,
+    CaseSpecError,
+    load_case,
+)
 
 from conftest import TASKS
 
@@ -70,6 +80,25 @@ def test_the_case_keys_are_devops_benchs_fields_and_aliases_plus_ours():
     assert DEVOPS_BENCH_CASE_KEYS == (set(Task.model_fields) - {"folder"}) | {"task_id", "goal", "input"}
     assert "folder" not in CASE_KEYS
     assert {"domain", "fixtures", "expected_fail", "scope_exclude"} <= CASE_KEYS
+
+
+def test_every_reader_modules_key_is_a_repository_case_key():
+    """A reader module declares the top-level key it reads as ``KEY``
+    (``audit_streams``, ``scope_exclude``); REPOSITORY_CASE_KEYS restates each
+    by hand. The shipped-task sweep catches a missing one only once a case in
+    the tree carries it, which is after main is red; this holds the set to the
+    readers without a case."""
+    import kube_agents_bench
+
+    found = {}
+    for module in pkgutil.iter_modules(kube_agents_bench.__path__):
+        key = getattr(importlib.import_module(f"kube_agents_bench.{module.name}"), "KEY", None)
+        if isinstance(key, str):
+            found[module.name] = key
+    assert found, "no reader module declares KEY; the sweep is vacuous"
+    assert set(found.values()) <= REPOSITORY_CASE_KEYS, {
+        name: key for name, key in found.items() if key not in REPOSITORY_CASE_KEYS
+    }
 
 
 def test_kanban_smoke_reads_as_the_shell_read_it(kanban_task):
