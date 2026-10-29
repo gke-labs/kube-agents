@@ -23,12 +23,22 @@ ship.
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
+
 import pytest
 
 import yaml
 from devops_bench.tasks.schema import Task
 
-from kube_agents_bench.cases import CASE_KEYS, DEVOPS_BENCH_CASE_KEYS, NOOP_DEPLOYER, CaseSpecError, load_case
+from kube_agents_bench.cases import (
+    CASE_KEYS,
+    DEVOPS_BENCH_CASE_KEYS,
+    NOOP_DEPLOYER,
+    REPOSITORY_CASE_KEYS,
+    CaseSpecError,
+    load_case,
+)
 
 from conftest import TASKS
 
@@ -69,7 +79,33 @@ def test_the_case_keys_are_devops_benchs_fields_and_aliases_plus_ours():
     case may use; its loader-set ``folder`` is not one."""
     assert DEVOPS_BENCH_CASE_KEYS == (set(Task.model_fields) - {"folder"}) | {"task_id", "goal", "input"}
     assert "folder" not in CASE_KEYS
-    assert {"domain", "fixtures", "expected_fail"} <= CASE_KEYS
+    assert {"domain", "fixtures", "expected_fail", "scope_exclude"} <= CASE_KEYS
+
+
+def test_every_reader_modules_key_is_a_repository_case_key():
+    """A module in ``kube_agents_bench`` that reads one top-level key of its
+    own names it ``KEY`` at module level, one string (``audit_streams``,
+    ``scope_exclude``; the convention is written above REPOSITORY_CASE_KEYS,
+    which restates each by hand). The shipped-task sweep catches a missing one
+    only once a case in the tree carries it, which is after main is red; this
+    holds the set to the readers without a case. It reaches a reader that
+    follows the convention and no other: a key read as a literal, the way
+    ``load_case`` reads ``expected_fail``, is the sweep's. A ``KEY`` that is
+    not one string fails here rather than being skipped, and subpackages are
+    walked, so neither shape hides a reader."""
+    import kube_agents_bench
+
+    found = {}
+    for module in pkgutil.walk_packages(kube_agents_bench.__path__, prefix=f"{kube_agents_bench.__name__}."):
+        key = getattr(importlib.import_module(module.name), "KEY", None)
+        if key is None:
+            continue
+        assert isinstance(key, str), f"{module.name}: KEY is {key!r}; a reader names one top-level key as a string"
+        found[module.name] = key
+    assert found, "no reader module declares KEY; the sweep is vacuous"
+    assert set(found.values()) <= REPOSITORY_CASE_KEYS, {
+        name: key for name, key in found.items() if key not in REPOSITORY_CASE_KEYS
+    }
 
 
 def test_kanban_smoke_reads_as_the_shell_read_it(kanban_task):
