@@ -24,24 +24,25 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// The bridge's conversation and lineage types (#3689 at 5a706327:
-// a2a/mcpbridge/config.go ConversationEntry, swarm_lineage.go
-// ConversationLineage), copied so the field sets can be held to ours.
+// The bridge's conversation entry (#3689 at 5eb4af7e:
+// a2a/mcpbridge/config.go ConversationEntry) and lineage (at 5a706327:
+// swarm_lineage.go ConversationLineage, since moved out to the host's own
+// integration), copied so the field sets can be held to ours.
 type bridgeConversationEntry struct {
-	Alias                   string    `json:"alias"`
-	Token                   string    `json:"token"`
-	SessionMode             bool      `json:"sessionMode"`
-	SessionTerminated       bool      `json:"sessionTerminated,omitempty"`
-	Description             string    `json:"description,omitempty"`
-	AGYConversationID       string    `json:"agyConversationId,omitempty"`
-	ParentAGYConversationID string    `json:"parentAgyConversationId,omitempty"`
-	SubagentRole            string    `json:"subagentRole,omitempty"`
-	SessionWorkerID         string    `json:"sessionWorkerId,omitempty"`
-	AutoBound               bool      `json:"autoBound,omitempty"`
-	DebugMode               bool      `json:"debugMode,omitempty"`
-	Disconnected            bool      `json:"disconnected,omitempty"`
-	CreatedAt               time.Time `json:"createdAt"`
-	LastUsedAt              time.Time `json:"lastUsedAt"`
+	Alias                    string    `json:"alias"`
+	Token                    string    `json:"token"`
+	SessionMode              bool      `json:"sessionMode"`
+	SessionTerminated        bool      `json:"sessionTerminated,omitempty"`
+	Description              string    `json:"description,omitempty"`
+	HostConversationID       string    `json:"hostConversationId,omitempty"`
+	ParentHostConversationID string    `json:"parentHostConversationId,omitempty"`
+	SubagentRole             string    `json:"subagentRole,omitempty"`
+	SessionWorkerID          string    `json:"sessionWorkerId,omitempty"`
+	AutoBound                bool      `json:"autoBound,omitempty"`
+	DebugMode                bool      `json:"debugMode,omitempty"`
+	Disconnected             bool      `json:"disconnected,omitempty"`
+	CreatedAt                time.Time `json:"createdAt"`
+	LastUsedAt               time.Time `json:"lastUsedAt"`
 }
 
 type bridgeConversationLineage struct {
@@ -331,7 +332,7 @@ func TestTheSwarmRouteResolvesARequestAliasOnTheServer(t *testing.T) {
 	created := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
 	sent := swarmConversationEntry{
 		Alias: DefaultConversation, Token: "kabridgelocal01", SessionMode: true, SessionTerminated: true,
-		Description: "the bridge's", AGYConversationID: "agy-root", ParentAGYConversationID: "agy-parent",
+		Description: "the bridge's", HostConversationID: "agy-root", ParentHostConversationID: "agy-parent",
 		SubagentRole: "reviewer", SessionWorkerID: "worker-1", AutoBound: true, DebugMode: true, Disconnected: true,
 		CreatedAt: created, LastUsedAt: created,
 	}
@@ -379,8 +380,8 @@ func TestTheSwarmRouteProjectsOnlyTheRequestsConversations(t *testing.T) {
 	publishSubmission(t, js, "s-mine", "t-mine", consoleConversationPrefix+"kamine01", "my turn", "")
 	publishRun(t, js, "s-mine", "t-mine", "", false)
 	resp, raw := askSwarm(t, h, map[string]any{"rootConversationId": "agy-mine", "conversations": map[string]any{
-		"mine": map[string]any{"alias": "mine", "token": "kamine01", "agyConversationId": "agy-sub",
-			"parentAgyConversationId": "agy-mine", "sessionMode": true, "lastUsedAt": time.Now()},
+		"mine": map[string]any{"alias": "mine", "token": "kamine01", "hostConversationId": "agy-sub",
+			"parentHostConversationId": "agy-mine", "sessionMode": true, "lastUsedAt": time.Now()},
 	}})
 	for _, not := range []string{"PRIVATE PROMPT", "t-secret", "someone-elses", other} {
 		if strings.Contains(string(raw), not) {
@@ -474,11 +475,11 @@ func TestTheSwarmRouteTakesClientInputAsUntrusted(t *testing.T) {
 
 func TestSwarmConversationParents(t *testing.T) {
 	entries := []swarmConversationEntry{
-		{Alias: "root", Token: "r", AGYConversationID: "agy-root"},
-		{Alias: "by-parent-id", Token: "a", AGYConversationID: "agy-a", ParentAGYConversationID: "agy-root"},
-		{Alias: "by-lineage", Token: "b", AGYConversationID: "agy-b"},
-		{Alias: "unresolvable", Token: "c", AGYConversationID: "agy-c", ParentAGYConversationID: "agy-nowhere"},
-		{Alias: "self", Token: "d", AGYConversationID: "agy-d", ParentAGYConversationID: "agy-d"},
+		{Alias: "root", Token: "r", HostConversationID: "agy-root"},
+		{Alias: "by-parent-id", Token: "a", HostConversationID: "agy-a", ParentHostConversationID: "agy-root"},
+		{Alias: "by-lineage", Token: "b", HostConversationID: "agy-b"},
+		{Alias: "unresolvable", Token: "c", HostConversationID: "agy-c", ParentHostConversationID: "agy-nowhere"},
+		{Alias: "self", Token: "d", HostConversationID: "agy-d", ParentHostConversationID: "agy-d"},
 	}
 	subagents := map[string]swarmLineage{
 		"agy-b": {ConversationID: "agy-b", ParentConversationID: "agy-a", IsSubagent: true},
@@ -812,17 +813,17 @@ func TestTheSwarmRouteCapsClientFields(t *testing.T) {
 	long := strings.Repeat("a", maxSwarmHandleBytes+1)
 	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{
 		"capped": map[string]any{"alias": "capped", "token": convTriage, "subagentRole": long, "sessionWorkerId": long,
-			"description": strings.Repeat("d", swarmScanBytes+1), "agyConversationId": "agy\x01bad",
-			"parentAgyConversationId": strings.Repeat("p", maxSwarmConversationIDRunes+1)},
+			"description": strings.Repeat("d", swarmScanBytes+1), "hostConversationId": "agy\x01bad",
+			"parentHostConversationId": strings.Repeat("p", maxSwarmConversationIDRunes+1)},
 		"kept": map[string]any{"alias": "kept", "token": convUnknown, "subagentRole": "reviewer", "sessionWorkerId": "w-1",
-			"description": "fine", "agyConversationId": "agy-ok", "parentAgyConversationId": "agy-parent"},
+			"description": "fine", "hostConversationId": "agy-ok", "parentHostConversationId": "agy-parent"},
 	}})
 	if e := resp.Conversations["capped"]; e.SubagentRole != "" || e.SessionWorkerID != "" || e.Description != "" ||
-		e.AGYConversationID != "" || e.ParentAGYConversationID != "" || e.Token != convTriage {
+		e.HostConversationID != "" || e.ParentHostConversationID != "" || e.Token != convTriage {
 		t.Errorf("capped = %+v", e)
 	}
 	if e := resp.Conversations["kept"]; e.SubagentRole != "reviewer" || e.SessionWorkerID != "w-1" || e.Description != "fine" ||
-		e.AGYConversationID != "agy-ok" || e.ParentAGYConversationID != "agy-parent" {
+		e.HostConversationID != "agy-ok" || e.ParentHostConversationID != "agy-parent" {
 		t.Errorf("kept = %+v", e)
 	}
 }
@@ -898,7 +899,7 @@ func TestTheSwarmRouteGivesSessionMembersTheirConversationID(t *testing.T) {
 	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "turn", "")
 	publishRun(t, js, "s-triage", "t-1", "", false)
 	entry := clientConv("triage", convTriage, time.Now())
-	entry["agyConversationId"] = "agy-sub-1"
+	entry["hostConversationId"] = "agy-sub-1"
 	resp, _ := askSwarm(t, h, map[string]any{"rootConversationId": "agy-root", "conversations": map[string]any{"triage": entry}})
 	found := false
 	for name, m := range resp.Snapshot.Members {
