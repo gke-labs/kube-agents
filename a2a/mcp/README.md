@@ -32,6 +32,8 @@ Reading the Secret needs `get` on it, and the port-forward needs `pods/portforwa
 
 The workstation bridge (`kube-agents-mcp`, gke-labs/kube-agents#3689) reads `KUBE_AGENTS_MCP_TOKEN` too. With one deployment saved, it sends the token to that one. With several, set `KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT` to the saved name of the deployment the token belongs to, and only that one gets it; unset, or naming none of them, the bridge sends the token nowhere and logs a warning.
 
+The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
+
 Point an MCP client at `http://localhost:8089/mcp` with the header `Authorization: Bearer <token>`. The endpoint takes JSON-RPC 2.0 over `POST`, one JSON answer per request. It refuses any request that carries an `Origin` header, so a browser page cannot use it. `GET /healthz` answers without a token.
 
 A request that names an MCP revision this server doesn't speak (the `MCP-Protocol-Version` header) is refused with 400; a request without the header is served.
