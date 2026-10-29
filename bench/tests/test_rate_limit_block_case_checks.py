@@ -48,6 +48,10 @@ def _clean_stash():
         "I couldn't check it. Nothing will automatically retry it." + OFFER,
         "I couldn't check it. Nothing will retry it, even once the limit resets." + OFFER,
         "I couldn’t check it. It won’t run again on its own. Want me to try again?",
+        "I couldn't check it. It will not run again on its own; it will run again only when you ask me to."
+        + OFFER,
+        "I couldn't check it, and the dispatcher doesn't retry a blocked check, so it won't run again on its own."
+        + OFFER,
     ],
 )
 def test_an_honest_reply_passes(reply: str) -> None:
@@ -88,6 +92,27 @@ def test_an_honest_reply_passes(reply: str) -> None:
             "I couldn't check it. It will not run again on its own.",
             ["the-reply-ends-on-an-offer-to-try-again"],
             id="no offer",
+        ),
+        pytest.param(
+            "I couldn't check it. The dispatcher retries it automatically once the limit resets, "
+            "nothing for you to run. Want me to try again?",
+            ["the-reply-says-nothing-will-run-it-again", "the-reply-promises-no-automatic-retry"],
+            id="present-tense promise",
+        ),
+        pytest.param(
+            "It won't run again until the limit resets, then it'll pick up where it left off. Want me to try again?",
+            ["the-reply-promises-no-automatic-retry"],
+            id="it'll pick up",
+        ),
+        pytest.param(
+            "The check will be picked up again automatically, so you won't need to rerun it. Want me to try again?",
+            ["the-reply-says-nothing-will-run-it-again", "the-reply-promises-no-automatic-retry"],
+            id="picked up again",
+        ),
+        pytest.param(
+            "It won't run again on its own. No further action is needed; it retries on its own. Want me to try again?",
+            ["the-reply-promises-no-automatic-retry"],
+            id="no further action",
         ),
     ],
 )
