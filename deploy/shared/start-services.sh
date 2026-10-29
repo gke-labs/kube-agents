@@ -276,7 +276,7 @@ readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # The credential runtime's own drain budget. In the broker role the runtime
 # leaves on SIGTERM (install_shutdown_handler in
-# agents/platform/scripts/credential_proxy.py): it refuses new event pulls,
+# agents/platform/scripts/credential_proxy.py): it refuses new Chat event pulls,
 # keeps the settle routes open for its 3s window so the gateway's acks land,
 # hands any unsettled Chat receipt back to Pub/Sub, and exits. Killing it and
 # returning, as terminate() once did, delivered the signal and not that
@@ -468,13 +468,23 @@ drain_supervised() {
   local budget="$1"
   shift
   local pid
-  local waited=0
-  local running
 
   for pid in "$@"; do
     pkill -TERM -P "${pid}" 2>/dev/null || true
     kill -TERM "${pid}" 2>/dev/null || true
   done
+
+  wait_for_exit "${budget}" "$@"
+}
+
+# Wait until every pid is gone or the budget runs out, then SIGKILL whatever
+# is left: the second half of drain_supervised and of drain_runtime.
+wait_for_exit() {
+  local budget="$1"
+  shift
+  local pid
+  local waited=0
+  local running
 
   while [[ "${waited}" -lt "${budget}" ]]; do
     running=""
@@ -494,6 +504,21 @@ drain_supervised() {
   done
 }
 
+# SIGTERM the credential runtime alone and wait for it. Not drain_supervised:
+# that sweeps the pid's children first, and the runtime's children are the
+# brokered commands in flight (kubectl, git, gh, gcloud, each in its own
+# session), which the runtime keeps its exec route open for during its settle
+# window so they can finish. A sweep would end them at the first instant of
+# the stop. One still running when the runtime exits dies with the pod, as it
+# did before.
+drain_runtime() {
+  local budget="$1"
+  local pid="$2"
+
+  kill -TERM "${pid}" 2>/dev/null || true
+  wait_for_exit "${budget}" "${pid}"
+}
+
 terminate() {
   trap - EXIT INT TERM
 
@@ -504,9 +529,8 @@ terminate() {
   # grace period does not grow with the number of processes in the container.
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
-  # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS. Its child commands
-  # get the same SIGTERM first, as a supervisor's process does.
-  [[ -z "${runtime_pid}" ]] || drain_supervised "${RUNTIME_DRAIN_SECONDS}" "${runtime_pid}"
+  # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
+  [[ -z "${runtime_pid}" ]] || drain_runtime "${RUNTIME_DRAIN_SECONDS}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM

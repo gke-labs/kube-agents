@@ -13207,7 +13207,7 @@ def install_shutdown_handler(
 ) -> None:
     """Make SIGTERM a graceful stop of the credentialed server.
 
-    On the signal: refuse new event pulls at once, keep every other route up
+    On the signal: refuse new Chat event pulls at once, keep every other route up
     for settle_seconds so the gateway's acks for pulls already answered land,
     hand what is still unsettled back to Pub/Sub, then stop the server so
     serve() returns and the process exits 0 inside the pod's grace period.
@@ -13237,7 +13237,7 @@ def install_shutdown_handler(
             return
         CredentialProxyHandler.shutting_down.set()
         LOGGER.info(
-            "SIGTERM: refusing new event pulls; settling receipts for %ss before stopping",
+            "SIGTERM: refusing new Chat event pulls; settling receipts for %ss before stopping",
             settle_seconds,
         )
         threading.Thread(target=drain, name=SHUTDOWN_THREAD_NAME, daemon=True).start()

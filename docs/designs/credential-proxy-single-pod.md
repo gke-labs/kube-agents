@@ -54,7 +54,7 @@ The `Recreate` strategy follows from the same state: two pods behind the Service
 rollout split traffic that assumes one pod.
 
 What one pod costs is a gap on every eviction, drain and rollout, and the gap is bounded rather
-than removed. On SIGTERM the broker refuses new event pulls, keeps the settle routes open for a few
+than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
 seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
 back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
 replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:

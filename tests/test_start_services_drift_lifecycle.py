@@ -261,6 +261,8 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
         readonly RUNTIME_DRAIN_SECONDS={runtime_drain}
         {self.lift("drain_supervised")}
+        {self.lift("wait_for_exit")}
+        {self.lift("drain_runtime")}
         {self.lift("terminate")}
         runtime_pid=""
         envoy_pid=""
@@ -432,6 +434,46 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
             self.assertLess(done.stat().st_mtime, returned.stat().st_mtime)
             self.assertGreater(elapsed, _SHUTDOWN_FLOOR_SECONDS)
 
+    def test_the_runtime_drain_leaves_the_brokered_commands_to_the_runtime(self) -> None:
+        """The runtime's children are brokered commands mid-flight; the runtime keeps
+        its exec route open through its settle window so they finish. A shell-side
+        sweep of them (what drain_supervised does for a supervisor's process) would
+        end them at the first instant of the stop.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = pathlib.Path(tmp)
+            ready = tmpdir / "ready"
+            command_signalled = tmpdir / "command-signalled"
+            runtime = tmpdir / "runtime"
+
+            # The fake runtime: one child standing in for a brokered command,
+            # then a TERM trap that exits without touching it, as the real
+            # runtime leaves a running command to finish inside its window.
+            child = f"""bash -c 'trap "touch {command_signalled}; exit 0" TERM
+                                 for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done' &
+                        trap 'exit 0' TERM
+                        touch {ready}
+                        for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
+            body = f"""
+            {self._runtime(child, runtime)}
+            while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
+            terminate
+            echo "terminate-returned"
+            """
+            try:
+                result = _run_bash(self._harness(body))
+            finally:
+                _kill_recorded(runtime)
+                subprocess.run(["pkill", "-f", f"touch {command_signalled}"], check=False)
+
+            self.assertIn("terminate-returned", result.stdout)
+            self.assertFalse(
+                command_signalled.exists(),
+                "terminate() sent SIGTERM to the runtime's child, a brokered command in "
+                "flight, at the first instant of the stop; the runtime's settle window "
+                "exists so that command can finish",
+            )
+
     def test_the_runtime_drain_is_bounded_by_its_own_budget(self) -> None:
         """A runtime that ignores SIGTERM holds the container for RUNTIME_DRAIN_SECONDS,
         not for the supervisors' budget: the two are sized for different pods.
@@ -594,7 +636,10 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 )
 
     def test_both_supervisors_are_drained_and_the_signal_precedes_the_kill(self) -> None:
-        drain = self.lift("drain_supervised")
+        # The wait and the last-resort kill live in wait_for_exit, which
+        # drain_supervised calls last; the two texts in that order are the
+        # sequence the function runs.
+        drain = self.lift("drain_supervised") + self.lift("wait_for_exit")
         pkill_at = drain.find("pkill -TERM -P")
         term_at = drain.find('kill -TERM "${pid}"')
         wait_at = drain.find('kill -0 "${pid}"')
