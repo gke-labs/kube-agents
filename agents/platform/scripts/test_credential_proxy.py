@@ -8600,7 +8600,11 @@ class GracefulShutdownTest(unittest.TestCase):
                 "subscription": self.SUBSCRIPTION,
                 "ack_ids": ["ack-1", "ack-2"],
                 "ack_deadline_seconds": 0,
-            }
+            },
+            # Bounded and unretried: the call sits inside the entrypoint's
+            # drain budget, and the library's defaults would outlast it.
+            timeout=credential_proxy.SHUTDOWN_NACK_TIMEOUT_SECONDS,
+            retry=None,
         )
         self.assertEqual({}, relay._receipts)
         self.assertEqual(0, relay.release_unsettled())
@@ -8626,7 +8630,9 @@ class GracefulShutdownTest(unittest.TestCase):
                 "subscription": self.SUBSCRIPTION,
                 "ack_ids": ["ack-late"],
                 "ack_deadline_seconds": 0,
-            }
+            },
+            timeout=credential_proxy.SHUTDOWN_NACK_TIMEOUT_SECONDS,
+            retry=None,
         )
         self.assertEqual({}, relay._receipts)
 

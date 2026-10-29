@@ -452,6 +452,15 @@ KILL_SETTLE_SECONDS = 1
 # ack deadline (60 s) runs out. Short on purpose: the window is the whole of
 # what a graceful stop adds to a Recreate rollout.
 SHUTDOWN_SETTLE_SECONDS = 3
+# How long the hand-back's one Pub/Sub call may take, with no retry. It runs
+# on the drain thread ahead of server.shutdown(), inside the entrypoint's
+# RUNTIME_DRAIN_SECONDS (10 s) after the settle window above; the client
+# library's defaults (60 s per call, retried for 60 s) would let a slow
+# Pub/Sub hold the stop past that budget and hand the process to SIGKILL with
+# the server still up, the ending this path exists to avoid. A call that does
+# not finish in this long is logged and the messages wait out their ack
+# deadline, as before.
+SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
 # The body of the 503 a Chat pull gets during the window. The gateway logs the
 # 503 as "event pull failed ... answered 503: subscription <name>" (it renders
 # only the chat, pubsub and subscription keys of a relay error, never free
@@ -3977,7 +3986,8 @@ class GoogleChatRelay:
     def _nack(self, ack_ids: list[Any]) -> bool:
         """Hand ack_ids back to Pub/Sub now; False, and a log line, when that failed.
 
-        Best effort: a failure leaves the messages to redeliver at their ack
+        Best effort and bounded (SHUTDOWN_NACK_TIMEOUT_SECONDS, no retry): a
+        failure or a timeout leaves the messages to redeliver at their ack
         deadline, which is what happened to them before the shutdown path.
         """
         try:
@@ -3986,7 +3996,9 @@ class GoogleChatRelay:
                     "subscription": self.subscription_path,
                     "ack_ids": ack_ids,
                     "ack_deadline_seconds": 0,
-                }
+                },
+                timeout=SHUTDOWN_NACK_TIMEOUT_SECONDS,
+                retry=None,
             )
         except Exception as exc:
             LOGGER.warning(

@@ -449,10 +449,12 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
             # The fake runtime: one child standing in for a brokered command,
             # then a TERM trap that exits without touching it, as the real
             # runtime leaves a running command to finish inside its window.
+            # The command touches `ready` itself, after its trap, so terminate
+            # cannot run before the trap that the assertion depends on exists.
             child = f"""bash -c 'trap "touch {command_signalled}; exit 0" TERM
+                                 touch {ready}
                                  for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done' &
                         trap 'exit 0' TERM
-                        touch {ready}
                         for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
             body = f"""
             {self._runtime(child, runtime)}
@@ -464,7 +466,9 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 result = _run_bash(self._harness(body))
             finally:
                 _kill_recorded(runtime)
-                subprocess.run(["pkill", "-f", f"touch {command_signalled}"], check=False)
+                # SIGKILL, never SIGTERM: the orphaned command's TERM trap is
+                # the very marker the assertion below needs to find absent.
+                subprocess.run(["pkill", "-KILL", "-f", f"touch {command_signalled}"], check=False)
 
             self.assertIn("terminate-returned", result.stdout)
             self.assertFalse(
@@ -636,10 +640,21 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 )
 
     def test_both_supervisors_are_drained_and_the_signal_precedes_the_kill(self) -> None:
-        # The wait and the last-resort kill live in wait_for_exit, which
-        # drain_supervised calls last; the two texts in that order are the
-        # sequence the function runs.
-        drain = self.lift("drain_supervised") + self.lift("wait_for_exit")
+        # The wait and the last-resort kill live in wait_for_exit. The order
+        # is asserted in two halves: drain_supervised signals and then calls
+        # wait_for_exit (its own text), and wait_for_exit polls before it
+        # kills (its text); a concatenation alone could not tell whether
+        # drain_supervised waits at all.
+        supervised = self.lift("drain_supervised")
+        waiter = self.lift("wait_for_exit")
+        handoff_at = supervised.find("wait_for_exit")
+        self.assertNotEqual(handoff_at, -1, "drain_supervised no longer waits for them to exit")
+        self.assertLess(
+            max(supervised.find("pkill -TERM -P"), supervised.find('kill -TERM "${pid}"')),
+            handoff_at,
+            "drain_supervised waits before it signals, so it waits for nothing",
+        )
+        drain = supervised + waiter
         pkill_at = drain.find("pkill -TERM -P")
         term_at = drain.find('kill -TERM "${pid}"')
         wait_at = drain.find('kill -0 "${pid}"')
