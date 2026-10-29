@@ -214,7 +214,9 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
   can't provide.
 - **The Lease, created by the operator** in the agent's namespace, under a fixed name. RBAC can't
   scope `create` to a name, so the operator owns creation, and the gateway's ServiceAccount gets
-  only `get` and `update` on that one Lease (`resourceNames`). Nothing else changes in its Role.
+  only `get` and `update` on that one Lease (`resourceNames`). Nothing else changes in its Role:
+  no EndpointSlice grant and no pod patch. The project's tech lead approved this grant for phase
+  one.
 
 ## Build, as follow-ups
 
