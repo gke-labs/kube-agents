@@ -1,4 +1,4 @@
-"""The nightly section of the 9 AM digest: what last night changed, and who
+"""The nightly section of the 11 AM digest: what last night changed, and who
 answers for it.
 
 ``post_health.py`` posts the digest; this builds its nightly part from the

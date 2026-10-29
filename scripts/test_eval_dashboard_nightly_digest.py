@@ -1,4 +1,4 @@
-"""nightly_digest.py: the 9 AM digest's nightly section -- new bugs, still
+"""nightly_digest.py: the daily digest's nightly section (these tests pin the digest hour at 9; the product posts at 11) -- new bugs, still
 red, first-time reds, recoveries and infra from last night, capped lists,
 the one-line quiet day, a truncated night labelled and not counted, Chat
 mentions from CI_HEALTH_CHAT_MENTIONS (plain text for a login it lacks), and
@@ -31,7 +31,7 @@ FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: requir
 STORM_REASON = "agent run failed: http 429 RESOURCE_EXHAUSTED"
 CASES = ["case-red", "case-red-extended", "case-maint", "case-outsider", "case-reviewer", "case-noowner", "case-xfail", "case-xfail-cap", "case-green"]
 FILLER = ("filler-1", "filler-2", "filler-3", "filler-4")
-# The digest goes out Tue 2026-10-20 9:05 AM ET; last night started 00:00Z.
+# The digest goes out Tue 2026-10-20 9:05 AM ET (the hour these tests pin); last night started 00:00Z.
 NOW = datetime(2026, 10, 20, 13, 5, tzinfo=timezone.utc)
 # Fake Chat user ids.
 MENTIONS = {"alice": "1001", "dave": "1002"}
@@ -213,7 +213,7 @@ class FullSectionTest(Harness):
 
         environ = {post_health.SPACE_ENV: "spaces/AAAAtest", post_health.TOKEN_ENV: "fake-token", post_health.ghcli.TOKEN_ENV: "fake-gh",
                    nightly_digest.MENTIONS_ENV: json.dumps(MENTIONS)}
-        argv = ["--health", str(tmp / "health.json"), "--state", str(tmp / "state.json"), "--data", str(tmp / "data.json"), "--now", NOW.isoformat()]
+        argv = ["--health", str(tmp / "health.json"), "--state", str(tmp / "state.json"), "--data", str(tmp / "data.json"), "--now", NOW.isoformat(), "--digest-hour", "9"]
         with mock.patch.object(nightly_digest.nightly_bugs, "REPO_ROOT", self.root), contextlib.redirect_stderr(io.StringIO()):
             rc = post_health.main(argv, environ=environ, opener=Opener(), gh_runner=gh_runner)
         self.assertEqual(rc, 0)
@@ -468,7 +468,7 @@ class SkipTest(Harness):
         half.update(job="ci-kube-agents-eval-nightly-main-b", build_id="3000000000000019003")
         with self.assertRaisesRegex(nightly_digest.Skipped, "^last night's main-b part is missing"):
             self.build(data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),)))
-        # main-b still in flight at 9 AM: held back, not built on half the matrix.
+        # main-b still in flight at the digest hour: held back, not built on half the matrix.
         running = data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),))
         running["pending_builds"] = [{"build_id": "3000000000000020003", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-b",
                                       "log_url": f"{LOGS}/ci-kube-agents-eval-nightly-main-b/3000000000000020003", "first_seen": "2026-10-20T05:00:00+00:00"}]
