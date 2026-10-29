@@ -5237,6 +5237,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
 	}
 
+	// Before the callout, which is rendered with its public half. The seed
+	// is the dispatcher's, and nothing mounts it until a dispatcher does.
+	taskSigningKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure the A2A task-signing key: %w", err)
+	}
+
 	// Before the config and every client: the server mounts the serving pair
 	// and each client mounts the bundle, and a pod started against a Secret
 	// or ConfigMap that does not exist yet waits in ContainerCreating.
@@ -5314,7 +5321,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent)
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public)
 	if err != nil {
 		return state, err
 	}
@@ -6200,6 +6207,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// cleanup pass dies on the map delete, the keys Secret is still standing
 		// to prevent the next pass from early-exiting.
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The task-signing key, before the keys Secret for the same reason
+		// as the map: the keys Secret is the sentinel.
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},

@@ -122,6 +122,12 @@ const (
 	// start without it, so it and the image that reads it ship together.
 	a2aCalloutReservedAddresseesEnvVar = "A2A_RESERVED_ADDRESSEES"
 
+	// a2aCalloutTaskSigningKeysEnvVar names the callout's list of
+	// task-signing public keys (#3889), comma separated. Optional to the
+	// callout, which honours no task connection without it, and refused
+	// there if malformed (authcallout.ParseTaskSigningKeys).
+	a2aCalloutTaskSigningKeysEnvVar = "A2A_TASK_SIGNING_PUBLIC_KEYS"
+
 	// a2aReservedAddresseesSeparator joins the list. The callout's
 	// authcallout.ParseReservedAddressees splits on a bare comma.
 	a2aReservedAddresseesSeparator = ","
@@ -633,8 +639,11 @@ func a2aCalloutPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string
 	return map[string]string{"app": a2aCalloutName(agent)}
 }
 
-// buildA2ACalloutDeployment renders the service.
-func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+// buildA2ACalloutDeployment renders the service. taskSigningPublic is the
+// task-signing public key (ensureA2ATaskSigningKeySecret), rendered as a value:
+// the callout gets the public half and never a reference to the Secret holding
+// the seed.
+func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPublic string) *appsv1.Deployment {
 	name := a2aCalloutName(agent)
 	labels := a2aLabels(agent, "callout")
 	selector := a2aCalloutPodSelector(agent)
@@ -738,6 +747,12 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// on a fixed name: a narrowed pod named after
 							// one would be handed them. Plain names.
 							{Name: a2aCalloutReservedAddresseesEnvVar, Value: renderA2AReservedAddressees()},
+							// The task-signing public key, whose
+							// credentials narrow a worker's task
+							// connection to one task. Public, so a plain
+							// value: a reference to its Secret would be a
+							// reference to the dispatcher's seed.
+							{Name: a2aCalloutTaskSigningKeysEnvVar, Value: taskSigningPublic},
 							// The seeds. This Deployment is the only
 							// thing that reads them, and the issuer is the
 							// key that decides what every connection on
@@ -884,8 +899,8 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 // informer later in the same pass, and the apply's response is the one
 // number that says whether the copy it gets is the object this pass wrote
 // or the one before it (a2aGatewayWaitsForCallout).
-func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (int64, error) {
-	callout := buildA2ACalloutDeployment(agent)
+func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, taskSigningPublic string) (int64, error) {
+	callout := buildA2ACalloutDeployment(agent, taskSigningPublic)
 	// Namespaced objects get an owner reference so they are reclaimed with
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage

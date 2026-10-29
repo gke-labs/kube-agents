@@ -51,6 +51,8 @@ const (
 	a2aCalloutKeysSuffix = "-keys"
 	a2aNATSTLSSuffix     = "-tls"
 	a2aNATSCASuffix      = "-ca"
+
+	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +79,13 @@ func A2ACalloutName(agentName string) string { return agentName + a2aCalloutName
 // among them the issuer seed that signs every identity the bus accepts.
 func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
+}
+
+// A2ATaskSigningKeySecretName is the Secret holding the task-signing key the
+// dispatcher signs per-task credentials with (#3889). Generated beside the
+// callout's keys; only the dispatcher will mount it, and nothing mounts it yet.
+func A2ATaskSigningKeySecretName(agentName string) string {
+	return agentName + a2aTaskSigningKeySuffix
 }
 
 // A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
@@ -106,6 +115,9 @@ func A2ACredentialSecretNames(agentName string) []string {
 		// a certificate that does the same.
 		A2ANATSTLSSecretName(agentName),
 		A2ANATSCASecretName(agentName),
+		// The task-signing seed: with a worker pod's own token, it scopes
+		// that pod to any task of its profile.
+		A2ATaskSigningKeySecretName(agentName),
 	}
 }
 
@@ -307,13 +319,14 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are five of them:
+// the expensive route and advertise the cheap one. There are six of them:
 // the creds Secret holds the static passwords (`bridge-password` among them),
 // the nats-config Secret holds nats.conf with every one of those passwords
 // inline, the callout-keys Secret holds the issuer seed that signs every
 // identity the bus accepts, which is worth more than any password in the
 // others, and the two TLS Secrets hold the keys that let a pod pass as the
-// bus: the serving key, and the CA key that can mint another.
+// bus: the serving key, and the CA key that can mint another. The sixth holds
+// the dispatcher's task-signing seed.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -1015,7 +1028,7 @@ type DeploymentSpec struct {
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
 	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
-	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca, <agent>-a2a-task-signing-key),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -1033,7 +1046,8 @@ type DeploymentSpec struct {
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
 	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
-	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls, <agent>-a2a-nats-ca or
+	// <agent>-a2a-task-signing-key -- and
 	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map

@@ -1218,7 +1218,7 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if workerEnv != mirror+"/a2a-worker:0.3.0" {
 		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
-	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
+	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
 	}
@@ -1681,7 +1681,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
@@ -1766,7 +1766,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
@@ -2331,9 +2331,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 }
 
 // TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender pins Shape 2 of #2216:
-// A render that died on write 7 (after writing the calloutKeys Secret, the
-// TLS Secrets and bundle, and the authMap ConfigMap, before writing the config
-// Secret or StatefulSet), followed by a
+// A render that died on write 8 (after writing the calloutKeys Secret, the
+// task-signing key Secret, the TLS Secrets and bundle, and the authMap
+// ConfigMap, before writing the config Secret or StatefulSet), followed by a
 // cleanup pass that deletes calloutKeys Secret and dies on deleting authMap
 // ConfigMap.
 func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
@@ -2343,7 +2343,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	today.Spec.Mode = nil
 
 	writes := 0
-	stopAt := 7
+	stopAt := 8
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(next.DeepCopy()).
@@ -5925,7 +5925,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
 		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
-		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
+		"callout Deployment": buildA2ACalloutDeployment(agent, "").Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
@@ -7210,7 +7210,7 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	}
 	// The callout too: it is the provision Job's authentication path, and a
 	// quota that refused it would leave the Job's creation held for good.
-	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
 	// The verifier too, and it is the one with the sharpest consequence: an

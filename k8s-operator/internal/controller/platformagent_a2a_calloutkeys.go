@@ -271,3 +271,160 @@ func generateA2ACalloutKeys() (*a2aCalloutKeys, map[string][]byte, error) {
 		a2aCalloutXKeyPubKey:    []byte(xkeyPub),
 	}, nil
 }
+
+// The task-signing key (#3889).
+//
+// The dispatcher signs a per-task credential with it, and the callout verifies
+// that credential on a profile worker's task connection and grants that one
+// task's subjects (a2a/taskcred, a2a/authcallout). It is generated here, beside
+// the callout's keys and on the same create-once terms, but it is not the
+// callout's: the seed goes in a Secret of its own that only the dispatcher
+// Deployment will mount, and the callout gets the public half as a plain
+// environment value (buildA2ACalloutDeployment), never a reference to that
+// Secret. No dispatcher Deployment is rendered yet; until one is, nothing
+// mounts the seed at all.
+//
+// Much less than the issuer, but not nothing. The callout honours a credential
+// only for the pod the cluster attests on the same connection and only within
+// that pod's own profile and tier, so the seed alone authenticates nothing.
+// With a worker pod's ServiceAccount token as well, it scopes that pod to any
+// task of its own profile, for as long as the attacker holds that token: each
+// credential lasts up to the callout's maximum task lifetime
+// (A2A_TASK_CREDENTIAL_MAX_LIFETIME) and each connection up to GrantTTL, and a
+// seed holder can mint another. That is the per-profile reach #3889 removes,
+// and no more. Hence a Secret of its own rather than a
+// key in the callout's, which would put it in front of the callout's reader,
+// and a place in A2ACredentialSecretNames, so no user volume can mount it.
+//
+// Rotation is as for the callout keys: none yet. The callout accepts two
+// public keys at once (taskcred.MaxTrustedKeys) so a rotation can overlap the
+// old key for one task deadline; the operator renders one. A repaired Secret
+// is a new key, which re-renders the callout's environment and so rolls it.
+
+const (
+	// a2aTaskSigningSeedKey is the task-signing seed (SC...) the dispatcher
+	// signs task credentials with.
+	a2aTaskSigningSeedKey = "task-signing-seed"
+
+	// a2aTaskSigningPubKey is its public half (C...), kept for a human
+	// reading the Secret. Nothing renders from it; see readA2ATaskSigningKey.
+	a2aTaskSigningPubKey = "task-signing-public"
+
+	// a2aTaskSigningKeyPrefix is the nkey type of a task-signing key: the
+	// cluster prefix, which nothing in NATS trusts for anything, so the key
+	// can't be mistaken for, or configured as, a key with more reach.
+	// a2a/taskcred makes the choice and argues it; the operator cannot
+	// import that module, so the prefix is repeated here and the callout's
+	// startup check (authcallout.ParseTaskSigningKeys) is what refuses a
+	// mismatch.
+	a2aTaskSigningKeyPrefix = nkeys.PrefixByteCluster
+)
+
+// a2aTaskSigningKeyName is the Secret holding the task-signing key.
+func a2aTaskSigningKeyName(agent *agentv1alpha1.PlatformAgent) string {
+	return agentv1alpha1.A2ATaskSigningKeySecretName(agent.Name)
+}
+
+// a2aTaskSigningKey is the rendered view: the seed, which only the dispatcher
+// will read, and the public half for the callout.
+type a2aTaskSigningKey struct {
+	Seed   string
+	Public string
+}
+
+// ensureA2ATaskSigningKeySecret creates the task-signing key once and then
+// leaves it alone, repairing an incomplete or corrupt Secret as a whole, the
+// way ensureA2ACalloutKeysSecret does and for the same reasons: a key that
+// changed on every reconcile would roll the callout every few seconds and
+// refuse every credential the dispatcher had already handed out.
+func (r *PlatformAgentReconciler) ensureA2ATaskSigningKeySecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aTaskSigningKey, error) {
+	name := types.NamespacedName{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}
+
+	existing := &corev1.Secret{}
+	err := r.a2aReader().Get(ctx, name, existing)
+	if err == nil {
+		// Not ours: refused before it is read, as ensureA2ADoorTokenSecret
+		// does. Adopting it would let whoever created a Secret at this name
+		// choose the task-signing seed (and so mint task credentials the
+		// callout honours), and repairing it would overwrite somebody
+		// else's object. Only a Secret this PlatformAgent controls is read
+		// or repaired.
+		if !metav1.IsControlledBy(existing, agent) {
+			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A task-signing key; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
+		}
+		if key, ok := readA2ATaskSigningKey(existing); ok {
+			return key, nil
+		}
+		generated, data, gerr := generateA2ATaskSigningKey()
+		if gerr != nil {
+			return nil, gerr
+		}
+		existing.Data = data
+		if err := r.Update(ctx, existing); err != nil {
+			return nil, err
+		}
+		return generated, nil
+	}
+	if !errors.IsNotFound(err) {
+		return nil, err
+	}
+
+	generated, data, err := generateA2ATaskSigningKey()
+	if err != nil {
+		return nil, err
+	}
+	secret := &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Name: name.Name, Namespace: name.Namespace, Labels: a2aLabels(agent, "task-signing-key")},
+		Data:       data,
+	}
+	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
+		return nil, err
+	}
+	if err := r.Create(ctx, secret); err != nil {
+		return nil, err
+	}
+	return generated, nil
+}
+
+// readA2ATaskSigningKey loads the seed and derives the public half from it,
+// for readA2ACalloutKeys' reason: the public half is rendered into the
+// callout's environment, and one derived from a validated seed can't be
+// anything but a public key, nor the public half of some other seed.
+func readA2ATaskSigningKey(secret *corev1.Secret) (*a2aTaskSigningKey, bool) {
+	seed := string(secret.Data[a2aTaskSigningSeedKey])
+	if seed == "" {
+		return nil, false
+	}
+	if prefix, _, err := nkeys.DecodeSeed([]byte(seed)); err != nil || prefix != a2aTaskSigningKeyPrefix {
+		return nil, false
+	}
+	kp, err := nkeys.FromSeed([]byte(seed))
+	if err != nil {
+		return nil, false
+	}
+	public, err := kp.PublicKey()
+	if err != nil {
+		return nil, false
+	}
+	return &a2aTaskSigningKey{Seed: seed, Public: public}, true
+}
+
+func generateA2ATaskSigningKey() (*a2aTaskSigningKey, map[string][]byte, error) {
+	kp, err := nkeys.CreateCluster()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generating the task-signing key: %w", err)
+	}
+	seed, err := kp.Seed()
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading the task-signing seed: %w", err)
+	}
+	public, err := kp.PublicKey()
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading the task-signing public key: %w", err)
+	}
+	return &a2aTaskSigningKey{Seed: string(seed), Public: public}, map[string][]byte{
+		a2aTaskSigningSeedKey: seed,
+		a2aTaskSigningPubKey:  []byte(public),
+	}, nil
+}

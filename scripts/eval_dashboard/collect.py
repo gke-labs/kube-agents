@@ -476,6 +476,17 @@ _REP_REPORT_LINE = re.compile(r"^\s+rep (?P<n>\d+) report: (?P<text>.*)$")
 #   rep 2 timing: agent_s=143.2 turn1_s=6.4
 _REP_TIMING_LINE = re.compile(r"^\s+rep (?P<n>\d+) timing: (?P<fields>.*)$")
 _REP_TIMING_KEYS = ("agent_s", "turn1_s")
+# What a repetition billed: one optional line right under its timing line,
+# printed by `bench-gate case` with each count the record carried
+# (results.json's top-level `tokens.input`, `tokens.output`, `tokens.total`),
+# plus `partial=1` when the record says the counts are short (the inject
+# transport's `tokens.usage_partial`, a worker in `tokens.workers.unbilled`,
+# or `tokens.workers` null: the run delegated and no worker was billed).
+# Its own shape, `rep N tokens:`, so `_REP_LINE` never matches it.
+#   rep 2 tokens: input=60468 output=79 total=60547 partial=1
+_REP_TOKENS_LINE = re.compile(r"^\s+rep (?P<n>\d+) tokens: (?P<fields>.*)$")
+_REP_TOKENS_KEYS = ("input", "output", "total")
+_REP_TOKENS_PARTIAL = "partial=1"
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -617,6 +628,35 @@ def _attach_timing(task: dict, n: int, fields: str) -> None:
             return
 
 
+def _attach_tokens(task: dict, n: int, fields: str) -> None:
+    """Record a `rep N tokens:` line as ``tokens`` on the rep it follows.
+
+    ``{"input", "output", "total"}`` each an int, or None when the line did
+    not carry it or its value is not a whole number at or above zero, and
+    ``partial`` true when the line says the counts are short. A line with no
+    count that parses adds no key -- absence means unknown -- and a line for
+    a repetition the log never graded is dropped.
+    """
+    words = fields.split()
+    counts: dict = {key: None for key in _REP_TOKENS_KEYS}
+    for pair in words:
+        key, _, raw = pair.partition("=")
+        if key in counts and raw.isascii() and raw.isdigit():
+            # int() refuses a digit run past the interpreter's limit; a
+            # count that size is not one, and must not drop the build.
+            try:
+                counts[key] = int(raw)
+            except ValueError:
+                pass
+    if all(value is None for value in counts.values()):
+        return
+    counts["partial"] = _REP_TOKENS_PARTIAL in words
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep["tokens"] = counts
+            return
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
@@ -625,8 +665,9 @@ def parse_build_log(text: str) -> dict:
     <name> Result:` line they follow; a task whose log has none (single-rep
     era, or a log truncated before grading) simply gets no `reps` key --
     absence means unknown, never fabricated. A `rep N report:` line under a
-    grading line becomes that rep's `excerpt`, the agent's own words, and a
-    `rep N timing:` line its `agent_s` and `turn1_s`.
+    grading line becomes that rep's `excerpt`, the agent's own words, a
+    `rep N timing:` line its `agent_s` and `turn1_s`, and a `rep N tokens:`
+    line its `tokens`.
     """
     project = None
     tasks = []
@@ -640,7 +681,7 @@ def parse_build_log(text: str) -> dict:
         # pattern below that is an unanchored `search` (the lease, the final
         # verdict) would otherwise read the report as if the log had said
         # it. A report line that follows no grading block is dropped, and so
-        # is a timing line.
+        # is a timing or tokens line.
         m = _REP_REPORT_LINE.match(line)
         if m:
             if current is not None:
@@ -650,6 +691,11 @@ def parse_build_log(text: str) -> dict:
         if m:
             if current is not None:
                 _attach_timing(current, int(m.group("n")), m.group("fields"))
+            continue
+        m = _REP_TOKENS_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_tokens(current, int(m.group("n")), m.group("fields"))
             continue
         m = _LEASE.search(line)
         if m:

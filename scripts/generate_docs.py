@@ -277,9 +277,10 @@ SKILL_GROUPS: dict[str, list[str]] = {
     ],
     "Reliability": [
         "fleet-upgrade-verification",
-        "upgrade-readiness-brief",
         "gke-reliability",
         "gke-upgrades",
+        "topology-drift",
+        "upgrade-readiness-brief",
     ],
     "Manifests and remediation": [
         "gcp-config-connector",

@@ -330,7 +330,7 @@ func TestTheVerifierBudgetSelectsTheDeploymentItBudgets(t *testing.T) {
 	// would count a verifier toward some other workload's allowance.
 	verifierPods := labels.Set(dep.Spec.Template.Labels)
 	for name, other := range map[string]*appsv1.Deployment{
-		"callout": buildA2ACalloutDeployment(agent),
+		"callout": buildA2ACalloutDeployment(agent, ""),
 		"gateway": buildA2AGatewayDeployment(agent),
 	} {
 		if selector.Matches(labels.Set(other.Spec.Template.Labels)) {
