@@ -812,8 +812,7 @@ def seed_file_main(argv: list[str] | None = None) -> int:
     remediation cases read). The path is derived, never typed, and
     `expected_project` holds it to the pool's layout as every other write
     here is held. The token arrives in GITLAB_SEED_TOKEN, never on argv, and
-    has to push to the default branch: the group Owner's, not the bot's (on a
-    per-run GitLab the bot owns the group, so its own token serves).
+    has to push to the default branch: the group Owner's, not the bot's.
     `--content-file -` reads stdin."""
     import argparse
 
