@@ -58,6 +58,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -497,10 +498,11 @@ const (
 	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
-	// a2aRoutePasswordKey authenticates the cluster routes between the bus's
+	// a2aNATSRouteCredsKey names the route user's password in the creds
+	// Secret: it authenticates the cluster routes between the bus's
 	// own servers. Not a client credential: the auth callout does not govern
 	// routes, so they carry their own user, and only a NATS pod reads it.
-	a2aRoutePasswordKey = "route-password" // #nosec G101 -- Secret key name, not a credential
+	a2aNATSRouteCredsKey = "route-password" // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
 	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
@@ -1603,7 +1605,7 @@ func randomA2APassword() (string, error) {
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
 	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
-	a2aBridgeActivityKey, a2aRoutePasswordKey,
+	a2aBridgeActivityKey, a2aNATSRouteCredsKey,
 }
 
 // a2aActivityHookEvents are the hook events the door reads: the tool calls
@@ -2361,10 +2363,10 @@ cluster {
   pool_size: -1
   authorization {
     user: ` + a2aNATSRouteUser + `
-    password: "` + pw(a2aRoutePasswordKey) + `"
+    password: "` + pw(a2aNATSRouteCredsKey) + `"
   }
   routes: [
-    "nats-route://` + a2aNATSRouteUser + `:` + pw(a2aRoutePasswordKey) + `@` + routeHost + `:` + strconv.Itoa(a2aNATSRoutePort) + `"
+    "nats-route://` + a2aNATSRouteUser + `:` + pw(a2aNATSRouteCredsKey) + `@` + routeHost + `:` + strconv.Itoa(a2aNATSRoutePort) + `"
   ]
   tls {
     cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
@@ -2523,7 +2525,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			// mean deleting and recreating every existing install's
 			// StatefulSet; routing through a second Service avoids that.
 			ServiceName: name,
-			Replicas:    ptr.To(int32(replicas)),
+			Replicas:    ptr.To(int32(replicas)), // #nosec G115 -- a2aNATSReplicas returns 1 or 3
 			// A rolled server is Ready once JetStream is enabled on it (the
 			// readiness probe below), before its stream replicas have caught
 			// up. Holding the next roll for this long is an allowance for
@@ -3993,7 +3995,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
 			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
 	}
-	agent.Status.BusReplicas = int32(want)
+	agent.Status.BusReplicas = int32(want) // #nosec G115 -- want is 1 or 3
 	return converting, nil
 }
 
@@ -4087,7 +4089,7 @@ func a2aNATSTopologySpread(selector map[string]string, replicas int) []corev1.To
 	}
 	return []corev1.TopologySpreadConstraint{{
 		MaxSkew:           1,
-		MinDomains:        ptr.To(int32(replicas)),
+		MinDomains:        ptr.To(int32(replicas)), // #nosec G115 -- a2aNATSReplicas returns 1 or 3
 		TopologyKey:       corev1.LabelHostname,
 		WhenUnsatisfiable: corev1.DoNotSchedule,
 		LabelSelector:     &metav1.LabelSelector{MatchLabels: selector},
@@ -5613,8 +5615,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// First: everything below renders from the server count, and a count
 	// read before this would be last pass's, or the default.
 	state.busReplicasPersisted = agent.Status.BusReplicas
-	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+	converting, err := r.resolveA2ABusReplicas(ctx, agent)
+	if err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
+	}
+	// A conversion empties the bus once the last server restarts into the new
+	// shape, so the provisioned-once record no longer describes it. Dropping
+	// it makes the provision Job count toward Ready again until the new one,
+	// held until the bus has rolled out, completes.
+	if converting {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
 	}
 
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
@@ -5715,10 +5725,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 				return state, err
 			}
 			if err := r.applyManaged(ctx, agent, obj); err != nil {
-				return state, fmt.Errorf("failed to apply A2A NATS %s: %w", obj.GetObjectKind().GroupVersionKind().Kind, err)
+				return state, fmt.Errorf("failed to apply A2A NATS %T: %w", obj, err)
 			}
-		} else if err := r.deleteIfManaged(ctx, obj); err != nil {
-			return state, fmt.Errorf("failed to delete A2A NATS %s for a single-server bus: %w", obj.GetObjectKind().GroupVersionKind().Kind, err)
+			// Owned objects only (#3871), as the teardown list removes these
+			// same two: a budget or Service an admin made under one of these
+			// names is skipped and logged, not deleted, and does not fail the
+			// pass.
+		} else if err := r.deleteA2AObjectIfOwned(ctx, agent, obj, r.Client, nil); err != nil {
+			return state, fmt.Errorf("failed to delete A2A NATS %T for a single-server bus: %w", obj, err)
 		}
 	}
 
@@ -6449,6 +6463,23 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForBus(ctx context.Context
 		return false, err
 	}
 	return !a2aNATSRolledOut(sts, natsGeneration), nil
+}
+
+// a2aNATSServingReplicas is the NATS StatefulSet's ready count as the status
+// writer counts it toward Ready: its Ready replicas once a quorum of them is
+// Ready, and 0 below that. A JetStream cluster serves with a majority of its
+// servers and not with fewer, so one of three Ready (the others Pending or
+// crash-looping) is a bus that cannot elect a leader, and must not read as
+// ready because one pod is. Two of three, as during a rolling update, serves.
+func a2aNATSServingReplicas(sts *appsv1.StatefulSet) int32 {
+	want := int32(1)
+	if sts.Spec.Replicas != nil {
+		want = *sts.Spec.Replicas
+	}
+	if sts.Status.ReadyReplicas < want/2+1 {
+		return 0
+	}
+	return sts.Status.ReadyReplicas
 }
 
 // a2aNATSRolledOut reads a StatefulSet's status as rolled out at generation.

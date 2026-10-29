@@ -1415,8 +1415,10 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
     def test_the_claim_the_pvc_name_is_built_from_is_the_statefulsets(self) -> None:
         c = self.constants()
         self.assertEqual(c["NATS_DATA_CLAIM"], self.go(_A2A_MANIFESTS, r'^const a2aNATSDataClaim = "([^"]+)"'))
-        # The operator's own spelling of the claim's name, which the script copies.
-        self.assertIn('a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0"', _CONTROLLER.read_text())
+        # The operator's own spelling of the claim's name, which the script
+        # copies for ordinal 0 (the claim every bus has).
+        self.assertIn('a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-" + strconv.Itoa(ordinal)', _A2A_MANIFESTS.read_text())
+        self.assertIn("a2aNATSDataClaimName(agent, ordinal)", _CONTROLLER.read_text())
         self.assertEqual(c["NATS_ORDINAL_SUFFIX"], "-0")
 
     def test_the_other_names_and_ports(self) -> None:
@@ -1447,11 +1449,12 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         cleanup = cleanup[: cleanup.index("\nfunc ")]
         self.assertNotIn("a2aCredsSecretName", cleanup)
         self.assertNotIn("PersistentVolumeClaim", cleanup)
-        # And the StatefulSet sets no PVC retention policy, so its default
-        # (Retain) keeps the claim when the StatefulSet is deleted.
+        # And the StatefulSet's PVC retention policy keeps the claim when the
+        # StatefulSet is deleted (a scale-down deletes the claims it removes,
+        # which a flip does not do).
         sts = text[text.index("func buildA2ANATSStatefulSet(") :]
         sts = sts[: sts.index("\nfunc ")]
-        self.assertNotIn("PersistentVolumeClaimRetentionPolicy", sts)
+        self.assertIn("WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType", sts)
 
     def test_the_capacity_wait_is_the_deploy_gates(self) -> None:
         # #2427's gate after the sidecar patch and the not-degraded checks

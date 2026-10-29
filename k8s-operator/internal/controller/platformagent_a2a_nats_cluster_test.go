@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -218,14 +219,14 @@ func TestTheBusFenceAdmitsRoutesFromItsOwnServersOnly(t *testing.T) {
 func TestTheRouteUserLivesOnlyInTheClusterBlock(t *testing.T) {
 	conf := renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
 	block := a2aClusterBlockRe.FindString(conf)
-	if !strings.Contains(block, "user: "+a2aNATSRouteUser) || !strings.Contains(block, `password: "pw-`+a2aRoutePasswordKey+`"`) {
+	if !strings.Contains(block, "user: "+a2aNATSRouteUser) || !strings.Contains(block, `password: "pw-`+a2aNATSRouteCredsKey+`"`) {
 		t.Errorf("the cluster block has no route user and password:\n%s", block)
 	}
 	rest := a2aClusterBlockRe.ReplaceAllString(conf, "")
 	if regexp.MustCompile(`user: ` + a2aNATSRouteUser + `\b`).MatchString(rest) {
 		t.Error("the route user appears outside the cluster block")
 	}
-	if strings.Contains(rest, "pw-"+a2aRoutePasswordKey) {
+	if strings.Contains(rest, "pw-"+a2aNATSRouteCredsKey) {
 		t.Error("the route password appears outside the cluster block")
 	}
 }
@@ -386,7 +387,7 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		if routePassword != "" {
 			// Only the cluster block's own password: the one this server
 			// would accept from a peer, and the one it dials with.
-			c = strings.ReplaceAll(c, string(creds.Data[a2aRoutePasswordKey]), routePassword)
+			c = strings.ReplaceAll(c, string(creds.Data[a2aNATSRouteCredsKey]), routePassword)
 		}
 		path := filepath.Join(t.TempDir(), "nats.conf")
 		if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, c)), 0o600); err != nil {
@@ -863,5 +864,129 @@ func TestAConversionProvisionsTheBusAgain(t *testing.T) {
 		if c.Type == batchv1.JobComplete {
 			t.Error("the provision Job after converting back is the old completed one, not a fresh run")
 		}
+	}
+}
+
+// A single-server bus leaves a routes Service or budget it does not own alone:
+// skipped and logged, not deleted, and the pass goes on (#3871).
+func TestASingleServerBusSkipsAForeignBudgetUnderItsName(t *testing.T) {
+	agent := a2aTestAgentWithBusReplicas(1)
+	foreign := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, foreign).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	if _, err := r.reconcileA2A(context.Background(), agent); err != nil {
+		t.Fatalf("a foreign budget under the bus's name failed the pass: %v", err)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(foreign), &policyv1.PodDisruptionBudget{}); err != nil {
+		t.Errorf("a budget this PlatformAgent does not own was deleted: %v", err)
+	}
+}
+
+// The status writer counts the NATS StatefulSet ready once a quorum of its
+// servers is: one of three is a bus that cannot elect a leader.
+func TestTheBusCountsTowardReadyOnlyWithAQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		replicas, ready, want int32
+	}{
+		{3, 0, 0}, {3, 1, 0}, {3, 2, 2}, {3, 3, 3}, {1, 0, 0}, {1, 1, 1},
+	} {
+		sts := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{Replicas: ptr.To(tc.replicas)}, Status: appsv1.StatefulSetStatus{ReadyReplicas: tc.ready}}
+		if got := a2aNATSServingReplicas(sts); got != tc.want {
+			t.Errorf("%d of %d servers Ready counts as %d, want %d", tc.ready, tc.replicas, got, tc.want)
+		}
+	}
+}
+
+// A write whose echo comes back without status.busReplicas (the served CRD
+// prunes it) stops the writers keying on the field, so the pruned write does
+// not repeat on every pass; an echo that carries it clears the record.
+func TestAPrunedBusReplicasStatusDoesNotLoopTheWriters(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := a2aTestAgent()
+	agent.Status.BusReplicas = 1
+	if r.busReplicasStatusCurrent(agent, 0) {
+		t.Fatal("a resolved count the CR does not carry reads as current before any write")
+	}
+	agent.Status.BusReplicas = 0 // the echo of a write of 1, pruned
+	r.noteBusReplicasEcho(agent, 1)
+	agent.Status.BusReplicas = 1 // the next pass resolves 1 again
+	if !r.busReplicasStatusCurrent(agent, 0) {
+		t.Error("after a pruned echo the writers still key on status.busReplicas and would write every pass")
+	}
+	r.noteBusReplicasEcho(agent, 1) // an echo that carries the field
+	if r.busReplicasStatusCurrent(agent, 0) {
+		t.Error("an echo that carried the field did not clear the pruned record")
+	}
+}
+
+// A conversion drops the provisioned-once record, so the CR reads Provisioning
+// until the new shape's provision Job completes, not Ready over an empty bus.
+func TestAConversionDropsBusProvisioned(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if !busProvisioned(agent) {
+		t.Fatal("precondition: BusProvisioned not set")
+	}
+	// The same shape: the record stands.
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(agent) {
+		t.Fatal("BusProvisioned dropped on a pass with no conversion")
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if busProvisioned(agent) {
+		t.Error("BusProvisioned survived converting the bus, which empties it")
+	}
+}
+
+// A flip to today clears status.busReplicas: a today CR has no bus.
+func TestAFlipToTodayClearsTheBusServerCount(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	keys := sandboxKeysSecret(agent)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, keys).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+		}
+	}
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status.BusReplicas == 0 {
+		t.Fatal("precondition: status.busReplicas not written under next")
+	}
+	fresh.Spec.Mode = ptr.To("today")
+	if err := cl.Update(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after flip: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status.BusReplicas != 0 {
+		t.Errorf("status.busReplicas = %d after the flip to today, want 0", fresh.Status.BusReplicas)
 	}
 }
