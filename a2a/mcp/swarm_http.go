@@ -11,6 +11,7 @@ package mcp
 // credential it was started with, and takes neither from a client.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -55,7 +56,7 @@ const (
 	noteTasksPartial     = "the TASKS read was partial, so tasks may be missing: %v"
 	noteTasksBusy        = "the TASKS read was skipped because this server's bus readers were busy; no tasks were read, try again in a few seconds"
 	noteTasksOldest      = "TASKS holds more than %d messages since the window began; the oldest were not read, so older tasks may be missing"
-	noteTasksBytes       = "the TASKS read kept only its newest %d KiB of task events; older events were let go, so older tasks may show an earlier state"
+	noteTasksNarrowed    = "TASKS since the window began holds more than one read's %d MiB; only its newest messages were read, so older tasks may be missing"
 	noteDroppedEntries   = "%d conversation entries in the request were dropped: an alias or token that is not valid"
 	noteNotConnected     = "not connected to the bus; no tasks were read"
 	noteCardsUnavailable = "the agent cards could not be read"
@@ -69,13 +70,19 @@ var swarmTaskWindow = swarmRecent
 // many on the stream. A variable for tests.
 var swarmTaskLimit = maxTaskEvents
 
-// maxSwarmReadBytes bounds the message bytes one TASKS read keeps. A variable
-// for tests.
-var maxSwarmReadBytes = 32 << 20
+// swarmReadNarrowings bounds how often a TASKS read that passed the bus
+// reader's byte budget (readMaxBytes) starts again from the newer half of
+// what it read, so the newest messages are the ones it keeps: the reader
+// delivers oldest first and stops at its budget.
+const swarmReadNarrowings = 6
 
 // maxSwarmPromptRunes caps the prompt kept of a submission; the projection
 // shortens it further for display.
 const maxSwarmPromptRunes = 4096
+
+// maxSwarmQuestionRunes caps the text kept of a task's input-required
+// question; the projection shortens it further for display.
+const maxSwarmQuestionRunes = 4096
 
 // maxSwarmRefBytes caps a conversation reference kept from a submission.
 const maxSwarmRefBytes = 256
@@ -185,6 +192,12 @@ func (h *swarmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req swarmRequest
+	// A JSON null decodes into the zero request without an error; it is no
+	// request at all.
+	if bytes.Equal(bytes.TrimSpace(body), []byte("null")) {
+		http.Error(w, msgSwarmBadRequest, http.StatusBadRequest)
+		return
+	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, msgSwarmBadRequest, http.StatusBadRequest)
 		return
@@ -234,8 +247,10 @@ func (h *swarmHandler) answer(ctx context.Context, req swarmRequest, now time.Ti
 
 	resp.Snapshot, resp.Ledger = BuildSwarmState(in, req.Ledger)
 	// The coordinator and the platform answer for the bridge's root
-	// conversation; 3a leaves their ids for the caller, who knows it.
-	if root := strings.TrimSpace(req.RootConversationID); validSwarmConversationID(root) {
+	// conversation; 3a leaves their ids for the caller, who knows it. The id
+	// passes the same path-safety check as every id 3a sets, since the
+	// client joins it into paths.
+	if root := safeConversationID(req.RootConversationID); root != "" {
 		for _, name := range []string{swarmMemberCoordinator, swarmMemberPlatform} {
 			if m, ok := resp.Snapshot.Members[name]; ok {
 				m.ConversationID = root
@@ -273,8 +288,8 @@ func (h *swarmHandler) taskSet(ctx context.Context) swarmTaskSet {
 	if read.oldestDropped {
 		set.notes = append(set.notes, fmt.Sprintf(noteTasksOldest, swarmTaskLimit))
 	}
-	if read.bytesCapped {
-		set.notes = append(set.notes, fmt.Sprintf(noteTasksBytes, maxSwarmReadBytes>>10))
+	if read.narrowed {
+		set.notes = append(set.notes, fmt.Sprintf(noteTasksNarrowed, readMaxBytes>>20))
 	}
 	if ctx.Err() != nil {
 		return set
@@ -451,9 +466,9 @@ type swarmRead struct {
 	// found none older than the window, so the window held more than the
 	// read takes, and its oldest messages were not read.
 	oldestDropped bool
-	// bytesCapped: the read passed maxSwarmReadBytes and let its oldest
-	// events go to stay under it.
-	bytesCapped bool
+	// narrowed: the window held more than the bus reader's byte budget, so
+	// the read started again further on and holds only its newest part.
+	narrowed bool
 }
 
 // swarmTasks reads the newest swarmTaskLimit messages on TASKS in one drain
@@ -479,34 +494,59 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		start = state.LastSeq - limit + 1
 	}
 	var (
-		reads       = map[TaskRef]*swarmTaskRead{}
+		reads       map[TaskRef]*swarmTaskRead
 		order       []*swarmTaskRead
-		submittedAt = map[TaskRef]time.Time{} // the first .in older than the window
+		submittedAt map[TaskRef]time.Time // the first .in older than the window
 		sawOlder    bool
-		kept        int
 		read        swarmRead
+		derr        error
 	)
-	// keepEvent holds env for rd, counting n bytes against
-	// maxSwarmReadBytes. Past it, the oldest events held are let go, so the
-	// newest are what the read keeps, as the read itself takes the newest.
-	type heldEvent struct {
-		rd *swarmTaskRead
-		i  int
-		n  int
+	// The bus reader delivers oldest first and stops at its byte budget, so
+	// a window past the budget would be read without its newest part. Such a
+	// read starts again from the newer half of where it began, until it fits.
+	for narrowings := 0; ; narrowings++ {
+		reads, order, submittedAt, sawOlder = map[TaskRef]*swarmTaskRead{}, nil, map[TaskRef]time.Time{}, false
+		derr = b.readSwarmWindow(ctx, s, start, since, reads, &order, submittedAt, &sawOlder)
+		if !errors.Is(derr, ErrReadByteBudget) || narrowings == swarmReadNarrowings || start >= state.LastSeq || ctx.Err() != nil {
+			break
+		}
+		start += (state.LastSeq - start + 1) / 2
+		read.narrowed = true
 	}
-	var held []heldEvent
-	keepEvent := func(rd *swarmTaskRead, env *lib.Envelope, n int) {
-		rd.events = append(rd.events, env)
-		held = append(held, heldEvent{rd, len(rd.events) - 1, n})
-		kept += n
-		for kept > maxSwarmReadBytes && len(held) > 0 {
-			oldest := held[0]
-			held = held[1:]
-			oldest.rd.events[oldest.i] = nil
-			kept -= oldest.n
-			read.bytesCapped = true
+	read.oldestDropped = start > state.FirstSeq && !sawOlder && !read.narrowed
+	addresseeOf := make(map[string]string, len(order))
+	for _, rd := range order {
+		if _, dup := addresseeOf[rd.ref.TaskID]; dup {
+			addresseeOf[rd.ref.TaskID] = ""
+		} else {
+			addresseeOf[rd.ref.TaskID] = rd.ref.Addressee
 		}
 	}
+	read.tasks = make([]SwarmTask, 0, len(order))
+	for _, rd := range order {
+		if !rd.submitted {
+			continue
+		}
+		t := rd.task
+		if len(rd.events) > 0 {
+			if folded, err := lib.FoldTask(rd.ref.TaskID, rd.events); err == nil {
+				t.Task = folded
+			}
+		}
+		if t.ViaTaskID != "" {
+			t.ViaAddressee = addresseeOf[t.ViaTaskID]
+		}
+		read.tasks = append(read.tasks, t)
+	}
+	return read, derr
+}
+
+// readSwarmWindow is one drain of TASKS from start, filling reads, order,
+// submittedAt and sawOlder as swarmTasks describes. What it keeps is bounded
+// by the drain's byte budget; a submission's conversation reference and
+// prompt are capped as well.
+func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start uint64, since time.Time,
+	reads map[TaskRef]*swarmTaskRead, order *[]*swarmTaskRead, submittedAt map[TaskRef]time.Time, sawOlder *bool) error {
 	_, derr := b.drainConsumer(ctx, s, jetstream.ConsumerConfig{
 		FilterSubject: taskSubjects,
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
@@ -523,7 +563,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		}
 		ref := TaskRef{Addressee: addressee, TaskID: taskID}
 		if !at.IsZero() && at.Before(since) {
-			sawOlder = true
+			*sawOlder = true
 			if _, have := submittedAt[ref]; !have && class == lib.TaskClassIn && agreedEnvelope(msg.Subject(), msg.Data()) != nil {
 				submittedAt[ref] = at
 			}
@@ -540,11 +580,11 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		if rd == nil {
 			rd = &swarmTaskRead{ref: ref, task: SwarmTask{Addressee: addressee, TaskID: taskID}}
 			reads[ref] = rd
-			order = append(order, rd)
+			*order = append(*order, rd)
 		}
 		if class != lib.TaskClassIn {
 			noteQuestion(rd, env, seq)
-			keepEvent(rd, env, len(msg.Data()))
+			rd.events = append(rd.events, env)
 			return
 		}
 		// The first message on .in in the read is the conversation's; later
@@ -559,10 +599,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		// What a task's record keeps is bounded too: the conversation only
 		// up to maxSwarmRefBytes (a delegated task's need not be a console
 		// one; it is kept through its parent), the delegation parent only
-		// as a valid task id, and the prompt capped and charged against the
-		// same budget as the events, dropped once that is spent. Prompts are
-		// never let go for events, so the budget can end above the cap by at
-		// most one prompt.
+		// as a valid task id, and the prompt capped at maxSwarmPromptRunes.
 		conv := a.Audience.Conversation
 		if len(conv) > maxSwarmRefBytes {
 			conv = ""
@@ -572,11 +609,6 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			via = a.Via.TaskID
 		}
 		text = swarmCapRunes(text, maxSwarmPromptRunes)
-		if kept+len(text) > maxSwarmReadBytes {
-			text = ""
-			read.bytesCapped = true
-		}
-		kept += len(text)
 		rd.submitted = true
 		rd.task.Conversation = conv
 		rd.task.ViaTaskID = via
@@ -589,38 +621,8 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			rd.task.Prompt = text
 		}
 	})
-	read.oldestDropped = start > state.FirstSeq && !sawOlder
-	addresseeOf := make(map[string]string, len(order))
-	for _, rd := range order {
-		if _, dup := addresseeOf[rd.ref.TaskID]; dup {
-			addresseeOf[rd.ref.TaskID] = ""
-		} else {
-			addresseeOf[rd.ref.TaskID] = rd.ref.Addressee
-		}
-	}
-	read.tasks = make([]SwarmTask, 0, len(order))
-	for _, rd := range order {
-		if !rd.submitted {
-			continue
-		}
-		t := rd.task
-		events := slices.DeleteFunc(rd.events, func(e *lib.Envelope) bool { return e == nil })
-		if len(events) > 0 {
-			if folded, err := lib.FoldTask(rd.ref.TaskID, events); err == nil {
-				t.Task = folded
-			}
-		}
-		if t.ViaTaskID != "" {
-			t.ViaAddressee = addresseeOf[t.ViaTaskID]
-		}
-		read.tasks = append(read.tasks, t)
-	}
-	return read, derr
+	return derr
 }
-
-// maxSwarmQuestionRunes caps the text kept of a task's input-required
-// question; the projection shortens it further for display.
-const maxSwarmQuestionRunes = 4096
 
 // noteQuestion records the task's latest input-required status message and
 // its stream sequence, which the fold does not keep but the projection posts

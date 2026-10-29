@@ -52,7 +52,7 @@ It projects only the conversations the request names. This server's own conversa
 
 It reads, bounded:
 
-- the newest 4096 messages on `TASKS`, keeping those from the last hour and at most 32 MiB of them. When the hour holds more, the oldest are the ones not read, and `notes` says so; a read cut short, or skipped because the server's bus readers are busy, is still answered, with a line in `notes`;
+- the newest 4096 messages on `TASKS`, keeping those from the last hour, within one bus read's 4 MiB budget. When the hour holds more messages or more bytes than that, the read starts further on, so the oldest are the ones not read, and `notes` says so; a read cut short, or skipped because the server's bus readers are busy, is still answered, with a line in `notes`;
 - the agent cards, from the same cached read `connection_status` uses.
 
 A call holds at most one bus reader, and concurrent calls share it: one `TASKS` read answers every call for three seconds, so the swarm view never takes the readers the turn tools need.
