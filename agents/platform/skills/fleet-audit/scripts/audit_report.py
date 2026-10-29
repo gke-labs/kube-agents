@@ -2152,6 +2152,15 @@ KCC_TRANSIENT_REASONS = frozenset({"Updating", "Deleting"})
 KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
 # How many segments a `project/location/name` cluster target has.
 CLUSTER_TARGET_SEGMENTS = 3
+# What a cluster entry of a collector that reads Config Connector needs to
+# be a possible host it never read: an outcome other than these (an
+# `unreachable` or `gate-failed` cluster), a cluster target, and a GKE
+# status in which the cluster can run the controllers, when the entry
+# records one. `kcc_health.py` holds the same status field and statuses.
+KCC_READ_OR_EXCLUDED_OUTCOMES = frozenset({"collected", "out-of-scope"})
+KCC_PROJECT_TARGET_PREFIX = "project/"
+KCC_CLUSTER_STATUS_FIELD = "cluster_status"
+KCC_READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
@@ -18659,7 +18668,8 @@ class KccHealth(NamedTuple):
     the targets whose read gave no answer. An object on an unread cluster is
     in neither list, so an empty `stalled` is never "everything is applying".
     `hosts` counts the entries that ran Config Connector (that carry
-    `kcc_unready`, also empty) or may run it (that carry `kcc_unread`): with
+    `kcc_unready`, also empty) or may run it (that carry `kcc_unread`, or
+    that the collector never read, `_kcc_never_read`): with
     more than one, the same object name can be ready on one host and not
     ready on another. `targets` holds the name
     of every manifest entry, so a match can see two clusters of one name in
@@ -18678,7 +18688,12 @@ def kcc_health(manifest: dict | None) -> KccHealth:
     unread: list[str] = []
     hosts = 0
     targets: list[str] = []
-    for entry in (manifest or {}).get("clusters") or []:
+    entries = [entry for entry in (manifest or {}).get("clusters") or [] if isinstance(entry, dict)]
+    # The manifest of a collector that reads Config Connector: some entry
+    # carries one of its keys. Only there is an entry never read a
+    # possible host; another stream's entries say nothing about it.
+    reads_kcc = any(KCC_UNREADY_FIELD in entry or KCC_UNREAD_FIELD in entry for entry in entries)
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         host = str(entry.get("name") or "")
@@ -18688,6 +18703,8 @@ def kcc_health(manifest: dict | None) -> KccHealth:
         # A failed read is a possible host: unknown is never "no Config
         # Connector here", so two real hosts never count as one.
         if isinstance(entry.get(KCC_UNREADY_FIELD), list) or entry.get(KCC_UNREAD_FIELD):
+            hosts += 1
+        elif reads_kcc and _kcc_never_read(entry):
             hosts += 1
         for record in entry.get(KCC_UNREADY_FIELD) or []:
             if not isinstance(record, dict) or not record.get("kind") or not record.get("name"):
@@ -18706,6 +18723,19 @@ def kcc_health(manifest: dict | None) -> KccHealth:
                 )
             )
     return KccHealth(stalled, unread, hosts, tuple(targets))
+
+
+def _kcc_never_read(entry: dict) -> bool:
+    """Whether `entry` is a cluster the collector never read that can run
+    Config Connector: an `unreachable` or `gate-failed` cluster target that
+    is running, when the entry records its status. Unknown is never "no
+    Config Connector here"."""
+    status = str(entry.get(KCC_CLUSTER_STATUS_FIELD) or "")
+    return (
+        str(entry.get("outcome") or "") not in KCC_READ_OR_EXCLUDED_OUTCOMES
+        and not str(entry.get("name") or "").startswith(KCC_PROJECT_TARGET_PREFIX)
+        and (not status or status in KCC_READABLE_STATUSES)
+    )
 
 
 def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall]:

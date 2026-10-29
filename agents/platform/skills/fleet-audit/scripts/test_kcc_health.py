@@ -39,7 +39,9 @@ UNREACHED = kcc_object("ComputeNetwork", "fresh")
 class FakeRun:
     """Answers `get-credentials` and the `gcp` read per cluster, and records the calls."""
 
-    def __init__(self, reads, credentials_rc=0):
+    def __init__(self, reads, credentials_rc=0, namespaces=None):
+        # `namespaces`: the answer to `kubectl get namespaces`, else a failure.
+        self.namespaces = namespaces
         self.reads = reads
         self.credentials_rc = credentials_rc
         self.calls = []
@@ -52,6 +54,8 @@ class FakeRun:
             if self.credentials_rc == 0:
                 Path(env["KUBECONFIG"]).write_text("apiVersion: v1\n")
             return kcc_health.Result(self.credentials_rc, "", "" if self.credentials_rc == 0 else "Permission denied")
+        if argv[:3] == ["kubectl", "get", "namespaces"]:
+            return self.namespaces if self.namespaces is not None else kcc_health.Result(1, "", "Forbidden")
         cluster = Path((env or {})["KUBECONFIG"]).name
         for key, answer in self.reads.items():
             if f"_{key}_" in cluster:
@@ -209,7 +213,7 @@ class AnnotateManifestTest(unittest.TestCase):
         self.assertIn("did not finish", slow["kcc_unread"])
         self.assertNotIn("kcc_unread", gone)
         self.assertEqual(read["kcc_unready"], [])
-        reads = [argv for argv, _ in run.calls if argv[0] == "kubectl"]
+        reads = [argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "gcp"]]
         self.assertEqual(len(reads), 3)
         self.assertTrue(all(argv == ["kubectl", "get", "gcp", "-A", "-o", "json"] for argv in reads))
         for argv, kubeconfig in run.calls:
@@ -282,7 +286,8 @@ class AnnotateManifestTest(unittest.TestCase):
         kcc_health.annotate_manifest(
             manifest, deadline=self.deadline, run=run, clock=self.clock, kubeconfig_for=lambda entry: swept
         )
-        self.assertEqual(run.calls, [(["kubectl", "get", "gcp", "-A", "-o", "json"], str(swept))])
+        self.assertEqual({kubeconfig for _, kubeconfig in run.calls}, {str(swept)})
+        self.assertNotIn("get-credentials", [argv[3] for argv, _ in run.calls if len(argv) > 3])
         self.assertEqual([r["name"] for r in manifest["clusters"][0]["kcc_unready"]], ["fleet-events"])
 
     def test_a_missing_kubeconfig_file_runs_no_read(self):
@@ -347,6 +352,66 @@ class AnnotateManifestTest(unittest.TestCase):
             "remediation": {"kind": "manifest", "path": "pools/gpu.yaml", "note": "Raise the ceiling."},
         }
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, root), ["f"])
+
+    def namespace(self, name, project=None):
+        meta = {"name": name}
+        if project:
+            meta["annotations"] = {"cnrm.cloud.google.com/project-id": project}
+        return {"kind": "Namespace", "metadata": meta}
+
+    def test_the_namespace_annotation_gives_an_object_its_project(self):
+        """Config Connector takes the project from the namespace when the
+        object names none; one namespaces read per such host gives it."""
+        bare = kcc_object("PubSubTopic", "events", status="False", reason="UpdateFailed")
+        run = FakeRun({"hub": listing(bare, STALLED_TOPIC)}, namespaces=listing(self.namespace("infra", "acme")))
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        self.assertEqual({r["name"]: r.get("project") for r in manifest["clusters"][0]["kcc_unready"]}, {"events": "acme", "fleet-events": "acme"})
+        self.assertEqual(len([argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "namespaces"]]), 1)
+
+    def test_a_failed_namespaces_read_leaves_the_project_unknown(self):
+        bare = kcc_object("PubSubTopic", "events", status="False", reason="UpdateFailed")
+        run = FakeRun({"hub": listing(bare)})
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        self.assertNotIn("project", manifest["clusters"][0]["kcc_unready"][0])
+
+    def test_no_namespaces_read_when_every_object_names_its_project(self):
+        annotated = kcc_object("PubSubTopic", "events", status="False", reason="UpdateFailed")
+        annotated["metadata"]["annotations"] = {"cnrm.cloud.google.com/project-id": "acme"}
+        run = FakeRun({"hub": listing(annotated)})
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        self.assertFalse([argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "namespaces"]])
+
+    def test_the_namespace_project_keeps_the_note_beside_an_unreachable_cluster(self):
+        """hub-2 is unreachable, so a match needs a known project; the
+        namespace gives it, and the note comes back."""
+        import audit_report  # noqa: PLC0415
+
+        bare = kcc_object("PubSubTopic", "events", status="False", reason="UpdateFailed")
+        manifest = {
+            "clusters": [
+                self.manifest()["clusters"][0],
+                {"name": "acme/us-east1/hub-2", "project": "acme", "location": "us-east1", "outcome": "unreachable"},
+            ]
+        }
+        root = Path(self.dir).parent / "repo"
+        (root / "topics").mkdir(parents=True)
+        (root / "topics" / "events.yaml").write_text(
+            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n"
+        )
+
+        def finding():
+            return {"id": "f", "cluster": "acme/us-central1/hub", "object": "Topic/events",
+                    "remediation": {"kind": "manifest", "path": "topics/events.yaml", "note": "x"}}
+
+        for namespaces, expected in ((None, []), (listing(self.namespace("infra", "acme")), ["f"])):
+            with self.subTest(namespaces=bool(namespaces)):
+                read = json.loads(json.dumps(manifest))
+                run = FakeRun({"hub": listing(bare)}, namespaces=namespaces)
+                kcc_health.annotate_manifest(read, deadline=self.deadline, run=run, clock=self.clock)
+                self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding()], read, root), expected)
 
 
 class DeadlineTest(unittest.TestCase):

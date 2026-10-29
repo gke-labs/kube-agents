@@ -647,6 +647,9 @@ def not_running_entry(c: dict, project: str) -> dict:
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": OUTCOME_UNREACHABLE,
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
+        # GKE's status, so `finish` does not count this cluster as one that
+        # may run Config Connector (`audit_report.kcc_health`).
+        "cluster_status": c.get("status") or "",
     }
 
 
@@ -8388,6 +8391,9 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # key, so `finish` can say when a fix edits a declaration Config Connector
     # does not apply. No second read.
     context["kcc_health"] = kcc_health.entry_fields(kcc_parsed, kcc_result.rc, kcc_result.stderr, KCC_READ_TIMEOUT_S)
+    # An object with no project annotation takes its namespace's; the
+    # namespaces are already in the context from the NetworkPolicy read.
+    kcc_health.fill_namespace_projects(context["kcc_health"].get(kcc_health.UNREADY_FIELD) or [], context.get("namespaces") or [])
     # `run_and_gate` returns `None` for four different things, and only one of
     # them means "no Config Connector here". Collapsing them would publish
     # "Config Connector is not installed on this cluster" as the audit's own

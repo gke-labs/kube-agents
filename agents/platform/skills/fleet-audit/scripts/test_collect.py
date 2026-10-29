@@ -7732,6 +7732,14 @@ class TestLbWorldOpen(unittest.TestCase):
         self.assertEqual(self.run_on(lb_service(ports=())), [])
 
 
+class NotRunningClusterStatusTest(unittest.TestCase):
+    def test_a_cluster_that_is_not_running_carries_its_status(self):
+        """`finish` must not count a STOPPING cluster as one that may run
+        Config Connector (`audit_report.kcc_health`)."""
+        entry = collect.not_running_entry({"name": "going", "location": "us-central1", "status": "STOPPING"}, "acme")
+        self.assertEqual(entry["cluster_status"], "STOPPING")
+
+
 class TestComplianceCollectCluster(unittest.TestCase):
     """One end-to-end pass over compliance-audit's real collection plan --
     five distinct kubectl/gcloud commands, gated and cross-referenced --
@@ -8162,6 +8170,19 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
         self.assertIn("not known", result["kcc_unread"])
         self.assertNotIn("kcc_unready", result)
+
+    def test_an_unready_object_takes_its_namespaces_project(self):
+        """Config Connector takes the project from the namespace when the
+        object names none; the NetworkPolicy read already holds the
+        namespaces, so no second read runs."""
+        namespace = {"apiVersion": "v1", "kind": "Namespace", "metadata": {
+            "name": "kubeagents-system", "annotations": {"cnrm.cloud.google.com/project-id": "acme"}}}
+        result = self.run_with(
+            netpol_items=[namespace],
+            kcc_items=[kcc_object("PubSubTopic", "fleet-events", ready="False", reason="UpdateFailed", message="Error 403")],
+        )
+        self.assertEqual(result["kcc_unready"][0]["project"], "acme")
+        self.assertFalse([argv for argv in self.issued if argv[:3] == ["kubectl", "get", "namespaces"]])
 
     def test_a_timed_out_gcp_read_names_the_timeout_it_had(self):
         """collect.py passes its own timeout to `kcc_health.entry_fields`, so

@@ -23076,6 +23076,41 @@ metadata:
                 self.assertEqual(self.disclose([finding], manifest), [])
                 self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
 
+    def test_a_cluster_that_was_never_read_counts_as_a_possible_host(self):
+        """hub-1 lists infra/events with no project. hub-2 was unreachable, so
+        nothing is known about its Config Connector: no note. A cluster of
+        another status, or a STOPPING one, is not a host."""
+        self.write(
+            "topics/events.yaml",
+            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
+        )
+        topic = dict(KCC_TOPIC, name="events")
+        for hub2, expected in (
+            ({"outcome": "unreachable", "error": "get-credentials rc=1"}, []),
+            ({"outcome": "gate-failed", "error": "dump failed"}, []),
+            ({"outcome": "unreachable", "cluster_status": "STOPPING"}, ["release-channel"]),
+            ({"outcome": "out-of-scope"}, ["release-channel"]),
+        ):
+            with self.subTest(hub2=hub2):
+                finding = kcc_finding(path="topics/events.yaml")
+                manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
+                del manifest["clusters"][1]["kcc_unready"]
+                manifest["clusters"][1].update(hub2)
+                self.assertEqual(self.disclose([finding], manifest), expected)
+
+    def test_the_namespace_project_brings_the_note_back(self):
+        """With an unreachable hub-2, the object's project (from its
+        namespace) agrees with the finding's, and the note is certain."""
+        self.write(
+            "topics/events.yaml",
+            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
+        )
+        finding = kcc_finding(path="topics/events.yaml")
+        manifest = self.two_hosts(("acme/us-central1/hub-1", [dict(KCC_TOPIC, name="events", project="acme")]), ("acme/us-east1/hub-2", []))
+        del manifest["clusters"][1]["kcc_unready"]
+        manifest["clusters"][1]["outcome"] = "unreachable"
+        self.assertEqual(self.disclose([finding], manifest), ["release-channel"])
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""

@@ -19,9 +19,10 @@ the result on that cluster's manifest entry:
   `{kind, namespace, name, why}`, plus `resource` (the object's
   `spec.resourceID`), `cluster` (a `ContainerNodePool`'s `clusterRef`) and
   `project` (the GCP project the object manages, from its
-  `cnrm.cloud.google.com/project-id` annotation) where they are set. An object
-  without the annotation has no `project`: the namespace's annotation is not
-  read. An empty list means the cluster runs Config Connector and every
+  `cnrm.cloud.google.com/project-id` annotation, else from the same
+  annotation on its namespace) where they are set. When no object on a host
+  has the annotation, one `kubectl get namespaces` gives the namespaces'
+  annotations; when that read fails, the project stays unknown. An empty list means the cluster runs Config Connector and every
   object it holds is ready or not yet reached.
 - `kcc_unread`: why the read did not give an answer (a timeout, a forbidden
   read, output that is not a list). This is "unknown", never "healthy".
@@ -118,6 +119,11 @@ GLOBAL_LOCATION = "global"
 # is not read and is not a host.
 CLUSTER_STATUS_FIELD = "cluster_status"
 READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+# The second read, on a host whose unready objects carry no project
+# annotation: Config Connector takes the project from the object's
+# namespace annotation then, so the namespaces give it. Its own timeout,
+# also cut to the time left.
+NAMESPACES_TIMEOUT_S = 60
 # What `kcc_unread` says when the kubeconfig file is not there. kubectl does
 # not fail on a missing `KUBECONFIG` file: it reads the defaults or the
 # in-cluster account, which is another cluster.
@@ -219,6 +225,45 @@ def unready_objects(items: list) -> list[dict]:
     return sorted(found, key=lambda r: (r["kind"], r["namespace"], r["name"]))
 
 
+def fill_namespace_projects(records: list[dict], namespaces: list) -> None:
+    """Give each record with no `project` its namespace's project annotation.
+
+    Config Connector takes the project from the namespace when the object
+    does not name one. `namespaces` is a list of Namespace objects; a
+    namespace without the annotation leaves the project unknown.
+    """
+    projects: dict[str, str] = {}
+    for item in namespaces or []:
+        meta = item.get("metadata") if isinstance(item, dict) and isinstance(item.get("metadata"), dict) else {}
+        annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+        project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
+        if project and meta.get("name"):
+            projects[str(meta["name"])] = project
+    for record in records:
+        if not record.get("project") and projects.get(record.get("namespace", "")):
+            record["project"] = projects[record["namespace"]]
+
+
+def _needs_namespace_projects(fields: dict) -> bool:
+    return any(not record.get("project") for record in fields.get(UNREADY_FIELD) or [])
+
+
+def read_namespace_projects(fields: dict, kubeconfig: Path, *, run: RunFn, timeout_s: int) -> None:
+    """Fill the unready objects' missing projects from one namespaces read.
+    A failed read leaves them unknown."""
+    result = run(
+        ["kubectl", "get", "namespaces", "-o", "json"], env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=timeout_s
+    )
+    if result.rc != 0:
+        return
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        fill_namespace_projects(fields[UNREADY_FIELD], parsed["items"])
+
+
 def entry_fields(parsed: object, rc: int, stderr: str, timeout_s: int = READ_TIMEOUT_S) -> dict:
     """The keys one cluster's `gcp` read puts on its manifest entry.
 
@@ -314,7 +359,12 @@ def _annotate_entry(
     left = _time_left(deadline, clock)
     if not left:
         return _budget_spent()
-    return read_cluster(kubeconfig, run=run, timeout_s=min(READ_TIMEOUT_S, left))
+    fields = read_cluster(kubeconfig, run=run, timeout_s=min(READ_TIMEOUT_S, left))
+    if _needs_namespace_projects(fields):
+        left = _time_left(deadline, clock)
+        if left:
+            read_namespace_projects(fields, kubeconfig, run=run, timeout_s=min(NAMESPACES_TIMEOUT_S, left))
+    return fields
 
 
 def annotate_manifest(
