@@ -32008,6 +32008,8 @@ class TestPlainChatLines(unittest.TestCase):
             ("ns/payments", "payments"),
             ("payments", "payments"),
             ("Deployment/api", "_"),
+            ("Deployment/api", "-"),
+            ("Deployment/api", "/"),
         ):
             with self.subTest(obj=obj, namespace=namespace):
                 finding = make_finding(check="netpol-missing", cluster="seeded-a", namespace=namespace, obj=obj)

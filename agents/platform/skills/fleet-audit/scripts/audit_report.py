@@ -20618,10 +20618,11 @@ def _object_name(finding: dict) -> str:
 def _row_namespace(finding: dict) -> str:
     """The finding's namespace as a row names it, or "" when it has none or the object is the namespace.
 
-    A namespace object in any spelling the join accepts (`NAMESPACE_KIND_SPELLINGS`).
+    A namespace object in any spelling the join accepts (`NAMESPACE_KIND_SPELLINGS`),
+    and no namespace where the finding's id has none (`_id_segment` folds it to `_`).
     """
     namespace = str(finding.get("namespace") or "").strip()
-    if namespace == ID_EMPTY_SEGMENT:
+    if _id_segment(namespace) == ID_EMPTY_SEGMENT:
         return ""
     kind, _, name = str(finding.get("object") or "").rpartition("/")
     if kind.rpartition("/")[2].lower() in NAMESPACE_KIND_SPELLINGS or (not kind and name == namespace):
