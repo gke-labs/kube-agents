@@ -151,21 +151,35 @@ def test_a_sha_that_is_not_a_commit_fails_the_extraction(change, tmp_path):
 # --------------------------------------------------------------------------
 
 
-def _unreadable(bench_dir: Path, *tasks: str) -> subprocess.CompletedProcess:
+def _unreadable(bench_dir: Path, *tasks: str, catalog: Path | None = None) -> subprocess.CompletedProcess:
     body = "\n".join([UV_SHIM, f'BENCH_DIR="{bench_dir}"', _function("grader_unreadable_cases"), 'grader_unreadable_cases "$@"'])
     return subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + body, "bash", *tasks],
         capture_output=True, text=True, check=False,
-        env={**os.environ, "GRADER_PY": sys.executable},
+        env={
+            **{k: v for k, v in os.environ.items() if k != "FLEET_CATALOG"},
+            "GRADER_PY": sys.executable,
+            **({"FLEET_CATALOG": str(catalog)} if catalog else {}),
+        },
     )
 
 
 def test_every_case_in_the_tree_reads_under_its_own_grader():
     """No false red: the check reads every case this tree carries, presubmit and
-    nightly, under this tree's grader, with nothing to say."""
-    tasks = sorted(f"./{p.relative_to(BENCH).as_posix()}" for p in (BENCH / "tasks").glob("*/task.yaml"))
+    nightly, under this tree's grader and fleet catalog, with nothing to say.
+    A case parked in the validator's FIXTURE_NOT_READY is left out: it names a
+    role the catalog does not have yet, is registered nowhere, and no job runs
+    it."""
+    from test_fleet_verifier import _parked_cases
+
+    parked = _parked_cases()
+    tasks = sorted(
+        f"./{p.relative_to(BENCH).as_posix()}"
+        for p in (BENCH / "tasks").glob("*/task.yaml")
+        if p.parent.name not in parked
+    )
     assert tasks
-    proc = _unreadable(BENCH, *tasks)
+    proc = _unreadable(BENCH, *tasks, catalog=BENCH / "tf" / "fleet" / "fixtures.json")
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "", proc.stdout
 
@@ -176,19 +190,20 @@ def mutated(tmp_path):
     this tree's tf/ so a stack the grader has resolves."""
     bench = tmp_path / "bench"
     (bench / "tasks").mkdir(parents=True)
-    # A real tf/ whose entries link to this tree's, so resolving a path
-    # against it stays inside this bench directory.
-    (bench / "tf").mkdir()
-    for entry in (BENCH / "tf").iterdir():
-        (bench / "tf" / entry.name).symlink_to(entry)
+    # A tf/ of real directories, so a stack resolves inside it and the check
+    # decides on whether the directory is there.
+    (bench / "tf" / "prebuilt" / "present").mkdir(parents=True)
     shutil.copytree(BENCH / "tasks" / SMOKE, bench / "tasks" / SMOKE)
     path = bench / "tasks" / SMOKE / "task.yaml"
+    # main's fleet catalog, as the pin exports it: one role.
+    catalog = tmp_path / "fixtures.json"
+    catalog.write_text('{"roles": {"role-on-main": {}}}', encoding="utf-8")
 
     def edit(fn):
         spec = yaml.safe_load(path.read_text(encoding="utf-8"))
         fn(spec)
         path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
-        return _unreadable(bench, f"./tasks/{SMOKE}/task.yaml")
+        return _unreadable(bench, f"./tasks/{SMOKE}/task.yaml", catalog=catalog)
 
     return edit
 
@@ -233,6 +248,11 @@ def test_a_top_level_key_the_grader_does_not_know_is_reported(mutated):
     assert f"./tasks/{SMOKE}/task.yaml: top-level key case_key_not_on_main is not in this grader" in proc.stdout
 
 
+def test_a_stack_the_grader_has_reads(mutated):
+    proc = mutated(lambda spec: spec.update(infrastructure={"deployer": "tofu", "stack": "prebuilt/present"}))
+    assert (proc.returncode, proc.stdout) == (0, ""), proc.stderr
+
+
 def test_a_stack_the_grader_does_not_have_is_reported(mutated):
     def stack(spec):
         spec["infrastructure"] = {"deployer": "tofu", "stack": "prebuilt/stack-not-on-main"}
@@ -256,6 +276,18 @@ def test_a_stack_outside_the_graders_tf_is_reported(mutated, tmp_path, escape):
     proc = mutated(point)
     assert proc.returncode == 0, proc.stderr
     assert f"its stack {stack} is not a directory under this grader" in proc.stdout
+
+
+@pytest.mark.parametrize("key,value", [("fixture_role", "role-not-on-main"), ("fixture_roles", ["role-on-main", "role-not-on-main"])])
+def test_a_fleet_role_the_grader_catalog_lacks_is_reported(mutated, key, value):
+    def add(spec):
+        check = {"type": "fleet_resource_property", key: value, "kind": "Pod", "property": "x", "equals": "y"}
+        spec["verification_spec"].append({"name": "needs-a-new-role", "role": "objective", "mode": "assert", "check": check})
+
+    proc = mutated(add)
+    assert proc.returncode == 0, proc.stderr
+    assert f"./tasks/{SMOKE}/task.yaml: fixture role role-not-on-main is not in the fleet catalog of this grader" in proc.stdout
+    assert "role role-on-main " not in proc.stdout
 
 
 def test_a_case_bench_gate_refuses_is_reported(mutated):

@@ -69,7 +69,8 @@ __all__ = [
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams`` -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
-#   pull request before the presubmit case that uses it.
+#   pull request before any case a pull-request job grades uses it (the
+#   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
 _DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
 _DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
 DEVOPS_BENCH_CASE_KEYS = (

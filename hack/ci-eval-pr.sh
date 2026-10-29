@@ -2607,12 +2607,14 @@ fi
 # where the two are the same commit.
 #
 # A case main's grader cannot read -- a check type, check field or top-level
-# key it does not know, a stack it does not have -- stops the job red here, before the fan-out,
+# key it does not know, a fleet role or stack it does not have -- stops the job red here, before the fan-out,
 # rather than running and losing the check to rung 2 (or a missing stack to
 # infrastructure). The check itself runs after the lane step ("main's grader
 # reads the cases as run"), over the task copies devops-bench is handed. So a grader change lands on main before the case that
-# needs it (decided 2026-10-28). A new case lands in the nightly, which grades
-# from HEAD, so only a change to a presubmit case is held to that order.
+# needs it (decided 2026-10-28). That holds for every case a pull-request job
+# grades: the presubmit roster, and a lane list such as gitlab-cases.txt,
+# which may name a nightly case. A case only the nightly runs is graded from
+# HEAD and is not held to that order.
 #
 # hack/OWNERS puts this script, and the hack/ files it sources, evals or runs
 # before the verdict, under the eval-crew alias, so an edit that would take
@@ -2628,12 +2630,16 @@ fi
 # each the one the run would make: devops-bench's task loader, its
 # verification-spec parser (which skips an entry it cannot parse and lets the
 # run go on), and bench-gate's case loader; then whether each top-level key
-# is in the grader's CASE_KEYS (both loaders drop a key they do not know) and
-# whether a declared stack is under tf/. A grader from before CASE_KEYS
+# is in the grader's CASE_KEYS (both loaders drop a key they do not know),
+# whether every fixture_role / fixture_roles a check names is in the fleet
+# catalog the run wrote kubeconfigs from (FLEET_CATALOG, main's on a pinned
+# run; a role it lacks errors the check after the lease), and whether a
+# declared stack is a directory under tf/. A grader from before CASE_KEYS
 # existed has no top-level schema to hold a case to, so that read is skipped
 # under it. Exits non-zero only when the check itself could not run.
 grader_unreadable_cases() { # <task file>... (relative to BENCH_DIR)
   (cd "${BENCH_DIR}" && uv run python -c '
+import json
 import os
 import sys
 from pathlib import Path
@@ -2644,6 +2650,23 @@ from devops_bench.verification.spec import parse_entries
 from kube_agents_bench import cases
 
 known = getattr(cases, "CASE_KEYS", None)
+catalog = os.environ.get("FLEET_CATALOG")
+fleet_roles = set(json.loads(Path(catalog).read_text(encoding="utf-8")).get("roles") or {}) if catalog else None
+
+
+def named_roles(node, found):
+    if isinstance(node, dict):
+        if isinstance(node.get("fixture_role"), str):
+            found.add(node["fixture_role"])
+        if isinstance(node.get("fixture_roles"), list):
+            found.update(r for r in node["fixture_roles"] if isinstance(r, str))
+        for value in node.values():
+            named_roles(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            named_roles(value, found)
+
+
 for path in sys.argv[1:]:
     try:
         tasks = FileSystemTaskLoader().load_tasks(path)
@@ -2654,6 +2677,11 @@ for path in sys.argv[1:]:
         continue
     for key in sorted(set(raw) - known) if known is not None else []:
         print(f"{path}: top-level key {key} is not in this grader (kube_agents_bench.cases.CASE_KEYS)")
+    if fleet_roles is not None:
+        found = set()
+        named_roles(raw.get("verification_spec"), found)
+        for role in sorted(found - fleet_roles):
+            print(f"{path}: fixture role {role} is not in the fleet catalog of this grader ({catalog})")
     for task in tasks:
         for error in parse_entries(task.verification_spec)[1]:
             print(path + ": verification entry " + str(error.get("name")) + ": " + str(error.get("reason")))
