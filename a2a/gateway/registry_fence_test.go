@@ -184,6 +184,9 @@ func TestWithRetryStopsOnAFencedWrite(t *testing.T) {
 func TestTheTermMarkerFencesRecordsTheNewLeaderHasNotWritten(t *testing.T) {
 	ctx := context.Background()
 	old, cur := fencedPair(t)
+	if _, err := old.BeginTerm(ctx); err != nil {
+		t.Fatal(err)
+	}
 	untouched := "slack:T1/C1/untouched"
 	if err := old.Put(ctx, &SessionRecord{Key: untouched, Addressee: "platform"}); err != nil {
 		t.Fatal(err)
@@ -191,8 +194,8 @@ func TestTheTermMarkerFencesRecordsTheNewLeaderHasNotWritten(t *testing.T) {
 	if err := old.IndexTask(ctx, "task-old", untouched); err != nil {
 		t.Fatal(err)
 	}
-	if err := cur.RaiseTerm(ctx); err != nil {
-		t.Fatalf("RaiseTerm at epoch 2: %v", err)
+	if got, err := cur.BeginTerm(ctx); err != nil || got != 2 {
+		t.Fatalf("BeginTerm = %d, %v, want 2", got, err)
 	}
 	// The new leader hasn't written this record, and the deposed one is
 	// refused on it anyway.
@@ -220,27 +223,40 @@ func TestTheTermMarkerFencesRecordsTheNewLeaderHasNotWritten(t *testing.T) {
 	}
 }
 
-func TestRaiseTermNeverLowersTheMarker(t *testing.T) {
+func TestBeginTermCountsUpFromTheMarkerWhateverTheRegistryHeld(t *testing.T) {
+	// The term comes from the marker, not from the registry or the Lease, so
+	// a registry that starts at 0 (a recreated Lease, a fresh process) still
+	// takes a term past every record already written.
 	ctx := context.Background()
-	old, cur := fencedPair(t)
-	if err := old.RaiseTerm(ctx); err != nil {
-		t.Fatalf("RaiseTerm at epoch 1: %v", err)
+	r := startRig(t)
+	first, second := NewRegistry(r.client), NewRegistry(r.client)
+	got, err := first.BeginTerm(ctx)
+	if err != nil || got != 1 || first.Epoch() != 1 {
+		t.Fatalf("first BeginTerm = %d, %v (epoch %d), want 1", got, err, first.Epoch())
 	}
-	if err := cur.RaiseTerm(ctx); err != nil {
-		t.Fatalf("RaiseTerm at epoch 2 over 1: %v", err)
-	}
-	if err := cur.RaiseTerm(ctx); err != nil {
-		t.Fatalf("RaiseTerm at its own epoch again: %v", err)
-	}
-	if err := old.RaiseTerm(ctx); !errors.Is(err, ErrFenced) {
-		t.Fatalf("RaiseTerm at epoch 1 over 2 = %v, want ErrFenced", err)
-	}
-	kv, err := cur.kv(ctx)
-	if err != nil {
+	key := "slack:T1/C1/terms"
+	if err := first.Put(ctx, &SessionRecord{Key: key, Addressee: "first"}); err != nil {
 		t.Fatal(err)
 	}
-	if term, _, err := readTerm(ctx, kv); err != nil || term != 2 {
-		t.Fatalf("marker = %d, %v, want 2", term, err)
+	got, err = second.BeginTerm(ctx)
+	if err != nil || got != 2 || second.Epoch() != 2 {
+		t.Fatalf("second BeginTerm = %d, %v (epoch %d), want 2", got, err, second.Epoch())
+	}
+	if err := first.Put(ctx, &SessionRecord{Key: key, Addressee: "deposed"}); !errors.Is(err, ErrFenced) {
+		t.Fatalf("Put from term 1 after term 2 began = %v, want ErrFenced", err)
+	}
+	if err := second.Put(ctx, &SessionRecord{Key: key, Addressee: "second"}); err != nil {
+		t.Fatalf("Put at term 2: %v", err)
+	}
+	// A third leader whose own count restarted (SetEpoch(0) stands in for a
+	// recreated Lease) still lands past the records.
+	third := NewRegistry(r.client)
+	third.SetEpoch(0)
+	if got, err := third.BeginTerm(ctx); err != nil || got != 3 {
+		t.Fatalf("BeginTerm after a reset = %d, %v, want 3", got, err)
+	}
+	if err := third.Put(ctx, &SessionRecord{Key: key, Addressee: "third"}); err != nil {
+		t.Fatalf("Put at term 3 over a term 2 record: %v", err)
 	}
 }
 

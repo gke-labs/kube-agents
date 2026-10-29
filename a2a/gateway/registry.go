@@ -82,7 +82,7 @@ type ActiveTask struct {
 // Runtime state is not git and not pod annotations; KV is the house answer.
 type SessionRecord struct {
 	Key string `json:"key"`
-	// Epoch is the lease epoch of the gateway term that last wrote the
+	// Epoch is the gateway term that last wrote the
 	// record (docs/designs/gateway-replicas.md, "Fencing"). Registry.Put
 	// refuses a write from an older epoch. Zero until the election exists.
 	Epoch        uint64    `json:"epoch,omitempty"`
@@ -635,61 +635,61 @@ const taskHistoryCap = 50
 // its sessions from here, so a gateway crash strands nothing.
 type Registry struct {
 	c *lib.Client
-	// epoch is this gateway's lease epoch, stamped on every record it
-	// writes and checked against the stored one. The election sets it on
-	// each acquisition; until then it stays 0, and every write passes.
+	// epoch is this gateway's term, stamped on every record it writes and
+	// checked against the stored one and the term marker. BeginTerm sets it
+	// on each acquisition; until the election exists it stays 0, and every
+	// write passes.
 	epoch atomic.Uint64
 	// afterCheck, when set, runs between a fenced write's epoch check and
 	// the write itself: tests use it to land a newer leader's write there.
 	afterCheck func()
 }
 
-// ErrFenced reports a write refused because the stored record was last
-// written by a later lease epoch than this gateway's: a newer leader owns
+// ErrFenced reports a write refused because the term marker or the stored
+// record carries a later term than this gateway's: a newer leader owns
 // it, and this replica has been deposed.
 var ErrFenced = errors.New("session record belongs to a newer gateway term")
 
-// SetEpoch sets the lease epoch this registry writes under.
+// SetEpoch sets the term this registry writes under, without touching the
+// marker; BeginTerm is how a leader takes a new one.
 func (r *Registry) SetEpoch(epoch uint64) {
 	r.epoch.Store(epoch)
 }
 
-// Epoch is the lease epoch this registry writes under.
+// Epoch is the term this registry writes under.
 func (r *Registry) Epoch() uint64 {
 	return r.epoch.Load()
 }
 
-// RaiseTerm moves the term marker up to this registry's epoch. It never
-// lowers it: a marker already at or past the epoch is left alone, and a
-// marker past it means a newer term exists, which is ErrFenced.
-func (r *Registry) RaiseTerm(ctx context.Context) error {
+// BeginTerm starts a new gateway term: it increments the term marker and
+// writes under the result from then on. The election calls it on each
+// acquisition, before the new leader starts work. The epoch lives in the
+// same bucket as the records it fences, so it only ever rises with them:
+// a Lease that is deleted and recreated, or an install restored around a
+// kept bus volume, can't hand a new leader a number older than the records.
+func (r *Registry) BeginTerm(ctx context.Context) (uint64, error) {
 	kv, err := r.kv(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	mine := r.epoch.Load()
-	value := []byte(strconv.FormatUint(mine, 10))
 	for attempt := 0; ; attempt++ {
 		current, rev, err := readTerm(ctx, kv)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		if current > mine {
-			return fmt.Errorf("term %d: %w", current, ErrFenced)
-		}
-		if current == mine && rev != 0 {
-			return nil
-		}
+		next := current + 1
+		value := []byte(strconv.FormatUint(next, 10))
 		if rev == 0 {
 			_, err = kv.Create(ctx, termKey, value)
 		} else {
 			_, err = kv.Update(ctx, termKey, value, rev)
 		}
 		if err == nil {
-			return nil
+			r.epoch.Store(next)
+			return next, nil
 		}
 		if !isRevisionConflict(err) || attempt+1 >= fencedWriteAttempts {
-			return fmt.Errorf("term marker %s: %w", termKey, err)
+			return 0, fmt.Errorf("term marker %s: %w", termKey, err)
 		}
 	}
 }
@@ -836,7 +836,7 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 }
 
 // Put writes a record, fenced: it refuses with ErrFenced when the stored
-// record was written by a later lease epoch, and the write is conditional on
+// record was written by a later term, and the write is conditional on
 // the revision it checked, so a newer leader's write can't land between the
 // check and this one. A lost revision race re-checks and tries again. Within
 // one epoch the last write wins, as it always has with one active replica.
