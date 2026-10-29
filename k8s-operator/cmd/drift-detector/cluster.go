@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -170,8 +169,7 @@ func applyJoinThrottle(cfg *rest.Config) {
 // value reaches the real GKE API with this process's own Google credentials, or
 // through the credential proxy when clusterprofiles.BrokerFromEnv names one;
 // the tests replace its Describe and TokenSource fields so the scan needs
-// neither. OnSkip is set per call instead, because the message it writes is
-// this binary's rather than the package's.
+// neither.
 //
 // The same seam k8s-event-watcher uses, deliberately: two binaries scanning the
 // same directory the same way is the reason the scan is a package.
@@ -297,28 +295,13 @@ func discoverProfileClusters(ctx context.Context, dir string, directlyReached *c
 		return profileScan{}, nil
 	}
 
-	scan := profileScan{}
-	skip := func(profile string, err error) {
-		if profile == clusterprofiles.NoProfile {
-			// The directory itself, not a profile in it -- so this is not one
-			// straggler but an unknown number of clusters, and counting it as
-			// "1 profile skipped" would understate it to whoever alerts on that
-			// number. The error already says which directory and what it means.
-			// Recorded rather than only logged so the startup line does not go
-			// on to call the directory empty; DirUnreadable has the argument.
-			scan.DirUnreadable = true
-			log.Printf("%s: %v", commandName, err)
-			return
-		}
-		scan.Skipped++
-		log.Printf("%s: skipping profile %s, its cluster will NOT be joined: %v", commandName, profile, err)
-	}
+	var absorbed []string
 
 	// One reason to decline a profile before it is addressed, and it is not a
 	// skip. Discover calls Want once per profile, in order, on the one
-	// goroutine this runs on, so writing to the scan from here is safe. It
-	// names the identity rather than the profile directory, which Want is not
-	// given -- and which the Platform Agent derives from the triple anyway.
+	// goroutine this runs on, so appending from here is safe. It names the
+	// identity rather than the profile directory, which Want is not given --
+	// and which the Platform Agent derives from the triple anyway.
 	want := func(id clusterprofiles.Identity) bool {
 		identity := identityFromProfile(id)
 
@@ -336,49 +319,41 @@ func discoverProfileClusters(ctx context.Context, dir string, directlyReached *c
 		// and the profile is reported as skipped, telling an operator that a
 		// cluster this run enriches normally will NOT be joined.
 		if directlyReached != nil && identity == *directlyReached {
-			scan.Absorbed = append(scan.Absorbed, identity.String())
+			absorbed = append(absorbed, identity.String())
 			return false
 		}
 
 		return true
 	}
 
-	// A copy, so setting these does not write to the package-level seam.
+	// A copy, so setting Want does not write to the package-level seam.
 	d := profilesDiscovery
-	d.OnSkip = skip
 	d.Want = want
-	// The credential proxy, as in k8s-event-watcher: when the operator names
-	// one it replaces the pod's Workload Identity for the describe and for
-	// every profile cluster's reads. A Broker already on the seam is a test's.
-	if d.Broker == nil {
-		broker, err := clusterprofiles.BrokerFromEnv()
-		if err != nil {
-			return scan, err
-		}
-		d.Broker = broker
-	}
-	discovered, err := d.Discover(ctx, dir)
-	if err != nil {
-		return scan, err
-	}
-
-	clusters := make([]profileCluster, 0, len(discovered))
-	for _, c := range discovered {
-		identity := identityFromProfile(c.Identity)
+	built, err := clusterprofiles.DiscoverAndBuild(ctx, d, dir, clusterprofiles.ScanOptions{
+		Component:   commandName,
+		Consequence: "joined",
+	}, func(c clusterprofiles.Cluster) (profileCluster, error) {
 		applyJoinThrottle(c.Config)
 		client, err := dynamic.NewForConfig(c.Config)
 		if err != nil {
-			skip(c.Profile, fmt.Errorf("dynamic client: %w", err))
-			continue
+			return profileCluster{}, fmt.Errorf("dynamic client: %w", err)
 		}
-		clusters = append(clusters, profileCluster{
-			Identity: identity,
+		return profileCluster{
+			Identity: identityFromProfile(c.Identity),
 			Profile:  c.Profile,
 			Getter:   dynamicGetter{client: client},
 			Config:   c.Config,
-		})
+		}, nil
+	})
+	scan := profileScan{
+		Skipped:       built.Skipped,
+		Absorbed:      absorbed,
+		DirUnreadable: built.DirUnreadable,
 	}
-	scan.Clusters = clusters
+	if err != nil {
+		return scan, err
+	}
+	scan.Clusters = built.Built
 	return scan, nil
 }
 
