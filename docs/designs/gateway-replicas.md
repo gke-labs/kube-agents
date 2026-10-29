@@ -71,6 +71,12 @@ socket: Slack would hand it events, and a standby can't take them.
   dead replica held come back when the relay durable's AckWait (30s) runs out, since nothing gave
   them back. The relay can't redeliver sooner without a shorter AckWait, which costs more
   heartbeats; an open question below.
+- **On the bus's side.** With the bus at three replicas, a stream or consumer leader election (a
+  node drain, an upgrade's restart) can add its own few seconds to a redelivery. An ack sent during
+  one can be lost, so an event already rendered comes back. The relay recognises it by its stream
+  sequence and acks it without rendering again, the guard it already keeps for a crash between a
+  render and its ack. A bus server draining in lame-duck mode spreads its clients' reconnects over
+  about 30s: a burst of reconnects for the active gateway, not a gap.
 
 ### Fencing
 
@@ -99,10 +105,44 @@ Process memory doesn't move. Most of it is a cache or is rebuilt from the stream
 
 ### Reaching the active replica over HTTP
 
-The doors' Services select a label the active replica sets on its own pod when it acquires the
-lease, and clears when it steps down. A standby's door is never routed to. Readiness stays
-"healthy", not "active", so a rollout's new pod becomes Ready as a standby and the rollout
-proceeds.
+The inject and A2A doors' Services have no selector. Their endpoints are one EndpointSlice per
+Service, which the operator creates empty, and the active gateway writes its own pod IP into it.
+Readiness stays "healthy", not "active", so a rollout's new pod becomes Ready as a standby and the
+rollout proceeds (the alternatives below say why routing can't ride on readiness).
+
+The takeover order bounds when a request can reach the wrong replica:
+
+1. The new leader acquires the Lease, then starts its work, doors included.
+2. Only then does it write its pod IP into the EndpointSlice, replacing whatever was there.
+3. A deposed leader stops serving door requests the moment it loses the Lease, or fails to renew
+   it within `renewDeadline`, before its other work stops. A request that still reaches it
+   before the EndpointSlice moves gets a 503 with `Retry-After`, never an answer from a replica
+   that no longer owns the conversation.
+
+So both replicas can be addressed only between step 1 and the old endpoint's removal in step 2,
+and in that window the old one refuses rather than serves. kube-proxy picks up the change within
+its own sync interval, typically a second or two.
+
+If the EndpointSlice write fails, the active gateway keeps retrying with backoff while it holds
+the Lease, and logs and counts each failure. The doors are unreachable meanwhile, and the
+operator, which watches both, sets a `GatewayDoorsUnrouted` condition on the PlatformAgent while
+the EndpointSlice doesn't name the Lease holder's pod. Chat traffic, the relay and the console
+don't use these Services and keep working.
+
+### Alternatives considered for routing
+
+- **Readiness, or a readinessGate, true only on the active replica.** It deadlocks every
+  rollout. A Deployment counts an unready pod as unavailable. With `maxUnavailable: 0` the new
+  pod comes up as a standby and never goes Ready, so the old leader is never stopped. With
+  `maxUnavailable: 1` the old leader is the only available pod and can't be taken either. A
+  readinessGate counts toward Ready the same way, and setting it also needs `pods/status`.
+- **A label the active replica sets on its own pod, selected by the Services.** It works, but it
+  needs `patch` on every pod in the namespace (RBAC can't scope it to the gateway's own,
+  generated, pod names), and the label can outlive the lease on a replica that dies mid-update.
+- **The standby proxies door requests to the active replica** (address from the Lease holder). It
+  needs no grant beyond the Lease, but it adds an application-level proxy, an extra hop, a second
+  place for SSE streams to break, and a handover where the proxy itself is pointing at the old
+  leader.
 
 ## Operator changes
 
@@ -113,8 +153,11 @@ proceeds.
 - **A PodDisruptionBudget** of `maxUnavailable: 1`, so a node drain takes one replica at a time.
 - **A zone topology spread** (`ScheduleAnyway`), as the callout and verifier already have, so a
   single-zone install still schedules.
-- **RBAC for the gateway's ServiceAccount:** get, create and update on its one Lease by name; and
-  patch on pods in its namespace, for the active label. Both are new grants.
+- **The Lease, created by the operator** in the agent's namespace, under a fixed name. RBAC can't
+  scope `create` to a name, so the operator owns creation, and the gateway's ServiceAccount gets
+  only `get` and `update` on that one Lease (`resourceNames`).
+- **The doors' EndpointSlices, created by the operator** (one per door Service, initially empty).
+  The gateway's ServiceAccount gets `get` and `update` on those, by name, and nothing on pods.
 
 ## Build, as follow-ups
 
@@ -124,7 +167,8 @@ proceeds.
 2. **Leader election in the gateway.** Acquire, renew, step down; `Run`'s work gated on holding the
    lease; the shutdown order on stepping down; release on SIGTERM. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows.
-3. **The active label and the door Services' selector,** with the pod-patch grant.
+3. **Door routing:** the selector-less door Services, the operator-created EndpointSlices and the
+   `GatewayDoorsUnrouted` condition, and the gateway's write after it takes the Lease.
 4. **Operator:** replicas, the strategy, the PDB, the spread and the Lease Role. Its tests pin
    each.
 5. **The cards-pending mark on the record** (planned separately).
