@@ -211,13 +211,13 @@ size, each picked as a T-shirt size. The fleet sizes are S (4 clusters), M (45),
 (2,500, the benchmark size), built from customer fleets with rounded figures and no names. The
 container sizes are S (what GKE Autopilot without bursting gives: each request becomes the limit),
 M (the defaults of a Standard install), L (raised for a large fleet) and XL (the most a container
-can practically get on GKE Standard, one n2-standard-128 node: 120 CPU and 480 GiB), or the sizes
-recommended for the fleet; both can be fine-tuned. Two verdicts follow, green or red: whether the
-container limits hold the fleet in one install, and whether the limits no setting raises do (the
-sandbox shell's CPU, which the operator fixes at 2 cores, the credential proxy's 8 command slots,
-the 10 run slots, and Stall Watch reading one cluster at a time). When one install cannot hold the
-fleet, the page gives how many installs it needs, from the largest measured fleet that held, and
-lists what each install needs: the containers' sizes, the node pool and the data volume. A chart
+can practically get on GKE Standard, one n2-standard-128 node: 120 CPU and 480 GB), or the sizes
+recommended for the fleet; both can be changed. One verdict follows, green or red: how many
+installs the fleet needs because of the limits no setting raises (the sandbox shell's CPU, which
+the operator fixes at 2 cores, the credential proxy's 8 command slots, the 10 run slots, and
+Stall Watch reading one cluster at a time), counted from the largest measured fleet that held,
+and whether the chosen container size is enough for each install. The page then lists what each
+install needs: the containers' sizes, the node pool and the data volume. A chart
 shows each key limit as a share of the chosen limit as the fleet grows and marks where each is
 reached. An option assumes an operator change that lets the shell be sized too. **Part 2,
 Empirical evidence**, takes no input: memory, CPU, the credential proxy's longest wait and the

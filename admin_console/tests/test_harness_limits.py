@@ -591,10 +591,11 @@ class CheckTest(unittest.TestCase):
         self.assertAlmostEqual(hl.headroom(failing), (2048 - 2400) * MIB)
         self.assertAlmostEqual(failing.reached, (2048 - 500) / (2400 - 500))
 
-    def test_the_limits_table_round_trips_in_mib_and_cores(self):
+    def test_the_limits_table_round_trips_in_gb_and_cores(self):
         table = hl.limit_table(hl.usual_limits(self.records), ["agent-api-auth", "other"])
 
-        self.assertEqual(table[hl.LIMIT_MEMORY_COLUMN], [2048.0, 0.0])
+        # 2 GiB is 2.147483648 GB.
+        self.assertEqual(table[hl.LIMIT_MEMORY_COLUMN], [2 * GIB / hl.GB, 0.0])
         table[hl.LIMIT_CPU_COLUMN] = [None, 0.5]
         self.assertEqual(
             hl.limits_from_table(table),
@@ -1073,13 +1074,13 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertEqual(failing.value, 1.0)
         self.assertNotIn("minute", failing.help)
         verdicts = [item.value for item in [*app.success, *app.error]]
-        self.assertTrue(any("Container limits" in text for text in verdicts))
-        self.assertTrue(any("Fixed limits" in text for text in verdicts))
+        self.assertTrue(any("One install holds all" in text for text in verdicts))
 
     def test_the_benchmark_fleet_is_split_into_installs(self):
         app = self.open_page()
 
-        self.assertTrue(any("one install cannot hold this fleet" in item.value for item in app.error))
+        verdicts = [item.value for item in [*app.success, *app.error]]
+        self.assertTrue(any("installs of about" in text for text in verdicts))
         self.assertTrue(any("Split into" in str(item.value) for item in app.markdown))
 
     def test_the_page_names_no_project_or_cluster(self):
@@ -1114,7 +1115,8 @@ class HarnessLimitsPageTest(unittest.TestCase):
         app = app.run()
 
         self.assertEqual(len(app.exception), 0, [item.value for item in app.exception])
-        self.assertTrue(any("Container limits: not enough" in item.value for item in app.error))
+        verdicts = [item.value for item in [*app.success, *app.error]]
+        self.assertTrue(any("installs of about" in text for text in verdicts))
 
 
 class LevelCountTest(unittest.TestCase):

@@ -56,7 +56,7 @@ class EstimateTest(unittest.TestCase):
 
     def test_the_report_names_the_breaking_point_and_the_proxy_demand(self):
         text = self.run_main()
-        self.assertIn("| Memory peak · platform-agent | 1,000 MiB (platform-agent limit) | 500 MiB | 12.0 clusters |", text)
+        self.assertIn("| Memory peak · platform-agent | 1.0 GB (platform-agent limit) | 0.52 GB | 12.0 clusters |", text)
         self.assertIn("| watcher_soak | base | 2 | 1 | 2.0 | 1.0 | — | — |", text)
         self.assertIn("| watcher_soak | Clusters 8 | 8 | 1 | 8.0 | 1.0 | — | — |", text)
         # 8 clusters: 800 MiB predicted, 1,040 MiB with the 30% margin.
@@ -67,7 +67,7 @@ class EstimateTest(unittest.TestCase):
         limits = Path(self.directory.name) / "requests.yaml"
         limits.write_text(f"platform-agent:\n  memory_bytes: {700 * MIB}\n")
         text = self.run_main("--limits", str(limits))
-        self.assertIn("| 700 MiB (platform-agent limit) | 500 MiB | 6.0 clusters |", text)
+        self.assertIn("| 0.73 GB (platform-agent limit) | 0.52 GB | 6.0 clusters |", text)
 
     def test_requests_replace_the_limits_when_asked(self):
         self.assertEqual(estimate.main(["--data", str(self.data), "--against", "requests"]), 1)
@@ -76,7 +76,7 @@ class EstimateTest(unittest.TestCase):
         self.data.write_text(json.dumps(data))
         text = self.run_main("--against", "requests")
         self.assertIn("against the requests most runs had", text)
-        self.assertIn("| 600 MiB (platform-agent request) | 500 MiB | 4.0 clusters |", text)
+        self.assertIn("| 0.63 GB (platform-agent request) | 0.52 GB | 4.0 clusters |", text)
 
     def test_an_unknown_commit_or_mode_is_an_error(self):
         with contextlib.redirect_stderr(io.StringIO()):

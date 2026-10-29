@@ -34,30 +34,26 @@ PROFILE_CAPTION = (
     "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape."
 )
 STORY = (
-    "Pick a fleet size and a container size. The forecast says whether one kube-agents install "
-    "holds that fleet with those containers, which limit it reaches first, and, when one install "
+    "Pick a fleet size and the container size you have in mind. The forecast says whether one "
+    "kube-agents install holds that fleet with those containers, which limit it reaches first, and, when one install "
     "cannot hold it, how many installs it needs and what each one needs. Part 2 shows the "
     "measurements behind every number."
 )
-CONTAINERS_OK = (
-    "**Container limits: enough.** With these container sizes, no container reaches its memory or "
-    "CPU limit for this fleet in one install."
+SPLIT_NONE = "One install holds all {clusters:,.0f} clusters."
+SPLIT_NEEDED = (
+    "One install holds about {held:.0f} clusters (measured), so {clusters:,.0f} clusters need "
+    "**{installs:,} installs of about {per_install:.0f} clusters**, or {stall_installs:,} for Stall Watch "
+    "to read every cluster each half hour."
 )
-CONTAINERS_RAISE = (
-    "**Container limits: not enough.** {count} container limits are too low for this fleet in one "
-    "install. The first one reached is **{first}**{where}. Raise them to the sizes listed below, "
-    "or split the fleet into installs."
+VERDICT_OK = "**Yes.** {split} The {size} container size is enough for each install."
+VERDICT_SHORT = (
+    "**Not with this container size.** {split} With the {size} size each install runs short of "
+    "**{short}**; pick *Recommended for this fleet* for the sizes listed below."
 )
-FIXED_OK = (
-    "**Fixed limits: one install holds this fleet.** It has {clusters:,.0f} clusters; one install "
-    "was measured holding {held:.0f} clusters of daily work, and Stall Watch reads up to about "
-    "{stall:.0f} clusters every half hour."
-)
-FIXED_SPLIT = (
-    "**Fixed limits: one install cannot hold this fleet.** It has {clusters:,.0f} clusters. No "
-    "setting raises these limits, so the fleet needs **{installs:,} installs of about "
-    "{per_install:.0f} clusters** (measured: one install held {held:.0f} clusters), or "
-    "**{stall_installs:,} installs** to have Stall Watch read every cluster each half hour."
+VERDICT_IMPOSSIBLE = (
+    "**No.** {split} Even at one cluster per install, the {names} would need more than the largest "
+    "container GKE can practically give (120 CPU, 480 GB on one n2-standard-128 node). This shape is "
+    "past the measurements."
 )
 SHELL_FIXED_LINE = (
     "- **Sandbox shell: 2 CPU, fixed by the kube-agents operator, not by GKE.** Every brokered command "
@@ -77,11 +73,11 @@ FIXED_WHY = """The limits no setting raises:
 
 The model's straight lines, which take each input's largest increase over all operations, are more cautious: they put the shell at its limit at about {model:.0f} clusters, because a user's upgrade readiness report loads it. At the measured size that report runs slower; it does not fail."""
 INSTALL_LINE = (
-    "- **Nodes per install:** {nodes} × {machine}, for {memory} of memory and {cpu} of CPU requested; "
+    "- **Nodes per install:** {nodes} × {machine}, for {memory} of memory and {cpu} requested; "
     "a data volume of at least {pvc}."
 )
 TOTAL_LINE = (
-    "- **All {installs:,} installs:** {total_nodes:,} × {machine}, {vcpu:,} vCPU and {node_memory:,.0f} GiB "
+    "- **All {installs:,} installs:** {total_nodes:,} × {machine}, {vcpu:,} vCPU and {node_memory:,.0f} GB "
     "of node memory."
 )
 NEED_ONE = "One install holds this fleet. Its containers need:"
@@ -90,14 +86,14 @@ SIZED_MODEL = "(From the model's lines: this size is past every measured fleet.)
 NEED_INTRO = "Split into {installs:,} installs of about {per_install:.0f} clusters each. Each install needs:"
 SHELL_TOGGLE = "Assume an operator change lets the sandbox shell be sized too"
 SHELL_HELP = (
-    "GKE would run a larger shell. Its 2 CPU and 2 GiB are fixed by the kube-agents operator "
+    "GKE would run a larger shell. Its 2 CPU and 2.1 GB (2 GiB) are fixed by the kube-agents operator "
     f"({hl.SHELL_RESOURCES_SOURCE}), and no PlatformAgent field changes them today."
 )
 LIMITS_TABLE_CAPTION = (
-    "Memory in MiB, CPU in cores; 0 is no limit. A container's limit can go up to what one node "
-    "holds: on GKE Standard about 120 CPU and 480 GiB on an n2-standard-128 node; GKE Autopilot "
-    "caps a Pod lower, by compute class. The sandbox shell's 2 CPU and 2 GiB are set by the "
-    "kube-agents operator, not by GKE, unless the option above assumes otherwise."
+    "Each container's size is its limit: memory in GB, CPU in cores; 0 is no limit. A container can "
+    "be as large as one node holds: on GKE Standard about 120 CPU and 480 GB on an n2-standard-128 "
+    "node; GKE Autopilot caps a Pod lower, by compute class. The sandbox shell's 2 CPU and 2.1 GB "
+    "(2 GiB) are set by the kube-agents operator, not by GKE, unless the option above assumes otherwise."
 )
 NO_MACHINE = "No listed machine type holds the largest pod: {memory} of memory and {cpu} of CPU."
 NEED_CAPTION = (
@@ -224,10 +220,11 @@ stall_seconds = hl.stall_watch_seconds_per_cluster(records)
 stall_clusters = hl.STALL_WATCH_BUDGET_SECONDS / stall_seconds if stall_seconds else None
 per_install_clusters = min(fleet[hl.CLUSTERS], held) if held else plan.fleet[hl.CLUSTERS]
 installs = max(-(-int(round(fleet[hl.CLUSTERS])) // int(per_install_clusters)), 1) if per_install_clusters else plan.installs
-install_fleet = hl.scaled_fleet(fleet, fleet[hl.CLUSTERS] / installs)
-recommendations, sized_from = hl.measured_recommendations(records, install_fleet, containers)
+split = hl.split_fleet(records, fleet, containers, installs)
+installs, install_fleet = split.installs, split.fleet
+recommendations, sized_from = split.recommendations, split.sized_from
 shell_settable = st.toggle(SHELL_TOGGLE, value=False, help=SHELL_HELP, key=f"{KEY_PREFIX}:shell_settable")
-with st.expander("Fine-tune the container limits"):
+with st.expander("Change the container size"):
     st.caption(LIMITS_TABLE_CAPTION)
     number_column = st.column_config.NumberColumn(min_value=0.0, format=NUMBER_FORMAT)
     edited = st.data_editor(
@@ -243,36 +240,35 @@ with st.expander("Fine-tune the container limits"):
     )
 limits = hl.limits_from_table(edited)
 
-resource_checks = hl.resource_checks(records, fleet, containers, limits)
-threshold_checks = hl.threshold_checks(records, fleet, containers)
 forecast = hl.bottleneck_series(records, fleet, limits)
 first = hl.first_crossing(forecast)
-container_failing = [check for check in resource_checks if check.status == hl.FAIL]
 
 st.subheader("Can this fleet be handled?")
-if not container_failing:
-    st.success(CONTAINERS_OK)
-else:
-    first_failing = hl.first_limit(container_failing) or container_failing[0]
-    where = ""
-    if first is not None and first[1] > forecast[0].clusters[0]:
-        where = f", at about {first[1]:,.0f} clusters"
-    elif first is not None:
-        where = ", already at the smallest fleet"
-    st.error(CONTAINERS_RAISE.format(count=len(container_failing), first=first_failing.label, where=where))
 stall_reach = stall_clusters or held
-if held and fleet[hl.CLUSTERS] <= min(held, stall_reach):
-    st.success(FIXED_OK.format(clusters=fleet[hl.CLUSTERS], held=held, stall=stall_reach))
-elif held:
-    st.error(
-        FIXED_SPLIT.format(
-            clusters=fleet[hl.CLUSTERS],
-            installs=installs,
-            per_install=fleet[hl.CLUSTERS] / installs,
-            held=held,
-            stall_installs=max(-(-int(round(fleet[hl.CLUSTERS])) // max(int(stall_reach), 1)), 1),
-        )
+stall_installs = max(-(-int(round(fleet[hl.CLUSTERS])) // max(int(stall_reach or 1), 1)), 1)
+if installs == 1:
+    split_text = SPLIT_NONE.format(clusters=fleet[hl.CLUSTERS])
+else:
+    split_text = SPLIT_NEEDED.format(
+        clusters=fleet[hl.CLUSTERS], held=held or 0.0, installs=installs,
+        per_install=install_fleet[hl.CLUSTERS], stall_installs=stall_installs,
     )
+# The same sizes the list below gives: a settable container is short where its need passes its size.
+needs = hl.size_needs(recommendations, limits)
+short = [
+    f"{need.name} {resource}"
+    for need in needs
+    if need.container not in hl.FIXED_LIMIT_CONTAINERS or shell_settable
+    for resource in need.short
+]
+size_name = "recommended" if preset == hl.LIMITS_RECOMMENDED else preset.split(":", 1)[0]
+if split.impossible:
+    names = ", ".join(hl.CONTAINER_NAMES.get(item.container, item.container) for item in split.impossible)
+    st.error(VERDICT_IMPOSSIBLE.format(split=split_text, names=names))
+elif short:
+    st.error(VERDICT_SHORT.format(split=split_text, size=size_name, short=", ".join(short)))
+else:
+    st.success(VERDICT_OK.format(split=split_text, size=size_name))
 shell_peak = max(
     (run.value(hl.CPU_PEAK, hl.SHELL_CONTAINER) or 0.0 for run in records if run.totals.get(hl.CLUSTERS) == held),
     default=0.0,
@@ -292,11 +288,10 @@ with st.expander("Why these limits cannot be raised"):
     )
 
 st.subheader("How big it needs to be")
-needs = hl.size_needs(recommendations, limits)
 bullets = []
 for need in needs:
     size = f"{hl.cpu_cores_text(need.cpu_cores)} CPU, {hl.memory_text(need.memory_bytes)}"
-    if need.container in hl.FIXED_LIMIT_CONTAINERS:
+    if need.container in hl.FIXED_LIMIT_CONTAINERS and not shell_settable:
         # A fixed container cannot be given the margin, so its peak itself is compared with the limit.
         fixed = need.current
         peak_cpu = (need.cpu_cores or 0.0) / (1 + hl.SAFETY_MARGIN)
@@ -308,12 +303,13 @@ for need in needs:
             f"raises ({state})."
         )
     elif need.enough:
-        bullets.append(f"- **{need.name}:** needs about {size}; the chosen size is enough.")
+        bullets.append(f"- **{need.name}:** needs about {size}; the chosen container size is enough.")
     else:
         current = need.current
         bullets.append(
-            f"- **{need.name}:** needs about {size}; the chosen size gives "
-            f"{hl.cpu_cores_text(current.get(hl.LIMIT_CPU))} CPU, {hl.memory_text(current.get(hl.LIMIT_MEMORY))}: raise it."
+            f"- **{need.name}:** needs about {size}; the chosen container size gives "
+            f"{hl.cpu_cores_text(current.get(hl.LIMIT_CPU))} CPU, {hl.memory_text(current.get(hl.LIMIT_MEMORY))}: "
+            f"too little {' and '.join(need.short)}."
         )
 bullets.append("- **LiteLLM, the operator and the rest:** their defaults are enough.")
 nodes = hl.node_plan(recommendations, hl.latest_replicas(records))
@@ -324,8 +320,8 @@ if nodes.pods and nodes.machine is not None:
             per_install=install_fleet[hl.CLUSTERS],
             nodes=nodes.nodes,
             machine=nodes.machine.name,
-            memory=hl.memory_quantity(nodes.total_memory_bytes),
-            cpu=hl.cpu_quantity(nodes.total_cpu_cores),
+            memory=hl.memory_text(nodes.total_memory_bytes),
+            cpu=f"{hl.cpu_cores_text(nodes.total_cpu_cores)} CPU",
             pvc=hl.storage_quantity(hl.with_margin(pvc.value)) if pvc else hl.NO_VALUE,
         )
     )
@@ -336,7 +332,7 @@ if nodes.pods and nodes.machine is not None:
                 total_nodes=nodes.nodes * installs,
                 machine=nodes.machine.name,
                 vcpu=nodes.nodes * installs * nodes.machine.vcpu,
-                node_memory=nodes.nodes * installs * nodes.machine.memory_gib,
+                node_memory=nodes.nodes * installs * nodes.machine.memory_gib * hl.GIB / hl.GB,
             )
         )
 heading = NEED_INTRO.format(installs=installs, per_install=install_fleet[hl.CLUSTERS]) if installs > 1 else NEED_ONE
@@ -346,17 +342,17 @@ st.caption(NEED_CAPTION)
 if nodes.pods and nodes.machine is None:
     st.error(
         NO_MACHINE.format(
-            memory=hl.memory_quantity(nodes.largest_memory_bytes), cpu=hl.cpu_quantity(nodes.largest_cpu_cores)
+            memory=hl.memory_text(nodes.largest_memory_bytes), cpu=f"{hl.cpu_cores_text(nodes.largest_cpu_cores)} CPU"
         )
     )
 
 st.subheader("Which limit the fleet reaches first")
 if first is None:
-    st.markdown(f"With these container sizes, no key limit is reached up to {FORECAST_CEILING} clusters.")
+    st.markdown(f"With this container size, no key limit is reached up to {FORECAST_CEILING} clusters.")
 elif first[1] <= forecast[0].clusters[0]:
-    st.markdown(f"With these container sizes, **{first[0].label}** is past its limit at every fleet size.")
+    st.markdown(f"With this container size, **{first[0].label}** is past its limit at every fleet size.")
 else:
-    st.markdown(f"With these container sizes, the first limit reached is **{first[0].label}**, at about {first[1]:,.0f} clusters.")
+    st.markdown(f"With this container size, the first limit reached is **{first[0].label}**, at about {first[1]:,.0f} clusters.")
 st.plotly_chart(
     bottleneck_chart(
         forecast,

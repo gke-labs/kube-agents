@@ -148,6 +148,8 @@ CONTAINER_LIMIT_KEYS = MappingProxyType({MEMORY_PEAK: LIMIT_MEMORY, CPU_PEAK: LI
 
 MIB = 1024**2
 GIB = 1024**3
+# The page shows memory in decimal gigabytes.
+GB = 1000**3
 MILLICORES_PER_CORE = 1000
 # Displayed values from this magnitude up show no decimals.
 WHOLE_NUMBER_FROM = 100
@@ -201,8 +203,8 @@ LIMIT_LABEL = "{container} limit"
 PVC_CAPACITY_LABEL = "PVC capacity {capacity}"
 # The columns of the editable limits table.
 LIMIT_CONTAINER_COLUMN = "Container"
-LIMIT_MEMORY_COLUMN = "Memory limit (MiB)"
-LIMIT_CPU_COLUMN = "CPU limit (cores)"
+LIMIT_MEMORY_COLUMN = "Memory (GB)"
+LIMIT_CPU_COLUMN = "CPU (cores)"
 
 # The PlatformAgent field that sets each harness container's resources. The
 # order is also the order of the containers' chart colours.
@@ -312,7 +314,7 @@ class MetricSpec:
 
 METRICS = MappingProxyType(
     {
-        MEMORY_PEAK: MetricSpec("Memory peak", "MiB", MIB),
+        MEMORY_PEAK: MetricSpec("Memory peak", "GB", GB),
         CPU_PEAK: MetricSpec("CPU peak", "cores"),
         CPU_SECONDS: MetricSpec("CPU used over the window", "core-s"),
         RESTARTS: MetricSpec("Restarts"),
@@ -440,24 +442,26 @@ LIMIT_REACHED = 1.0
 # Container sizes, smallest first. S is what GKE Autopilot without bursting gives (each request
 # becomes the limit), M the defaults of a Standard install, L a raised size a large fleet uses. XL
 # is the most a container can practically get on GKE Standard: a Pod has to fit on one node, and
-# one n2-standard-128 node has about 127 CPU and 495 GiB allocatable; 120 CPU and 480 GiB leave
+# one n2-standard-128 node has about 127 CPU and 530 GB allocatable; 120 CPU and 480 GB leave
 # room for the node's DaemonSets. The sandbox shell keeps the operator's fixed 2 CPU and 2 GiB in
 # every size unless the page assumes an operator change that makes it settable.
 LIMITS_S = "S: GKE Autopilot without bursting (limits equal the requests)"
 LIMITS_M = "M: defaults of a Standard install"
-LIMITS_L = "L: agent 8 CPU / 16 GiB, credential proxy 8 CPU / 8 GiB, event watcher 2 CPU / 4 GiB"
-LIMITS_XL = "XL: the largest practical on GKE Standard, one n2-standard-128 node per container (120 CPU / 480 GiB)"
+LIMITS_L = "L: agent 8 CPU / 16 GB, credential proxy 8 CPU / 8 GB, event watcher 2 CPU / 4 GB"
+LIMITS_XL = "XL: the largest practical on GKE Standard, one n2-standard-128 node per container (120 CPU / 480 GB)"
 LIMITS_RECOMMENDED = "Recommended for this fleet"
 LIMIT_PRESETS = (LIMITS_S, LIMITS_M, LIMITS_L, LIMITS_XL, LIMITS_RECOMMENDED)
 LARGEST_CPU = 120.0
-LARGEST_MEMORY = 480 * GIB
+LARGEST_MEMORY = 480 * GB
+# How fast the split grows when an install's containers do not fit: half again as many installs per step.
+SPLIT_GROWTH = 1.5
 RAISED_LIMITS = MappingProxyType(
     {
         LIMITS_L: {
-            "platform-agent": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 16 * GIB},
-            "envoy-credential-proxy": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GIB},
-            "agent-api-auth": {LIMIT_CPU: 2.0, LIMIT_MEMORY: 4 * GIB},
-            SHELL_CONTAINER: {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GIB},
+            "platform-agent": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 16 * GB},
+            "envoy-credential-proxy": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GB},
+            "agent-api-auth": {LIMIT_CPU: 2.0, LIMIT_MEMORY: 4 * GB},
+            SHELL_CONTAINER: {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GB},
         },
         LIMITS_XL: {
             name: {LIMIT_CPU: LARGEST_CPU, LIMIT_MEMORY: LARGEST_MEMORY}
@@ -1069,11 +1073,11 @@ def usual_requests(records: Iterable[Record]) -> dict[str, dict[str, float]]:
 def limit_table(
     limits: Mapping[str, Mapping[str, float]], selected: Sequence[str]
 ) -> dict[str, list]:
-    """The limits as an editable table, in MiB and cores; 0 is no limit."""
+    """The limits as an editable table, in GB and cores; 0 is no limit."""
     return {
         LIMIT_CONTAINER_COLUMN: list(selected),
         LIMIT_MEMORY_COLUMN: [
-            limits.get(name, {}).get(LIMIT_MEMORY, 0.0) / MIB for name in selected
+            limits.get(name, {}).get(LIMIT_MEMORY, 0.0) / GB for name in selected
         ],
         LIMIT_CPU_COLUMN: [limits.get(name, {}).get(LIMIT_CPU, 0.0) for name in selected],
     }
@@ -1085,8 +1089,8 @@ def limits_from_table(table: Mapping[str, Sequence[Any]]) -> dict[str, dict[str,
         table[LIMIT_CONTAINER_COLUMN], table[LIMIT_MEMORY_COLUMN], table[LIMIT_CPU_COLUMN]
     )
     return {
-        name: {LIMIT_MEMORY: _cell(memory_mib) * MIB, LIMIT_CPU: _cell(cores)}
-        for name, memory_mib, cores in rows
+        name: {LIMIT_MEMORY: _cell(memory_gb) * GB, LIMIT_CPU: _cell(cores)}
+        for name, memory_gb, cores in rows
     }
 
 
@@ -1835,10 +1839,19 @@ class SizeNeed:
     current: dict[str, float]
 
     @property
-    def enough(self) -> bool:
+    def short(self) -> tuple[str, ...]:
+        """The resources the current limit gives too little of: "memory", "CPU", or none."""
         memory = self.current.get(LIMIT_MEMORY) or math.inf
         cpu = self.current.get(LIMIT_CPU) or math.inf
-        return (self.memory_bytes or 0.0) <= memory and (self.cpu_cores or 0.0) <= cpu
+        return tuple(
+            name
+            for name, need, limit in (("memory", self.memory_bytes, memory), ("CPU", self.cpu_cores, cpu))
+            if (need or 0.0) > limit
+        )
+
+    @property
+    def enough(self) -> bool:
+        return not self.short
 
 
 def size_needs(
@@ -1891,6 +1904,46 @@ def measured_recommendations(
             )
         )
     return chosen, at
+
+
+def too_large(items: Iterable[Recommendation]) -> list[Recommendation]:
+    """The recommendations no container on GKE can hold: past the largest practical node's share."""
+    return [
+        item for item in items
+        if (item.memory_bytes or 0.0) > LARGEST_MEMORY or (item.cpu_cores or 0.0) > LARGEST_CPU
+    ]
+
+
+@dataclass(frozen=True)
+class InstallSplit:
+    """How a fleet is split so every install fits its fixed limits and the largest containers."""
+
+    installs: int
+    fleet: dict[str, float]
+    recommendations: list[Recommendation]
+    # The measured fleet size the recommendations come from; None when they are the model's lines.
+    sized_from: float | None
+    # Containers that need more than the largest size even at one cluster per install.
+    impossible: list[Recommendation]
+
+
+def split_fleet(
+    records: Sequence[Record], fleet: Mapping[str, float], containers: Sequence[str], installs: int
+) -> InstallSplit:
+    """From ``installs``, add installs until every container's recommended size fits on GKE.
+
+    One cluster per install is the floor: a container that still needs more than the largest
+    size there makes the fleet impossible to hold on GKE with today's code.
+    """
+    clusters = max(fleet[CLUSTERS], 1.0)
+    count = max(installs, 1)
+    while True:
+        share = scaled_fleet(fleet, clusters / count)
+        chosen, sized_from = measured_recommendations(records, share, containers)
+        over = too_large(chosen)
+        if not over or count >= clusters:
+            return InstallSplit(count, share, chosen, sized_from, over)
+        count = min(math.ceil(count * SPLIT_GROWTH), math.ceil(clusters))
 
 
 def measured_clusters(records: Iterable[Record]) -> float:
@@ -2311,12 +2364,10 @@ def nodes_needed(machine: MachineType, memory_bytes: float, cpu_cores: float) ->
 
 
 def memory_text(value_bytes: float | None) -> str:
-    """Memory as a reader says it: "4 GiB", "512 MiB"; no limit when there is none."""
+    """Memory as a reader says it, in GB rounded up to a tenth: "4.3 GB"; no limit when there is none."""
     if not value_bytes:
         return NO_LIMIT_TEXT
-    if value_bytes >= GIB:
-        return f"{math.ceil(value_bytes / GIB * 2) / 2:g} GiB"
-    return f"{math.ceil(value_bytes / MIB):,.0f} MiB"
+    return f"{math.ceil(value_bytes / GB * 10) / 10:g} GB"
 
 
 def cpu_cores_text(cores: float | None) -> str:
