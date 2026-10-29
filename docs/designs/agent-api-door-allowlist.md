@@ -522,10 +522,9 @@ tells an operator whether anything of theirs would be refused.
 2. **`/p/{profile}` routes.** The door re-signs them with the non-secret sentinel, and Hermes checks a
    profile-scoped key for a named profile. Do profile routes work through the door at all today?
    If not, the descriptor can leave them out.
-3. **Runs and jobs reachability.** Today `/api/jobs` and `/v1/runs` are open to a key holder.
-   Phase 2 closes them through the door. Before that, can a job or run be pointed at an `a2a-*`
-   session other than through the top-level `session_id` the door checks? If so, phase 2 should go
-   first.
+3. **Runs and jobs reachability.** Today `/api/jobs` and `/v1/runs` are open to a key holder,
+   and phase 2 closes them through the door. Before that, can a job or run reach an `a2a-*` session
+   by a path the door doesn't check? If so, phase 2 should go first.
 4. **Stream idle timeout.** The door's upstream socket timeout is 300 s (CP:2734-2736). Does a
    quiet `chat/stream` or `turn.respond` stream hit it? The descriptor's `stream` flag could carry
    a per-route idle timeout.
