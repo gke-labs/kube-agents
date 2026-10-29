@@ -1763,8 +1763,17 @@ class Sender:
             return f"chat api (space set, {TOKEN_ENV} missing)"
         return "webhook" if self.webhook else "unconfigured"
 
-    def request(self, text: str) -> urllib.request.Request:
-        body = json.dumps({"text": text}).encode("utf-8")
+    @staticmethod
+    def body(text: str, card: dict | None = None) -> dict:
+        """The message: ``text``, or with a cardsV2 ``card`` the card and
+        ``text`` as its fallback (what a notification or a client without
+        cards shows; Chat would print a ``text`` above the card as well)."""
+        if card is None:
+            return {"text": text}
+        return {"fallbackText": text, "cardsV2": [card]}
+
+    def request(self, text: str, card: dict | None = None) -> urllib.request.Request:
+        body = json.dumps(self.body(text, card)).encode("utf-8")
         headers = {"Content-Type": "application/json; charset=UTF-8", "User-Agent": USER_AGENT}
         if self.space and self.token:
             url = f"{CHAT_API_ROOT}/{CHAT_MESSAGES_PATH.format(space=self.space)}"
@@ -1773,10 +1782,10 @@ class Sender:
             url = self.webhook
         return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, card: dict | None = None) -> bool:
         """POST once. True on 2xx; a failure is logged without the URL."""
         try:
-            with self.opener(self.request(text), timeout=REQUEST_TIMEOUT_S) as response:
+            with self.opener(self.request(text, card), timeout=REQUEST_TIMEOUT_S) as response:
                 status = getattr(response, "status", 200)
         except urllib.error.HTTPError as exc:
             log(f"post failed: HTTP {exc.code} from {self.describe()}")
