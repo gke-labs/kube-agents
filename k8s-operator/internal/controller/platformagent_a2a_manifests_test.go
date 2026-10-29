@@ -721,19 +721,21 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
 	sub := rest[strings.Index(rest, "subscribe"):]
-	var got, gotSub []string
-	for _, line := range strings.Split(pub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			got = append(got, strings.Trim(line, `"`))
-		}
+	subDeny := ""
+	if i := strings.Index(sub, "deny"); i >= 0 {
+		sub, subDeny = sub[:i], sub[i:]
 	}
-	for _, line := range strings.Split(sub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			gotSub = append(gotSub, strings.Trim(line, `"`))
+	quoted := func(block string) []string {
+		var out []string
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+			if strings.HasPrefix(line, `"`) {
+				out = append(out, strings.Trim(line, `"`))
+			}
 		}
+		return out
 	}
+	got, gotSub, gotSubDeny := quoted(pub), quoted(sub), quoted(subDeny)
 	want := []string{
 		"$JS.API.INFO",
 		"$JS.API.STREAM.INFO.TASKS",
@@ -761,6 +763,10 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
+	}
+	// web's subtraction: `a2a.>` covers the verifier's queue group.
+	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
 	// body lists every key. Nor the KV data plane.

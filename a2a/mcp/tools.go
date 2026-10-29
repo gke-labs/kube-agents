@@ -36,7 +36,9 @@ const (
 
 // MaxTurnWait is the longest a turn tool holds a request: the wait for the
 // lock and the gateway's submission, plus the longest answer wait a caller
-// may ask for. Every turn call is held to it, whatever the client allows.
+// may ask for. The noticeSettle window after the submission is spent inside
+// it: noticeGrace is slack on that path. Every turn call is held to it,
+// whatever the client allows.
 const MaxTurnWait = submissionWait + noticeGrace + maxWaitSeconds*time.Second
 
 // TurnBus is what the turn tools need from the bus.
@@ -83,37 +85,43 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
-			token, err := convs.Resolve(a.Conversation, a.ConversationToken)
-			if err != nil {
-				return "", err
-			}
-			// The wait covers any wait for the conversation's running turn
-			// too, so a second message waits rather than being steered
-			// into it.
-			start, wait := time.Now(), waitFor(a.WaitSeconds)
-			res, w, err := bus.SendTurn(ctx, convs, token, a.Text, wait)
-			if err != nil {
-				return "", err
-			}
-			var sb strings.Builder
-			writeConversation(&sb, a.Conversation, token, a.ConversationToken != "")
-			writeNotices(&sb, res.Notices)
-			if res.Task == nil {
-				if len(res.Notices) == 0 {
-					sb.WriteString("The gateway answered with no task and no notice.\n")
-				}
-				return sb.String(), nil
-			}
-			out, err := bus.WaitForTurn(ctx, w, *res.Task, max(wait-time.Since(start), minAnswerWait))
-			if err != nil {
-				fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
-				return sb.String(), nil
-			}
-			convs.setRunning(token, out.Unfinished())
-			writeOutcome(&sb, out)
-			return sb.String(), nil
+			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, waitFor(a.WaitSeconds))
 		},
 	}
+}
+
+// sendAndWait sends text as one turn of the conversation named by alias or
+// token and renders what came of it: the gateway's notices, and the turn's
+// task as it stands after wait.
+func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
+	token, byToken, err := convs.ResolveCall(alias, token)
+	if err != nil {
+		return "", err
+	}
+	// The wait covers any wait for the conversation's running turn too, so
+	// a second message waits rather than being steered into it.
+	start := time.Now()
+	res, w, err := bus.SendTurn(ctx, convs, token, text, wait)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	writeConversation(&sb, alias, token, byToken)
+	writeNotices(&sb, res.Notices)
+	if res.Task == nil {
+		if len(res.Notices) == 0 {
+			sb.WriteString("The gateway answered with no task and no notice.\n")
+		}
+		return sb.String(), nil
+	}
+	out, err := bus.WaitForTurn(ctx, w, *res.Task, max(wait-time.Since(start), minAnswerWait))
+	if err != nil {
+		fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
+		return sb.String(), nil
+	}
+	convs.setRunning(token, out.Unfinished())
+	writeOutcome(&sb, out)
+	return sb.String(), nil
 }
 
 type taskControlArgs struct {
@@ -169,7 +177,7 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 				writeTask(&sb, ref, task)
 				return sb.String(), nil
 			case actionStop:
-				token, err := convs.Resolve(a.Conversation, a.ConversationToken)
+				token, byToken, err := convs.ResolveCall(a.Conversation, a.ConversationToken)
 				if err != nil {
 					return "", err
 				}
@@ -178,7 +186,7 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 					return "", err
 				}
 				var sb strings.Builder
-				writeConversation(&sb, a.Conversation, token, a.ConversationToken != "")
+				writeConversation(&sb, a.Conversation, token, byToken)
 				sb.WriteString("Sent stop.\n")
 				writeNotices(&sb, res.Notices)
 				return sb.String(), nil
@@ -227,7 +235,8 @@ func waitFor(seconds int) time.Duration {
 
 // writeConversation names the conversation a call used. A call that named a
 // token used that conversation whatever alias came with it, so it is named
-// by the token alone.
+// by the token alone; otherwise the alias is the caller's, so it is shown as
+// an inert cell.
 func writeConversation(sb *strings.Builder, alias, token string, byToken bool) {
 	if byToken {
 		fmt.Fprintf(sb, "Conversation by token `%s`.\n\n", token)
@@ -236,7 +245,7 @@ func writeConversation(sb *strings.Builder, alias, token string, byToken bool) {
 	if alias == "" {
 		alias = DefaultConversation
 	}
-	fmt.Fprintf(sb, "Conversation `%s` (token `%s`).\n\n", alias, token)
+	fmt.Fprintf(sb, "Conversation %s (token `%s`).\n\n", cell(alias), token)
 }
 
 // writeNotices quotes each notice whole, line breaks and all: for a settled

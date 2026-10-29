@@ -56,9 +56,9 @@ const (
 	// Living under `a2a.` rather than `_INBOX` has a consequence that an
 	// earlier revision of this comment got wrong, and the way it was wrong
 	// is worth keeping. `a2a.>` is a real subscribe grant on this bus — the
-	// read-only `web` user, the one credential published to a browser,
-	// holds it — and that grant covers both subjects above. The comment
-	// used to reason about what a browser could OBSERVE there (caller, key,
+	// read-only `web` user and the `console` user, the two credentials
+	// published to a browser, hold it — and that grant covers both
+	// subjects above. The comment used to reason about what a browser could OBSERVE there (caller, key,
 	// revision, verb, verdict; never a capability, since neither message
 	// carries one) and accept it as a subset of what `web` already reads
 	// off `a2a.tasks.>`.
@@ -74,7 +74,8 @@ const (
 	// task on the bus and rejected some of them. A subscriber on a
 	// request subject intercepts; it does not merely watch.
 	//
-	// So `web` is denied `a2a.cap.>` outright (webIdentity, in
+	// So `web` and `console` are denied `a2a.cap.>` outright (webIdentity
+	// and consoleIdentity, in
 	// k8s-operator/internal/controller/platformagent_a2a_identities.go).
 	// The general rule this leaves behind: any future grant wide enough to
 	// cover VerifySubscribe has to be checked against queue-group theft,
@@ -121,12 +122,19 @@ func callerFromSubject(subject string) (string, error) {
 	return rest, nil
 }
 
-// Request is what a broker asks. It carries no identity: the subject carries
+// Request is what a broker asks, or the dispatcher asking profile.run. It carries no identity: the subject carries
 // that, and a payload field would be one the caller writes.
 type Request struct {
 	Ref      Ref   `json:"ref"`
 	Verb     Verb  `json:"verb"`
 	Resource Scope `json:"resource"`
+
+	// Profile and Tier are profile.run's, and only profile.run's: what the
+	// dispatcher means to run and at which tier. Any other verb carrying
+	// either is refused, so a field one verb reads can never be quietly
+	// ignored by another.
+	Profile string `json:"profile,omitempty"`
+	Tier    Tier   `json:"tier,omitempty"`
 }
 
 // Response is a verdict and the rule behind it. It deliberately does NOT carry
@@ -190,6 +198,15 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 			s.Log.Error("capability store unavailable; failing closed", "err", err)
 		}
 		return Response{Reason: WalkRefused}
+	}
+	if req.Verb == VerbProfileRun {
+		if err := PermitsProfile(leaf, req.Profile, req.Tier, req.Resource); err != nil {
+			return Response{Reason: Reason(err)}
+		}
+		return Response{Allowed: true}
+	}
+	if req.Profile != "" || req.Tier != "" {
+		return Response{Reason: "profile and tier are only read for profile.run"}
 	}
 	if err := Permits(leaf, req.Verb, req.Resource); err != nil {
 		return Response{Reason: Reason(err)}
@@ -389,7 +406,18 @@ var errUnreachable = refuse(unreachableRule)
 // ctx ends the wait too, with the unreachable refusal, so a caller that is
 // shutting down or was canceled tells the two apart by ctx.Err() as before.
 func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
-	b, err := json.Marshal(Request{Ref: ref, Verb: v, Resource: r})
+	return c.check(ctx, Request{Ref: ref, Verb: v, Resource: r})
+}
+
+// CheckProfileRun asks profile.run: may the grant at ref run profile at tier
+// for target. target is the task's target scope, or the install's namespace
+// scope for a task with none; it is never empty.
+func (c *Client) CheckProfileRun(ctx context.Context, ref Ref, profile string, tier Tier, target Scope) error {
+	return c.check(ctx, Request{Ref: ref, Verb: VerbProfileRun, Resource: target, Profile: profile, Tier: tier})
+}
+
+func (c *Client) check(ctx context.Context, req Request) error {
+	b, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}

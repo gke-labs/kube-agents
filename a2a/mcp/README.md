@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-It answers `connection_status` and `read_topics`, and the turn tools `send_message` and `task_control`. Further tools come in later changes.
+It answers `connection_status` and `read_topics`, the turn tools `send_message` and `task_control`, and `manage_session`. Further tools come in later changes.
 
 ## Turn it on
 
@@ -43,3 +43,22 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 `connection_status` reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the platform agent are consuming, and the agents registered on `DIRECTORY`. It reads all of it through the console's grants, at most once every five seconds whatever the call rate. Agent names and descriptions are shown as code, as published, shortened.
 
 `read_topics` reads the install's standing topics and agent cards, through the same grants. `list` shows every topic provisioned on `TOPICS-STATE` and `TOPICS-JOURNAL` with its newest entry, or that it has none yet (up to 256 per stream; past that the list says so). `read` shows one topic: a state topic's latest entry, or a journal topic's newest 16 entries from the last 1024 messages of its stream, or its latest entry alone if none falls in that window. `cards` shows the agent cards on `DIRECTORY`. A topic is named by its name, `shared.<name>` or `agent.<agent>.<name>`, or its subject; a bare name that several topics share is refused as ambiguous. A name that is not dot-separated subject tokens is refused before the bus is asked, and one that names no provisioned topic is refused before any consumer is opened. A repeated call within five seconds is answered from the last read. Entries are written by agents and shown as quoted data: one line each in the list, fenced and capped at 2 KiB per summary and per data block in a read. Every caller reads every topic the console can.
+
+## Conversations
+
+Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). A token given where a name goes, in either form, names that conversation too, whether or not this server still holds a name for it. There is no server-wide active conversation.
+
+Names are this server's memory only, and they're shared:
+
+- A restart forgets them, and so does the table itself past 1024 names, starting with the least recently used. A conversation resumes by its token either way.
+- Every caller holds the same bearer token, so every caller sees and can use every name.
+- A name is at most 128 characters, and holds nothing `list` couldn't show back as typed: no backticks, pipes, control or invisible characters, spaces at either end, doubled or other than the plain space, and nothing spelled like a token (`mcp` and 24 lower-case hex digits).
+
+`manage_session` handles the names and the console's control turns:
+
+- `list`: the named conversations, most recently used first, with token, description and last use;
+- `new`: create a name, with an optional description of at most 200 characters; an existing name is refused;
+- `delete`: forget a name, given as the name or as the conversation's token. The conversation's history stays on the bus, and a `/session` worker for it idles out by itself. To end one now, stop its running task and send `session_off` first;
+- `session_on`, `session_off`, `help`: send `/session`, `/session off` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `help` is a message to the agent, sent like any other: while the conversation's turn is still running it waits for it to end, as a second `send_message` does.
+
+The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.

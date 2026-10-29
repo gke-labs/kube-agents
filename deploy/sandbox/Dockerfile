@@ -77,16 +77,9 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # The credential-free utility CLIs: yq and helm (at the versions the agent
-# image carried before #737 moved them here) plus leeway for GKE capacity,
-# spot, and zonal topology-skew diagnostics. This is their only home —
-# deploy/docker's step 2 says so and its guard enforces it — so a version bump
-# has one place to happen. leeway holds no credentials of its own; inside the
-# sandbox session `CREDENTIAL_PROXY_URL` is set (`pkg/clusters/broker.go`:
-# `BrokerFromEnv` sets `ShellMode: true`), so `leeway report` (`v0.1.3+`) leaves
-# `Cluster.Config = nil` and `fetchViaKubectl` (`pkg/report/collector.go`)
-# shells out to the sandbox's `kubectl` credential-proxy shim on `PATH`
-# (`/opt/credential-proxy/bin/kubectl`, governed by `KUBECTL_READ_VERBS`) rather
-# than dialing the Kubernetes API server directly through `client-go`.
+# image carried before #737 moved them here) plus leeway, below. This is their
+# only home — deploy/docker's step 2 says so and its guard enforces it — so a
+# version bump has one place to happen.
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
@@ -94,14 +87,35 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
-    tar -xzf /tmp/helm.tar.gz -C /tmp && \
+    tar -xzf /tmp/helm.tar.gz --no-same-owner -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
-    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH} && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz "https://github.com/go-steer/leeway/releases/download/v0.1.3/leeway_v0.1.3_linux_${ARCH}.tar.gz" && \
-    tar -xzf /tmp/leeway.tar.gz -C /usr/local/bin leeway && \
-    chmod +x /usr/local/bin/leeway && \
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+
+# leeway, for GKE capacity, spot, and zonal topology-skew diagnostics. It holds
+# no credentials of its own; inside the sandbox session `CREDENTIAL_PROXY_URL`
+# is set (`pkg/clusters/broker.go`: `BrokerFromEnv` sets `ShellMode: true`), so
+# `leeway report` (`v0.1.3+`) leaves `Cluster.Config = nil` and
+# `fetchViaKubectl` (`pkg/report/collector.go`) shells out to the sandbox's
+# `kubectl` credential-proxy shim on `PATH` (`/opt/credential-proxy/bin/kubectl`,
+# governed by `KUBECTL_READ_VERBS`) rather than dialing the Kubernetes API
+# server directly through `client-go`. Pinned and checked against the
+# release's SHA256SUMS, per architecture; a version bump moves the hashes and
+# the `leeway version` check in deploy/sandbox/smoke-test.sh with it.
+ARG LEEWAY_VERSION=0.1.3
+ARG LEEWAY_SHA256_AMD64=26380a054ae1e5291f915f3965705c5d4198aeec611c42db843fd0ddbea06854
+ARG LEEWAY_SHA256_ARM64=850d8b9cd8d745898f41d139c1284db0aa88c6b9a42a5a95e758f59b58a8bb5b
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "${ARCH}" in \
+      amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \
+      arm64) LEEWAY_SHA256="${LEEWAY_SHA256_ARM64}" ;; \
+      *) echo "no leeway checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz \
+      "https://github.com/go-steer/leeway/releases/download/v${LEEWAY_VERSION}/leeway_v${LEEWAY_VERSION}_linux_${ARCH}.tar.gz" && \
+    echo "${LEEWAY_SHA256}  /tmp/leeway.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/leeway.tar.gz --no-same-owner -C /usr/local/bin leeway && \
     rm -f /tmp/leeway.tar.gz && \
-    /usr/local/bin/leeway version
+    leeway version
 
 # OpenTofu, for one command: `tofu fmt -check -diff`, the gcp-terraform skill's
 # syntax check on the HCL it writes before a pull request. It is the only check

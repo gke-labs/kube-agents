@@ -899,6 +899,14 @@
 # provisioning the preferred tier. deployer: noop, transcript-only.
 ./tasks/autoscaler-zonal-stockout-cooldown-scope-probe/task.yaml
 
+# #3702: the onboarding sweep under a first-run cluster card cap of 2, below the
+# eval fleet's roster so it binds. Cards for the first two Cluster Agents by
+# profile name only, and the raw report shows the rest audited by the sweep
+# itself. The bootstrap-discovery stack, as bootstrap-discovery-fanout runs it
+# with a cap of 2 where the fan-out pins 24; the onboarding lock, so main-a.
+# Priced with the fan-out.
+./tasks/bootstrap-discovery-capped/task.yaml
+
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The
 # bootstrap-ranking stack with a planted report that has no critical finding;
