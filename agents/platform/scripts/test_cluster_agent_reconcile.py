@@ -3234,6 +3234,30 @@ class ScopeTest(HomesMixin):
         self.assertEqual(deleted, [])
         self.assertEqual(report["kept"], ["cluster-a"])
 
+    def test_a_refused_role_falls_back_to_gcloud_for_the_run(self):
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: {"status": 403, "error": {"code": "CALLER_ROLE_FORBIDDEN"}}})
+        report, deleted, lists, describes = self._relayed_run(
+            relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+        self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
+        self.assertEqual(deleted, [])
+
+    def test_a_not_found_body_under_another_status_is_unknown(self):
+        profiles, identities = self._profiles("odd")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()},
+                               gets={self._key("odd"): {"status": 400, "error": self.NOT_FOUND}})
+        report, deleted, _, _ = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["skipped_error"], ["cluster-odd"])
+
+    def test_an_answer_the_broker_could_not_project_goes_to_gcloud(self):
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()},
+                               gets={self._key("a"): {"status": 502, "error": {"code": "UPSTREAM_UNEXPECTED"}}})
+        report, deleted, _, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(report["kept"], ["cluster-a"])
+
     def test_a_helper_that_cannot_run_falls_back_to_gcloud(self):
         profiles, identities = self._profiles("a")
         report, _, lists, describes = self._relayed_run(lambda request, timeout: None, profiles, identities)
@@ -3326,6 +3350,21 @@ class ScopeTest(HomesMixin):
         self.assertEqual(deleted, [])
         self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b", "cluster-c"])
         self.assertTrue(any(b.get("clusters") for b in batches))
+
+    def test_a_malformed_identity_is_read_with_gcloud_not_the_relay(self):
+        # `x/../y`, `y?a=b` or `y#f` would reach the API as cluster `y`; such an identity is
+        # never put in a relay URL, and gcloud reads it as before.
+        profiles, identities = self._profiles("ok", "dots", "query", "frag")
+        identities["cluster-dots"] = dict(identities["cluster-dots"], cluster="x/../y")
+        identities["cluster-query"] = dict(identities["cluster-query"], cluster="y?a=b")
+        identities["cluster-frag"] = dict(identities["cluster-frag"], cluster="y#f")
+        batches, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={self._key("ok"): {"status": 200}})
+        report, deleted, _, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(["x/../y", "y#f", "y?a=b"], sorted(describes))
+        self.assertEqual([[self.MGMT, "us-central1", "ok"]], [c for b in batches for c in b.get("clusters", [])])
+        self.assertEqual(deleted, [])
+        self.assertFalse(rec._relayable("p", "us-central1", "a/b"))
+        self.assertTrue(rec._relayable("example.com:proj", "us-central1-a", "seeded-a"))
 
     def test_a_read_the_helper_never_started_goes_to_gcloud(self):
         profiles, identities = self._profiles("a", "b")

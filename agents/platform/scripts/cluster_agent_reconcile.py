@@ -421,7 +421,8 @@ def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WOR
 # gcloud stays the fallback, at two grains. For the rest of the run, when the relay
 # itself is unusable: the helper is missing (a sandbox image older than this script)
 # or broken, the broker refuses the host (a broker older than the routes) or this
-# caller's role, or every read in a batch failed before reaching the API. For one
+# caller's role, or every read in a batch failed in the relay (no answer from the
+# broker, a 401, the broker without its credential). For one
 # read, when the broker refused that read alone: a body over its cap, a path its
 # table does not take, an answer it could not project, or a read the helper's own
 # deadline left unstarted. A version skew between the pods costs speed, never
@@ -451,7 +452,16 @@ _RELAY_ROW_CODES = frozenset({"SECURITY_POLICY_BLOCKED", "UPSTREAM_UNEXPECTED", 
 # after the relay has accepted the read, and stay that read's "unknown" however many
 # rows carry them -- the management project is a batch of one.
 _RELAY_UNREACHABLE_CODES = frozenset({"RELAY_CREDENTIAL_UNAVAILABLE"})
+# A project, location or cluster name the helper may put in a URL path. Anything else
+# (a slash, a dot segment, a `?` or `#`, which `requests` would read as the end of the
+# path) is read with gcloud instead, so a malformed identity can never be looked up as
+# some other cluster.
+_RELAY_SEGMENT = re.compile(r"[a-z0-9][a-z0-9.:-]*")
 _relay_unusable_this_run = False
+
+
+def _relayable(*segments: str) -> bool:
+    return all(isinstance(x, str) and _RELAY_SEGMENT.fullmatch(x) and ".." not in x for x in segments)
 
 
 class _RelayUnusable(Exception):
@@ -621,6 +631,9 @@ def _relay_batch(kind: str, keys: dict, request: dict, rows_of, read, deadline: 
 
 def _relay_lists(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]] | None:
     """Each project the relay listed; see `_relay_batch` for what a missing key means."""
+    projects = [p for p in projects if _relayable(p)]
+    if not projects:
+        return {}
     return _relay_batch("listing", {p: p for p in projects}, {"projects": projects},
                         lambda answer: answer["lists"], _read_list, deadline)
 
@@ -629,7 +642,10 @@ def _relay_describes(keys: dict[str, dict], deadline: float) -> dict[str, tuple[
     """`name -> (exists, "")` for each identity the relay answered; see `_relay_batch`."""
     if not keys:
         return {}
-    triples = {name: (i["project"], i["location"], i["cluster"]) for name, i in keys.items()}
+    triples = {name: (i["project"], i["location"], i["cluster"]) for name, i in keys.items()
+               if _relayable(i["project"], i["location"], i["cluster"])}
+    if not triples:
+        return {}
     return _relay_batch("describing", {name: "/".join(t) for name, t in triples.items()},
                         {"clusters": [list(t) for t in triples.values()]}, lambda answer: answer["gets"],
                         lambda name, row: (_read_get(triples[name][0], row), ""), deadline)

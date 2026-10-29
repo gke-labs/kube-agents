@@ -18,7 +18,8 @@ already has, with the same caller authentication, refusal shape and audit line a
 
 The first table entries are the Monitoring `timeSeries` and `metricDescriptors` reads and the
 Managed Prometheus query endpoints; the Cloud Trace `traces` list and single-trace get followed,
-for the observability skill's trace helpers. A collector's one-function change is to obtain its
+for the observability skill's trace helpers, and then the GKE `projects.locations.clusters` list and
+get, for the Cluster Agent reconcile (#3703), with their answers projected. A collector's one-function change is to obtain its
 `requests`-shaped session from the broker client (`credential_proxy_client.ApiSession`)
 instead of from `google.auth`.
 
@@ -129,6 +130,7 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    | `API_RELAY_DEADLINE_S` passed after the connect                                   | 504    | `UPSTREAM_TIMEOUT`             |
    | The broker could not obtain its own credential                                    | 503    | `RELAY_CREDENTIAL_UNAVAILABLE` |
    | No relay armed on the handler (only a test reaches this)                          | 503    | `API_RELAY_DISABLED`           |
+   | A projected route's 2xx body the projection cannot read                           | 502    | `UPSTREAM_UNEXPECTED`          |
 
    The over-cap remedy is a smaller `pageSize`, which every listed endpoint supports; the
    message says so.
@@ -317,12 +319,15 @@ records it as its `limitations` string for a cluster gives the model something i
 
 ## Security review
 
-**What the model's code gains.** `GET` on the path shapes the table names, on two hosts,
-executed with the platform service account: metric data from Monitoring and Managed
-Prometheus, and every trace and span from Cloud Trace that the account can read. A
+**What the model's code gains.** `GET` on the path shapes the table names, executed with the
+platform service account: metric data from Monitoring and Managed Prometheus, every trace and
+span from Cloud Trace that the account can read, and each GKE cluster's name, location, status
+and id. The two GKE routes return only those four fields: the projection drops the rest of the
+cluster object, `masterAuth` included, and an answer it cannot read is a 502, not the raw body. A
 prompt-injected turn can read any project's metrics and traces that the account can read. It
 could already read the same clusters' objects through proxied `kubectl` and the same projects'
-resources through proxied `gcloud`; this adds Monitoring metric data and Trace to that set. The
+resources through proxied `gcloud`; this adds Monitoring metric data and Trace to that set, and
+the GKE fields above, which proxied `gcloud` already returns. The
 Trace-console writes `roles/cloudtrace.user` carries (analysis-report tasks, trace scopes) are
 not in it: the method check refuses everything but `GET` before the host is read.
 
@@ -459,10 +464,11 @@ tests above, and the route's mention in the documents that enumerate the broker'
 site's `reference/security-and-iam.md` and `reference/credential-isolation.md`,
 `docs/credential-isolation-design.md`, `docs/security-requirements.md` and the role table
 paragraph of `agent-shell-sandboxing.md`. Any script in the sandbox can read the Monitoring,
-Managed Prometheus and Trace reads the table names through it.
+Managed Prometheus, Trace and GKE cluster reads the table names through it.
 
 The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector
-(`fleet_health.py`, the chat-only fleet health sweep, reads the Managed Prometheus `query` route the same way),
+(`fleet_health.py`, the chat-only fleet health sweep, reads the Managed Prometheus `query` route the same way,
+and `gke_cluster_reads.py` makes the Cluster Agent reconcile's GKE list and get reads),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
 `ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's

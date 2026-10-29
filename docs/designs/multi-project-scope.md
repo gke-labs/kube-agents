@@ -545,9 +545,10 @@ retire it on that reading alone, because the index lags a move by minutes and a 
 would otherwise retire a project that merely moved: the member is kept, with `absentSince` stamped on
 its row, for a day (`INDEX_LAG_GRACE_SECONDS`), and only after that does it retire over the ordinary
 two clean runs; the declaration speaking, an `exclude.projects` entry or the container removed from
-the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `describe --project=<P>`
-meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
-classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
+the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile lookup in `<P>` (the relayed
+`clusters.get`, or `describe --project=<P>` on the gcloud fallback) meanwhile returns a 403, because
+the folder binding no longer covers it, which `_read_get` or `_cluster_exists` classifies as unknown
+and keeps. Moved to a different declared folder: no change, because resolution
 is by project; the `via` field records the new path and any placement clears the stamp, including a
 placement during the lag by the folder the project left. Dropped from `projects`, or from a folder the same edit removes, in the edit that
 declares the folder it moved into, a project is held the same day, since the index may not place it yet

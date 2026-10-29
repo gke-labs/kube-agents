@@ -18,7 +18,8 @@ Output: {"lists": {"p1": {"status": 200, "clusters": [["name", "location"], ...]
          "gets":  {"project/location/name": {"status": 200} | {"status": ..., "error": {...}}}}
 
 `budget_seconds` is this process's own deadline: a call starts only with time left in
-it, reads for no longer than that, and one it never started comes back as
+it, its connect and read timeouts together fit in what is left (a read timeout bounds
+each wait for bytes, and the broker writes its answer at once), and one it never started comes back as
 `{"status": 0, "error": {"skipped": "budget"}}` for the caller to read some other way.
 So the answer arrives inside the caller's wait however the calls are spread over the
 worker threads, and a slow call costs that one read.

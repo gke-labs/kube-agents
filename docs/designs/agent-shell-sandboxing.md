@@ -1329,7 +1329,8 @@ the operator's StatefulSet it is a root-owned copy inside a directory the model 
 the model can rename it aside and put its own in its place until the next start.
 `/opt/vcs/libexec/platform` is the second copy, root-owned and mode 0755, and it is the
 one a caller that logs in as `hermes` runs: the pull-request and issue crons forward a
-forge verb into this container rather than holding a forge CLI themselves, and running
+forge verb into this container rather than holding a forge CLI themselves, the Cluster
+Agent reconcile sends its GKE reads to `gke_cluster_reads.py` here, and running
 the data volume's copy over that session would hand the credential to whatever sits at
 that path. The read-only mount narrows that to the fallback, and the second copy stays
 as defence in depth. The whole import closure is staged, because `sys.path[0]` is the
