@@ -148,15 +148,15 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   internal project, service account, Workload Identity pool, repo path, maintainer environment).
 - **Do not document pull-request status** or cite a PR/issue number as the reason a behaviour exists
   in user/maintainer docs.
-- **Verify identifiers against source, not against other docs** (`install.defaults.env`,
+- **Verify identifiers against source, not other docs** (`install.defaults.env`,
   `k8s-operator/go.mod`, the identifier table in `docs/README.md`).
 - **Link a new document from the page that owns its topic; add no map entry** to `docs/README.md`.
 - **Write it straight and match length to the task.** Lead with the fact; cut hype (`comprehensive`,
   `robust`, `seamless`), "not X, but Y", and filler sections; prefer prose to `**Bold term:**`
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
-Run `make docs-check` before pushing: generated regions, links/reachability, terminology, site
-audience, and this file plus `CLAUDE.md` against the context budget.
+Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
+site audience, site prose, and the `AGENTS.md`/`CLAUDE.md` context budget.
 
 ## Contributing as an agent
 

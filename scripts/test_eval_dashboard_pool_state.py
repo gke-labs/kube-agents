@@ -549,7 +549,7 @@ class Workflow(unittest.TestCase):
         self.assertIn('--project-timeout "$POOL_STATE_PROJECT_TIMEOUT_S"', run)
         self.assertIn('timeout "$POOL_STATE_TIMEOUT_S"', run)
         self.assertEqual(steps[fleet].get("id"), "fleet_scan")
-        fleet_upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        fleet_upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         self.assertEqual(fleet_upload.get("id"), "fleet_upload")
         for step in (steps[scan], steps[scan - 1], steps[scan + 1]):
             # The failures the pool steps run through are the fleet scan's and
@@ -557,7 +557,7 @@ class Workflow(unittest.TestCase):
             # after an auth or setup failure, with no credential and no work
             # directory.
             self.assertEqual(step.get("if"), "${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}", f"{step.get('name')} must run whether or not the fleet scan or its upload failed, and after nothing else's")
-        upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/pool-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/pool-state.json"', upload["run"])
         self.assertIn("Fetch the previous pool-state scan", names)
         env = self.doc["env"]
@@ -591,7 +591,7 @@ class Workflow(unittest.TestCase):
     def test_the_tick_reads_the_published_scan(self):
         steps = self.jobs["refresh-and-adjudicate"]["steps"]
         fetch = next(step for step in steps if "pool-state.json" in step.get("run", "") and "health-prev.json" in step["run"])
-        self.assertIn('gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true', fetch["run"])
+        self.assertIn('gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true', fetch["run"])
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--pool-state work/pool-state.json", adjudicate["run"])
 
@@ -599,7 +599,7 @@ class Workflow(unittest.TestCase):
         # The same `python3 -c '…'` shape as the pool step, and the hourly
         # job was red on it: a quote inside the script ended the shell word.
         steps = self.jobs["fixture-state-scan"]["steps"]
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         run = upload["run"]
         start = run.index("python3 -c '")
         end = run.index("\n'", start) + 2
@@ -623,7 +623,7 @@ class Workflow(unittest.TestCase):
 
     def test_the_upload_steps_summary_script_runs(self):
         steps = self.jobs["fixture-state-scan"]["steps"]
-        upload = next(step for step in steps if "cp work/pool-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/pool-state.json" in step.get("run", ""))
         run = upload["run"]
         # The whole `python3 -c '…'` word, run through the shell as the step
         # does, so a quote inside the script that would end the word is caught.

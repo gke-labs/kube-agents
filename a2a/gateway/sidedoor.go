@@ -395,6 +395,15 @@ func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
 	}
 }
 
+// SetBoardActor hands the board-health card's Retry and Drop route to the
+// primary, the half that draws the card; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetBoardActor(actor BoardActor) {
+	if sink, ok := s.primary.(BoardActSink); ok {
+		sink.SetBoardActor(actor)
+	}
+}
+
 // SetSessionLookup hands the gateway's session lookup, and the idle TTL it
 // is bounded by, to the primary, which is the half that wants them (the
 // Slack adapter's session-thread rule; the door keys every conversation

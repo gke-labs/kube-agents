@@ -299,12 +299,18 @@ running.
 
 What the operator renders per profile, as built (amended 10/6):
 
-- The ServiceAccount: `agentprofile-<profile>`, owned by the CR, token automount off, no
-  RoleBinding anywhere. A profile that names its own in `identity.serviceAccountName` gets
-  none created. A profile may not name a ServiceAccount the operator already uses for
-  something else (the agent's, the session pods', the callout's, and so on) or `default`.
+- The ServiceAccounts: one per allowed tier, `agentprofile-<profile>-<tier>`, in the
+  profile namespace, token automount off, no RoleBinding anywhere (amended 10/23). They
+  carry the profile's name and UID instead of an owner reference, which can't cross
+  namespaces. A profile that names its own in `identity.serviceAccountName` gets none
+  created, and may then allow only one tier. A profile may not name a ServiceAccount name
+  the operator uses for the agent (the agent's, the session pods', the callout's, and so on)
+  or `default`.
   Those are refused with a condition, and the profile renders nothing.
-- The callout identity: one entry per profile in the PlatformAgent's identity map. A static
+- The callout identity: one entry per profile and tier in the PlatformAgent's identity map,
+  user `profile-<profile>-<tier>`. A tier's entry adds the dispatch subjects for its own pod
+  (`a2a.dispatch.<profile>.<tier>.<pod>`, plus `.accept` and `.lease` to publish) and no KV
+  grant: the dispatcher is the only writer of `PROFILE_LEASES`. A static
   entry cannot work here. Every pod of a profile publishes as the profile, but two of them
   running at once need their own consumers and inboxes, and a shared consumer name or a
   wildcard one is worse than either. So the entry narrows on `profile`. It carries the

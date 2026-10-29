@@ -80,12 +80,32 @@ CRON_ROSTERS = (
 EXAMPLE_JOB_ID = "compliance-audit"
 # The roster file's own indentation, so the example reads as the file spells it.
 EXAMPLE_INDENT = 2
+# How the helper-jobs table names a roster entry's kind: a `no_agent` script
+# that runs no model, a prompt job, or a prompt job with a pre-run script whose
+# output goes above the prompt (the weekly brief is the one such entry).
+HELPER_KIND_SCRIPT = "script, `{script}`"
+HELPER_KIND_PROMPT = "prompt"
+HELPER_KIND_PROMPT_AFTER_SCRIPT = "prompt, after `{script}`"
+HELPER_JOBS_HEADER = (
+    "| Job | Type | Cadence | Name |",
+    "| --- | ---- | ------- | ---- |",
+)
+# The governance page's audit matrix: the SOP each prompt names, the watchdog
+# that runs it, its cadence and its name, all read from the roster.
+GOVERNANCE_AUDITS_HEADER = (
+    "| SOP file | Watchdog | Cadence | Audit |",
+    "| -------- | -------- | ------- | ----- |",
+)
+# What the reference page prints in its cadence column when an expression has
+# no gloss: that page shows the expression in its own column already.
+NO_CADENCE_GLOSS = "—"
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 IMAGES_JSON = REPO / "images.json"
 
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
 WATCHDOGS_PAGE = REPO / "docs/site/src/content/docs/concepts/autonomous-watchdogs.md"
+GOVERNANCE_PAGE = REPO / "docs/site/src/content/docs/concepts/governance-sops.md"
 SKILLS_CONCEPT_PAGE = REPO / "docs/site/src/content/docs/concepts/skills.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
@@ -358,6 +378,31 @@ def escape_cell(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def schedule_expr(schedule: dict) -> tuple[str, str]:
+    """Return (expr, shown) for a roster entry's schedule.
+
+    An interval job has no ``expr``: the roster carries ``minutes`` and a
+    rendered ``display`` instead, so ``shown`` falls back to ``display`` and a
+    row never prints an empty schedule.
+    """
+    expr = schedule.get("expr") or ""
+    return expr, expr or schedule.get("display") or ""
+
+
+def cadence_cell(schedule: dict, fallback: str | None = None) -> str:
+    """The ``CRON_CADENCE`` gloss for a schedule, or what a page shows without one.
+
+    Every generator that prints a cadence goes through here so a new schedule
+    shape is handled once. ``fallback`` is for a page that already shows the
+    expression beside the gloss; the others print the expression itself.
+    """
+    expr, shown = schedule_expr(schedule)
+    gloss = CRON_CADENCE.get(expr)
+    if gloss:
+        return gloss
+    return fallback if fallback is not None else f"`{shown}`"
+
+
 def load_roster(path: Path) -> list[dict]:
     """Return the job entries of a cron roster, whichever shape the file takes.
 
@@ -389,8 +434,7 @@ def gen_cron_jobs() -> str:
             # rendered `display` instead. Falling back to `display` keeps those
             # rows from printing an empty cell in both schedule columns.
             schedule = job.get("schedule", {})
-            expr = schedule.get("expr", "")
-            shown = expr or schedule.get("display", "")
+            _, shown = schedule_expr(schedule)
             # The governance jobs put the work in `prompt`; the onboarding and
             # reconcile jobs are self-contained scripts and leave it empty.
             # Naming the script is what stops those rows reading as a job that
@@ -408,7 +452,7 @@ def gen_cron_jobs() -> str:
                     shown=shown,
                     # Only a cron expression gets a gloss; an interval schedule
                     # already reads as human text and would just repeat itself.
-                    cadence=CRON_CADENCE.get(expr, "—"),
+                    cadence=cadence_cell(schedule, NO_CADENCE_GLOSS),
                     enabled="yes" if job.get("enabled") else "no",
                     prompt=prompt,
                 )
@@ -434,6 +478,57 @@ def gen_cron_job_example(job_id: str = EXAMPLE_JOB_ID) -> str:
         )
     rendered = json.dumps(job, indent=EXAMPLE_INDENT, ensure_ascii=False)
     return f"```json\n{rendered}\n```"
+
+
+def is_audit(job: dict) -> bool:
+    """Whether a roster entry is a governance audit: it carries the `fleet-audit` skill.
+
+    The one predicate behind `helper_jobs()` and `governance_audits()`, so the
+    two regions partition the enabled roster between them and cannot drift. A
+    missing or `null` `skills` reads as no skills, as every other roster reader
+    in the tree treats it.
+    """
+    return AUDIT_SKILL in (job.get("skills") or [])
+
+
+def helper_jobs() -> list[dict]:
+    """The enabled Platform Agent roster entries that are not fleet audits.
+
+    An audit carries the `fleet-audit` skill; everything else on the roster is
+    a helper: the pollers, the watches, the collectors and the weekly brief.
+    A disabled entry is a tombstone on its way out (see `gen_cron_jobs`) and
+    is left out for the same reason.
+    """
+    return [job for job in load_roster(PLATFORM_CRON_ROSTER) if job.get("enabled") and not is_audit(job)]
+
+
+def helper_kind(job: dict) -> str:
+    script = job.get("script", "")
+    if job.get("no_agent"):
+        return HELPER_KIND_SCRIPT.format(script=script)
+    if script:
+        return HELPER_KIND_PROMPT_AFTER_SCRIPT.format(script=script)
+    return HELPER_KIND_PROMPT
+
+
+def gen_cron_helper_jobs() -> str:
+    """Render the Platform Agent's non-audit roster as a table, in roster order.
+
+    The watchdogs page used to list these jobs in one paragraph that restated
+    `jobs.json` by hand; this region reads the roster so an entry added,
+    retired or rescheduled there changes the page on the next `docs-generate`.
+    """
+    rows = list(HELPER_JOBS_HEADER)
+    for job in helper_jobs():
+        rows.append(
+            "| `{id}` | {kind} | {cadence} | {name} |".format(
+                id=job.get("id", ""),
+                kind=helper_kind(job),
+                cadence=cadence_cell(job.get("schedule", {})),
+                name=md_escape(job.get("name") or job.get("id", "")),
+            )
+        )
+    return "\n".join(rows)
 
 
 def read_frontmatter(path: Path) -> dict[str, str]:
@@ -528,7 +623,7 @@ def governance_audits() -> list[dict[str, str]]:
     """Return the enabled governance audits in the order the README lists them."""
     audits = []
     for job in load_roster(PLATFORM_CRON_ROSTER):
-        if not job.get("enabled") or AUDIT_SKILL not in (job.get("skills") or []):
+        if not job.get("enabled") or not is_audit(job):
             continue
         sop = SOP_REF_RE.search(job.get("prompt") or "")
         if not sop:
@@ -544,6 +639,7 @@ def governance_audits() -> list[dict[str, str]]:
                 "name": job.get("name") or job.get("id", ""),
                 "expr": schedule.get("expr") or "",
                 "display": schedule.get("display") or "",
+                "schedule": schedule,
                 "sop": sop.group(0),
             }
         )
@@ -562,7 +658,7 @@ def gen_capabilities() -> str:
         "| ----- | -------------- | --------- |",
     ]
     for audit in governance_audits():
-        cadence = CRON_CADENCE.get(audit["expr"]) or f"`{audit['expr'] or audit['display']}`"
+        cadence = cadence_cell(audit["schedule"])
         link = f"{PLATFORM_HOME}/{audit['sop']}"
         out.append(
             f"| {md_escape(audit['name'])} | {cadence} | [`{Path(audit['sop']).name}`]({link}) |"
@@ -579,6 +675,26 @@ def gen_capabilities() -> str:
         if names:
             out.append(f"| {group} | {', '.join(f'`{n}`' for n in names)} |")
     return "\n".join(out)
+
+
+def gen_governance_audits() -> str:
+    """Render the governance page's audit matrix from the roster, in README order.
+
+    The page used to carry the watchdog ids and cadences by hand, one
+    subsection per SOP; the check lists stay hand-written beside this region,
+    since no machine-readable source counts them the same way for every SOP.
+    """
+    rows = list(GOVERNANCE_AUDITS_HEADER)
+    for audit in governance_audits():
+        rows.append(
+            "| `{sop}` | `{id}` | {cadence} | {name} |".format(
+                sop=Path(audit["sop"]).name,
+                id=audit["id"],
+                cadence=cadence_cell(audit["schedule"]),
+                name=md_escape(audit["name"]),
+            )
+        )
+    return "\n".join(rows)
 
 
 ORIGIN_SECTIONS: list[tuple[str, str, str]] = [
@@ -747,6 +863,8 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
         (WATCHDOGS_PAGE, SKILLS_CONCEPT_PAGE, CRON_PAGE),
         gen_cron_job_example,
     ),
+    "cron-helper-jobs": ((WATCHDOGS_PAGE,), gen_cron_helper_jobs),
+    "governance-audits": ((GOVERNANCE_PAGE,), gen_governance_audits),
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
     "capabilities": ((README,), gen_capabilities),

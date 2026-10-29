@@ -2,10 +2,10 @@
 # whose spec.scope.exclude.clusters names a cluster; the answer must leave the
 # excluded cluster out (#3081).
 #
-# Parked (FIXTURE_NOT_READY, #3213): the precondition is the install's own
-# PlatformAgent, whose scope must exclude seeded-b with seeded-a and seeded-c
-# in scope. No pool install declares that yet and the case format cannot patch
-# the CR for a run.
+# The precondition is the install's own PlatformAgent, whose scope excludes
+# seeded-b with seeded-a and seeded-c in scope: `scope_exclude:` below, which
+# hack/ci-eval-pr.sh applies for this case's repetitions alone and then
+# restores (#3213).
 #
 # Red before #3100: the 2026-10-14 rehearsal answered "which clusters can you
 # see" with every cluster in the project, and on 2026-10-15 a dev lane with the
@@ -31,6 +31,9 @@ expected_output: >-
 infrastructure:
   deployer: noop
 fixtures: []
+# Slot b, the catalogue's name for seeded-b (bench/tf/fleet/fixtures.json).
+scope_exclude:
+  slots: [b]
 validated: false
 
 # Slug per docs/designs/domains.yaml: the front door's routing journey.

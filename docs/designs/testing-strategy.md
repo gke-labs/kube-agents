@@ -54,7 +54,7 @@ Why it earns a tier rather than folding into either neighbour:
 - **It makes a red eval mean something.** An eval failure has five candidate causes: model, prompt, plumbing, harness, infrastructure. This tier pins the plumbing, leaving the eval tier measuring the only thing it uniquely can.
 - **Most breakage is plumbing.** A dropped alert between the event watcher and the gateway, a session store that swallows a delivery failure, a renamed tool a verification spec still names. Evals catch these stochastically at eval prices; a seam test catches them in seconds.
 - **Error paths are testable here and nowhere else.** Dependency down, API returning 429, malformed event. An eval cannot systematically inject faults.
-- **The gate needs its own deterministic guard.** A scripted agent run through the real bench pipeline (loader, deployer, verifiers, gate) tests the machinery that decides merges, at zero tokens.
+- **The gate needs its own deterministic guard.** A scripted agent run through the real bench pipeline (loader, deployer, verifiers, gate) tests the machinery that decides merges, at zero tokens. The grading half is built: `bench/tests/test_grader_guard.py` replays captured agent runs through `devops-bench` and `bench-gate` on every pull request and asserts each verdict. A scripted run against a cluster, which would also cover the deployer and the cluster-reading verifiers, is not.
 
 Budget is minutes, not hours, and anything needing a full install belongs to the release gate. The seam inventory lives in the implementation plan, ranked by blast radius of silent breakage.
 

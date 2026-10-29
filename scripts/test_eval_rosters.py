@@ -114,6 +114,7 @@ ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625; promoted 2026-09-22
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
+    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
@@ -787,7 +788,7 @@ INJECT_LANE_SAFEGUARDS = [
 ]
 # The registered cases whose checks request a pull request, at the
 # safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
-# second phase on the inject lane, after every other unit has finished. A
+# second phase on both lanes, after every other unit has finished. A
 # new requesting case edits this set in the same pull request; the check
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
@@ -832,12 +833,11 @@ def _leaf_types(node) -> list[str]:
 
 class InjectLaneSafeguardsTest(unittest.TestCase):
     """hack/eval/inject-lane-safeguards.yaml: the entries hack/ci-eval-pr.sh
-    appends to every case it runs on the inject lane (#2079).
+    appends to every case it runs, on the api and inject lanes alike (#2079,
+    #2611).
 
-    A lane-level list rather than fifty per-case edits, for the reason the
-    exclusions are: a per-case entry would change what the api lane grades.
-    What has to hold: the file is the pinned set; every entry is a
-    none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
+    A lane-level list rather than fifty per-case edits. What has to hold:
+    the file is the pinned set; every entry is a none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
     that PASSES on a write, so `none` is what makes it a safeguard); no
     registered case declares an entry of the same name, since devops-bench
     refuses a duplicate name as a parse error on every repetition of that

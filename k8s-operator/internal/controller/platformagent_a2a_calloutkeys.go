@@ -110,12 +110,21 @@ type a2aCalloutKeys struct {
 // A partially-populated Secret is repaired as a set rather than per key: the
 // four values are two keypairs, and filling in a seed without its public half
 // would leave the server trusting a key nothing holds.
+//
+// An existing Secret at the name that this PlatformAgent doesn't control is
+// refused rather than adopted or repaired, as ensureA2ADoorTokenSecret does.
 func (r *PlatformAgentReconciler) ensureA2ACalloutKeysSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aCalloutKeys, error) {
 	name := types.NamespacedName{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}
 
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
+		// Only a Secret this PlatformAgent controls is read or repaired, as
+		// for the door's token: one created by anything else is neither
+		// trusted for its keys nor overwritten.
+		if !metav1.IsControlledBy(existing, agent) {
+			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A callout keys; delete it and the operator creates a fresh one (a controller reference is not a remedy: it would adopt keys of unknown origin as they are)", name.Namespace, name.Name)
+		}
 		keys, ok := readA2ACalloutKeys(existing)
 		if ok {
 			return keys, nil

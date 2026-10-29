@@ -213,13 +213,14 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import tempfile
 import time
@@ -244,6 +245,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
@@ -358,9 +360,6 @@ REPORT_DATE_FORMAT = "%Y-%m-%d"
 
 GCLOUD_TIMEOUT_S = 120
 KUBECTL_TIMEOUT_S = 120
-# What `timeout(1)` exits with, so a timed-out read reads the same as one the
-# shell cut off.
-TIMEOUT_RC = 124
 # How many clusters a sweep reads at once is broker_admission.sweep_width(),
 # resolved in collect_fleet: what the credential broker admits, less headroom
 # for chat (collect.py's comment above its own collect_fleet has the reasoning).
@@ -1440,32 +1439,12 @@ def is_system_namespace(namespace: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+default_run = functools.partial(collector_run.default_run, timeout=GCLOUD_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def _text(output: str | bytes | None) -> str:
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output or ""
-
-
-def default_run(argv: list[str], *, timeout: int = GCLOUD_TIMEOUT_S, env: dict | None = None) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:  # a missing binary, a bad env
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 
 
 def _excerpt(result: Run) -> str:

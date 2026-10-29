@@ -524,6 +524,122 @@ def test_a_paged_poll_reads_every_entry_once(stub_gateway: _StubGatewayServer) -
     assert len(posts) == 2
 
 
+# The opening turn's timing file: hack/ci-eval-pr.sh sets
+# KUBE_AGENTS_TIMING_FILE per repetition, and under spec.mode next every rep
+# goes through this door, so a door that writes none leaves the dashboard's
+# turn-1 latency empty.
+
+
+def test_the_opening_task_is_timed_to_its_terminal(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "timed answer")
+
+    started = time.monotonic()
+    result = KubeAgentsHarness().run("how long?")
+    took = time.monotonic() - started
+
+    assert not result.errors
+    timing = json.loads(target.read_text(encoding="utf-8"))
+    assert set(timing) == {"turn1_s"}
+    assert 0 <= timing["turn1_s"] <= took
+
+
+def test_an_opening_task_at_its_budget_writes_no_timing(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The budget is not how long the turn took, as the api path's timed-out
+    turn writes nothing."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("source", "reason", "is_infra"),
+    [
+        (inject.TERMINAL_SOURCE_EXECUTOR, "reason: hermes-exited-nonzero - exit status 1", False),
+        (inject.TERMINAL_SOURCE_GATEWAY, "", True),
+    ],
+)
+def test_an_opening_task_that_did_not_complete_writes_no_timing(
+    stub_gateway: _StubGatewayServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    source: str,
+    reason: str,
+    is_infra: bool,
+) -> None:
+    """Only a completed opening task is timed, as only a turn that answered
+    is on the api path: a graded failure and a terminal the gateway declared
+    (infrastructure) both write nothing."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_gateway.entries = [
+        entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
+        entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed", messageId=RESULT_ID),
+        entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
+              source=source, reason=reason),
+    ]
+
+    result = KubeAgentsHarness().run("break")
+
+    assert infra(result) is is_infra
+    assert not target.exists()
+
+
+def test_an_opening_post_whose_reply_was_lost_writes_no_timing(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The door may have started the task on the POST whose reply never came,
+    and its dedupe hands the retry that same task, so when the turn began is
+    unknown: no time is written rather than one counted from the retry."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+    original = inject.InjectTask.submit
+    calls: list[int] = []
+
+    def _lost_once(task: inject.InjectTask) -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            task.unanswered_post = True
+            raise inject.InjectUnavailable("reply lost", answered=False)
+        return original(task)
+
+    monkeypatch.setattr(inject.InjectTask, "submit", _lost_once)
+
+    result = KubeAgentsHarness().run("hello")
+
+    assert result.output == "done"
+    assert len(calls) == 2
+    assert not target.exists()
+
+
+def test_a_refused_opening_task_writes_no_timing(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_gateway.accept_submissions = False
+    stub_gateway.refusal_code = inject.REFUSAL_UNVERIFIED_AUTHOR
+    stub_gateway.refusal_note = "an author the principal map does not know"
+
+    result = KubeAgentsHarness().run("who am I?")
+
+    assert infra(result)
+    assert not target.exists()
+
+
 def test_a_terminal_reported_out_of_band_is_still_seen(stub_gateway: _StubGatewayServer) -> None:
     """A reader that arrives after the event must learn the answer rather than
     waiting out its deadline for one that has been and gone."""

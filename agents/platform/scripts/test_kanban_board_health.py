@@ -608,6 +608,25 @@ class StuckDueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
 
+    def test_only_a_hard_failure_unsays_the_post(self):
+        said_at = 1_761_220_000.0
+        landed = (
+            "chat relay partial: the report did not reach googlechat. Delivered — do not re-run to resend.",
+            "chat relay degraded: the report was posted but the Chat Agent turn failed. "
+            "Delivered — do not re-run to resend.",
+            "configured thread_id 12345 was not found; delivered without thread_id",
+            "2 media attachment(s) not delivered to slack (live adapter confirmation timed out)",
+        )
+        for error in landed:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as d:
+                self._store(d, error, "2025-10-23T11:47:10+00:00")
+                self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
+        for error in ("chat relay unreachable: connection refused",
+                      "composed but not delivered to slack; delivered without thread_id"):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as d:
+                self._store(d, error, "2025-10-23T11:47:10+00:00")
+                self.assertTrue(kbh.last_post_undelivered(Path(d), said_at, env={}))
+
     def test_an_unwritable_record_does_not_raise(self):
         with tempfile.TemporaryDirectory() as d:
             blocker = Path(d) / "file"
@@ -770,6 +789,48 @@ class MainOutputContractTests(unittest.TestCase):
         self.assertEqual(card, "**1 task is stuck and needs someone to decide.**")
         self.assertTrue(other.startswith("kanban board health: attention required\n"))
 
+    def card(self):
+        path = Path(self.env["KANBAN_HEALTH_STATE"]).with_suffix(".card.json")
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def test_stuck_tasks_said_alone_leave_a_card_matching_the_post(self):
+        tasks = [stuck("t_1", "Triage x", 30), stuck("t_2", "Upgrade pool", 2, person=True)]
+        _code, out = self.run_main(tasks, [])
+        card = self.card()
+        self.assertEqual(card["text"], out.rstrip("\n"))
+        self.assertEqual(card["headline"], "2 tasks are stuck and need someone to decide.")
+        self.assertEqual(card["rows"], [
+            {"title": "Upgrade pool", "count": 1, "status": "Paused 2 hours ago.", "held": "", "tasks": ["t_2"]},
+            {"title": "Triage x", "count": 1, "status": "Stopped 1 day ago before finishing.", "held": "",
+             "tasks": ["t_1"]},
+        ])
+        self.assertEqual(card["more"], "")
+
+    def test_a_row_of_tasks_sharing_a_title_carries_every_id(self):
+        self.run_main([stuck("t_1", "Triage x", 30), stuck("t_2", "Triage x", 5)], [])
+        self.assertEqual([(r["count"], r["tasks"]) for r in self.card()["rows"]], [(2, ["t_1", "t_2"])])
+
+    def test_a_quiet_run_removes_the_card(self):
+        tasks = [stuck("t_1", "Triage x", 30)]
+        self.run_main(tasks, [])
+        self.assertIsNotNone(self.card())
+        self.run_main(tasks, [], now=1000.0 + 86400)
+        self.assertIsNone(self.card())
+
+    def test_other_findings_post_as_text_with_no_card(self):
+        self.run_main([stuck("t_1", "Triage x", 30)], ["  ghost claim: task t is 'ready'"])
+        self.assertIsNone(self.card())
+    def test_an_unreadable_board_removes_the_card(self):
+        self.run_main([stuck("t_1", "Triage x", 30)], [])
+        self.assertIsNotNone(self.card())
+
+        def boom(home, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        self._patch("report", boom)
+        with contextlib.redirect_stdout(io.StringIO()):
+            kbh.main(env=self.env, now=1000.0 + 86400)
+        self.assertIsNone(self.card())
     def test_an_unreadable_board_reports_and_still_exits_zero(self):
         def boom(home, **kwargs):
             raise sqlite3.OperationalError("unable to open database file")
