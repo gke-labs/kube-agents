@@ -3186,9 +3186,14 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertIn("do not re-run it and never pass `--force`", body)
         self.assertIn("Complete this card with the refusal quoted in `result`", body)
         # The refusal stands: nothing here reaps the copy on the card's behalf
-        # (vcs_client spares the clone's own destination), so the text says who
-        # clears it and when the reaper does.
-        self.assertIn("Every later card for this branch meets the same refusal until a person clears the copy or publishes what is in it.", body)
+        # (vcs_client spares the clone's own destination), so the text has the
+        # `result` the operator reads name the action that clears it, verb and
+        # branch, rather than "a person".
+        self.assertIn("Complete this card with the refusal quoted in `result`, and say there what clears it", body)
+        self.assertIn("every later card for this branch meets the same refusal until someone asks the Platform Agent in chat", body)
+        self.assertIn("to publish what is in that copy, or to discard it", body)
+        self.assertIn(f"`discard --branch {expected_branch}`", body)
+        self.assertNotIn("until a person clears the copy", body)
         self.assertNotIn("is removed by the next `prepare` for this branch", body)
         # No TTL promise either: a refused `prepare` runs `git status`, which
         # refreshes the index `_last_touched` reads, so a branch that keeps
