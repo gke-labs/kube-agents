@@ -199,6 +199,8 @@ MEASURED_LABEL = "measured at the base point"
 BASE_VALUE_LABEL = "base value"
 NO_VALUE = "—"
 NO_LIMIT_TEXT = "no limit"
+# Inputs from this value up read as whole numbers.
+NUMBER_TEXT_WHOLE = 10.0
 LIMIT_LABEL = "{container} limit"
 PVC_CAPACITY_LABEL = "PVC capacity {capacity}"
 # The columns of the editable limits table.
@@ -422,6 +424,8 @@ CONTAINER_NAMES = MappingProxyType(
     }
 )
 MINUTES_PER_DAY = 1440.0
+# An ISO timestamp's date part.
+DATE_LENGTH = 10
 # The fleet choice that starts every input at the measured base instead of an example fleet.
 CUSTOM_PROFILE = "Custom: the measured base"
 # The basis of a recommendation read from measured runs rather than a fitted line.
@@ -1552,7 +1556,8 @@ def scaled_fleet(base: Mapping[str, float], clusters: float) -> dict[str, float]
     Per-cluster inputs (nodes, objects) and the request-side inputs stay; the
     fleet-wide inputs (pod churn, Pods failing at once) grow with the clusters.
     """
-    ratio = clusters / base[CLUSTERS]
+    # A base of no clusters scales nothing: the fleet-wide inputs stay as they are.
+    ratio = clusters / base[CLUSTERS] if base.get(CLUSTERS, 0.0) > 0 else 1.0
     fleet = dict(base)
     fleet[CLUSTERS] = clusters
     for factor in FLEET_WIDE_FACTORS:
@@ -1946,6 +1951,55 @@ def split_fleet(
         if not over or count >= clusters:
             return InstallSplit(count, share, chosen, sized_from, over)
         count = min(math.ceil(count * SPLIT_GROWTH), math.ceil(clusters))
+
+
+@dataclass(frozen=True)
+class InputRange:
+    label: str
+    low: float
+    high: float
+    levels: int
+
+
+@dataclass(frozen=True)
+class DatasetSummary:
+    """What the measured runs cover, read from the records, for the page to state."""
+
+    runs: int
+    phases: tuple[str, ...]
+    operations: tuple[str, ...]
+    inputs: tuple[InputRange, ...]
+    containers: tuple[str, ...]
+    # Metric label and how many runs recorded it, most recorded first.
+    metrics: tuple[tuple[str, int], ...]
+    first: str
+    last: str
+
+
+def dataset_summary(records: Sequence[Record]) -> DatasetSummary:
+    """The runs, phases, operations, the range of every fleet input, and the readings they hold."""
+    inputs = []
+    for factor, spec in FACTORS.items():
+        values = sorted({value for record in records if (value := factor_value(record, factor)) is not None})
+        if values:
+            inputs.append(InputRange(spec.input_label, values[0], values[-1], len(values)))
+    counts: dict[str, int] = {}
+    for record in records:
+        for name in {measurement.name for measurement in record.metrics}:
+            counts[name] = counts.get(name, 0) + 1
+    started = sorted(record.started for record in records if record.started)
+    return DatasetSummary(
+        runs=len(records),
+        phases=tuple(sorted({record.phase for record in records})),
+        operations=tuple(operations(records)),
+        inputs=tuple(inputs),
+        containers=tuple(containers(records)),
+        metrics=tuple(
+            (metric_spec(name).label, count) for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        first=started[0][:DATE_LENGTH] if started else "",
+        last=started[-1][:DATE_LENGTH] if started else "",
+    )
 
 
 def measured_clusters(records: Iterable[Record]) -> float:
@@ -2363,6 +2417,11 @@ def nodes_needed(machine: MachineType, memory_bytes: float, cpu_cores: float) ->
     by_memory = math.ceil(memory_bytes / machine.allocatable_memory_bytes - EPSILON)
     by_cpu = math.ceil(cpu_cores / machine.allocatable_cpu - EPSILON)
     return max(1, by_memory, by_cpu)
+
+
+def number_text(value: float) -> str:
+    """A measured input as a reader says it: "40", "4,469", "0.5"."""
+    return f"{value:,.0f}" if value >= NUMBER_TEXT_WHOLE else f"{value:g}"
 
 
 def memory_text(value_bytes: float | None) -> str:

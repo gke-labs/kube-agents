@@ -1047,6 +1047,12 @@ class HarnessLimitsPageTest(unittest.TestCase):
         app = AppTest.from_file(APP_PATH, default_timeout=60).run()
         return app.switch_page(PAGE_PATH).run()
 
+    def first_commit_and_mode(self) -> tuple[str, str]:
+        records = hl.load_dataset().records
+        commit = hl.commits(records)[0]
+        available = hl.modes(records, commit)
+        return commit, available[hl.default_mode_index(available)]
+
     def custom_fleet(self, app: AppTest) -> AppTest:
         app.selectbox(key="harness_limits:profile").set_value(hl.CUSTOM_PROFILE)
         return app.run()
@@ -1078,6 +1084,13 @@ class HarnessLimitsPageTest(unittest.TestCase):
 
     def test_the_benchmark_fleet_is_split_into_installs(self):
         app = self.open_page()
+        # The count the page states: the XL fleet over the largest fleet a run held, in whole clusters.
+        records = hl.select(hl.load_dataset().records, *self.first_commit_and_mode())
+        held = hl.measured_install_capacity(records) or hl.install_plan(
+            records, hl.containers(records), hl.FLEET_PROFILES[-1].fleet(hl.base_fleet(records))
+        ).capacity
+        installs = math.ceil(hl.FLEET_PROFILES[-1].clusters / max(int(held), 1))
+        self.assertTrue(any(f"**{installs:,} installs of about" in item.value for item in [*app.success, *app.error]))
 
         verdicts = [item.value for item in [*app.success, *app.error]]
         self.assertTrue(any("installs of about" in text for text in verdicts))
@@ -1430,3 +1443,81 @@ class UsualLimitsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForecastNumbersTest(unittest.TestCase):
+    """The Limits forecast's numbers, asserted, on a small fleet whose answers can be worked by hand."""
+
+    proxy, shell = "envoy-credential-proxy", "shell"
+    limits = {proxy: {"cpu_cores": 1.0, "memory_bytes": 2 * GIB}, shell: {"cpu_cores": 2.0, "memory_bytes": 2 * GIB}}
+
+    def runs(self) -> tuple[hl.Record, ...]:
+        # The proxy's CPU is 0.4 cores at 2 clusters and 0.8 at 8, under the 90% at which a peak counts as
+        # held at its limit. The shell's CPU stays at 0.5 cores; at 16 clusters a run refused a command.
+        def run(clusters: float, proxy_cpu: float, refused: float = 0.0, run_index: int = 1) -> dict:
+            factor, level = ("base", 0) if clusters == 2 else ("clusters", clusters)
+            return record(
+                factor, level, "fan_out", run_index,
+                metrics=((hl.CPU_PEAK, self.proxy, proxy_cpu), (hl.CPU_PEAK, self.shell, 0.5),
+                         (hl.PROXY_REFUSALS, None, refused)),
+                totals={"clusters": clusters, "nodes": clusters * 2}, limits=self.limits,
+                requests={self.shell: {"cpu_cores": 0.2, "memory_bytes": 512 * MIB}},
+                values=planned(clusters=clusters),
+            )
+
+        return parse(run(2, 0.4), run(8, 0.8), run(16, 0.8, refused=1.0))
+
+    def test_the_share_line_divides_by_the_limit_and_crosses_where_it_reaches_it(self):
+        records = self.runs()
+        fleet = hl.base_fleet(records)
+        [line] = [item for item in hl.bottleneck_series(records, fleet, self.limits) if self.proxy in item.label]
+        # 0.4 cores at 2 clusters against a 1-core limit.
+        at_two = min(range(len(line.clusters)), key=lambda index: abs(line.clusters[index] - 2))
+        self.assertAlmostEqual(line.shares[at_two] / hl.predict(records, hl.CPU_PEAK, self.proxy, hl.scaled_fleet(fleet, line.clusters[at_two])).value, 1.0)
+        # Measured dots are divided by the same limit: 0.8 cores is 80% at 8 clusters.
+        self.assertIn(0.8, [round(point.share, 2) for point in line.measured])
+        self.assertIsNotNone(hl.crossing(line))
+
+    def test_the_largest_size_that_held_is_the_install_capacity(self):
+        # 2 and 8 clusters held; at 16 a command was refused.
+        self.assertEqual(hl.measured_install_capacity(self.runs()), 8)
+
+    def test_a_fleet_is_split_into_installs_that_fit(self):
+        records = self.runs()
+        fleet = hl.scaled_fleet(hl.base_fleet(records), 40)
+        split = hl.split_fleet(records, fleet, [self.proxy, self.shell], 5)
+        self.assertEqual(split.installs, 5)
+        self.assertAlmostEqual(split.fleet[hl.CLUSTERS], 8)
+        # Sized from the runs at 8 clusters: 0.8 cores plus 30%.
+        self.assertEqual(split.sized_from, 8)
+        [proxy] = [item for item in split.recommendations if item.container == self.proxy]
+        self.assertAlmostEqual(proxy.cpu_cores, 0.8 * 1.3)
+        self.assertEqual(split.impossible, [])
+
+    def test_container_sizes_set_the_limits_and_keep_the_shell_fixed_on_standard(self):
+        records = self.runs()
+        medium = hl.preset_limits(hl.LIMITS_M, records, [])
+        large = hl.preset_limits(hl.LIMITS_L, records, [])
+        small = hl.preset_limits(hl.LIMITS_S, records, [])
+        settable = hl.preset_limits(hl.LIMITS_L, records, [], shell_settable=True)
+        self.assertEqual(medium[self.proxy]["cpu_cores"], 1.0)
+        self.assertEqual(large[self.proxy]["cpu_cores"], 8.0)
+        self.assertEqual(large[self.shell]["cpu_cores"], 2.0)
+        self.assertEqual(settable[self.shell]["cpu_cores"], 8.0)
+        # Autopilot without bursting gives the shell its request.
+        self.assertEqual(small[self.shell]["cpu_cores"], 0.2)
+
+    def test_a_size_is_short_of_each_resource_its_need_passes(self):
+        need = hl.SizeNeed(self.proxy, "Credential proxy", 1 * GIB, 3.2, {"cpu_cores": 1.0, "memory_bytes": 2 * GIB})
+        self.assertEqual(need.short, ("CPU",))
+        self.assertFalse(need.enough)
+
+    def test_no_clusters_does_not_divide_by_zero(self):
+        fleet = hl.scaled_fleet({**hl.base_fleet(self.runs()), hl.CLUSTERS: 0.0}, 5)
+        self.assertEqual(fleet[hl.CLUSTERS], 5)
+
+    def test_the_dataset_summary_counts_runs_and_input_ranges(self):
+        summary = hl.dataset_summary(self.runs())
+        self.assertEqual(summary.runs, 3)
+        [clusters] = [item for item in summary.inputs if item.label == "Clusters"]
+        self.assertEqual((clusters.low, clusters.high, clusters.levels), (2, 16, 3))

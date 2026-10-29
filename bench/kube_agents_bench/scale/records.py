@@ -19,7 +19,8 @@ SCHEMA_VERSION = 1
 KEY_SEPARATOR = "|"
 COMMIT_KEY_LENGTH = 8
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-JSON_INDENT = 2
+# Compact: the file holds every run and is read by programs, so pretty-printing only adds size.
+JSON_INDENT = None
 
 
 def record_key(commit: str, mode: str, factor: str, level: float, operation: str, run: int) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import streamlit as st
 from admin_console import harness_limits as hl
 from admin_console.charts import bottleneck_chart, breakdown_chart, harness_limit_chart
 from admin_console.connection_session import recover_app_shell
-from admin_console.ui import PALETTE, section_title
+from admin_console.ui import PALETTE
 
 KEY_PREFIX = "harness_limits"
 DESIGN_DOC = "docs/designs/agent-harness-bottlenecks.md"
@@ -23,12 +24,15 @@ SELECTOR_WIDTHS = (3, 1)
 FLEET_COLUMNS = 4
 CHART_COLUMNS = 2
 FLEET_STEP = 1.0
+MIN_CLUSTERS = 1.0
 # Shows 2 as "2" and 178.5 as "178.5".
 NUMBER_FORMAT = "%.1f"
 FLEET_DECIMALS = 1
 CHART_CONFIG = {"displayModeBar": False}
 # The largest fleet the forecast chart reaches, for the verdict when no line reaches its limit.
 FORECAST_CEILING = "10,000"
+# The readings listed before the rest fold into an expander.
+EVIDENCE_METRICS_SHOWN = 12
 PROFILE_CAPTION = (
     "{projects:,} projects, {autopilot:.0%} of clusters on Autopilot, {workloads:,} workloads a day "
     "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape."
@@ -64,12 +68,20 @@ SHELL_SETTABLE_LINE = (
     "- **Sandbox shell: sized like the other containers here,** which assumes an operator change. "
     "Past {held:.0f} clusters nothing is measured, so the next limit there is unknown."
 )
+STALL_LINE = (
+    "- **Stall Watch: one cluster at a time, about {seconds:.0f} seconds each,** within a 25-minute "
+    "budget every half hour, so one pass covers about {stall:.0f} clusters."
+)
+STALL_UNMEASURED_LINE = (
+    "- **Stall Watch: one cluster at a time,** within a 25-minute budget every half hour; this data "
+    "has no measured pass time."
+)
 FIXED_WHY = """The limits no setting raises:
 
 {shell_line}
 - **Credential proxy: 8 commands at once.** A command that waits 60 seconds is refused.
 - **Agent: 10 requests at once.** The 11th is refused.
-- **Stall Watch: one cluster at a time, about {seconds:.0f} seconds each,** within a 25-minute budget every half hour, so one pass covers about {stall:.0f} clusters.
+{stall_line}
 
 The model's straight lines, which take each input's largest increase over all operations, are more cautious: they put the shell at its limit at about {model:.0f} clusters, because a user's upgrade readiness report loads it. At the measured size that report runs slower; it does not fail."""
 INSTALL_LINE = (
@@ -104,15 +116,18 @@ NEED_CAPTION = (
 )
 FORECAST_CAPTION = (
     "Each line is a key prediction as a share of its limit at the chosen container size, for this "
-    "fleet's cluster shape at every size; a cross marks where it reaches the limit. Dots are measured "
-    "runs. The shaded range is measured, the rest predicted; dashed lines mark the example fleets."
+    "fleet's cluster shape at every size; a cross marks where it reaches the limit. Dots are every "
+    "measured run, each at its own fleet shape and operation (hover one for its size), so they show "
+    "the range measured, not this fleet. The shaded range is measured, the rest predicted; dashed "
+    "lines mark the example fleets."
 )
 EVIDENCE_STORY = (
-    "The runs behind Part 1, on one experiment install (GKE Standard, mode next): {runs} runs at 2 to "
-    "{clusters:.0f} test clusters, each cluster 2 to 4 nodes and 100 to 4,000 objects. Phases 1 to 3 "
-    "measured one stress point at a time, onboarding and the first-run audits; Phase 4 measured only "
-    "an install's daily work, with the agent and proxy limits raised so that the peaks show the need. "
-    "These charts take no input from Part 1: each resource in its own unit, one line per container "
+    "The runs behind Part 1, read from `{path}`: **{runs:,} runs** on one experiment install, from "
+    "{first} to {last}, in {phases} measurement phases. Each run applied one fleet point to the test "
+    "clusters, ran one operation, and recorded what each container and the broker used."
+)
+EVIDENCE_CHARTS = (
+    "The charts below take no input from Part 1: each resource in its own unit, one line per container "
     "fitted through the runs, for clusters shaped like the measured base, against the default limits."
 )
 CURVE_NOTE = (
@@ -206,7 +221,8 @@ with st.expander("Fine-tune the fleet"):
     for index, (factor, spec) in enumerate(hl.FACTORS.items()):
         fleet[factor] = fleet_columns[index % FLEET_COLUMNS].number_input(
             spec.input_label,
-            min_value=0.0,
+            # A fleet has at least one cluster; every other input can be zero.
+            min_value=MIN_CLUSTERS if factor == hl.CLUSTERS else 0.0,
             value=round(float(start[factor]), FLEET_DECIMALS),
             step=FLEET_STEP,
             format=NUMBER_FORMAT,
@@ -219,7 +235,9 @@ held = hl.measured_install_capacity(records) or plan.capacity
 stall_seconds = hl.stall_watch_seconds_per_cluster(records)
 stall_clusters = hl.STALL_WATCH_BUDGET_SECONDS / stall_seconds if stall_seconds else None
 per_install_clusters = min(fleet[hl.CLUSTERS], held) if held else plan.fleet[hl.CLUSTERS]
-installs = max(-(-int(round(fleet[hl.CLUSTERS])) // int(per_install_clusters)), 1) if per_install_clusters else plan.installs
+# Whole clusters per install, at least one, so the count and the "about N clusters" agree.
+per_install_whole = max(int(per_install_clusters), 1) if per_install_clusters else 1
+installs = max(math.ceil(fleet[hl.CLUSTERS] / per_install_whole), 1)
 split = hl.split_fleet(records, fleet, containers, installs)
 installs, install_fleet = split.installs, split.fleet
 recommendations, sized_from = split.recommendations, split.sized_from
@@ -281,8 +299,8 @@ with st.expander("Why these limits cannot be raised"):
                 held=held or 0.0, shell=shell_peak / shell_limit
             ),
             held=held or 0.0,
-            seconds=stall_seconds or 0.0,
-            stall=stall_clusters or 0.0,
+            stall_line=STALL_LINE.format(seconds=stall_seconds, stall=stall_clusters)
+            if stall_seconds else STALL_UNMEASURED_LINE,
             model=plan.capacity or 0.0,
         )
     )
@@ -378,7 +396,30 @@ st.caption(FORECAST_CAPTION)
 # --- Part 2 ---------------------------------------------------------------------------------
 st.divider()
 st.header("Part 2: Empirical evidence")
-st.markdown(EVIDENCE_STORY.format(runs=len(records), clusters=measured))
+summary = hl.dataset_summary(records)
+st.markdown(
+    EVIDENCE_STORY.format(
+        path=hl.display_path(dataset.path), runs=summary.runs, first=summary.first, last=summary.last,
+        phases=len(summary.phases),
+    )
+)
+inputs_column, readings_column = st.columns(2)
+with inputs_column:
+    st.markdown("**The fleet points**")
+    st.markdown("\n".join(
+        f"- {item.label}: {hl.number_text(item.low)} to {hl.number_text(item.high)}, {item.levels} levels"
+        for item in summary.inputs
+    ))
+    st.markdown(f"**The operations ({len(summary.operations)})**: " + ", ".join(f"`{name}`" for name in summary.operations))
+with readings_column:
+    st.markdown(f"**The readings ({len(summary.metrics)} metrics, runs that recorded each)**")
+    st.markdown("\n".join(f"- {label}: {count}" for label, count in summary.metrics[:EVIDENCE_METRICS_SHOWN]))
+    rest = summary.metrics[EVIDENCE_METRICS_SHOWN:]
+    if rest:
+        with st.expander(f"{len(rest)} more metrics"):
+            st.markdown("\n".join(f"- {label}: {count}" for label, count in rest))
+    st.markdown(f"**The containers ({len(summary.containers)})**: " + ", ".join(f"`{name}`" for name in summary.containers))
+st.markdown(EVIDENCE_CHARTS)
 log_axis = st.toggle("Logarithmic axis", value=True, key=f"{KEY_PREFIX}:log_axis")
 for first_metric in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
     row = st.columns(CHART_COLUMNS)
