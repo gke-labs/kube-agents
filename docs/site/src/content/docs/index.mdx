@@ -35,7 +35,7 @@ It ships as a small set of components:
 - A **Kubernetes operator** (`k8s-operator`, Go / Kubebuilder) that reconciles a `PlatformAgent` custom resource.
 - An **agent Deployment** (running the [Hermes runtime](https://github.com/NousResearch/hermes-agent), `nousresearch/hermes-agent`) hosting co-located profiles: the Planning Agent (chat ingress, planning, and delegation), the Platform Agent (an opinionated persona, an MCP-based Kubernetes toolset, and a library of skills), and per-cluster Cluster Agents scaffolded on demand.
 - An **inference gateway** — [LiteLLM](https://litellm.ai) for hosted models (Gemini, Anthropic, OpenAI) or [vLLM](https://vllm.ai) for local models on GPU nodes.
-- The **A2A stack**, which `spec.mode: next` puts in front of the agent and a first `install.sh` run deploys: a NATS JetStream message bus, the A2A gateway that holds the chat backend, and the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console), a browser page reached through `kubectl port-forward`. A chart or Terraform install that sets no mode runs `today`, the previous layout, which stays as the rollback ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
+- The **A2A stack**, which `spec.mode: next`, the first-install default, puts in front of the agent: a NATS JetStream message bus, the A2A gateway that holds the chat backend, and the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console), a browser page reached through `kubectl port-forward`. A chart or Terraform install that sets no mode runs `today`, the previous layout, which stays as the rollback ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
 
 <Aside type="note">
   Today's shipping skills, install path, and MCP integrations target GKE. The
@@ -132,7 +132,7 @@ flowchart LR
     GW -.->|proactive alert / relayed progress| SL
 ```
 
-The diagram shows a `spec.mode: next` install, what a first `install.sh` run deploys. With both chat platforms enabled, Slack stays on the agent pod's own listener, as under `today`; a `today` install has no A2A stack, and chat reaches the Planning Agent directly. Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page.
+The diagram shows a `spec.mode: next` install, the first-install default ([the quick start](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install)). With both chat platforms enabled, Slack stays on the agent pod's own listener, as under `today`; a `today` install has no A2A stack, and chat reaches the Planning Agent directly. Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page.
 
 ## Install
 
@@ -160,7 +160,7 @@ cd kube-agents
 ./install.sh
 ```
 
-The installer bootstraps a GKE cluster, the operator CRDs, IAM bindings, Google Chat Pub/Sub, Kubernetes secrets, and the Platform Agent itself, on `spec.mode: next` — one `terraform apply` through `terraform/examples/full-install`. See the [Quick start](/kube-agents/install/quickstart-gke/) for a step-by-step breakdown.
+The installer bootstraps a GKE cluster, the operator CRDs, IAM bindings, Google Chat Pub/Sub, Kubernetes secrets, and the Platform Agent itself, on `spec.mode: next` by default — one `terraform apply` through `terraform/examples/full-install`. See the [Quick start](/kube-agents/install/quickstart-gke/) for a step-by-step breakdown.
 
 ## Disclaimer
 

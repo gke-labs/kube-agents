@@ -2,7 +2,7 @@
 title: MCP server
 description: The opt-in A2A MCP server, a Model Context Protocol endpoint through which an external coding agent or IDE talks to a spec.mode next install over its message bus.
 sidebar:
-  order: 10
+  order: 11
 ---
 
 The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page can. It is off by default and renders nothing under `today`.
@@ -41,8 +41,8 @@ To rotate the token, write a new value into the Secret. The server reads the mou
 | `read_topics`       | Reads the install's standing topics and agent cards: `list` shows every provisioned topic with its newest entry, `read` shows one topic, and `cards` shows the agent cards. Entries are shown as quoted data, capped per block.                                          |
 | `send_message`      | Sends one message to the install as a console user and waits for the answer, on a named conversation so that later turns continue it. A turn still running when the wait ends returns its task, to be read later with `task_control`.                                    |
 | `task_control`      | Reads a task's state and answer (`get`, optionally waiting for it to finish), or stops a conversation's running task (`stop`).                                                                                                                                           |
-| `inspect_pr`        | Reads one pull or merge request, with its comments and diff, from a repository the install manages, through the credential broker; the pod holds no forge credential. Offered only when the operator has wired the broker in.                                            |
+| `inspect_pr`        | Reads one pull or merge request, with its comments and diff, from a repository the install manages, through the credential broker; the pod holds no forge credential. The operator wires the broker in whenever it renders the server, so the tool is always offered.    |
 
 A message sent through `send_message` reaches the A2A gateway through its console door, the same path the A2A console's chat pane takes, so the Planning Agent answers it or files kanban cards as for any chat message ([Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next)). Everything `inspect_pr` returns that a pull request's authors wrote is shown as data: fenced, capped on line boundaries with a count of what was cut, and introduced by a line saying it is the authors' content.
 
-[`a2a/mcp/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/mcp/README.md) is canonical for the server and is where a new tool is described first.
+[`a2a/mcp/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/mcp/README.md) is canonical for the server, the tool list included.

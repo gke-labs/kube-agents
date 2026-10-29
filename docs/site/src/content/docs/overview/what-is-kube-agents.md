@@ -43,7 +43,7 @@ Short-lived GitHub App installation tokens signed via GCP KMS and delivered thro
 
 ### 5. The A2A stack (`spec.mode: next`)
 
-A first `install.sh` run records `spec.mode: next` on the `PlatformAgent`, and the operator then renders a message bus and its clients in front of the agent. A chart or Terraform install that sets no mode runs `today`, the previous layout, which is kept as the rollback: [Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today) is the way back, and `today` renders none of the pods below.
+A first `install.sh` run records `spec.mode: next` on the `PlatformAgent`, unless it mirrors its third-party images or is passed `--mode=today` ([the quick start](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install)), and the operator then renders a message bus and its clients in front of the agent. A chart or Terraform install that sets no mode runs `today`, the previous layout, which is kept as the rollback: [Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today) is the way back, and `today` renders none of the pods below.
 
 - **The bus** (`<name>-a2a-nats`), a NATS JetStream StatefulSet, with an **auth callout** (`<name>-a2a-callout`, two replicas) that authenticates every bus client and a **capability verifier** (`<name>-a2a-verifier`, two replicas) that checks each submitted task. A provisioning Job creates the streams once.
 - **The A2A gateway** (`<name>-a2a-gateway`), which holds the chat backend: Google Chat when it is enabled, Slack otherwise. It publishes each message as a task on the bus and posts the answer back into the thread. With no chat platform enabled it runs on its console door alone ([Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next)).
@@ -59,7 +59,7 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 - A GKE cluster with Workload Identity.
 - The operator controller manager Deployment.
 - One `PlatformAgent` custom resource and the three agent pods it reconciles into: the gateway running Hermes, the shell sandbox and the credential broker ([Credential isolation](/kube-agents/reference/credential-isolation/#pod-anatomy)).
-- The A2A stack, because a first install runs `spec.mode: next`: the bus, two auth callout and two verifier replicas, the A2A gateway and the A2A console, with the `hermes-bridge` container added to the gateway pod. [Verify a `spec.mode: next` install](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install) lists the pods.
+- The A2A stack, on an install running `spec.mode: next`, the first-install default: the bus, two auth callout and two verifier replicas, the A2A gateway and the A2A console, with the `hermes-bridge` container added to the gateway pod. [Verify a `spec.mode: next` install](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install) lists the pods.
 - A LiteLLM Deployment (or vLLM if you opted in).
 - A Minty Deployment plus a GCP KMS keyring and key.
 - A Google Chat Pub/Sub topic + subscription and a Kubernetes `Secret` holding your model provider API key.
@@ -68,7 +68,7 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 ## What is _not_ included
 
 - **No local Kind install** — the installer and the Terraform composition it drives both target GKE, and a deployment needs a real GKE cluster. A kind cluster exists only as a development path for contributors; see [Helm and Kind](/kube-agents/install/helm-and-kind/). (For versioned Helm/Terraform installs on GKE, see [Helm and Kind](/kube-agents/install/helm-and-kind/).)
-- **One browser page by default, and no CLI outside the pod** — chat is the primary user interface. A `next` install serves the A2A console, reached through `kubectl port-forward`; the web console and the Hermes dashboard are opt-in, and the admin console runs on your own machine. [User interfaces](/kube-agents/reference/user-interfaces/) compares the four. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` does not reach the agent pod, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
+- **One browser page by default, and no CLI outside the pod** — chat is the primary user interface. A `next` install serves the A2A console, reached through `kubectl port-forward`; the web console and the Hermes dashboard are opt-in, and the admin console runs on your own machine. [User interfaces](/kube-agents/reference/user-interfaces/) compares them. The Hermes CLI is reachable with `kubectl exec` into the agent pod; `kubectl port-forward` does not reach the agent pod, because the install defaults to a GKE Sandbox (gVisor) node pool whose loopback listeners it cannot reach. [ChatOps](/kube-agents/concepts/chatops/) is canonical.
 - **No cross-cloud abstractions** — the shipping MCP toolset, IAM assumptions, and install path all target GKE. The runtime and persona are cluster-agnostic; the skill catalog is not.
 
 ## Where to go next

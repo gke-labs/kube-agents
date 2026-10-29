@@ -73,7 +73,7 @@ If a card blocks again for the same type of reason (a second question, or a seco
 
 ### `spec.mode`
 
-The `PlatformAgent` field that selects the component stack. `next`, which a first `install.sh` run records, puts the [message bus](#message-bus) and the [A2A gateway](#a2a-gateway) in front of the agent. `today` is the previous layout, where the Planning Agent's own chat adapters listen; it is what a chart or Terraform install with no mode runs, and the rollback ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
+The `PlatformAgent` field that selects the component stack. `next`, which a first `install.sh` run records unless it mirrors its third-party images or is passed `--mode=today`, puts the [message bus](#message-bus) and the [A2A gateway](#a2a-gateway) in front of the agent. `today` is the previous layout, where the Planning Agent's own chat adapters listen; it is what a chart or Terraform install with no mode runs, and the rollback ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
 
 ### Message bus
 
@@ -105,7 +105,7 @@ The agent runtime all the agents run on ([nousresearch/hermes-agent](https://git
 
 A native Hermes feature (`hermes -p <name>`) giving multiple isolated Hermes instances — each with its own config, sessions, skills, and home directory — inside a single gateway process. In `kube-agents`, the `default` profile is the [Planning Agent](#planning-agent), the `platform` profile is the [Platform Agent](#platform-agent), and each `cluster-*` profile is a [Cluster Agent](#cluster-agent). Executable scripts are shared across profiles; persona, config, and skills are per-profile.
 
-A Hermes profile is a directory, `$HERMES_HOME/profiles/<name>` inside the `<name>-gateway` pod, and no Kubernetes object. It is distinct from the [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) custom resource (`kubectl get apr`), which describes one kind of agent pod on the message bus under `spec.mode: next` and renders nothing under `today`.
+A Hermes profile is a directory inside the `<name>-gateway` pod, `$HERMES_HOME/profiles/<name>` for every profile but `default`, whose home is `$HERMES_HOME` itself, and no Kubernetes object. It is distinct from the [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) custom resource (`kubectl get apr`), which describes one kind of agent pod on the message bus under `spec.mode: next` and renders nothing under `today`.
 
 ### MCP (Model Context Protocol)
 
