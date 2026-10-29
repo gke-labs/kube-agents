@@ -25,9 +25,10 @@ package controller
 // streams, retention, and the account layout; subjects come from the payload
 // spec (docs/designs/spec-a2a-payloads.md).
 //
-// PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
-// R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
-// has a decided design in the specs; none gates letting people play.
+// PLAYGROUND POSTURE (stage 1): no audit exporter, no breaker, gateway sweep as
+// the only janitor. Each has a decided design in the specs; none gates letting
+// people play. The bus came off that list: it runs as a three-server
+// JetStream cluster with R3 streams by default (a2aNATSReplicas).
 //
 // Authentication came off that list. The auth callout is armed, and the
 // identities that have a ServiceAccount and a client that presents it — the
@@ -479,6 +480,11 @@ const (
 	a2aNATSMonitorPort   = 8222
 	a2aNATSWebSocketPort = 9222
 
+	// The cluster route listener: server to server only, on a multi-server
+	// bus (a2aNATSReplicas above 1). Written in the config's cluster block,
+	// the container port, the routes Service and the bus fence's peer rule.
+	a2aNATSRoutePort = 6222
+
 	// The creds Secret's keys. Each is written in at least three places — this
 	// list, the nats.conf template, and whatever workload consumes it through
 	// a secretKeyRef — and a key that disagrees between them renders
@@ -491,6 +497,10 @@ const (
 	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	// a2aRoutePasswordKey authenticates the cluster routes between the bus's
+	// own servers. Not a client credential: the auth callout does not govern
+	// routes, so they carry their own user, and only a NATS pod reads it.
+	a2aRoutePasswordKey = "route-password" // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
 	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
@@ -757,10 +767,11 @@ const (
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
-	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
-# R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
-# has a decided design in the specs (spec-nats-deployment.md); none gates
-# letting people play.
+	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): no audit exporter, no breaker, gateway sweep as
+# the only janitor. Each has a decided design in the specs
+# (spec-nats-deployment.md); none gates letting people play. The bus itself is
+# past that stage: a three-server JetStream cluster with R3 streams by default
+# (spec.harness.tuning.busReplicas: 1 runs one server with R1 streams).
 #
 # Authentication is NOT on that list any more. The auth callout is armed: a
 # client presents a projected Kubernetes ServiceAccount token, the callout
@@ -1592,7 +1603,7 @@ func randomA2APassword() (string, error) {
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
 	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
-	a2aBridgeActivityKey,
+	a2aBridgeActivityKey, a2aRoutePasswordKey,
 }
 
 // a2aActivityHookEvents are the hook events the door reads: the tool calls
@@ -2127,9 +2138,17 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys) string {
 	return a2aPostureComment + `
 
-server_name: ` + a2aNATSName(agent) + `
+# One name per server, from the pod (a JetStream cluster refuses two servers
+# with the same name, and the pod name is the one stable across restarts).
+server_name: $POD_NAME
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
+
+# For the preStop hook's lame-duck signal (buildA2ANATSStatefulSet).
+pid_file: "` + a2aNATSPidFile + `"
+# How long a stopping server spreads its clients' reconnects over.
+lame_duck_duration: "` + strconv.Itoa(a2aNATSLameDuckSeconds) + `s"
+` + renderA2ANATSCluster(agent, pw) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -2301,6 +2320,60 @@ authorization {
 `
 }
 
+// renderA2ANATSCluster is the cluster block of a multi-server bus, empty for a
+// single server.
+//
+// Routes: one URL, the headless routes Service, which resolves to every
+// server's pod IP. A server dials it, reaches a peer, and learns the rest of
+// the cluster from that peer's gossip, so the list does not change with the
+// replica count.
+//
+// TLS, verified both ways. Each server presents the serving certificate as a
+// client (it carries ClientAuth for this) and checks its peer's against the
+// bus CA. The peers it learns by gossip arrive as IPs, which no certificate
+// here names; nats-server dials those with the TLS name saved from the
+// explicit route's hostname (saveRouteTLSName in its route.go), which is why
+// the routes Service's name is one of the certificate's SANs.
+//
+// And a route user. The auth callout governs client connections, not routes,
+// so without a cluster authorization block anything that reached 6222 with a
+// certificate from the bus CA could join as a server. The bus fence admits
+// 6222 from the bus's own pods only; this is the second lock.
+func renderA2ANATSCluster(agent *agentv1alpha1.PlatformAgent, pw func(key string) string) string {
+	if a2aNATSReplicas(agent) <= 1 {
+		return ""
+	}
+	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain
+	return `
+cluster {
+  name: ` + a2aNATSName(agent) + `
+  port: ` + strconv.Itoa(a2aNATSRoutePort) + `
+  authorization {
+    user: ` + a2aNATSRouteUser + `
+    password: "` + pw(a2aRoutePasswordKey) + `"
+  }
+  routes: [
+    "nats-route://` + a2aNATSRouteUser + `:` + pw(a2aRoutePasswordKey) + `@` + routeHost + `:` + strconv.Itoa(a2aNATSRoutePort) + `"
+  ]
+  tls {
+    cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
+    key_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSKeyKey + `"
+    ca_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCAKey + `"
+    verify: true
+  }
+}
+`
+}
+
+// a2aNATSRouteUser is the user the bus's servers present to each other on
+// their routes (renderA2ANATSCluster). Not a client identity.
+const a2aNATSRouteUser = "route"
+
+// a2aNATSRoutesName is the headless Service the cluster routes dial.
+func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
+	return a2aNATSName(agent) + "-routes"
+}
+
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
@@ -2376,11 +2449,22 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // a2aConfigRolloutHash and rides the pod template — the agent Deployment's
 // config-hash mechanism — so a changed render rolls the server instead of
 // silently diverging from it.
-// a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
-// controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
-// so a rename here that is not matched there turns the reap into a silent no-op
-// and leaks the PV on every CR deletion. One spelling, both sites.
+// a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claims the
+// controller stamps out are "<this>-<sts>-<ordinal>" (a2aNATSDataClaimName),
+// which handleDeletion reaps by name -- so a rename here that is not matched
+// there turns the reap into a silent no-op and leaks the PVs on every CR
+// deletion. One spelling, both sites.
 const a2aNATSDataClaim = "data"
+
+// a2aNATSMaxReplicas is the most servers the bus can run (the busReplicas
+// enum's top value), and so the ordinals handleDeletion reaps claims for.
+const a2aNATSMaxReplicas = 3
+
+// a2aNATSDataClaimName is the claim the StatefulSet controller creates for
+// the server at ordinal.
+func a2aNATSDataClaimName(agent *agentv1alpha1.PlatformAgent, ordinal int) string {
+	return a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-" + strconv.Itoa(ordinal)
+}
 
 // a2aProvisionResources adds the provision container's ephemeral-storage
 // request and equal limit, for the tmp emptyDir it writes
@@ -2408,6 +2492,7 @@ func a2aResources(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev
 
 func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string) *appsv1.StatefulSet {
 	name := a2aNATSName(agent)
+	replicas := a2aNATSReplicas(agent)
 	labels := a2aLabels(agent, "nats")
 	selector := map[string]string{"app": name}
 	podLabels := map[string]string{"app": name}
@@ -2419,11 +2504,22 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
+			// ServiceName stays the client Service, which is ClusterIP and so
+			// gives the pods no per-pod DNS names. The cluster routes do not
+			// need them: they dial the headless routes Service
+			// (buildA2ANATSRoutesService) and learn their peers from it. The
+			// field is immutable, so moving it to a headless Service would
+			// mean deleting and recreating every existing install's
+			// StatefulSet; routing through a second Service avoids that.
 			ServiceName: name,
-			// Single node, R1, per the dev posture in the deployment spec;
-			// production guidance is a 3-node cluster with stream replicas R3.
-			Replicas: ptr.To(int32(1)),
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Replicas:    ptr.To(int32(replicas)),
+			// A rolled server is Ready once it serves (the readiness probe
+			// below), before its stream replicas have caught up. Holding the
+			// next roll for this long gives them the time, so a rollout does
+			// not take a second replica of an R3 stream down while the first
+			// is still behind, which would stall writes on that stream.
+			MinReadySeconds: a2aNATSMinReadySeconds(replicas),
+			Selector:        &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,
@@ -2437,14 +2533,32 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						FSGroup:        ptr.To(int64(1000)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
+					// Lame duck has to finish inside this, with room for the
+					// preStop signal to land first.
+					TerminationGracePeriodSeconds: ptr.To(int64(a2aNATSTerminationGraceSeconds)),
+					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
 					Containers: []corev1.Container{{
 						Name:  "nats",
 						Image: a2aNATSImage(),
 						Args:  []string{"-c", "/etc/nats/nats.conf"},
-						Ports: []corev1.ContainerPort{
-							{Name: "client", ContainerPort: a2aNATSClientPort},
-							{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
-							{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
+						// server_name in nats.conf is $POD_NAME: every server
+						// in a JetStream cluster needs its own, and the pod
+						// name is the one that is stable across restarts.
+						Env: []corev1.EnvVar{{
+							Name:      "POD_NAME",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+						}},
+						Ports: a2aNATSContainerPorts(replicas),
+						// Lame duck on the way out: the server stops accepting
+						// connections and moves its clients to the other
+						// servers over lame_duck_duration, rather than
+						// dropping them all at once when the kubelet's TERM
+						// arrives. On a single server there is nowhere to move
+						// them, and it still closes them gracefully.
+						Lifecycle: &corev1.Lifecycle{
+							PreStop: &corev1.LifecycleHandler{
+								Exec: &corev1.ExecAction{Command: []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}},
+							},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
@@ -2455,7 +2569,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("monitor")},
+								HTTPGet: &corev1.HTTPGetAction{Path: a2aNATSReadinessPath(replicas), Port: intstr.FromString("monitor")},
 							},
 						},
 					}},
@@ -2506,6 +2620,53 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 				// server, not this port.
 				{Name: "websocket", Port: a2aNATSWebSocketPort},
 			},
+		},
+	}
+}
+
+// buildA2ANATSRoutesService is the headless Service the cluster routes dial
+// (renderA2ANATSCluster): no ClusterIP, so its name resolves to every
+// server's pod IP rather than to one virtual IP that would balance a route
+// onto whichever server it liked, including the one dialling.
+//
+// PublishNotReadyAddresses, because a server reports ready only once it
+// serves, and on a new cluster it cannot serve JetStream until it has met
+// its peers: publishing only ready addresses would keep the first server
+// from finding the second. Port 6222 only; clients use the client Service.
+func buildA2ANATSRoutesService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	return &corev1.Service{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "nats")},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:                corev1.ClusterIPNone,
+			PublishNotReadyAddresses: true,
+			Selector:                 map[string]string{"app": a2aNATSName(agent)},
+			Ports:                    []corev1.ServicePort{{Name: "cluster", Port: a2aNATSRoutePort}},
+		},
+	}
+}
+
+// buildA2ANATSPDB keeps an eviction from taking more than one server of a
+// multi-server bus at a time: with two of three left, the cluster keeps its
+// JetStream quorum and every R3 stream keeps a leader.
+//
+// maxUnavailable 1, not 0. A budget that allows no eviction holds every node
+// drain and upgrade, and every install would trip the obtainability audit's
+// own blocking-pdb finding (obtainability_audit_sop.md §3.4); #3274 has the
+// argument. UnhealthyPodEvictionPolicy AlwaysAllow for the callout's reason
+// (buildA2ACalloutPDB): a server that is Running and not Ready is not
+// serving, and holding a drain to protect it protects nothing.
+//
+// Not rendered for a single server, where it could only allow the one
+// eviction or block every drain.
+func buildA2ANATSPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "nats")},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable:             ptr.To(intstr.FromInt32(1)),
+			Selector:                   &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aNATSName(agent)}},
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
 		},
 	}
 }
@@ -2683,7 +2844,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 
-	return &networkingv1.NetworkPolicy{
+	np := &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSNetpolName(agent),
@@ -2721,11 +2882,11 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					//
 					// The same rule is owed to the peers that arm later.
 					// The audit exporter, the janitor and the metrics
-					// scrape each add one when they exist. And the NATS
-					// pods join on their route port the moment this
-					// leaves the single-node dev shape: a 3-node cluster's
-					// servers dial each other, and a fence without the
-					// route peer means the cluster never forms.
+					// scrape each add one when they exist. The NATS
+					// servers' own route peer, on 6222, is a separate rule
+					// (a2aNATSRouteIngress): a multi-server bus's servers
+					// dial each other, and a fence without it means the
+					// cluster never forms.
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						"app": a2aCalloutName(agent),
 					}}},
@@ -2781,6 +2942,26 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			}},
 		},
 	}
+	np.Spec.Ingress = append(np.Spec.Ingress, a2aNATSRouteIngress(agent)...)
+	return np
+}
+
+// a2aNATSRouteIngress admits the cluster routes on a multi-server bus: 6222
+// from the bus's own servers and nothing else. Without it the servers cannot
+// dial each other and the cluster never forms; with a wider peer, anything
+// that reached 6222 would only need the route password (renderA2ANATSCluster)
+// to join as a server.
+func a2aNATSRouteIngress(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyIngressRule {
+	if a2aNATSReplicas(agent) <= 1 {
+		return nil
+	}
+	tcp := corev1.ProtocolTCP
+	return []networkingv1.NetworkPolicyIngressRule{{
+		Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSRoutePort))}},
+		From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			"app": a2aNATSName(agent),
+		}}}},
+	}}
 }
 
 // a2aOperatorNATSPeers admits the operator's own pod, which publishes
@@ -3050,14 +3231,14 @@ NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile(
 # fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
+  --max-age=72h --max-bytes=21474836480 --discard=old --replicas="${STREAM_REPLICAS}" \
   --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
-  --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
 # State-class topics (provisioned registry): upgrade-readiness, topology-skew, blueprint, probe.
@@ -3078,13 +3259,13 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
   --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
-  --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
 # Journal-class topics: annotations.
 $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
-  --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-age=720h --max-bytes=5368709120 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
@@ -3104,9 +3285,9 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 # running task would refuse that task mid-flight instead. Reclaiming is a
 # "nats kv del cap" against a finished task's key; no tooling ships for it
 # and the runbook says so.
-$NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
-$NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
-$NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+$NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456
+$NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456
+$NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456
 
 # feedback: the 👍 and 👎 ratings chat users gave the gateway's answers, each with
 # the exchange it rated (a2a/gateway/feedback.go). User content, so the max
@@ -3115,7 +3296,7 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # gateway's user reads or writes its records (provision and seed can list its keys). 64MiB holds about three thousand ratings
 # at their caps (ask, answer and note, about 22KB) and more at a typical
 # size; past it the write is refused, and the rating is counted but not kept.
-$NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
+$NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=67108864 --ttl=720h
 
 # TASKS older than this render: the limits the create above could not apply.
 #
@@ -3437,6 +3618,12 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 							// not as any part of the decision.
 							Name:  "BUS_USER",
 							Value: a2aServiceAccountName(agent.Namespace, a2aProvisionServiceAccountName(agent)),
+						}, {
+							// Every stream and bucket the script creates takes
+							// this, never a literal: one copy per server, up to
+							// three (a2aStreamReplicas).
+							Name:  a2aStreamReplicasEnv,
+							Value: strconv.Itoa(a2aStreamReplicas(agent)),
 						}},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: a2aProvisionWritablePath},
@@ -3701,7 +3888,8 @@ const defaultA2AMaxSessions = 10
 // count-then-create overshoot. Fifteen covered roughly ten standing pods plus
 // surge; the console server made it eleven, hence sixteen. If the base
 // install grows again, raise this before anything user-visible starts failing
-// admission.
+// admission. NATS is counted as one of those pods; a multi-server bus adds
+// its other servers on top (a2aNATSReplicas - 1), in buildA2ASessionQuota.
 const a2aQuotaHeadroom = 16
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
@@ -3709,6 +3897,114 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxSessions
 	}
 	return defaultA2AMaxSessions
+}
+
+// a2aNATSReplicas is the bus's server count: spec.tuning.busReplicas, or
+// DefaultBusReplicas when absent. The CRD admits only 1 and 3; anything else
+// that reaches here (a CR written past the schema) falls back to the
+// default rather than rendering a two-server cluster, which has no JetStream
+// quorum to lose a server from.
+func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
+	if limits := agentTuning(agent); limits != nil && limits.BusReplicas != nil {
+		if r := *limits.BusReplicas; r == 1 || r == 3 {
+			return r
+		}
+	}
+	return agentv1alpha1.DefaultBusReplicas
+}
+
+// a2aStreamReplicas is the replica count every JetStream stream and bucket
+// is created with: one per server, up to JetStream's useful maximum of 3.
+// The provision script reads it as STREAM_REPLICAS, so a stream added there
+// writes --replicas="${STREAM_REPLICAS}" and never a literal (a test walks
+// a2aProvisionedStreams to hold that).
+func a2aStreamReplicas(agent *agentv1alpha1.PlatformAgent) int {
+	return min(a2aNATSMaxReplicas, a2aNATSReplicas(agent))
+}
+
+// a2aStreamReplicasEnv carries a2aStreamReplicas into the provision script.
+const a2aStreamReplicasEnv = "STREAM_REPLICAS"
+
+const (
+	// a2aNATSPidFile is where nats-server writes its pid, for the preStop
+	// lame-duck signal. On the data volume because the root filesystem is
+	// read-only; a stale file from a crash is overwritten at the next boot.
+	a2aNATSPidFile = "/data/nats-server.pid"
+
+	// a2aNATSLameDuckSeconds is lame_duck_duration: how long a stopping
+	// server spreads its clients' reconnects over. a2aNATSTerminationGrace
+	// leaves room above it for the grace period nats-server waits before
+	// it starts, and for the final flush.
+	a2aNATSLameDuckSeconds         = 30
+	a2aNATSTerminationGraceSeconds = 60
+)
+
+// a2aNATSMinReadySeconds holds a multi-server bus's rollout between servers
+// (the comment on MinReadySeconds in buildA2ANATSStatefulSet). A single
+// server has no peer to wait for.
+func a2aNATSMinReadySeconds(replicas int) int32 {
+	if replicas > 1 {
+		return 20
+	}
+	return 0
+}
+
+// a2aNATSReadinessPath is the server's health endpoint as the readiness probe
+// reads it. A single server keeps the full /healthz, which includes JetStream.
+// A cluster member reports ready as a server (js-server-only): the full check
+// waits for a JetStream meta leader, which a fresh cluster cannot elect until
+// a second server is up, and the StatefulSet's OrderedReady policy does not
+// start the second until the first is Ready. With the full check, a new
+// install's bus would never form.
+func a2aNATSReadinessPath(replicas int) string {
+	if replicas > 1 {
+		return "/healthz?js-server-only=true"
+	}
+	return "/healthz"
+}
+
+// a2aNATSContainerPorts lists the server's listeners; the route port only on
+// a multi-server bus, which is the only one with a cluster block to serve it.
+func a2aNATSContainerPorts(replicas int) []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{
+		{Name: "client", ContainerPort: a2aNATSClientPort},
+		{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
+		{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
+	}
+	if replicas > 1 {
+		ports = append(ports, corev1.ContainerPort{Name: "cluster", ContainerPort: a2aNATSRoutePort})
+	}
+	return ports
+}
+
+// a2aNATSTopologySpread keeps a multi-server bus's servers on separate nodes,
+// so one node drain, upgrade or repair takes one server and the cluster keeps
+// its JetStream quorum (two of three).
+//
+// Hostname, DoNotSchedule, minDomains 3: with fewer than three nodes the
+// third server waits Pending rather than doubling up, and on Autopilot or an
+// autoscaled pool that wait is what brings up the third node. Two servers on
+// one node would look healthy and lose quorum to that node's first drain. A
+// Standard cluster that cannot grow to three nodes should run busReplicas 1
+// instead (the field's doc says so). Zone is ScheduleAnyway: spreading
+// across zones is better, but a single-zone cluster is common and a zone
+// spread must not block it.
+func a2aNATSTopologySpread(selector map[string]string, replicas int) []corev1.TopologySpreadConstraint {
+	if replicas <= 1 {
+		return nil
+	}
+	return []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		MinDomains:        ptr.To(int32(replicas)),
+		TopologyKey:       corev1.LabelHostname,
+		WhenUnsatisfiable: corev1.DoNotSchedule,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: selector},
+	}, {
+		MaxSkew:           1,
+		TopologyKey:       corev1.LabelTopologyZone,
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: selector},
+	}}
 }
 
 // a2aBridgeConcurrency is the number of bridge workers this CR declares: the
@@ -4162,7 +4458,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom + a2aNATSReplicas(agent) - 1)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -5301,6 +5597,23 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
+	// The routes Service and the disruption budget belong to a multi-server
+	// bus. On a single server they are deleted rather than left, so lowering
+	// busReplicas does not leave a budget that blocks the last server's
+	// drain or a Service that points routes at nothing.
+	for _, obj := range []client.Object{buildA2ANATSRoutesService(agent), buildA2ANATSPDB(agent)} {
+		if a2aNATSReplicas(agent) > 1 {
+			if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+				return state, err
+			}
+			if err := r.applyManaged(ctx, agent, obj); err != nil {
+				return state, fmt.Errorf("failed to apply A2A NATS %s: %w", obj.GetObjectKind().GroupVersionKind().Kind, err)
+			}
+		} else if err := r.deleteIfManaged(ctx, obj); err != nil {
+			return state, fmt.Errorf("failed to delete A2A NATS %s for a single-server bus: %w", obj.GetObjectKind().GroupVersionKind().Kind, err)
+		}
+	}
+
 	// The auth callout, before the fence and before anything that dials the
 	// bus. nats.conf now names it as the authority for every non-exempt
 	// connection, so a bus standing up without it accepts only the static
@@ -6206,6 +6519,10 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	return []a2aTeardownEntry{
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		// A multi-server bus's routes Service and budget. Absent on a single
+		// server, which the teardown reads as already gone.
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
 		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},

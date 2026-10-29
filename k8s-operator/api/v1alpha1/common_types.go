@@ -837,6 +837,25 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// BusReplicas is how many NATS servers run the A2A bus under mode: next,
+	// and so how many copies JetStream keeps of every stream and bucket: 3
+	// runs a cluster with R3 streams, which keeps the bus up through a node
+	// drain, upgrade or eviction that moves one server; 1 runs a single
+	// server with R1 streams, which is down for as long as its pod restarts.
+	// Absent means DefaultBusReplicas. 1 is for a throwaway or cost-bound
+	// install that accepts that outage; it saves two NATS pods and two 40Gi
+	// volumes.
+	//
+	// Raising it on an existing install grows the cluster, and streams
+	// created from then on take the new replica count. Streams that already
+	// exist keep the count they were created with: no workload may edit a
+	// stream, so raising them is an admin action (docs/designs/spec-nats-deployment.md).
+	// Lowering it from 3 to 1 is not supported: R3 streams cannot be served
+	// by one server.
+	// +kubebuilder:validation:Enum=1;3
+	// +optional
+	BusReplicas *int `json:"busReplicas,omitempty"`
+
 	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
 	// concurrent profile tasks and the warm workers kept per interactive
 	// (profile, tier). Until the sizing budget exists these are fixed,
@@ -864,6 +883,10 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultBusReplicas is the NATS server count when spec.tuning.busReplicas is
+// absent: a three-server cluster with R3 streams.
+const DefaultBusReplicas = 3
 
 // The ProfileTuning defaults.
 const (

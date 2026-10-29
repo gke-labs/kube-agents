@@ -1271,23 +1271,28 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		}
 
-		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
+		// The NATS StatefulSet's volumeClaimTemplate PVCs have no owner
 		// reference (nothing from a template does), so without this a
-		// deleted next-mode agent leaks its 40Gi JetStream volume. Guarded by
+		// deleted next-mode agent leaks a 40Gi JetStream volume per server.
+		// Every ordinal the bus can have, not just the current replica count:
+		// a StatefulSet scaled down keeps its higher ordinals' claims, so a
+		// bus lowered from three servers to one still owns three. Guarded by
 		// the instance label the claim template stamps, because a name is not
-		// ownership: a PVC squatting this exact name that this render did not
-		// create is left alone rather than destroyed.
-		a2aPVC := &corev1.PersistentVolumeClaim{}
-		pvcKey := client.ObjectKey{Name: a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace}
-		switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
-		case err == nil:
-			if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
-				if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
-					return ctrl.Result{}, err
+		// ownership: a PVC squatting one of these names that this render did
+		// not create is left alone rather than destroyed.
+		for ordinal := range a2aNATSMaxReplicas {
+			a2aPVC := &corev1.PersistentVolumeClaim{}
+			pvcKey := client.ObjectKey{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}
+			switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
+			case err == nil:
+				if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+					if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
+						return ctrl.Result{}, err
+					}
 				}
+			case client.IgnoreNotFound(err) != nil:
+				return ctrl.Result{}, err
 			}
-		case client.IgnoreNotFound(err) != nil:
-			return ctrl.Result{}, err
 		}
 
 		// Resource is deleted. Safe to remove finalizer and update.
