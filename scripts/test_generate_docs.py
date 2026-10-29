@@ -218,9 +218,33 @@ class CapabilitiesTest(unittest.TestCase):
         names = {
             *generate_docs._read_skills(generate_docs.SKILLS_DIR),
             *generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR),
+            *generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR),
         }
+        self.assertTrue(names)
         for name in names:
             self.assertIn(f"`{name}`", skills)
+
+    def test_the_catalog_lists_the_support_agent_skills_under_their_own_group(self):
+        tse_skills = generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR)
+        self.assertTrue(tse_skills, "agents/tse/skills holds no SKILL.md")
+        body = generate_docs.gen_skill_catalog()
+        group = body.split(f"### {generate_docs.TSE_SKILL_GROUP}\n")[1]
+        for name in tse_skills:
+            self.assertIn(
+                f"[`{name}`]({generate_docs.GITHUB_BLOB}/agents/tse/skills/{name}/SKILL.md)",
+                group,
+            )
+        self.assertTrue(body.rstrip().endswith(group.rstrip()))
+
+    def test_a_persona_group_with_no_skills_is_left_out(self):
+        grouped = generate_docs.group_skills({"fleet-audit": "d"}, {}, {})
+        self.assertEqual(grouped[generate_docs.TSE_SKILL_GROUP], [])
+        with mock.patch.object(
+            generate_docs, "read_persona_skills", return_value=({"fleet-audit": "d"}, {}, {})
+        ):
+            body = generate_docs.gen_skill_catalog()
+        self.assertNotIn(generate_docs.TSE_SKILL_GROUP, body)
+        self.assertNotIn(generate_docs.CLUSTER_SKILL_GROUP, body)
 
     def test_daily_audits_come_first_and_untimed_schedules_last(self):
         roster = [

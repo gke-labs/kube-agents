@@ -1,15 +1,15 @@
 ---
 title: Skill catalog
-description: The skills shipping with the Platform and Cluster Agents, grouped by area.
+description: The skills shipping with the Platform, Cluster and GKE Support Agents, grouped by area.
 ---
 
-Every skill is a `SKILL.md` bundle. The Platform Agent's live in [`agents/platform/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills); the Cluster Agent's live in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) and are scaffolded into each per-cluster profile. An agent loads them on demand based on the `description:` field in each skill's frontmatter — clicking through to source below gives you the full procedure the agent follows.
+Every skill is a `SKILL.md` bundle. The Platform Agent's live in [`agents/platform/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills); the Cluster Agent's live in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) and are scaffolded into each per-cluster profile; the GKE Support Agent's live in [`agents/tse/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/tse/skills) and are scaffolded into the optional `tse` profile when an install enables it. An agent loads them on demand based on the `description:` field in each skill's frontmatter — clicking through to source below gives you the full procedure the agent follows.
 
 For how skills are structured and invoked, see [Concepts → Skills](/kube-agents/concepts/skills/).
 
 ## The catalogue
 
-Generated from the `name` and `description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md`.
+Generated from the `name` and `description` frontmatter of every `SKILL.md` under `agents/platform/skills/`, `agents/cluster/skills/` and `agents/tse/skills/`.
 
 {/* BEGIN GENERATED: skill-catalog */}
 {/* Regenerate with: make docs-generate -- do not edit by hand. */}
@@ -130,6 +130,12 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | [`gke-workload-security`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-workload-security/SKILL.md) | Workflows for auditing and hardening the security of GKE workloads. |
 | [`gke-workload-troubleshooting`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-workload-troubleshooting/SKILL.md) | Systematic Standard Operating Procedure (SOP) for diagnosing GKE workload failures, crash loops, resource OOMs, mounting errors, and connectivity timeouts. |
 | [`topology-drift`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/topology-drift/SKILL.md) | Read-only attribution of zonal placement skew from a `leeway report` run against this cluster — which multi-replica workloads have their running replicas concentrated in one zone, why (a conflicting nodeAffinity under a soft spread constraint, no spread constraint at all, zonal PersistentVolumes, a zone out of CPU, a zone cordoned or NotReady, a node pool that exists in one zone), the share of the workload a zone failure takes, and which remediation category each cause takes. Use when a card asks about topology spread, zonal skew, single-zone blast radius, or why replicas are not spreading. |
+
+### GKE Support Agent (tse)
+
+| Skill | Description |
+| ----- | ----------- |
+| [`support-escalation-bundle`](https://github.com/gke-labs/kube-agents/blob/main/agents/tse/skills/support-escalation-bundle/SKILL.md) | Generates a structured, redacted Google Cloud Support escalation bundle when a GKE issue requires Google-side control plane intervention, quota adjustments, or platform bug escalation. Use when diagnostics confirm the root cause is outside customer-managed Kubernetes/GitOps state (such as stuck GKE control plane operations, regional stockouts with no fallback, or internal GKE control plane errors). Don't use when the issue can be resolved directly via customer-side manifest, node pool, or IAM configuration changes. |
 
 {/* END GENERATED: skill-catalog */}
 
