@@ -314,10 +314,12 @@ def test_a_card_the_stopped_turn_filed_must_end_archived(monkeypatch):
     assert _entry(archived, stop_hook.CARDS_STOPPED_ENTRY)["status"] == "completed"
 
 
-def test_a_turn_that_ended_before_the_mid_turn_stop_fails_the_entry(monkeypatch):
+def test_a_turn_that_ended_before_the_mid_turn_stop_fails_the_entry_with_why(monkeypatch):
     result = _stop_mid_turn(monkeypatch, [_cards({})], send=(False, "the opening turn ended first"))
     assert _entry(result)["status"] == "error"
-    assert any("filed no card" in e for e in result.errors)
+    assert _entry(result)["result"] == "the opening turn ended first"
+    assert result.errors == [f"{stop_hook.STOP_ENTRY}: the opening turn ended first"]
+    assert not any(e["name"] == stop_hook.CARDS_STOPPED_ENTRY for e in result.trajectory)
 
 
 def test_every_task_that_names_the_mid_turn_directive_parses():

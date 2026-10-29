@@ -1,6 +1,7 @@
 package hermesbridge
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -162,5 +163,29 @@ func TestTurnStop_NothingSentStopsNothing(t *testing.T) {
 	b.stopCanceledTurn(run, "a2a-ctx-n", errNeverConnected)
 	if stops := stub.stopsSeen(); len(stops) != 0 {
 		t.Fatalf("stops = %v, want none", stops)
+	}
+}
+
+// A shutdown ends a stop already in flight rather than waiting out its
+// timeout: the pod's turns go with the bridge.
+func TestTurnStop_AShutdownEndsAStopInFlight(t *testing.T) {
+	stub := newAPIStub(t, nil)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	stub.stop = func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}
+	stopping, stopStopping := context.WithCancel(context.Background())
+	b := &Bridge{cfg: Config{APIURL: stub.srv.URL + "/v1/chat/completions"}, apiClient: newAPIClient(), stopping: stopping}
+	time.AfterFunc(200*time.Millisecond, stopStopping)
+	started := time.Now()
+	if _, err := b.postTurnStop("a2a-ctx-s"); err == nil {
+		t.Fatal("a stop the shutdown ended reported an answer")
+	}
+	if took := time.Since(started); took > 5*time.Second {
+		t.Fatalf("the stop held the shutdown for %s", took)
 	}
 }

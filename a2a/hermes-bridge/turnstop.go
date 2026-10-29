@@ -66,6 +66,8 @@ func (b *Bridge) stopCanceledTurn(run *taskRun, sessionID string, err error) {
 	taskID := run.origin.TaskID
 	resp, err := b.postTurnStop(sessionID)
 	switch {
+	case err != nil && b.closing.Load():
+		// The shutdown ended the request; the pod's turns go with it.
 	case errors.Is(err, errTurnStopUnsupported):
 		b.cfg.Logger.Warn("the canceled turn runs on in hermes: "+err.Error(), "task", taskID, "session", sessionID)
 	case err != nil:
@@ -86,7 +88,11 @@ func (b *Bridge) postTurnStop(sessionID string) (*turnStopResponse, error) {
 	if !ok {
 		return nil, fmt.Errorf("APIURL %q does not end in %s, so the stop route's address is unknown", b.cfg.APIURL, apiChatCompletionsSuffix)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), turnStopTimeout)
+	parent := b.stopping
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, turnStopTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+fmt.Sprintf(turnStopPathFormat, url.PathEscape(sessionID)), nil)
 	if err != nil {

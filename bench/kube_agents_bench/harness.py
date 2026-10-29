@@ -2815,8 +2815,8 @@ class KubeAgentsHarness(AgentHarness):
         store does not know, or a stop that never reached the gateway makes
         the run infrastructure. :data:`stop_hook.STOP_ENTRY` goes on the
         trajectory either way, ``completed`` only when a card was filed and
-        the gateway took the word as a stop; for a mid-turn stop, a turn that
-        filed no card completes both entries.
+        the gateway took the word as a stop; for a mid-turn stop, a stop that
+        landed on a turn that then filed no card completes both entries.
         """
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)
@@ -2905,6 +2905,10 @@ class KubeAgentsHarness(AgentHarness):
                 "status": "completed",
                 "result": "the stopped turn filed no card",
             })
+            return
+        if not cards and stop.mid_turn_after is not None:
+            # The stop never landed while the turn ran: its reason is the miss.
+            result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")
             return
         if not cards:
             # The session is known and filed nothing: the agent's miss, graded.
