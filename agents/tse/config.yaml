@@ -98,6 +98,7 @@ plugins:
     - hermes_otel
     - tool_call_audit
     - pr_opened
+    - model_identity
 
 agent:
   environment_probe: false
