@@ -25,6 +25,9 @@ console's Harness limits page reads `harness-limits.json`.
   fan-out questions) from 40 clusters down. Its test clusters are created before the run, outside
   the runner, each with its own subnet and small Pod and Service ranges, so the project's default
   network does not cap their number.
+- `real-install-test-plan.md`, `real-install.yaml` and `real-install-concurrent.yaml`: the test of one
+  new install at the L container size on 40 clusters (first-run flow, heavy questions, churn, a red test
+  at the S size, cost), and the two plans its measured steps run.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
