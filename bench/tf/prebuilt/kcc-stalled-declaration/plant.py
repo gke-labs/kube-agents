@@ -66,6 +66,16 @@ teardown, every step independent of the others:
    delete has a time limit, and the namespace delete runs when an object delete
    fails.
 
+   The add-on's operator can fail to finish the context delete (for example,
+   when it cannot list a Config Connector kind in the namespace), and its
+   finalizer then holds the context, two RoleBindings it made, and the
+   namespace in `Terminating`. So when the context delete times out, and only
+   when `kubectl get gcp -n <namespace>` shows that no Config Connector object
+   is left, the teardown removes that finalizer from the objects in the
+   stack's namespace that carry it, logs a WARNING with the operator's error,
+   and waits a bounded time for the namespace to go. It changes nothing
+   outside that namespace.
+
 Steps 1 and 2 need the seeded cluster's name from `gcloud container clusters
 list`, and the GitHub token. When either is not available, the teardown logs
 an error that names what stays, and still does step 3.
@@ -116,7 +126,8 @@ BRANCH_DIGEST_CHARS = 10
 # How long `kubectl delete` waits for the object to go, and the hard limit on
 # the process around it.
 DELETE_TIMEOUT_S = 120
-DELETE_PROCESS_TIMEOUT_S = DELETE_TIMEOUT_S + 30
+PROCESS_MARGIN_S = 30
+DELETE_PROCESS_TIMEOUT_S = DELETE_TIMEOUT_S + PROCESS_MARGIN_S
 # How long Config Connector gets to write `Ready=False`, and how often the
 # plant reads it. A reference it cannot resolve is its first check.
 READY_WAIT_S = 300
@@ -136,8 +147,21 @@ CONTEXT_NAME = "configconnectorcontext.core.cnrm.cloud.google.com"
 # How long the namespaced controller gets to come up after the context is
 # created, and how often the plant reads it.
 CONTEXT_WAIT_S = 300
+# The finalizer the Config Connector operator puts on a context and on the
+# RoleBindings it makes for it, and the kinds in the stack's namespace the
+# teardown looks for it on when the operator cannot finish the delete.
+OPERATOR_FINALIZER = "configconnector.cnrm.cloud.google.com/finalizer"
+FINALIZER_RESOURCES = (
+    CONTEXT_RESOURCE,
+    "rolebindings.rbac.authorization.k8s.io",
+    "roles.rbac.authorization.k8s.io",
+    "serviceaccounts",
+)
+# What `kubectl delete --timeout` says when the object did not go in time.
+DELETE_TIMED_OUT_MARKER = "timed out"
 # What kubectl says when an object or a type is not there.
-NOT_FOUND_MARKERS = ("NotFound", "not found", "doesn't have a resource type")
+RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
+NOT_FOUND_MARKERS = ("NotFound", "not found", RESOURCE_TYPE_ABSENT_MARKER)
 GITHUB_API = "https://api.github.com"
 GITHUB_PAGE = 100
 HTTP_NOT_FOUND = 404
@@ -561,19 +585,95 @@ class Plant:
         if status != 200:
             raise RuntimeError(f"cannot delete {path} (HTTP {status})")
 
-    def delete_object(self, resource: str, name: str) -> str:
-        """Delete one object in the namespace, with a time limit; the error,
-        or `""`. A type the server does not serve is not an error."""
+    def delete_object(self, resource: str, name: str) -> tuple[str, bool]:
+        """Delete one object in the namespace, with a time limit.
+
+        Returns the error, or `""`, and whether the delete ran out of time. A
+        type the server does not serve is not an error.
+        """
         argv = [
             "kubectl", "delete", resource, name, "-n", self.settings.namespace,
             "--ignore-not-found", "--wait=true", f"--timeout={DELETE_TIMEOUT_S}s",
         ]
         result = self.run(argv, env=self.env, timeout=DELETE_PROCESS_TIMEOUT_S)
         if result.returncode == 0 or any(marker in result.stderr for marker in NOT_FOUND_MARKERS):
-            return ""
+            return "", False
+        timed_out = result.returncode == TIMEOUT_RC or DELETE_TIMED_OUT_MARKER in result.stderr
         error = f"the {resource} delete exited {result.returncode}: {result.stderr.strip()}"
         log(f"{error}; the teardown goes on")
-        return error
+        return error, timed_out
+
+    def kcc_objects_left(self) -> int | None:
+        """How many Config Connector objects the namespace still holds, or
+        None when the read failed (which is never "none left")."""
+        result = self.run(["kubectl", "get", "gcp", "-n", self.settings.namespace, "-o", "json"], env=self.env)
+        if result.returncode != 0:
+            if RESOURCE_TYPE_ABSENT_MARKER in result.stderr:
+                return 0
+            return None
+        try:
+            return len(json.loads(result.stdout).get("items") or [])
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+    def operator_error(self) -> str:
+        """The errors the operator wrote on the context's status, or `""`."""
+        result = self.run(
+            ["kubectl", "get", CONTEXT_RESOURCE, CONTEXT_NAME, "-n", self.settings.namespace, "-o", "json"],
+            env=self.env,
+        )
+        if result.returncode != 0:
+            return ""
+        try:
+            errors = (json.loads(result.stdout).get("status") or {}).get("errors") or []
+        except (json.JSONDecodeError, AttributeError):
+            return ""
+        return "; ".join(str(e) for e in errors)
+
+    def strip_operator_finalizer(self) -> list[str]:
+        """Remove `OPERATOR_FINALIZER` from each object in the stack's
+        namespace that carries it; the objects changed.
+
+        Every read and patch names the namespace with `-n`, so nothing outside
+        it changes. A JSON patch `test` op guards each removal, so a list that
+        changed since the read is not cut at the wrong place.
+        """
+        changed: list[str] = []
+        namespace = self.settings.namespace
+        for resource in FINALIZER_RESOURCES:
+            result = self.run(["kubectl", "get", resource, "-n", namespace, "-o", "json"], env=self.env)
+            if result.returncode != 0:
+                continue
+            for item in json.loads(result.stdout).get("items") or []:
+                meta = item.get("metadata") or {}
+                finalizers = meta.get("finalizers") or []
+                if OPERATOR_FINALIZER not in finalizers or meta.get("namespace", namespace) != namespace:
+                    continue
+                index = finalizers.index(OPERATOR_FINALIZER)
+                patch = [
+                    {"op": "test", "path": f"/metadata/finalizers/{index}", "value": OPERATOR_FINALIZER},
+                    {"op": "remove", "path": f"/metadata/finalizers/{index}"},
+                ]
+                name = str(meta.get("name") or "")
+                self.must(["kubectl", "patch", resource, name, "-n", namespace, "--type=json", "-p", json.dumps(patch)])
+                changed.append(f"{resource}/{name}")
+        return changed
+
+    def release_stuck_context(self) -> str:
+        """After a context delete that ran out of time: remove the operator's
+        finalizer when no Config Connector object is left; the error, or `""`."""
+        left = self.kcc_objects_left()
+        if left is None:
+            return "cannot read the Config Connector objects in the namespace, so no finalizer is removed"
+        if left:
+            return f"{left} Config Connector object(s) are still in the namespace, so no finalizer is removed"
+        reason = self.operator_error() or "no error on the context's status"
+        changed = self.strip_operator_finalizer()
+        log(
+            f"WARNING: the Config Connector operator did not finish the {CONTEXT_KIND} delete ({reason}); "
+            f"removed {OPERATOR_FINALIZER} from {', '.join(changed) or 'nothing'} in {self.settings.namespace}"
+        )
+        return ""
 
     def delete_kubernetes(self) -> None:
         """Delete the node pool, then the context, then the namespace.
@@ -581,10 +681,31 @@ class Plant:
         The node pool goes while its controller still runs, so the controller
         can remove its finalizer; the context delete stops that controller.
         The namespace delete runs also when an object delete fails or runs
-        out of time: it removes the objects with it.
+        out of time: it removes the objects with it. A context delete that
+        runs out of time goes to `release_stuck_context`, and then the
+        teardown waits a bounded time for the namespace to go.
         """
-        errors = [self.delete_object(KIND.lower(), self.settings.pool), self.delete_object(CONTEXT_RESOURCE, CONTEXT_NAME)]
+        pool_error, _ = self.delete_object(KIND.lower(), self.settings.pool)
+        context_error, context_timed_out = self.delete_object(CONTEXT_RESOURCE, CONTEXT_NAME)
+        errors = [pool_error, context_error]
+        released = False
+        if context_timed_out:
+            release_error = self.release_stuck_context()
+            errors.append(release_error)
+            released = not release_error
         self.must(["kubectl", "delete", "namespace", self.settings.namespace, "--ignore-not-found", "--wait=false"])
+        if released:
+            waited = self.run(
+                ["kubectl", "wait", "--for=delete", f"namespace/{self.settings.namespace}", f"--timeout={NAMESPACE_WAIT_S}s"],
+                env=self.env,
+                timeout=NAMESPACE_WAIT_S + PROCESS_MARGIN_S,
+            )
+            if waited.returncode == 0 or any(marker in waited.stderr for marker in NOT_FOUND_MARKERS):
+                # The context went with the namespace, so its timeout is not
+                # an error any more.
+                errors.remove(context_error)
+            else:
+                errors.append(f"namespace {self.settings.namespace} did not go in {NAMESPACE_WAIT_S}s: {waited.stderr.strip()}")
         errors = [e for e in errors if e]
         if errors:
             raise RuntimeError("; ".join(errors))

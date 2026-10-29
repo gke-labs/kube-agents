@@ -31,6 +31,9 @@
 # `ConfigConnectorContext` in the namespace, with the service account in
 # `kcc_google_service_account`, and waits until its controller is healthy. The
 # plant stops with an error when that mode has no service account set.
+# When the add-on's operator cannot finish the context delete, the teardown
+# removes the operator's finalizer from the objects in that namespace, but
+# only when no Config Connector object is left there (plant.py, teardown).
 #
 # Teardown on both paths. A failed plant removes what it wrote before it
 # exits, because Terraform taints a resource whose create provisioner failed

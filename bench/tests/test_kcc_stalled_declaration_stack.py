@@ -74,7 +74,17 @@ def done(rc=0, stdout="", stderr=""):
 class Cluster:
     """The commands plant.py runs, against an in-memory Config Connector cluster."""
 
-    def __init__(self, crd=True, namespace_owner=None, ready="False", fail_on=None, mode=None, context_healthy=True):
+    def __init__(
+        self, crd=True, namespace_owner=None, ready="False", fail_on=None, mode=None, context_healthy=True,
+        context_stuck=False, kcc_left=0, finalized=None,
+    ):
+        # `context_stuck`: the operator cannot finish the context delete.
+        # `kcc_left`: the Config Connector objects still in the namespace.
+        # `finalized`: resource -> the objects a list of it in the namespace returns.
+        self.context_stuck = context_stuck
+        self.kcc_left = kcc_left
+        self.finalized = finalized or {}
+        self.patched = []
         # `mode` is the ConfigConnector object's `spec.mode`, None with no object.
         self.mode = mode
         self.context_healthy = context_healthy
@@ -102,8 +112,18 @@ class Cluster:
             if self.mode is None:
                 return done(1, stderr='Error from server (NotFound): configconnectors "x" not found')
             return done(stdout=json.dumps({"spec": {"mode": self.mode}}))
+        if argv[:3] == ["kubectl", "get", "gcp"]:
+            return done(stdout=json.dumps({"items": [{"kind": "ContainerNodePool"}] * self.kcc_left}))
+        if argv[:2] == ["kubectl", "get"] and argv[3] == "-n":
+            return done(stdout=json.dumps({"items": self.finalized.get(argv[2], [])}))
         if argv[:3] == ["kubectl", "get", plant.CONTEXT_RESOURCE]:
-            return done(stdout=json.dumps({"status": {"healthy": self.context_healthy}}))
+            errors = ['cannot list resource "edgenetworknetworks" in the namespace'] if self.context_stuck else []
+            return done(stdout=json.dumps({"status": {"healthy": self.context_healthy, "errors": errors}}))
+        if argv[:2] == ["kubectl", "patch"]:
+            self.patched.append(list(argv))
+            return done()
+        if argv[:3] == ["kubectl", "delete", plant.CONTEXT_RESOURCE] and self.context_stuck:
+            return done(1, stderr="error: timed out waiting for the condition on configconnectorcontexts/x")
         if argv[:3] == ["kubectl", "get", "namespace"]:
             if self.namespace_owner is None:
                 return done(1, stderr="NotFound")
@@ -406,3 +426,74 @@ def test_the_service_account_comes_from_the_environment(monkeypatch):
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     assert plant.Settings.from_env().google_service_account == "sa@acme.iam.gserviceaccount.com"
+
+
+def finalized_objects():
+    """What the operator leaves in the namespace when it cannot finish the
+    context delete: the context and two RoleBindings it made, with its
+    finalizer, and one RoleBinding without it."""
+    def obj(name, finalizers):
+        return {"metadata": {"name": name, "namespace": "eval-kcc-stalled", "finalizers": finalizers}}
+
+    return {
+        plant.CONTEXT_RESOURCE: [obj(plant.CONTEXT_NAME, [plant.OPERATOR_FINALIZER])],
+        "rolebindings.rbac.authorization.k8s.io": [
+            obj("cnrm-admin-binding-eval-kcc-stalled", ["other/finalizer", plant.OPERATOR_FINALIZER]),
+            obj("cnrm-manager-ns-binding-eval-kcc-stalled", [plant.OPERATOR_FINALIZER]),
+            obj("someone-elses", []),
+        ],
+    }
+
+
+def test_a_stuck_context_loses_the_operators_finalizer_after_the_node_pool_is_gone(capsys):
+    cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced", context_stuck=True, finalized=finalized_objects())
+    assert new_plant(cluster, Forge()).teardown()
+    names = [patch[3] for patch in cluster.patched]
+    assert names == [plant.CONTEXT_NAME, "cnrm-admin-binding-eval-kcc-stalled", "cnrm-manager-ns-binding-eval-kcc-stalled"]
+    # The admin binding carries the finalizer second; the patch removes that one only.
+    admin = json.loads(cluster.patched[1][-1])
+    assert admin == [
+        {"op": "test", "path": "/metadata/finalizers/1", "value": plant.OPERATOR_FINALIZER},
+        {"op": "remove", "path": "/metadata/finalizers/1"},
+    ]
+    # The node pool went first, and the namespace delete and a bounded wait follow.
+    order = [c[:3] for c in cluster.calls]
+    assert order.index(["kubectl", "delete", "containernodepool"]) < order.index(["kubectl", "get", "gcp"]) < order.index(["kubectl", "patch", plant.CONTEXT_RESOURCE])
+    assert DELETE_NAMESPACE in cluster.calls
+    assert ["kubectl", "wait", "--for=delete", "namespace/eval-kcc-stalled", f"--timeout={plant.NAMESPACE_WAIT_S}s"] in cluster.calls
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "edgenetworknetworks" in err
+
+
+def test_no_finalizer_is_removed_while_a_config_connector_object_remains():
+    cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced", context_stuck=True, kcc_left=1, finalized=finalized_objects())
+    assert not new_plant(cluster, Forge()).teardown()
+    assert cluster.patched == []
+    assert DELETE_NAMESPACE in cluster.calls
+
+
+def test_no_finalizer_is_removed_when_the_objects_cannot_be_read():
+    cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced", context_stuck=True, finalized=finalized_objects(), fail_on="get gcp")
+    assert not new_plant(cluster, Forge()).teardown()
+    assert cluster.patched == []
+
+
+def test_the_finalizer_removal_stays_in_the_stacks_namespace():
+    objects = finalized_objects()
+    objects["rolebindings.rbac.authorization.k8s.io"].append(
+        {"metadata": {"name": "elsewhere", "namespace": "kube-system", "finalizers": [plant.OPERATOR_FINALIZER]}}
+    )
+    cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced", context_stuck=True, finalized=objects)
+    assert new_plant(cluster, Forge()).teardown()
+    assert "elsewhere" not in [patch[3] for patch in cluster.patched]
+    for call in cluster.calls:
+        if call[:2] in (["kubectl", "patch"], ["kubectl", "get"]) and call[2] != "namespace":
+            assert call[call.index("-n") + 1] == "eval-kcc-stalled", call
+    assert not [c for c in cluster.calls if "-A" in c or "--all-namespaces" in c]
+
+
+def test_a_context_delete_that_finishes_strips_nothing():
+    cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced", finalized=finalized_objects())
+    assert new_plant(cluster, Forge()).teardown()
+    assert cluster.patched == []
+    assert not [c for c in cluster.calls if c[:3] == ["kubectl", "get", "gcp"]]
