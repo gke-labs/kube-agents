@@ -2211,6 +2211,10 @@ KCC_STALLED_NAMED = 2
 KCC_STALLED_OBJECT = "`Ready=False` on {name} ({why})"
 KCC_STALLED_SEPARATOR = "; "
 KCC_STALLED_WAITS_ON = ", which waits on "
+# How the list counts the other unready objects in a dependency chain: it
+# names only the deepest one, the root cause, so a long chain cannot push
+# the note past `MAX_NOTE_CHARS`.
+KCC_STALLED_WAITS_MORE = " (and {rest} more unready object(s) between them)"
 KCC_STALLED_MORE = "; and {rest} more unready object(s) in this file"
 KCC_STALLED_WHY_CHARS = 160
 KCC_STALLED_OBJECTS_MAX_CHARS = 900
@@ -18978,17 +18982,20 @@ def kcc_stalled_objects(matched: list[KccStall], stalled: list[KccStall]) -> str
     """The objects a note or a comment names, with what each waits on.
 
     `Ready=False` on the first `KCC_STALLED_NAMED` matched objects, each with
-    the unready objects it waits on (`_kcc_dependencies`), within
+    the deepest unready object it waits on (`_kcc_dependencies`, the root
+    cause) and a count of the ones between them, within
     `KCC_STALLED_OBJECTS_MAX_CHARS`; the rest are counted. The first object is
     always named.
     """
     parts: list[str] = []
     for count, stall in enumerate(matched):
         text = KCC_STALLED_OBJECT.format(name=_kcc_name(stall), why=_kcc_why(stall))
-        text += "".join(
-            f"{KCC_STALLED_WAITS_ON}{_kcc_name(cause)} ({_kcc_why(cause)})"
-            for cause in _kcc_dependencies(stall, stalled)
-        )
+        chain = _kcc_dependencies(stall, stalled)
+        if chain:
+            root = chain[-1]
+            text += f"{KCC_STALLED_WAITS_ON}{_kcc_name(root)} ({_kcc_why(root)})"
+            if len(chain) > 1:
+                text += KCC_STALLED_WAITS_MORE.format(rest=len(chain) - 1)
         joined = KCC_STALLED_SEPARATOR.join([*parts, text])
         if parts and (count >= KCC_STALLED_NAMED or len(joined) > KCC_STALLED_OBJECTS_MAX_CHARS):
             break
@@ -19020,7 +19027,14 @@ def _with_kcc_stalled_note(note: str, stalled_note: str) -> str:
     fitted = _cut_worker_note(body, "", stalled_note, head)
     if fitted is None:
         fitted = head
-    return ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, stalled_note) if part)
+    # The Config Connector paragraph is never the part that is cut: drop
+    # what is before it, the worker's text first and then the head, until
+    # the note fits.
+    for before in (fitted, head, ""):
+        joined = ROUTE_PARAGRAPH_BREAK.join(part for part in (before, stalled_note) if part)
+        if len(publishable_text(joined).strip()) <= MAX_NOTE_CHARS:
+            return joined
+    return stalled_note
 
 
 def disclose_stalled_kcc_remediations(

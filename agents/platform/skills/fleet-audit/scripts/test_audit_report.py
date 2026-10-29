@@ -23188,6 +23188,29 @@ metadata:
         self.assertEqual(self.disclose([finding], kcc_manifest(account)), ["a"])
         self.assertIn("`IAMServiceAccount shop/web-sa`", finding["remediation"]["note"])
 
+    def test_a_deep_dependency_chain_names_the_root_cause_and_the_paragraph_fits_whole(self):
+        """An 8-deep `DependencyNotReady` chain under a long worker note: the
+        note names the deepest object, counts the rest, and keeps the whole
+        Config Connector paragraph inside the cap."""
+        chain = [dict(KCC_CLUSTER, why=f"DependencyNotReady: reference PubSubTopic infra/t1 is not ready")]
+        for depth in range(1, 8):
+            chain.append({"kind": "PubSubTopic", "namespace": "infra", "name": f"t{depth}",
+                          "why": f"DependencyNotReady: reference PubSubTopic infra/t{depth + 1} is not ready " + "x" * 120})
+        chain.append({"kind": "PubSubTopic", "namespace": "infra", "name": "t8", "why": "UpdateFailed: Error 403: roles/pubsub.editor is missing"})
+        for head in ("", audit_report.GENERATED_FIX_NOTE + " "):
+            with self.subTest(head=bool(head)):
+                finding = kcc_finding(note=head + "Raise the channel. " * 300)
+                self.disclose([finding], kcc_manifest(*chain))
+                note = finding["remediation"]["note"]
+                paragraph = note.split("\n\n")[-1]
+                self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:80])
+                self.assertTrue(paragraph.endswith("until then."), paragraph[-80:])
+                self.assertIn("which waits on `PubSubTopic infra/t8` (`UpdateFailed: Error 403", paragraph)
+                self.assertIn("(and 7 more unready object(s) between them)", paragraph)
+                self.assertNotIn("infra/t3`", paragraph)
+                self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+                self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""
