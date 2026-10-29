@@ -318,3 +318,49 @@ func TestDeleteConversationRefusesAmbiguousRoleMatch(t *testing.T) {
 		t.Fatalf("DeleteConversation(session-reviewer) = %+v, %v; want the remaining worker", deleted, ok)
 	}
 }
+
+func TestSyncKeepsDisambiguatedNameWhenTheOtherContextFails(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		ctxA, ctxB = "gke_proj-a_us-central1_kube-agents", "gke_proj-b_us-central1_kube-agents"
+		shared     = "kube-agents"
+	)
+	both := []DeploymentProfile{
+		{Name: shared, KubeContext: ctxA, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+		{Name: shared, KubeContext: ctxB, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+	}
+	if err := store.SyncDiscoveredDeployments(both); err != nil {
+		t.Fatal(err)
+	}
+	keyA, keyB := ctxA+"/"+shared, ctxB+"/"+shared
+	if _, err := store.SetActiveDeployment(keyB); err != nil {
+		t.Fatal(err)
+	}
+
+	// ctxB fails its probe, so ctxA's profile arrives under the bare name.
+	partial := []DeploymentProfile{
+		{Name: shared, KubeContext: ctxA, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+		ContextProbeFailure(ctxB, fmt.Errorf("Unauthorized")),
+	}
+	for _, scan := range [][]DeploymentProfile{partial, both} {
+		if err := store.SyncDiscoveredDeployments(scan); err != nil {
+			t.Fatal(err)
+		}
+		snap := store.Snapshot()
+		if _, ok := snap.Deployments[shared]; ok {
+			t.Fatalf("a bare %q profile appeared: %v", shared, snap.Deployments)
+		}
+		if _, ok := snap.Deployments[keyA]; !ok {
+			t.Fatalf("%q was renamed or pruned: %v", keyA, snap.Deployments)
+		}
+		if _, ok := snap.Deployments[keyB]; !ok {
+			t.Fatalf("%q was pruned: %v", keyB, snap.Deployments)
+		}
+		if snap.ActiveDeployment != keyB {
+			t.Fatalf("active deployment re-targeted to %q; want %q", snap.ActiveDeployment, keyB)
+		}
+	}
+}
