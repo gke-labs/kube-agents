@@ -2454,9 +2454,6 @@ type renderOptions struct {
 	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
 	// so the zero value renders byte-identical manifests.
 	enabledProfiles []string
-	// slackHomeRecord is the home-channel record the reconciler read this
-	// pass (platformagent_home_channel_record.go); the zero value is no record.
-	slackHomeRecord homeChannelRecord
 }
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
@@ -3326,19 +3323,20 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// count Chat as a platform to post to ahead of Slack.
 	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if slackHome := a2aSlackHomeEffective(agent, opts.slackHomeRecord); a2aAgentSurface(agent) && a2aSlackArmed(agent) && slackHome != "" {
+	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed. The
-		// channel is the CR's, else the one the gateway learned and the
-		// record admits (platformagent_home_channel_record.go): the one
-		// signal every agent-side reader follows.
+		// the single-backend gateway, so at most one platform is routed. Only
+		// the CR's channel travels as env; a channel the gateway learned
+		// reaches the agent through the projection file mounted below
+		// (platformagent_home_channel_record.go), which the agent's readers
+		// take after a non-empty env, so a learn replaces no pod.
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
 		// The agent's own idea of the Slack home channel, as under today: the
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: slackHome})
+		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first
@@ -3521,6 +3519,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		// The home-channel projection (platformagent_home_channel_record.go):
+		// Optional and out of the pod-template hashes, so its content rolls
+		// no pod; the agent's readers follow the file within a kubelet sync.
+		volumes = append(volumes, homeChannelProjectionVolume(agent))
+	}
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 		// Optional here and only here: a2aAgentSurface also holds on the skew
@@ -5262,6 +5266,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
+	}
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME

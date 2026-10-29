@@ -175,7 +175,7 @@ func TestTheSlackIntegrationRendersTheGateway(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	dep := &appsv1.Deployment{}
@@ -626,7 +626,7 @@ func TestAnUnarmedGatewayCarriesNoSlackAllowlist(t *testing.T) {
 // digest read off an absent Deployment is "" and would pass on absence.
 func gatewayDigestAfterPass(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	dep := &appsv1.Deployment{}
@@ -822,7 +822,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("precondition: a Slack-armed gateway renders: %v", err)
 	}
 	armed := &appsv1.Deployment{}
@@ -831,7 +831,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(false)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A with Slack disabled: %v", err)
 	}
 	off := &appsv1.Deployment{}
@@ -853,7 +853,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(true)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("re-enabling Slack: %v", err)
 	}
 	back := &appsv1.Deployment{}

@@ -4,13 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
-	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -21,33 +20,39 @@ import (
 // gateway learns the home channel from the first admitted mention in a
 // channel (a2a/gateway/slack_home_channel.go, armed by the
 // A2A_HOME_CHANNEL_LEARN this operator renders) and patches it into the
-// record. The operator reads the record and renders every agent-side
-// home-channel signal from "the CR, else the admitted record", so the agent,
-// the HomeChannelUnset condition and the gateway say the same thing. The
-// gateway writes the data keys with a merge patch; the operator applies the
-// object with no data, so server-side apply never resets a key it did not
-// set.
+// record. The operator reads the record, admits it, and projects the home
+// channel it stands behind, "the CR, else the admitted record", into a
+// second ConfigMap it mounts as a directory in the agent pod and the
+// gateway pod. Both read the file where it is mounted, and the kubelet
+// refreshes it in place, so a learned channel reaches them with no pod
+// replaced and no copy to drift: the agent, the HomeChannelUnset condition
+// and the gateway follow one read. The gateway writes the record's data keys
+// with a merge patch; the operator applies the record with no data, so
+// server-side apply never resets a key it did not set.
 const (
 	// a2aHomeChannelRecordSuffix names the ConfigMap after the agent.
 	a2aHomeChannelRecordSuffix = "-home-channel"
 
-	// The record's data keys the operator reads: the channel, the learn's
-	// timestamp that starts the admit delay, the refusal and the reader. The
-	// gateway also writes slack.setBy and writer, for audit; nothing here
-	// reads them.
+	// The record's data keys the operator reads: the channel and the
+	// refusal. The gateway also writes slack.setBy, slack.setAt and writer,
+	// for audit; nothing here reads them.
 	homeChannelRecordSlackKey   = "slack"
-	homeChannelRecordSetAtKey   = "slack.setAt"
 	homeChannelRecordRefusedKey = "slack.refused"
-	// homeChannelRecordReaderKey is the gateway image that last confirmed
-	// the recorded channel, stamped at every learn and every boot adopt. A
-	// record another image confirmed is stale: the gateway this operator
-	// renders has not stood behind it yet, so it arms nothing and no post is
-	// dropped under a clear condition. Compared in full with the
-	// non-printable runes dropped, the form the condition prints, so the
-	// message never shows two equal images for an unequal compare; a
-	// floating tag such as latest can name two images under one reference,
-	// which the compare cannot tell.
-	homeChannelRecordReaderKey = "reader"
+
+	// The projection: the home channel the operator admitted, in a ConfigMap
+	// it owns and mounts as a directory in the agent pod and the gateway pod.
+	// One key, the Slack channel id or empty, always present, so a reader
+	// never sees two keys torn across a kubelet refresh and a pod with the
+	// mount always finds the file. Mounted without subPath, so the kubelet
+	// refreshes it in place, and kept out of every pod-template hash, so a
+	// learn rolls no pod.
+	a2aHomeChannelProjectionSuffix  = "-chat-home"
+	homeChannelProjectionKey        = "slack_home"
+	homeChannelProjectionVolumeName = "chat-home"
+	// World-readable: the agent container runs as its own user, not root.
+	homeChannelProjectionFileMode int32 = 0444
+	agentChatHomeDir                    = "/etc/kube-agents/chat-home"
+	a2aGatewayChatHomeDir               = "/etc/a2a/chat-home"
 
 	// slackHomeChannelPolicyAuto and slackHomeChannelPolicyManual are the
 	// values of spec.integration.slack.homeChannelPolicy; absent reads as auto.
@@ -70,28 +75,10 @@ const (
 	// The condition's message is bounded (a status field), so no record value
 	// is echoed verbatim: the learned id is named only when it is a channel id
 	// within homeChannelRecordIDMax runes (Slack ids are about eleven, and the
-	// grammar alone has no upper bound), the reader image is cut to
-	// homeChannelRecordImageMax runes for display with the ellipsis marking
-	// the cut, and a refusal is one of the fixed words below, mapped to a
-	// fixed sentence.
-	homeChannelRecordIDMax         = 32
-	homeChannelRecordImageMax      = 160
-	homeChannelRecordImageEllipsis = "..."
-	homeChannelRecordMalformed     = "<not a channel id>"
-
-	// homeChannelAdmitDelay is how long after the learn (slack.setAt) an
-	// otherwise admitted record reaches the agent. The channel reaches the
-	// agent as pod env, so the admission replaces the agent pod, and the
-	// conversation that learned the channel runs through the bridge in that
-	// pod: admitted at once, the roll failed the user's own first message
-	// ("bridge-shutdown", 2026-10-28). The delay lets that conversation
-	// finish first; the reconcile requeues for the remainder. A record with
-	// no readable timestamp was not written by a learn and applies at once.
-	// A stamp ahead of this clock (a writer clock fast, a hand edit) waits
-	// until its own delay has passed, however far ahead that is: the
-	// condition names the time, and an admission never reverses while the
-	// record stands.
-	homeChannelAdmitDelay = 5 * time.Minute
+	// grammar alone has no upper bound), and a refusal is one of the fixed
+	// words below, mapped to a fixed sentence.
+	homeChannelRecordIDMax     = 32
+	homeChannelRecordMalformed = "<not a channel id>"
 
 	// The refusal vocabulary the gateway writes into slack.refused.
 	homeChannelRefusedShared    = "shared"
@@ -107,16 +94,6 @@ const (
 	homeChannelUnsetMalformedSuffix        = " The recorded channel is not a channel id (C... or G...), so it is not used."
 	homeChannelUnsetRefusedRecordedFormat  = " The recorded channel %s was refused: %s, so it is not used; the next admitted mention in a channel replaces it."
 	homeChannelUnsetRefusedCandidateFormat = " The last mention that could have set it was refused: %s."
-	homeChannelUnsetPendingFormat          = " A learned channel %s is recorded and is applied to the agent at %s, %s after it was learned, so the conversation that learned it finishes before the agent restarts."
-	homeChannelUnsetStaleFormat            = " A learned channel %s was last confirmed by gateway image %s, not the %s this operator renders, so it is not used until that gateway confirms it;" + homeChannelUnsetStaleExit
-	homeChannelUnsetStaleNoReaderFormat    = " A learned channel %s is recorded with no confirming gateway image, so it is not used until the gateway confirms it;" + homeChannelUnsetStaleExit
-	// homeChannelUnsetStaleExit names the way out of a stale record: the
-	// gateway checks and re-stamps the record when it starts. An operator
-	// upgrade is the usual cause (the gateway image follows the operator's)
-	// and starts its new gateway itself; a hand-edited reader, a boot check
-	// that could not be made or a re-stamp that failed waits for a restart
-	// that can check, because nothing retries them.
-	homeChannelUnsetStaleExit = " the gateway checks the record when it starts. During an operator upgrade the new gateway does that as it starts, and no action is needed; otherwise restart it (kubectl rollout restart deployment/%s -n %s)."
 )
 
 // homeChannelRefusedReasons maps the gateway's refusal vocabulary to the
@@ -131,28 +108,14 @@ var homeChannelRefusedReasons = map[string]string{
 // homeChannelRecord is what the operator read from the record ConfigMap.
 type homeChannelRecord struct {
 	// channel is the admitted learned channel id: "" when there is none, the
-	// id is malformed, the policy is manual, the gateway refused it, or the
-	// reader is stale.
+	// id is malformed, the policy is manual, or the gateway refused it.
 	channel string
 	// recorded is the raw learned id, admitted or not, or
 	// homeChannelRecordMalformed when it is not a channel id.
 	recorded string
-	// reader is the image that last confirmed the record, printable runes
-	// only, compared in full; stale says it is not the one this operator
-	// renders for the gateway. readerShown is the copy the condition prints,
-	// cut for display.
-	reader      string
-	readerShown string
-	stale       bool
 	// refused is the condition's sentence for the gateway's refusal, "" when
 	// none is recorded.
 	refused string
-	// pending says the record is admissible but younger than
-	// homeChannelAdmitDelay; appliesAt is when it is admitted and appliesIn
-	// how long from the read that is, for the reconcile's requeue.
-	pending   bool
-	appliesAt time.Time
-	appliesIn time.Duration
 }
 
 // slackHomeChannelPolicy is spec.integration.slack.homeChannelPolicy with
@@ -181,19 +144,16 @@ func buildHomeChannelRecord(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 	}
 }
 
-// readHomeChannelRecord interprets a record for this agent at time now.
-// gatewayImage is the image this operator renders for the gateway. A channel
-// is admitted only under policy auto, with no refusal recorded beside it,
-// with the reader equal to gatewayImage, and once homeChannelAdmitDelay has
-// passed since slack.setAt.
-func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.ConfigMap, gatewayImage string, now time.Time) homeChannelRecord {
+// readHomeChannelRecord interprets a record for this agent. A channel is
+// admitted only under policy auto and with no refusal recorded beside it;
+// the gateway that posts into it reads the same projection, so nothing
+// confirms the record beyond the gateway's own check at the learn.
+func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.ConfigMap) homeChannelRecord {
 	var rec homeChannelRecord
 	if cm == nil {
 		return rec
 	}
 	raw := strings.TrimSpace(cm.Data[homeChannelRecordSlackKey])
-	rec.reader = printableRunes(strings.TrimSpace(cm.Data[homeChannelRecordReaderKey]))
-	rec.readerShown = boundedRunes(rec.reader, homeChannelRecordImageMax)
 	if reason := strings.TrimSpace(cm.Data[homeChannelRecordRefusedKey]); reason != "" {
 		rec.refused = homeChannelRefusedReasons[reason]
 		if rec.refused == "" {
@@ -210,40 +170,51 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 		rec.recorded = homeChannelRecordMalformed
 		return rec
 	}
-	rec.stale = rec.reader != printableRunes(gatewayImage)
-	if slackHomeChannelPolicy(agent) != slackHomeChannelPolicyAuto || rec.stale || rec.refused != "" {
-		return rec
-	}
-	setAt, err := time.Parse(time.RFC3339, strings.TrimSpace(cm.Data[homeChannelRecordSetAtKey]))
-	if err == nil && now.Before(setAt.Add(homeChannelAdmitDelay)) {
-		rec.pending = true
-		rec.appliesAt = setAt.Add(homeChannelAdmitDelay)
-		rec.appliesIn = rec.appliesAt.Sub(now)
+	if slackHomeChannelPolicy(agent) != slackHomeChannelPolicyAuto || rec.refused != "" {
 		return rec
 	}
 	rec.channel = rec.recorded
 	return rec
 }
 
-// printableRunes is s with its non-printable runes dropped: a hand-edited
-// record can carry a newline or a terminal escape.
-func printableRunes(s string) string {
-	return strings.Map(func(c rune) rune {
-		if unicode.IsPrint(c) {
-			return c
-		}
-		return -1
-	}, s)
+// a2aHomeChannelProjectionName is the projection ConfigMap's name.
+func a2aHomeChannelProjectionName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + a2aHomeChannelProjectionSuffix
 }
 
-// boundedRunes is s cut to at most n runes, the cut marked with
-// homeChannelRecordImageEllipsis as the tree's other status cuts mark theirs.
-func boundedRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
+// buildHomeChannelProjection is the projection for this pass: the one key,
+// the home channel the agent and the gateway are to use (a2aSlackHomeEffective)
+// or empty. The operator owns the data too, so a hand edit of this object
+// is rewritten on the next pass; the record is where a hand edit belongs.
+func buildHomeChannelProjection(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
+		Data:       map[string]string{homeChannelProjectionKey: a2aSlackHomeEffective(agent, rec)},
 	}
-	return string(r[:n-len([]rune(homeChannelRecordImageEllipsis))]) + homeChannelRecordImageEllipsis
+}
+
+// homeChannelProjectionVolume mounts the projection as a directory: Optional,
+// so a pod under an operator that has not written it yet (or a stack torn
+// down) starts with an empty directory instead of waiting in
+// ContainerCreating; no subPath, so the kubelet refreshes the file in place.
+func homeChannelProjectionVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: homeChannelProjectionVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aHomeChannelProjectionName(agent)},
+				Optional:             ptr.To(true),
+				DefaultMode:          ptr.To(homeChannelProjectionFileMode),
+			},
+		},
+	}
+}
+
+// homeChannelProjectionMount is the read-only directory mount of the
+// projection at dir, in the agent container and in the gateway's.
+func homeChannelProjectionMount(dir string) corev1.VolumeMount {
+	return corev1.VolumeMount{Name: homeChannelProjectionVolumeName, MountPath: dir, ReadOnly: true}
 }
 
 // homeChannelRecordFor reads the record from the cache, once per reconcile
@@ -263,28 +234,15 @@ func (r *PlatformAgentReconciler) homeChannelRecordFor(ctx context.Context, agen
 		}
 		return homeChannelRecord{}, fmt.Errorf("read the home-channel record %s: %w", key.Name, err)
 	}
-	now := time.Now()
-	if r.now != nil {
-		now = r.now()
-	}
-	return readHomeChannelRecord(agent, &cm, a2aGatewayImage(), now), nil
+	return readHomeChannelRecord(agent, &cm), nil
 }
 
-// homeChannelRequeue is the reconcile's steady-state requeue, brought forward
-// to the moment a pending record is admitted: nothing else wakes that pass,
-// because the record does not change again after the learn.
-func homeChannelRequeue(after time.Duration, rec homeChannelRecord) time.Duration {
-	if rec.appliesIn > 0 {
-		return min(after, rec.appliesIn)
-	}
-	return after
-}
-
-// a2aSlackHomeEffective is the Slack home channel the agent is told about:
-// the CR's when it sets one, else the admitted record's. A CR value that is
-// set but malformed falls through to nothing, not to the record: the gateway
-// Deployment carries the raw CR value and refuses to arm on it, so arming the
-// agent from the record would have it post into a route nothing answers.
+// a2aSlackHomeEffective is the Slack home channel the projection carries,
+// which the agent and the gateway read: the CR's when it sets one, else the
+// admitted record's. A CR value that is set but malformed falls through to
+// nothing, not to the record: the gateway refuses to arm on the raw CR value
+// it carries, so a projection from the record would have the agent post into
+// a route nothing answers.
 func a2aSlackHomeEffective(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	if !slackEnabled(agent) {
 		return ""

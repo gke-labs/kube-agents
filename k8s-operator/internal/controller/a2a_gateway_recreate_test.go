@@ -159,7 +159,7 @@ func TestTheGatewayStrategyIsClearedInPlaceWhenRecreateIsRefused(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, agent, fakeAPI := gatewayRecreateFixture(t, gatewayAppliedBeforeRecreate(agent))
 
-	if _, err := r.reconcileA2A(context.Background(), agent); err != nil {
+	if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A must get past the refused apply by clearing the strategy: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func TestTheGatewayIsLeftAloneOnceItRollsWithRecreate(t *testing.T) {
 	agent := a2aTestAgent()
 	r, _, agent, fakeAPI := gatewayRecreateFixture(t, buildA2AGatewayDeployment(agent))
 
-	if _, err := r.reconcileA2A(context.Background(), agent); err != nil {
+	if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	if fakeAPI.refused != 0 {

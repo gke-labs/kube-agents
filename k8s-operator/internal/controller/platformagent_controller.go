@@ -436,10 +436,6 @@ type PlatformAgentReconciler struct {
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
 
-	// now is the reconcile's clock, time.Now when nil; a test injects one to
-	// hold the home-channel admit delay still (homeChannelRecordFor).
-	now func() time.Time
-
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
 	// so each generation logs them once. Keyed by ObjectKey, value int64;
@@ -999,14 +995,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
-	// The home-channel record, read once per pass: the agent render below
-	// and both condition writers after the A2A render take this value, so
-	// the env and the condition never disagree within one pass.
+	// The home-channel record, read once per pass: the projection in the
+	// A2A render and both condition writers take this value, so the file
+	// and the condition never disagree within one pass.
 	homeRec, err := r.homeChannelRecordFor(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled, homeRec); err != nil {
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1047,7 +1043,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var a2aState a2aProvisionState
 	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
-		if a2aState, err = r.reconcileA2A(ctx, instance); err != nil {
+		if a2aState, err = r.reconcileA2A(ctx, instance, homeRec); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
@@ -1055,9 +1051,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 	}
-	// The record travels with the render state to every status writer below,
-	// the failed and parked paths included, so the condition follows the same
-	// read the agent env did.
+	// The record travelled into the render (the projection) and travels on
+	// the state to every status writer below, the failed and parked paths
+	// included, so the file and the condition follow one read. The failed
+	// render path returns a state of its own, so it is set here too.
 	a2aState.homeRecord = homeRec
 
 	// The version this pass rendered, for the deferred write at 2d. Empty on
@@ -1190,7 +1187,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
-	requeueAfter = homeChannelRequeue(requeueAfter, homeRec)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
@@ -2382,11 +2378,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxyPolicyConfigMap(ctx co
 	return getConfigMapHash(cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool, homeRec homeChannelRecord) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
-	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled, slackHomeRecord: homeRec}
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
 	held, err := r.heldGitHubOrg(ctx, agent)
 	if err != nil {
 		return err
@@ -4732,7 +4728,7 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // channel, from the CR or admitted from the record. A malformed home channel
 // is not this condition's: the gateway refuses it at start and says so. On
 // Slack with the CR field empty the base sentence carries at most one more:
-// why the record did not stand in (manual, not an id, refused, stale), or
+// why the record did not stand in (manual, not an id, refused), or
 // that a mention sets it.
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	switch {
@@ -4752,13 +4748,6 @@ func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannel
 			return msg + homeChannelUnsetMalformedSuffix
 		case rec.recorded != "" && rec.refused != "":
 			return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.recorded, rec.refused)
-		case rec.recorded != "" && rec.reader == "":
-			return msg + fmt.Sprintf(homeChannelUnsetStaleNoReaderFormat, rec.recorded, a2aGatewayName(agent), agent.Namespace)
-		case rec.pending:
-			return msg + fmt.Sprintf(homeChannelUnsetPendingFormat, rec.recorded, rec.appliesAt.UTC().Format(time.RFC3339), homeChannelAdmitDelay)
-		case rec.stale:
-			return msg + fmt.Sprintf(homeChannelUnsetStaleFormat, rec.recorded, rec.readerShown,
-				boundedRunes(a2aGatewayImage(), homeChannelRecordImageMax), a2aGatewayName(agent), agent.Namespace)
 		case rec.refused != "":
 			return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.refused)
 		}

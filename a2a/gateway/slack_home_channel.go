@@ -56,11 +56,6 @@ const (
 	// homeRecordAttempts is how many times a write is tried when the record
 	// changed under it: the second read adopts the winner.
 	homeRecordAttempts = 2
-	// homeRefusalAttempts is how many times the refusal write is tried, with
-	// a fresh read before each retry. A recorded channel whose refusal never
-	// lands is one the operator admits while this gateway's home is unset,
-	// so every error is tried again, not only a 409.
-	homeRefusalAttempts = 3
 
 	// slackChannelTypeMpIM is a group direct message's channel_type. The
 	// InboundMessage.Kind of a non-DM turn is slackKindGroup (slack_stop.go).
@@ -183,10 +178,9 @@ func (s *SlackAdapter) adoptHome(ctx context.Context) {
 		return
 	case refused != "":
 		s.log.Warn("slack: recorded home channel refused; the first admitted channel mention replaces it", "channel", id, "reason", refused)
-		// A write that fails every try leaves the recorded channel without
-		// its reason until the next boot or the mention that replaces it;
-		// refuseHome never fills it in, because the reason it holds is a
-		// candidate's.
+		// A write that fails leaves the recorded channel without its reason
+		// until the next boot or the mention that replaces it; refuseHome
+		// never fills it in, because the reason it holds is a candidate's.
 		if cm.Data[homeRecordKeyRefused] != refused {
 			s.writeRefusal(ctx, cm, refused)
 		}
@@ -347,28 +341,11 @@ func (s *SlackAdapter) refuseHome(ctx context.Context, reason string) {
 	s.writeRefusal(ctx, cm, reason)
 }
 
-// writeRefusal writes the reason, within the caller's timeout, reading the
-// record again before each retry. It stops once the record says so, or names
-// another channel than the one the reason describes (a replacement learned
-// under the write), so a retry never labels a channel it did not check.
 func (s *SlackAdapter) writeRefusal(ctx context.Context, cm *corev1.ConfigMap, reason string) {
 	l := &s.homeLearn
-	channel := strings.TrimSpace(cm.Data[homeRecordKeySlack])
-	var err error
-	for attempt := 0; attempt < homeRefusalAttempts; attempt++ {
-		if attempt > 0 {
-			if cm, err = l.record.get(ctx); err != nil {
-				continue
-			}
-			if cm.Data[homeRecordKeyRefused] == reason || strings.TrimSpace(cm.Data[homeRecordKeySlack]) != channel {
-				return
-			}
-		}
-		if err = l.record.patch(ctx, cm.ResourceVersion, map[string]*string{homeRecordKeyRefused: &reason}); err == nil {
-			return
-		}
+	if err := l.record.patch(ctx, cm.ResourceVersion, map[string]*string{homeRecordKeyRefused: &reason}); err != nil {
+		s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "err", err)
 	}
-	s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "attempts", homeRefusalAttempts, "err", err)
 }
 
 // recordHome writes the learned channel, unless the record names one already:

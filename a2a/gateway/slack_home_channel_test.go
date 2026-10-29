@@ -352,56 +352,33 @@ func TestSlackHomeWriteErrorLearnsNothing(t *testing.T) {
 	}
 }
 
-// failActions passes the next skip configmaps actions of verb, fails the n
-// after them, and passes the rest.
-func failActions(cs *k8sfake.Clientset, verb string, skip, n int) {
+// failOnce fails the next configmaps action of verb once; later ones pass.
+func failOnce(cs *k8sfake.Clientset, verb string) {
+	failed := false
 	cs.PrependReactor(verb, "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		if skip > 0 {
-			skip--
+		if failed {
 			return false, nil, nil
 		}
-		if n == 0 {
-			return false, nil, nil
-		}
-		n--
+		failed = true
 		return true, nil, errors.New("apiserver unavailable")
 	})
 }
 
-// failTimes fails the next n configmaps actions of verb; later ones pass.
-func failTimes(cs *k8sfake.Clientset, verb string, n int) { failActions(cs, verb, 0, n) }
-
-// failOnce fails the next configmaps action of verb once; later ones pass.
-func failOnce(cs *k8sfake.Clientset, verb string) { failTimes(cs, verb, 1) }
-
-// TestSlackHomeRefusalThatDidNotLandIsWrittenAtTheNextRefusal: a candidate's
-// refusal write is tried again at once after a fresh read, and a refusal that
-// still did not land is written at the next refusal.
 func TestSlackHomeRefusalThatDidNotLandIsWrittenAtTheNextRefusal(t *testing.T) {
-	cases := []struct {
-		name           string
-		verb           string
-		fails          int
-		refusedAtFirst string // slack.refused after the first refusal
-	}{
-		{"the record get fails: nothing is written until the next refusal", "get", 1, ""},
-		{"the record patch fails once: the retry writes it", "patch", 1, homeRefusedArchived},
-		{"the record patch fails every try: the next refusal writes it", "patch", homeRefusalAttempts, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, verb := range []string{"get", "patch"} {
+		t.Run("the record "+verb+" fails", func(t *testing.T) {
 			a, api, cs, setter := newHomeLearnAdapter(t, nil)
 			api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true })
 			a.AdoptHomeRecord(context.Background())
-			failTimes(cs, tc.verb, tc.fails)
+			failOnce(cs, verb)
 			homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U1", "<@UBOT> hi", "100.0", "", true)
-			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != tc.refusedAtFirst {
-				t.Fatalf("record after the first refusal = %v, want refused=%q", data, tc.refusedAtFirst)
+			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != "" {
+				t.Fatalf("record after the failed %s = %v, want no refusal yet", verb, data)
 			}
-			// The same refusal again: the reason is in the record after it.
+			// The same refusal again: the reason reaches the record this time.
 			homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U2", "<@UBOT> again", "101.0", "", true)
 			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != homeRefusedArchived {
-				t.Fatalf("record after the second refusal = %v, want refused=%s", data, homeRefusedArchived)
+				t.Fatalf("record after the retry = %v, want refused=%s", data, homeRefusedArchived)
 			}
 			// And once it is there, a third refusal is a log line.
 			patches := homePatches(cs)
@@ -463,18 +440,16 @@ func TestSlackHomeRefusedRecordIsReplacedByTheNextMention(t *testing.T) {
 // TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel: while a
 // channel is recorded, slack.refused describes that channel. A candidate
 // refused for another reason writes nothing, whether the boot's own refusal
-// write landed, landed on a retry or failed every try; the next channel that
-// passes replaces the record.
+// write landed or failed; the next channel that passes replaces the record.
 func TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel(t *testing.T) {
 	cases := []struct {
 		name          string
-		bootPatchFail int
+		bootWriteOK   bool
 		refusedAfter  string
 		patchesBefore int
 	}{
-		{"the boot refusal landed", 0, homeRefusedArchived, 1},
-		{"the boot refusal landed on the retry", 1, homeRefusedArchived, 2},
-		{"the boot refusal write failed every try", homeRefusalAttempts, "", homeRefusalAttempts},
+		{"the boot refusal landed", true, homeRefusedArchived, 1},
+		{"the boot refusal write failed", false, "", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -484,7 +459,9 @@ func TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel(t *testing.T) 
 			api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true })
 			api.conversations["C0BB2"] = homeChannelInfo("C0BB2", func(c *slack.Channel) { c.IsExtShared = true })
 			api.conversations["C0CC3"] = homeChannelInfo("C0CC3", nil)
-			failTimes(cs, "patch", tc.bootPatchFail)
+			if !tc.bootWriteOK {
+				failOnce(cs, "patch")
+			}
 			a.AdoptHomeRecord(context.Background())
 			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != tc.refusedAfter || !a.homeLearn.armed {
 				t.Fatalf("after boot: record %v, armed %v; want refused=%q and armed", data, a.homeLearn.armed, tc.refusedAfter)
@@ -506,64 +483,6 @@ func TestSlackHomeRefusedCandidateNeverRelabelsTheRecordedChannel(t *testing.T) 
 			}
 			if got := setter.all(); len(got) != 1 || got[0] != "C0CC3" {
 				t.Errorf("SetHome = %v, want [C0CC3]", got)
-			}
-		})
-	}
-}
-
-// TestSlackHomeBootRefusalWriteRetries: a boot refusal whose write fails is
-// tried again after a fresh read, so one failed call does not leave a
-// recorded channel the operator admits while this gateway's home is unset. A
-// record that came to name another channel under the write is left to the
-// next boot: the reason describes the channel this boot checked.
-func TestSlackHomeBootRefusalWriteRetries(t *testing.T) {
-	recorded := map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyReader: homeTestOldImage}
-	replaceUnderTheWrite := func(cs *k8sfake.Clientset) {
-		done := false
-		cs.PrependReactor("patch", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
-			if done {
-				return false, nil, nil
-			}
-			done = true
-			obj, err := cs.Tracker().Get(configMapsGVR, homeTestNamespace, homeTestRecord)
-			if err != nil {
-				return true, nil, err
-			}
-			cm := obj.(*corev1.ConfigMap)
-			cm.Data = map[string]string{homeRecordKeySlack: "C0BB2", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyReader: homeTestOldImage}
-			if err := cs.Tracker().Update(configMapsGVR, cm, homeTestNamespace); err != nil {
-				return true, nil, err
-			}
-			return true, nil, errors.New("the record changed under the write")
-		})
-	}
-	cases := []struct {
-		name        string
-		arrange     func(cs *k8sfake.Clientset)
-		wantRefused string
-		wantSlack   string
-		patches     int
-	}{
-		{"the write fails once: the retry lands", func(cs *k8sfake.Clientset) { failOnce(cs, "patch") }, homeRefusedArchived, "C0AA1", 2},
-		{"the write fails once and the retry's read fails once: the third try lands", func(cs *k8sfake.Clientset) {
-			failOnce(cs, "patch")
-			failActions(cs, "get", 1, 1)
-		}, homeRefusedArchived, "C0AA1", 2},
-		{"the write fails every try: the channel stays without its reason", func(cs *k8sfake.Clientset) { failTimes(cs, "patch", homeRefusalAttempts) }, "", "C0AA1", homeRefusalAttempts},
-		{"a replacement learned under the failed write is not labelled with this channel's reason", replaceUnderTheWrite, "", "C0BB2", 1},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			a, api, cs, setter := newHomeLearnAdapter(t, recorded)
-			api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true })
-			tc.arrange(cs)
-			a.AdoptHomeRecord(context.Background())
-			data := homeRecordData(t, cs)
-			if data[homeRecordKeyRefused] != tc.wantRefused || data[homeRecordKeySlack] != tc.wantSlack || homePatches(cs) != tc.patches {
-				t.Errorf("record %v, patches %d; want refused=%q beside %s and %d patches", data, homePatches(cs), tc.wantRefused, tc.wantSlack, tc.patches)
-			}
-			if len(setter.all()) != 0 || !a.homeLearn.armed {
-				t.Errorf("SetHome %v, armed %v; want nothing adopted and the learner armed", setter.all(), a.homeLearn.armed)
 			}
 		})
 	}

@@ -505,6 +505,9 @@ gateway.
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
      channel those posts are dropped while conversations keep working: the run warns, and the
      `PlatformAgent` carries the `HomeChannelUnset` condition.
+   - Keep the agent image at the operator's release. A learned home channel reaches the agent through
+     a file the operator mounts; an older agent image reads env only and never sees it, while the CR
+     shows no condition.
 
 3. Check the board for cards in flight:
 

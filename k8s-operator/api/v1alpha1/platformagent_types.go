@@ -337,12 +337,14 @@ type SlackSpec struct {
 	// A2A gateway may learn the Slack home channel under spec.mode next when
 	// HomeChannel is empty. Under "auto" the channel of the first top-level
 	// mention of the agent in a channel becomes the home channel: the gateway
-	// records it in the <agent>-home-channel ConfigMap and, five minutes
-	// later, the operator renders it to the agent as if HomeChannel named it
-	// (the agent pod restarts once for that, after the conversation that
-	// learned the channel) and clears HomeChannelUnset. Under "manual"
-	// HomeChannel alone decides. A set
-	// HomeChannel wins under either. No schema default: the API server would
+	// records it in the <agent>-home-channel ConfigMap, the operator projects
+	// it into the <agent>-chat-home ConfigMap it mounts as a directory in the
+	// agent pod and the gateway pod, both read the file within about a minute
+	// with no pod restarted, and HomeChannelUnset clears. An agent image
+	// older than this operator reads env only and never sees a learned
+	// channel: keep the agent image at the operator's release. Under
+	// "manual" HomeChannel alone decides. A set HomeChannel wins under
+	// either. No schema default: the API server would
 	// apply one to every stored object it reads, so absent is read as "auto"
 	// by the operator instead.
 	// +kubebuilder:validation:Enum=auto;manual

@@ -1326,7 +1326,7 @@ next_home_channel_unset_key() {
 
 # The warning for that key ($1), one line.
 next_home_channel_unset_message() {
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so it will drop every one of them; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so it will drop every one of them; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set, or, on Slack under homeChannelPolicy auto, until the agent is mentioned top-level in a channel."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can
@@ -1336,7 +1336,7 @@ next_home_channel_unset_remedy() {
   case "${1:-}" in
     SLACK_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel"
-      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
+      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel; or mention the agent once, top-level, in the channel you want. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
