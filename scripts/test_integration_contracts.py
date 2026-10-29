@@ -883,6 +883,16 @@ class WorkflowNameJoinTest(unittest.TestCase):
         runs = " ".join(step.get("run", "") for step in join["steps"])
         self.assertIn("coverage-merge", runs)
 
+    def assert_bench_job_is_hard(self, bench):
+        """The bench job the join needs must be able to go red: no job-level or
+        step-level continue-on-error, and one step that runs exactly
+        `make test-bench`, so a `|| true` cannot report success on a red suite."""
+        self.assertIsNot(bench.get("continue-on-error"), True, "the bench job is continue-on-error")
+        for step in bench["steps"]:
+            self.assertIsNot(step.get("continue-on-error"), True, f"a bench step is continue-on-error: {step.get('name')}")
+        runs = [str(step.get("run", "")).strip() for step in bench["steps"]]
+        self.assertEqual(runs.count("make test-bench"), 1, f"no single bench step runs exactly `make test-bench`: {runs}")
+
     def test_the_required_python_check_fails_closed_on_its_shards(self):
         """The required check is a join of three shards and the bench job, and a skip is a pass.
 
@@ -916,6 +926,18 @@ class WorkflowNameJoinTest(unittest.TestCase):
         for label, mutant in (("a soft guard", soft_guard), ("the bench gate in a step gated off", moved), ("the bench gate in a soft step", soft_moved)):
             with self.subTest(mutant=label), self.assertRaises(AssertionError):
                 self.assert_join_fails_closed(mutant)
+        # The bench job itself must stay able to go red, or the join's bench
+        # branch guards nothing.
+        bench = jobs["bench-tests"]
+        self.assert_bench_job_is_hard(bench)
+        run_index = next(i for i, step in enumerate(bench["steps"]) if str(step.get("run", "")).strip() == "make test-bench")
+        soft_step = copy.deepcopy(bench)
+        soft_step["steps"][run_index]["continue-on-error"] = True
+        or_true = copy.deepcopy(bench)
+        or_true["steps"][run_index]["run"] = "make test-bench || true"
+        for label, mutant in (("a soft bench step", soft_step), ("`make test-bench || true`", or_true)):
+            with self.subTest(mutant=label), self.assertRaises(AssertionError):
+                self.assert_bench_job_is_hard(mutant)
         shard_runs = " ".join(step.get("run", "") for step in shards["steps"])
         self.assertIn("COVERAGE_STRICT=1", shard_runs)
         # In the environment, not on make's command line, where it would also
