@@ -3239,6 +3239,52 @@ class ScopeTest(HomesMixin):
         self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
         self.assertEqual(report["kept"], ["cluster-a"])
 
+    def test_a_batch_that_failed_in_the_relay_falls_back_to_gcloud(self):
+        # No HTTP answer, a 401, or the broker's own transport code on every row is the
+        # relay failing as a whole (an unreadable token, no broker), not an answer about
+        # the projects: gcloud lists and describes, as it would have before the relay.
+        for failed in ({"status": 0, "error": {"exception": "ConnectionError"}},
+                       {"status": 401, "error": {"error": "unauthorized"}},
+                       {"status": 503, "error": {"code": "RELAY_CREDENTIAL_UNAVAILABLE"}},
+                       {"status": 504, "error": {"code": "UPSTREAM_TIMEOUT"}}):
+            with self.subTest(failed=failed):
+                profiles, identities = self._profiles("a")
+                _, relay = self._relay(lists={self.MGMT: failed})
+                report, deleted, lists, describes = self._relayed_run(
+                    relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+                self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
+                self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+                self.assertEqual(deleted, [])
+
+    def test_a_describe_batch_that_failed_in_the_relay_falls_back_to_gcloud(self):
+        profiles, identities = self._profiles("a", "b")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
+            self._key("a"): {"status": 0, "error": {"exception": "ReadTimeout"}},
+            self._key("b"): {"status": 504, "error": {"code": "UPSTREAM_TIMEOUT"}}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual([], lists)
+        self.assertEqual(["a", "b"], sorted(describes))
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
+
+    def test_the_helper_gets_half_the_budget_and_each_call_less(self):
+        # A stalled helper leaves gcloud the other half; a stalled call is one row's
+        # "unknown", answered inside the helper's own wait.
+        waits: list = []
+        profiles, identities = self._profiles("gone")
+        batches, relay = self._relay(lists={self.MGMT: self._ok_list()},
+                                     gets={self._key("gone"): {"status": 404, "error": self.NOT_FOUND}})
+
+        def timed(request, timeout):
+            waits.append(timeout)
+            return relay(request, timeout)
+        with mock.patch.object(rec.time, "monotonic", return_value=1000.0):
+            batch, call = rec._relay_budget(1100.0)
+        self.assertEqual((50.0, 50.0 - rec.RELAY_CALL_MARGIN_SECONDS), (batch, call))
+        self._relayed_run(timed, profiles, identities)
+        self.assertEqual(2, len(batches))
+        for request, wait in zip(batches, waits):
+            self.assertLess(request["call_timeout"], wait)
+
 
 class ProjectSourceTest(unittest.TestCase):
     """The management project comes from the operator before the metadata server.

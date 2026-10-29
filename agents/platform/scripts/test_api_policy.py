@@ -271,6 +271,13 @@ class GkeClusterRoutesTest(unittest.TestCase):
             "v1/projects/kagents-dev/zones/us-central1-a/clusters",
             "v1beta1/projects/kagents-dev/locations/-/clusters",
             "v1/projects/kagents-dev/locations/US-central1/clusters",
+            "v1/projects/kagents-dev/locations/us-central1:x/clusters",
+            "v1/projects/kagents-dev/locations/us-central1-ab/clusters",
+            "v1/projects/kagents-dev/locations/us-central123/clusters",
+            "v1/projects/kagents-dev/locations/uscentral1/clusters",
+            "v1/projects/kagents-dev/locations/global/clusters",
+            "v1/projects/kagents-dev/locations/--/clusters",
+            "v1/projects/kagents-dev/locations/us-central1-/clusters",
             "v1/projects/kagents-dev/locations/us-central1/clusters/Seeded-a",
             "v1/projects/kagents-dev/locations/us-central1/clusters/1a",
             "v1/projects/kagents-dev/locations/us-central1/clusters/a-",
@@ -311,6 +318,11 @@ class GkeClusterRoutesTest(unittest.TestCase):
         self.assertIsNone(api_policy.project_gke_cluster_list(b'{"clusters": {"a": 1}}'))
         self.assertIsNone(api_policy.project_gke_cluster_list(b'{"clusters": ["a"]}'))
         self.assertEqual(b'{"clusters":[]}', api_policy.project_gke_cluster_list(b"{}"))
+
+    def test_a_list_keeps_no_top_level_key_but_clusters_and_missing_zones(self):
+        body = {"clusters": [], "missingZones": ["europe-west1-b"], "nextPageToken": "t", "fieldOne": "x"}
+        got = json.loads(api_policy.project_gke_cluster_list(json.dumps(body).encode()))
+        self.assertEqual({"clusters": [], "missingZones": ["europe-west1-b"]}, got)
 
     def test_only_the_cluster_routes_carry_a_projection(self):
         projected = {r.rule_id for r in api_policy.API_READ_ROUTES if r.project is not None}

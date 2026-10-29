@@ -415,20 +415,39 @@ def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WOR
 # gcp.api.container.clusters-list and -get, projected to name, location, status and id).
 # A `gcloud` process per read cost ~2.4 s of the sandbox's CPU each; a REST call costs a
 # fraction of that. When the relay cannot be used -- the helper is missing (a sandbox
-# image older than this script), it failed, or the broker refused the route (a broker
-# older than the routes) -- the run says so once and falls back to `gcloud` for the rest
+# image older than this script), it failed, the broker refused the route (a broker
+# older than the routes), or every read in a batch failed before reaching the API -- the run says so once and falls back to `gcloud` for the rest
 # of the tick, so a version skew between the pods costs speed, never correctness.
 GKE_READS_HELPER = "/opt/defaults/scripts/gke_cluster_reads.py"
 GKE_READS_WORKERS = 16
+# Room between a call's read timeout and the helper's own: the connect, the helper's start-up.
+RELAY_CALL_MARGIN_SECONDS = 5.0
 # The broker's own refusal codes. Any of them on a relayed read means the relay itself
 # said no, which is not an answer about the cluster or the project.
 _RELAY_REFUSAL_CODES = frozenset({"SECURITY_POLICY_BLOCKED", "CALLER_ROLE_FORBIDDEN", "API_RELAY_DISABLED",
                                   "UPSTREAM_UNEXPECTED", "UPSTREAM_RESPONSE_TOO_LARGE", "UPSTREAM_REDIRECTED"})
+# The broker's own codes for a call it could not complete: no credential, no upstream,
+# a timeout, an answer it could not relay. One of them on one row is that read's
+# "unknown"; on every row of a batch it is the relay failing as a whole, like a 401 or a
+# call that got no HTTP answer at all, and the run falls back to gcloud.
+_RELAY_TRANSPORT_CODES = frozenset({"RELAY_CREDENTIAL_UNAVAILABLE", "UPSTREAM_UNAVAILABLE", "UPSTREAM_TIMEOUT",
+                                    "UPSTREAM_TRUNCATED", "UPSTREAM_UNRELAYABLE"})
 _relay_unusable_this_run = False
 
 
 class _RelayUnusable(Exception):
     """The relay answered in a way that says nothing about the clusters; use gcloud."""
+
+
+def _relay_budget(deadline: float) -> tuple[float, float]:
+    """(seconds for the helper, read timeout for each of its calls).
+
+    The helper gets half of what is left, so a helper that stalls leaves gcloud the other
+    half; each call's read timeout sits under the helper's, so one slow call is that one
+    read's "unknown" rather than the whole batch thrown away.
+    """
+    batch = max(1.0, (deadline - time.monotonic()) / 2)
+    return batch, max(1.0, batch - RELAY_CALL_MARGIN_SECONDS)
 
 
 def _relay_reads(request: dict, timeout: float) -> dict | None:
@@ -460,6 +479,20 @@ def _check_relay_answer(row) -> dict:
     if isinstance(error, dict) and error.get("code") in _RELAY_REFUSAL_CODES:
         raise _RelayUnusable(f"the broker answered {error.get('code')} ({error.get('rule', '')})")
     return row
+
+
+def _transport_failure(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    error = row.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return not row.get("status") or row.get("status") == 401 or code in _RELAY_TRANSPORT_CODES
+
+
+def _check_relay_batch(rows: list) -> None:
+    """Raise _RelayUnusable when every read in a batch failed in the relay, not at Google."""
+    if rows and all(_transport_failure(row) for row in rows):
+        raise _RelayUnusable(f"all {len(rows)} read(s) failed before reaching the API")
 
 
 def _read_list(project: str, row) -> tuple[list | None, str]:
@@ -503,13 +536,14 @@ def _relay_lists(projects: list[str], deadline: float) -> dict[str, tuple[list |
     global _relay_unusable_this_run
     if _relay_unusable_this_run:
         return None
-    answer = _relay_reads({"projects": projects, "workers": GKE_READS_WORKERS},
-                          max(1.0, deadline - time.monotonic()))
+    batch, call = _relay_budget(deadline)
+    answer = _relay_reads({"projects": projects, "workers": GKE_READS_WORKERS, "call_timeout": call}, batch)
     if answer is None:
         _relay_unusable_this_run = True
         return None
     try:
         lists = answer["lists"]
+        _check_relay_batch([lists[project] for project in projects])
         return {project: _read_list(project, lists[project]) for project in projects}
     except (KeyError, TypeError, ValueError, _RelayUnusable) as e:
         _relay_unusable_this_run = True
@@ -523,13 +557,15 @@ def _relay_describes(keys: dict[str, dict], deadline: float) -> dict[str, tuple[
     if _relay_unusable_this_run or not keys:
         return None if keys else {}
     triples = {name: (i["project"], i["location"], i["cluster"]) for name, i in keys.items()}
-    answer = _relay_reads({"clusters": [list(t) for t in triples.values()], "workers": GKE_READS_WORKERS},
-                          max(1.0, deadline - time.monotonic()))
+    batch, call = _relay_budget(deadline)
+    answer = _relay_reads({"clusters": [list(t) for t in triples.values()], "workers": GKE_READS_WORKERS,
+                           "call_timeout": call}, batch)
     if answer is None:
         _relay_unusable_this_run = True
         return None
     try:
         gets = answer["gets"]
+        _check_relay_batch([gets["/".join(t)] for t in triples.values()])
         return {name: (_read_get(t[0], gets["/".join(t)]), "") for name, t in triples.items()}
     except (KeyError, TypeError, ValueError, _RelayUnusable) as e:
         _relay_unusable_this_run = True

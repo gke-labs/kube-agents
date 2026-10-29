@@ -141,8 +141,9 @@ def project_gke_cluster(body: bytes) -> bytes | None:
 def project_gke_cluster_list(body: bytes) -> bytes | None:
     """The relayed form of a `clusters.list` answer, or None if it is not one.
 
-    `missingZones` is kept: it is how the API says the list is partial, and a
-    partial list must read as one.
+    `missingZones` is kept so the answer still says when a list is partial. The
+    reconcile does not need it: it reads a list only as proof that a cluster exists,
+    never as proof of absence, so a partial list cannot delete anything.
     """
     try:
         answer = json.loads(body)

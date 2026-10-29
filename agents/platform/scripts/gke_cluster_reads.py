@@ -11,7 +11,7 @@ location, status and id. That replaces a `gcloud` process per project and per cl
 whose start-up on the sandbox's CPU was what made a tick grow by ~2.4 s per cluster.
 
 Input:  {"projects": ["p1", ...], "clusters": [["project", "location", "name"], ...],
-         "workers": 16}
+         "workers": 16, "call_timeout": 25.0}
 Output: {"lists": {"p1": {"status": 200, "clusters": [["name", "location"], ...],
                            "missingZones": [...]}
                          | {"status": <int or 0>, "error": {...}}},
@@ -39,13 +39,16 @@ sys.path.append(str(Path(__file__).resolve().parent))
 import credential_proxy_client  # noqa: E402
 
 GKE_API = "https://container.googleapis.com/v1"
-# Per call: the client's connect bound, and a read bound under the broker's own
-# upstream deadline (API_RELAY_DEADLINE_S, 120 s) so a slow page is the broker's 504.
-CALL_TIMEOUT = (credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, 150)
+# Per call: the client's connect bound, and a read bound. The caller's `call_timeout`
+# sets the read bound, under its own wait for this process, so one slow call is that
+# row's status 0 and not the whole batch lost. With no `call_timeout` it sits over the
+# broker's own upstream deadline (API_RELAY_DEADLINE_S, 120 s), so a slow page is the
+# broker's 504.
+MAX_READ_TIMEOUT = 150.0
 DEFAULT_WORKERS = 16
 MAX_WORKERS = 32
-# How much of an error body is passed back: enough for the Google error's
-# status, reason and message, which is all the reconcile reads.
+# How much of an error body that is not JSON is passed back. A JSON error is parsed
+# whole and passed back whole, so a long one keeps the reason the reconcile reads.
 ERROR_BODY_CHARS = 2000
 
 _local = threading.local()
@@ -60,18 +63,19 @@ def _session():
 
 
 def _error_of(response) -> dict:
-    text = (response.text or "")[:ERROR_BODY_CHARS]
+    text = response.text or ""
     try:
         body = json.loads(text)
     except ValueError:
-        return {"text": text}
-    return body if isinstance(body, dict) else {"text": text}
+        return {"text": text[:ERROR_BODY_CHARS]}
+    return body if isinstance(body, dict) else {"text": text[:ERROR_BODY_CHARS]}
 
 
-def _call(url: str) -> tuple[int, dict | None, dict | None]:
+def _call(url: str, read_timeout: float) -> tuple[int, dict | None, dict | None]:
     """(status, json body on 2xx, error on anything else)."""
+    timeout = (credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, read_timeout)
     try:
-        response = _session().get(url, timeout=CALL_TIMEOUT)
+        response = _session().get(url, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - reported, not raised: one read is one row
         return 0, None, {"exception": type(exc).__name__, "text": str(exc)[:ERROR_BODY_CHARS]}
     if 200 <= response.status_code < 300:
@@ -83,8 +87,8 @@ def _call(url: str) -> tuple[int, dict | None, dict | None]:
     return response.status_code, None, _error_of(response)
 
 
-def list_project(project: str) -> dict:
-    status, body, error = _call(f"{GKE_API}/projects/{project}/locations/-/clusters")
+def list_project(project: str, read_timeout: float = MAX_READ_TIMEOUT) -> dict:
+    status, body, error = _call(f"{GKE_API}/projects/{project}/locations/-/clusters", read_timeout)
     if error is not None or body is None:
         return {"status": status, "error": error or {"text": "no body"}}
     rows = []
@@ -98,20 +102,24 @@ def list_project(project: str) -> dict:
     return answer
 
 
-def get_cluster(project: str, location: str, name: str) -> dict:
-    status, _, error = _call(f"{GKE_API}/projects/{project}/locations/{location}/clusters/{name}")
+def get_cluster(project: str, location: str, name: str, read_timeout: float = MAX_READ_TIMEOUT) -> dict:
+    status, _, error = _call(f"{GKE_API}/projects/{project}/locations/{location}/clusters/{name}", read_timeout)
     return {"status": status} if error is None else {"status": status, "error": error}
 
 
 def run(request: dict) -> dict:
     workers = request.get("workers") or DEFAULT_WORKERS
     workers = max(1, min(MAX_WORKERS, int(workers)))
+    read_timeout = request.get("call_timeout")
+    if isinstance(read_timeout, bool) or not isinstance(read_timeout, (int, float)) or read_timeout <= 0:
+        read_timeout = MAX_READ_TIMEOUT
+    read_timeout = min(MAX_READ_TIMEOUT, float(read_timeout))
     projects = [p for p in request.get("projects") or [] if isinstance(p, str)]
     clusters = [tuple(c) for c in request.get("clusters") or []
                 if isinstance(c, (list, tuple)) and len(c) == 3 and all(isinstance(x, str) for x in c)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        lists = dict(zip(projects, pool.map(list_project, projects)))
-        gets = dict(zip(("/".join(c) for c in clusters), pool.map(lambda c: get_cluster(*c), clusters)))
+        lists = dict(zip(projects, pool.map(lambda p: list_project(p, read_timeout), projects)))
+        gets = dict(zip(("/".join(c) for c in clusters), pool.map(lambda c: get_cluster(*c, read_timeout), clusters)))
     return {"lists": lists, "gets": gets}
 
 

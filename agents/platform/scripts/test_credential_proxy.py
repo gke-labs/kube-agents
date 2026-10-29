@@ -14387,6 +14387,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         roles = {
             "shell-token": credential_proxy.CALLER_ROLE_SHELL,
             "chat-token": credential_proxy.CALLER_ROLE_CHAT,
+            "session-token": credential_proxy.CALLER_ROLE_SESSION,
         }
         caller = self.CALLER
 
@@ -14649,9 +14650,10 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
             for role in (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_SESSION):
                 with self.subTest(path=path, role=role):
                     self.assertNotIn(role, credential_proxy.required_roles(path))
-            with self.subTest(path=path, token="chat-token"):
-                status, _, payload = self._json_request(path, token="chat-token")
-                self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+            for token in ("chat-token", "session-token"):
+                with self.subTest(path=path, token=token):
+                    status, _, payload = self._json_request(path, token=token)
+                    self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
         self.assertEqual([], self.upstream_requests)
 
     def test_an_unauthenticated_caller_is_401(self):

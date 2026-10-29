@@ -114,7 +114,10 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    forwarded byte-for-byte (`strip_credential_query_keys` splits on `&` and rejoins rather
    than parsing and re-encoding); the filter grammar is Google's to validate.
 5. Forwards with a connect timeout and a total deadline, reads at most the response cap, and
-   returns the upstream status code, `Content-Type` and body unchanged. What the broker
+   returns the upstream status code, `Content-Type` and body unchanged, except on a route
+   that carries a projection (the two GKE cluster reads below): its 2xx body is cut down to
+   the fields the route names, and a 2xx body the projection cannot read is a 502
+   `UPSTREAM_UNEXPECTED` rather than relayed. What the broker
    answers on its own account, each with a `code` the caller can branch on:
 
    | Condition                                                                         | Status | `code`                         |
@@ -180,6 +183,7 @@ class ApiRoute:
     method: str          # API_READ_METHOD, "GET", in this version
     path: re.Pattern     # anchored at both ends, fullmatched against the whole path
     rule_id: str         # what the audit line and the 403 name
+    project: Callable[[bytes], bytes | None] | None = None  # 2xx body -> what is relayed
 
 # One entry, as an example of the shape; the table is in api_policy.py.
 ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
@@ -190,7 +194,10 @@ ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
 `API_READ_ROUTES` in that file is the table and the only place it is written down; today it
 holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Prometheus
 `query`, `query_range`, `series` and `labels` reads, and the Cloud Trace `traces` list and
-`traces/<id>` get (the id held to 32 lower-case hex characters), each with a comment saying
+`traces/<id>` get (the id held to 32 lower-case hex characters), and the GKE
+`projects.locations.clusters` list and get the Cluster Agent reconcile reads (#3703; location
+`-` or a region or zone, cluster name in GKE's grammar, both answers projected to each
+cluster's `name`, `location`, `status` and `id`, so `masterAuth` is never relayed), each with a comment saying
 which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
 or that turn a read into a write elsewhere — the token, STS, OAuth, IAM, Secret Manager, KMS
 and metadata endpoints — and is checked before the table and never overridable by it; the

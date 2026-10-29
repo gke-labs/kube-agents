@@ -1304,7 +1304,8 @@ class ApiSession:
     rewrites `https://<host>/<path>` onto the broker's `/v1/gcp/<host>/<path>`
     route and attaches the caller token; the broker checks the read against
     `api_policy.API_READ_ROUTES`, forwards it on its own credential, and hands
-    back the upstream status, `Content-Type` and body unchanged. A refusal
+    back the upstream status, `Content-Type` and body unchanged (or, on a route
+    with a projection, a 2xx body cut down to the fields it names). A refusal
     arrives as a 403 whose JSON body carries `rule` and `message`, the same
     shape `/v1/exec` uses.
 

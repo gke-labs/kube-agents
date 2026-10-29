@@ -30,9 +30,11 @@ class _Session:
     def __init__(self, answers):
         self.answers = answers
         self.urls = []
+        self.timeouts = []
 
     def get(self, url, timeout=None):
         self.urls.append(url)
+        self.timeouts.append(timeout)
         answer = self.answers[url]
         if isinstance(answer, Exception):
             raise answer
@@ -86,6 +88,22 @@ class GkeClusterReadsTest(unittest.TestCase):
         url = f"{self.API}/projects/p1/locations/us-central1/clusters/a"
         out, _ = self._run({url: (404, "<html>no</html>")}, {"clusters": [["p1", "us-central1", "a"]]})
         self.assertEqual({"status": 404, "error": {"text": "<html>no</html>"}}, out["gets"]["p1/us-central1/a"])
+
+    def test_each_call_reads_under_the_callers_timeout(self):
+        url = f"{self.API}/projects/p1/locations/-/clusters"
+        for asked, used in ((25.0, 25.0), (None, reads.MAX_READ_TIMEOUT), (900, reads.MAX_READ_TIMEOUT),
+                            (0, reads.MAX_READ_TIMEOUT), (True, reads.MAX_READ_TIMEOUT)):
+            with self.subTest(asked=asked):
+                _, session = self._run({url: (200, {})}, {"projects": ["p1"], "call_timeout": asked})
+                self.assertEqual([used], [t[1] for t in session.timeouts])
+
+    def test_a_long_json_error_is_passed_back_whole(self):
+        # A long Google error keeps its reason, which sits after the message.
+        url = f"{self.API}/projects/p1/locations/-/clusters"
+        error = {"error": {"code": 403, "message": "x" * 5000, "status": "PERMISSION_DENIED",
+                           "details": [{"reason": "SERVICE_DISABLED"}]}}
+        out, _ = self._run({url: (403, error)}, {"projects": ["p1"]})
+        self.assertEqual(error, out["lists"]["p1"]["error"])
 
     def test_malformed_entries_are_skipped(self):
         out, session = self._run({}, {"projects": [7, None], "clusters": [["p", "l"], "x"]})

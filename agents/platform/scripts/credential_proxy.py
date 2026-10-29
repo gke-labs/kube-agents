@@ -10001,7 +10001,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         ROUTE_ROLES by `_authenticated`; what happens here, in order, is the
         normal-form check on the caller's text, the `api_policy` decision, the
         upstream request with exactly the broker's two headers, and the
-        passthrough of the upstream's status, `Content-Type` and body. Two
+        passthrough of the upstream's status, `Content-Type` and body (a 2xx body
+        cut down by the route's projection, when it has one). Two
         audit lines per request, on the exec route's pattern: one before the
         decision and exactly one verdict -- rejected, blocked, forwarded, or
         one of the upstream failures. `host` and `path` are caller text and go through

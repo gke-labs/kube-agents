@@ -201,8 +201,11 @@ per-project outcome. It runs inside the existing reconcile job under the agent's
 the credential broker, because that is the only process in the install that talks to GCP on a
 schedule and the operator deliberately holds no GCP credential.
 
-**Explicit projects** use the call the script makes today, once per project:
-`gcloud container clusters list --project <P> --format=value(name,location)`.
+**Explicit projects** are listed once per project. Since #3703 this is the GKE API's
+`projects.locations.clusters` list (`v1/projects/<P>/locations/-/clusters`), read through the
+broker's Cloud API relay, with
+`gcloud container clusters list --project <P> --format=value(name,location)` as the fallback
+when the relay cannot be used. PRUNE's describes take the same path, through the relay's get route.
 
 **Folders and organisations** use Cloud Asset Inventory rather than walking the tree:
 
