@@ -971,7 +971,7 @@ class Tokens(Base):
         self.assertEqual(overall["prev_paired_tokens_median"], 100_000)
         self.assertEqual(overall["counted_runs"], 168)
         self.assertEqual(overall["tokens_partial"], 0)
-        line = "🔢 Tokens: typical 120k per run (▲ 20% from last week)"
+        line = "🔢 Tokens: typical 120k per run (▲ 20% vs last week on the same scenarios)"
         self.assertEqual(we.chat_tokens(week), line)
         self.assertIn(line, we.chat_text(week).splitlines())
         time = we.chat_card(week)["card"]["sections"][3]
@@ -980,15 +980,15 @@ class Tokens(Base):
         self.assertIn('<td style="width:25%;', page)
         self.assertIn("120k</div>", page)
         self.assertIn("typical tokens per run", page)
-        self.assertIn("middle of 168 counted runs; &#9650; 20% vs last week<", page)
+        self.assertIn("middle of 168 counted runs; &#9650; 20% vs last week on the same scenarios<", page)
 
     def test_a_drop_and_no_change(self):
         week, page = self.produce_week(with_tokens(timed_runs(), lambda day, case: 200_000 if day in LAST_WEEK else 150_000))
-        self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 150k per run (▼ 25% from last week)")
+        self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 150k per run (▼ 25% vs last week on the same scenarios)")
         self.assertIn("&#9660; 25% vs last week", page)
         week, page = self.produce_week(with_tokens(timed_runs(), lambda day, case: 150_000))
-        self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 150k per run (same as last week)")
-        self.assertIn("; same as last week", page)
+        self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 150k per run (flat vs last week on the same scenarios)")
+        self.assertIn("; flat vs last week on the same scenarios", page)
 
     def test_a_week_without_tokens_omits_the_line_and_the_tile(self):
         week, page = self.produce_week(timed_runs())
@@ -1022,10 +1022,10 @@ class Tokens(Base):
         self.assertEqual(overall["tokens_partial"], 21)
         self.assertEqual(overall["counted_runs"], 147)
         self.assertEqual(overall["tokens_median"], 120_000)
-        line = "🔢 Tokens: typical 120k per run (▲ 20% from last week) · 21 partial"
+        line = "🔢 Tokens: typical 120k per run (▲ 20% vs last week on the same scenarios) · 21 partial"
         self.assertEqual(we.chat_tokens(week), line)
         self.assertEqual(card_texts(we.chat_card(week)["card"]["sections"][3])[1], line)
-        self.assertIn("middle of 147 counted runs; &#9650; 20% vs last week; 21 partial left out", page)
+        self.assertIn("middle of 147 counted runs; &#9650; 20% vs last week on the same scenarios; 21 partial left out", page)
 
     def test_a_week_of_only_partial_counts(self):
         runs = with_tokens(timed_runs(), lambda day, case: None if day in LAST_WEEK else 5_000,
@@ -1057,8 +1057,8 @@ class Tokens(Base):
         week, page = self.produce_week(runs)
         self.assertEqual(week["overall"]["tokens_median"], 200_000)
         self.assertEqual(week["overall"]["paired_tokens_median"], 100_000)
-        self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 200k per run (same as last week)")
-        self.assertIn("; same as last week", page)
+        self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 200k per run (flat vs last week on the same scenarios)")
+        self.assertIn("; flat vs last week on the same scenarios", page)
 
     def test_a_scenario_keeping_one_full_count_does_not_move_the_change(self):
         # Chat at 50k and the rest at 150k, both weeks. This week every
@@ -1072,8 +1072,8 @@ class Tokens(Base):
         self.assertEqual(week["overall"]["paired_tokens_median"], 150_000)
         self.assertEqual(week["overall"]["prev_paired_tokens_median"], 150_000)
         self.assertEqual(we.tokens_change(week["overall"]), 0)
-        self.assertIn("(same as last week)", we.chat_tokens(week))
-        self.assertIn("; same as last week", page)
+        self.assertIn("(flat vs last week on the same scenarios)", we.chat_tokens(week))
+        self.assertIn("; flat vs last week on the same scenarios", page)
 
     def test_the_page_and_the_card_show_the_same_numbers(self):
         for runs in (tokened_runs(), with_tokens(timed_runs(), lambda day, case: 1_234_567),
@@ -1088,10 +1088,10 @@ class Tokens(Base):
             pct = figures["pct"]
             if pct:
                 self.assertIn(f"{abs(pct)}% vs last week", page)
-                self.assertIn(f"{abs(pct)}% from last week", line)
+                self.assertIn(f"{abs(pct)}% vs last week on the same scenarios", line)
             else:
-                self.assertIn("same as last week", page)
-                self.assertIn("same as last week", line)
+                self.assertIn("flat vs last week on the same scenarios", page)
+                self.assertIn("flat vs last week on the same scenarios", line)
 
 
 def card_texts(section):

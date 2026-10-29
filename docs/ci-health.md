@@ -1066,8 +1066,9 @@ The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
 the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
-per graded repetition and its change from last week when the week has a
-trend), a "Needs attention" box, one row per area with
+per graded repetition and, when the week has a trend, its change from last
+week on the same scenarios, which the text says because it is not measured
+against that median), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
