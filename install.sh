@@ -6855,7 +6855,11 @@ main() {
   # check below: a flag outside the enum would otherwise be refused as a
   # disagreement with the file, with a remedy that records a value the
   # generator and the CRD refuse. The generator checks again on every route.
-  require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" flags || exit 1
+  # The remedy names the flag only when this run typed it (note_install_env_flag):
+  # a flag cannot correct a value the file carries, the file check below would
+  # refuse the disagreement, so that value is sent back to the file.
+  require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is

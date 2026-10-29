@@ -218,7 +218,9 @@ edits the keys on its own screens.
 says what each value does. The interview does not ask for it: the field is an opt-out, set in the
 file by the few installs that want it. `write_tfvars_from_state` refuses any other spelling before
 a file is written, on every route, because the CRD accepts only those two. A shell export of the
-key, like an export of any Slack key, applies to the run it is typed in and is recorded nowhere. A
+key, like an export of any Slack key, is read only when the file does not assign it: a first
+`install.sh` run records it in the `install.env` it writes, and `upgrade.sh` applies it for that
+run alone. A
 full or operator `upgrade.sh` applies the CRDs before the chart; a `lifecycle.sh apply` run by hand
 after `--generate-only` does not, so on an install whose CRD predates the field apply
 `charts/kube-agents/crds/` first, or the chart refuses the value with a message that says so.

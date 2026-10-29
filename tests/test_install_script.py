@@ -9082,23 +9082,29 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     # ── the home channel policy ─────────────────────────────────────────────
 
+    @staticmethod
+    def _policy_check_call():
+        # main()'s own call, so the tests run the line the source carries:
+        # the text of main() from the call on, and the call itself.
+        source = _INSTALL_SH.read_text()
+        main = source[source.index("\nmain() {"):]
+        start = main.index('require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}"')
+        end = main.index("|| exit 1", start) + len("|| exit 1")
+        return main[start:], main[start:end]
+
     def test_the_policy_flag_is_checked_before_the_file_is_consulted(self):
         # main() runs require_slack_home_channel_policy before the file check,
         # so a flag outside the enum is refused as a bad value, not as a
         # disagreement with the file whose remedy would have the operator
         # record it. The helper itself is tested in test_installer_common.py.
-        source = _INSTALL_SH.read_text()
-        main = source[source.index("\nmain() {"):]
-        check = main.index('require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" flags || exit 1')
-        self.assertLess(check, main.index("check_flags_against_install_env || exit 1"))
+        rest, call = self._policy_check_call()
+        self.assertIn("check_flags_against_install_env || exit 1", rest)
         with tempfile.TemporaryDirectory() as tmp:
             for content in ("SLACK_HOME_CHANNEL_POLICY=manual\n", "PROJECT_ID=p\n"):
                 with self.subTest(content=content):
                     path = self._file(tmp, content)
                     proc = self._run(
-                        "parse_args --slack-home-channel-policy=sometimes; "
-                        'require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" flags || exit 1; '
-                        f"{self._CHECK}", path)
+                        f"parse_args --slack-home-channel-policy=sometimes; {call}; {self._CHECK}", path)
                     out = proc.stdout + proc.stderr
                     self.assertNotEqual(proc.returncode, 0, out)
                     self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", out)
@@ -9110,6 +9116,29 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 with self.subTest(value=value):
                     path, proc, out = self._check(tmp, f"SLACK_HOME_CHANNEL_POLICY={value}\n", f"--slack-home-channel-policy={value}")
                     self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
+    def test_a_bad_policy_this_run_did_not_type_is_sent_back_to_the_file(self):
+        # The remedy names --slack-home-channel-policy only when this run typed
+        # it. A flag cannot correct a value the file carries: the enum check
+        # would pass and the file check would refuse the disagreement, two
+        # refusals for one typo. A value from the file, or from the shell, is
+        # sent back to the file.
+        _, call = self._policy_check_call()
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, extra_env in (
+                ("SLACK_HOME_CHANNEL_POLICY=Manual\n", None),
+                ("PROJECT_ID=p\n", {"SLACK_HOME_CHANNEL_POLICY": "Manual"}),
+            ):
+                with self.subTest(content=content, exported=extra_env is not None):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args; {call}; {self._CHECK}", path, extra_env)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'Manual'", out)
+                    self.assertIn("Set it in install.env and run again", out)
+                    self.assertNotIn("--slack-home-channel-policy", out)
+                    self.assertNotIn("QUEUED=", out)
+                    self.assertEqual(path.read_text(), content)
 
     # ── agreement ───────────────────────────────────────────────────────────
 
