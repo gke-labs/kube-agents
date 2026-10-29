@@ -19,6 +19,19 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+const (
+	// termKey holds the current gateway term's epoch: the election raises it
+	// on each acquisition, before the new leader starts work, so a deposed
+	// leader's write is refused on every record, not only on records the new
+	// leader has already written. One token, outside the "sessions." and
+	// "tasks." listings.
+	termKey = "gateway-term"
+	// fencedWriteAttempts bounds a fenced write's revision races: each loss
+	// re-reads and re-checks the epoch, and only a write landing every time
+	// in between exhausts it.
+	fencedWriteAttempts = 5
+)
+
 // ActiveTask is the task currently serializing a session's conversation.
 type ActiveTask struct {
 	TaskID        string `json:"taskId"`
@@ -646,12 +659,6 @@ func (r *Registry) Epoch() uint64 {
 	return r.epoch.Load()
 }
 
-// termKey holds the current gateway term's epoch: the election raises it on
-// each acquisition, before the new leader starts work, so a deposed leader's
-// write is refused on every record, not only on records the new leader has
-// already written. One token, outside the "sessions." and "tasks." listings.
-const termKey = "gateway-term"
-
 // RaiseTerm moves the term marker up to this registry's epoch. It never
 // lowers it: a marker already at or past the epoch is left alone, and a
 // marker past it means a newer term exists, which is ErrFenced.
@@ -682,7 +689,7 @@ func (r *Registry) RaiseTerm(ctx context.Context) error {
 			return nil
 		}
 		if !isRevisionConflict(err) || attempt+1 >= fencedWriteAttempts {
-			return fmt.Errorf("term marker: %w", err)
+			return fmt.Errorf("term marker %s: %w", termKey, err)
 		}
 	}
 }
@@ -695,26 +702,28 @@ func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error
 		return 0, 0, nil
 	}
 	if err != nil {
-		return 0, 0, fmt.Errorf("term marker: %w", err)
+		return 0, 0, fmt.Errorf("term marker %s: %w", termKey, err)
 	}
 	epoch, err := strconv.ParseUint(string(entry.Value()), 10, 64)
 	if err != nil {
-		return 0, 0, fmt.Errorf("term marker %q: %w", entry.Value(), err)
+		return 0, 0, fmt.Errorf("term marker %s holds %q, not an epoch: %w", termKey, entry.Value(), err)
 	}
 	return epoch, entry.Revision(), nil
 }
 
-// fencedRecord reads a session's stored record for a fenced write: its KV
-// revision (0 when absent), and ErrFenced when the term marker or the
-// record itself carries a later epoch than this registry's. The marker
-// fences records the new leader hasn't written yet; the record's own epoch
-// closes the gap between reading the marker and writing.
-func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string) (uint64, error) {
+// fencedRecord reads a session's stored record for a fenced write at epoch
+// mine: its KV revision (0 when absent), and ErrFenced when the term marker
+// or the record itself carries a later epoch. The marker fences records the
+// new leader hasn't written yet. The record's own epoch closes the gap
+// between reading the marker and writing, for any record the new leader has
+// written. A record that doesn't parse carries no epoch to check, so the
+// conditional write goes ahead and replaces it, as an unfenced Put did.
+func fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string, mine uint64) (uint64, error) {
 	term, _, err := readTerm(ctx, kv)
 	if err != nil {
 		return 0, err
 	}
-	if term > r.epoch.Load() {
+	if term > mine {
 		return 0, fmt.Errorf("session %s: term %d: %w", sessionKey, term, ErrFenced)
 	}
 	entry, err := kv.Get(ctx, kvKey(sessionKey))
@@ -728,9 +737,9 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 		Epoch uint64 `json:"epoch"`
 	}
 	if err := json.Unmarshal(entry.Value(), &stored); err != nil {
-		return 0, fmt.Errorf("session %s: %w", sessionKey, err)
+		return entry.Revision(), nil
 	}
-	if stored.Epoch > r.epoch.Load() {
+	if stored.Epoch > mine {
 		return 0, fmt.Errorf("session %s: %w", sessionKey, ErrFenced)
 	}
 	return entry.Revision(), nil
@@ -804,14 +813,15 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 	if err != nil {
 		return err
 	}
+	mine := r.epoch.Load()
 	term, _, err := readTerm(ctx, kv)
 	if err != nil {
 		return err
 	}
-	if term > r.epoch.Load() {
+	if term > mine {
 		return fmt.Errorf("session %s: term %d: %w", rec.Key, term, ErrFenced)
 	}
-	rec.Epoch = r.epoch.Load()
+	rec.Epoch = mine
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -835,13 +845,14 @@ func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
 	if err != nil {
 		return err
 	}
-	rec.Epoch = r.epoch.Load()
+	mine := r.epoch.Load()
+	rec.Epoch = mine
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
 	for attempt := 0; ; attempt++ {
-		rev, err := r.fencedRecord(ctx, kv, rec.Key)
+		rev, err := fencedRecord(ctx, kv, rec.Key, mine)
 		if err != nil {
 			return err
 		}
@@ -862,20 +873,12 @@ func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
 	}
 }
 
-// fencedWriteAttempts bounds Put's revision races: each loss re-reads and
-// re-checks the epoch, and only a write landing every time in between
-// exhausts it.
-const fencedWriteAttempts = 5
-
 // isRevisionConflict reports a conditional KV write that lost to another
-// writer: Update's wrong last sequence, or Create finding the key (a
-// tombstone or a racing first write).
+// writer. nats.go wraps Update's conflict as ErrKeyRevisionMismatch whether
+// the stream answered 10071 (R1) or 10164 (replicated, as production runs
+// the bus), and Create's as ErrKeyExists.
 func isRevisionConflict(err error) bool {
-	var apiErr *jetstream.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence {
-		return true
-	}
-	return errors.Is(err, jetstream.ErrKeyExists)
+	return errors.Is(err, jetstream.ErrKeyRevisionMismatch) || errors.Is(err, jetstream.ErrKeyExists)
 }
 
 // IndexTask records taskId -> session key so the relay can route an event to
@@ -889,7 +892,7 @@ func (r *Registry) IndexTask(ctx context.Context, taskID, sessionKey string) err
 	if err != nil {
 		return err
 	}
-	if _, err := r.fencedRecord(ctx, kv, sessionKey); err != nil {
+	if _, err := fencedRecord(ctx, kv, sessionKey, r.epoch.Load()); err != nil {
 		return err
 	}
 	if _, err := kv.Put(ctx, taskKey(taskID), []byte(sessionKey)); err != nil {
@@ -915,8 +918,11 @@ func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 	if err != nil {
 		return fmt.Errorf("task index %s: %w", taskID, err)
 	}
-	if _, err := r.fencedRecord(ctx, kv, string(entry.Value())); err != nil {
+	if _, err := fencedRecord(ctx, kv, string(entry.Value()), r.epoch.Load()); err != nil {
 		return err
+	}
+	if r.afterCheck != nil {
+		r.afterCheck()
 	}
 	return kv.Delete(ctx, taskKey(taskID), jetstream.LastRevision(entry.Revision()))
 }
@@ -934,12 +940,15 @@ func (r *Registry) DeleteSession(ctx context.Context, sessionKey string) error {
 	if err != nil {
 		return err
 	}
-	rev, err := r.fencedRecord(ctx, kv, sessionKey)
+	rev, err := fencedRecord(ctx, kv, sessionKey, r.epoch.Load())
 	if err != nil {
 		return err
 	}
 	if rev == 0 {
 		return nil
+	}
+	if r.afterCheck != nil {
+		r.afterCheck()
 	}
 	if err := kv.Delete(ctx, kvKey(sessionKey), jetstream.LastRevision(rev)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
 		return fmt.Errorf("session %s: %w", sessionKey, err)

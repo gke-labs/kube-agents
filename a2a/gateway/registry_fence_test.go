@@ -3,7 +3,11 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
+
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -237,5 +241,109 @@ func TestRaiseTermNeverLowersTheMarker(t *testing.T) {
 	}
 	if term, _, err := readTerm(ctx, kv); err != nil || term != 2 {
 		t.Fatalf("marker = %d, %v, want 2", term, err)
+	}
+}
+
+func TestASameEpochRaceRetriesAndWins(t *testing.T) {
+	// Within one term the last write wins, as with kv.Put: losing the
+	// revision race to a same-epoch write re-checks and writes again.
+	ctx := context.Background()
+	_, cur := fencedPair(t)
+	other := NewRegistry(cur.c)
+	other.SetEpoch(2)
+	key := "slack:T1/C1/same-term"
+	if err := cur.Put(ctx, &SessionRecord{Key: key, Addressee: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	raced := false
+	cur.afterCheck = func() {
+		if !raced {
+			raced = true
+			if err := other.Put(ctx, &SessionRecord{Key: key, Addressee: "racer"}); err != nil {
+				t.Errorf("racing write: %v", err)
+			}
+		}
+	}
+	if err := cur.Put(ctx, &SessionRecord{Key: key, Addressee: "last"}); err != nil {
+		t.Fatalf("Put after losing a same-epoch race = %v, want it to retry and win", err)
+	}
+	if rec, _ := cur.Get(ctx, key); rec == nil || rec.Addressee != "last" {
+		t.Fatalf("record = %+v, want the last write", rec)
+	}
+}
+
+func TestDeletesAreConditionalOnTheCheckedRevision(t *testing.T) {
+	// A write landing between a delete's check and the delete keeps the
+	// record: the delete was for the revision it checked.
+	ctx := context.Background()
+	_, cur := fencedPair(t)
+	other := NewRegistry(cur.c)
+	other.SetEpoch(2)
+	key := "slack:T1/C1/delete-race"
+	if err := cur.Put(ctx, &SessionRecord{Key: key, Addressee: "platform"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cur.IndexTask(ctx, "task-race", key); err != nil {
+		t.Fatal(err)
+	}
+	cur.afterCheck = func() {
+		if err := other.Put(ctx, &SessionRecord{Key: key, Addressee: "rewritten"}); err != nil {
+			t.Errorf("racing write: %v", err)
+		}
+		if err := other.IndexTask(ctx, "task-race", key); err != nil {
+			t.Errorf("racing index: %v", err)
+		}
+	}
+	if err := cur.DeleteSession(ctx, key); err == nil {
+		t.Fatal("DeleteSession deleted a record rewritten after its check")
+	}
+	if rec, _ := cur.Get(ctx, key); rec == nil || rec.Addressee != "rewritten" {
+		t.Fatalf("record = %+v, want the rewrite to survive", rec)
+	}
+	if err := cur.DropTask(ctx, "task-race"); err == nil {
+		t.Fatal("DropTask dropped an index entry rewritten after its check")
+	}
+	if got, _ := cur.SessionForTask(ctx, "task-race"); got != key {
+		t.Fatalf("index = %q, want the rewrite to survive", got)
+	}
+}
+
+func TestAnUnreadableMarkerNamesItselfAndARecordThatDoesNotParseIsReplaced(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	reg := NewRegistry(r.client)
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "discord:g/corrupt"
+	if _, err := kv.Put(ctx, kvKey(key), []byte("not json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Put(ctx, &SessionRecord{Key: key, Addressee: "repaired"}); err != nil {
+		t.Fatalf("Put over a record that doesn't parse = %v, want it replaced", err)
+	}
+	if rec, _ := reg.Get(ctx, key); rec == nil || rec.Addressee != "repaired" {
+		t.Fatalf("record = %+v, want the repair", rec)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	err = reg.Put(ctx, &SessionRecord{Key: key, Addressee: "blocked"})
+	if err == nil || !strings.Contains(err.Error(), termKey) {
+		t.Fatalf("Put under an unreadable marker = %v, want an error naming %s", err, termKey)
+	}
+}
+
+func TestAReplicatedStreamsConflictIsARevisionConflict(t *testing.T) {
+	// Replicated streams answer a lost compare-and-swap with 10164, which
+	// nats.go wraps as ErrKeyRevisionMismatch rather than the 10071 an R1
+	// test server returns.
+	replicated := fmt.Errorf("%w: %w", &jetstream.APIError{ErrorCode: 10164}, jetstream.ErrKeyRevisionMismatch)
+	if !isRevisionConflict(replicated) {
+		t.Fatal("a replicated stream's conflict isn't a revision conflict")
+	}
+	if isRevisionConflict(errors.New("timeout")) {
+		t.Fatal("an unrelated error is a revision conflict")
 	}
 }
