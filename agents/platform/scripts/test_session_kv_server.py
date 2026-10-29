@@ -3583,7 +3583,8 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertIn(f"attempts={attempts} ungated=true", failed[0])
         self.assertEqual(sum("INCIDENT_PR_SIBLING_LOOKUP_RETRY" in line for line in logs.output), attempts - 1, logs.output)
         self.assertEqual(sleep.call_args_list, [call(retry_s)] * (attempts - 1))
-        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
         # A locked board past the busy timeout, on every attempt.
         sleep.reset_mock()
         self.board.unlink()
@@ -3596,7 +3597,8 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                 self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
             self.assertTrue(any("ungated=true" in line for line in logs.output), logs.output)
             self.assertEqual(sleep.call_count, attempts - 1)
-            self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
         holder.execute("ROLLBACK")
         sleep.reset_mock()
         self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])

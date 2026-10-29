@@ -360,10 +360,16 @@ INCIDENT_START_UNKNOWN_POLL_S = 5.0
 # not fit, a board path that cannot be resolved) is tried this many times in
 # all, INCIDENT_PR_SIBLING_READ_RETRY_S apart, before the lookup falls open to
 # the one-parent prompt. The lookup is the whole of the serialization, so a
-# transient refusal would otherwise file a card no live sibling gates; the
-# stripe is already held across the turn, so the retries cost the turn at most
-# two seconds. A board that does not exist yet is not retried: that is a
-# fresh install, not a refused read.
+# transient refusal would otherwise file a card no live sibling gates. The
+# stripe is already held across the turn, and the retries lengthen it by at
+# most INCIDENT_PR_SIBLING_READ_ATTEMPTS * FEED_DB_BUSY_TIMEOUT_SECONDS +
+# (INCIDENT_PR_SIBLING_READ_ATTEMPTS - 1) * INCIDENT_PR_SIBLING_READ_RETRY_S,
+# about 17 s today: every attempt first waits out the read-only open's busy
+# timeout, so a lock the board holds across the whole lookup costs that full
+# wait on each attempt, while a refusal that returns at once (a schema the
+# query does not fit, a path that cannot be resolved) costs only the sleeps
+# between attempts, two seconds. A board that does not exist yet is not
+# retried: that is a fresh install, not a refused read.
 INCIDENT_PR_SIBLING_READ_ATTEMPTS = 3
 INCIDENT_PR_SIBLING_READ_RETRY_S = 1.0
 # Every unsettled pull-request card whose body names the branch, oldest first,
@@ -2937,15 +2943,23 @@ def _live_pull_request_siblings(branch: str) -> list[str]:
     gives [] and today's single-parent prompt at once (a fresh install has no
     board); a board that cannot be read is tried INCIDENT_PR_SIBLING_READ_ATTEMPTS
     times in all, INCIDENT_PR_SIBLING_READ_RETRY_S apart, because this read is
-    the whole of the serialization and a refusal that outlasts a 5 s busy
+    the whole of the serialization and a refusal that outlasts the busy
     timeout is usually over a second later, and only then gives [] with a log
-    line saying the card about to be filed is ungated; a status in
-    `KANBAN_SETTLED_STATUSES` is not live; an id that is not shaped like a
-    card id is logged and left out, and the rest are kept. A failure here is
-    logged and never reaches the triage start thread. The hold on the same
-    stripe (`_own_pull_request_card`) treats a refused read as "not yet"
-    rather than falling either way, which is the other half of the same rule:
-    neither reader ends the serialization on a read it could not make.
+    line saying the card about to be filed is ungated. Each attempt first
+    waits out the read-only open's busy timeout (FEED_DB_BUSY_TIMEOUT_SECONDS),
+    so a lock held across the whole lookup costs the turn, under the stripe,
+    the bound the comment at INCIDENT_PR_SIBLING_READ_ATTEMPTS states, about
+    17 s today, and a refusal that returns at once costs only the sleeps. A
+    status in `KANBAN_SETTLED_STATUSES` is not live; an id that is not shaped
+    like a card id is logged and left out, and the rest are kept. A failure
+    here is logged and never reaches the triage start thread. The hold on the
+    same stripe (`_own_pull_request_card`) treats a refused read as "not yet",
+    which is the same rule for one read: neither reader ends the serialization
+    on a read it could not make. Past that they differ on purpose: the hold
+    fails closed, keeping the stripe until INCIDENT_START_UNKNOWN_HOLD_S
+    passes, while this lookup falls open after its last attempt, logged,
+    because failing closed here would stop every triage on an install whose
+    board stays unreadable.
 
     The lookup runs when the start is dequeued, before the front door's turn
     files anything, so two starts for one branch running at once would each
