@@ -131,20 +131,23 @@ on any install, keyed on the `install.env` names in the table's second column;
 [`scripts/installer/README.md`](../scripts/installer/README.md#the-install-configuration-installenv)
 states it for users.
 
-`ENABLE_DRIFT_DETECTOR` is the exception to the paragraph above, and the only one:
-its shipped default is `true`, so an omission provisions rather than destroys — a
+`ENABLE_DRIFT_DETECTOR` and `VERTEX_MANAGE_SERVING_PROJECT` are the exceptions to the
+paragraph above. Their shipped defaults are `true`, so an omission provisions rather
+than destroys. For `ENABLE_DRIFT_DETECTOR` that is a
 Log Router sink exporting every GKE cluster in the project (one more per project a declared scope lists), a Pub/Sub topic and a
-subscription that retains a copy of those records for 31 days. Nothing is lost by
-leaving it unset, and an environment that wants the detector need not set it. It is
-in the table because it is the only way to say no: the reconcile regenerates
-`install.env` from these variables on every run, so the `ENABLE_DRIFT_DETECTOR=false`
-line that is the opt-out everywhere else does not survive to the next one here.
+subscription that retains a copy of those records for 31 days. For
+`VERTEX_MANAGE_SERVING_PROJECT`, on an install whose `MODEL_PROVIDER` is `vertex_ai`,
+it is the Vertex AI API enabled and the gateway's role granted on the serving
+project, which can be a project the installing identity does not administer.
+Nothing is lost by leaving either unset. They are in the table because it is the
+only way to say no: the reconcile regenerates `install.env` from these variables on
+every run, so a `false` line written into that file does not survive to the next one.
 
 Required for a **plan** as much as for an apply: the reconcile renders `--strict`
 before it branches on the mode, so until an environment carries all twelve required
 settings the daily drift report goes red on it rather than reporting no drift.
-`ENABLE_DRIFT_DETECTOR` is not among the twelve — a strict render does not ask for
-it, for the reason in the paragraph above.
+Neither exception is among the twelve — a strict render does not ask for them, for
+the reason in the paragraph above.
 
 | GitHub variable                 | install.env key                 | Notes                                                                                                                                               |
 | ------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -161,6 +164,7 @@ it, for the reason in the paragraph above.
 | `ENABLE_PUBSUB_PLATFORM`        | `ENABLE_PUBSUB_PLATFORM`        | Absent removes the adapter plugin unless `ENABLE_STOCKOUT_INVESTIGATOR` keeps it; the Pub/Sub API it enabled stays on and nothing else is destroyed |
 | `ENABLE_STOCKOUT_INVESTIGATOR`  | `ENABLE_STOCKOUT_INVESTIGATOR`  | Absent destroys log sink and stockout alerts topic/sub                                                                                              |
 | `ENABLE_DRIFT_DETECTOR`         | `ENABLE_DRIFT_DETECTOR`         | The one that runs the other way: absent **provisions** the drift Log Router sink, topic and subscription, because the shipped default is `true`     |
+| `VERTEX_MANAGE_SERVING_PROJECT` | `VERTEX_MANAGE_SERVING_PROJECT` | Also runs the other way on a `vertex_ai` install: absent **enables** the Vertex AI API and grants the gateway's role on the serving project         |
 
 Required when the integration they belong to is switched on, because an empty
 allowlist is not "no opinion" — the operator reads an absent list as allow-all,

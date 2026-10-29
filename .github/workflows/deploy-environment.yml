@@ -499,6 +499,9 @@ jobs:
           # Unset takes install.sh's default, which is on. Here so that a rebuilt
           # environment can decline it, matching what the reconcile path reads.
           ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
+          # Likewise on: a vertex_ai install manages the serving project unless
+          # this says false.
+          VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           # The GitOps repository the agent targets, and the one the token minter
           # scopes its tokens to. Deliberately NOT vars.GH_ORG/vars.GH_REPO: that
           # pair names the RELEASE repository, so reusing it here would scope a

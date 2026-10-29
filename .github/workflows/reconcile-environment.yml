@@ -328,6 +328,11 @@ jobs:
           # every reconcile, so a line added to that file by hand does not survive
           # to the next run and this variable is the only durable opt-out.
           ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
+          # The same shape, for a vertex_ai install: unset enables the Vertex AI
+          # API and grants the gateway's role on the serving project, and false
+          # is the only durable way to decline when this environment cannot
+          # administer that project.
+          VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
           # The PlatformAgent's spec.mode. Unset or `today` renders no key, so
