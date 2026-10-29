@@ -917,7 +917,9 @@
 # A card the AI model's rate limit blocked is not promised a retry: the wake
 # reply says it will not run again on its own and offers to try again (SOUL
 # §2 step 5, #3766). Plants its own card through card_wake.py; one front-door
-# turn, no card round trip, no fixture: +3 units at the 200s default.
+# turn, no card round trip, no fixture: +3 units at the 200s default. Off the
+# inject lane until #4004 (inject-lane-exclusions.txt): under next the reply
+# to a wake is posted nowhere.
 ./tasks/chat-rate-limit-block-promises-no-retry/task.yaml
 
 # The front door routes "which namespaces exist in this cluster?" to the host

@@ -579,11 +579,13 @@ class SplitLostNothingTest(unittest.TestCase):
 # reason the sets above are pinned.
 INJECT_LANE_EXCLUDED = [
     "chat-question-typed-answer-fresh-session",  # #4004: its answer turn is today's Slack thread context, which next's door does not send
+    "chat-rate-limit-block-promises-no-retry",  # #4004: grades the reply to a wake, which next posts nowhere
 ]
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
     "chat-question-typed-answer-fresh-session": "nightly",
+    "chat-rate-limit-block-promises-no-retry": "nightly",
 }
 
 

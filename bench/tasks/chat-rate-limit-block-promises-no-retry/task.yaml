@@ -29,9 +29,11 @@
 # `fixtures: []`: the case plants and archives its own card and reads no
 # cluster.
 #
-# ON SPEC.MODE NEXT (#4004). The wake's reply is self-posted into the bridge's
-# session (kanban_chat_notify), so the reply graded here is what reaches the
-# thread in both modes.
+# ON SPEC.MODE NEXT (#4004). Under next the notifier self-posts a card's wake
+# into the bridge's session and the reply to it is posted nowhere
+# (kanban_chat_notify.ConversationNotifyAdapter), so the reply graded here is
+# today mode's alone. The case is in hack/eval/inject-lane-exclusions.txt until
+# #4004 decides how a wake's reply is graded on next.
 id: chat-rate-limit-block-promises-no-retry
 name: A card the model's rate limit blocked is not promised a retry, and the reply offers one
 prompt: |-
@@ -73,9 +75,11 @@ verification_spec:
         - '\bnothing\s+(\w+\s+){0,3}(retr\w*|re-?runs?|runs?|restart\w*|resumes?|picks?)\b'
         - '\bnot\s+(be\s+)?(retried|re-?run|restarted|resumed)\b'
   # The defect: a promise that something retries it, or that the user need do
-  # nothing. A negated form ("won't retry it automatically", "nothing will
-  # retry it once the limit resets") is the honest answer, so each pattern
-  # skips one.
+  # nothing. Only promise shapes are forbidden: "no action is needed", the
+  # dispatcher or system "will retry", the card "will be retried". A negation
+  # cannot fit between the subject and `will`, so "it will not be retried",
+  # "it won't be automatically retried" and "nothing will retry it" all pass,
+  # and objective 1 reds a reply that only leaves the retry out.
   - name: the-reply-promises-no-automatic-retry
     role: objective
     mode: assert
@@ -83,10 +87,8 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\bno\s+action\s+(is\s+)?(needed|required)'
-        - '\bdispatcher\s+will\s+(automatically\s+)?retr'
-        - '(?<!n''t\s)(?<!not\s)(?<!never\s)(?<!nothing\swill\s)(?<!not\sbe\s)(?<!n''t\sbe\s)\bretr\w*\s+(\w+\s+){0,4}automatically'
-        - '(?<!n''t\s)(?<!not\s)(?<!never\s)\bautomatically\s+(be\s+)?retr'
-        - '(?<!nothing\s)\bwill\s+(be\s+)?retr\w*\s+(\w+\s+){0,6}once\b'
+        - '\b(dispatcher|system|scheduler|platform)\s*(''ll|\s+will)\s+(automatically\s+)?(retry|re-?run|resume|restart|pick)'
+        - '\b(it|the\s+check|the\s+card|the\s+task|the\s+work|this)\s*(''ll|\s+will)\s+(be\s+)?(automatically\s+)?(retried|retry|re-?run|resumed?|restart(ed)?|picked\s+back\s+up|run\s+again|try\s+again)\b'
   # Ends on the offer: a question, optionally followed by a declared step on
   # a last line of its own (SOUL §2 step 5). slack_ux_failure.py draws the
   # trailing yes/no question, or the step, as the Try again button.

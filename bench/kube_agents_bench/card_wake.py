@@ -315,7 +315,7 @@ try:
         decoy = kb.create_task(conn, title=TITLE, body=REASON, created_by=CREATOR,
                                priority=DECOY_PRIORITY, idempotency_key=DECOY_KEY)
         out["decoy"] = decoy
-        if not kb.block_task(conn, decoy, reason=REASON, kind="needs_input"):
+        if not kb.block_task(conn, decoy, reason=REASON, kind=NEEDS_INPUT):
             raise RuntimeError("decoy card %s would not block" % decoy)
         conn.execute("UPDATE tasks SET created_at = created_at - ? WHERE id = ?",
                      (CARD_BACKDATE_SECONDS, card))

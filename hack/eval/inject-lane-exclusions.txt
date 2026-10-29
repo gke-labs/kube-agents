@@ -41,3 +41,12 @@
 # is one no next-mode user sends. Returns to the lane when the replay builds
 # that turn as next's door does.
 chat-question-typed-answer-fresh-session
+
+# #4004: grades the front door's reply to a card's wake, which under next the
+# notifier self-posts into the bridge's session and posts nowhere
+# (kanban_chat_notify.ConversationNotifyAdapter), so the inject lane would
+# grade a reply no next-mode user sees. A block replay
+# (bench/kube_agents_bench/card_wake.py, [bench:card-block-wake]) sends only
+# that wake. Returns to the lane when #4004 decides how a wake's reply is
+# graded on next.
+chat-rate-limit-block-promises-no-retry

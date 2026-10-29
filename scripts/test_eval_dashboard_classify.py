@@ -129,6 +129,11 @@ class RepAndOutcomeTest(unittest.TestCase):
             ),
             (
                 "the record is not evidence of a real agent run: "
+                "record status is 'error', not 'success' (block wake: RuntimeError: card t_1 would not block); "
+                "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
+            ),
+            (
+                "the record is not evidence of a real agent run: "
                 "record status is 'error', not 'success' (thread context: none in ''); "
                 "the trajectory is empty: the agent made no tool calls, which for these tasks means no agent ran"
             ),
