@@ -703,6 +703,22 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self._only("non-empty list", audit_streams=value)
 
+    # -- scope_exclude --
+
+    def test_a_declared_scope_exclusion_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
+
+    def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
+        self._only("does not declare", scope_exclude={"slots": ["b", "z"]})
+
+    def test_excluding_every_slot_is_rejected(self):
+        self._only("excludes every seeded slot", scope_exclude={"slots": ["a", "b", "c", "d"]})
+
+    def test_a_scope_exclusion_the_runner_cannot_read_is_rejected(self):
+        for value in (None, ["b"], {"slots": []}, {"slots": ["b", "b"]}, {"slots": ["seeded-b"]}, {"clusters": ["b"]}):
+            with self.subTest(value=value):
+                self._only("must be {slots:", scope_exclude=value)
+
     def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
         # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
         for text in ("{trailing,}", "null", '{"jobs": {"compliance-audit": {}}}'):

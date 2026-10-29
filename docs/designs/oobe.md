@@ -66,8 +66,10 @@ summaries, which assume a fleet the operator has already seen.
 
 `bootstrap-inventory-scan` (`bootstrap_scan_gate.py`) files the sweep card to `platform`, which
 lists the fleet, and records it in `.bootstrap_scan_filed`. On the same job's ticks the hand-off
-(`bootstrap_handoff.py`) files one card per Cluster Agent and, once those settle or its deadline of
-an hour plus five minutes per cluster card passes (`deadline`), files the ranking card, key
+(`bootstrap_handoff.py`) files one card per Cluster Agent up to the first-run cap
+(`.first_run_cluster_cards`, default 6; the sweep audits the rest) and, once those settle or its
+deadline of an hour plus five minutes per cluster, carded or left to the sweep, passes
+(`deadline`), files the ranking card, key
 `bootstrap-inventory-prioritize`, recorded in `.bootstrap_handoff_filed`. It files one ranking card
 per sweep, and Hermes retries that card in place; a re-run by hand uses a suffixed key
 (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the

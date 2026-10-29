@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below.",
+  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below. kube_agents_bench.scope_exclude reads the same file, for a case that declares `scope_exclude:`, to name a slot's cluster in the install's spec.scope.exclude.clusters for that case's repetitions; it discovers nothing either.",
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
   "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `age_hours_ge` (an RFC 3339 timestamp at least `value` hours in the past; an unparseable one fails), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), `not_ahead_of_channel` (cluster subject only, no value: the version is in the cluster's own release channel's `validVersions` in get-server-config, or that list has a newer patch of the same minor, or a newer version when it carries none of that minor; an unrecognised version string fails), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
   "cluster_slots": {
@@ -1056,6 +1056,53 @@
           "op": "eq",
           "value": "nvidia-l4",
           "why": "the accelerator selector is what ties the image to a node image's driver; without it the pin is just an image"
+        }
+      ]
+    },
+    "scaled-zero-gateway": {
+      "cluster_slot": "a",
+      "namespace": "seeded-scaled-zero",
+      "probes": [
+        "deployment/storefront",
+        "deployment/envoy-seeded-scaled-zero-storefront-edge",
+        "service/storefront",
+        "gateway/storefront-edge",
+        "httproute/storefront"
+      ],
+      "fixture": "A switched-off environment behind an in-cluster gateway: Deployment storefront and the Gateway's proxy Deployment both at replicas 0, Service storefront, Gateway storefront-edge (GatewayClass seeded-envoy) and HTTPRoute storefront. No controller runs; the class names Envoy Gateway's controller, the proxy carries Envoy Gateway's labels, and the status is the one Envoy Gateway v1.9.2 wrote for this shape (Programmed=False, NoResources), written by gateway_status.py",
+      "state": [
+        {
+          "subject": "deployment/storefront",
+          "path": "spec.replicas",
+          "op": "eq",
+          "value": 0,
+          "why": "the environment is switched off on purpose; a scaled-up backend is a running environment, and the case's silence then proves nothing about a deliberate scale to zero"
+        },
+        {
+          "subject": "deployment/envoy-seeded-scaled-zero-storefront-edge",
+          "path": "spec.replicas",
+          "op": "eq",
+          "value": 0,
+          "why": "the proxy at zero is what makes the Gateway switched off; the stall rule finds it by these labels through the GatewayClass controllerName"
+        },
+        {
+          "subject": "gateway/storefront-edge",
+          "path": "status.conditions[?(@.type=='Programmed')].reason",
+          "op": "any_eq",
+          "value": "NoResources",
+          "why": "the signal main reports as a stale condition; a Gateway with the CRD's default Pending status (re-created, status not rewritten) is a different stall, and the case would grade the wrong thing"
+        },
+        {
+          "subject": "pod?app=storefront",
+          "path": null,
+          "op": "absent",
+          "why": "the backend runs nothing; a storefront pod means the environment was scaled up"
+        },
+        {
+          "subject": "pod?app.kubernetes.io/name=envoy",
+          "path": null,
+          "op": "absent",
+          "why": "the proxy runs nothing; an envoy pod means the gateway was scaled up and its Programmed=False no longer matches the cluster"
         }
       ]
     }

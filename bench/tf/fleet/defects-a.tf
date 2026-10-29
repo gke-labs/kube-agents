@@ -778,6 +778,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     qos         = kubernetes_namespace_v1.seeded_qos.metadata[0].name
     shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
     defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
+    scaled_zero = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
     # SOP's 2.6 posture the pool repository's declared-intent note covers, the
     # way the same note covers notification-relay's missing budget.
@@ -1935,5 +1936,203 @@ resource "kubernetes_cron_job_v1" "cuda_pinned_trainer" {
         }
       }
     }
+  }
+}
+
+# Fixture (stall watch): a switched-off environment behind an in-cluster
+# gateway. Role `scaled-zero-gateway`. An operator scales the whole
+# environment to zero out of hours: the backend and the gateway's own proxy
+# Deployment both ask for zero replicas, and the Gateway reports
+# Programmed=False (NoResources). stall_report.py on main reports that
+# Gateway as a stale condition; a deliberate scale to zero is not a stall,
+# which the case reading this role asserts.
+#
+# No controller runs. The GatewayClass names Envoy Gateway's controller, the
+# proxy Deployment carries the labels Envoy Gateway v1.9.2 puts on its proxy,
+# and gateway_status.py writes the status Envoy Gateway wrote for this shape
+# on a live cluster. A real controller would need a node and a third-party
+# install on every pool project for a fixture whose pods never run.
+# Gateway API's CRDs come from GKE (gateway_api_config on seeded_a).
+resource "kubernetes_namespace_v1" "seeded_scaled_zero" {
+  metadata {
+    name   = "seeded-scaled-zero"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+# The object names are literals, as everywhere in this file: the role's
+# probes in fixtures.json name them, and bench/tests/test_fleet_verifier.py
+# reads them here.
+locals {
+  scaled_zero_listener   = "http"
+  scaled_zero_controller = "gateway.envoyproxy.io/gatewayclass-controller"
+  # Envoy Gateway's proxy Deployment, named and labelled as v1.9.2 names and
+  # labels it for a Gateway in the Gateway's own namespace.
+  scaled_zero_proxy_labels = {
+    "app.kubernetes.io/component"                    = "proxy"
+    "app.kubernetes.io/managed-by"                   = "envoy-gateway"
+    "app.kubernetes.io/name"                         = "envoy"
+    "gateway.envoyproxy.io/owning-gateway-name"      = "storefront-edge"
+    "gateway.envoyproxy.io/owning-gateway-namespace" = "seeded-scaled-zero"
+  }
+}
+
+resource "kubernetes_deployment_v1" "scaled_zero_backend" {
+  metadata {
+    name      = "storefront"
+    namespace = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+    labels    = { app = "storefront" }
+  }
+  spec {
+    replicas = 0
+    selector {
+      match_labels = { app = "storefront" }
+    }
+    template {
+      metadata {
+        labels = { app = "storefront" }
+      }
+      spec {
+        # Compliance SOP 2.7 and 2.11, as on every planted workload: no API
+        # token, non-root with a seccomp filter. The pods never run.
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "web"
+          image = "registry.k8s.io/pause:3.9"
+        }
+      }
+    }
+  }
+  # Zero replicas never become ready; the provider would otherwise wait.
+  wait_for_rollout = false
+}
+
+resource "kubernetes_service_v1" "scaled_zero_backend" {
+  metadata {
+    name      = "storefront"
+    namespace = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+  }
+  spec {
+    selector = { app = "storefront" }
+    port {
+      port        = 80
+      target_port = 8080
+    }
+  }
+}
+
+resource "kubernetes_deployment_v1" "scaled_zero_proxy" {
+  metadata {
+    name      = "envoy-seeded-scaled-zero-storefront-edge"
+    namespace = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+    labels    = local.scaled_zero_proxy_labels
+  }
+  spec {
+    replicas = 0
+    selector {
+      match_labels = local.scaled_zero_proxy_labels
+    }
+    template {
+      metadata {
+        labels = local.scaled_zero_proxy_labels
+      }
+      spec {
+        # Compliance SOP 2.7 and 2.11, as on every planted workload: no API
+        # token, non-root with a seccomp filter. The pods never run.
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name  = "envoy"
+          image = "registry.k8s.io/pause:3.9"
+        }
+      }
+    }
+  }
+  wait_for_rollout = false
+}
+
+resource "kubernetes_manifest" "scaled_zero_gateway_class" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "GatewayClass"
+    metadata   = { name = "seeded-envoy" }
+    spec       = { controllerName = local.scaled_zero_controller }
+  }
+}
+
+resource "kubernetes_manifest" "scaled_zero_gateway" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "Gateway"
+    metadata = {
+      name      = "storefront-edge"
+      namespace = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+    }
+    spec = {
+      gatewayClassName = kubernetes_manifest.scaled_zero_gateway_class.manifest.metadata.name
+      listeners        = [{ name = local.scaled_zero_listener, protocol = "HTTP", port = 80 }]
+    }
+  }
+}
+
+resource "kubernetes_manifest" "scaled_zero_route" {
+  manifest = {
+    apiVersion = "gateway.networking.k8s.io/v1"
+    kind       = "HTTPRoute"
+    metadata = {
+      name      = "storefront"
+      namespace = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+    }
+    spec = {
+      parentRefs = [{ name = kubernetes_manifest.scaled_zero_gateway.manifest.metadata.name }]
+      rules      = [{ backendRefs = [{ name = kubernetes_service_v1.scaled_zero_backend.metadata[0].name, port = 80 }] }]
+    }
+  }
+}
+
+# The status a controller would write. Written once, on create, and again
+# whenever gateway_status.py changes, or the GatewayClass, the Gateway or the
+# route is created or replaced:
+# a re-created object starts with the CRD's default Pending status, which the
+# stall check reads as a different stall. That replace is a standing
+# reconcile-allow.json entry. An out-of-band edit to the status is drift the
+# fixture-state scan reports (Programmed must read False with reason
+# NoResources) and no reconcile repairs, because nothing re-plans this
+# resource: the README's hand recoveries say how to re-run it.
+resource "terraform_data" "scaled_zero_status" {
+  # A changed script is a changed status: its hash re-runs it on every project.
+  triggers_replace = [filesha256("${path.module}/gateway_status.py")]
+
+  provisioner "local-exec" {
+    interpreter = ["python3"]
+    command     = "${path.module}/gateway_status.py"
+    environment = {
+      K8S_HOST              = "https://${google_container_cluster.seeded_a.endpoint}"
+      K8S_CA_BASE64         = google_container_cluster.seeded_a.master_auth[0].cluster_ca_certificate
+      FIXTURE_NAMESPACE     = kubernetes_namespace_v1.seeded_scaled_zero.metadata[0].name
+      FIXTURE_GATEWAY       = kubernetes_manifest.scaled_zero_gateway.manifest.metadata.name
+      FIXTURE_ROUTE         = kubernetes_manifest.scaled_zero_route.manifest.metadata.name
+      FIXTURE_LISTENER      = local.scaled_zero_listener
+      FIXTURE_GATEWAY_CLASS = kubernetes_manifest.scaled_zero_gateway_class.manifest.metadata.name
+      FIXTURE_CONTROLLER    = local.scaled_zero_controller
+    }
+  }
+
+  lifecycle {
+    replace_triggered_by = [kubernetes_manifest.scaled_zero_gateway_class, kubernetes_manifest.scaled_zero_gateway, kubernetes_manifest.scaled_zero_route]
   }
 }

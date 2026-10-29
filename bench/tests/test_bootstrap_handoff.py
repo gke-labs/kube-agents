@@ -503,7 +503,10 @@ def test_the_case_runs_the_hand_off_stack() -> None:
     case = yaml.safe_load(TASK.read_text().split("\n---\n", 1)[1])
     infra = case["infrastructure"]
     assert infra["stack"] == "prebuilt/bootstrap-discovery"
-    assert "variables" not in infra
+    # Pinned at the maximum so the fan-out objective's card per Cluster Agent is not cut by the default cap.
+    assert infra["variables"] == {
+        "first_run_cluster_cards": _gate_constant("FIRST_RUN_CLUSTER_CARDS_MAX", GATE.parent / "bootstrap_handoff.py")
+    }
     checks = {e["name"]: e["check"] for e in case["verification_spec"]}
     assert checks["raw-report-has-findings-block"] == {"type": "bootstrap_handoff", "require": "raw_report_has_findings_block"}
     assert checks["ranking-card-keyed"] == {"type": "bootstrap_handoff", "require": "ranking_card_filed"}

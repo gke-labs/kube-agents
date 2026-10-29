@@ -899,6 +899,14 @@
 # provisioning the preferred tier. deployer: noop, transcript-only.
 ./tasks/autoscaler-zonal-stockout-cooldown-scope-probe/task.yaml
 
+# #3702: the onboarding sweep under a first-run cluster card cap of 2, below the
+# eval fleet's roster so it binds. Cards for the first two Cluster Agents by
+# profile name only, and the raw report shows the rest audited by the sweep
+# itself. The bootstrap-discovery stack, as bootstrap-discovery-fanout runs it
+# with a cap of 2 where the fan-out pins 24; the onboarding lock, so main-a.
+# Priced with the fan-out.
+./tasks/bootstrap-discovery-capped/task.yaml
+
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The
 # bootstrap-ranking stack with a planted report that has no critical finding;
@@ -1078,6 +1086,13 @@
 # carry on their roster entries (#1947). deployer: noop, no fixture; the run
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
+
+# A fleet question on an install whose spec.scope.exclude.clusters names
+# seeded-b: the answer names seeded-a and seeded-c and does not report on
+# seeded-b (#3081, #3100). The runner excludes slot b for this case's
+# repetitions alone, after every other unit, and restores the scope after them
+# (scope_exclude, #3213); deployer: noop, read-only.
+./tasks/scope-excluded-cluster-not-listed/task.yaml
 
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without

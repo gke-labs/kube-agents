@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-It answers `connection_status` and `read_topics`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
+It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
 ## Turn it on
 
@@ -55,7 +55,7 @@ It reads, bounded:
 - the newest 4096 messages on `TASKS`, keeping those from the last hour, in one drain within a bus read's 4 MiB budget. When the hour holds more messages than that, the oldest are the ones not read. When the messages hold more bytes than the budget, the drain, which reads oldest first, stops before the newest, so the newest tasks and states may be missing. Either way `notes` says so. A read cut short (by the budget, its deadline or its caller), or skipped because the server's bus readers are busy, is still answered with a line in `notes`, and isn't kept for the next call;
 - the agent cards, from the same cached read `connection_status` uses.
 
-A call holds at most one bus reader, and concurrent calls share it: one `TASKS` read answers every call for three seconds, so the swarm view never takes the readers the turn tools need.
+A call holds at most one bus reader, and concurrent calls share a complete read: one `TASKS` read answers every call for three seconds. A read cut short (by the budget, its deadline or its caller) isn't shared, so on an install past the budget every call reads again, and the swarm view can take readers the turn tools need (tracked in #4219).
 
 It keeps only the tasks of those conversations, and the tasks delegated from them. A task submitted before the hour that took a follow-up message inside it is still shown, since it is live, but without a prompt: the follow-up isn't its submission. A task whose submission is older than the read's start (the hour, or the newest 4096 messages) isn't shown even while it runs, since the conversation it belongs to is only on its submission.
 

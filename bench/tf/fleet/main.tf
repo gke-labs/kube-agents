@@ -288,6 +288,10 @@ resource "google_container_cluster" "seeded_a" {
   # The fleet is standing, but deletion protection stays off: the scheduled
   # re-apply must be able to replace a cluster when a facet change requires
   # it, and the label plus README are the guard against accidental sweeps.
+  # This cluster is the exception: the scaled-zero gateway fixture's
+  # kubernetes_manifest resources (defects-a.tf) cannot plan while its endpoint
+  # is unknown, so creating or replacing seeded-a is the README's two-apply
+  # hand recovery, not a reconcile.
   deletion_protection = false
 
   logging_config {

@@ -2028,11 +2028,19 @@ func (r *PlatformAgentReconciler) a2aReader() client.Reader {
 // it is inert data, and re-enabling `next` must not re-roll credentials the
 // gateway image may have cached in a still-running pod. The one thing it
 // changes on an existing Secret is a missing or empty key, which it fills.
+// An existing Secret at the name that this PlatformAgent doesn't control is
+// refused rather than adopted or repaired.
 func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*corev1.Secret, error) {
 	name := types.NamespacedName{Name: a2aCredsSecretName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
+		// Only a Secret this PlatformAgent controls is read or repaired, as
+		// for the callout keys and the door's token: one created by anything
+		// else is neither trusted for its passwords nor overwritten.
+		if !metav1.IsControlledBy(existing, agent) {
+			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A NATS credentials; delete it and the operator creates a fresh one (a controller reference is not a remedy: it would adopt passwords of unknown origin as they are)", name.Namespace, name.Name)
+		}
 		repaired := false
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}

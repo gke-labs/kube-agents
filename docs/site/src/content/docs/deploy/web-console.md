@@ -5,7 +5,7 @@ sidebar:
   order: 9
 ---
 
-The web console is a browser page for the agent that runs inside the cluster. It is for installs where Slack or Google Chat is not set up yet, such as an evaluation cluster, a workshop seat or a demo. It is off by default.
+The web console is a browser page for the agent that runs inside the cluster. It is for installs where Slack or Google Chat is not set up yet, such as an evaluation cluster, a workshop seat or a demo. It is off by default. It is distinct from the A2A console, which a `spec.mode: next` install serves without a flag; [User interfaces](/kube-agents/reference/user-interfaces/) compares the two and the other browser pages.
 
 ## The layout
 

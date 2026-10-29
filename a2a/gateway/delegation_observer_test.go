@@ -1271,6 +1271,99 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 	})
 }
 
+// TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain: a harness reads the
+// chain's cost off the root, so a probe that asks for it sums the usage of
+// the root's own turn and of every wake that continued it, whichever link
+// the read follows, and the children's apart, since a child is another
+// addressee's work. A probe that did not ask reads no extra streams and
+// carries none.
+func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
+	r, spawn, obs := startObservedRig(t, doorDelegation(t))
+	ctx := context.Background()
+	conv := "a2a:agent-1001/ctx-usage-chain"
+	publishUsage := func(exec *lib.TaskExecution, in, out int64) {
+		t.Helper()
+		part, err := lib.UsagePart(lib.Usage{InputTokens: in, OutputTokens: out})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactUsage, Name: lib.ArtifactUsage,
+			Parts: []lib.Part{part}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// delegate has the turn exec publish its usage and delegate, then ends
+	// it, and returns the child once the record names it.
+	delegate := func(exec *lib.TaskExecution, turnID string, n int, in, out int64) *lib.Envelope {
+		t.Helper()
+		publishUsage(exec, in, out)
+		if err := exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "report fleet health")); err != nil {
+			t.Fatal(err)
+		}
+		child := awaitSubmission(t, r, targetPlatform, n)
+		waitFor(t, "the child on the record", func() bool {
+			rec, _ := r.g.reg.Get(ctx, conv)
+			ref, _ := rec.TaskRefFor(turnID)
+			return len(ref.Children) == 1
+		})
+		completeTask(t, exec, "delegated to platform")
+		return child
+	}
+	// wakeAfter ends the child, whose usage counts apart from the front
+	// door's, and returns the wake its end started.
+	wakeAfter := func(child *lib.Envelope, spawns int) (*lib.TaskExecution, *lib.Envelope) {
+		t.Helper()
+		cexec := r.execFor(t, child, targetPlatform)
+		publishUsage(cexec, 100000, 10000)
+		completeTask(t, cexec, "fleet is green")
+		waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) >= spawns })
+		session := spawn.calls()[spawns-1].Session
+		n := 0
+		for _, c := range spawn.calls()[:spawns-1] {
+			if c.Session == session {
+				n++
+			}
+		}
+		wake := awaitSubmission(t, r, session, n)
+		wexec := r.execFor(t, wake, session)
+		if err := wexec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+			t.Fatal(err)
+		}
+		return wexec, wake
+	}
+
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, a2aBackend, "how is the fleet?")
+	child := delegate(exec, origin.TaskID, 0, 1000, 100)
+	wexec, wake := wakeAfter(child, 2)
+	child2 := delegate(wexec, wake.TaskID, 1, 200, 20)
+	wexec2, _ := wakeAfter(child2, 3)
+	publishUsage(wexec2, 30, 3)
+	completeTask(t, wexec2, "the fleet is healthy")
+
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	waitFor(t, "the chain settled on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask == nil
+	})
+	if plain, err := r.g.probeConversation(ctx, conv, origin.TaskID); err != nil || plain.Usage != nil || plain.ChildUsage != nil {
+		t.Fatalf("a probe that did not ask carries usage %+v / %+v (err %v); want none", plain.Usage, plain.ChildUsage, err)
+	}
+	st, err := r.g.probeConversation(withChainUsage(ctx), conv, origin.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := lib.Usage{InputTokens: 1230, OutputTokens: 123}
+	if !st.Final || st.Usage == nil || *st.Usage != want {
+		t.Fatalf("probe of the root = %+v (usage %+v), want final with usage %+v: the root and both wakes, no child",
+			st, st.Usage, want)
+	}
+	wantChildren := lib.Usage{InputTokens: 200000, OutputTokens: 20000}
+	if st.ChildUsage == nil || *st.ChildUsage != wantChildren || st.UsagePartial {
+		t.Fatalf("child usage = %+v (partial %v), want %+v: both children, apart from the front door",
+			st.ChildUsage, st.UsagePartial, wantChildren)
+	}
+}
+
 // The door's one deliverable is the last turn's answer; earlier turns are
 // history posts.
 func TestTurnAnswersPostAndOnlyTheLastIsDelivered(t *testing.T) {
