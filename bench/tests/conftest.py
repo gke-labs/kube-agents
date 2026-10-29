@@ -59,6 +59,14 @@ def _no_forge_from_the_shell(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_grader_sha_from_the_shell(monkeypatch):
+    """`bench-gate suite` reads EVAL_GRADER_SHA, which hack/ci-eval-pr.sh
+    exports; a shell that has it would add a key and a line to every suite
+    output the tests compare, the store-unset golden's included."""
+    monkeypatch.delenv("EVAL_GRADER_SHA", raising=False)
+
+
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
 TASKS = Path(__file__).resolve().parents[1] / "tasks"
 

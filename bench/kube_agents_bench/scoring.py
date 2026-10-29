@@ -214,9 +214,12 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
 #: The trajectory entry name the harness's inject transport gives a task's
 #: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
-#: that read the bus directly would use the same name). The gateway reports
-#: no token usage, so such a record's ``tokens`` are all null and its
-#: liveness signal is the executor's own events instead: an entry of this
+#: that read the bus directly would use the same name). Such a record's
+#: ``tokens`` are the chain's usage as the gateway's probe reported it, and
+#: its ``total`` is null when it reported none (a gateway older than the
+#: field, or turns that published no usage), whatever the delegated workers
+#: billed; its liveness signal is then the
+#: executor's own events instead: an entry of this
 #: name whose ``args.final`` is true (the task ended), or whose ``args.state``
 #: is ``working`` (the executor spawned the persona; a task the harness
 #: cancelled at its budget has no final entry and is still a run). A
@@ -606,6 +609,29 @@ def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def token_count(value: Any) -> int | None:
+    """A token bucket's value as a count, or None when it is not one: null,
+    a flag, a float or a negative number."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _tokens_partial(tokens: dict[str, Any]) -> bool:
+    """Whether the record's counts are short of what the run billed: the
+    inject transport could not read a link of the chain (``usage_partial``),
+    a delegated worker's session reported no counts (``workers.unbilled``),
+    or the run delegated and no worker could be billed (``workers`` null:
+    the pod read failed, or every session was unbilled), so nothing of the
+    workers' is in ``total``. A run that delegated nothing has no ``workers``.
+    """
+    if "workers" in tokens and tokens["workers"] is None:
+        return True
+    workers = tokens.get("workers")
+    unbilled = workers.get("unbilled") if isinstance(workers, dict) else None
+    return tokens.get("usage_partial") is True or bool(unbilled)
+
+
 @dataclass(frozen=True)
 class RepResult:
     """One repetition's verdict.
@@ -630,6 +656,12 @@ class RepResult:
     latency: float | None = None
     turn1_s: float | None = None
     total_tokens: int | None = None
+    #: The record's top-level ``input`` and ``output`` buckets, and whether
+    #: its counts are short (:func:`_tokens_partial`), for the build log's
+    #: tokens line. Not in the hand-off: the dashboard reads them from the log.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    tokens_partial: bool = False
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
@@ -718,8 +750,8 @@ def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
     # so the log says which one happened. The one record that legitimately
-    # carries null buckets is an inject transport run: the gateway
-    # reports no usage, and its liveness is the executor's status events in
+    # carries null buckets is an inject transport run whose gateway
+    # reported no usage, and its liveness is the executor's status events in
     # the trajectory instead (see _a2a_run_evidence).
     total = record.tokens.get("total")
     if total is None:
@@ -1127,6 +1159,9 @@ def classify_rep(
             total_tokens=(
                 record.tokens.get("total") if record and record.tokens else None
             ),
+            input_tokens=token_count(record.tokens.get("input")) if record else None,
+            output_tokens=token_count(record.tokens.get("output")) if record else None,
+            tokens_partial=_tokens_partial(record.tokens) if record else False,
             report=record.output if record else "",
             not_applicable_checks=list(lane.not_applicable) if lane else [],
         )

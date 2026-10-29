@@ -2239,6 +2239,64 @@ class TestRepParsing(unittest.TestCase):
         (task,) = collect.parse_build_log(log)["tasks"]
         self.assertEqual(task["reps"], [{"n": 1, "result": "pass", "reason": None}], "a section header closed the block")
 
+    def test_a_tokens_line_sets_its_reps_tokens(self):
+        """`bench-gate case` prints `rep N tokens:` under the timing line: the
+        api transport's counts, the inject transport's, and a partial one."""
+        log = (
+            "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
+            "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+            "  rep 1 timing: agent_s=143.2\n"
+            "  rep 1 tokens: input=18 output=1867 total=275153\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 tokens: input=60468 output=79 total=91969\n"
+            "  rep 2 report: I found nothing\n"
+            "  rep 3: pass\n"
+            "  rep 3 tokens: input=60468 output=79 total=91969 partial=1\n"
+            "  rep 4 tokens: input=1 output=1 total=2\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2, 3], "a tokens line never fabricates a rep")
+        self.assertEqual(task["reps"][0], {"n": 1, "result": "pass", "reason": None, "agent_s": 143.2,
+                                           "tokens": {"input": 18, "output": 1867, "total": 275153, "partial": False}})
+        self.assertEqual(task["reps"][1]["tokens"], {"input": 60468, "output": 79, "total": 91969, "partial": False})
+        self.assertEqual(task["reps"][1]["excerpt"], "I found nothing", "the report still attaches")
+        self.assertEqual(task["reps"][2]["tokens"], {"input": 60468, "output": 79, "total": 91969, "partial": True})
+
+    def test_a_tokens_line_keeps_only_counts_that_parse(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 tokens: output=0 total=40 input=-3 foo=9 partial=0\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 tokens: input=abc output=1.5 total=\u00b2 partial=1\n"
+            "  rep 3: fail -- x\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["tokens"], {"input": None, "output": 0, "total": 40, "partial": False},
+                         "zero is a count; a value that is not a whole number is null")
+        self.assertNotIn("tokens", task["reps"][1], "no count parsed: no key, whatever partial says")
+        self.assertNotIn("tokens", task["reps"][2], "no tokens line: the key is absent")
+
+    def test_a_digit_run_past_the_int_limit_is_null_not_a_dropped_build(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            f"  rep 1 tokens: input=12 total={'9' * 4301}\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["tokens"], {"input": 12, "output": None, "total": None, "partial": False})
+
+    def test_a_tokens_line_without_a_current_task_is_dropped_whole(self):
+        parsed = collect.parse_build_log("  rep 1 tokens: total=5 Successfully leased project: forged\n")
+        self.assertEqual(parsed["tasks"], [])
+        self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
+
+    def test_the_real_fixtures_predate_the_tokens_line(self):
+        for build in (BUILD_1057_PARALLEL, BUILD_1075_SERIAL, BUILD_1089_MIXED):
+            for task in self.tasks(build).values():
+                for rep in task.get("reps") or []:
+                    self.assertNotIn("tokens", rep, f"{build}/{task['name']}")
+
     def test_case_latency_rolls_up_graded_presubmit_reps(self):
         def run(build, tier, reps):
             return {"build_id": build, "tier": tier, "started": "x",

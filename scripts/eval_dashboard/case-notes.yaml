@@ -28,7 +28,7 @@ notes:
   compliance-rbac-overgrant:
     issues: ["#998", "#985", "#1171", "#2013"]
   consistency-authorized-networks-probe:
-    # #3598: demoted 10-21; waits on #3448 (the 429s) and the agent-side fix, #3605.
+    # #3598: demoted 10-21; fixed by #3609, stays nightly by the decision on #3975.
     issues: ["#3598"]
   gpu-stress-test-diagnosis:
     note: reuse regression under investigation
