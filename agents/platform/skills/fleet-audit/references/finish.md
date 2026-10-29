@@ -44,10 +44,10 @@ goes in neither `checks_run` nor `checks_not_applicable` but in that target's `l
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.
 
-The drift, patch readiness, stockout and compliance collectors also give a cluster that runs Config
-Connector `kcc_unready`, the Config Connector objects there whose `Ready` condition is `False`, or
+The compliance collector, and the drift, patch readiness and stockout collectors with
+`--config-connector`, also give a cluster that runs Config Connector `kcc_unready`, the Config Connector objects there whose `Ready` condition is `False`, or
 `kcc_unread`, why that read failed. You copy neither into the document. `finish` reads them: a
-`manifest` fix whose file declares one of those objects gets a last paragraph that starts
+`manifest` fix whose file declares the finding's own object among them gets a last paragraph that starts
 "**Config Connector is not applying this file.**", and the fix stays `manifest`. Do not write that
 paragraph yourself, and do not copy it from an earlier ledger: `finish` removes it and writes it
 again from this run's manifest.
