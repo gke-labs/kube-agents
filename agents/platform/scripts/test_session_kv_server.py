@@ -11,7 +11,7 @@ import time
 from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from pathlib import Path
 
 # Create a temporary SQLite database for testing and set it in the environment
@@ -3564,32 +3564,105 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             with self.assertLogs(session_kv_server.logger, level="WARNING"):
                 self.assertEqual(own_card(), "")
 
-    def test_an_unreadable_board_fails_open_to_the_one_parent(self):
+    def test_an_unreadable_board_fails_open_to_the_one_parent_after_the_retries(self):
         import sqlite3
 
-        # A board without the tasks table: the read raises and the lookup logs instead of raising.
+        attempts = session_kv_server.INCIDENT_PR_SIBLING_READ_ATTEMPTS
+        retry_s = session_kv_server.INCIDENT_PR_SIBLING_READ_RETRY_S
+        self.assertGreater(attempts, 1)
+        sleep = patch.object(session_kv_server, "_triage_sleep").start()
+        self.addCleanup(patch.stopall)
+        # A board without the tasks table: the read raises on every attempt and
+        # the lookup logs instead of raising, naming the card it files as ungated.
         with sqlite3.connect(self.board) as conn:
             conn.execute("CREATE TABLE other (id TEXT)")
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
             self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
-        self.assertTrue(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
+        failed = [line for line in logs.output if "INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line]
+        self.assertEqual(len(failed), 1, logs.output)
+        self.assertIn(f"attempts={attempts} ungated=true", failed[0])
+        self.assertEqual(sum("INCIDENT_PR_SIBLING_LOOKUP_RETRY" in line for line in logs.output), attempts - 1, logs.output)
+        self.assertEqual(sleep.call_args_list, [call(retry_s)] * (attempts - 1))
         self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
-        # A locked board past the busy timeout.
+        # A locked board past the busy timeout, on every attempt.
+        sleep.reset_mock()
         self.board.unlink()
         self.make_board(self.card(self.SIBLING, "running"))
         holder = sqlite3.connect(self.board, isolation_level=None)
         self.addCleanup(holder.close)
         holder.execute("BEGIN EXCLUSIVE")
         with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
-            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
                 self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+            self.assertTrue(any("ungated=true" in line for line in logs.output), logs.output)
+            self.assertEqual(sleep.call_count, attempts - 1)
             self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
         holder.execute("ROLLBACK")
+        sleep.reset_mock()
         self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
-        # The board path itself cannot be resolved.
+        sleep.assert_not_called()
+        # The board path itself cannot be resolved: retried the same way.
         with patch.object(session_kv_server, "_kanban_db_path", side_effect=RuntimeError("no home")):
-            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
                 self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertTrue(any("ungated=true error=RuntimeError" in line for line in logs.output), logs.output)
+        self.assertEqual(sleep.call_count, attempts - 1)
+
+    def test_a_refused_board_read_that_clears_on_a_retry_still_gates_the_card(self):
+        """The lookup is the whole of the serialization, so a transient refusal
+        (a lock outlasting the busy timeout) is retried under the stripe before
+        the lookup falls open; a missing board is not a refusal and is not retried."""
+        import sqlite3
+
+        attempts = session_kv_server.INCIDENT_PR_SIBLING_READ_ATTEMPTS
+        retry_s = session_kv_server.INCIDENT_PR_SIBLING_READ_RETRY_S
+        sleep = patch.object(session_kv_server, "_triage_sleep").start()
+        self.addCleanup(patch.stopall)
+        # A lock the holder releases on the lookup's first retry: the sibling is found.
+        self.make_board(self.card(self.SIBLING, "running"))
+        holder = sqlite3.connect(self.board, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN EXCLUSIVE")
+        sleep.side_effect = lambda seconds: holder.execute("ROLLBACK") if holder.in_transaction else None
+        with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        self.assertEqual(sleep.call_args_list, [call(retry_s)])
+        self.assertTrue(any("INCIDENT_PR_SIBLING_LOOKUP_RETRY" in line and "attempt=1" in line for line in logs.output), logs.output)
+        self.assertFalse(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
+        self.assertFalse(any("ungated" in line for line in logs.output), logs.output)
+        # The same through the prompt builder: the card is gated on the sibling.
+        holder.execute("BEGIN EXCLUSIVE")
+        sleep.reset_mock()
+        with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                line = self.parents_line(self.query("true"))
+        self.assertNotEqual(line, self.ONE_PARENT)
+        self.assertIn(f"`{self.SIBLING}`", line)
+        self.assertEqual(sleep.call_count, 1)
+        # A refusal that clears only on the last attempt is still a found sibling.
+        sleep.reset_mock()
+        sleep.side_effect = None
+        answers = [session_kv_server.HTTPException(503, "locked")] * (attempts - 1) + [[self.SIBLING]]
+        with patch.object(session_kv_server, "_read_kanban", side_effect=answers):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        self.assertEqual(sleep.call_count, attempts - 1)
+        self.assertFalse(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
+        # One refusal more than the budget falls open, once, with the ungated line.
+        sleep.reset_mock()
+        with patch.object(session_kv_server, "_read_kanban", side_effect=session_kv_server.HTTPException(503, "locked")):
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        self.assertEqual(sleep.call_count, attempts - 1)
+        self.assertEqual(sum("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), 1, logs.output)
+        self.assertTrue(any("ungated=true detail=locked" in line for line in logs.output), logs.output)
+        # No board at all is a fresh install, not a refusal: no retry, no sleep, no warning.
+        sleep.reset_mock()
+        self.board.unlink()
+        with self.assertNoLogs(session_kv_server.logger, level="WARNING"):
+            self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        sleep.assert_not_called()
 
     def test_the_branch_is_stable_and_one_safe_segment(self):
         first = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)

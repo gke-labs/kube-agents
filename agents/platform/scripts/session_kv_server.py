@@ -336,8 +336,9 @@ INCIDENT_PR_SIBLING_ID_RE = re.compile(r"t_[0-9a-f]{8,32}")
 # one of a fixed number of stripes keyed by the branch, so the table never
 # grows with the number of incidents; two branches sharing a stripe only wait
 # on each other. Each holder keeps it for at most one turn (TRIAGE_CHAT_TIMEOUT_S
-# plus the retry budget, plus INCIDENT_START_UNKNOWN_HOLD_S after a turn the
-# gateway did not answer), and a waiter holds its triage pool slot while it
+# plus the retry budget, plus the sibling lookup's read retries, plus
+# INCIDENT_START_UNKNOWN_HOLD_S after a turn the gateway did not answer), and a
+# waiter holds its triage pool slot while it
 # waits: the k-th start for one branch begins up to k-1 turns after the first,
 # and the pool has one slot fewer for every waiter. Folding
 # (INCIDENT_WORKLOAD_DEDUP_SECONDS) is what keeps a crashing Deployment's
@@ -354,6 +355,17 @@ INCIDENT_START_WAIT_LOG_S = 1.0
 INCIDENT_START_UNKNOWN_HOLD_S = 300.0
 # How often the held stripe re-reads the board for that card.
 INCIDENT_START_UNKNOWN_POLL_S = 5.0
+# A board read the sibling lookup could not make (`_live_pull_request_siblings`:
+# the read-only open refused past its busy timeout, a schema the query does
+# not fit, a board path that cannot be resolved) is tried this many times in
+# all, INCIDENT_PR_SIBLING_READ_RETRY_S apart, before the lookup falls open to
+# the one-parent prompt. The lookup is the whole of the serialization, so a
+# transient refusal would otherwise file a card no live sibling gates; the
+# stripe is already held across the turn, so the retries cost the turn at most
+# two seconds. A board that does not exist yet is not retried: that is a
+# fresh install, not a refused read.
+INCIDENT_PR_SIBLING_READ_ATTEMPTS = 3
+INCIDENT_PR_SIBLING_READ_RETRY_S = 1.0
 # Every unsettled pull-request card whose body names the branch, oldest first,
 # the order the dispatcher runs them in. All of them rather than the newest:
 # the new card is parented on each, so it waits for every one, and a middle
@@ -2921,11 +2933,19 @@ def _live_pull_request_siblings(branch: str) -> list[str]:
     whatever happens to B. The set is bounded by the un-folded same-branch
     starts whose cards are still live, one per front-door turn.
 
-    Read-only, and it fails open: no board yet, or a board that cannot be
-    read, gives [] and today's single-parent prompt; a status in
+    Read-only, and it fails open, but not at the first refusal: no board yet
+    gives [] and today's single-parent prompt at once (a fresh install has no
+    board); a board that cannot be read is tried INCIDENT_PR_SIBLING_READ_ATTEMPTS
+    times in all, INCIDENT_PR_SIBLING_READ_RETRY_S apart, because this read is
+    the whole of the serialization and a refusal that outlasts a 5 s busy
+    timeout is usually over a second later, and only then gives [] with a log
+    line saying the card about to be filed is ungated; a status in
     `KANBAN_SETTLED_STATUSES` is not live; an id that is not shaped like a
     card id is logged and left out, and the rest are kept. A failure here is
-    logged and never reaches the triage start thread.
+    logged and never reaches the triage start thread. The hold on the same
+    stripe (`_own_pull_request_card`) treats a refused read as "not yet"
+    rather than falling either way, which is the other half of the same rule:
+    neither reader ends the serialization on a read it could not make.
 
     The lookup runs when the start is dequeued, before the front door's turn
     files anything, so two starts for one branch running at once would each
@@ -2950,13 +2970,24 @@ def _live_pull_request_siblings(branch: str) -> list[str]:
         ).fetchall()
         return [str(row["id"]) for row in rows if row["id"] is not None]
 
-    try:
-        found = _read_kanban(read) or []
-    except HTTPException as exc:
-        logger.warning(f"INCIDENT_PR_SIBLING_LOOKUP_FAILED branch={branch} detail={exc.detail}")
-        return []
-    except Exception as exc:  # noqa: BLE001 - a board that cannot be read must not stop the triage
-        logger.warning(f"INCIDENT_PR_SIBLING_LOOKUP_FAILED branch={branch} error={type(exc).__name__}: {exc}")
+    found: list[str] | None = None
+    refusal = ""
+    for attempt in range(1, INCIDENT_PR_SIBLING_READ_ATTEMPTS + 1):
+        try:
+            found = _read_kanban(read) or []
+            break
+        except HTTPException as exc:
+            refusal = f"detail={exc.detail}"
+        except Exception as exc:  # noqa: BLE001 - a board that cannot be read must not stop the triage
+            refusal = f"error={type(exc).__name__}: {exc}"
+        if attempt < INCIDENT_PR_SIBLING_READ_ATTEMPTS:
+            logger.warning(f"INCIDENT_PR_SIBLING_LOOKUP_RETRY branch={branch} attempt={attempt} {refusal}")
+            _triage_sleep(INCIDENT_PR_SIBLING_READ_RETRY_S)
+    if found is None:
+        logger.warning(
+            f"INCIDENT_PR_SIBLING_LOOKUP_FAILED branch={branch} attempts={INCIDENT_PR_SIBLING_READ_ATTEMPTS} "
+            f"ungated=true {refusal}"
+        )
         return []
     siblings: list[str] = []
     for sibling in found:
