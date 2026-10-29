@@ -275,6 +275,18 @@ type SlackAdapter struct {
 	// pressers caches each Stop presser's workspace answer (slack_stop.go,
 	// presserInWorkspace), so a press costs at most one users.info call.
 	pressers map[string]slackPresser
+	// boardActor acts on a board-health row's Retry or Drop, and boardTaps
+	// holds each row whose tap is running or landed, under s.mu
+	// (slack_board.go).
+	boardActor     BoardActor
+	boardTaps      map[string]bool
+	boardTapsOrder []string
+	// boardSent is the blocks each board card's last edit sent, by
+	// channel/ts, under s.mu, bounded oldest first like boardTaps
+	// (remember); boardEditMu runs one board edit at a time.
+	boardSent      map[string]json.RawMessage
+	boardSentOrder []string
+	boardEditMu    sync.Mutex
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
@@ -283,6 +295,9 @@ type SlackAdapter struct {
 	// postWebhook posts to a shortcut's response_url (slack_shortcut.go);
 	// nil is slack-go's, through the bounded client. Tests fake it.
 	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
+
+	// homeLearn is the learned home channel's state (slack_home_channel.go).
+	homeLearn slackHomeLearn
 
 	// workspaceURL is the bot's workspace as auth.test names it
 	// ("https://acme.slack.com/"), the root of a message's permalink; home is
@@ -570,6 +585,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// blocks with it, which is the honest reading of "the pump is finished".
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	// A home-channel learn or adopt in flight finishes its write before Run
+	// returns, and none starts after (slack_home_channel.go).
+	defer s.closeHomeLearn()
 
 	// The pump below exits only on ctx, so derive our own: any return from
 	// Run — a failed auth.test, or RunContext giving up on an invalid token
@@ -754,6 +772,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
+					s.noteHomeCandidate(msg, inner)
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}

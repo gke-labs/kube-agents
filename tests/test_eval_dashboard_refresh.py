@@ -7,7 +7,7 @@ alert -- so past the dormancy and trust gates it must FAIL LOUD. These tests
 run the real script end to end: the local-target tests execute the actual
 collect -> zero-runs floor -> render -> publish pipeline against the real
 fixtures under scripts/eval_dashboard/testdata/, and nothing here ever
-touches a bucket (a stub gsutil on PATH proves the gs:// wiring instead).
+touches a bucket (a stub gcloud on PATH proves the gs:// wiring instead).
 """
 
 import json
@@ -108,10 +108,10 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(list(self.target.iterdir()), [])
 
     def test_a_bucket_target_requires_a_main_branch_job_type(self):
-        """gs:// + non-main JOB_TYPE skips BEFORE gsutil is ever invoked."""
+        """gs:// + non-main JOB_TYPE skips BEFORE gcloud storage is ever invoked."""
         stubs = self.tmp / "stubs"
         stubs.mkdir()
-        write_stub(stubs, "gsutil", f'touch "{self.tmp}/gsutil-was-called"\nexit 1\n')
+        write_stub(stubs, "gcloud", f'touch "{self.tmp}/gcloud-was-called"\nexit 1\n')
         for job_type in ("", "presubmit", "batch"):
             with self.subTest(job_type=job_type or "unset"):
                 env = {"EVAL_DASHBOARD_TARGET": "gs://kube-agents-dashboards/evals/"}
@@ -120,7 +120,7 @@ class RefreshScriptTest(unittest.TestCase):
                 proc = run_script(env=env, path_prepend=str(stubs))
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("may not write a bucket dashboard", proc.stdout)
-        self.assertFalse((self.tmp / "gsutil-was-called").exists())
+        self.assertFalse((self.tmp / "gcloud-was-called").exists())
 
     def test_a_local_target_needs_no_job_type(self):
         """The offline path a laptop or these tests use crosses no boundary."""
@@ -171,7 +171,7 @@ class RefreshScriptTest(unittest.TestCase):
         stubs.mkdir()
         published_capture = self.tmp / "captured_site"
         published_capture.mkdir()
-        fake_gsutil = f"""
+        fake_gcloud = f"""
         for arg in "$@"; do
             if [[ -f "$arg" ]]; then
                 cp "$arg" "{published_capture}/"
@@ -179,7 +179,7 @@ class RefreshScriptTest(unittest.TestCase):
         done
         exit 0
         """
-        write_stub(stubs, "gsutil", fake_gsutil)
+        write_stub(stubs, "gcloud", fake_gcloud)
         proc = run_script(
             env={
                 "EVAL_DASHBOARD_TARGET": "gs://staging-bucket/evals/",
@@ -200,7 +200,7 @@ class RefreshScriptTest(unittest.TestCase):
         offline path has to disarm it along with the presubmit glob."""
         stubs = self.tmp / "stubs"
         stubs.mkdir()
-        write_stub(stubs, "gsutil", f'touch "{self.tmp}/gsutil-was-called"\nexit 1\n')
+        write_stub(stubs, "gcloud", f'touch "{self.tmp}/gcloud-was-called"\nexit 1\n')
         proc = run_script(
             env={
                 "EVAL_DASHBOARD_TARGET": str(self.target),
@@ -210,7 +210,7 @@ class RefreshScriptTest(unittest.TestCase):
             path_prepend=str(stubs),
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse((self.tmp / "gsutil-was-called").exists(), proc.stdout)
+        self.assertFalse((self.tmp / "gcloud-was-called").exists(), proc.stdout)
         self.assertNotIn("releases", json.loads((self.target / "data.json").read_text()))
 
     def test_rc_from_dir_publishes_the_releases_section(self):
@@ -277,13 +277,13 @@ class RefreshScriptTest(unittest.TestCase):
         log = artifacts / "eval-dashboard-refresh.log"
         self.assertIn("refusing to publish an empty dashboard", log.read_text())
 
-    def test_a_failing_gsutil_source_hits_the_floor_not_the_bucket(self):
-        """gs:// end to end with a gsutil that always fails: the prior
+    def test_a_failing_gcloud_storage_source_hits_the_floor_not_the_bucket(self):
+        """gs:// end to end with a gcloud that always fails: the prior
         download degrades to the first-run message, the sweep collects
         nothing, and the floor reds the run before publish."""
         stubs = self.tmp / "stubs"
         stubs.mkdir()
-        write_stub(stubs, "gsutil", "exit 1\n")
+        write_stub(stubs, "gcloud", "exit 1\n")
         argv_log = self.tmp / "collect-argv.log"
         recording_python(stubs, argv_log)
         artifacts = self.tmp / "artifacts"
@@ -300,7 +300,7 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn("first armed run, or a transient read failure", proc.stdout)
         self.assertIn("refusing to publish an empty dashboard", proc.stdout)
         self.assertIn(
-            "gsutil ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
+            "gcloud storage ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
         # The bucket path hands collect.py both sources, the nightly one with
         # its default prefix and the nightly's writers and main-b periodics

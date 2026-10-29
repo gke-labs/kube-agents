@@ -35,11 +35,22 @@ import (
 // Deliberately absent, as for sessions: STREAM.INFO and message get on TASKS
 // (neither is subject-scoped), $JS.ACK and $JS.FC (the adapter's consumers are
 // ack-none pulls), and any subscribe on the task subjects. Also absent, and
-// different from a session: the capability verify and reply subjects. A
-// session's caller identity at the verifier is its pod name, which is also its
-// addressee; a profile pod's addressee is the profile, and which name a profile
-// pod asks the verifier in is the dispatcher's design to settle. A grant for a
-// question nobody has decided how to ask would be a standing authorization.
+// different from a session: the capability verify and reply subjects, and any
+// fetch on the shared submission durables. #3660 settles both: the dispatcher
+// is the only fetcher and holder of submissions and the one that asks the
+// verifier, and a worker gets its task from the dispatcher.
+//
+// Per (profile, tier) since #3655: the operator renders one entry per tier
+// a profile allows, so the tier is the entry's. What a worker does with it is
+// the hand-off and the lease, both scoped to its own (profile, tier, pod):
+// the dispatcher's request on lib.DispatchSubject, its answer on
+// lib.DispatchAcceptSubject, and its lease renewals on
+// lib.DispatchLeaseSubject. No grant on the lease bucket itself: a KV bucket
+// allows rollup headers, so a put on any key would let a worker purge every
+// lease, and the dispatcher is the bucket's only writer. The task subjects carry no tier (#3660,
+// "Subjects"), so the .events publish and the .in reader still reach every
+// task of the profile at any tier, as before tiers; per-task credentials
+// close that (#3889) before a tier stronger than read is live.
 
 // TopicGrants are an AgentProfile's blackboard grants as the profile spells
 // them, without the a2a.topics. prefix.
@@ -52,6 +63,12 @@ type TopicGrants struct {
 // from the topic which one holds it, so a read grant names both, each scoped
 // to the one subject.
 var topicStreams = []string{lib.StreamTopicsState, lib.StreamTopicsJournal}
+
+// profileTiers are the tiers a profile entry may name, the AgentProfile
+// CRD's allowedTiers values. Duplicated here because the modules cannot
+// import each other, and kept equal by hand: the rendered fixture the
+// contract test reads carries only read.
+var profileTiers = map[string]bool{"read": true, "unattended": true}
 
 // topicPrefix is how a profile's topic grant becomes a subject.
 const topicPrefix = "a2a.topics."
@@ -74,8 +91,8 @@ const topicPrefix = "a2a.topics."
 // An agent-scoped topic the profile publishes must be its own,
 // agent.<profile>.<topic>: the payload spec gives each agent namespace one
 // writer. Another agent's topic, or a shared one, is fine to read.
-func profileGrants(profile, pod string, topics TopicGrants) (Grants, error) {
-	g := executorGrants(profile, pod)
+func profileGrants(profile, tier, pod string, topics TopicGrants) (Grants, error) {
+	g := profileWorkerGrants(profile, tier, pod)
 	for _, t := range topics.Publish {
 		subject, err := topicSubject(t)
 		if err != nil {
@@ -126,12 +143,35 @@ func ownsAgentTopic(profile, grant string) error {
 	return nil
 }
 
+// profileWorkerGrants is a worker pod's task plane: an executor's, the
+// profile's .events publish and the pod's own three consumers (origin,
+// follow-ups, and the .events reader the adapter uses to see whether a task
+// already has a terminal before it runs it); then, with a tier, the
+// hand-off and lease grants above. An entry from an operator before per-tier
+// identities names no tier and gets none of those, so a pod under it can't
+// take dispatched work.
+func profileWorkerGrants(profile, tier, pod string) Grants {
+	g := executorGrants(profile, pod)
+	if tier == "" {
+		return g
+	}
+	g.Subscribe = append(g.Subscribe, lib.DispatchSubject(profile, tier, pod))
+	g.Publish = append(g.Publish,
+		lib.DispatchAcceptSubject(profile, tier, pod),
+		lib.DispatchLeaseSubject(profile, tier, pod),
+	)
+	return g
+}
+
 // validateProfileEntry is the map-time check for a NarrowingProfile entry. The
 // mint repeats the topic check, so a map that got past this function by some
 // other route still cannot mint a non-topic subject.
 func validateProfileEntry(id Identity) error {
 	if !lib.ValidSubjectToken(id.Profile) {
 		return fmt.Errorf("user %q narrows on %q but names profile %q, which is not a dot-free DNS-1123 label", id.User, id.Narrowing, id.Profile)
+	}
+	if id.Tier != "" && !profileTiers[id.Tier] {
+		return fmt.Errorf("user %q narrows on %q but names tier %q, which is not one of the profile tiers", id.User, id.Narrowing, id.Tier)
 	}
 	if id.Topics == nil {
 		return nil

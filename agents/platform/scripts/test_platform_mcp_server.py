@@ -1361,16 +1361,19 @@ class TestSanitizationAndMutationRemoval(unittest.TestCase):
     def test_sanitize_log_text_zero_width_bidi_c1_and_tags(self):
         # Verify stripping of zero-width space (U+200B), BOM (U+FEFF), bidi override (U+202E),
         # DEL (0x7F), C1 control (0x80), 8-bit CSI (0x9B), and Unicode tag block (U+E0001).
-        raw = "normal\u200btext\ufeff\u202esmuggled\x7f\x80\x9b31mcolor\U000e0041end\n"
+        raw = "normal\u200btext\ufeff\u202esmuggled\x7f\x80\x9b31mcolor\U000e0041end\u2028sep\u2029par\u2800blank\n"
         sanitized = _sanitize_log_text(raw)
         self.assertNotIn("\u200b", sanitized)
+        # The three code points the shared filter added over the server's old copy.
+        for separator in ("\u2028", "\u2029", "\u2800"):
+            self.assertNotIn(separator, sanitized)
         self.assertNotIn("\ufeff", sanitized)
         self.assertNotIn("\u202e", sanitized)
         self.assertNotIn("\x7f", sanitized)
         self.assertNotIn("\x80", sanitized)
         self.assertNotIn("\x9b", sanitized)
         self.assertNotIn("\U000e0041", sanitized)
-        self.assertIn("normaltextsmuggledcolorend", sanitized)
+        self.assertIn("normaltextsmuggledcolorendseppar", sanitized)
 
     def test_sanitize_audit_value_zero_width_bidi_c1_and_tags(self):
         raw = {
@@ -1541,6 +1544,21 @@ class TestFindingsQueueTools(unittest.TestCase):
     def test_a_hash_only_publication_does_not_clobber_the_target(self):
         platform_mcp_server.findings_publication("nudge", "chat", content_hash="h1")
         self.assertEqual(self.captured[-1][2], {"target_kind": "chat", "content_hash": "h1"})
+
+    def test_a_decision_covers_its_item_without_asking_unless_a_row_is_unnamed(self):
+        # The model reads this docstring as the tool's description: without
+        # the rule, a careful model asks before a permanent decision that also
+        # covers rows the user did not name (findings-decision-covers-item).
+        # 'queued' is the one state no message has named (mark_surfaced moves
+        # every named row out of it), so it is the condition for asking.
+        doc = " ".join(platform_mcp_server.update_finding.__doc__.split())
+        self.assertIn("Covering the rest of the item is the decision's design, not a side effect to confirm", doc)
+        self.assertIn("say in the reply which other findings it covered", doc)
+        self.assertIn("before the call, look for one: get_findings(project=..., cluster=..., state='queued')", doc)
+        self.assertIn("If there is one, ask the user instead of calling", doc)
+        import findings_queue
+
+        self.assertIn("queued", findings_queue.UNDECIDED_STATES)
 
     def test_a_finding_id_cannot_reroute_the_call(self):
         platform_mcp_server.update_finding("../../v1/sessions", state="accepted")

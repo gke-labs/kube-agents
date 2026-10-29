@@ -1,13 +1,18 @@
-# NIGHTLY-TIER ACTIVE — recast out of the presubmit on 2026-08-26, an
-# entry in hack/eval/nightly-cases.txt since 2026-09-02: the nightly
-# runs it (EVAL_TIER=nightly), the presubmit never does. Its one run failed
-# on
+# PRESUBMIT-ACTIVE, ON THE BLOCKING ROSTER since 2026-10-26, the consistency
+# domain's seat, moved from hack/eval/nightly-cases.txt on its nightly record:
+# 33/34 graded repetitions on the twelve main nightlies that graded it
+# 2026-10-13 to 10-26, 14/14 since the claude-opus-5-5 agent model of
+# 2026-10-19, 5/5 under spec.mode next, about 200s a repetition
+# (docs/eval-gate-roster.md, "Admitted on the record since the split", has
+# the entry). Before that it was nightly-only: recast out of the presubmit
+# on 2026-08-26, an entry in hack/eval/nightly-cases.txt from 2026-09-02.
+# Its one run then failed on
 # agent-endpoint HTTP 502s — transport, not a scenario bug — and the audit
-# shape budgets at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
+# shape budgeted at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
 # run), which six domains cannot spend in one presubmit. The consistency
 # domain was covered there by consistency-authorized-networks-probe
-# (nightly since 2026-10-21, #3598); this
-# full sweep is the SOP-fidelity version and runs nightly. It was held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else
+# until its demotion to the nightly on 2026-10-21 (#3598); this
+# full sweep is the SOP-fidelity version. It was held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else
 # -- it compares GKE-level facets through the ledger, so A5's
 # ambient-kubeconfig problem never touched it.
 #
@@ -55,11 +60,15 @@
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
 # GitHub token and clones the GitOps workspace named by the `Git Repo:` line
 # of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
-# remediation pull requests and closes findings that stopped reproducing.
+# remediation pull requests and closes findings that stopped reproducing
+# (the remediation sweep is off on the inject lane's install,
+# KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, #3439, so there the case requests no
+# pull request and runs in the fan-out's first phase).
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1, now closed. Eligible tier: presubmit, and active there
-# since 2026-08-25.
+# blocker A1, now closed. Eligible tier: presubmit; active there
+# 2026-08-25 to 2026-08-26, nightly from then, and on the roster since
+# 2026-10-26.
 id: consistency-drift-outlier
 name: Drift audit names the cluster that does not match its peers
 # The prompt no longer asks for a summary in the final answer: the SOP's

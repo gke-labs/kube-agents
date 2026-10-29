@@ -34,9 +34,11 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -128,6 +130,9 @@ if args[:3] == ["container", "clusters", "describe"]:
         sys.exit(1)
     print(json.dumps(doc))
 elif args[:2] == ["container", "get-server-config"]:
+    if world.get("server_config") == "UNREACHABLE":
+        print("ERROR: (gcloud.container.get-server-config) ResponseError: code=503", file=sys.stderr)
+        sys.exit(1)
     print(json.dumps(world.get("server_config", {})))
 else:
     print("unexpected gcloud call: " + " ".join(args), file=sys.stderr)
@@ -415,8 +420,8 @@ def _healthy_world() -> dict:
         },
         "server_config": {
             "channels": [
-                {"channel": "RAPID", "defaultVersion": "1.35.0-gke.1"},
-                {"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"},
+                {"channel": "RAPID", "defaultVersion": "1.35.0-gke.1", "validVersions": ["1.35.0-gke.1", "1.34.2-gke.5", "1.33.5-gke.9"]},
+                {"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000", "1.33.4-gke.1000000"]},
             ]
         },
     }
@@ -628,6 +633,65 @@ class EvaluateTest(unittest.TestCase):
         unchannelled = {"currentMasterVersion": "1.33.4-gke.1"}
         problem = ffs.evaluate(entry, [unchannelled], channel_default=lookup)
         assert problem is not None and "channel unset" in problem
+
+    def test_not_ahead_of_channel_reads_the_clusters_own_channel(self):
+        entry = self._entry("not_ahead_of_channel", path="currentMasterVersion", subject="cluster")
+        valid = {"REGULAR": ["1.35.8-gke.1626001", "1.34.11-gke.1209000", "1.34.11-gke.1102000"], "RAPID": ["1.34.12-gke.1011000"]}
+        lookup = valid.get
+        on_channel = {"currentMasterVersion": "1.34.11-gke.1209000", "releaseChannel": {"channel": "REGULAR"}}
+        assert ffs.evaluate(entry, [on_channel], channel_valid=lookup) is None
+        # #3025/#3269: a RAPID patch newer than every 1.34 patch REGULAR
+        # carries is one minor behind the default and still not the fixture.
+        ahead = dict(on_channel, currentMasterVersion="1.34.12-gke.1011000")
+        problem = ffs.evaluate(entry, [ahead], channel_valid=lookup)
+        assert problem == (
+            'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", '
+            "newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000)"
+        ), problem
+        # A patch REGULAR has moved past is what other upgrades cases read.
+        moved_past = dict(on_channel, currentMasterVersion="1.34.10-gke.1")
+        assert ffs.evaluate(entry, [moved_past], channel_valid=lookup) is None
+        # Numeric, not string, order: 1.34.9 is behind 1.34.11, 1.34.12 is not.
+        assert ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.34.9-gke.9")], channel_valid=lookup) is None
+        # A minor the channel no longer carries at all: behind if anything it
+        # offers is newer, ahead if nothing is.
+        assert ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.33.4-gke.1")], channel_valid=lookup) is None
+        problem = ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.36.0-gke.1")], channel_valid=lookup)
+        assert problem is not None and problem.endswith("newer than every version REGULAR offers"), problem
+        # Read against the cluster's OWN channel: the RAPID patch is on RAPID.
+        assert ffs.evaluate(entry, [dict(ahead, releaseChannel={"channel": "RAPID"})], channel_valid=lookup) is None
+        unchannelled = {"currentMasterVersion": "1.34.11-gke.1209000"}
+        assert "release channel unset" in ffs.evaluate(entry, [unchannelled], channel_valid=lookup)
+        unlisted = dict(on_channel, releaseChannel={"channel": "EXTENDED"})
+        assert "get-server-config lists no EXTENDED channel" in ffs.evaluate(entry, [unlisted], channel_valid=lookup)
+        assert "not a GKE version" in ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.34")], channel_valid=lookup)
+        assert ffs.evaluate(entry, [{"releaseChannel": {"channel": "REGULAR"}}], channel_valid=lookup) == (
+            "cluster currentMasterVersion not_ahead_of_channel: observed nothing"
+        )
+        # A roster with no version the operator can order is a failed read,
+        # never "ahead of every version it offers".
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [on_channel], channel_valid={"REGULAR": ["1.34", "latest"]}.get)
+        # One stray entry is enough: ordering against the rest could drop the
+        # newest patch of the minor and read the master as ahead.
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [ahead], channel_valid={"REGULAR": ["1.34.11-gke.1209000", "1.34.13"]}.get)
+
+    def test_not_ahead_of_channel_is_cluster_only_and_takes_no_value(self):
+        def load(entry):
+            path = pathlib.Path(tempfile.mkdtemp()) / "fixtures.json"
+            self.addCleanup(shutil.rmtree, path.parent)
+            path.write_text(json.dumps({"roles": {"r": {"cluster_slot": "b", "namespace": None, "state": [entry]}}}))
+            return ffs.load_assertions(path)
+
+        assert load({"subject": "cluster", "path": "currentMasterVersion", "op": "not_ahead_of_channel"})
+        for bad in (
+            {"subject": "pod?app=x", "path": "v", "op": "not_ahead_of_channel"},
+            {"subject": "cluster", "path": "currentMasterVersion", "op": "not_ahead_of_channel", "value": "REGULAR"},
+            {"subject": "cluster", "op": "not_ahead_of_channel"},
+        ):
+            with self.assertRaises(ffs.CatalogError):
+                load(bad)
 
     def test_node_cpu_spare_ge_sums_what_is_bound_to_each_node(self):
         entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
@@ -1157,6 +1221,51 @@ class PassTest(_Harness):
         done = self.run_script(world)
         body = self.drift_files()["version-laggard"]
         assert "currentMasterVersion minor_behind_channel_default 1: observed \"1.34.1-gke.1\" against channel default 1.34.1-gke.1" in body, done.stderr
+
+    def test_the_laggard_on_a_patch_ahead_of_its_channel_is_drift(self):
+        # #3025/#3269: one minor behind REGULAR's default, so the minor check
+        # passes, on a patch newer than any REGULAR carries for that minor.
+        world = _healthy_world()
+        world["describe"]["seeded-b"] = _cluster_b(master="1.33.5-gke.9")
+        done = self.run_script(world)
+        assert "1 drifted" in done.stderr, done.stderr
+        body = self.drift_files()["version-laggard"]
+        assert (
+            'cluster currentMasterVersion not_ahead_of_channel: observed "1.33.5-gke.9", '
+            "newer than every 1.33 patch REGULAR offers (newest 1.33.4-gke.1134000)"
+        ) in body, body
+        assert "minor_behind_channel_default" not in body, body
+        # One server-config read serves both channel assertions.
+        assert self.log.read_text().count("get-server-config") == 1
+
+    def test_the_laggard_on_a_patch_its_channel_moved_past_is_not_drift(self):
+        world = _healthy_world()
+        world["describe"]["seeded-b"] = _cluster_b(master="1.33.3-gke.1")
+        done = self.run_script(world)
+        assert "0 drifted" in done.stderr, done.stderr
+        assert self.drift_files() == {}
+
+    def test_a_failed_server_config_read_is_made_once_per_pass(self):
+        world = _healthy_world()
+        world["server_config"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert "version-laggard" not in self.drift_files(), done.stderr
+        assert "1 not checked" in done.stderr, done.stderr
+        assert self.log.read_text().count("get-server-config") == 1, self.log.read_text()
+
+    def test_a_channel_entry_without_valid_versions_leaves_the_laggard_not_checked(self):
+        for roster in (None, []):
+            with self.subTest(roster=roster):
+                world = _healthy_world()
+                for channel in world["server_config"]["channels"]:
+                    if roster is None:
+                        channel.pop("validVersions")
+                    else:
+                        channel["validVersions"] = roster
+                done = self.run_script(world)
+                assert "0 drifted, 1 not checked" in done.stderr, done.stderr
+                assert "carries no validVersions list" in done.stderr, done.stderr
+                assert self.drift_files() == {}
 
     def test_a_lapsed_exclusion_is_drift_before_the_master_moves(self):
         world = _healthy_world()

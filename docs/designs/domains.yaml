@@ -55,6 +55,9 @@
 # the never-admitted canary moved to the nightly with the other full audits
 # (hack/eval/nightly-cases.txt), and back into the presubmit file, held out,
 # on 2026-09-29 (#2013); only a roster line counts as coverage.
+# consistency is the exception since 2026-10-26: its seat is the full drift
+# audit, consistency-drift-outlier, which runs at about 200s a repetition on
+# the claude-opus-5-5 agent model.
 
 # Not a domain, and no case claims it: who a nightly eval failure caused by
 # infrastructure (pool projects, seeded fleet, CI, Prow) is filed to. Area
@@ -104,7 +107,9 @@ domains:
     owner: lapis2002
     backup: dshnayder
     meaning: Spots a cluster configured differently from its peers.
-    journey: A targeted probe compares one cluster's configuration against its live peers and names the differing facet
+    # Covered by the full drift audit since 2026-10-26 (consistency-drift-outlier),
+    # not by a probe: consistency-authorized-networks-probe is nightly (#3598).
+    journey: The drift audit compares each cluster's configuration against its live peers and files a ledger naming the outlier and the differing facet
   - slug: fleet-audits
     name: Fleet audits (SOP machinery)
     owner: toshiowang
@@ -152,9 +157,11 @@ domains:
 # covers chat-and-routing; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security,
 # upgrades and cost are covered by domain probes, upgrades again since 2026-10-23
-# (its probe was nightly-only from 2026-10-16, #3269; consistency's was
-# demoted on 2026-10-21, #3598, below) --
+# (its probe was nightly-only from 2026-10-16, #3269) --
 # see the header above for why probes rather than six full audits.
+# consistency's probe was demoted on 2026-10-21 (#3598), which put the
+# domain on the allowlist until 2026-10-26, when consistency-drift-outlier,
+# the full drift audit, took a roster seat on its nightly record.
 # remediation's one roster case, pdb-remediation-pr, was nightly-only from
 # 2026-10-17 (#3120) until 2026-10-26, when it took its roster line back
 # after #3145 seeded the manifest it needs.
@@ -208,22 +215,13 @@ allowlist:
     expires: 2026-11-09
     why: "Uncovered before records expired; the first dated expiry, set on 2026-10-26, is 14 days from that day, and #2013 lists four product defects to fix before the canary can take a roster line."
     held_out: compliance-rbac-overgrant
-  # consistency: the domain's one presubmit case,
-  # consistency-authorized-networks-probe, was demoted to the nightly on
-  # 2026-10-21 (#3604) after it failed about 30% of repetitions on the Gemini
-  # setup on unrelated pull requests: Vertex 429s (#3399, #3448) and real
-  # misses where the agent read seeded-c's leftover authorized-networks block
-  # as configured. Delete this record in the pull request that restores it,
-  # or a stand-in such as consistency-drift-outlier, to the roster.
-  - slug: consistency
-    since: 2026-10-21
-    issue: 3598
-    expires: 2026-11-04
   # observability: every case claiming it has been a nightly case since the
   # row was added (#3437), so it has never had a roster case. Delete this
   # record in the pull request that gives the domain a roster line.
   # source-control sat here beside it until vcs-spent-branch-reuse took its
-  # roster line on 2026-10-23.
+  # roster line on 2026-10-23, and consistency from its probe's demotion on
+  # 2026-10-21 (#3598) until consistency-drift-outlier took its roster line on
+  # 2026-10-26.
   - slug: observability
     since: 2026-10-19
     issue: 3980

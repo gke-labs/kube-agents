@@ -428,8 +428,11 @@ class DedupeTest(Harness):
         self.assertIn("tracked: case-red by #3996 (closed, still tracking)", out)
         reads = [p for m, p, _ in gh.calls if m == "GET" and "state=closed" in p]
         self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&since=2026-10-15T00:00:30Z&per_page=100"])
-        # A newer failing night after the close files again.
+        # One newer failing night is not a streak after the close; three are.
         later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
+        gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
+        self.assertEqual(self.filed(gh), [])
+        later = data(*(night(d, [red(), green()]) for d in range(15, 21)))
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh)), 1)
 
@@ -453,12 +456,23 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[old]))
         self.assertEqual(len(self.filed(gh)), 1)
 
-    def test_a_bug_closed_while_the_newest_red_night_ran_is_filed_again(self):
-        # Closed at 00:30 on the 17th, between that night's start (00:00:30)
-        # and its finish (00:59): the close did not see the night's verdict.
-        closed = {"number": 3996, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z"}
-        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
-        self.assertEqual(len(self.filed(gh)), 1)
+    def test_a_bug_closed_while_the_newest_red_night_ran_counts_only_nights_started_after(self):
+        # #4041: a fix merged and closed the bug at 00:30 on the 17th, while
+        # that night's run (started 00:00:30, from code before the fix) was
+        # still going. Its red verdict and the older ones do not re-file.
+        closed = {"number": 3863, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z",
+                  "state_reason": "completed"}
+        gh, out, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("tracked: case-red by #3863 (closed, still tracking)", out)
+        # Failing on three nights that started after the close: the fix did
+        # not hold, and a fresh issue lists only those nights.
+        after = data(*(night(d, [red(), green()]) for d in range(15, 21)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[closed]))
+        [issue] = self.filed(gh)
+        for day in (18, 19, 20):
+            self.assertIn(f"2026-10-{day}: 0/3 passed", issue["body"])
+        self.assertNotIn("2026-10-17", issue["body"])
 
     def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
         other = {"number": 3995, "title": "Nightly: case-maint fails every run", "body": nightly_bugs.MARKER.format(case="case-maint") + "\nreason: see case-red too"}
@@ -1000,13 +1014,31 @@ class InfraCaseTest(Harness):
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
         self.assertEqual(self.filed(gh, infra=True), [])
-        # Closed as completed (fixed), the next kept night files again.
-        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[dict(closed, state_reason="completed")]))
+        # Closed as completed (fixed) on the 16th while the streak's nights
+        # (15th-17th) include ones that started before the close: still
+        # tracked, as for domain bugs (#4041).
+        fixed = dict(closed, state_reason="completed")
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[fixed]))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # Three kept nights that all started after the close: filed again.
+        after = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17, 18, 19)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[fixed]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
         # Graded after the close, then kept again: a new problem, filed.
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [green("case-red")]),
                    *(night(d, [infra_task("case-red")]) for d in (18, 19, 20)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+
+    def test_a_handed_off_lost_job_issue_clears_on_a_clean_night_inside_the_window(self):
+        # Lost on the 15th, clean on the 16th, lost on the 17th; the job's
+        # issue was handed off (not planned) on the 15th after that night
+        # started. The clean 16th finished after the close, so the hand-off
+        # has cleared and the 17th's loss files fresh.
+        lost = data(night(15, [], lost=True), night(16, [green()]), night(17, [], lost=True))
+        handed_off = {"number": 3716, "title": "t", "closed_at": "2026-10-15T12:00:00Z", "state_reason": "not_planned",
+                      "body": nightly_bugs.BOT_MARKER.format(kind=nightly_bugs.KIND_LOST, field=nightly_bugs.KEY_JOB, key=JOB)}
+        gh, _, _ = self.run_once(lost, FakeGh(closed_issues=[handed_off]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
     def test_a_case_that_changed_parts_is_read_from_the_part_that_ran_it(self):

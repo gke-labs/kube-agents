@@ -1734,7 +1734,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         "entry": 21,
         "holds": ["node-pool"],
         "backend_service": "drain-timeout-seeded-b",
-        "text": "BackendService drain-timeout-seeded-b drains for 3600 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out; set the timeout at or under the wait: `gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`",
+        "text": "BackendService drain-timeout-seeded-b drains for 720 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out; set the timeout at or under the wait: `gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`",
     }
     ORPHAN_RULE = {
         "rule": "orphan-node-objects",
@@ -1785,7 +1785,7 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         hit = hits[0]
         self.assertEqual((hit["severity"], hit["object"]), (pr.CRITICAL, "Cluster/lag"))
-        self.assertTrue(hit["excerpt"].startswith("readiness.status=blocked: readiness rule lb-connection-draining blocks it: BackendService drain-timeout-seeded-b drains for 3600 s on pool(s) default-pool"), hit["excerpt"])
+        self.assertTrue(hit["excerpt"].startswith("readiness.status=blocked: readiness rule lb-connection-draining blocks it: BackendService drain-timeout-seeded-b drains for 720 s on pool(s) default-pool"), hit["excerpt"])
         self.assertIn("--connection-draining-timeout=600", hit["excerpt"])
         self.assertTrue(hit["impact"].startswith("lag is 1 minor(s) behind and its upgrade would not go through cleanly: readiness rule lb-connection-draining blocks it: BackendService drain-timeout-seeded-b"), hit["impact"])
         self.assertNotIn("held, not stopped", hit["impact"])

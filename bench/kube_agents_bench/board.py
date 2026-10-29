@@ -79,14 +79,52 @@ ids = [a for a in sys.argv[4:] if a]
 # Seconds a read waits on a locked store before giving up. A hermes writer
 # holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"statuses": {}, "error": None}
+out = {"statuses": {}, "summaries": {}, "errors": {}, "error": None}
+
+
+def has_table(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def columns(conn, table):
+    return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+
+
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     marks = ",".join("?" for _ in ids)
-    rows = conn.execute("SELECT id, status FROM tasks WHERE id IN (%s)" % marks, ids).fetchall()
-    conn.close()
-    for tid, status in rows:
+    cols = columns(conn, "tasks")
+    has_lfe = "last_failure_error" in cols
+    query = "SELECT id, status%s FROM tasks WHERE id IN (%s)" % (", last_failure_error" if has_lfe else "", marks)
+    rows = conn.execute(query, ids).fetchall()
+    for row in rows:
+        tid, status = row[0], row[1]
         out["statuses"][str(tid)] = str(status)
+        if has_lfe and len(row) > 2 and row[2]:
+            out["errors"][str(tid)] = str(row[2])
+    if has_table(conn, "task_runs"):
+        run_cols = columns(conn, "task_runs")
+        if "summary" in run_cols:
+            for tid in ids:
+                r = conn.execute(
+                    "SELECT summary FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r and r[0]:
+                    out["summaries"][str(tid)] = str(r[0])
+        if "error" in run_cols:
+            for tid in ids:
+                r = conn.execute(
+                    "SELECT error FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r and str(tid) not in out["errors"] and r[0]:
+                    out["errors"][str(tid)] = str(r[0])
+    conn.close()
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc
 print(SENTINEL)
@@ -304,9 +342,9 @@ if out["error"] is None:
             if has_table(board, "task_runs") and "summary" in columns(board, "task_runs"):
                 for tid in wanted:
                     row = board.execute(
-                        "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
-                        "AND summary != '' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    if row:
+                        "SELECT summary FROM task_runs WHERE task_id = ? "
+                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                    if row and row[0]:
                         out["cards"][tid]["summary"] = row[0]
             if has_table(board, "task_events"):
                 for tid in wanted:
@@ -341,19 +379,12 @@ def command(task_ids: list[str]) -> str:
     )
 
 
-def read_statuses(
+def read_board_state(
     shell: Callable[[str, float], str], task_ids: list[str], timeout: float
-) -> dict[str, str] | None:
-    """The board's current status for each of ``task_ids``, or ``None``.
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]] | None:
+    """The board's status, summary, and error for each of ``task_ids``, or ``None``.
 
-    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
-    module stays importable without the harness and testable with a canned
-    reply.
-
-    ``None`` means the read cannot be trusted: no card was asked for, the
-    script did not run to completion, its reply was not JSON, or the board
-    could not be opened. A card the board does not know is simply absent from
-    the returned map; the caller decides what an unknown card means.
+    Returns a 3-tuple of (statuses, summaries, errors), or None if the read failed.
     """
     if not task_ids:
         return None
@@ -376,7 +407,20 @@ def read_statuses(
     statuses = payload.get("statuses")
     if not isinstance(statuses, dict):
         return None
-    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}
+    matched_statuses = {str(k): str(v) for k, v in statuses.items() if k in task_ids}
+    summaries = payload.get("summaries") or {}
+    matched_summaries = {str(k): str(v) for k, v in summaries.items() if k in task_ids}
+    errors = payload.get("errors") or {}
+    matched_errors = {str(k): str(v) for k, v in errors.items() if k in task_ids}
+    return matched_statuses, matched_summaries, matched_errors
+
+
+def read_statuses(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> dict[str, str] | None:
+    """The board's current status for each of ``task_ids``, or ``None``."""
+    state = read_board_state(shell, task_ids, timeout)
+    return state[0] if state is not None else None
 
 
 def api_session_id(context_id: str) -> str:

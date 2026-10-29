@@ -36,10 +36,20 @@ sandbox stays silent and is retried on the next tick. The first run
 ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
 cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
-With the flag on, a Slack origin and the credential proxy's Slack relay in the
-environment, the report goes out as Block Kit instead (a headline with the
-total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
-buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
+With the flag on and a Slack destination, the report goes out as a card instead,
+built by ``inventory_card`` from the files the prioritization worker left beside
+the report (the items, scores, limits and shown files, read once before the claim
+by ``_read_sweep_files``) and never from the report's text: a headline counting
+the things to fix first, one row per listed item with its scored risk and action,
+the queue line, the scan's checks folded, and the "Fix the first one" and "See all
+N" buttons. The card needs the hand-off to have filed a prioritization card and
+the files to be there, readable and in step (the recomputed selection equals the
+shown file); otherwise the text goes, and one line in the oobe stage log says why
+(``_first_report_card``), as it does on the origin path for a card its door could
+not post (in a recorded conversation, a card that did not post is posted again on a
+later tick, below). On a Slack
+origin with the credential proxy's Slack relay in the environment it is posted
+here as Block Kit through ``slack_blocks_post``, because the scheduler's delivery
 takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
 the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).
@@ -75,7 +85,8 @@ findings queue from this pod, from the items and scores the prioritization
 worker left beside the report (``_register_findings`` says why the worker's
 own registration is not enough). Between the claim and the first byte of
 stdout, it marks the report's findings shown in the findings queue, as the paced publisher ``first_report``,
-from ``INVENTORY.shown.json`` (what ``inventory_findings.py select`` chose).
+from ``INVENTORY.shown.json`` (what ``inventory_findings.py select`` chose), read with
+the other files before the claim.
 That counts them against the day's limit and keeps the hourly findings nudge,
 whose hold ends at the claim, from announcing them again as new. The marks are
 best-effort: a missing file or an unreachable queue is logged to stderr and the
@@ -92,8 +103,9 @@ sent the entire onboarding report twice.
 
 Because the prioritization stage writes a finished, presentation-ready
 ``INVENTORY.md``, no LLM is involved in delivery: what that stage produced is
-what the user sees, as written or, on Slack with the flag on, laid out again by
-``inventory_presenter`` without a model call, followed by the audits note. The
+what the user sees: as written; on Slack with the flag on, as the card built from
+that stage's files without a model call; or, when the card cannot be built, laid
+out again by ``inventory_presenter`` without one; followed by the audits note. The
 sweep's complete findings are a different file (``INVENTORY.raw.md``) and are
 never delivered from here.
 """
@@ -111,12 +123,16 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
+import findings_queue as fq  # beside this script in the pod
+import inventory_card  # beside this script in the pod
 import inventory_findings  # beside this script in the pod
 import oobe  # beside this script in the pod
 import sandbox_exec
+import slack_presenter  # beside this script in the pod
 
 # The two jobs oobe took over, removed once onboarding is done.
 SCAN_JOB_ID = "bootstrap-inventory-scan"
@@ -152,6 +168,9 @@ ITEMS_NAME = "INVENTORY.items.json"
 SCORES_NAME = "INVENTORY.scores.json"
 ITEMS_KEY = "items"
 SCORES_KEY = "scores"
+# The pacing limits the hand-off wrote beside the raw file (bootstrap_handoff.LIMITS_PATH) and
+# `select` read; the card recomputes `select`'s choice under the same ones.
+LIMITS_NAME = "INVENTORY.limits.json"
 # A few KB per finding; far above any fleet's sweep.
 BATCH_MAX_BYTES = 4 * 1024 * 1024
 # The outcome the queue gives a row the user dismissed (findings_queue._register_one).
@@ -215,6 +234,27 @@ REMOTE_MV = "/bin/mv"
 
 # The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
+# Why the first report went as text and not as the card, one line in the oobe stage log
+# (_stage_note), which an operator reads; the scheduler keeps a zero-exit run's stderr nowhere.
+# No name here reads CARD_NO or CARD_NUM: CodeQL's private-data heuristic takes that for a card
+# number and flags every stage-log line it reaches.
+TEXT_REPORT_NOTE = "the first report went as text: {reason}"
+CARD_FLAG_OFF = "KAGE_SLACK_UX is off"
+CARD_PLATFORM_TAKES_TEXT = "the report goes to {platform}, which takes text"
+CARD_PLATFORM_UNRECORDED = "a chat whose platform is not recorded"
+CARD_MARKER_UNREAD = "the hand-off marker could not be read, so the files beside the report may be an earlier sweep's"
+CARD_RANKING_MISSING = "the hand-off filed no prioritization card, so the files beside the report are an earlier sweep's"
+CARD_FILE_UNUSABLE = "{name} could not be read: {problem}"
+CARD_FILE_MISSING = "no {name}"
+CARD_BUILD_FAILED = "the card could not be built: {error!r}"
+# A card that was built and not posted: the Slack doors' reasons.
+CARD_UNPOSTED = "the report card was not posted, so the text goes: {reason}"
+CARD_CHAT_ID_MISSING = "the origin is not a Slack chat with a chat id"
+CARD_THREAD_MISSING = "the origin has no thread for the gateway to post into"
+CARD_RELAY_MISSING = "no Slack relay is configured"
+CARD_REFUSED = "Slack refused the blocks: {error}"
+CARD_GATEWAY_REFUSED = "the gateway did not post it: {error}"
+CARD_POST_FAILED = "{error!r}"
 
 # The note on the fleet audits (_audits_note). The scan leaves their workload checks to the first-run
 # audits. Its stage sentences say only what oobe's marker records the stage did; whether an audit ran is
@@ -674,6 +714,65 @@ def _read_json_beside(data_dir: Path, in_sandbox: bool, name: str) -> dict | Non
     return parsed
 
 
+def _parse_shown(raw: bytes):
+    """``SHOWN_NAME``'s record from its bytes; ``ValueError`` past ``SHOWN_MAX_BYTES`` or when it is not JSON."""
+    if len(raw) > SHOWN_MAX_BYTES:
+        raise ValueError(f"larger than {SHOWN_MAX_BYTES} bytes")
+    return json.loads(raw.decode("utf-8"))
+
+
+class SweepFiles(NamedTuple):
+    """What the prioritization worker left beside the report, read once before the claim.
+
+    ``items`` and ``scores`` are the parsed files, None when absent; ``limits`` the pacing
+    limits the hand-off wrote, the defaults when the file is absent or unusable, as ``select``
+    read them; ``shown`` the shown file's bytes, None when absent, which ``_mark_shown`` and the
+    card each parse for what they need. ``problems`` names each file that was there and could not
+    be read or parsed, with why; its readers say what they did without it.
+    """
+
+    items: dict | None
+    scores: dict | None
+    limits: fq.PacingLimits
+    shown: bytes | None
+    problems: dict[str, str]
+
+
+def _read_sweep_files(data_dir: Path, in_sandbox: bool) -> SweepFiles:
+    """The files beside the report, each read once, where the report was read.
+
+    Raises ``sandbox_exec.SandboxUnavailable`` or ``subprocess.TimeoutExpired`` when the sandbox
+    did not answer, for ``main`` to treat as it does the report's read: silent, retried next tick.
+    Every other failure to read or parse a file goes in ``problems`` under its name; a file that
+    is not there is None and no problem.
+    """
+    parsed: dict[str, dict | None] = {}
+    problems: dict[str, str] = {}
+    for name in (ITEMS_NAME, SCORES_NAME, LIMITS_NAME):
+        try:
+            parsed[name] = _read_json_beside(data_dir, in_sandbox, name)
+        except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired):
+            raise
+        except Exception as e:  # noqa: BLE001 - the file's readers say what they did without it
+            parsed[name] = None
+            problems[name] = str(e)
+    try:
+        shown = _read_shown(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired):
+        raise
+    except Exception as e:  # noqa: BLE001 - as above
+        shown = None
+        problems[SHOWN_NAME] = str(e)
+    if LIMITS_NAME in problems:
+        sys.stderr.write(
+            f"bootstrap_delivery: cannot read {LIMITS_NAME} ({problems[LIMITS_NAME]}); using the default limits\n"
+        )
+    elif parsed[LIMITS_NAME] is None:
+        sys.stderr.write(f"bootstrap_delivery: no {LIMITS_NAME}; using the default limits\n")
+    limits = inventory_findings.limits_from(parsed[LIMITS_NAME] or {})
+    return SweepFiles(parsed[ITEMS_NAME], parsed[SCORES_NAME], limits, shown, problems)
+
+
 def _findings_endpoint() -> str:
     return (os.environ.get(FINDINGS_ENDPOINT_ENV) or DEFAULT_FINDINGS_ENDPOINT).rstrip("/")
 
@@ -695,9 +794,10 @@ def _no_ranking(data_dir: Path) -> bool | None:
         return None
 
 
-def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None) -> set[str]:
+def _register_findings(data_dir: Path, no_ranking: bool | None, files: SweepFiles) -> set[str]:
     """Register every finding the sweep extracted in the findings queue, as
-    ``inventory_findings.py register`` does, from this pod.
+    ``inventory_findings.py register`` does, from this pod, from the items and
+    scores read before the claim (``files``).
 
     The worker runs ``register`` through its terminal. With the shell sandbox
     on, that terminal cannot reach the queue on this pod's loopback, so
@@ -731,15 +831,18 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
                 f"{ITEMS_NAME} is an earlier sweep's; registering nothing\n"
             )
             return suppressed
-        extracted = _read_json_beside(data_dir, in_sandbox, ITEMS_NAME)
-        if extracted is None:
+        if ITEMS_NAME in files.problems:
+            raise ValueError(files.problems[ITEMS_NAME])
+        if files.items is None:
             sys.stderr.write(f"bootstrap_delivery: no {ITEMS_NAME}; registering nothing\n")
             return suppressed
-        items = extracted[ITEMS_KEY]
+        items = files.items[ITEMS_KEY]
         if not items:
             _mark_registered(data_dir)
             return suppressed  # a clean fleet: nothing to register, and no scores file
-        raw_scores = _read_json_beside(data_dir, in_sandbox, SCORES_NAME)
+        if SCORES_NAME in files.problems:
+            raise ValueError(files.problems[SCORES_NAME])
+        raw_scores = files.scores
         if raw_scores is None:
             sys.stderr.write(f"bootstrap_delivery: no {SCORES_NAME}; registering nothing\n")
             return suppressed
@@ -796,29 +899,28 @@ def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
         response.read()
 
 
-def _mark_shown(data_dir: Path, in_sandbox: bool, suppressed: set[str] = frozenset()) -> bool:
+def _mark_shown(files: SweepFiles, suppressed: set[str] = frozenset()) -> bool:
     """Mark every row of every item the report lists shown, as ``PUBLISHER``,
-    except the ``suppressed`` ids registration reported: the user dismissed
-    them, so they are never pending and spend no slot of the day's limit.
-    The queue refuses such a mark anyway; skipping it saves the request.
+    from the shown file read before the claim (``files``), except the
+    ``suppressed`` ids registration reported: the user dismissed them, so they
+    are never pending and spend no slot of the day's limit. The queue refuses
+    such a mark anyway; skipping it saves the request.
 
     Returns whether to set the shown file aside: True unless there is none,
     so a file this run could not read is not marked by a later report.
     Never raises: the claim is taken, so nothing here may stop the report
     going out.
     """
-    try:
-        raw = _read_shown(data_dir, in_sandbox)
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: could not read {SHOWN_NAME}; marking nothing: {e}\n")
+    problem = files.problems.get(SHOWN_NAME)
+    if problem:
+        sys.stderr.write(f"bootstrap_delivery: could not read {SHOWN_NAME}; marking nothing: {problem}\n")
         return True
+    raw = files.shown
     if raw is None:
         sys.stderr.write(f"bootstrap_delivery: no {SHOWN_NAME}; marking nothing\n")
         return False
     try:
-        if len(raw) > SHOWN_MAX_BYTES:
-            raise ValueError(f"larger than {SHOWN_MAX_BYTES} bytes")
-        items = json.loads(raw.decode("utf-8"))[SHOWN_ITEMS]
+        items = _parse_shown(raw)[SHOWN_ITEMS]
         marks = [(str(item[SHOWN_CLASS]), [str(fid) for fid in item[SHOWN_IDS]]) for item in items]
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: {SHOWN_NAME} is not readable; marking nothing: {e}\n")
@@ -1241,66 +1343,103 @@ def _with_note(report: str, note: str) -> str:
     return report.rstrip("\n") + "\n\n" + note + "\n"
 
 
-def _posted_as_blocks(content: str) -> bool:
-    """Whether the report was posted to Slack as Block Kit; False posts nothing.
+def _first_report_card(
+    platform: str | None, no_ranking: bool | None, files: SweepFiles, suppressed: set[str]
+) -> tuple[inventory_card.Card | None, str]:
+    """The first report as the card ``inventory_card`` builds from the stage's files, or None and
+    why the text goes instead.
 
-    False, and the caller prints the text, unless the flag is on, the origin is
-    Slack with a chat id, the relay is configured and the report parses. Any
+    The card needs all of: ``KAGE_SLACK_UX`` on; a Slack destination (``platform``); a hand-off
+    that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
+    are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
+    and the scores file readable when an item is listed; and a card the builder accepts, which recomputes
+    ``select``'s choice and checks it against the shown file. Built once per run, before the
+    claim, for whichever door posts it. Never raises: a report the card cannot carry goes as text.
+    """
+    if not slack_presenter.enabled():
+        return None, CARD_FLAG_OFF
+    if platform != PRESENTED_PLATFORM:
+        return None, CARD_PLATFORM_TAKES_TEXT.format(platform=platform or CARD_PLATFORM_UNRECORDED)
+    if no_ranking is None:
+        return None, CARD_MARKER_UNREAD
+    if no_ranking:
+        return None, CARD_RANKING_MISSING
+    for name in (ITEMS_NAME, SHOWN_NAME):
+        if name in files.problems:
+            return None, CARD_FILE_UNUSABLE.format(name=name, problem=files.problems[name])
+    for name, present in ((ITEMS_NAME, files.items), (SHOWN_NAME, files.shown)):
+        if present is None:
+            return None, CARD_FILE_MISSING.format(name=name)
+    # The builder reads the scores file only for a listed item, as ``_register_findings`` does, so
+    # one that cannot be read beside an empty item list (a clean fleet writes none) is no reason to
+    # hold the done card back.
+    item_list = files.items.get(ITEMS_KEY)
+    if SCORES_NAME in files.problems and isinstance(item_list, list) and item_list:
+        return None, CARD_FILE_UNUSABLE.format(name=SCORES_NAME, problem=files.problems[SCORES_NAME])
+    try:
+        shown = _parse_shown(files.shown)
+    except ValueError as e:
+        return None, CARD_FILE_UNUSABLE.format(name=SHOWN_NAME, problem=e)
+    try:
+        return inventory_card.build(files.items, files.scores, files.limits, shown, frozenset(suppressed)), ""
+    except inventory_card.CardUnavailable as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 - the text must still go
+        return None, CARD_BUILD_FAILED.format(error=e)
+
+
+def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
+    """Whether the report was posted to Slack as the card; False posts nothing.
+
+    False, and the caller prints the text, with no card (``_first_report_card``
+    said why), an origin that is not Slack with a chat id, or no relay. Any
     failure is False too, including one that may have posted (a timeout once
     the request was sent): this report is sent once per install, and a second
-    copy of it is a smaller loss than none.
+    copy of it is a smaller loss than none. Each goes to the stage log.
     """
+    if card is None:
+        return False
     try:
-        import slack_presenter
-
-        if not slack_presenter.enabled():
-            return False
         origin = _origin()
         channel = str(origin.get(CHAT_ID_KEY) or "")
+        thread = str(origin.get(THREAD_ID_KEY) or "")
         if origin.get(PLATFORM_KEY) != PRESENTED_PLATFORM or not channel:
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_CHAT_ID_MISSING))
             return False
-        import chat_notify
-
         if chat_notify.routes(PRESENTED_PLATFORM):
-            return _posted_through_gateway(content, channel, str(origin.get(THREAD_ID_KEY) or ""))
-        import inventory_presenter
+            return _posted_through_gateway(data_dir, card, channel, thread)
         import slack_blocks_post
 
         if not slack_blocks_post.configured():
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_RELAY_MISSING))
             return False
-        built = inventory_presenter.blocks(content)
-        if built is None:
-            return False
-        blocks, text = built
+        blocks, text = inventory_card.blocks(card)
         try:
-            slack_blocks_post.post(channel, text, blocks, str(origin.get(THREAD_ID_KEY) or ""))
+            slack_blocks_post.post(channel, text, blocks, thread)
         except slack_blocks_post.Refused as e:
-            sys.stderr.write(f"bootstrap_delivery: Slack refused the report blocks ({e})\n")
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_REFUSED.format(error=e)))
             return False
         return True
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
+    except Exception as e:  # noqa: BLE001 - the text must still go
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_POST_FAILED.format(error=e)))
     return False
 
 
-def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
+def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, channel: str, thread: str) -> bool:
     """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
 
     The gateway holds Slack there and the broker's relay is gone, so the card
-    goes as ``a2a notify --chat-file`` (``inventory_presenter.chat``) into the
+    goes as ``a2a notify --chat-file`` (``inventory_card.chat``) into the
     origin's thread, which the gateway posts only when it is a thread of its
     home channel. False, and the caller prints the text, with no thread to
     reply on (a bare post would land in the home channel, wherever the origin
-    is), a report that does not parse, or any failure, including one that may
-    have posted, for the reason ``_posted_as_blocks`` gives.
+    is) or any failure, including one that may have posted, for the reason
+    ``_posted_as_blocks`` gives.
     """
-    import chat_notify
-    import inventory_presenter
-
-    built = inventory_presenter.chat(content) if thread else None
-    if built is None:
+    if not thread:
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_THREAD_MISSING))
         return False
-    chat, text = built
+    chat, text = inventory_card.chat(card)
     path = ""
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -1321,7 +1460,7 @@ def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
             with contextlib.suppress(OSError):
                 os.unlink(path)
     if res.returncode != 0:
-        sys.stderr.write(f"bootstrap_delivery: the gateway did not post the report card: {res.stderr.strip()}\n")
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_GATEWAY_REFUSED.format(error=res.stderr.strip())))
         return False
     return True
 
@@ -1389,35 +1528,24 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
 
 
 def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note: str,
-                          mark_shown) -> tuple[str, str, bool]:
+                          mark_shown, card: inventory_card.Card | None) -> tuple[str, str, bool]:
     """Post the report and the audits note: the card then the note, or one text message.
 
-    The card goes only when ``KAGE_SLACK_UX`` is on, the conversation is Slack's
-    and the report parses. On the card path anything short of posted is
-    returned as ``NOT_POSTED``, since the next attempt's key edits a card that
-    landed. Once the claim is kept, the outcome is recorded, then the
-    findings are marked shown (``mark_shown``, whose result is returned), both
-    before the card path's note goes, since the outcome ends the findings
-    nudge's hold. A note that fails is logged: the report is out.
+    ``card`` is ``_first_report_card``'s for this conversation, None for the
+    text. On the card path anything short of posted is returned as
+    ``NOT_POSTED``, since the next attempt's key edits a card that landed. Once
+    the claim is kept, the outcome is recorded, then the findings are marked
+    shown (``mark_shown``, whose result is returned), both before the card
+    path's note goes, since the outcome ends the findings nudge's hold. A note
+    that fails is logged: the report is out.
     """
-    platform = conversation["platform"]
-    card = None
-    try:
-        import slack_presenter
-
-        if platform == PRESENTED_PLATFORM and slack_presenter.enabled():
-            import inventory_presenter
-
-            card = inventory_presenter.chat(content)
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
     if card is None:
-        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, platform), note))
+        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, conversation["platform"]), note))
         if outcome == NOT_POSTED:
             return outcome, reason, False
         _record_outcome(data_dir, outcome)
         return outcome, reason, mark_shown()
-    chat, text = card
+    chat, text = inventory_card.chat(card)
     outcome, reason = _notify_conversation(conversation, text, chat, CONVERSATION_REPORT_UPDATE)
     if outcome != POSTED:
         return NOT_POSTED, reason, False
@@ -1437,24 +1565,26 @@ def _record_outcome(data_dir: Path, outcome: str) -> None:
 
 
 def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
-                             note: str, suppressed: set[str]) -> None:
+                             note: str, suppressed: set[str], files: SweepFiles,
+                             card: inventory_card.Card | None) -> bool:
     """After the claim: post into the conversation, and release the claim unless the report is out.
 
-    The findings are marked shown only once the claim is kept (posted, or on
-    the text path most likely posted), so a released claim leaves none counted
-    against the day's limit.
+    True when the claim is kept. The findings are marked shown only once it is
+    (posted, or on the text path most likely posted), so a released claim
+    leaves none counted against the day's limit.
     """
     outcome, reason, shown = _post_to_conversation(
-        data_dir, conversation, content, note, lambda: _mark_shown(data_dir, in_sandbox, suppressed)
+        data_dir, conversation, content, note, lambda: _mark_shown(files, suppressed), card
     )
     if outcome == NOT_POSTED:
         # Recorded first, so the released claim is retried only after the wait.
         _record_attempt(data_dir, reason, counted=True)
         _release_claim(data_dir)
-        return
+        return False
     if outcome != POSTED:
         _record_attempt(data_dir, reason, counted=False)
     _cleanup(data_dir, in_sandbox, shown)
+    return True
 
 
 def main(data_dir: Path | None = None) -> int:
@@ -1513,10 +1643,21 @@ def main(data_dir: Path | None = None) -> int:
         )
         return 1
 
+    # The files beside the report, read before the claim like the report, so a
+    # sandbox that stopped answering leaves no claim behind to undo.
+    try:
+        files = _read_sweep_files(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
     # Before the claim, which ends the nudge's hold, so the rows exist when
     # the marks below are sent.
     no_ranking = _no_ranking(data_dir)
-    suppressed = _register_findings(data_dir, in_sandbox, no_ranking)
+    suppressed = _register_findings(data_dir, no_ranking, files)
+    # One card for whichever door posts it, from the files read above; built
+    # here, before the claim, since it reads nothing more.
+    platform = conversation["platform"] if conversation is not None else _origin_platform()
+    card, text_reason = _first_report_card(platform, no_ranking, files, suppressed)
     # Also before the claim, so its reads cannot cost the report once the claim is taken.
     home = bool(chat_notify.routed_platform()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
@@ -1527,22 +1668,28 @@ def main(data_dir: Path | None = None) -> int:
         return 0  # another run is delivering this report — stay silent
 
     if conversation is not None:
-        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, note, suppressed)
-        return 0
-
-    # Right after the claim, which ends the nudge's hold, so a nudge run has
-    # the shortest window in which to announce these findings as new.
-    shown = _mark_shown(data_dir, in_sandbox, suppressed)
-
-    if _posted_as_blocks(content):
-        sys.stdout.write(note + "\n")
+        kept = _deliver_to_conversation(data_dir, in_sandbox, conversation, content, note, suppressed, files, card)
     else:
-        sys.stdout.write(_with_note(_presented(content), note))
-    sys.stdout.flush()
+        # The origin path keeps every claim: stdout is the scheduler's.
+        kept = True
+        # Right after the claim, which ends the nudge's hold, so a nudge run has
+        # the shortest window in which to announce these findings as new.
+        shown = _mark_shown(files, suppressed)
 
-    # Cleanup runs only after the report is posted or safely on stdout (already
-    # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
-    _cleanup(data_dir, in_sandbox, shown)
+        if _posted_as_blocks(data_dir, card):
+            sys.stdout.write(note + "\n")
+        else:
+            sys.stdout.write(_with_note(_presented(content, platform), note))
+        sys.stdout.flush()
+
+        # Cleanup runs only after the report is posted or safely on stdout (already
+        # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
+        _cleanup(data_dir, in_sandbox, shown)
+
+    # Logged by the run that keeps the claim, so a text post that failed and
+    # released it leaves no line; the attempt that posts writes the one.
+    if kept and card is None:
+        _stage_note(data_dir, TEXT_REPORT_NOTE.format(reason=text_reason))
     return 0
 
 

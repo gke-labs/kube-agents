@@ -1582,12 +1582,37 @@ one platform is ever routed.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
 record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. In this
-release nothing reads or writes the record and the policy has no effect: the agent's env and the
-`HomeChannelUnset` condition follow `homeChannel` alone. The change that makes the gateway learn the
-channel of the first admitted mention under `auto`, write the record, and makes the operator render the
-agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the CR, else the record" ships as one, so
-no release holds a signal nothing answers. `patch` on the object is the RBAC bound; data-only writes
-are the gateway's contract. A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
+release the agent's env and the `HomeChannelUnset` condition follow `homeChannel` alone. The change
+that makes the operator render the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the
+CR, else the record" and the switch that arms the gateway's learn ship as one, so no release holds a
+signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
+switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
+that change merges after the gateway code, never before it. With the switch set, the policy `auto`
+and `homeChannel` empty, the gateway reads the record at boot: a recorded channel is checked again
+with `conversations.info` and adopted, with `reader` re-stamped to the gateway's own image and a stale
+`slack.refused` cleared; one that is shared, archived, not joined, or not a channel id is written to
+`slack.refused` as one of the four words the operator matches, `shared`, `archived`, `not-member` or
+`malformed`, nothing is adopted and the learn is armed, so the first mention that passes replaces the
+channel (one archived after it was learned is the ordinary case); one whose check cannot be made (a
+Slack API error) is adopted in memory for that boot with no re-stamp, so `reader` never claims a check
+that did not happen. An empty record arms the learn: the first verified, top-level channel mention that is not a command, whose
+channel passes the same check, is written once (`slack`, `slack.setBy`, `slack.setAt`, `writer`,
+`reader`), the gateway's notify route is armed on it, and one line in the learning thread names the
+channel; a candidate the check refuses is written to `slack.refused` while the record names no
+channel and does not name that reason already (a write that fails is tried again at the next
+refusal; while a channel is recorded, `slack.refused` describes it, only the boot check writes it,
+and a refused candidate writes nothing) and the next mention may learn; a record another writer
+filled first is adopted after the same check, with `reader` re-stamped, or replaced when that check
+refuses it; a group direct message is refused without a call and a direct message is never a
+candidate. One hand-reachable
+state exists: `kubectl set env` of that switch on the gateway Deployment survives the operator's
+server-side apply, and the gateway then learns, writes and posts while the agent env stays unrouted
+and `HomeChannelUnset` stays True. `reader` compares the image reference only: under a floating tag
+such as `latest` the same tag can name a different image, which the key cannot tell. `patch` on the
+object is the RBAC bound; data-only merge patches with the read `resourceVersion` as the precondition
+are the gateway's contract.
+
+A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
 and posted on the `ts`, or a bare `ts`, which names no channel, so the gateway checks it only for
 shape and posts it into the home channel: a `ts` from elsewhere can only ever thread (or fail to
 thread) there. The kanban notifier sends the qualified form, with the card's own channel, so a
@@ -2114,6 +2139,19 @@ answered recomputes who is waiting and reads the board only once the snapshot ha
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
 A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+
+**The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
+chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
+(`actions`, `retry` and `drop`; spec-a2a-payloads.md, "Chat messages"). The renderer lays such a
+row out as its text over an actions block keyed by the row (`kage_board.row.<n>`), labels the
+buttons Retry and Drop itself, and puts the row's ids, joined by commas, in their value
+(`slack_board.go`). A tap is never a turn. It is admitted by the Home tab's rule above, then sent
+over the board route as a request with a body (`lib.BoardAction`), which the Hermes bridge relays
+to session-kv's `POST /v1/board/actions`; that unblocks (Retry) or archives (Drop) the row's cards
+while they are still `blocked`, and answers each card's outcome. The row is then edited in place:
+its buttons give way to "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>", or "No longer
+stuck. <name>, <time>" when the cards had already moved, the time as Slack's date token; a tap that did not land
+keeps the buttons under a line saying so, and so does a row whose edit Slack refused, so a second tap asks again. One tap per row at a time, and one edit of a card at a time, each from the blocks the last one sent, in this process. A message whose rows carry buttons is drawn without its side bar, so every row stays in the message's own blocks where the edit finds it.
 
 ### Answer feedback (added 10/16)
 

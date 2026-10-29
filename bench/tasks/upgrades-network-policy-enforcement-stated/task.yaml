@@ -3,7 +3,7 @@
 # dataplane with the NetworkPolicy add-on off, and three of them carry
 # NetworkPolicy objects that nothing enforces (seeded-a's default-deny
 # policies in seeded-reliability, seeded-debug, seeded-capacity,
-# seeded-stall, seeded-token and seeded-headroom, its apiserver-egress-only
+# seeded-stall, seeded-token, seeded-headroom and seeded-qos, its apiserver-egress-only
 # policy in seeded-deprecation, and, once the seeded-a shapes are applied,
 # default-deny in seeded-shapes and seeded-defaults, with seeded-intent
 # carrying none on purpose; seeded-b's and seeded-d's default-deny in
@@ -68,7 +68,7 @@ expected_output: >-
   from the GKE API and the NetworkPolicy objects from the Kubernetes API, and
   reports that every seeded cluster runs the legacy dataplane with
   enforcement off, so the policies on seeded-a (seeded-reliability, seeded-debug,
-  seeded-capacity, seeded-stall, seeded-token, seeded-headroom and
+  seeded-capacity, seeded-stall, seeded-token, seeded-headroom, seeded-qos and
   seeded-deprecation, plus seeded-shapes and seeded-defaults once the
   seeded-a shapes are applied; none in seeded-intent, on purpose), seeded-b
   (seeded-upgrade) and seeded-d (seeded-topology) are not enforced today and

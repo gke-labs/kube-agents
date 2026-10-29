@@ -164,8 +164,10 @@ OPTION_NAMED = re.compile(r"\bOption ([A-Z])\b")
 #: A proposed fix the section names in any shape: bullet, numbered, bold label, heading, any case.
 PROPOSED_FIX_NAMED = re.compile(r"\bproposed fix\b", re.IGNORECASE)
 #: The recommendation line, ``- ✅ **Recommended: Option B**``; only markup may precede the
-#: word, so ``Not Recommended: Option A`` is not one.
-RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", re.MULTILINE)
+#: word, so ``Not Recommended: Option A`` is not one. The emphasis may be ``_`` as well as ``*``
+#: (``__Recommended: Option B__``), so the letter's boundary excludes ``_`` where ``\b`` would
+#: count it as a letter, as ``OPENING_PULL_REQUEST`` does for its marker words.
+RECOMMENDED = re.compile(r"^[^\w\n]*[*_]*Recommended[*_]*:?[*_\s]*Option ([A-Z])(?![^\W_])", re.MULTILINE)
 #: A markdown link; the url may hold balanced parentheses, as a Logs Explorer query does.
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: How many edited alerts this process remembers.
@@ -178,9 +180,18 @@ EDITED_MAX = 512
 #: changes is read against the call to action it actually carries. Only the marker counts: a
 #: restatement of the reply-wanted clause (``a Pull Request will be opened``, ``is being opened for
 #: review``) keeps its buttons, because stripping them would leave a report that asks for ``apply``
-#: with no button for it. The words may wrap onto continuation lines of the bullet.
+#: with no button for it. The words may wrap onto continuation lines of the bullet. The label
+#: and the marker words may carry ``*`` or ``_`` emphasis (``__To authorize__``,
+#: ``_is being opened automatically_``), so the marker's boundaries exclude ``_`` where ``\b``
+#: would count it as a letter; an indented continuation line may open with bold
+#: (``  **is being opened automatically**``). The clause ends at an unordered list marker (``-``,
+#: ``*``, ``+``) followed by whitespace, a thematic break (``---``, ``***``, ``___``, a trailing
+#: ``\r`` allowed), a ``#`` line, a blank line, or an unindented line opening with ``-``, ``*``
+#: or ``+`` at all: an unindented ``**Note:**`` paragraph under the bullet is not part of it.
 OPENING_PULL_REQUEST = re.compile(
-    r"^[^\w\n]*To authorize[*_]*:?(?:[^\n]|\n(?![ \t]*[-*#]|\s*$))*?\bis\s+being\s+opened\s+automatically\b",
+    r"^[^\w\n]*[*_]*To authorize[*_]*:?"
+    r"(?:[^\n]|\n(?![-*+]|[ \t]*(?:[-*+][ \t]|#|(?P<hr>[-*_])(?:[ \t]*(?P=hr)){2,}[ \t\r]*$)|\s*$))*?"
+    r"(?<![^\W_])is\s+being\s+opened\s+automatically(?![^\W_])",
     re.IGNORECASE | re.MULTILINE,
 )
 

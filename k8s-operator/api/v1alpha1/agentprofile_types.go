@@ -44,6 +44,7 @@ const DefaultAgentProfileQueueTimeoutSeconds = 3600
 const AgentProfileTopicPattern = `^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`
 
 // AgentProfileSpec defines the desired state of AgentProfile.
+// +kubebuilder:validation:XValidation:rule="!has(self.identity) || !has(self.identity.serviceAccountName) || self.identity.serviceAccountName == '' || !has(self.allowedTiers) || size(self.allowedTiers) <= 1",message="spec.identity.serviceAccountName names one ServiceAccount, so it can serve only one tier: leave it unset (the operator creates one per tier) or allow one tier"
 type AgentProfileSpec struct {
 	// Description is the routing blurb, rendered into the A2A agent card.
 	// +kubebuilder:validation:MinLength=1
@@ -196,9 +197,10 @@ type AgentProfileBus struct {
 
 // AgentProfileIdentity names the ServiceAccount the profile's pods run as.
 type AgentProfileIdentity struct {
-	// ServiceAccountName is an existing ServiceAccount in the profile's
-	// namespace. Naming one hands this profile's pods whatever RBAC it holds;
-	// absent, the operator creates a ServiceAccount with none.
+	// ServiceAccountName is an existing ServiceAccount in the profile
+	// namespace (<namespace>-profiles), and it serves the profile's one
+	// allowed tier. Naming one hands this profile's pods whatever RBAC it
+	// holds; absent, the operator creates a ServiceAccount per tier with none.
 	// +kubebuilder:validation:MaxLength=253
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('agentprofile-')",message="serviceAccountName may not name an operator-created AgentProfile ServiceAccount (agentprofile-*): that ServiceAccount belongs to another profile"
@@ -273,8 +275,9 @@ type AgentProfileStatus struct {
 	// +optional
 	AgentRef string `json:"agentRef,omitempty"`
 
-	// ServiceAccountName is the ServiceAccount the profile's pods run as,
-	// whether named in spec.identity or created by the operator.
+	// ServiceAccountName lists the ServiceAccounts the profile's pods run as,
+	// in the profile namespace: one per allowed tier, comma-separated, or the
+	// one named in spec.identity.
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
@@ -294,10 +297,18 @@ type AgentProfileStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // The name is the addressee token in a2a.tasks.{profile}.… and a2a.agents.{profile},
 // so it is a single subject token: a dot-free DNS-1123 label.
-// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$') && self.metadata.name.size() <= 55",message="AgentProfile name must be a dot-free DNS-1123 label of at most 55 characters: it is the addressee token on the task and directory subjects, and profile-<name> is its bus identity, which must fit one 63-character label"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="AgentProfile name must be a dot-free DNS-1123 label: it is the addressee token on the task and directory subjects (its length is bounded by the next rule, per tier)"
 // `platform` is the Hermes bridge's addressee: a profile under that name would put a
 // second executor on a2a.tasks.platform.*. The platform persona as a profile is not a goal.
 // +kubebuilder:validation:XValidation:rule="self.metadata.name != 'platform'",message="AgentProfile name 'platform' is reserved: the Hermes bridge is the executor for that addressee"
+// The name bound ratchets: it refuses a create, or an update that newly breaks
+// it, but not an update to a profile that already broke it. A profile named
+// under 0.19.0's flat 55 would otherwise be refused every write after the
+// upgrade, its status and finalizer removal included, and hang Terminating.
+// The operator still drops such a profile from the identity map. The old
+// object's unattended test reads the set by size and index, not exists():
+// through the optional oldSelf, exists() blows the CEL cost budget.
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.size() <= (has(self.spec.allowedTiers) && self.spec.allowedTiers.exists(t, t == 'unattended') ? 44 : 50) || (oldSelf.hasValue() && oldSelf.value().metadata.name.size() > ((has(oldSelf.value().spec.allowedTiers) && (size(oldSelf.value().spec.allowedTiers) == 2 || oldSelf.value().spec.allowedTiers[0] == 'unattended')) ? 44 : 50))",optionalOldSelf=true,message="AgentProfile name is too long for its tiers: each tier's bus identity is profile-<name>-<tier>, which must fit one 63-character label, so a name is at most 50 characters, or 44 if allowedTiers includes unattended"
 
 // AgentProfile is the Schema for the agentprofiles API.
 type AgentProfile struct {

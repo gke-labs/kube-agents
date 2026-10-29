@@ -26,7 +26,9 @@ plus one line, once per episode, when the gate is slow without being broken
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
-([below](#the-watched-periodics)).
+([below](#the-watched-periodics)). Once a week, from 9 AM Toronto time on
+Monday, `scripts/eval_dashboard/weekly_chat.py` posts the weekly health
+summary to the same space ([below](#the-weekly-health-email)).
 The digest also carries a section on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected), built by
 `scripts/eval_dashboard/nightly_digest.py`; [The nightly section](#the-nightly-section)
@@ -34,9 +36,10 @@ describes it. When the section cannot be built, the digest carries one line on
 the night instead (the cases recorded, how many passed all reps, partial and
 failed, what is newly failing against the night before, the opening chat
 turn's p50 and p95 as advice beside the p95 < 10 s target
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
-`spec.mode: next`, because the harness times the opening turn on the agent API only),
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
+grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
+the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
 the section was skipped. A night can be the builds of up to three periodics
 (the main job, the main-b job when the main part runs as two halves, and the
@@ -44,7 +47,8 @@ writers job), reported as one night: the line names a part that is missing,
 still running or cut short, the night counts as cut short when its main or
 main-b part is, and a night without its main or main-b part gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
-and the report from the same nightly runs.
+and the report from the same nightly runs. After it, the digest carries one
+line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -72,7 +76,8 @@ OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
 pool-project drift owes its owner (`gate_issue.py`), files a bug for a case
 the nightly fails on every run three nights in a row, and an infra bug when
 the nightly or a case is kept from running, dry run until armed
-([Nightly bugs](#nightly-bugs)), renders the weekly health email beside
+([Nightly bugs](#nightly-bugs)), keeps an issue open for the owner of each
+domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)), renders the weekly health email beside
 `data.json` ([The weekly health email](#the-weekly-health-email)), and appends
 `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
@@ -173,7 +178,8 @@ jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
 the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
-spare again) — a case whose grade depends on the drifted fixture is recorded as
+spare again; for drift no re-apply clears, at the time or event the message
+names) — a case whose grade depends on the drifted fixture is recorded as
 infrastructure on a run whose own lease-time scan saw the drift, and a red on such a
 case from a run whose scan could not read the role is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries. Who the
@@ -495,8 +501,20 @@ interrupted in, each with its reason and its one next step, then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
-did. `periodics_runs` carries every read
-job's latest build and its summary, which is what the recovery message says. A
+did. For a failed build the note also carries how it died, read from what
+Prow wrote beside it: the node its pod ran on and a Warning pod event when
+the pod recorded one (`podinfo.json`; a run that outlives the event window
+has none), and the line of its log that says so (from the tail of
+`build-log.txt`: the script's last line that starts or ends like an error,
+else the message of Prow's own entrypoint line when the build hit its
+timeout, else the last line of all when the build wrote no report, which is a
+script that died before its summary), each left out when it cannot be read.
+The quoted line has credential shapes scrubbed and control characters and
+Chat markup dropped first, because it leaves the job's bucket: the same words
+ride the evidence into the tracking issues that quote it, and `health.json`
+is public. `periodics_runs`
+carries every read job's latest build and its summary, which is what the
+recovery message says. A
 job with no reading writes no note and ends none: that is the bot losing sight
 of the job, not the job recovering.
 
@@ -507,15 +525,21 @@ last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
 reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
-messages are four lines, the failed one with the report's detail lines under its
-second: a headline naming where and what stopped happening ("Eval GitOps repos:
+messages are four lines, the failed one with the report's detail lines and a
+"how it died" line (the log line that says so, the node, a Warning pod event)
+under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
 leftover pull requests from eval runs are not being cleaned up"); the job, what
 it does and how often, which run and how it failed; the effect and the scope
-("CI eval infrastructure only"); the runbook link and the build link. The
+("CI eval infrastructure only"); the runbook link and the build link. Failed
+jobs whose builds died on the same log line, when both are news in the same
+tick, are one message: the places and the shared last line (the same line,
+which is one place to look first, not proof of one cause), then each job as
+its own block would say it (its node and pod event included), the effects, a
+footer per job. The
 recovery is one line naming the run and what it did ("closed 241 pull request(s)
-across 12 project(s)"). The digest carries one line per open note, and one per
-reconcile job's latest run: when, which build, passed or failed, dry run or
-not, and what it did. Nothing here
+across 12 project(s)"). The digest carries one line per open note (with how a failed build died,
+when that was read), and one per reconcile job's latest run: when, which
+build, passed or failed, dry run or not, and what it did. Nothing here
 files an issue: the recovery is a person's, and the failed and stopped messages
 link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
@@ -642,7 +666,7 @@ commented on is never commented on twice. The watermark and the comment ids
 live in `gate-comment-state.json` beside `health.json`; a first tick with no
 state looks back one hour. Posting uses the workflow's own `GITHUB_TOKEN`
 through `gh api` (the job holds `pull-requests: write` and `issues: write` for
-this, the tracking issue and the nightly bug). A failure to post is a warning; the run is
+this, the tracking issue, the nightly bug and the coverage-gap issue). A failure to post is a warning; the run is
 retried next tick and the job never reds for it. `--dry-run` prints the
 comments instead.
 
@@ -661,7 +685,8 @@ whose body also carries a word the condition's own evidence uses ("drift" or
 "pending" beside a fixture role, "NotReady" or "lost" beside a node), so an
 issue that mentions a role or node in passing is not the tracker; case names
 never match an unlabelled body, since a roster tracker lists them all. The
-bot's own `nightly-red` issues are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
+bot's own `nightly-red` issues, and its coverage-gap issues (the
+`kube-agents-bot:coverage-gap` marker, [Coverage gaps](#coverage-gaps)), are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
 in `health-state.json` and in `health.json`'s `issue` field (`{number, url, condition}`,
 `null` outside an incident; `health.py` reads it back through
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
@@ -772,11 +797,12 @@ An open `nightly-red` issue that carries the case's marker, or (for an issue
 without a marker, a human's) names the case as a whole word in its title or
 body, in any letter case (or links its transcript, `eval_<case>_rep1.log`), is
 adopted instead, so a case is filed once and a human's issue wins. A
-`nightly-red` issue for the case closed after the streak's newest night counts
-too: a fix that merged before the next nightly closes its issue while the
-nights on record are still red, so the case is filed again only after a newer
-failing night. An issue closed as not planned (or a duplicate), the close a
-triager picks when handing an infra failure to the infra issue, keeps
+`nightly-red` issue for the case closed after any of the streak's nights
+started counts too: a fix that merges closes its issue while the nights on
+record, even one still running when it merged, tested the code from before it,
+so the case is filed again only after 3 failing nights whose runs all started
+after the close. An issue closed as not planned (or a duplicate), the
+close a triager picks when handing an infra failure to the infra issue, keeps
 tracking the case until it passes on a night after the close; a red streak
 after that pass files a new issue. A hand-off closed before the 14 nights on
 record holds nothing back: the record can no longer show whether the case
@@ -841,7 +867,8 @@ or when GitHub refuses that login, the issue is filed unassigned and says so.
 
 The step runs in dry run until armed: it reads the open issues and the comments
 it needs, prints what it would file, comment and assign, and writes nothing.
-Setting the repository variable `NIGHTLY_BUGS_LIVE=true` arms it;
+Setting the repository variable `NIGHTLY_BUGS_LIVE=true` arms it, and the
+coverage-gap filer with it ([Coverage gaps](#coverage-gaps));
 `CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
 `python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
 against any `data.json`; `--live` writes.
@@ -855,9 +882,9 @@ bugs](#nightly-bugs) files by: a case's verdict for a night is the bug filer's
 where nearly every case failed give none), and cases marked `expected_fail`,
 off the nightly matrix, or with no `task.yaml` on the checkout are left out. An
 issue tracks a case as the filer reads it: an open `nightly-red` issue naming
-it, or a closed one that still tracks the streak (closed after its newest
-night, or handed off as not planned). The issue listings are cross-checked
-against GraphQL and read again exactly as the filer reads them. The lists follow the filer's classifier,
+it, or a closed one that still tracks the streak (closed after the first of
+its last 3 graded nights started, or handed off as not planned). The issue
+listings are cross-checked against GraphQL and read again exactly as the filer reads them. The lists follow the filer's classifier,
 which drops repetitions it reads as infrastructure even when the collector
 recorded them as failures; the header's counts do not, so they match the
 Nightly report's.
@@ -883,16 +910,32 @@ Nightly report's.
 - **⚙️ Infra:** each part of the nightly lost last night, with its run and issue,
   and each case kept from running last night that has an open infra issue or a
   3-night streak (`nightly_infra.py`); "none last night" otherwise.
+- **⏱ Latency:** last night's opening chat turn (p50 and p95, beside the
+  p95 < 10 s target) and agent time (the median of the cases' agent p50),
+  each against its typical: the median of the same number over the last 7
+  earlier whole nights that carry it (not cut short, no part missing or still
+  running), with at least 3 of them. A number at 1.5× its typical or more gets a 🐢 mark. Under it,
+  **🐢 Slow cases**: a case whose agent p50 is at least 2× its own typical
+  (its last 7 earlier nights with timing, at least 3) and at least 60 s more,
+  largest ratio first, with its owner; "sustained N nights" when it was slow
+  on 2 or more of its nights in a row (its nights with timing, so a night it
+  did not run in does not break the streak). A slowdown that lasts about four
+  nights becomes the case's typical, and the case drops off the list. When more than a quarter of the cases
+  with timing and a typical are slow, and more than 5, one "broad slowdown" line replaces the
+  list: a shift that wide has one cause. A night cut off at the deadline,
+  or with a part missing or still running, carries the block too, labelled as
+  covering only the cases or parts on record. It is advisory and moves no
+  state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - A footer asking owners to reply in the thread.
 
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
 report. A night with no new bug, no case owed a bug for the first time, no
 case red for the first night (a tracked case red again after a green night
 counts), no recovery, no infra item and no part cut off, missing or still running is
-one line instead: the date, the pass count and how many were not graded, "no
-new reds, nothing recovered", and how many are still red. A night whose main part was cut
+one summary line instead: the date, the pass count and how many were not graded, "no
+new reds, nothing recovered", and how many are still red, followed by the latency block. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
-counted, and only the infra list follows; a writers part cut off, missing or still running is named in
+counted, and only the infra list and the latency block follow; a writers part cut off, missing or still running is named in
 the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from
@@ -914,26 +957,115 @@ point into this repository). Links are checked for form, not fetched: the
 dashboard's links sit behind a Google login a fetch from the job cannot pass.
 It never posts partial numbers.
 
+## Coverage gaps
+
+`scripts/eval_dashboard/coverage_gaps.py` keeps one issue open for each domain
+in [`docs/designs/domains.yaml`](designs/domains.yaml) that has no blocking
+presubmit seat, and closes it when the domain has one again. A domain is
+covered when a case on `hack/eval/blocking-roster.txt` claims it with
+`domain:` and carries a non-empty `verification_spec`; the step and
+`scripts/test_domain_coverage.py` both read coverage through
+`scripts/domain_coverage.py`, so the two agree. When `domains.yaml` gives no
+domains the step writes nothing, and the same when any uncovered domain is not
+on its allowlist: `scripts/test_domain_coverage.py` keeps every uncovered
+domain listed on `main`, so such a gap means a bad read (a truncated roster, no
+`bench/tasks`). The step logs each one, and the digest carries no gap line that
+tick.
+It runs every tick after the nightly bug filer and before the post, capped at
+2 minutes.
+
+An allowlist entry is either a bare slug, the shape `domains.yaml` used first,
+or a record with `since`, `issue`, `expires` and optional `owner` and
+`held_out`; the step reads both. The issue is labelled `presubmit-gate` and
+`domain:<slug>` and assigned to the domain's `owner:` (a record's own `owner:`
+wins), with `backup:` mentioned; when GitHub refuses the owner as assignee it
+is filed unassigned and says so. Its body names how many days the domain has
+been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
+or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
+or "start date not recorded" (also for a date that does not parse or is after
+today); why, from the entry
+and the issue it cites; and the candidates. A candidate is a case of the
+domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
+not on the roster, with its
+graded repetitions over the last 14 nightly nights (read as [Nightly
+bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
+(90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
+bar, and who clears it"), and, when the tick read the evidence store (not the
+last published copy written back after a failed read, nor a read stopped at its
+deadline), what the
+store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
+`collecting` with the runs still needed for a full window, `cut` (the read left
+older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
+bar, then by pass rate. The body is edited in place when any of this changes,
+about once a day; its assignees are never touched, and the assignment line of an
+open issue names the assignees GitHub holds, with the owner beside them when
+the owner is not one. The body is the bot's: an edit to it or the title is
+rewritten on the next tick, so notes go in comments.
+
+A record past its `expires` date fails no pull request; this issue is where it
+is chased. Which records have expired is `expired_records` in
+`scripts/domain_allowlist.py`, which ships with the record shape; on a checkout
+without it nothing expires. Once a record has expired, the body says "The
+allowlist exception expired on <date>, N days ago", and a comment @-mentions
+the owner and backup at most once every 24 hours: not while the last such
+comment is younger than that, nor in the 24 hours after an issue filed after
+the expiry (its body carries the mentions). A bare slug has no expiry.
+
+The bot's issue carries the marker `<!-- kube-agents-bot:coverage-gap
+domain=<slug> -->` and is found by it among the open `presubmit-gate` issues
+(an issue whose label a person removes is no longer seen, and the next tick
+files another); an issue without the marker is never taken for the bot's, and no tracking issue the gate files or adopts ([The
+tracking issue](#the-tracking-issue)) ever takes one for its own. The listing
+is read the way [Nightly bugs](#nightly-bugs) reads it, cross-checked against
+GraphQL up to 4 times; when no read agrees, nothing is written that tick. When
+the domain is covered again, the bot comments once naming the roster case and
+closes the issue as completed. An issue a person closes as not planned (or a
+duplicate) after the gap began stays closed; the bot files again only for a
+later gap. For a domain whose start date is not recorded, a close in the last
+90 days counts, and after that the bot files again. An issue whose domain has
+left `domains.yaml` without a roster case covering it is left open, with a
+warning in the job log.
+
+The 9 AM digest carries one line per uncovered domain, after the nightly part:
+the domain, days uncovered, "exception expired N days ago" once its record has
+expired, the owner (as text, not a mention), and the best
+candidate with its record and the store's verdict when the store was read
+(`post_health.py --store`). With every domain covered there is no line. It
+reads no GitHub.
+
+It runs dry until armed, on the nightly bug filer's switch: `NIGHTLY_BUGS_LIVE=true`
+arms it, `CI_HEALTH_MUTE=true` disarms it, and it has no variable of its own. It
+writes with the job's token under the `issues: write` the job already holds.
+It opens no roster pull request: the job holds no branch write path, and the
+eval crew approves every roster line. Locally,
+`python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
+is a dry run; `--live` writes.
+
 ## The weekly health email
 
 `scripts/eval_dashboard/weekly_email.py` renders a one-page summary of the
 nightly tier for leadership and the team. Its step runs after the bug filer, so
 a bug filed that tick counts, and publishes it as `health-email.html` beside
-`data.json`. Nothing sends it yet: the mail route,
-the sending account and the chat line that links to it are still to be decided.
+`data.json`. Nothing mails it yet: the mail route and the sending account are
+still to be decided. Its summary is posted to the CI-health Chat space once a
+week (below).
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
-when none of its parts was cut off at the job deadline, it has a main part, and
-it is not a night on which nearly every graded case failed; two counted nights
+when none of its parts was cut off at the job deadline, it has both halves of
+the main matrix it owed (the main part, and the main-b part once that job runs;
+the digest withholds its verdict on a night without either), and it is not a
+night on which nearly every graded case failed; two counted nights
 on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
-weeks; a scenario graded in only one week is left out and counted in the
-closing note.
+weeks; a scenario graded in only one week, or no longer in the suite (no
+`task.yaml` on the checkout, or no `domain:` line, so no area), is left out and
+counted in the closing note.
 
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
-the compared scenarios' graded repetitions), a "Needs attention" box, one row per area with
+the compared scenarios' graded repetitions with its 90th percentile, "the
+slowest 10%"), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -943,7 +1075,7 @@ each reason and exits 1, the step logs a warning, and the last published copy
 stays. The checks:
 
 - **Same cases.** Both weeks' numbers are over one set of scenarios, and the
-  counts shown add up to it.
+  tile and the area rows' scenario counts add up to it.
 - **Truncated nights.** No counted night was cut off.
 - **Not enough data.** With fewer than 4 counted nights in either week, the
   intro says so and nothing is called up, down or steady.
@@ -970,9 +1102,32 @@ stays. The checks:
   footer names those models and the two weeks' dates; a week that changed model
   says so in the intro.
 
+The weekly Chat post is the same week in a few lines: the pass rate with its
+change from last week (or why no change is called: how many nights counted and
+why the rest were left out), the "Needs attention" areas with their open-bug
+counts and links, the three strongest areas, the task time (the median, the
+90th percentile and the area with the slowest median, with the median's change
+when the week has a trend), and links to the page and the dashboard. The
+render step writes it (`--chat-out`) only when the page passes, from the
+numbers the page printed, so the two cannot disagree and a refused week posts
+nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
+the first tick at or after 9 AM Toronto time on the Monday after the week ends,
+through the poster's app identity and token, and records the week in
+`weekly-chat-state.json` beside `data.json`, so later ticks and re-runs post
+nothing more for that week. The week is recorded before the post, so it goes
+out at most once: a Monday missed (a refused render, a state object it cannot
+read or write) is retried each tick until the week rolls over at 00:00 UTC
+Monday (Sunday evening in Toronto), but a post that fails after the record is
+written is not: the step logs an error and that week's summary is missed
+(deleting `weekly-chat-state.json` posts it on the next tick). `CI_HEALTH_MUTE=true`
+skips it and records nothing; a state object it cannot read posts nothing that
+tick.
+
 Locally,
-`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html`
-renders against any downloaded pair (it reads the issues with `gh`).
+`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html --chat-out weekly-chat.json`
+renders against any downloaded pair (it reads the issues with `gh`), and
+`python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
+prints the post.
 
 ## The seeded-fleet scan
 
@@ -1087,7 +1242,15 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing) — and the
+applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+keyed on its assertion rather than its role, the Chat message and the health box's advice say
+so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
+24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
+to retest after, and a `version-laggard` line reading `not_ahead_of_channel` with "newer than
+every", a master ahead of its channel, clears when REGULAR ships a newer patch of the minor `seeded_b_pin.py` holds, or sooner when seeded-b is
+re-created under a lease; one ordinary drift line beside them keeps the re-apply advice, the
+issue lists both as exceptions, and a hand run of `hack/fleet_reconcile.py --drifted` skips a
+project whose only drift is these) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
 them healthy; the bot closes it when the condition clears." An open issue that already names
@@ -1273,7 +1436,8 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_SA` override them. The off switch is the repository variable
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
-step on pull requests is skipped, the nightly bug filer runs dry, and the refresh, the verdict and the
+step on pull requests and the weekly summary are skipped, the nightly bug
+filer and the coverage-gap filer run dry, and the refresh, the verdict and the
 `health.json` upload carry on. It exits before writing `health-state.json`
 too, so what the poster remembers stands still while muted: an alert already
 sent stays sent. The dashboard is unaffected — the pool episode's start rides
