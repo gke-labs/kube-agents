@@ -545,8 +545,8 @@ def _cmd_case(args: argparse.Namespace) -> int:
         if counts:
             partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
             print(f"  rep {rep.index} tokens: {counts}{partial}")
-        # The agent's own words, one line under the grading line of every
-        # repetition that did not pass, so the dashboard can quote the report
+        # The agent's own words, one line under the grading line (after the
+        # timing and tokens lines) of every repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty
         # report (a transport failure's, typically) prints nothing rather
         # than an empty line. Its own shape -- `rep N report:` -- so nothing

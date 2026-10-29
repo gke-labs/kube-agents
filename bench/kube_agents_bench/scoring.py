@@ -620,8 +620,13 @@ def token_count(value: Any) -> int | None:
 def _tokens_partial(tokens: dict[str, Any]) -> bool:
     """Whether the record's counts are short of what the run billed: the
     inject transport could not read a link of the chain (``usage_partial``),
-    or a delegated worker's session reported no counts (``workers.unbilled``).
+    a delegated worker's session reported no counts (``workers.unbilled``),
+    or the run delegated and no worker could be billed (``workers`` null:
+    the pod read failed, or every session was unbilled), so nothing of the
+    workers' is in ``total``. A run that delegated nothing has no ``workers``.
     """
+    if "workers" in tokens and tokens["workers"] is None:
+        return True
     workers = tokens.get("workers")
     unbilled = workers.get("unbilled") if isinstance(workers, dict) else None
     return tokens.get("usage_partial") is True or bool(unbilled)

@@ -403,7 +403,7 @@ _API_TOKENS = {
 }
 _INJECT_TOKENS = {
     "input": 60468, "cached": None, "cache_write": None, "reasoning": None, "output": 79,
-    "total": 91969, "children": {"input": 91204, "output": 218, "total": 91422},
+    "total": 151969, "children": {"input": 91204, "output": 218, "total": 91422},
 }
 
 
@@ -411,16 +411,17 @@ _INJECT_TOKENS = {
     ("tokens", "expected"),
     [
         (_API_TOKENS, TOKENS_PREFIX + "input=18 output=1867 total=275153"),
-        (_INJECT_TOKENS, TOKENS_PREFIX + "input=60468 output=79 total=91969"),
-        ({**_INJECT_TOKENS, "usage_partial": True}, TOKENS_PREFIX + "input=60468 output=79 total=91969 partial=1"),
+        (_INJECT_TOKENS, TOKENS_PREFIX + "input=60468 output=79 total=151969"),
+        ({**_INJECT_TOKENS, "usage_partial": True}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         (
             {**_API_TOKENS, "workers": {**_API_TOKENS["workers"], "unbilled": [{"session": "s1"}]}},
             TOKENS_PREFIX + "input=18 output=1867 total=275153 partial=1",
         ),
+        ({**_INJECT_TOKENS, "workers": None}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         ({"input": None, "output": 0, "total": 0}, TOKENS_PREFIX + "output=0 total=0"),
         ({"input": True, "output": 1.5, "total": 40}, TOKENS_PREFIX + "total=40"),
     ],
-    ids=["api", "inject", "inject-partial", "unbilled-worker", "zero-is-a-count", "non-counts-left-out"],
+    ids=["api", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
 )
 def test_the_tokens_line_follows_the_timing_line(kanban_task, make_run, tmp_path, capsys, tokens, expected):
     """The dashboard reads each repetition's token counts from `rep N

@@ -480,7 +480,8 @@ _REP_TIMING_KEYS = ("agent_s", "turn1_s")
 # printed by `bench-gate case` with each count the record carried
 # (results.json's top-level `tokens.input`, `tokens.output`, `tokens.total`),
 # plus `partial=1` when the record says the counts are short (the inject
-# transport's `tokens.usage_partial`, or a worker in `tokens.workers.unbilled`).
+# transport's `tokens.usage_partial`, a worker in `tokens.workers.unbilled`,
+# or `tokens.workers` null: the run delegated and no worker was billed).
 # Its own shape, `rep N tokens:`, so `_REP_LINE` never matches it.
 #   rep 2 tokens: input=60468 output=79 total=60547 partial=1
 _REP_TOKENS_LINE = re.compile(r"^\s+rep (?P<n>\d+) tokens: (?P<fields>.*)$")

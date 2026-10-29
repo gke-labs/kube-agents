@@ -187,8 +187,9 @@ layout and are collected from the moment they start running.
       dump stripped, truncated to 300 chars. `null` for passing reps and
       when nothing remains.
     - `excerpt` — **optional, additive**: the agent's own words — the text
-      of the `rep N report: <text>` line `bench-gate case` prints right
-      under the grading line of a repetition that did not pass (since
+      of the `rep N report: <text>` line `bench-gate case` prints under the
+      grading line of a repetition that did not pass, after its timing and
+      tokens lines (since
       2026-09-15): the first 300 characters of the agent's final report
       (`results.json`'s `output`, the "Actual Output" the judge grades),
       whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
@@ -211,7 +212,8 @@ layout and are collected from the moment they start running.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
-      right under the grading line (before any `rep N report:` line), one
+      right under the grading line (before any `rep N tokens:` or
+      `rep N report:` line), one
       decimal each. `agent_s`
       is the agent run's wall clock (`results.json`'s `latency`, which
       devops-bench takes around the harness run: the delegation wait is in
@@ -244,8 +246,10 @@ layout and are collected from the moment they start running.
       transport they are the front door's turns alone and `input` counts
       cached reads. `partial` is true when the record says its counts are
       short: the inject transport could not read a link of the chain
-      (`tokens.usage_partial`), or a worker session reported no counts
-      (`tokens.workers.unbilled`). A count the line did not carry, or one
+      (`tokens.usage_partial`), a worker session reported no counts
+      (`tokens.workers.unbilled`), or the run delegated work whose workers
+      could not be billed at all (`tokens.workers` null), so `total` is the
+      front door's alone. A count the line did not carry, or one
       that is not a whole number at or above zero, is `null`; zero is a
       count. The collector consumes the line whole, like the timing line.
       The key is **absent** when the line carried no count, when the log has
