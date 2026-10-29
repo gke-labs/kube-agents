@@ -99,14 +99,16 @@ EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while its first sighting is this
 # recent: the longest part's budget is 12 hours (oss-test-infra: timeout
-# 12h on the main and main-b parts) and Prow needs a little longer to write
-# finished.json after ending the job. Past that the build is a pod that died
-# without uploading, which the collector keeps on pending_builds for two
-# days; it is not a running night.
-RUNNING_MAX_AGE = datetime.timedelta(hours=13)
+# 12h on the main and main-b parts), plus Prow's 5-minute grace and one
+# 15-minute collector tick to record finished.json. Past that the build is a
+# pod that died without uploading, which the collector keeps on
+# pending_builds for two days; it is not a running night. Keep it under
+# 12h30m: the summer digest reads a 00:00 UTC night at 12h30m-12h45m, and
+# must see a dead one as missing, not still running.
+RUNNING_MAX_AGE = datetime.timedelta(hours=12, minutes=20)
 # A night whose start is older than this when the digest goes out is not
-# "last night": the 8 PM ET run starts 13 hours before the 9 AM digest (and
-# may still be running then, under its 12-hour budget); 36 hours tolerates one
+# "last night": the 8 PM ET run starts 13 hours before the 9 AM digest, so
+# its 12-hour budget has ended by then; 36 hours tolerates one
 # late or re-run night without reading the night before as last night.
 LAST_NIGHT_MAX_AGE = datetime.timedelta(hours=36)
 # A nightly build is dated by its start plus this. Both periodics start at
