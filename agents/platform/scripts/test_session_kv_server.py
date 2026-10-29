@@ -2985,6 +2985,55 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
     SESSION = "evt-Prod_us/OOM:42"
     ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
     OFF_FOOTER = "A human reads your options and the agent that holds the GitOps write path opens the Pull Request"
+    ONE_PARENT = "- `parents`: a list holding the one card id call 1 returned, so this card waits for the diagnosis.\n"
+    SIBLING = "t_0a43cf9c"
+
+    def setUp(self):
+        # The front door reads the board for a live same-branch card; by
+        # default the class has none, so every test below starts from the
+        # single-parent prompt and the sibling tests build a board on demand.
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.board = Path(self._tmpdir.name) / "kanban.db"
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.board))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def branch(self):
+        return session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+
+    def card(self, task_id, status, *, branch=None, title=None, created_at=1.0, body=None):
+        """A row shaped like Hermes' `tasks` table for a pull-request card."""
+        branch = self.branch() if branch is None else branch
+        if body is None:
+            body = session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION).replace(self.branch(), branch)
+        if title is None:
+            title = "Open GitOps PR for test-ns/Pod/test-pod (OOMKilled) on prod-us-central1"
+        return (task_id, title, body, "platform", status, created_at)
+
+    def make_board(self, *cards):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY, title TEXT, body TEXT, assignee TEXT, status TEXT,
+                    priority INTEGER, session_id TEXT, created_at REAL, started_at REAL,
+                    completed_at REAL, last_heartbeat_at REAL, result TEXT, last_failure_error TEXT,
+                    worker_pid INTEGER, claim_lock TEXT
+                );
+                CREATE TABLE IF NOT EXISTS task_links (parent_id TEXT, child_id TEXT);
+                """
+            )
+            conn.executemany(
+                "INSERT INTO tasks (id, title, body, assignee, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                cards,
+            )
+
+    def parents_line(self, query):
+        call_2 = query.split("**Call 2 — the Pull Request, after call 1 returns.**", 1)[1]
+        return next(line for line in call_2.splitlines() if line.startswith("- `parents`:")) + "\n"
 
     def query(self, value):
         env = {self.ENV: value} if value is not None else {}
@@ -3123,10 +3172,19 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         )
         self.assertNotIn("ArgoCD", body)
         self.assertNotIn("unapplied Terraform", body)
-        self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
+        # The worker has no `kanban_list` (Hermes registers it for orchestrators
+        # only; deploy/docker/patches/verify_kanban_worker_tools.py pins that),
+        # so the card neither asks it to check the board nor to judge a copy
+        # stale and `--force` past it: the one mention of the flag forbids it.
+        self.assertNotIn("kanban_list", body)
+        self.assertNotIn("re-run `prepare` once with `--force`", body)
+        self.assertNotIn("re-run with --force", body)
+        self.assertEqual(body.count("--force"), 1, body)
+        self.assertIn("do not re-run it and never pass `--force`", body)
+        self.assertIn("Complete this card with the refusal quoted in `result`", body)
+        self.assertIn("removed after its TTL (`reap_stale_copies`)", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
-        self.assertIn("`Publish it, or re-run with --force to replace it.`", body)
         self.assertNotIn("with uncommitted work on branch", body)
         import vcs_client
         with tempfile.TemporaryDirectory() as tmp:
@@ -3140,10 +3198,104 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                     vcs_client._refuse_to_discard(dest, force=False)
         self.assertTrue(str(refused.exception).startswith(f"there is already a copy at {dest} with "))
         self.assertTrue(str(refused.exception).endswith("Publish it, or re-run with --force to replace it."))
-        self.assertIn("`kanban_show` this card's parent", body)
-        self.assertIn("If the parent card has no report (`result` is empty or its `status` is not `done`)", body)
+        self.assertIn("This card has one or two parents; `kanban_show` each", body)
+        self.assertIn("A second parent titled `Open GitOps PR for ...`", body)
+        self.assertIn("if its `result` names a Pull Request, that is the one you revise rather than opening a second", body)
+        self.assertIn("If the triage parent has no report (`result` is empty or its `status` is not `done`)", body)
         self.assertIn("Never change the live cluster directly", body)
         self.assertIn("open nothing", body)
+        import vcs_client
+        self.assertTrue(callable(vcs_client.reap_stale_copies))
+        self.assertGreater(vcs_client.COPY_TTL_HOURS, 0)
+
+    def test_without_a_live_sibling_call_2_has_the_one_parent(self):
+        self.assertFalse(self.board.exists())
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+        self.assertEqual(session_kv_server._live_pull_request_sibling(""), "")
+
+    def test_a_live_sibling_on_the_branch_is_a_second_parent(self):
+        # A pull-request card the dispatcher has not settled (`_parents_satisfied`
+        # promotes a child only once every parent is done or archived) still
+        # owns the branch's checkout, whichever of its live statuses it is in.
+        for status in ("todo", "running", "blocked"):
+            with self.subTest(status=status):
+                if self.board.exists():
+                    self.board.unlink()
+                self.make_board(self.card(self.SIBLING, status))
+                self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), self.SIBLING)
+                query = self.query("true")
+                line = self.parents_line(query)
+                self.assertNotEqual(line, self.ONE_PARENT)
+                self.assertIn("a list of two card ids, in this order: the card id call 1 returned", line)
+                self.assertIn(f"and `{self.SIBLING}`, a card already opening a Pull Request on this incident's branch", line)
+                self.assertIn("starts only after that one has finished", line)
+                # The two bodies between the markers are unchanged: only the routing line names the sibling.
+                pr = query.split("--- BEGIN PULL REQUEST TASK BODY (copy verbatim) ---\n", 1)[1]
+                pr = pr.split("\n--- END PULL REQUEST TASK BODY ---", 1)[0]
+                self.assertEqual(pr, session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
+                self.assertEqual(query.count(self.SIBLING), 1)
+
+    def test_a_settled_or_unrelated_card_leaves_the_one_parent(self):
+        other_branch = session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": "other-pod"})
+        self.make_board(
+            self.card("t_11111111", "done"),
+            self.card("t_22222222", "archived"),
+            self.card("t_33333333", "running", branch=other_branch),
+            self.card("t_44444444", "running", title="Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1"),
+            self.card("t_55555555", "running", body=""),
+            ("t_66666666", "Open GitOps PR for x", None, "platform", "running", 9.0),
+        )
+        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertEqual(session_kv_server._live_pull_request_sibling(other_branch), "t_33333333")
+
+    def test_the_newest_live_sibling_is_the_parent(self):
+        self.make_board(
+            self.card("t_aaaaaaaa", "running", created_at=10.0),
+            self.card("t_bbbbbbbb", "todo", created_at=20.0),
+            self.card("t_cccccccc", "done", created_at=30.0),
+        )
+        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "t_bbbbbbbb")
+
+    def test_a_malformed_card_id_is_kept_out_of_the_prompt(self):
+        for bad in ("t_../../etc", "T_0A43CF9C", "t_0a43cf9", "x_0a43cf9c", "t_0a43cf9c`; drop", "t_" + "f" * 33):
+            with self.subTest(id=bad):
+                if self.board.exists():
+                    self.board.unlink()
+                self.make_board(self.card(bad, "running"))
+                with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                    self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+                self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
+                self.assertFalse(any(bad in line for line in logs.output), logs.output)
+                self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+
+    def test_an_unreadable_board_fails_open_to_the_one_parent(self):
+        import sqlite3
+
+        # A board without the tasks table: the read raises and the lookup logs instead of raising.
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("CREATE TABLE other (id TEXT)")
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+        self.assertTrue(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        # A locked board past the busy timeout.
+        self.board.unlink()
+        self.make_board(self.card(self.SIBLING, "running"))
+        holder = sqlite3.connect(self.board, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN EXCLUSIVE")
+        with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+            self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        holder.execute("ROLLBACK")
+        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), self.SIBLING)
+        # The board path itself cannot be resolved.
+        with patch.object(session_kv_server, "_kanban_db_path", side_effect=RuntimeError("no home")):
+            with self.assertLogs(session_kv_server.logger, level="WARNING"):
+                self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
 
     def test_the_branch_is_stable_and_one_safe_segment(self):
         first = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
