@@ -2650,6 +2650,9 @@ AGENT_API_SESSION_ID_MAX_LEN = 256
 # More distinct short top-level strings than this in one body are refused
 # rather than checked one by one. No caller of the door sends more than a few.
 AGENT_API_MAX_CHECKED_BODY_STRINGS = 256
+# Free-text request-body keys: the agent API reads a message or instructions
+# from these, never a session id, so the generic check skips them.
+AGENT_API_FREE_TEXT_BODY_KEYS = ("message", "input", "instructions")
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -2917,6 +2920,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                         value
                         for key, value in parsed.items()
                         if key not in AGENT_API_SESSION_BODY_KEYS
+                        and key not in AGENT_API_FREE_TEXT_BODY_KEYS
                         and isinstance(value, str)
                         and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
                     }

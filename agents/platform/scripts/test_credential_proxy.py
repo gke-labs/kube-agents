@@ -348,6 +348,9 @@ class AgentAPIProxyTest(unittest.TestCase):
             ("/api/sessions", {"id": "web-console-abc", "title": "Web console abc"}),
             ("/v1/responses", {"conversation": "run-42", "input": "status of a2a-ctx-body?"}),
             ("/v1/responses", {"input": "a2a-" + "x" * 300}),
+            ("/api/sessions/web-console-abc/chat", {"message": "a2a-x"}),
+            ("/v1/responses", {"input": "a2a-x"}),
+            ("/v1/responses", {"input": "hi", "instructions": "A2A-x"}),
             ("/v1/runs", {"session_id": "plain", "input": "hi", "stream": True, "limit": 3}),
         ):
             with self.subTest(path=path, body=body):
