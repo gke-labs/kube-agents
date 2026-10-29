@@ -25,7 +25,10 @@ means no coercion: `critical: yes` is a string, not a boolean, and fails validat
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
 `fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
-exactly why `scripts/validate_bench_cases.py` exists.
+exactly why `scripts/validate_bench_cases.py` exists. A new one is added to `REPOSITORY_CASE_KEYS` in
+`bench/kube_agents_bench/cases.py` before any case a pull-request job grades uses it; the comment above
+that set says how, and a module in that package that reads one key of its own names it `KEY` at module
+level, so `bench/tests/test_cases.py` holds the set to it on the reader's own pull request.
 
 ## The id key
 

@@ -71,7 +71,12 @@ __all__ = [
 #   ``task_version``, a case's own revision note that nothing reads. A new one
 #   is added here, in a pull request before any case a pull-request job grades
 #   uses it (the presubmit roster, or a lane list such as
-#   hack/eval/gitlab-cases.txt).
+#   hack/eval/gitlab-cases.txt). A module in this package that reads one key
+#   of its own (audit_streams.py, scope_exclude.py) names it ``KEY`` at module
+#   level, one string: tests/test_cases.py imports every module here and holds
+#   this set to those, so the reader's own pull request goes red when its key
+#   is missing, before any case carries it. A key read as a literal, the way
+#   load_case reads ``expected_fail``, is held only by the shipped-task sweep.
 _DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
 _DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
 DEVOPS_BENCH_CASE_KEYS = (

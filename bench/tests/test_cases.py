@@ -83,18 +83,25 @@ def test_the_case_keys_are_devops_benchs_fields_and_aliases_plus_ours():
 
 
 def test_every_reader_modules_key_is_a_repository_case_key():
-    """A reader module declares the top-level key it reads as ``KEY``
-    (``audit_streams``, ``scope_exclude``); REPOSITORY_CASE_KEYS restates each
-    by hand. The shipped-task sweep catches a missing one only once a case in
-    the tree carries it, which is after main is red; this holds the set to the
-    readers without a case."""
+    """A module in ``kube_agents_bench`` that reads one top-level key of its
+    own names it ``KEY`` at module level, one string (``audit_streams``,
+    ``scope_exclude``; the convention is written above REPOSITORY_CASE_KEYS,
+    which restates each by hand). The shipped-task sweep catches a missing one
+    only once a case in the tree carries it, which is after main is red; this
+    holds the set to the readers without a case. It reaches a reader that
+    follows the convention and no other: a key read as a literal, the way
+    ``load_case`` reads ``expected_fail``, is the sweep's. A ``KEY`` that is
+    not one string fails here rather than being skipped, and subpackages are
+    walked, so neither shape hides a reader."""
     import kube_agents_bench
 
     found = {}
-    for module in pkgutil.iter_modules(kube_agents_bench.__path__):
-        key = getattr(importlib.import_module(f"kube_agents_bench.{module.name}"), "KEY", None)
-        if isinstance(key, str):
-            found[module.name] = key
+    for module in pkgutil.walk_packages(kube_agents_bench.__path__, prefix=f"{kube_agents_bench.__name__}."):
+        key = getattr(importlib.import_module(module.name), "KEY", None)
+        if key is None:
+            continue
+        assert isinstance(key, str), f"{module.name}: KEY is {key!r}; a reader names one top-level key as a string"
+        found[module.name] = key
     assert found, "no reader module declares KEY; the sweep is vacuous"
     assert set(found.values()) <= REPOSITORY_CASE_KEYS, {
         name: key for name, key in found.items() if key not in REPOSITORY_CASE_KEYS
