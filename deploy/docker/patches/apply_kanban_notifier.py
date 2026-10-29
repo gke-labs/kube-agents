@@ -109,11 +109,13 @@ WAKE_TRY_INDENT = " " * 16
 #
 # ``wake_handoff`` is upstream's name for the clipped string it keeps for the
 # synthetic wake turn (#70752); v2026.9.14 derives ``handoff`` from it rather
-# than the other way round. It is carried through unchanged, which means the
-# wake turn inherits the un-severed clip for free — a strict improvement on the
-# hard slice, and the most this patch should do to it. The full report is
-# deliberately NOT handed to the wake turn: it goes on the delivered message,
-# below, where a human reads it. See section 1 of gateway/kanban_notifier.py.
+# than the other way round. On push adapters with ``send_passive=True``, the
+# full report goes on the delivered message and ``wake_handoff`` stays the
+# un-severed clip; on the two paths where ``_send_pings`` skips the passive
+# message (non-push adapters like ``api_server``, and ``delivery_mode="wake"``
+# subscriptions), ``_kanban_wake_handoff_with_result`` promotes the enriched
+# ``handoff`` into ``wake_handoff`` so the wake turn — the sole delivery there
+# — does not drop ``task.result``. See section 2 of gateway/kanban_notifier.py.
 
 HANDOFF_ANCHOR = (
     f"{HANDOFF_INDENT}if payload_summary:\n"
@@ -137,6 +139,7 @@ HANDOFF_PATCHED = (
     f"{HANDOFF_INDENT}    wake_handoff = _clip_handoff(n.task.result)\n"
     f'{HANDOFF_INDENT}handoff = f"\\n{{wake_handoff}}" if wake_handoff is not None else ""\n'
     f"{HANDOFF_INDENT}handoff = _kanban_handoff_with_result(handoff, n.task)\n"
+    f"{HANDOFF_INDENT}wake_handoff = _kanban_wake_handoff_with_result(wake_handoff, handoff, n)\n"
 )
 
 # --- Anchor 2: the wake set ---------------------------------------------------
@@ -355,6 +358,7 @@ TRAILER = (
     "    note_suppressed_completion as _kanban_note_suppressed,\n"
     "    store_incident_report as _kanban_store_incident,\n"
     "    tell_unexplained as _kanban_tell_unexplained,\n"
+    "    wake_handoff_with_result as _kanban_wake_handoff_with_result,\n"
     "    wake_kinds_for as _wake_kinds_for,\n"
     ")\n"
 )

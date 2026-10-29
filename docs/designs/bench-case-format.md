@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional` and `audit_streams`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -140,6 +140,22 @@ releases them when devops-bench returns. A run that outlasts the unit is covered
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
+
+`scope_exclude` is for a case whose precondition is an install that leaves some seeded
+clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
+cluster names, so the case runs unchanged on every pool project. The runner
+(`hack/ci-eval-pr.sh`, `scope_exclude_apply`) runs the case's repetitions alone, after every
+other unit, because a scope edit rolls the gateway and the Cluster Agent reconcile deletes an
+excluded cluster's profile. Before them it adds each slot's cluster, read from the fleet's
+`.fleet-context`, to the PlatformAgent's `spec.scope.exclude.clusters`, waits until the pod
+reads the new scope, and runs the reconcile once. After them it puts the scope back and runs the
+reconcile again to re-create the profiles. A CR that had no scope block first gets a block that
+excludes nothing, and loses it only after a reconcile has run under that block: the reconcile
+reads a missing block as "keep the last exclusions". The scope it replaced is saved on the CR
+(`bench/kube_agents_bench/scope_exclude.py`), so the EXIT trap and the next lease can restore it
+after a run that died first; the annotation stays until a reconcile has run under the restored scope. A repetition whose exclusion did not take effect is recorded as
+infrastructure. The validator refuses a slot the catalogue does not declare and a list that
+excludes every slot. devops-bench ignores the key.
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
@@ -547,7 +563,8 @@ case that declares no `fixtures:` at all, a missing, empty or inline `verificati
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
-does not have, a case that is registered nowhere, and a file that writes one key twice in
+does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
+`bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`

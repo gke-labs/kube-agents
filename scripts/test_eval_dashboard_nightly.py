@@ -199,7 +199,7 @@ class NightDocumentTest(unittest.TestCase):
         data["pending_builds"] = [
             {"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
             {"build_id": "3000000000000000004", "first_seen": "2026-09-08T14:10:00+00:00"},  # the presubmit's
-            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13 h ago
+            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13.5 h ago
             {"build_id": "bogus", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
         ]
         now = datetime.datetime.fromisoformat(NOW)
@@ -282,11 +282,29 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
         # A last night on record outranks a build in flight: the numbers are there.
         self.assertIn("newly failing: case-b", self.line(data))
-        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=10)).isoformat()
+        # These IDs are not snowflakes, so the first sighting dates the start.
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=20)).isoformat()
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "past its 12-hour budget, inside the upload slack: still running")
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=31)).isoformat()
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "past the budget: not running")
         self.assertEqual(self.line({"runs": [], "cases": []}), "🌙 Nightly: no run on record yet")
         self.assertEqual(self.line({}), "🌙 Nightly: no data.json to read a night from")
         self.assertEqual(self.line(None), "🌙 Nightly: no data.json to read a night from")
+
+    def test_a_night_is_aged_from_its_build_start_not_its_first_sighting(self):
+        data = two_nights()
+        started = datetime.datetime(2026, 9, 10, 0, 0, 59, tzinfo=UTC)  # Wed 8:00 PM ET
+        build = str((int(started.timestamp() * 1000) - nightly.PROW_BUILD_ID_EPOCH_MS) << nightly.PROW_BUILD_ID_TIME_SHIFT)
+        self.assertEqual(nightly.build_started(build, started + datetime.timedelta(hours=1)), started)
+        self.assertEqual(nightly.build_started("9" * 40, started), started, "not a snowflake: the first sighting")
+        self.assertEqual(nightly.build_started("1234", started), started, "not a snowflake: the first sighting")
+        # First seen 40 minutes late, as the collector's late cron does.
+        data["pending_builds"] = [{"build_id": build, "first_seen": (started + datetime.timedelta(minutes=40)).isoformat(), "tier": "nightly"}]
+        self.assertEqual(self.line(data, started + datetime.timedelta(hours=12, minutes=25)), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "cut at its deadline, not yet recorded: still running")
+        # The summer digest window opens at 12:40 UTC; a night pending then died
+        # without uploading, though first seen only 12 hours before.
+        digest = datetime.datetime(2026, 9, 10, 12, 41, tzinfo=UTC)
+        self.assertEqual(self.line(data, digest), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "dead at the digest: not running")
 
     def test_the_nights_turn1_percentiles_are_advice_beside_the_target(self):
         data = two_nights()

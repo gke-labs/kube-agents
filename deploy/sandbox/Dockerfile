@@ -622,6 +622,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/credential_shapes.py \
      agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
+     agents/platform/scripts/collector_run.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \

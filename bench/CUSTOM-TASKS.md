@@ -233,6 +233,10 @@ A task whose stack starts real audit runs lists them in a top-level `audit_strea
 the runner holds those streams' locks while it runs; see
 [bench-case-format.md](../docs/designs/bench-case-format.md).
 
+A task whose precondition is an install that leaves some seeded clusters out of its scope
+declares `scope_exclude: {slots: [...]}`, and the runner excludes those slots' clusters for its
+repetitions alone; see [bench-case-format.md](../docs/designs/bench-case-format.md).
+
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
 eval-driven-development marker for a gap whose fix is not yours to make — land the case red and
@@ -771,8 +775,8 @@ the workers' calls, read back from the pod, are what name a write there. A write
 in the record and the reason, not charged, so one late write fails the case that named it rather
 than every case running at the time; a write no repetition names fails none, and the job log's
 leftovers listing still names it. The script also runs the cases that request a pull request
-(the same leaf count as the allowance) in a second phase, after every other unit has finished,
-one unit at a time, each after a settle as long as the check's clock-skew tolerance, so no window
+(the same leaf count as the allowance) in a second phase, after every first-phase unit has
+finished (a case that declares `scope_exclude:` runs after them, in a phase of its own), one unit at a time, each after a settle as long as the check's clock-skew tolerance, so no window
 reaches back into the unit before. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
 each is allowed the pull requests its own reply names. A pull request that was only

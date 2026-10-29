@@ -7,6 +7,8 @@ sidebar:
 
 A **Cluster Agent** is a read-only SRE scoped to exactly one GKE cluster. It is a Hermes profile (`cluster-<project>-<cluster>-<location>`, sanitized to 63 characters) that the [Platform Agent](/kube-agents/concepts/platform-agent/) scaffolds at runtime inside its own pod — one per managed cluster, persisting on the data volume until that cluster is deleted. `SOUL.md §6` makes delegation the default: work scoped to a single cluster's live runtime (crash loops, OOMs, scheduling failures, mount errors, connectivity, autoscaling, storage, observability gaps) belongs to that cluster's Cluster Agent, while fleet-wide audits, provisioning, and the GitOps write path stay with the Platform Agent.
 
+That profile is a directory under `$HERMES_HOME/profiles` in the `<name>-gateway` pod, not an [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) resource (`apr`), which describes a separate agent pod on the `spec.mode: next` bus; `kubectl get apr` lists no Cluster Agents.
+
 ## Scoped by construction
 
 Each profile is stamped from the [`agents/cluster/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster) template (baked into the image at `/opt/cluster-template`) by [`cluster_agent_profile.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/cluster_agent_profile.py):

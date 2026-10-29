@@ -598,10 +598,11 @@ The two labels are the two people:
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root,
   [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
-  [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
-  and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
+  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/ci-eval-pr.sh` with the files that run inside it
+  ([`docs/eval-gate-roster.md`](eval-gate-roster.md) lists them; one is under `scripts/installer/OWNERS`), with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
-  to what the presubmit runs or what blocks; the nightly file and the case directories under
+  to what the presubmit runs, what blocks, or what grades it; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
@@ -617,8 +618,8 @@ between them by what the author's own approval already covers (#1075): an approv
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
-settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt` and
-`hack/eval/blocking-roster.txt` entries send a change there to its own `eval-crew` group, so the
+settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt`,
+`hack/eval/blocking-roster.txt` and grader-pin entries send a change there to its own `eval-crew` group, so the
 reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
 member is a root approver, so a change that also touches root-owned paths still waits on a root
 approver's `/approve` after that review. The bot never requests the author, so a member's own case
@@ -726,6 +727,11 @@ kind of verdict, so a run after an override reuses it in seconds. The reused run
 ordinary `Job succeeded.`; the `/override` comment, the build log's `REVALIDATED` line and a key the
 run leaves in its `finished.json` metadata are the record that it was one, and step 0 reads the key
 so that such a run is never itself taken for a green.
+
+The smoke grades a pull request with `main`'s grader: `bench/` at the commit the change was merged
+onto, with the change's own `bench/tasks/`, and the verdict's `Graded by` line names that commit
+([`testing-strategy.md`](designs/testing-strategy.md#pinning-and-baselines) has the rule for a
+case that needs a grader change).
 
 Do not post `/test pull-kube-agents-smoke-test` on an approved pull request whose `Smoke gate` is
 green, above all one in the merge queue. The run posts a pending smoke status, and if the queue's

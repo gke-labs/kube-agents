@@ -322,7 +322,9 @@ name — is refused at admission, and stripped from the render on an install run
 A2A surface, because a volume hands a second container far more than the `bridge`
 principal's one password. `<agent>-a2a-nats-creds` and the `nats.conf` in
 `<agent>-a2a-nats-config` both carry `sys-password`, which is the `$SYS` account, and
-`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The
+`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The same
+refusal covers the other three Secrets the bus renders with a key in them:
+`<agent>-a2a-nats-tls`, `<agent>-a2a-nats-ca` and `<agent>-a2a-task-signing-key`. The
 agent's own credential is in none of them: under the callout the `agent` principal has
 no shared secret at all, and the `a2a-bus` audience projection is the only route to it
 as a credential. The seed is a way to mint one, which is the other reason that Secret is

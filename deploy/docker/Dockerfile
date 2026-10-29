@@ -646,6 +646,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -q "wake_handoff = _clip_handoff(payload_summary)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q "wake_handoff = _clip_handoff(n.task.result)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q "handoff = _kanban_handoff_with_result(handoff, n.task)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q "wake_handoff = _kanban_wake_handoff_with_result(wake_handoff, handoff, n)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'if self.wake_agent' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF 'wake_configured=self.wake_agent,' /opt/hermes/gateway/kanban_watchers_notifier.py && \

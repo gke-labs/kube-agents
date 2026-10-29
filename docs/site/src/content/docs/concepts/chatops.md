@@ -181,7 +181,15 @@ A sender the allowlist does not admit gets one notice, once per sender until the
 
 ### What a task looks like
 
-On Slack the gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. Elsewhere, each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed by the agent's latest progress note (on Google Chat only with `googleChat.mode: debug`). The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer.
+#### On Slack
+
+The gateway posts no status line: Working… on the thread, the reaction on your message and the plan of the agent's cards show where the task is, and a task whose submission never reached the gateway's bus posts `❌ could not reach the bus; try again`. A card the agent files while answering posts each progress note as a message of its own, and then its report, into the thread. The answer posts as a message of its own.
+
+#### On Google Chat and the A2A console
+
+Each turn that becomes a task posts a status line, `⏳ submitted…`, which the gateway edits as the task moves: `⚙️ **working**`, followed by the agent's latest progress note. On Google Chat the note shows only with `googleChat.mode: debug`, and that setting also governs the console when the gateway holds Google Chat. A gateway without Google Chat (Slack, or no chat backend) is rendered no mode, so its console always shows the note.
+
+The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer.
 
 ### Follow-ups while a task runs
 
@@ -413,13 +421,13 @@ The job fires every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agents
 
 ## What's not here
 
-- **No user-facing web UI by default.** Chat is the primary surface. The install can run two web UIs, both off by default. The [web console](/kube-agents/deploy/web-console/) is a browser page, reached only through `kubectl port-forward`. Its threads reach the Planning Agent front door, and its channels show event triage and scheduled checks. The other is the Hermes dashboard, a per-pod debugging view the installer offers as `--enable-hermes-dashboard` (off by default there; the CRD's own default is on) that binds loopback inside the pod, so reaching it means a port-forward or the tunnel script — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine, loopback only; the install does not deploy it.
+- **One browser page by default.** Chat is the primary surface. A `spec.mode: next` install serves the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console), a status page over the bus with a chat pane, reached only through `kubectl port-forward`. Two more are off by default: the [web console](/kube-agents/deploy/web-console/), whose threads reach the Planning Agent front door and whose channels show event triage and scheduled checks, and the Hermes dashboard, a per-pod debugging view the installer offers as `--enable-hermes-dashboard` (the CRD's own default is on) that binds loopback inside the pod. A local [admin console](/kube-agents/reference/admin-console/) runs from a repository checkout on your own machine; the install does not deploy it. [User interfaces](/kube-agents/reference/user-interfaces/) compares them, with the port and the way in for each.
 - **No CLI beyond the Hermes CLI inside the pod.** `kubectl exec` into the agent pod and run the Hermes CLI there — note the pod hosts several profiles, so a bare `hermes` command talks to the locked-down Planning Agent; use `hermes -p platform` to reach the Platform Agent (or `hermes -p <cluster-profile>` for a Cluster Agent). `kubectl port-forward` is not a way in on a GKE Sandbox (gVisor) node pool, which is the install default: the forward is established in the host-side netns and cannot see a listener inside the sandbox — [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#specharness) is canonical on that. `kubectl exec` has no such problem, because it enters the sandbox.
 - **No email, PagerDuty, or generic webhook ingress.** Chat channels only.
 
 ## When no chat platform is enabled
 
-Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. The [web console](/kube-agents/deploy/web-console/) is a browser alternative you turn on with `install.sh --enable-web-console`. Its channels also show event triage and scheduled checks. The Hermes CLI above is the other way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
+Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. On a `spec.mode: next` install the A2A gateway still runs, on its console door alone, so the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console)'s chat pane reaches the Planning Agent with nothing to turn on: `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`, then `http://localhost:8080`. The [web console](/kube-agents/deploy/web-console/) is a browser alternative in either mode, turned on with `install.sh --enable-web-console`; its channels also show event triage and scheduled checks. The Hermes CLI above is another way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
 
 ```bash
 gcloud container clusters get-credentials <cluster> --location <region> --project <project> --dns-endpoint
@@ -430,7 +438,7 @@ Pass `--dns-endpoint` only on a cluster that publishes an externally reachable D
 
 This reaches the Platform Agent directly, bypassing the front door: a request typed here is executed by the profile that receives it rather than being planned and filed as a kanban card. A bare `hermes` reaches the Planning Agent instead, which is where a chat message would have landed and which delegates as described above.
 
-A third way in is the [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be.
+The [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine, is one more: its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be. [User interfaces](/kube-agents/reference/user-interfaces/) compares the browser pages.
 
 Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And the onboarding delivery stage waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume; read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 
