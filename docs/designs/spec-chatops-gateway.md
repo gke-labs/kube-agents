@@ -1588,19 +1588,24 @@ CR, else the record" and the switch that arms the gateway's learn ship as one, s
 signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
 that change merges after the gateway code, never before it. With the switch set, the policy `auto`
-and `homeChannel` empty, the gateway reads the record at boot: a recorded channel is checked again
-with `conversations.info` and adopted, with `reader` re-stamped to the gateway's own image and a stale
-`slack.refused` cleared; one that is shared, archived, not joined, or not a channel id is written to
-`slack.refused` as one of the four words the operator matches, `shared`, `archived`, `not-member` or
-`malformed`, nothing is adopted and the learn is armed, so the first mention that passes replaces the
-channel (one archived after it was learned is the ordinary case); one whose check cannot be made (a
-Slack API error) is adopted in memory for that boot with no re-stamp, so `reader` never claims a check
-that did not happen. An empty record arms the learn: the first verified, top-level channel mention that is not a command, whose
+and `homeChannel` empty, the gateway keeps its home in step with the record while it runs: a first
+pass at start, then one every 30 seconds, and sooner after a pass that failed (2 seconds, doubling to
+30), so a read, a check or a write that failed is tried again rather than logged once, and a record
+edited by hand is acted on within a pass. A pass reads the record; one equal to the state the last
+pass settled (the channel, the refusal beside it, the reader stamp) costs the read alone. Otherwise a
+recorded channel is checked with `conversations.info` and adopted, with `reader` re-stamped to the
+gateway's own image and a stale `slack.refused` cleared; one that is shared, archived, not joined, or
+not a channel id is written to `slack.refused` as one of the four words the operator matches,
+`shared`, `archived`, `not-member` or `malformed`, nothing is adopted and the learn is armed, so the
+first mention that passes replaces the channel (one archived after it was learned is the ordinary
+case); one whose check cannot be made (a Slack API error) is adopted by no pass until a check
+succeeds, so `reader` never claims a check that did not happen and nothing is armed before a read
+and a check succeed. An empty record arms the learn: the first verified, top-level channel mention that is not a command, whose
 channel passes the same check, is written once (`slack`, `slack.setBy`, `slack.setAt`, `writer`,
 `reader`), the gateway's notify route is armed on it, and one line in the learning thread names the
 channel; a candidate the check refuses is written to `slack.refused` while the record names no
 channel and does not name that reason already (a write that fails is tried again at the next
-refusal; while a channel is recorded, `slack.refused` describes it, only the boot check writes it,
+refusal; while a channel is recorded, `slack.refused` describes it, only a reconcile pass writes it,
 and a refused candidate writes nothing) and the next mention may learn; a record another writer
 filled first is adopted after the same check, with `reader` re-stamped, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a

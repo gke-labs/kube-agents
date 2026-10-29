@@ -319,8 +319,9 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 }
 
 // armHomeLearn lets a Slack gateway learn its home channel from the first
-// admitted channel mention and record it (gateway/slack_home_channel.go), when
-// the operator armed it (Config.HomeLearnArmed). The record client is the
+// admitted channel mention, record it and keep its route in step with the
+// record while it runs (gateway/slack_home_channel.go), when the operator
+// armed it (Config.HomeLearnArmed). The record client is the
 // pod's own ServiceAccount, whose Role reaches that one ConfigMap; one that
 // cannot be built leaves the learn off and chat ingress untouched.
 func armHomeLearn(ctx context.Context, cfg *gateway.Config, backend gateway.Adapter, notifier *gateway.Notifier, log *slog.Logger) {
@@ -339,7 +340,7 @@ func armHomeLearn(ctx context.Context, cfg *gateway.Config, backend gateway.Adap
 		return
 	}
 	slack.SetHomeLearner(notifier, cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage)
-	slack.AdoptHomeRecord(ctx)
+	slack.RunHomeReconciler(ctx)
 	log.Info("home channel learn armed", "record", cfg.HomeChannelRecord)
 }
 

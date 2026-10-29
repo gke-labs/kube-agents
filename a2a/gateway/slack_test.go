@@ -64,6 +64,12 @@ type fakeSlackAPI struct {
 	conversations         map[string]*slack.Channel
 	conversationErr       error
 	conversationInfoCalls int
+	// conversationErrs makes the next calls fail before conversations is
+	// consulted: a check that cannot be made for a while. infoHook, when
+	// set, runs before each call takes the lock: a test's chance to act
+	// while a check is in flight.
+	conversationErrs int
+	infoHook         func(channel string)
 	// views records views.publish calls by member.
 	views []publishedView
 }
@@ -112,9 +118,16 @@ func (f *fakeSlackAPI) GetUserInfoContext(_ context.Context, user string, option
 // a conversation it names, conversationErr for one it does not, or a channel
 // the bot is a member of when neither is set.
 func (f *fakeSlackAPI) GetConversationInfoContext(_ context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
+	if f.infoHook != nil {
+		f.infoHook(input.ChannelID)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.conversationInfoCalls++
+	if f.conversationErrs > 0 {
+		f.conversationErrs--
+		return nil, errors.New("ratelimited")
+	}
 	if ch, ok := f.conversations[input.ChannelID]; ok {
 		return ch, nil
 	}
