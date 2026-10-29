@@ -2,6 +2,7 @@ package k8sapiproxy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -20,6 +21,9 @@ const (
 	shellUsername     = "system:serviceaccount:agents:shell"
 	tokenReviewPath   = "/apis/authentication.k8s.io/v1/tokenreviews"
 )
+
+// jsonContent makes the client send JSON, which the fake decodes; it defaults to protobuf.
+var jsonContent = rest.ContentConfig{ContentType: contentTypeJSON}
 
 // fakeTokenReviewServer answers TokenReviews with status and records each request.
 type fakeTokenReviewServer struct {
@@ -72,7 +76,7 @@ func newTestTokenReviewAuthenticator(t *testing.T, fake *fakeTokenReviewServer) 
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 	a, err := NewTokenReviewAuthenticator(TokenReviewConfig{
-		Kubernetes:     &rest.Config{Host: srv.URL, BearerToken: testReviewerToken},
+		Kubernetes:     &rest.Config{Host: srv.URL, BearerToken: testReviewerToken, ContentConfig: jsonContent},
 		Audience:       testAudience,
 		AllowedCallers: []string{shellUsername},
 	})
@@ -151,15 +155,18 @@ func TestTokenReviewAuthenticatorRefuses(t *testing.T) {
 		code   int
 		// authorization replaces the caller's bearer token when set; "-" sends none.
 		authorization string
-		reviews       int
+		// reviews is the TokenReviews after two identical requests: a refusal is cached, a
+		// failed review is not.
+		reviews     int
+		unavailable bool
 	}{
 		{name: "not authenticated", status: func(s *authenticationv1.TokenReviewStatus) {
-			*s = authenticationv1.TokenReviewStatus{Error: "token expired"}
+			s.Authenticated, s.User, s.Error = false, authenticationv1.UserInfo{}, "token expired"
 		}, reviews: 1},
 		{name: "caller not allowed", status: func(s *authenticationv1.TokenReviewStatus) { s.User.Username = "system:serviceaccount:agents:other" }, reviews: 1},
 		{name: "other audience", status: func(s *authenticationv1.TokenReviewStatus) { s.Audiences = []string{"https://kubernetes.default.svc"} }, reviews: 1},
 		{name: "no audience in the review", status: func(s *authenticationv1.TokenReviewStatus) { s.Audiences = nil }, reviews: 1},
-		{name: "review refused", code: http.StatusForbidden, reviews: 1},
+		{name: "review failed", code: http.StatusForbidden, reviews: 2, unavailable: true},
 		{name: "no token", authorization: "-"},
 		{name: "basic scheme", authorization: "Basic dXNlcjpwYXNz"},
 	}
@@ -170,20 +177,25 @@ func TestTokenReviewAuthenticatorRefuses(t *testing.T) {
 				tc.status(&fake.status)
 			}
 			a := newTestTokenReviewAuthenticator(t, fake)
-			r := bearerRequest(testCallerToken)
-			switch tc.authorization {
-			case "":
-			case "-":
-				r.Header.Del("Authorization")
-			default:
-				r.Header.Set("Authorization", tc.authorization)
-			}
-			id, err := a.AuthenticateRequest(r)
-			if err == nil {
-				t.Fatalf("AuthenticateRequest accepted the caller as %+v", id)
-			}
-			if strings.Contains(err.Error(), testCallerToken) {
-				t.Errorf("error %q contains the caller's token", err)
+			for range 2 {
+				r := bearerRequest(testCallerToken)
+				switch tc.authorization {
+				case "":
+				case "-":
+					r.Header.Del("Authorization")
+				default:
+					r.Header.Set("Authorization", tc.authorization)
+				}
+				id, err := a.AuthenticateRequest(r)
+				if err == nil {
+					t.Fatalf("AuthenticateRequest accepted the caller as %+v", id)
+				}
+				if strings.Contains(err.Error(), testCallerToken) {
+					t.Errorf("error %q contains the caller's token", err)
+				}
+				if got := errors.Is(err, errAuthenticationUnavailable); got != tc.unavailable {
+					t.Errorf("error %q: unavailable = %t, want %t", err, got, tc.unavailable)
+				}
 			}
 			if got := fake.calls(); got != tc.reviews {
 				t.Errorf("TokenReviews = %d, want %d", got, tc.reviews)
@@ -203,5 +215,21 @@ func TestHandlerWithTokenReviewAuthenticator(t *testing.T) {
 	}
 	if rec := serve(h, bearerRequest("")); rec.Code != http.StatusUnauthorized {
 		t.Errorf("code without a token = %d, want 401", rec.Code)
+	}
+
+	// A failed review is a 503 that does not name the API server.
+	fake := &fakeTokenReviewServer{code: http.StatusInternalServerError}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	a, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+		Kubernetes: &rest.Config{Host: srv.URL, ContentConfig: jsonContent}, Audience: testAudience, AllowedCallers: []string{shellUsername},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _ = newTestHandler(t, Config{Authenticator: a})
+	rec := serve(h, bearerRequest(testCallerToken))
+	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), srv.Listener.Addr().String()) {
+		t.Errorf("failed review: code %d, body %s", rec.Code, rec.Body.String())
 	}
 }

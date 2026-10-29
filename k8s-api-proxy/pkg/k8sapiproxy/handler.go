@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	authFailedMessage   = messagePrefix + "caller authentication failed"
-	unclassifiedMessage = messagePrefix + "the request path could not be classified"
-	upstreamFailed      = "kube-proxy could not reach cluster %q"
+	authFailedMessage      = messagePrefix + "caller authentication failed"
+	authUnavailableMessage = messagePrefix + "caller authentication is unavailable; retry"
+	unclassifiedMessage    = messagePrefix + "the request path could not be classified"
+	upstreamFailed         = "kube-proxy could not reach cluster %q"
 
 	// flushImmediately streams each upstream write to the caller, which watch and log
 	// follow need.
@@ -163,6 +164,11 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent) 
 	// The authenticator's error goes to the audit event, not to the caller, as the transport's
 	// does: it can describe the proxy's own authentication setup.
 	caller, err := h.authenticator.AuthenticateRequest(r)
+	if errors.Is(err, errAuthenticationUnavailable) {
+		// The cause can name the host API server; it is not the caller's to read.
+		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, authUnavailableMessage)
+		return
+	}
 	if err != nil || caller == nil {
 		ev.Outcome, ev.Err = OutcomeUnauthenticated, err
 		writeStatus(w, http.StatusUnauthorized, metav1.StatusReasonUnauthorized, authFailedMessage)

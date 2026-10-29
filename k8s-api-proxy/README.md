@@ -9,9 +9,10 @@ and the HTTP handler around it (`handler.go`), which authenticates through a plu
 `Sec-WebSocket-Protocol`), impersonation, `Audit-ID` and `Connection`-named headers, and forwards
 through a pluggable `UpstreamTransport`. `NewTokenReviewAuthenticator` (`auth.go`) is the
 `CallerAuthenticator`: it accepts a bearer token that a TokenReview on the host cluster finds
-valid for the proxy's own audience, from a ServiceAccount on an allowlist, and caches each review
-for ten seconds by default. Requiring an audience other than the API server's keeps a token sent to the
-proxy from working against the API server directly. `pkg/upstream` implements the transport, and
+valid for the configured audience, from a username on an allowlist, and caches each acceptance
+or refusal for ten seconds by default. The audience should be one the API server does not accept,
+so a token sent to the proxy cannot be used against the API server directly; the operator picks
+it. A review that fails is a 503 rather than a 401. `pkg/upstream` implements the transport, and
 nothing serves or deploys the handler yet.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
