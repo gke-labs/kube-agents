@@ -31,6 +31,8 @@ FLEET_DECIMALS = 1
 CHART_CONFIG = {"displayModeBar": False}
 # The largest fleet the forecast chart reaches, for the verdict when no line reaches its limit.
 FORECAST_CEILING = "10,000"
+# The resources a container size sets, charted in their own units under the share chart.
+SIZED_METRICS = (hl.MEMORY_PEAK, hl.CPU_PEAK)
 # The readings listed before the rest fold into an expander.
 EVIDENCE_METRICS_SHOWN = 12
 PROFILE_CAPTION = (
@@ -120,6 +122,11 @@ FORECAST_CAPTION = (
     "measured run, each at its own fleet shape and operation (hover one for its size), so they show "
     "the range measured, not this fleet. The shaded range is measured, the rest predicted; dashed "
     "lines mark the example fleets."
+)
+SIZED_CAPTION = (
+    "On the share chart above, every limit is the 100% line, so a larger container size moves the "
+    "lines down. Here the same predictions are in GB and cores, and each dotted line is a container's "
+    "limit at the chosen size: it moves with the size picked at the top and with any edit to it."
 )
 EVIDENCE_STORY = (
     "The runs behind Part 1, read from `{path}`: **{runs:,} runs** on one experiment install, from "
@@ -392,6 +399,28 @@ st.plotly_chart(
     key=f"{KEY_PREFIX}:forecast:{scope}",
 )
 st.caption(FORECAST_CAPTION)
+# The same predictions in their own units, so the chosen container size shows as the limit lines.
+size_columns = st.columns(CHART_COLUMNS)
+for column, metric in zip(size_columns, SIZED_METRICS):
+    spec = hl.metric_spec(metric)
+    with column:
+        st.markdown(f"**{spec.label} at the chosen container size**")
+        st.plotly_chart(
+            breakdown_chart(
+                hl.breakdown_series(records, fleet, limits, metric),
+                spec.label,
+                spec.unit,
+                hl.FLEET_PROFILES,
+                measured,
+                fleet[hl.CLUSTERS],
+                colors,
+                fleet[hl.NODES],
+            ),
+            width="stretch",
+            config=CHART_CONFIG,
+            key=f"{KEY_PREFIX}:sized:{scope}:{metric}",
+        )
+st.caption(SIZED_CAPTION)
 
 # --- Part 2 ---------------------------------------------------------------------------------
 st.divider()

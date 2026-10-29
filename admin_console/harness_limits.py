@@ -200,6 +200,8 @@ NO_VALUE = "—"
 NO_LIMIT_TEXT = "no limit"
 # Inputs from this value up read as whole numbers.
 NUMBER_TEXT_WHOLE = 10.0
+# Smaller inputs keep this many significant digits: 8.13, 0.5.
+NUMBER_TEXT_DIGITS = 3
 LIMIT_LABEL = "{container} limit"
 PVC_CAPACITY_LABEL = "PVC capacity {capacity}"
 # The columns of the editable limits table.
@@ -2418,7 +2420,7 @@ def nodes_needed(machine: MachineType, memory_bytes: float, cpu_cores: float) ->
 
 def number_text(value: float) -> str:
     """A measured input as a reader says it: "40", "4,469", "0.5"."""
-    return f"{value:,.0f}" if value >= NUMBER_TEXT_WHOLE else f"{value:g}"
+    return f"{value:,.0f}" if value >= NUMBER_TEXT_WHOLE else f"{value:.{NUMBER_TEXT_DIGITS}g}"
 
 
 def memory_text(value_bytes: float | None) -> str:
