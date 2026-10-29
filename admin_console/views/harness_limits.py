@@ -43,11 +43,21 @@ NEED_CAPTION = (
     "container's whole block; `credentialProxy.resources` and `agentAPIAuth.resources` replace only "
     "the keys they set. On Autopilot, set the requests to these values."
 )
-BOTTLENECK_CAPTION = (
-    "Each line is a container's or the broker's predicted peak as a share of its limit, for this "
-    "fleet's cluster shape at every size; above 100% it is past the limit. Dots are measured runs "
-    "(open dots are left out of the fit). The shaded range is measured, the rest predicted; dashed "
-    "lines mark the example fleets. Hover a line for the whole fleet at that point."
+LIMITS_CAPTION = (
+    "The limits question 1 checks. Start from the defaults of a Standard install, what GKE Autopilot "
+    "without bursting gives each container (its request becomes its limit), or the limits question 2 "
+    "recommends for this fleet; then change any cell. Memory in MiB, CPU in cores; 0 is no limit. The "
+    "sandbox shell's 2 CPU and 2 GiB are fixed by the operator."
+)
+FORECAST_CAPTION = (
+    "Each line is a key prediction as a share of its limit above, for this fleet's cluster shape at every "
+    "size; a cross marks where it reaches the limit. Dots are measured runs. The shaded range is measured, "
+    "the rest predicted; dashed lines mark the example fleets."
+)
+WHY_CAPTION = (
+    "Every measured run, with no input from this page: each resource in its own unit, one line per "
+    "container fitted through the runs, for clusters shaped like the measured base, against the default "
+    "limits."
 )
 CURVE_NOTE = (
     "Why the lines curve upward: they are not exponential. The model is a straight line in each "
@@ -56,11 +66,6 @@ CURVE_NOTE = (
     "Turn the logarithmic axis off to see the lines straight. A real queue, such as the broker's "
     "8 command slots, grows faster than a straight line once it fills, so past the measured range "
     "the lines are a lower bound."
-)
-BREAKDOWN_CAPTION = (
-    "The same predictions in each resource's own unit, one line per container; a dotted line in a "
-    "container's colour is its limit. The proxy wait's line is the 60-second refusal bound, and the "
-    "response time's the 60-second investigate gate for a fan-out question."
 )
 CHART_CAPTION = (
     "Filled points are runs; open points are left out of the fit (a failed or declined prompt, work "
@@ -95,19 +100,7 @@ if not dataset.records:
     st.info(f"`{hl.display_path(dataset.path)}` has no records yet.")
     st.stop()
 
-profiles = {profile.label: profile for profile in hl.FLEET_PROFILES}
-choice = st.selectbox(
-    "Fleet", [*profiles, hl.CUSTOM_PROFILE], index=len(profiles) - 1, key=f"{KEY_PREFIX}:profile"
-)
-profile = profiles.get(choice)
-if profile:
-    st.caption(
-        PROFILE_CAPTION.format(
-            projects=profile.projects, autopilot=profile.autopilot_share, workloads=profile.workloads_per_day
-        )
-    )
-
-with st.expander("Data and fleet inputs"):
+with st.expander("Measurement data"):
     commit_column, mode_column = st.columns(SELECTOR_WIDTHS)
     commit = commit_column.selectbox(
         "Commit",
@@ -123,48 +116,92 @@ with st.expander("Data and fleet inputs"):
         help="The results hold only for the mode measured.",
         key=f"{KEY_PREFIX}:mode:{commit}",
     )
-    records = hl.select(dataset.records, commit, mode)
-    scope = f"{commit}:{mode}"
-    base = hl.base_fleet(records)
-    start = profile.fleet(base) if profile else base
-    fleet: dict[str, float] = {}
-    fleet_columns = st.columns(FLEET_COLUMNS)
-    for index, (factor, spec) in enumerate(hl.FACTORS.items()):
-        fleet[factor] = fleet_columns[index % FLEET_COLUMNS].number_input(
-            spec.input_label,
-            min_value=0.0,
-            value=round(float(start[factor]), FLEET_DECIMALS),
-            step=FLEET_STEP,
-            format=NUMBER_FORMAT,
-            help=spec.help or None,
-            key=f"{KEY_PREFIX}:fleet:{factor}:{scope}:{choice}",
-        )
+records = hl.select(dataset.records, commit, mode)
+scope = f"{commit}:{mode}"
 containers = hl.containers(records)
 colors = hl.container_colors(containers, PALETTE.series_colors, PALETTE.neutral)
+base = hl.base_fleet(records)
+defaults = hl.usual_limits(records)
+measured = hl.measured_clusters(records)
 
 st.divider()
-section_title("1. Are these container limits enough for this fleet?", "One install, with the limits below.")
-with st.expander("Container limits: the defaults, or your PlatformAgent values (0 for none)"):
-    number_column = st.column_config.NumberColumn(min_value=0.0, format=NUMBER_FORMAT)
-    edited = st.data_editor(
-        hl.limit_table(hl.usual_limits(records), containers),
-        hide_index=True,
-        width="stretch",
-        disabled=[hl.LIMIT_CONTAINER_COLUMN],
-        column_config={hl.LIMIT_MEMORY_COLUMN: number_column, hl.LIMIT_CPU_COLUMN: number_column},
-        key=f"{KEY_PREFIX}:limits:{scope}",
+section_title("Fleet", "Pick a size, then change any input.")
+profiles = {profile.label: profile for profile in hl.FLEET_PROFILES}
+choice = st.selectbox(
+    "Example fleet", [*profiles, hl.CUSTOM_PROFILE], index=len(profiles) - 1, key=f"{KEY_PREFIX}:profile"
+)
+profile = profiles.get(choice)
+if profile:
+    st.caption(
+        PROFILE_CAPTION.format(
+            projects=profile.projects, autopilot=profile.autopilot_share, workloads=profile.workloads_per_day
+        )
     )
+start = profile.fleet(base) if profile else base
+fleet: dict[str, float] = {}
+fleet_columns = st.columns(FLEET_COLUMNS)
+for index, (factor, spec) in enumerate(hl.FACTORS.items()):
+    fleet[factor] = fleet_columns[index % FLEET_COLUMNS].number_input(
+        spec.input_label,
+        min_value=0.0,
+        value=round(float(start[factor]), FLEET_DECIMALS),
+        step=FLEET_STEP,
+        format=NUMBER_FORMAT,
+        help=spec.help or None,
+        key=f"{KEY_PREFIX}:fleet:{factor}:{scope}:{choice}",
+    )
+plan = hl.install_plan(records, containers, fleet)
+recommendations = hl.recommendations(records, plan.fleet, containers)
+
+st.divider()
+section_title("Container limits on GKE", LIMITS_CAPTION)
+preset = st.radio("Start from", hl.LIMIT_PRESETS, horizontal=True, key=f"{KEY_PREFIX}:limit_preset")
+starting = {
+    hl.LIMITS_DEFAULT: defaults,
+    hl.LIMITS_AUTOPILOT: hl.usual_requests(records),
+    hl.LIMITS_RECOMMENDED: {**defaults, **hl.recommended_limits(recommendations)},
+}[preset]
+number_column = st.column_config.NumberColumn(min_value=0.0, format=NUMBER_FORMAT)
+edited = st.data_editor(
+    hl.limit_table(starting, [name for name in containers if name in defaults]),
+    hide_index=True,
+    width="stretch",
+    disabled=[hl.LIMIT_CONTAINER_COLUMN],
+    column_config={hl.LIMIT_MEMORY_COLUMN: number_column, hl.LIMIT_CPU_COLUMN: number_column},
+    key=f"{KEY_PREFIX}:limits:{scope}:{preset}:{choice}",
+)
 limits = hl.limits_from_table(edited)
+
+st.divider()
+section_title("1. Are these container limits enough for this fleet?", "One install, with the limits above.")
 resource_checks = hl.resource_checks(records, fleet, containers, limits)
 threshold_checks = hl.threshold_checks(records, fleet, containers)
-first = hl.first_limit(resource_checks + threshold_checks)
 failing = [check for check in resource_checks + threshold_checks if check.status == hl.FAIL]
-summary = f"{len(failing)} limits fail." if failing else "Every limit holds."
-if first is not None and hl.past_at_base(first):
-    summary += f" First limit reached: **{first.label}**, already at the measured base."
-elif first is not None:
-    summary += f" First limit reached: **{first.label}**, at {hl.percent(first.reached)} of this fleet's growth."
-(st.error if failing else st.success)(summary)
+forecast = hl.bottleneck_series(records, fleet, limits)
+first = hl.first_crossing(forecast)
+if first is None:
+    verdict = "With these limits, no key limit is reached at any fleet size up to 10,000 clusters."
+elif first[1] <= forecast[0].clusters[0]:
+    verdict = f"With these limits, **{first[0].label}** is past its limit at every fleet size."
+else:
+    verdict = f"With these limits, the first limit reached is **{first[0].label}**, at about {first[1]:,.0f} clusters."
+summary = f"{len(failing)} limits fail for this fleet. " if failing else "Every limit holds for this fleet. "
+(st.error if failing else st.success)(summary + verdict)
+st.plotly_chart(
+    bottleneck_chart(
+        forecast,
+        hl.FLEET_PROFILES,
+        measured,
+        fleet[hl.CLUSTERS],
+        PALETTE.series_colors,
+        fleet[hl.NODES],
+        crossings=[hl.crossing(item) for item in forecast],
+    ),
+    width="stretch",
+    config=CHART_CONFIG,
+    key=f"{KEY_PREFIX}:forecast:{scope}",
+)
+st.caption(FORECAST_CAPTION)
 table(hl.resource_rows(resource_checks))
 # Restarts and OOMKills are listed only when one is predicted: a column of passes per container says nothing.
 table(
@@ -175,14 +212,12 @@ table(
 
 st.divider()
 section_title("2. What node size and container limits does this fleet need?", NEED_CAPTION)
-plan = hl.install_plan(records, containers, fleet)
 if plan.installs > 1:
     st.warning(
         INSTALLS_NOTE.format(
             capacity=plan.capacity, limit=plan.limit.label, installs=plan.installs, per_install=plan.fleet[hl.CLUSTERS]
         )
     )
-recommendations = hl.recommendations(records, plan.fleet, containers)
 table(hl.recommendation_rows(recommendations))
 nodes = hl.node_plan(recommendations, hl.latest_replicas(records))
 if nodes.pods and nodes.machine is not None:
@@ -218,47 +253,31 @@ st.markdown("**Limits that resources cannot fix**")
 table(hl.unfixable_rows(hl.threshold_checks(records, plan.fleet, containers)))
 
 st.divider()
-section_title("Why: the limits as the fleet grows", BOTTLENECK_CAPTION)
+section_title("Why: the limits as the fleet grows", WHY_CAPTION)
 log_axis = st.toggle("Logarithmic axis", value=True, key=f"{KEY_PREFIX}:log_axis")
-st.plotly_chart(
-    bottleneck_chart(
-        hl.bottleneck_series(records, fleet, limits),
-        hl.FLEET_PROFILES,
-        hl.measured_clusters(records),
-        fleet[hl.CLUSTERS],
-        PALETTE.series_colors,
-        fleet[hl.NODES],
-        log_axis,
-    ),
-    width="stretch",
-    config=CHART_CONFIG,
-    key=f"{KEY_PREFIX}:bottlenecks:{scope}:{log_axis}",
-)
-st.caption(CURVE_NOTE)
-st.markdown("**Each resource on its own**")
-for first in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
+for first_metric in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
     row = st.columns(CHART_COLUMNS)
-    for column, metric in zip(row, list(hl.BREAKDOWN_OWNERS)[first : first + CHART_COLUMNS]):
+    for column, metric in zip(row, list(hl.BREAKDOWN_OWNERS)[first_metric : first_metric + CHART_COLUMNS]):
         spec = hl.metric_spec(metric)
         with column:
             st.markdown(f"**{spec.label}**")
             st.plotly_chart(
                 breakdown_chart(
-                    hl.breakdown_series(records, fleet, limits, metric),
+                    hl.breakdown_series(records, base, defaults, metric),
                     spec.label,
                     spec.unit,
                     hl.FLEET_PROFILES,
-                    hl.measured_clusters(records),
-                    fleet[hl.CLUSTERS],
+                    measured,
+                    base[hl.CLUSTERS],
                     colors,
-                    fleet[hl.NODES],
+                    base[hl.NODES],
                     log_axis,
                 ),
                 width="stretch",
                 config=CHART_CONFIG,
                 key=f"{KEY_PREFIX}:breakdown:{scope}:{metric}:{log_axis}",
             )
-st.caption(BREAKDOWN_CAPTION)
+st.caption(CURVE_NOTE)
 
 with st.expander("Measured runs"):
     operation_column, factor_column = st.columns(2)

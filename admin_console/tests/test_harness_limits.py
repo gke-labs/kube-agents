@@ -1047,7 +1047,7 @@ class HarnessLimitsPageTest(unittest.TestCase):
         return app.switch_page(PAGE_PATH).run()
 
     def custom_fleet(self, app: AppTest) -> AppTest:
-        app.selectbox[0].set_value(hl.CUSTOM_PROFILE)
+        app.selectbox(key="harness_limits:profile").set_value(hl.CUSTOM_PROFILE)
         return app.run()
 
     def test_the_page_renders_the_sample_without_a_connection(self):
@@ -1058,7 +1058,7 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertTrue(any("Sample data" in item.value for item in app.warning))
         self.assertFalse(any("Connect a project" in item.value for item in app.info))
         # The benchmark size is the default fleet, and both questions are answered for it.
-        self.assertEqual(app.selectbox[0].value, hl.FLEET_PROFILES[-1].label)
+        self.assertEqual(app.selectbox(key="harness_limits:profile").value, hl.FLEET_PROFILES[-1].label)
         headings = " ".join(str(item.value) for item in app.subheader)
         self.assertIn("1. Are these container limits enough for this fleet?", headings)
         self.assertIn("2. What node size and container limits does this fleet need?", headings)

@@ -421,6 +421,14 @@ BOTTLENECK_CHECKS = (
     (CPU_PEAK, AGENT_CONTAINER),
     (MEMORY_PEAK, AGENT_CONTAINER),
 )
+# A share line reaches its limit at 1.0.
+LIMIT_REACHED = 1.0
+# Where the container limits table starts: the install's defaults, what Autopilot without bursting
+# gives (each request becomes the limit), or the recommended limits for this fleet.
+LIMITS_DEFAULT = "Defaults of a Standard install"
+LIMITS_AUTOPILOT = "GKE Autopilot without bursting (limits equal the requests)"
+LIMITS_RECOMMENDED = "Recommended for this fleet (question 2)"
+LIMIT_PRESETS = (LIMITS_DEFAULT, LIMITS_AUTOPILOT, LIMITS_RECOMMENDED)
 # The breakdown charts: one metric each, in its own unit, one line per owner.
 BREAKDOWN_OWNERS = MappingProxyType(
     {
@@ -1683,6 +1691,33 @@ def breakdown_series(
         if item is not None:
             series.append(item)
     return series
+
+
+def crossing(item: BottleneckSeries) -> float | None:
+    """The cluster count at which a share line first reaches its limit (1.0), interpolated on the log axis."""
+    points = [(clusters, share) for clusters, share in zip(item.clusters, item.shares) if not math.isnan(share)]
+    for (low_x, low_y), (high_x, high_y) in zip(points, points[1:]):
+        if low_y >= LIMIT_REACHED:
+            return low_x
+        if high_y >= LIMIT_REACHED:
+            part = (LIMIT_REACHED - low_y) / (high_y - low_y)
+            return 10 ** (math.log10(low_x) + part * (math.log10(high_x) - math.log10(low_x)))
+    return None
+
+
+def first_crossing(series: Sequence[BottleneckSeries]) -> tuple[BottleneckSeries, float] | None:
+    """The line that reaches its limit at the fewest clusters, and where; None when no line does."""
+    reached = [(item, at) for item in series if (at := crossing(item)) is not None]
+    return min(reached, key=lambda pair: pair[1]) if reached else None
+
+
+def recommended_limits(items: Iterable[Recommendation]) -> dict[str, dict[str, float]]:
+    """Recommendations as a limits mapping, for a container that has one."""
+    return {
+        item.container: {LIMIT_MEMORY: item.memory_bytes or 0.0, LIMIT_CPU: item.cpu_cores or 0.0}
+        for item in items
+        if item.memory_bytes or item.cpu_cores
+    }
 
 
 def measured_clusters(records: Iterable[Record]) -> float:

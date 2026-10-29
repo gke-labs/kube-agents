@@ -45,6 +45,10 @@ EXCLUDED_LABEL = "excluded from fit"
 FLEET_LABEL = "this fleet"
 CONTAINER_LIMIT_KEY = "container limit"
 THRESHOLD_KEY = "threshold"
+CROSSING_KEY = "reaches its limit"
+CLUSTER_AXIS_TITLE = "Clusters × nodes each"
+CROSSING_SYMBOL = "x"
+CROSSING_MARKER_SIZE = 13
 BOTTLENECK_CHART_HEIGHT = 440
 # The share axis stops at 4 times the limit: past that, every line has long since failed.
 BOTTLENECK_SHARE_CEILING = 4.0
@@ -458,10 +462,32 @@ def bottleneck_chart(
     colors: list[str],
     nodes_per_cluster: float,
     log_axis: bool = True,
+    crossings: list[float | None] | None = None,
 ) -> go.Figure:
-    """Each key check against its limit as the fleet grows, with the runs and the example fleets marked."""
+    """Each key check against its limit as the fleet grows, with the runs and the example fleets marked.
+
+    ``crossings`` marks, per line, the cluster count where it reaches its limit.
+    """
     figure = _growth_chart(series, profiles, measured, fleet_clusters, colors, nodes_per_cluster, log_axis,
                            value_format=".0%", value_suffix=" of its limit")
+    for index, (item, at) in enumerate(zip(series, crossings or [])):
+        if at is None:
+            continue
+        figure.add_trace(
+            go.Scatter(
+                x=[at],
+                y=[LIMIT_SHARE],
+                mode="markers",
+                name=f"{item.label} reaches its limit",
+                legendgroup=item.label,
+                showlegend=False,
+                marker={"color": colors[index % len(colors)], "size": CROSSING_MARKER_SIZE, "symbol": CROSSING_SYMBOL,
+                        "line": {"color": TEXT, "width": THRESHOLD_LINE_WIDTH}},
+                hovertemplate=f"<b>{escape(item.label)}</b> reaches its limit at about %{{x:,.0f}} clusters<extra></extra>",
+            )
+        )
+    if crossings and any(at is not None for at in crossings):
+        _style_key(figure, CROSSING_KEY, symbol=CROSSING_SYMBOL)
     figure.add_hline(
         y=LIMIT_SHARE,
         line={"color": PALETTE.danger, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
@@ -585,10 +611,10 @@ def _growth_chart(
     _style_key(figure, MEASURED_KEY, symbol=MEASURED_SYMBOL)
     ticks = [value for value in (ticks or BOTTLENECK_TICKS) if first <= value <= series[0].clusters[-1]] if series else []
     figure.update_xaxes(
-        title="Clusters, and the nodes they hold",
+        title=CLUSTER_AXIS_TITLE,
         type="log" if log_axis else "linear",
         tickvals=ticks,
-        ticktext=[f"{value:,.0f}<br>{value * nodes_per_cluster:,.0f} nodes" for value in ticks],
+        ticktext=[f"{value:,.0f} × {round(nodes_per_cluster, 1):g}" for value in ticks],
         showgrid=True,
         gridcolor=GRID,
         zeroline=False,
