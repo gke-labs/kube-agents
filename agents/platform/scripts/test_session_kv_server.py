@@ -2001,6 +2001,19 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         # degrades to "" rather than raising.
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
+    def test_the_projected_file_is_read_after_the_config_files(self):
+        # Under `next` the operator projects a learned channel into a file the
+        # kubelet refreshes in place; it is read last, after `/sethome`'s files.
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+                handle.write("C0PROJECTED\n")
+            with patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: directory}):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0PROJECTED")
+                self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
+                os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
+
     def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
         self._point("CONFIG_PATH", "platforms: slack\n")
         self.assertEqual(session_kv_server._slack_home_channel(), "")

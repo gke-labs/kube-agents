@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -16,6 +17,73 @@ import chat_notify  # noqa: E402
 import chat_platforms  # noqa: E402
 
 ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
+
+
+class HomeFileTest(unittest.TestCase):
+    """The home channel the operator projects into the pod as a file.
+
+    A learned channel is never rendered into the pod env; ``routed_platform``
+    and ``slack_home_channel`` take it from the file after a non-empty env,
+    and read it on every call because the kubelet refreshes it in place.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
+            chat_notify.SLACK_HOME_CHANNEL_ENV: "",
+            chat_notify.HOME_FILE_DIR_ENV: self.dir,
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_projected_channel_routes_slack_and_names_the_home(self):
+        self._write("C0FILE\n")
+        self.assertEqual(chat_notify.home_file_value(), "C0FILE")
+        self.assertEqual(chat_notify.slack_home_channel(), "C0FILE")
+        self.assertEqual(chat_notify.routed_platform(), "slack")
+        self.assertTrue(chat_notify.routes("slack"))
+
+    def test_a_non_empty_env_wins_over_the_file(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {chat_notify.SLACK_HOME_CHANNEL_ENV: "C0ENV",
+                                          chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+            self.assertEqual(chat_notify.slack_home_channel(), "C0ENV")
+            self.assertEqual(chat_notify.routed_platform(), "google_chat")
+
+    def test_an_empty_or_absent_file_routes_nothing(self):
+        self.assertEqual(chat_notify.home_file_value(), "")
+        self.assertEqual(chat_notify.routed_platform(), "")
+        self._write("")
+        self.assertEqual(chat_notify.routed_platform(), "")
+        self._write("   \n")
+        self.assertEqual(chat_notify.home_file_value(), "")
+
+    def test_the_file_routes_only_the_platform_the_gateway_holds(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(chat_notify.routed_platform(), "")
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertEqual(chat_notify.routed_platform(), "")
+
+    def test_the_file_is_read_on_every_call(self):
+        self._write("C0ONE\n")
+        self.assertEqual(chat_notify.slack_home_channel(), "C0ONE")
+        self._write("C0TWO\n")
+        self.assertEqual(chat_notify.slack_home_channel(), "C0TWO")
+        os.unlink(os.path.join(self.dir, chat_notify.HOME_FILE_KEY))
+        self.assertEqual(chat_notify.slack_home_channel(), "")
+
+    def test_a_missing_directory_reads_as_nothing(self):
+        with mock.patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(self.dir, "absent")}):
+            self.assertEqual(chat_notify.home_file_value(), "")
+            self.assertEqual(chat_notify.routed_platform(), "")
 
 
 class CommandTest(unittest.TestCase):

@@ -69,6 +69,45 @@ ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 UNROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: ""}
 
 
+class RoutedPlatformFromTheFileTest(unittest.TestCase):
+    """A learned Slack home channel reaches the stand-in through the operator's
+    projected file, not the env: routed when the gateway holds Slack and the
+    file names a channel, and the env still wins when it is set."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        env = mock.patch.dict(os.environ, {
+            kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
+            kanban_chat_notify.HOME_FILE_DIR_ENV: self.dir,
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_the_file_routes_slack(self):
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self._write("C0FILE\n")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "slack")
+        self.assertTrue(kanban_chat_notify.routes("slack"))
+        self.assertIn("slack", kanban_chat_notify.served_platforms())
+
+    def test_the_env_wins_and_another_platform_ignores_the_file(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "google_chat")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+    def test_an_absent_directory_routes_nothing(self):
+        with mock.patch.dict(os.environ, {kanban_chat_notify.HOME_FILE_DIR_ENV: os.path.join(self.dir, "absent")}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+
 class _Runner:
     config = types.SimpleNamespace(multiplex_profiles=False)
 

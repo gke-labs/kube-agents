@@ -76,12 +76,12 @@ func serveJSON(t *testing.T, n *Notifier, req lib.NotifyRequest) lib.NotifyReply
 // returns the one answer it gives.
 func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
 	t.Helper()
-	req, refusal := n.validate(body)
+	req, home, refusal := n.validate(body)
 	if refusal != nil {
 		return *refusal
 	}
 	var answers []lib.NotifyReply
-	n.post(notifyJob{req: req, answer: func(r lib.NotifyReply) { answers = append(answers, r) }})
+	n.post(notifyJob{req: req, home: home, answer: func(r lib.NotifyReply) { answers = append(answers, r) }})
 	if len(answers) != 1 {
 		t.Fatalf("post answered %d times, want exactly once: %+v", len(answers), answers)
 	}
