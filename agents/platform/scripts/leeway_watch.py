@@ -13,8 +13,12 @@ broken spread constraints before a zone outage or node drain exposes them.
 
 Which clusters. Target clusters are resolved on the agent pod:
 1. `LEEWAY_WATCH_CLUSTERS` when set (comma-separated `project/location/cluster`
-   triples), passed directly to `leeway report --clusters`.
-2. Otherwise `LEEWAY_WATCH_PROJECTS` when set, or the management project
+   triples), passed directly to `leeway report --clusters`, less any clusters
+   the declared scope excludes (`spec.scope.exclude.clusters`).
+2. On an install with a declared scope (`spec.scope`), the resolved projects
+   from `fleet_scope_targets.py` (`fleet_scope.json` / `ScopeTargets.projects`),
+   less any clusters in `ScopeTargets.excluded_clusters`.
+3. Otherwise `LEEWAY_WATCH_PROJECTS` when set, or the management project
    (`GCP_PROJECT_ID`) together with every project a Cluster Agent profile's
    `cluster_identity` names; with neither, the sandbox's `gcloud config
    get-value project`; and with nothing at all the tick fails closed rather
@@ -22,8 +26,9 @@ Which clusters. Target clusters are resolved on the agent pod:
    clusters the Cluster Agent profiles name is swept by those
    `<project>/<location>/<cluster>` triples; any other project is enumerated
    first with `gcloud container clusters list --project <project>` in the
-   sandbox and swept by the triples that returns. Every `leeway report` run
-   is a `--clusters` run: in the sandbox each triple becomes a
+   sandbox and swept by the triples that returns, less any clusters in
+   `ScopeTargets.excluded_clusters`. Every `leeway report` run is a `--clusters`
+   run: in the sandbox each triple becomes a
    `kubectl --context=gke_<project>_<location>_<cluster>` read through the
    credential-proxy shim, which is the one route the sandbox has to a
    cluster.
@@ -70,6 +75,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 
@@ -320,8 +326,35 @@ def roster_projects() -> set[str]:
     return set(roster_clusters_by_project().keys())
 
 
-def projects() -> list[str]:
+def declared_scope(agent_home: str | os.PathLike | None = None) -> fleet_scope_targets.ScopeTargets | None:
+    """The install's declared scope as the reconcile resolved it, or None."""
+    try:
+        return fleet_scope_targets.declared_scope_targets(agent_home)
+    except fleet_scope_targets.ScopeRenderUnreadable:
+        return None
+    except Exception:
+        return None
+
+
+def excluded_clusters(scope: fleet_scope_targets.ScopeTargets | None = None) -> set[str]:
+    """`<project>/<location>/<cluster>` triples that `spec.scope.exclude.clusters` leaves out."""
+    targets = scope if scope is not None else declared_scope()
+    if targets is None or not targets.excluded_clusters:
+        return set()
+    return {"/".join(ref) for ref in targets.excluded_clusters}
+
+
+def projects(scope: fleet_scope_targets.ScopeTargets | None = None) -> list[str]:
+    """The projects to sweep: from the declared scope when present, else from
+    LEEWAY_WATCH_PROJECTS, Cluster Agent profiles, or the management project."""
+    targets = scope if scope is not None else declared_scope()
     explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(CSV_SEPARATOR) if p.strip()]
+    if targets is not None:
+        # A declared scope is in force: sweep its resolved projects.
+        if explicit:
+            return sorted(set(explicit) & set(targets.projects))
+        return list(targets.projects)
+
     if explicit:
         return sorted(set(explicit))
     found = roster_projects()
@@ -921,7 +954,9 @@ def sweep_fleet(
     deadline: float,
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, str], dict[str, str], set[str], set[str]]:
     """Run `leeway report` across configured clusters or projects."""
-    clusters = explicit_clusters()
+    scope = declared_scope()
+    excluded = excluded_clusters(scope)
+    clusters = [c for c in explicit_clusters() if c not in excluded]
     project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {})
     scan_errors: dict[str, str] = {}
     error_kinds: dict[str, str] = {}
@@ -946,7 +981,7 @@ def sweep_fleet(
         )
 
     known_triples_by_proj = roster_clusters_by_project()
-    target_projects = order_by_least_recent(projects(), project_runs)
+    target_projects = order_by_least_recent(projects(scope), project_runs)
     for proj in target_projects:
         remaining = int(deadline - time.monotonic())
         if remaining < MIN_PROJECT_RUN_SECONDS:
@@ -954,10 +989,10 @@ def sweep_fleet(
             error_kinds[proj] = ERROR_KIND_BUDGET_EXHAUSTED
             continue
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
-        triples = known_triples_by_proj.get(proj) or []
+        triples = [t for t in (known_triples_by_proj.get(proj) or []) if t not in excluded]
         try:
             if not triples:
-                triples = project_cluster_triples(proj)
+                triples = [t for t in project_cluster_triples(proj) if t not in excluded]
             if not triples:
                 # A project with no clusters is a clean, empty read.
                 scanned_projects.add(proj)

@@ -792,6 +792,77 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("no GCP project", buf.getvalue())
 
+    def test_declared_scope_resolves_projects_and_drops_out_of_scope_roster(self) -> None:
+        fake_scope = mock.Mock(
+            projects=("p-scoped",),
+            excluded_clusters=(),
+        )
+        with mock.patch.object(watch, "declared_scope", return_value=fake_scope), mock.patch.object(
+            watch, "roster_projects", return_value={"p-out-of-scope"}
+        ):
+            self.assertEqual(watch.projects(), ["p-scoped"])
+
+    def test_declared_scope_drops_excluded_clusters_from_sweep(self) -> None:
+        fake_scope = mock.Mock(
+            projects=("p-scoped",),
+            excluded_clusters=(("p-scoped", "us-central1", "c-excluded"),),
+        )
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p-scoped/us-central1/c-included", "status": "ok"}]))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: tmp,
+                watch.CLUSTERS_ENV: "",
+                watch.PROJECTS_ENV: "",
+            },
+            clear=False,
+        ), mock.patch.object(watch, "declared_scope", return_value=fake_scope), mock.patch.object(
+            watch, "roster_clusters_by_project", return_value={
+                "p-scoped": ["p-scoped/us-central1/c-included", "p-scoped/us-central1/c-excluded"]
+            }
+        ), mock.patch.object(
+            watch.sandbox_exec, "run", side_effect=fake_run
+        ):
+            code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            seen_argv,
+            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p-scoped/us-central1/c-included"]],
+        )
+
+    def test_declared_scope_drops_excluded_clusters_from_explicit_clusters_flag(self) -> None:
+        fake_scope = mock.Mock(
+            projects=("p1",),
+            excluded_clusters=(("p1", "us-central1", "c-excluded"),),
+        )
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p1/us-central1/c-ok", "status": "ok"}]))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: tmp,
+                watch.CLUSTERS_ENV: "p1/us-central1/c-ok, p1/us-central1/c-excluded",
+            },
+            clear=False,
+        ), mock.patch.object(watch, "declared_scope", return_value=fake_scope), mock.patch.object(
+            watch.sandbox_exec, "run", side_effect=fake_run
+        ):
+            code = watch.tick(now=T0)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            seen_argv,
+            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c-ok"]],
+        )
+
 
 class RosterTest(unittest.TestCase):
     def test_the_platform_roster_carries_leeway_watch_as_a_daily_no_agent_entry(self) -> None:
