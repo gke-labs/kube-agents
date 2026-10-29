@@ -1,17 +1,39 @@
 package gateway
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// waitRunning waits for Run to have started (it sets runCtx first, then
-// logs the feedback state), so a test touches nothing Run hasn't set.
+// waitRunning waits until Run has bound its relay durable on the server,
+// which it does after setting runCtx and before it starts the adapter: a test
+// that then touches runCtx reads what Run set, and a stop that follows
+// reaches a gateway past its bind, so Run gets to the adapter and returns
+// through it.
 func waitRunning(t *testing.T, r *rig) {
 	t.Helper()
+	nc, err := nats.Connect(r.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the gateway's relay bound", func() bool {
+		_, err := js.Consumer(context.Background(), lib.TasksStream, r.g.relayDurable)
+		return err == nil
+	})
+	// Bound, and then Run starts the adapter: wait for that too, so a stop
+	// is answered by the adapter returning.
 	waitFor(t, "the gateway running", func() bool { return strings.Contains(r.logs.String(), "answer feedback") })
 }
 
@@ -26,11 +48,9 @@ func TestAStoppedGatewayDropsABatchWithOneLine(t *testing.T) {
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	r.stop()
-	select {
-	case <-r.adapter.stopped:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the gateway did not stop")
-	}
+	// Run wrote runCtx once, before the log line waitRunning read under the
+	// buffer's lock, so reading it here doesn't race that write.
+	waitFor(t, "the gateway stopped", func() bool { return r.g.runCtx.Err() != nil })
 	start := time.Now()
 	r.g.relayBatch("discord:g1/t-stopped", stoppedBatch())
 	if took := time.Since(start); took > time.Second {
