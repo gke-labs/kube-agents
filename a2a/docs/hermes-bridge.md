@@ -591,7 +591,7 @@ the `cli` executor kills a process group, with the same terminals: `canceled-by-
 the request ends the bridge's wait, and the server interrupts the turn only for a streaming
 client, which the bridge is not. So after a cancel ends a turn's request, and its `canceled`
 terminal is out, the bridge asks the server to stop the turn running in the session (the turn
-stop, #3263): `POST /v1/kube-agents/sessions/{id}/stop` on the API server, with its key, a route
+stop): `POST /v1/kube-agents/sessions/{id}/stop` on the API server, with its key, a route
 the image's `api_session_stop` patch adds (`deploy/docker/patches/api_session_stop.py`). The
 route gives every turn running in that session upstream's hard interrupt and process reap, the
 pair `/v1/runs/{run_id}/stop` uses, interrupts a turn whose agent did not exist yet as soon as it

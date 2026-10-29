@@ -697,7 +697,7 @@ The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it change
 pull request runs.
 
 Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject lane can carry:
-the stopped asks (a `stop` sent on the conversation after the opening turn,
+the stopped asks (a `stop` sent on the conversation during or after the opening turn,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
 into the reply. `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file

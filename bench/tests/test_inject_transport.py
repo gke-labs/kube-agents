@@ -3345,3 +3345,32 @@ def test_a_turn_that_ends_before_the_mid_turn_stop_sends_none(
 
     assert running_at_stop == []
     assert answers[0] == (False, "the opening turn ended before the stop could land while it ran")
+
+
+@pytest.mark.parametrize("hooked", [False, True])
+def test_a_stream_terminal_ends_the_wait_with_or_without_a_poll_hook(
+    stub_gateway: _StubGatewayServer, hooked: bool
+) -> None:
+    """A status turn awaits with no hook and the opening exchange with one;
+    the read that finds the stream terminal ends either wait at once rather
+    than at the deadline."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "the answer")
+    stub_gateway.executor_states = ["completed"]
+    stub_gateway.probe_final = True
+    stub_gateway.probe_terminal_source = inject.TERMINAL_SOURCE_EXECUTOR
+    task = inject.InjectTask(
+        base_url=f"http://127.0.0.1:{stub_gateway.server_address[1]}",
+        conversation=CONVERSATION,
+        prompt="quick one",
+        token=TOKEN,
+    )
+    task_id = task.submit()
+    polled: list[Any] = []
+    started = time.monotonic()
+
+    exchange = task.await_terminal(
+        task_id, deadline=started + 60.0, on_poll=polled.append if hooked else None
+    )
+
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert time.monotonic() - started < 30.0

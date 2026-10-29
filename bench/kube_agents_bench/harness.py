@@ -2802,7 +2802,8 @@ class KubeAgentsHarness(AgentHarness):
         """Stop the work a stopped ask filed, then watch it for the window (:mod:`stop_hook`).
 
         The opening turn has ended. ``send_stop`` sends ``stop`` on the
-        conversation first: the gateway finds the conversation's cards
+        conversation first, or, for a mid-turn stop, reports the ``stop``
+        already sent while that turn ran: the gateway finds the conversation's cards
         itself, so the stop needs no card ids and reaches a card the turn
         saved a moment late. A stop the gateway took is then watched for the
         observation window with no further turn, polling the board, and graded
@@ -2814,7 +2815,8 @@ class KubeAgentsHarness(AgentHarness):
         store does not know, or a stop that never reached the gateway makes
         the run infrastructure. :data:`stop_hook.STOP_ENTRY` goes on the
         trajectory either way, ``completed`` only when a card was filed and
-        the gateway took the word as a stop.
+        the gateway took the word as a stop; for a mid-turn stop, a turn that
+        filed no card completes both entries.
         """
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)

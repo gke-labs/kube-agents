@@ -1527,9 +1527,9 @@ class InjectTask:
             deadline: ``time.monotonic()`` instant after which the wait ends
                 on the read route's answer. The budget behind it clears the
                 floor (:func:`check_budget`).
-            on_poll: Called with the fold after each read has been folded in,
-                before the wait decides what the read means: the harness's
-                mid-turn stop sends from here (:mod:`stop_hook`).
+            on_poll: Called with the fold after each read that did not end
+                the wait: the harness's mid-turn stop sends from here
+                (:mod:`stop_hook`).
 
         Raises:
             InjectUnavailable: The gateway could not be reached or was lost.
@@ -1550,8 +1550,6 @@ class InjectTask:
             if answered is not None:
                 probe = answered
                 adopted = self._note(fold, task_id, answered)
-            if on_poll is not None:
-                on_poll(fold)
                 if answered.could_look and answered.concerns(task_id) and not fold.final:
                     if answered.final:
                         if not adopted:
@@ -1563,6 +1561,8 @@ class InjectTask:
                         return self._finish(fold, task_id, after, answered)
                     if answered.executor_state == "" and answered.past_grace:
                         return self._never_started(fold, task_id, answered)
+            if on_poll is not None:
+                on_poll(fold)
             if fold.final and not adopted:
                 # The relay's terminal arrived in this read and its probe
                 # carried no trace to adopt: whatever trace the fold holds
