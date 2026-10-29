@@ -63,7 +63,8 @@ jobs:
   # steps in the `test` job below are therefore continue-on-error -- a broken
   # report costs the comment, not the merge. What is left able to fail the
   # required check is the suite itself, coverage.py writing and joining its
-  # data, and a shard that did not finish, which are the things that should.
+  # data, a shard that did not finish, and the bench harness job, which are
+  # the things that should.
   #
   # The sweep runs as three shards on three runners (`test-shard`), and `test`
   # joins their coverage and carries the required check's name. On one runner

@@ -25,6 +25,7 @@ Contracts that each fail silently today when the two sides drift:
 
 from __future__ import annotations
 
+import copy
 import contextlib
 import io
 import json
@@ -859,6 +860,29 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "but would not fail the check",
         )
 
+    def assert_join_fails_closed(self, join):
+        """The required join carries the check's name, runs on every outcome, and
+        its one guard step, read alone, compares both the shards' and the bench
+        job's result and is not continue-on-error."""
+        self.assertEqual(join.get("name"), "Run Python Unit Tests", "the join no longer carries the required check's name")
+        self.assertEqual(join.get("needs"), ["test-shard", "bench-tests"])
+        self.assertEqual(str(join.get("if", "")).replace(" ", ""), "${{always()}}")
+        guard = [step for step in join["steps"] if "SHARDS" in (step.get("env") or {})]
+        self.assertEqual(len(guard), 1, "the join has no single shard-result step")
+        self.assertEqual(str(guard[0].get("if", "")).replace(" ", ""), "${{always()}}")
+        # The guard step alone: a result read or a comparison in another step,
+        # one gated by its own `if` or one marked continue-on-error, would keep
+        # these substrings in the job while the gate no longer holds.
+        self.assertIsNot(guard[0].get("continue-on-error"), True, "the guard step is continue-on-error, so its red does not fail the check")
+        guard_env = guard[0].get("env") or {}
+        guard_run = guard[0].get("run", "")
+        self.assertIn("needs.test-shard.result", str(guard_env.get("SHARDS", "")), "the guard does not read the shards' result")
+        self.assertIn("needs.bench-tests.result", str(guard_env.get("BENCH", "")), "the guard does not read the bench job's result")
+        self.assertIn('"$SHARDS" != "success"', guard_run, "the guard does not fail on a shard that did not succeed")
+        self.assertIn('"$BENCH" != "success"', guard_run, "the guard does not fail on a bench job that did not succeed")
+        runs = " ".join(step.get("run", "") for step in join["steps"])
+        self.assertIn("coverage-merge", runs)
+
     def test_the_required_python_check_fails_closed_on_its_shards(self):
         """The required check is a join of three shards and the bench job, and a skip is a pass.
 
@@ -875,20 +899,23 @@ class WorkflowNameJoinTest(unittest.TestCase):
         yaml = _yaml()
         jobs = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())["jobs"]
         join, shards = jobs["test"], jobs["test-shard"]
-        self.assertEqual(join.get("name"), "Run Python Unit Tests", "the join no longer carries the required check's name")
-        self.assertEqual(join.get("needs"), ["test-shard", "bench-tests"])
-        self.assertEqual(str(join.get("if", "")).replace(" ", ""), "${{always()}}")
-        guard = [step for step in join["steps"] if "SHARDS" in (step.get("env") or {})]
-        self.assertEqual(len(guard), 1, "the join has no single shard-result step")
-        self.assertEqual(str(guard[0].get("if", "")).replace(" ", ""), "${{always()}}")
-        envs = " ".join(str((step.get("env") or {}).get("SHARDS", "")) for step in join["steps"])
-        bench_envs = " ".join(str((step.get("env") or {}).get("BENCH", "")) for step in join["steps"])
-        runs = " ".join(step.get("run", "") for step in join["steps"])
-        self.assertIn("needs.test-shard.result", envs, "the join does not read the shards' result")
-        self.assertIn("needs.bench-tests.result", bench_envs, "the join does not read the bench job's result")
-        self.assertIn('"$SHARDS" != "success"', runs, "the join does not fail on a shard that did not succeed")
-        self.assertIn('"$BENCH" != "success"', runs, "the join does not fail on a bench job that did not succeed")
-        self.assertIn("coverage-merge", runs)
+        self.assert_join_fails_closed(join)
+        # The pin must refuse a neutralised gate, not only a missing one: the
+        # bench comparison in a gated step, in a soft step, or a soft guard.
+        guard_index = next(i for i, step in enumerate(join["steps"]) if "SHARDS" in (step.get("env") or {}))
+        soft_guard = copy.deepcopy(join)
+        soft_guard["steps"][guard_index]["continue-on-error"] = True
+        moved = copy.deepcopy(join)
+        bench_step = {"name": "bench gate", "if": "${{ false }}", "env": {"BENCH": moved["steps"][guard_index]["env"].pop("BENCH")},
+                      "run": 'if [ "$BENCH" != "success" ]; then exit 1; fi'}
+        moved["steps"][guard_index]["run"] = moved["steps"][guard_index]["run"].split('if [ "$BENCH"')[0]
+        moved["steps"].append(bench_step)
+        soft_moved = copy.deepcopy(moved)
+        soft_moved["steps"][-1]["if"] = "${{ always() }}"
+        soft_moved["steps"][-1]["continue-on-error"] = True
+        for label, mutant in (("a soft guard", soft_guard), ("the bench gate in a step gated off", moved), ("the bench gate in a soft step", soft_moved)):
+            with self.subTest(mutant=label), self.assertRaises(AssertionError):
+                self.assert_join_fails_closed(mutant)
         shard_runs = " ".join(step.get("run", "") for step in shards["steps"])
         self.assertIn("COVERAGE_STRICT=1", shard_runs)
         # In the environment, not on make's command line, where it would also
@@ -898,7 +925,8 @@ class WorkflowNameJoinTest(unittest.TestCase):
         self.assertEqual(shards["strategy"]["matrix"]["shard"], list(range(1, count + 1)))
         shard_env = " ".join(str((step.get("env") or {}).get("PYTHON_TEST_SHARD", "")) for step in shards["steps"])
         self.assertIn(f"/{count}", shard_env, "a shard divides the sweep by another count than the matrix has")
-        self.assertIn(f"COVERAGE_SHARD_COUNT={count}", runs, "the join expects another shard count than the matrix has")
+        join_runs = " ".join(step.get("run", "") for step in join["steps"])
+        self.assertIn(f"COVERAGE_SHARD_COUNT={count}", join_runs, "the join expects another shard count than the matrix has")
         self.assertFalse(shards["strategy"].get("fail-fast", True), "one red shard would cancel the others")
 
     def test_the_coverage_artifact_name_join_holds(self):
