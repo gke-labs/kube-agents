@@ -2132,6 +2132,52 @@ func TestInjectReadRouteShowsAnEmptyTraceForATaskThatCalledNothing(t *testing.T)
 	}
 }
 
+// TestInjectReadRouteCarriesTheTasksUsage: the relay never posts the usage
+// artifact, so the read route is how a harness learns what the front door's
+// turn cost. The key is absent while the executor has published none, and a
+// read of the finished task carries the total over every turn's part.
+func TestInjectReadRouteCarriesTheTasksUsage(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-usage", injectTestAuthor, "list the clusters")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if usage, ok := r.probeRaw(t, reply.Conversation, reply.TaskID)["usage"]; ok {
+		t.Fatalf("usage = %s before the executor published any; want the key absent", usage)
+	}
+
+	first, err := lib.UsagePart(lib.Usage{Model: "m1", InputTokens: 1200, OutputTokens: 300, DurationMs: 2000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := lib.UsagePart(lib.Usage{Model: "m2", InputTokens: 800, OutputTokens: 100, DurationMs: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactUsage, Name: lib.ArtifactUsage,
+		Parts: []lib.Part{first}}); err != nil {
+		t.Fatal(err)
+	}
+	r.appendArtifact(t, origin, "platform", lib.Artifact{ArtifactID: lib.ArtifactUsage, Name: lib.ArtifactUsage,
+		Parts: []lib.Part{second}})
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+
+	probe := r.probe(t, reply.Conversation, reply.TaskID).Probe
+	if !probe.Final {
+		t.Fatalf("probe = %+v, want the finished task read by id", probe)
+	}
+	want := lib.Usage{Model: "m2", InputTokens: 2000, OutputTokens: 400, DurationMs: 2500}
+	if probe.Usage == nil || *probe.Usage != want {
+		t.Fatalf("probe.Usage = %+v, want %+v: the sum over the task's turns", probe.Usage, want)
+	}
+}
+
 // TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead: with no active task
 // there is no stream to read, and a read that failed learned nothing about
 // one, so the activity key is absent in both -- the same shape a door older

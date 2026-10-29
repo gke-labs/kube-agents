@@ -90,7 +90,8 @@ correctness is the lane's doing and the repetition is reported not applicable ra
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
-a record the harness's inject transport produced carries no usage at all (the gateway reports
+a record the harness's inject transport produced carries null buckets when the gateway reports
+no usage for the turn (a gateway older than the probe's `usage` field, or a turn that published
 none), so its liveness signal is the executor's own events instead — a trajectory entry named
 `a2a.status-update` whose `args.final` is true (the task ended) or whose `args.state` is `working`
 (the executor spawned the persona; a task the harness cancelled at its budget has no final entry)

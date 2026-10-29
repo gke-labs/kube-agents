@@ -477,6 +477,13 @@ type probeReport struct {
 	// Progress is the last text part of the progress artifact -- the line
 	// the relay's rolling edit shows -- at the instant of the read.
 	Progress string `json:"progress,omitempty"`
+	// Usage is what the task's turns cost as its stream holds it at the
+	// read: the sum of its usage artifact's parts (ConversationState.Usage).
+	// Absent when the executor published none, when the stream was not
+	// read, and on a door older than the field. A read that shows the task
+	// final carries every turn's, since the executor publishes each before
+	// its terminal.
+	Usage *lib.Usage `json:"usage,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1898,6 +1905,7 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string) *probe
 		Result:         truncateRunes(state.Result, injectMaxEntryBytes),
 		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
 		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
+		Usage:          state.Usage,
 	}
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.

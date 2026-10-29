@@ -215,6 +215,15 @@ EVENT_ENTRY_ACTIVITY = "a2a.activity"
 PROBE_ACTIVITY_KEY = "activity"
 PROBE_ACTIVITY_DROPPED_KEY = "activityDropped"
 PROBE_PROGRESS_KEY = "progress"
+# What the task's turns cost: the probe body's sum of the task's ``usage``
+# artifact (``ConversationState.Usage``), absent when the executor published
+# none and on a door older than the field. The executor publishes each turn's
+# usage before its terminal, so a read that shows the task final carries all
+# of it. Hermes reports the prompt whole, cached reads included, with no
+# split, so the harness maps ``inputTokens`` and ``outputTokens`` alone.
+PROBE_USAGE_KEY = "usage"
+USAGE_INPUT_KEY = "inputTokens"
+USAGE_OUTPUT_KEY = "outputTokens"
 # The keys of one activity part, as the executors publish them, and the two
 # status words with a meaning here: the api shape's default for a call the
 # part gives no status for (``ToolCall.status`` before a result is folded
@@ -714,6 +723,12 @@ class Fold:
     # adopt, so ``activity`` is an earlier read's (:meth:`note_trace_stale`).
     activity_stale: bool = False
     progress: str = ""
+    # The front door's token counts as the last read that carried them showed
+    # them (:attr:`Probe.usage`), ``None`` until one does. ``usage_settled``
+    # is whether that read showed the task final, after which no turn's usage
+    # is still to come.
+    usage: dict[str, int | None] | None = None
+    usage_settled: bool = False
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -1101,6 +1116,10 @@ class Probe:
     activity_dropped: int = 0
     activity_malformed: int = 0
     progress: str = ""
+    # The task's token counts at this read, ``{"input": n, "output": n}`` from
+    # the body's ``usage`` (:data:`PROBE_USAGE_KEY`), a count that cannot be
+    # read as ``None``; ``None`` whole when the body had no usage.
+    usage: dict[str, int | None] | None = None
     last_post: str = ""
     error: str = ""
     # The conversation's A2A contextId, from the gateway's session record;
@@ -1142,6 +1161,13 @@ class Probe:
                     malformed += 1
                 else:
                     dropped = readable
+        raw_usage = raw.get(PROBE_USAGE_KEY)
+        usage: dict[str, int | None] | None = None
+        if isinstance(raw_usage, dict):
+            usage = {
+                "input": _readable_count(raw_usage.get(USAGE_INPUT_KEY)),
+                "output": _readable_count(raw_usage.get(USAGE_OUTPUT_KEY)),
+            }
         return cls(
             backend=str(raw.get("backend") or ""),
             inject_only=bool(raw.get("injectOnly")),
@@ -1161,6 +1187,7 @@ class Probe:
             activity_dropped=dropped,
             activity_malformed=malformed,
             progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
+            usage=usage,
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
             context_id=str(raw.get("contextId") or ""),
@@ -1529,7 +1556,7 @@ class InjectTask:
         probe: Probe | None = None
         while True:
             if fold.final:
-                return self._ended(fold, task_id, probe)
+                return self._ended(fold, task_id, after, probe)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return self._classify(fold, task_id, after)
@@ -1559,9 +1586,31 @@ class InjectTask:
             if not fresh and not fold.final:
                 time.sleep(POLL_PAUSE_SECONDS)
 
-    def _ended(self, fold: Fold, task_id: str, probe: Probe | None) -> Exchange:
-        outcome = OUTCOME_NEVER_STARTED if fold.never_started else OUTCOME_TERMINAL
-        return Exchange(fold, outcome, self.conversation, task_id, probe)
+    def _ended(self, fold: Fold, task_id: str, after: int, probe: Probe | None) -> Exchange:
+        if fold.never_started:
+            return Exchange(fold, OUTCOME_NEVER_STARTED, self.conversation, task_id, probe)
+        if not fold.usage_settled:
+            self._settle_usage(fold, task_id, after)
+        return Exchange(fold, OUTCOME_TERMINAL, self.conversation, task_id, probe)
+
+    def _settle_usage(self, fold: Fold, task_id: str, after: int) -> None:
+        """One more probed read for the usage, after the relay's terminal.
+
+        The door probes before it snapshots the transcript, so the read that
+        carried the relay's terminal can hold a probe taken before the
+        executor's terminal, and with it before the turn's usage. A read made
+        now follows the terminal, and so the usage. Best effort: a read that
+        fails leaves the counts as the earlier reads had them.
+        """
+        try:
+            answered = Probe.from_body(self._poll(task_id, after, 0))
+        except InjectUnavailable as exc:
+            _log.info("inject: could not read the usage of %s after its terminal: %s", task_id, exc)
+            return
+        if answered is not None and answered.could_look and answered.task_id == task_id:
+            if answered.usage is not None:
+                fold.usage = answered.usage
+            fold.usage_settled = answered.final
 
     def _never_started(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
         """The read showed nothing on the stream past the grace: nobody took it."""
@@ -1598,6 +1647,10 @@ class InjectTask:
                 adopted = True
             if probe.progress:
                 fold.progress = probe.progress
+            if probe.usage is not None:
+                fold.usage = probe.usage
+            if probe.final:
+                fold.usage_settled = True
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come
@@ -1662,7 +1715,7 @@ class InjectTask:
             "inject: deadline read on %s for %s: %s", self.conversation, task_id, probe.describe()
         )
         if fold.final:
-            return self._ended(fold, task_id, probe)
+            return self._ended(fold, task_id, after, probe)
         if not probe.could_look:
             return self._classify_from_the_polls(fold, task_id, probe)
         if not probe.concerns(task_id):

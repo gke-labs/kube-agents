@@ -1686,6 +1686,16 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			}
 		}
 		state.Progress = lastTextPart(artifactParts(task, lib.ArtifactProgress))
+		var turns []lib.Usage
+		for _, p := range artifactParts(task, lib.ArtifactUsage) {
+			if u, ok := lib.UsageOf(p); ok {
+				turns = append(turns, u)
+			}
+		}
+		if len(turns) != 0 {
+			total := lib.UsageTotal(turns)
+			state.Usage = &total
+		}
 		if state.Final {
 			// The fold's terminal, with whose word it is: the events
 			// subject is the executor's, the supervisor subject the

@@ -295,15 +295,21 @@ _INJECT_STOP_SUFFIX = "/stop"
 _DEFAULT_HTTP_TIMEOUT = "600"
 _DEFAULT_DELEGATION_TIMEOUT = "1800"
 _DEFAULT_DELEGATION_POLL_INTERVAL = "30"
-# What ``tokens`` say on an inject record: the gateway reports no usage for
-# the turn it ran, and a null bucket is the truthful value rather than a zero
-# (``scoring.py`` reads the task's final ``a2a.status-update`` entry in the
-# trajectory as the liveness signal instead). The delegated workers are
-# another matter: when the delegation wait found the cards in the session
-# store, ``_settle`` reads the workers' sessions and their counts land under
-# ``tokens["workers"]``, beside the null top-level buckets.
+# What ``tokens`` say on an inject record: the top-level buckets are the
+# front door's turn as the read route's probe reported it (the task's
+# ``usage`` artifact, :func:`_inject_tokens`). Hermes reports the prompt whole
+# with no cached or reasoning split, so ``input`` counts cached reads too and
+# ``cached`` and ``reasoning`` stay null. A gateway older than the field, or a
+# turn that published no usage, leaves every bucket null, which is the
+# truthful value rather than a zero (``scoring.py`` reads the task's final
+# ``a2a.status-update`` entry in the trajectory as the liveness signal then).
+# The delegated workers are another matter: when the delegation wait found
+# the cards in the session store, ``_settle`` reads the workers' sessions and
+# their counts land under ``tokens["workers"]``, beside the top-level buckets.
 _INJECT_TOKENS_NOTE = (
-    "the inject transport carries no token usage for the turn; its buckets are null, and "
+    "the inject transport's top-level buckets are the front door's turn as the gateway "
+    "reported it: input counts cached reads too, and cached and reasoning are null since "
+    "Hermes reports no split; every bucket is null when the gateway reported no usage; "
     "tokens.workers holds the delegated workers' counts when the delegation wait read them"
 )
 # The case and repetition the presubmit is running (hack/ci-eval-pr.sh exports
@@ -1669,6 +1675,23 @@ def _inject_identity() -> tuple[str, str, str]:
     return _mint_run_id(), case, repetition
 
 
+def _inject_tokens(usage: dict[str, int | None] | None) -> dict[str, int | None]:
+    """The record's buckets from the front door's usage (``Fold.usage``).
+
+    ``input`` and ``output`` as the probe carried them and ``total`` their
+    sum; every bucket null when the probe carried neither count.
+    """
+    tokens = empty_tokens()
+    if usage is None:
+        return tokens
+    counts = [usage.get(bucket) for bucket in ("input", "output")]
+    if all(count is None for count in counts):
+        return tokens
+    tokens["input"], tokens["output"] = counts
+    tokens["total"] = sum(count for count in counts if count is not None)
+    return tokens
+
+
 def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> AgentResult:
     """Map a folded conversation onto the canonical result.
 
@@ -1685,8 +1708,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     cannot show it writes neither, and the scorer sets router-scope
     ``tool_called`` checks with no ``result`` pattern aside then, or when
     the marker reports a loss).
-    Tokens stay null -- the gateway reports no usage -- and ``metadata``
-    says so rather than inventing a number. ``identity`` is the run, case
+    Tokens are the front door's usage as the probe reported it, null when
+    it reported none (:func:`_inject_tokens`), and ``metadata`` says which
+    buckets mean what. ``identity`` is the run, case
     and repetition the key and message id were built from,
     stored beside the task id so the record joins to the gateway's ingress
     log.
@@ -1695,7 +1719,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     return AgentResult(
         output=fold.deliverable,
         trajectory=list(fold.trajectory),
-        tokens=empty_tokens(),
+        tokens=_inject_tokens(fold.usage),
         errors=[],
         metadata={
             "transport": TRANSPORT_INJECT,
@@ -3398,8 +3422,8 @@ class KubeAgentsHarness(AgentHarness):
         could be billed. On the api transport they are added into the run's
         top-level buckets later, in :meth:`_execute`, after the front door's
         session row is read (:func:`_fold_worker_tokens` says why the order
-        matters). On the inject transport the top-level buckets stay null (the
-        gateway reports no usage) and the counts stay under ``workers``.
+        matters). On the inject transport the top-level buckets stay the front
+        door's (:func:`_inject_tokens`) and the counts stay under ``workers``.
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)

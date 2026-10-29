@@ -326,6 +326,10 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # The conversation's contextId, which the door reports from the session
     # record on every probed read; "" is a door older than the field.
     probe_context_id: str = ""
+    # The task's usage as a door that reports it carries it on a read that
+    # names the task (``usage``); None is a door older than the field, or a
+    # turn that published none, and sends no key.
+    probe_usage: dict[str, Any] | None = None
 
     def poll_fails(self) -> bool:
         """Whether this GET is one of the scripted failures."""
@@ -367,6 +371,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
                 report["activityDropped"] = self.probe_activity_dropped
             if self.probe_progress:
                 report["progress"] = self.probe_progress
+        if self.probe_usage is not None and task == self.task_id:
+            report["taskId"] = self.task_id
+            report["usage"] = dict(self.probe_usage)
         if active:
             # Scripted states advance per read of the ACTIVE task, so the
             # preflight read (before any POST) does not consume one.
@@ -3285,3 +3292,105 @@ def test_a_stop_that_drops_once_in_transport_is_retried(
 
     assert drops == [1]
     assert answers[0][0] is True
+
+
+# --- The front door's token usage. The executor publishes each turn's usage
+# artifact before its terminal, the door's probe carries the task's total
+# (``usage``), and the harness maps its two counts into the record's
+# top-level buckets. A door older than the field sends no key, and the
+# buckets stay null with the note saying why.
+
+USAGE = {"model": "gemini-2.5-pro", "inputTokens": 1500, "outputTokens": 200, "durationMs": 9000}
+
+
+def test_the_front_doors_usage_fills_the_top_level_buckets(stub_gateway: _StubGatewayServer) -> None:
+    """``input``, ``output`` and their ``total`` from the probe; ``cached``
+    and ``reasoning`` stay null, since Hermes reports no split."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
+    stub_gateway.probe_usage = USAGE
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.output == "all quiet"
+    assert result.tokens == {
+        "input": 1500,
+        "cached": None,
+        "cache_write": None,
+        "reasoning": None,
+        "output": 200,
+        "total": 1700,
+    }
+    assert result.metadata["tokens_note"] == harness._INJECT_TOKENS_NOTE
+
+
+def test_a_door_that_reports_no_usage_leaves_the_buckets_null(stub_gateway: _StubGatewayServer) -> None:
+    """A gateway older than the field: no ``usage`` key, every bucket null,
+    and the note on the result says what the nulls mean."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert all(v is None for v in result.tokens.values())
+    assert result.metadata["tokens_note"] == harness._INJECT_TOKENS_NOTE
+
+
+def test_usage_with_no_readable_count_leaves_the_buckets_null() -> None:
+    """A usage carrying only a duration, or counts this side cannot read,
+    is no token count: the buckets stay null rather than reading zero."""
+    for raw in ({"durationMs": 500}, {"inputTokens": "many", "outputTokens": -3}):
+        probe = inject.Probe.from_body(probe_body(usage=raw))
+        assert probe is not None and probe.usage == {"input": None, "output": None}
+        assert all(v is None for v in harness._inject_tokens(probe.usage).values())
+    assert harness._inject_tokens({"input": 1200, "output": None})["total"] == 1200
+
+
+def test_usage_is_read_again_after_a_terminal_its_probe_predates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The door probes before it snapshots the transcript, so the read that
+    carries the relay's terminal can hold a probe from before the executor's
+    terminal, and before the usage published ahead of it. One more probed
+    read follows the terminal and carries it; a wait whose probe already
+    showed the task final makes no such read."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    reads: list[bool] = []
+
+    def scripted(bodies: list[dict[str, Any]]):
+        replies = list(bodies)
+
+        def _poll(task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
+            reads.append(probe)
+            return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        return _poll
+
+    running = {
+        "entries": running_transcript("task-1"),
+        "lastSeq": 3,
+        "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
+    }
+    relay_terminal = {
+        "entries": [
+            entry(4, inject.ENTRY_POST, text="done", messageId=RESULT_ID),
+            entry(5, inject.ENTRY_TERMINAL, taskId="task-1", state="completed",
+                  source=inject.TERMINAL_SOURCE_EXECUTOR),
+        ],
+        "lastSeq": 5,
+        "probe": {"active": True, "taskId": "task-1", "executorState": "working"},
+    }
+    settled = probe_body(final=True, executorState="completed", usage=USAGE)
+    settled["lastSeq"] = 5
+    monkeypatch.setattr(task, "_poll", scripted([running, relay_terminal, settled]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_TERMINAL
+    assert exchange.fold.usage == {"input": 1500, "output": 200}
+    assert reads == [True, True, True]
+
+    reads.clear()
+    final_with_usage = {
+        **relay_terminal,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed", "usage": USAGE},
+    }
+    monkeypatch.setattr(task, "_poll", scripted([running, final_with_usage]))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.fold.usage == {"input": 1500, "output": 200}
+    assert reads == [True, True]
