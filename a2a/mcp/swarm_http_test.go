@@ -78,13 +78,13 @@ const (
 )
 
 // swarmServer is a handler serving the swarm route from a fresh bus, with the
-// TASKS window, drain limit and byte cap restored after the test.
+// TASKS window and drain limit restored after the test.
 func swarmServer(t *testing.T) (http.Handler, jetstream.JetStream, *Conversations) {
 	t.Helper()
 	url, js := testBus(t)
 	convs := NewConversations()
-	oldWindow, oldLimit, oldBytes := swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes
-	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes = oldWindow, oldLimit, oldBytes })
+	oldWindow, oldLimit := swarmTaskWindow, swarmTaskLimit
+	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit = oldWindow, oldLimit })
 	return Handler(mustServer(t), writeToken(t, testToken), quietLog(), WithSwarm(dial(t, url), convs)), js, convs
 }
 
@@ -164,7 +164,7 @@ func TestTheSwarmRouteBoundsItsBody(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("a body that fails to read = %d, want 400: only an oversized body is 413", rec.Code)
 	}
-	for _, body := range []string{`[]`, `{"conversations":5}`, `{"ledger":"x"}`, `not json`, `{} {}`} {
+	for _, body := range []string{`[]`, `{"conversations":5}`, `{"ledger":"x"}`, `not json`, `{} {}`, `null`, ` null `} {
 		if rec := postSwarm(h, swarmAuth, body); rec.Code != http.StatusBadRequest {
 			t.Errorf("body %s = %d, want 400", body, rec.Code)
 		}
@@ -241,7 +241,8 @@ func TestTheSwarmRouteIgnoresTheDeployment(t *testing.T) {
 // nothing delegated, and one older than the window are not. A second call
 // with the returned ledger posts nothing again.
 func TestTheSwarmRouteProjectsTheConversationsTasks(t *testing.T) {
-	h, js, _ := swarmServer(t)
+	sh, _, js := swarmBus(t)
+	h := Handler(mustServer(t), writeToken(t, testToken), quietLog(), func(c *handlerConfig) { c.swarm = sh })
 	publishSubmission(t, js, "s-triage", "t-old", consoleConversationPrefix+convTriage, "old work", "")
 	publishRun(t, js, "s-triage", "t-old", "old answer", true)
 	time.Sleep(100 * time.Millisecond)
@@ -261,7 +262,11 @@ func TestTheSwarmRouteProjectsTheConversationsTasks(t *testing.T) {
 		"rootConversationId": "agy-root",
 		"conversations":      map[string]any{"triage": clientConv("triage", convTriage, time.Now())},
 	}
-	swarmTaskWindow = time.Since(boundary)
+	// The read's clock is fixed, so the window starts at the boundary
+	// exactly, however long the call takes to reach the read.
+	now := time.Now()
+	sh.now = func() time.Time { return now }
+	swarmTaskWindow = now.Sub(boundary)
 	resp, _ := askSwarm(t, h, req)
 	if !resp.Connected || len(resp.Notes) != 1 {
 		t.Fatalf("connected %v, notes %q", resp.Connected, resp.Notes)
@@ -286,7 +291,6 @@ func TestTheSwarmRouteProjectsTheConversationsTasks(t *testing.T) {
 	}
 
 	req["ledger"] = resp.Ledger
-	swarmTaskWindow = time.Since(boundary)
 	again, _ := askSwarm(t, h, req)
 	if len(again.Snapshot.NewMessages) != 0 {
 		t.Errorf("a second call with the ledger posted again:\n%s", boardTexts(again.Snapshot))
@@ -531,52 +535,49 @@ func TestTheSwarmRouteReadsTheNewestTasks(t *testing.T) {
 	}
 }
 
-// Past maxSwarmReadBytes the read keeps nothing more, and says so.
-func TestTheSwarmRouteCapsTheBytesItKeeps(t *testing.T) {
-	h, js, _ := swarmServer(t)
-	for i := 0; i < 4; i++ {
-		id := fmt.Sprintf("t-%d", i)
-		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
-		publishRun(t, js, "s-triage", id, "", false)
-	}
-	maxSwarmReadBytes = 2048
-	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{"triage": clientConv("triage", convTriage, time.Now())}})
-	if !hasNote(resp, "older events were let go") {
-		t.Errorf("notes = %q, want the byte cap reported", resp.Notes)
-	}
-}
-
-// Past the byte cap the read lets its OLDEST events go, so the newest task
-// keeps its state and the oldest is shown by its submission alone.
-func TestTheSwarmReadKeepsTheNewestEventsUnderTheCap(t *testing.T) {
-	url, js := testBus(t)
-	for i := 0; i < 4; i++ {
-		id := fmt.Sprintf("t-%d", i)
-		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
-		publishRun(t, js, "s-triage", id, "", false)
-	}
-	old := maxSwarmReadBytes
-	maxSwarmReadBytes = 2048
-	t.Cleanup(func() { maxSwarmReadBytes = old })
-	read, err := dial(t, url).swarmTasks(context.Background(), time.Now().Add(-time.Hour))
-	if err != nil {
+// A window holding more than the bus reader's byte budget is read from
+// further on until it fits, so the newest task keeps its state, the oldest
+// are what goes, and the notes say so. The reader delivers oldest first and
+// stops at its budget, so without that the newest would be what went.
+func TestTheSwarmReadKeepsTheNewestPastTheReadBudget(t *testing.T) {
+	h, _, js := swarmBus(t)
+	// The test bus caps each stream at 1 MiB; this one must hold more than
+	// the reader's budget.
+	cfg := jetstream.StreamConfig{Name: lib.TasksStream, Subjects: []string{"a2a.tasks.>"}, MaxBytes: 4 * readMaxBytes}
+	if _, err := js.UpdateStream(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !read.bytesCapped {
-		t.Fatal("the read did not reach the cap; the test publishes too little")
+	big := strings.Repeat("x", 600<<10)
+	// About three times the budget, so only reading from the newer half
+	// fits within swarmReadNarrowings tries.
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("t-old%d", i)
+		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
+		publishArtifact(t, js, "s-triage", id, lib.ArtifactResult, big)
 	}
-	byID := map[string]SwarmTask{}
-	for _, task := range read.tasks {
-		byID[task.TaskID] = task
+	publishSubmission(t, js, "s-triage", "t-new", consoleConversationPrefix+convTriage, "the newest turn", "")
+	publishRun(t, js, "s-triage", "t-new", answerText, true)
+
+	set := h.taskSet(context.Background())
+	var newest *SwarmTask
+	for i := range set.tasks {
+		if set.tasks[i].TaskID == "t-new" {
+			newest = &set.tasks[i]
+		}
 	}
-	if len(byID) != 4 {
-		t.Fatalf("read %d tasks, want all 4 by their submissions", len(byID))
+	if newest == nil || newest.Task == nil || newest.Task.State != lib.StateCompleted {
+		t.Fatalf("the newest task = %+v, want it read with its state", newest)
 	}
-	if byID["t-3"].Task == nil {
-		t.Error("the newest task lost its events under the cap")
+	if len(set.tasks) >= 21 {
+		t.Errorf("read all %d tasks; the test publishes too little to pass the budget", len(set.tasks))
 	}
-	if byID["t-0"].Task != nil {
-		t.Error("the oldest task kept its events under the cap; the newest should have been kept instead")
+	if !slices.ContainsFunc(set.notes, func(n string) bool { return strings.Contains(n, "only its newest messages were read") }) {
+		t.Errorf("notes = %q, want the narrowed read reported", set.notes)
+	}
+	for _, n := range set.notes {
+		if strings.Contains(n, "partial") || strings.Contains(n, "oldest were not read") {
+			t.Errorf("a narrowed read that fits reported %q", n)
+		}
 	}
 }
 
@@ -586,8 +587,15 @@ func TestTheSwarmRouteSetsTheRootConversation(t *testing.T) {
 		{"agy-root-1", "agy-root-1"},
 		{"", ""},
 		{"bad\x01id", ""},
-		{strings.Repeat("é", maxSwarmConversationIDRunes+1), ""},
-		{strings.Repeat("é", maxSwarmConversationIDRunes), strings.Repeat("é", maxSwarmConversationIDRunes)},
+		{"  agy-root-2  ", "agy-root-2"},
+		{"../../x", ""},
+		{"a/b", ""},
+		{".hidden", ""},
+		{"CON", ""},
+		{"a b", ""},
+		{"é", ""},
+		{strings.Repeat("r", maxConversationIDBytes+1), ""},
+		{strings.Repeat("r", maxConversationIDBytes), strings.Repeat("r", maxConversationIDBytes)},
 	} {
 		resp, _ := askSwarm(t, h, map[string]any{"rootConversationId": tc.root})
 		for _, name := range []string{swarmMemberCoordinator, swarmMemberPlatform} {
@@ -630,13 +638,13 @@ func TestTheSwarmResponseIsTheBridges(t *testing.T) {
 }
 
 // swarmBus is a fresh bus, its connection, and a swarm handler on them with
-// the TASKS window, drain limit and byte cap restored after the test.
+// the TASKS window and drain limit restored after the test.
 func swarmBus(t *testing.T) (*swarmHandler, *NATSBus, jetstream.JetStream) {
 	t.Helper()
 	url, js := testBus(t)
 	bus := dial(t, url)
-	oldWindow, oldLimit, oldBytes := swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes
-	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes = oldWindow, oldLimit, oldBytes })
+	oldWindow, oldLimit := swarmTaskWindow, swarmTaskLimit
+	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit = oldWindow, oldLimit })
 	return &swarmHandler{bus: bus, convs: NewConversations()}, bus, js
 }
 
@@ -740,7 +748,9 @@ func TestASteerIsNotTheSubmission(t *testing.T) {
 	if got := read.tasks[0]; got.Prompt != "" || !got.Submitted.Before(boundary) || got.Conversation != consoleConversationPrefix+convTriage {
 		t.Errorf("task = prompt %q, submitted %v (window from %v), conversation %q", got.Prompt, got.Submitted, boundary, got.Conversation)
 	}
-	swarmTaskWindow = time.Since(boundary)
+	now := time.Now()
+	sh.now = func() time.Time { return now }
+	swarmTaskWindow = now.Sub(boundary)
 	resp := sh.answer(context.Background(), swarmRequest{Conversations: map[string]swarmConversationEntry{"triage": {Token: convTriage, LastUsedAt: time.Now()}}}, time.Now())
 	all := string(swarmJSON(t, resp.Snapshot))
 	if !strings.Contains(all, "t-straddle") || strings.Contains(all, "STEER") {
@@ -873,7 +883,9 @@ func TestACutShortSwarmReadIsNotCached(t *testing.T) {
 	req := swarmRequest{Conversations: map[string]swarmConversationEntry{"triage": {Token: convTriage, LastUsedAt: time.Now()}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	sh.answer(ctx, req, time.Now())
+	if first := sh.answer(ctx, req, time.Now()); !hasNote(first, "the TASKS read was partial") {
+		t.Errorf("a cut-short read was not reported in notes: %q", first.Notes)
+	}
 	if b := boardTexts(sh.answer(context.Background(), req, time.Now()).Snapshot); !strings.Contains(b, "t-1") {
 		t.Errorf("the cut-short read was cached:\n%s", b)
 	}
@@ -902,32 +914,23 @@ func TestTheSwarmRouteGivesSessionMembersTheirConversationID(t *testing.T) {
 	}
 }
 
-// A task's record is bounded too: prompts are charged against the byte cap
-// and dropped once it is spent, and an over-long conversation reference is
-// not kept.
+// A task's record is bounded too: a prompt is capped at maxSwarmPromptRunes,
+// and an over-long conversation reference is not kept.
 func TestTheSwarmReadBoundsWhatATaskKeeps(t *testing.T) {
 	url, js := testBus(t)
-	long := strings.Repeat("p", 3000)
-	for i := 0; i < 3; i++ {
-		publishSubmission(t, js, "s-triage", fmt.Sprintf("t-%d", i), consoleConversationPrefix+convTriage, long, "")
-	}
+	publishSubmission(t, js, "s-triage", "t-long", consoleConversationPrefix+convTriage, strings.Repeat("p", maxSwarmPromptRunes+1000), "")
 	publishSubmission(t, js, "s-triage", "t-longref", consoleConversationPrefix+strings.Repeat("c", maxSwarmRefBytes), "q", "")
-	old := maxSwarmReadBytes
-	maxSwarmReadBytes = 4000
-	t.Cleanup(func() { maxSwarmReadBytes = old })
 	read, err := dial(t, url).swarmTasks(context.Background(), time.Now().Add(-time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	prompts := 0
 	for _, task := range read.tasks {
-		prompts += len(task.Prompt)
+		if n := utf8.RuneCountInString(task.Prompt); n > maxSwarmPromptRunes {
+			t.Errorf("%s kept a %d-rune prompt; the cap is %d", task.TaskID, n, maxSwarmPromptRunes)
+		}
 		if task.TaskID == "t-longref" && task.Conversation != "" {
 			t.Errorf("an over-long conversation reference was kept (%d bytes)", len(task.Conversation))
 		}
-	}
-	if prompts > maxSwarmReadBytes || !read.bytesCapped {
-		t.Errorf("kept %d prompt bytes under a %d cap (capped=%v)", prompts, maxSwarmReadBytes, read.bytesCapped)
 	}
 }
 
