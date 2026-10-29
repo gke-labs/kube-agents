@@ -2534,9 +2534,16 @@ class KubeAgentsHarness(AgentHarness):
                         settled.fold.terminal_source,
                         settled.fold.terminal_reason,
                     )
-                    # The settle's usage read follows the terminal, so it
-                    # holds every turn the front door ran, one that finished
-                    # between the deadline and the cancel included.
+                # The settle's usage read follows the terminal, so it holds
+                # every turn the chain ran, one that finished between the
+                # deadline and the cancel included -- whether the relay
+                # posted that terminal inside the settle or the settle
+                # adopted it off the stream.
+                if timed_out and settled is not None and (
+                    settled.fold.usage is not None
+                    or settled.fold.child_usage is not None
+                    or settled.fold.usage_partial
+                ):
                     exchange.fold.usage = settled.fold.usage
                     exchange.fold.child_usage = settled.fold.child_usage
                     exchange.fold.usage_partial = settled.fold.usage_partial

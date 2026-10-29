@@ -3554,3 +3554,49 @@ def test_status_turns_sum_the_tiers_and_the_flag() -> None:
     assert (base["input"], base["output"], base["total"]) == (30, 3, 47)
     assert base["children"] == {"input": 12, "output": 2, "total": 14}
     assert base["usage_partial"] is True
+
+
+def test_usage_is_read_after_a_terminal_adopted_off_the_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the relay never posts the terminal the stream shows, the fold is
+    adopted off the stream (``OUTCOME_STREAM_TERMINAL``), and the usage read
+    follows that terminal the same as a relay-posted one."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(inject, "FINISHED_SETTLE_SECONDS", 0.05)
+    stream_final = {
+        "entries": running_transcript("task-1"),
+        "lastSeq": 3,
+        "probe": {"active": True, "taskId": "task-1", "final": True, "executorState": "completed",
+                  "terminalSource": inject.TERMINAL_SOURCE_EXECUTOR, "result": "done"},
+    }
+    monkeypatch.setattr(
+        task, "_poll",
+        lambda task_id, after, budget, *, probe=True: stream_final if probe else {**stream_final, "entries": [], "probe": None},
+    )
+    monkeypatch.setattr(inject, "_request", lambda *args, **kwargs: probe_body(usage=USAGE))
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert exchange.fold.usage == {"input": 1500, "output": 200}
+
+
+def test_a_cancel_settle_adopted_off_the_stream_still_carries_the_usage(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The settle carries its usage onto the record whichever way it learned
+    the terminal: here the relay never posted it and the settle adopted it
+    off the stream, so the terminal is not copied, and the usage still is."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    def cancel(self: Any, task_id: str = "", *, settle: float | None = None) -> inject.Exchange:
+        fold = inject.Fold(task_id)
+        fold.mark_terminal("canceled", inject.TERMINAL_SOURCE_EXECUTOR, "reason: canceled-by-request")
+        fold.usage = {"input": 1500, "output": 200}
+        return inject.Exchange(fold, inject.OUTCOME_STREAM_TERMINAL, self.conversation, task_id, None)
+
+    monkeypatch.setattr(inject.InjectTask, "cancel", cancel)
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert any("did not reach a terminal state" in e for e in result.errors)
+    assert (result.tokens["input"], result.tokens["output"], result.tokens["total"]) == (1500, 200, 1700)
