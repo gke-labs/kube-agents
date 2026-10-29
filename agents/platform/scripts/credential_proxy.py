@@ -2898,16 +2898,13 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     return True
             else:
                 if isinstance(parsed, dict):
-                    for key in AGENT_API_SESSION_BODY_KEYS:
-                        if key in parsed and parsed[key] is not None:
-                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
-                                parsed[key], workspace_root
-                            ):
-                                return True
+                    named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
+                    if any(not isinstance(value, str) for value in named):
+                        return True
                     # Any other top-level string short enough to be a session id is
                     # checked too, so a field the harness reads an id from doesn't
                     # need to be named here first.
-                    candidates = {
+                    candidates = set(named) | {
                         value
                         for key, value in parsed.items()
                         if key not in AGENT_API_SESSION_BODY_KEYS
