@@ -8163,6 +8163,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertIn("not known", result["kcc_unread"])
         self.assertNotIn("kcc_unready", result)
 
+    def test_a_timed_out_gcp_read_names_the_timeout_it_had(self):
+        """collect.py passes its own timeout to `kcc_health.entry_fields`, so
+        `kcc_unread` states the timeout the read really had."""
+        with mock.patch.object(collect, "KCC_READ_TIMEOUT_S", 7):
+            result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 7.0))
+        self.assertIn("did not finish in 7s", result["kcc_unread"])
+
     def test_a_cluster_without_config_connector_gets_neither_key(self):
         result = self.run_with()
         self.assertNotIn("kcc_unready", result)

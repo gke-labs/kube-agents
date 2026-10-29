@@ -404,5 +404,24 @@ class DeadlineTest(unittest.TestCase):
         self.assertIn("RuntimeError", manifest["clusters"][0]["kcc_unread"])
 
 
+class CopiedConstantsTest(unittest.TestCase):
+    """kcc_health.py cannot import collect.py at load time (collect.py imports
+    it), so it copies these constants; this holds each copy equal."""
+
+    def test_the_copies_equal_collects(self):
+        pairs = {
+            "READ_TIMEOUT_S": collect.KCC_READ_TIMEOUT_S,
+            "CREDENTIALS_TIMEOUT_S": collect.DEFAULT_TIMEOUT_S,
+            "MAX_WHY_CHARS": collect.MAX_KCC_WEDGE_MESSAGE_CHARS,
+            "TIMEOUT_RC": collect.TIMEOUT_RC,
+            "RESOURCE_TYPE_ABSENT_MARKER": collect.RESOURCE_TYPE_ABSENT_MARKER,
+            "KCC_CATEGORY": collect.KCC_CATEGORY,
+            "KCC_READY_CONDITION": collect.KCC_READY_CONDITION,
+        }
+        for name, source in pairs.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(kcc_health, name), source)
+
+
 if __name__ == "__main__":
     unittest.main()

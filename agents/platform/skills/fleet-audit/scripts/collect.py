@@ -8387,7 +8387,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # The same read, as the manifest entry's `kcc_unready` or `kcc_unread`
     # key, so `finish` can say when a fix edits a declaration Config Connector
     # does not apply. No second read.
-    context["kcc_health"] = kcc_health.entry_fields(kcc_parsed, kcc_result.rc, kcc_result.stderr)
+    context["kcc_health"] = kcc_health.entry_fields(kcc_parsed, kcc_result.rc, kcc_result.stderr, KCC_READ_TIMEOUT_S)
     # `run_and_gate` returns `None` for four different things, and only one of
     # them means "no Config Connector here". Collapsing them would publish
     # "Config Connector is not installed on this cluster" as the audit's own
