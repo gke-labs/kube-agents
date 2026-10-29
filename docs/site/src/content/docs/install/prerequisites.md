@@ -99,6 +99,8 @@ The first command omits a key whose value is unset, so a requirement that is not
 
 A new bus runs three NATS servers on separate nodes, so that one node drain or upgrade takes one server and the bus stays up. An install from before that default keeps its one server. Setting `spec.harness.tuning.busReplicas: 3` converts it, and conversion empties the bus once: task history, the topics journal and the KV buckets start over. With fewer than three nodes, the third waits `Pending` until a node joins. Autopilot and an autoscaled pool add one. A Standard cluster that cannot grow to three nodes should set `spec.harness.tuning.busReplicas: 1`. That runs one server, which is down for as long as its pod restarts.
 
+The Terraform full install sets it to 1 on a zonal Standard cluster it creates, and sets it again on every apply. To run three servers there after adding nodes, set `platformAgent.harness.tuning.busReplicas: 3` in `extra_helm_values`, not on the CR, or the next apply converts the bus back.
+
 The chart's quota check counts a `today` release only, not the `spec.mode: next` additions in the capacity row above or the session pods. Autopilot sizes nodes to fit; on a Standard cluster, check the free allocatable against those figures, or a session pod stays `Pending` when one is asked for.
 
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 7

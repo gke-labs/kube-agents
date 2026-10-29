@@ -5628,8 +5628,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// A conversion empties the bus once the last server restarts into the new
 	// shape, so the provisioned-once record no longer describes it. Dropping
 	// it makes the provision Job count toward Ready again until the new one,
-	// held until the bus has rolled out, completes.
-	if converting {
+	// held until the bus has rolled out, completes. A persisted count other
+	// than the resolved one is a conversion whose pass failed after the
+	// StatefulSet apply and before any status write: the StatefulSet already
+	// runs the new count, so only the record still says the drop is owed.
+	if converting || (state.busReplicasPersisted != 0 && state.busReplicasPersisted != agent.Status.BusReplicas) {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
 	}
 
@@ -6477,12 +6480,8 @@ func a2aNATSServingReplicas(sts *appsv1.StatefulSet) int32 {
 // read. The StatefulSet comes from the informer; the pods are listed only when
 // a server is short.
 func (r *PlatformAgentReconciler) a2aNATSShortNote(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
-	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil || sts.Spec.Replicas == nil {
-		return ""
-	}
-	want, ready := *sts.Spec.Replicas, sts.Status.ReadyReplicas
-	if ready >= want {
+	want, ready, isShort := r.a2aNATSShort(ctx, agent)
+	if !isShort {
 		return ""
 	}
 	note := fmt.Sprintf("The A2A bus is serving on %d of %d NATS servers", ready, want)
@@ -6492,6 +6491,11 @@ func (r *PlatformAgentReconciler) a2aNATSShortNote(ctx context.Context, agent *a
 	}
 	var short []string
 	for i := range pods.Items {
+		// A pod on its way out is the one being replaced; its successor
+		// carries the reason.
+		if pods.Items[i].DeletionTimestamp != nil {
+			continue
+		}
 		if why := a2aNATSPodNotReadyReason(&pods.Items[i]); why != "" {
 			short = append(short, pods.Items[i].Name+": "+why)
 		}
@@ -7172,4 +7176,30 @@ func (r *PlatformAgentReconciler) reconcileA2ANATSClusterObjects(ctx context.Con
 		}
 	}
 	return nil
+}
+
+// a2aNATSShort reports a bus StatefulSet with fewer Ready servers than its
+// count.
+func (r *PlatformAgentReconciler) a2aNATSShort(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (want, ready int32, short bool) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil || sts.Spec.Replicas == nil {
+		return 0, 0, false
+	}
+	want, ready = *sts.Spec.Replicas, sts.Status.ReadyReplicas
+	return want, ready, ready < want
+}
+
+// a2aBusNeedsRecheck is whether a pass that reached the end of Reconcile
+// on a next install must come round again in 30 seconds: provisioning still
+// running, the gateway held or waking (Reconcile's comment), or a bus server
+// short of the count. Pods are not watched, so a short server's reason
+// changing (Unschedulable to ImagePullBackOff, or back to Ready) wakes
+// nothing, and the Ready message's note (a2aNATSShortNote) would stand stale
+// until the 15-minute re-probe.
+func (r *PlatformAgentReconciler) a2aBusNeedsRecheck(ctx context.Context, agent *agentv1alpha1.PlatformAgent, state a2aProvisionState) bool {
+	if !state.done || state.gatewayHeld || state.gatewayWaking {
+		return true
+	}
+	_, _, short := r.a2aNATSShort(ctx, agent)
+	return short
 }

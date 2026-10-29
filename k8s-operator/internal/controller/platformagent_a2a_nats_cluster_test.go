@@ -1154,3 +1154,84 @@ func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 		}
 	}
 }
+
+// Pods are not watched, so the short server's note follows its pod only if a
+// short bus requeues on a provisioned, Ready pass; and the note skips a pod
+// on its way out, which its successor replaces.
+func TestAShortBusRequeuesAndItsNoteSkipsATerminatingPod(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Status = appsv1.StatefulSetStatus{Replicas: 3, ReadyReplicas: 2}
+	leaving := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: a2aNATSName(agent) + "-2", Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)},
+		DeletionTimestamp: ptr.To(metav1.Now()), Finalizers: []string{"test/hold"},
+	}}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(sts, leaving).WithStatusSubresource(&appsv1.StatefulSet{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	settled := a2aProvisionState{done: true}
+	if !r.a2aBusNeedsRecheck(ctx, agent, settled) {
+		t.Error("a provisioned bus one server short does not requeue; its Ready note would stand stale until the 15-minute re-probe")
+	}
+	if note := r.a2aNATSShortNote(ctx, agent); strings.Contains(note, "-2:") {
+		t.Errorf("note names a terminating pod: %q", note)
+	}
+	sts.Status.ReadyReplicas = 3
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	if r.a2aBusNeedsRecheck(ctx, agent, settled) {
+		t.Error("a provisioned, fully Ready bus requeues at 30s")
+	}
+}
+
+// A converting pass that fails after the StatefulSet apply writes no status,
+// so the CR keeps BusProvisioned and the old count. The retry finds the
+// StatefulSet already at the new count, no conversion by the StatefulSet's
+// account; the persisted count still differs, and the record is dropped.
+func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	failCallout := false
+	base := fakeServerSideApplyInterceptors()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, isDep := obj.(*appsv1.Deployment); failCallout && isDep && obj.GetName() == a2aCalloutName(agent) {
+					return fmt.Errorf("injected: the apply after the bus StatefulSet fails")
+				}
+				return base.Patch(ctx, c, obj, patch, opts...)
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusReplicas != 3 || !busProvisioned(agent) {
+		t.Fatalf("precondition: status.busReplicas = %d, BusProvisioned = %v; want 3 and set", agent.Status.BusReplicas, busProvisioned(agent))
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+
+	// The converting pass, on a copy: it fails, so none of its in-memory
+	// status reaches the CR the retry reads.
+	failCallout = true
+	if _, err := r.reconcileA2A(ctx, agent.DeepCopy()); err == nil {
+		t.Fatal("precondition: the injected failure did not fail the converting pass")
+	}
+	failCallout = false
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil || ptr.Deref(sts.Spec.Replicas, 0) != 1 {
+		t.Fatalf("precondition: the failed pass did not land the StatefulSet at 1 (err=%v replicas=%v)", err, sts.Spec.Replicas)
+	}
+
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if busProvisioned(agent) {
+		t.Error("BusProvisioned survived the retry of a converting pass that failed after the StatefulSet apply; the CR reads Ready over an emptied bus")
+	}
+}
