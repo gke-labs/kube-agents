@@ -1292,6 +1292,7 @@ class Failures(Base):
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn("is not this job's ledger; refusing to overwrite it", out)
+        self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)))
         self.assertEqual(sandbox.calls, [])
         self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"something": "else"}')
 
@@ -1352,7 +1353,8 @@ class Failures(Base):
         ), mock.patch.object(watch.sandbox_exec, "run", side_effect=unset), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
-        self.assertIn("the tick failed: RuntimeError: no GCP project: set UPGRADE_READINESS_PROJECTS or GCP_PROJECT_ID", out.getvalue())
+        self.assertIn("the tick failed: NoProject: no GCP project: set UPGRADE_READINESS_PROJECTS or GCP_PROJECT_ID", out.getvalue())
+        self.assertTrue(out.getvalue().startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_NO_PROJECT, next=watch.FAILED_NEEDS_ADMIN)))
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
     def test_a_persisting_failure_is_announced_once_and_its_recovery_once(self) -> None:
@@ -2937,11 +2939,24 @@ class PlainFailureLine(unittest.TestCase):
             (watch.ProjectUnresolved("number"), watch.FAILED_REASON_UNRESOLVED),
             (watch.SandboxTimedOut("slow"), watch.FAILED_REASON_TIMED_OUT),
             (watch.WriteFailed("disk full"), watch.FAILED_REASON_WRITE),
+            (watch.RosterMisspelled("spelling"), watch.FAILED_REASON_ROSTER),
+            (watch.NoProject("none"), watch.FAILED_REASON_NO_PROJECT),
+            (watch.LedgerUnusable("not JSON"), watch.FAILED_REASON_LEDGER),
             (OSError("cannot fork"), watch.FAILED_REASON_ERROR),
         )
         for error, reason in cases:
             with self.subTest(error=error):
                 self.assertEqual(watch.failure_reason(error), reason)
+
+    def test_a_configuration_fault_ends_on_the_admin_sentence(self) -> None:
+        """A retry does not change the roster, the project or the ledger, so none promises one."""
+        self.roster("10 10 * * *")
+        for error in (watch.RosterMisspelled("spelling"), watch.NoProject("none"), watch.LedgerUnusable("not JSON")):
+            with self.subTest(error=type(error).__name__):
+                (Path(self.tmp.name) / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+                out, _ = self.run_main(error)
+                self.assertTrue(out.endswith(watch.FAILED_NEEDS_ADMIN + "\n"), out)
+                self.assertNotIn(watch.FAILED_REASON_ERROR, out)
 
     def test_a_refusal_that_clears_on_its_own_promises_a_retry(self) -> None:
         self.roster("10 10 * * *")

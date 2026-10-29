@@ -587,11 +587,23 @@ FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
 FAILED_REASON_UNRESOLVED = "It couldn't look up the fleet's projects"
 FAILED_REASON_WRITE = "It couldn't save its report"
 FAILED_REASON_TIMED_OUT = "Reading the fleet took too long"
+FAILED_REASON_ROSTER = "Its list of projects names something that isn't a project"
+FAILED_REASON_NO_PROJECT = "It has no GCP project to read"
+FAILED_REASON_LEDGER = "Its record of earlier runs can't be read"
 FAILED_REASON_ERROR = "It hit an error"
-# The reasons a retry does not clear: the install's scope, the roster or the
-# disk has to change first. A refusal is decided by its causes instead
-# (`REFUSAL_CAUSES_THAT_CLEAR`).
-FAILED_REASONS_NEED_ADMIN = frozenset({FAILED_REASON_SCOPE_UNREADABLE, FAILED_REASON_UNRESOLVED, FAILED_REASON_WRITE})
+# The reasons a retry does not clear: the install's scope, the roster, the
+# ledger or the disk has to change first. A refusal is decided by its causes
+# instead (`REFUSAL_CAUSES_THAT_CLEAR`).
+FAILED_REASONS_NEED_ADMIN = frozenset(
+    {
+        FAILED_REASON_SCOPE_UNREADABLE,
+        FAILED_REASON_UNRESOLVED,
+        FAILED_REASON_WRITE,
+        FAILED_REASON_ROSTER,
+        FAILED_REASON_NO_PROJECT,
+        FAILED_REASON_LEDGER,
+    }
+)
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -712,6 +724,21 @@ class ProjectUnresolved(RuntimeError):
     """Every project the table ran is a number the report could not resolve: nothing was read under a key."""
 
 
+# The fail-closed configuration faults. RuntimeErrors still, so a caller that
+# catches the plain failure (the standing-outside write) keeps catching them;
+# their own class is what gives the tick's line its reason and the admin ending.
+class RosterMisspelled(RuntimeError):
+    """A roster spelling is not a project id or number (``ROSTER_SPELLING_DETAIL``)."""
+
+
+class NoProject(RuntimeError):
+    """No source names a GCP project, and the report would otherwise enumerate every one (``NO_PROJECT_DETAIL``)."""
+
+
+class LedgerUnusable(RuntimeError):
+    """The ledger is not valid JSON, not this job's, or malformed; it is refused rather than overwritten."""
+
+
 class WriteFailed(Exception):
     """The ledger or a report file could not be written; the tick's result must not be claimed."""
 
@@ -792,7 +819,7 @@ def projects() -> list[str]:
     names = roster_names()
     refused = [p for p in names if ROSTER_SPELLING_REFUSED.search(p)]
     if refused:
-        raise RuntimeError(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
+        raise RosterMisspelled(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
     return names
 
 
@@ -812,7 +839,7 @@ def roster_names() -> list[str]:
         raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS)) from None
     configured = (completed.stdout or "").strip()
     if not configured:
-        raise RuntimeError(NO_PROJECT_DETAIL)
+        raise NoProject(NO_PROJECT_DETAIL)
     return [configured]
 
 
@@ -1379,9 +1406,9 @@ def load_ledger(path: Path) -> dict:
     except FileNotFoundError:
         return empty_ledger()
     except ValueError as exc:
-        raise RuntimeError(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
+        raise LedgerUnusable(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
     if not isinstance(data, dict) or not isinstance(data.get(TARGETS_KEY), dict):
-        raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
+        raise LedgerUnusable(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
     for version, entry in data[TARGETS_KEY].items():
         shape_ok = (
             isinstance(version, str)
@@ -1392,12 +1419,12 @@ def load_ledger(path: Path) -> dict:
             and (entry.get(LAST_REPORT_KEY) is None or parse_iso(entry.get(LAST_REPORT_KEY)) is not None)
         )
         if not shape_ok:
-            raise RuntimeError(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
+            raise LedgerUnusable(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
     block = data.get(ANNOUNCED_KEY)
     if block is None:
         data[ANNOUNCED_KEY] = {}
     elif not announced_shape_ok(block):
-        raise RuntimeError(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
+        raise LedgerUnusable(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
     # A null map is the absent one: ``setdefault`` and ``get`` would otherwise
     # hand the None back on the next due or retired version.
     if data[ANNOUNCED_KEY].get(ANNOUNCED_UNGRADED_KEY) is None:
@@ -2282,6 +2309,12 @@ def failure_reason(exc: Exception) -> str:
         return FAILED_REASON_UNRESOLVED
     if isinstance(exc, SandboxTimedOut):
         return FAILED_REASON_TIMED_OUT
+    if isinstance(exc, RosterMisspelled):
+        return FAILED_REASON_ROSTER
+    if isinstance(exc, NoProject):
+        return FAILED_REASON_NO_PROJECT
+    if isinstance(exc, LedgerUnusable):
+        return FAILED_REASON_LEDGER
     return FAILED_REASON_ERROR
 
 
