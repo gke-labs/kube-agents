@@ -15,6 +15,7 @@ func (s *Server) readResource(ctx context.Context, uri string) (string, error) {
 	case resourceURITopics:
 		return s.handleReadTopics(ctx, nil)
 	case resourceURITasks:
+		// Gated with task_control list (upstreamTaskListAndSteer): refused, not forwarded.
 		txt, _, _, err := s.handleTaskControl(ctx, json.RawMessage(`{"action":"list"}`))
 		return txt, err
 	case resourceURIEvents:
@@ -48,12 +49,14 @@ func (s *Server) resourceDefinitions() []Resource {
 			Description: "Standing fleet and cluster state on TOPICS-STATE and TOPICS-JOURNAL.",
 			MIMEType:    mimeTypeMarkdown,
 		},
-		{
+	}
+	if upstreamTaskListAndSteer {
+		defs = append(defs, Resource{
 			URI:         resourceURITasks,
 			Name:        "Recent Kube-Agents Tasks",
 			Description: "Recent and in-flight tasks on the TASKS JetStream stream.",
 			MIMEType:    mimeTypeMarkdown,
-		},
+		})
 	}
 	if s.host != nil {
 		defs = append(defs, Resource{
@@ -167,48 +170,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 				},
 			},
 		},
-		{
-			Name:        ToolTaskControl,
-			Description: "Inspect or control tasks on the TASKS JetStream stream: get a task's full folded state (thinking, tool activities, progress, delegation chain, result), list recent/active tasks, trigger gateway status replay, steer an in-flight task, or stop/cancel a running task.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"action": map[string]any{
-						"type":        "string",
-						"enum":        []string{"get", "list", "status", "steer", "stop"},
-						"description": "Task control action to perform.",
-					},
-					"task_id": map[string]any{
-						"type":        "string",
-						"description": "Task ID to inspect when action is 'get'.",
-					},
-					"conversation": map[string]any{
-						"type":        "string",
-						"description": "Optional conversation alias or token filter.",
-					},
-					"message": map[string]any{
-						"type":        "string",
-						"description": "Steering instruction text when action is 'steer'.",
-					},
-					"only_active": map[string]any{
-						"type":        "boolean",
-						"description": "When action is 'list', only return non-terminal in-flight tasks.",
-					},
-					"limit": map[string]any{
-						"type":        "integer",
-						"description": "Maximum number of tasks to return when action is 'list' (default: 20).",
-					},
-					"wait_timeout_seconds": map[string]any{
-						"type":        "integer",
-						"description": "Optional seconds to wait (with live streaming progress) when action is 'get' or 'steer' on an in-flight task.",
-					},
-					"debug": map[string]any{
-						"type":        "boolean",
-						"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
-					},
-				},
-			},
-		},
+		taskControlDefinition(),
 		{
 			Name:        ToolReadTopics,
 			Description: "Read standing blackboard topics from TOPICS-STATE and TOPICS-JOURNAL (e.g. upgrade-readiness, blueprint, annotations) or DIRECTORY agent cards.",
@@ -254,4 +216,60 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 		defs = s.host.AugmentToolSchemas(defs)
 	}
 	return defs
+}
+
+// taskControlDefinition is task_control's schema. The list, status and steer actions, and the
+// arguments only they take, are advertised only once the in-cluster server offers them
+// (upstreamTaskListAndSteer).
+func taskControlDefinition() ToolDefinition {
+	actions := []string{taskActionGet, taskActionStop}
+	description := "Inspect or control tasks on the TASKS JetStream stream: get a task's state and answer (optionally waiting for it to finish), or stop/cancel a conversation's running task."
+	props := map[string]any{
+		"action": map[string]any{
+			"type":        "string",
+			"enum":        actions,
+			"description": "Task control action to perform.",
+		},
+		"task_id": map[string]any{
+			"type":        "string",
+			"description": "Task ID to inspect when action is 'get'.",
+		},
+		"conversation": map[string]any{
+			"type":        "string",
+			"description": "Conversation alias or token whose running task to stop when action is 'stop' (defaults to the active conversation).",
+		},
+		"wait_timeout_seconds": map[string]any{
+			"type":        "integer",
+			"description": "Optional seconds to wait for an in-flight task to finish when action is 'get'.",
+		},
+		"debug": map[string]any{
+			"type":        "boolean",
+			"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
+		},
+	}
+	if upstreamTaskListAndSteer {
+		actions = []string{taskActionGet, actionList, taskActionStatus, taskActionSteer, taskActionStop}
+		props["action"].(map[string]any)["enum"] = actions
+		description = "Inspect or control tasks on the TASKS JetStream stream: get a task's full folded state (thinking, tool activities, progress, delegation chain, result), list recent/active tasks, trigger gateway status replay, steer an in-flight task, or stop/cancel a running task."
+		props["message"] = map[string]any{
+			"type":        "string",
+			"description": "Steering instruction text when action is 'steer'.",
+		}
+		props["only_active"] = map[string]any{
+			"type":        "boolean",
+			"description": "When action is 'list', only return non-terminal in-flight tasks.",
+		}
+		props["limit"] = map[string]any{
+			"type":        "integer",
+			"description": "Maximum number of tasks to return when action is 'list' (default: 20).",
+		}
+	}
+	return ToolDefinition{
+		Name:        ToolTaskControl,
+		Description: description,
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": props,
+		},
+	}
 }

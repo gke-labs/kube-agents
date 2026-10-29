@@ -320,11 +320,12 @@ func TestServeStdioResourcesReadDoesNotBlockReadLoop(t *testing.T) {
 		t.Fatalf("unexpected resources/read result: %+v", read.Result)
 	}
 
-	// Reading kube-agents://tasks must forward {"action":"list"} so it does not register an in-flight streaming task.
+	// kube-agents://tasks sends task_control list, which the in-cluster server does not offer yet:
+	// the read is refused without a gateway call.
 	h.send(3, methodResourcesRead, map[string]any{"uri": resourceURITasks})
 	tasksRead := h.await(3, stdioTestWait)
-	if tasksRead.Error != nil {
-		t.Fatalf("resources/read tasks failed: %+v", tasksRead.Error)
+	if tasksRead.Error == nil || !strings.Contains(tasksRead.Error.Message, "not supported by the in-cluster server yet") {
+		t.Fatalf("resources/read tasks: want a not-supported error, got %+v", tasksRead)
 	}
 
 	if err := h.stdin.Close(); err != nil {

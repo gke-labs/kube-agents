@@ -2,8 +2,8 @@
 // (MCP) bridge: a stdio JSON-RPC server that lets a local coding agent drive a
 // kube-agents deployment through its in-cluster a2a-mcp server — discover and
 // connect to deployments across kubeconfig contexts, send a message and stream
-// the turn's steps back as it runs, manage persistent /session workers, inspect
-// and steer tasks, read blackboard topics, and inspect or download the GitHub
+// the turn's steps back as it runs, manage persistent /session workers, read
+// and stop tasks, read blackboard topics, and inspect or download the GitHub
 // pull requests an agent filed.
 //
 // It is a thin client of the in-cluster a2a-mcp server (<agent>-a2a-mcp:8089):

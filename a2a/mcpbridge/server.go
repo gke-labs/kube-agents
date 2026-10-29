@@ -1212,7 +1212,7 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 
 	streamKey := "send:" + FirstNonEmptyStr(callerID, conv.Alias, DefaultConvAlias)
 	s.registerStreamingCallStart(streamKey, "", conv.Alias, callerID, meta.ArtifactsDir, cancelCall)
-	updatedArgs, _ := json.Marshal(args)
+	updatedArgs, _ := json.Marshal(serverSendMessageArgs(args))
 	txt, title, md, callErr := sess.callRemoteTool(callCtx, ToolSendMessage, updatedArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
 	s.finishStreamingCall(streamKey, conv.Alias, callerID, meta.ArtifactsDir, txt, callCtx.Err(), callErr)
 	return txt, title, md, callErr
@@ -1329,10 +1329,6 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 }
 
 func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage) (string, string, string, error) {
-	sess, err := s.ensureConnected(ctx)
-	if err != nil {
-		return "", "", "", err
-	}
 	var args struct {
 		Action       string `json:"action"`
 		TaskID       string `json:"task_id"`
@@ -1342,17 +1338,26 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		_ = json.Unmarshal(rawArgs, &args)
 	}
 	act := strings.ToLower(strings.TrimSpace(args.Action))
+	if taskActionAwaitsServer(act) {
+		return "", "", "", errTaskActionNotSupported(act)
+	}
+	sess, err := s.ensureConnected(ctx)
+	if err != nil {
+		return "", "", "", err
+	}
 	taskID := strings.TrimSpace(args.TaskID)
 	meta := CallMetaFromContext(ctx)
 	conv := s.ReadOnlyConversationFor(ctx, args.Conversation)
 	callerID := FirstNonEmptyStr(strings.TrimSpace(conv.HostConversationID), strings.TrimSpace(meta.ConversationID))
 
-	if act == "stop" || act == "cancel" {
+	if act == taskActionStop || act == taskActionCancel {
 		s.clearStreamingTask(taskID, conv.Alias)
-		return sess.callRemoteTool(ctx, ToolTaskControl, rawArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
+		fwd := serverTaskControlArgs(rawArgs, conv.Alias)
+		return sess.callRemoteTool(ctx, ToolTaskControl, fwd, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
 	}
+	rawArgs = serverTaskControlArgs(rawArgs, "")
 
-	if (act == "get" || act == "steer") && taskID != "" {
+	if (act == taskActionGet || act == taskActionSteer) && taskID != "" {
 		callCtx, cancelCall := context.WithCancel(ctx)
 		defer cancelCall()
 		streamKey := "task:" + taskID
@@ -1505,6 +1510,7 @@ func (s *Server) stopRemoteTaskOnCancel(convAlias, taskID string) {
 		stopArgs["conversation"] = strings.TrimSpace(convAlias)
 	}
 	raw, _ := json.Marshal(stopArgs)
+	raw = serverTaskControlArgs(raw, strings.TrimSpace(convAlias))
 	_, _, _, _ = sess.callRemoteTool(stopCtx, ToolTaskControl, raw, CallMeta{}, s.store.Snapshot(), nil)
 	if s.host != nil {
 		s.host.OnKeepAliveTick(stopCtx, s)
