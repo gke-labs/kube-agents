@@ -124,6 +124,13 @@ list means the cluster runs Config Connector and nothing there is unready. An ob
 condition yet is left out, and so is one whose reason is `Updating` or `Deleting`: Config Connector
 sets those while it still applies the object.
 
+The read is `kcc_health.read_objects`: one list of the CustomResourceDefinitions finds the Config
+Connector kinds (a group that ends in `.cnrm.cloud.google.com`, in the `gcp` category), then one
+`kubectl get --raw /apis/<group>/<version>/<plural>` per kind runs, `KIND_READ_WORKERS` at a time.
+`kubectl get gcp -A` makes the same list requests one after another, which through the credential
+proxy took longer than the read's limit on a cluster with the add-on. A kind that does not list
+makes the entry `kcc_unread`, unless its CustomResourceDefinition went away after the first list.
+
 The compliance collector always writes the keys, from the read its own `kcc-object-wedged` check
 makes ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12),
 and takes the namespace annotations from its NetworkPolicy read. The drift, patch readiness and
@@ -145,8 +152,8 @@ Some entries are not read and get neither key: an entry with no project or no lo
 `RECONCILING`. The drift collector records `cluster_status` on every entry, because it marks every
 listed cluster `collected`; the stockout and compliance collectors record it on the entries of
 clusters that are not running. An entry with no kubeconfig file gets `kcc_unread`. On a `collected`
-cluster entry that is read, neither key means that the API server does not serve the `gcp` category,
-so Config Connector does not run there.
+cluster entry that is read, neither key means that the cluster has no Config Connector
+CustomResourceDefinition in the `gcp` category, so Config Connector does not run there.
 
 `finish` counts the possible Config Connector hosts: the entries with either key, and, in the
 manifest of a collector that reads Config Connector, each cluster entry that it never read

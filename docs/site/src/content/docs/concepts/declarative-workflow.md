@@ -113,7 +113,9 @@ For a Kustomize overlay the release note says "the Kustomize overlay" in place o
 
 #### When Config Connector is not applying a file
 
-A `manifest` fix that edits a Config Connector declaration changes the cloud resource only when Config Connector applies that object. When the controller cannot apply it, the pull request merges and nothing changes. So the collectors of the drift, patch readiness, stockout and compliance audits read Config Connector on each cluster they sweep (`kubectl get gcp -A`), and record each object whose `Ready` condition is `False`, with the reason the controller gives. The compliance collector always reads Config Connector, because its own check needs the read. The drift, patch readiness and stockout collectors read it whenever the audit runs by its SOP, scheduled or on demand; only a fleet question in chat runs them without the read.
+A `manifest` fix that edits a Config Connector declaration changes the cloud resource only when Config Connector applies that object. When the controller cannot apply it, the pull request merges and nothing changes. So the collectors of the drift, patch readiness, stockout and compliance audits read Config Connector on each cluster they sweep, and record each object whose `Ready` condition is `False`, with the reason the controller gives. The read lists the CustomResourceDefinitions once, then lists each Config Connector kind, several kinds at a time.
+
+The compliance collector always reads Config Connector, because its own check needs the read. The drift, patch readiness and stockout collectors read it whenever the audit runs by its SOP, scheduled or on demand; only a fleet question in chat runs them without the read.
 
 An object of the file matches when it has the same kind and `metadata.name`, the same `metadata.namespace` when the file sets one, and the same `clusterRef` when the file and the object both set one. When the object's `spec.location` is known, it must be the file's `spec.location` or, for a cluster or a node pool, the location of the finding's cluster.
 
@@ -135,7 +137,7 @@ A ready object is not in the list. So when more than one swept cluster can run C
 
 An object with no project does not match the finding's own cluster when the audit swept a cluster of the same name in another project. The finding's own object must also be in a namespace that the file sets, when it sets one. A fix whose file declares no Config Connector object never gets the paragraph.
 
-When the audit cannot read a cluster (the read times out, is refused, or has no time left before the collector must stop), no paragraph names an object on that cluster. The `finish` log then has a warning that names the cluster. A fix with no paragraph does not prove that Config Connector applies its file. The read needs no setting: on a cluster that does not run Config Connector, the API server does not serve the `gcp` category and the cluster is skipped. The identity the collectors use must be able to list the Config Connector objects on that cluster; [Security and IAM](/kube-agents/reference/security-and-iam/#roles-per-set) says which roles give it.
+When the audit cannot read a cluster (the read times out, is refused, or has no time left before the collector must stop), no paragraph names an object on that cluster. The `finish` log then has a warning that names the cluster. A fix with no paragraph does not prove that Config Connector applies its file. The read needs no setting: on a cluster that does not run Config Connector, the cluster has no Config Connector CustomResourceDefinition and is skipped. The identity the collectors use must be able to list the Config Connector objects on that cluster; [Security and IAM](/kube-agents/reference/security-and-iam/#roles-per-set) says which roles give it.
 
 ### Tier 2 — remediation pull requests
 
