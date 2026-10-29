@@ -38,8 +38,8 @@ follow-up have to reach the same replica.
 ## Decision: active-standby first
 
 **Run two replicas, one active.** A Kubernetes Lease elects the active replica, which does
-everything the gateway does today. The standby holds a NATS connection and nothing else, and takes
-over when the lease moves. Every assumption above stays true, because only one replica acts at a
+everything the gateway does today. The standby holds a NATS connection and answers its doors
+with a 503 naming the holder (below). It does nothing else, and takes over when the lease moves. Every assumption above stays true, because only one replica acts at a
 time.
 
 Active-active, where replicas share the work, would need every one of those assumptions undone
@@ -64,7 +64,9 @@ On losing the lease, or on SIGTERM, it stops in this order:
    conversation. They were acked by their backend, so this is a loss, bounded by the queue's
    depth at that moment (see "What a failover loses").
 3. **The relay:** the batches rendering finish, and the relay gives back every event it holds
-   unrendered (its deferred-ack mode), in stream order.
+   unrendered, in stream order. This needs the relay's deferred-ack mode, where an event is acked
+   only after it renders. That's the relay ack-after-render change (#4183), which lands before the
+   election; on `main` today the relay acks each event on receipt.
 4. **The loops:** reap and sweep stop.
 
 Then it releases the lease.
@@ -80,14 +82,17 @@ Then it releases the lease.
   held relay events come back only when the relay durable's AckWait (30s) runs out, and a newer
   event the new leader rendered first would leave them rendering late and out of order, possibly
   after the task's terminal. So after a takeover from an expired lease, the new leader binds the
-  relay only once AckWait has passed since the old leader's last renewal. NATS sends a consumer's
-  pending redeliveries before new messages, so the dead leader's events come back first. Chat
-  ingress starts at once; the relay waits up to 30s.
+  relay only once AckWait has passed since the takeover. A held event's AckWait restarts at its
+  last in-progress ack, which can come after the old leader's last renewal, but not after it died,
+  and it died before the lease expired. NATS sends a consumer's pending redeliveries before new
+  messages, so the dead leader's events come back first. Chat ingress starts at once; the relay
+  waits 30s.
 - **On the bus's side.** With the bus at three replicas, a stream or consumer leader election (a
   node drain, an upgrade's restart) can add its own few seconds to a redelivery. An ack sent during
   one can be lost, so an event already rendered comes back. The relay recognises it by its stream
-  sequence and acks it without rendering again, the guard it already keeps for a crash between a
-  render and its ack. A bus server draining in lame-duck mode spreads its clients' reconnects over
+  sequence and acks it without rendering again. That guard is part of the ack-after-render change:
+  the session record keeps the sequences it rendered (`RelayedSeqs`, the last 256), in KV, so a new
+  leader reads the same guard the old one wrote. A bus server draining in lame-duck mode spreads its clients' reconnects over
   about 30s: a burst of reconnects for the active gateway, not a gap.
 
 ### Fencing
@@ -99,10 +104,20 @@ it runs out is abandoned and given back. That makes two replicas acting at once 
 impossible: a paused process, or a clock that jumps, can still overlap the next leader.
 
 So writes are fenced by the Lease's own epoch. `leaseTransitions` counts every acquisition, so
-each leader's term has a number no earlier term shares. The session record carries the epoch of
-the term that last wrote it, and `Registry.Update` (a revision-checked read-modify-write) refuses
-a write from an older epoch than the record's, so a deposed leader's write fails rather than
-landing on top of the new one's. The task index and session deletes go through the same check.
+each leader's term has a number no earlier term shares. On acquiring the lease, and before it
+starts any work, the new leader raises a term marker in the session-state bucket to its epoch.
+Every record write, task-index write and session delete then checks two epochs: the marker's and
+the stored record's. A write from an epoch older than either is refused, and the write is
+conditional on the record revision it checked. So a deposed leader's write fails on every record
+once the new term has started, including records the new leader hasn't touched yet. The marker
+alone would leave a gap between reading it and writing, and the record's own epoch closes it for
+any record the new leader has written.
+
+The election's identity is the pod name plus a per-process id. client-go lets a process whose
+identity matches the current holder renew without waiting and without counting a transition, so a
+container restarting in the same pod under the bare pod name would carry on in the old term with
+no new epoch. With the per-process id, a restarted container is a new holder: it waits out the
+lease like any other and gets the next epoch.
 
 The epoch fences records, not every side effect. A deposed leader in the overlap can still post
 to a chat, publish a task or spawn a pod before it learns it lost. Its record write then fails, so
@@ -136,7 +151,8 @@ so `kubectl port-forward svc/...` can resolve a pod. With two replicas, that can
 standby. So:
 
 - A standby's door answers every request with 503 and the active pod's name, which it reads from
-  the Lease's `holderIdentity`, so a client knows where to port-forward instead.
+  the Lease's `holderIdentity` (the part before the `_` and the per-process id), so a client knows
+  where to port-forward instead.
 - A client that has to reach the active replica port-forwards to `pod/<holder>`, read from the
   Lease (`kubectl get lease`). The eval harness and the repository's scripts do that.
 
@@ -150,11 +166,11 @@ Today people, scripts and the eval harness run `kubectl port-forward svc/<agent>
 that from being a trap:
 
 - **The 503 says exactly what to run.** Its body names the holder and gives the command, for
-  example `kubectl -n kubeagents-system port-forward pod/<holder> 8699`, so a person who hits the
+  example `kubectl -n kubeagents-system port-forward pod/<holder> 8099`, so a person who hits the
   standby copies one line.
 - **A one-liner and a helper resolve the holder.**
-  `kubectl -n <ns> port-forward pod/$(kubectl -n <ns> get lease <agent>-a2a-gateway -o jsonpath='{.spec.holderIdentity}') <port>`
-  does it by hand, and a small script in `hack/` wraps it, re-resolving when the port-forward drops
+  `h=$(kubectl -n <ns> get lease <agent>-a2a-gateway -o jsonpath='{.spec.holderIdentity}'); kubectl -n <ns> port-forward pod/${h%%_*} <port>`
+  does it by hand (a pod name has no `_`), and a small script in `hack/` wraps it, re-resolving when the port-forward drops
   on a handover.
 - **Every caller is updated in the same change as the standby's 503:** the bench harness's
   inject transport (`bench/kube_agents_bench/harness.py` and `inject_transport.py`), which
@@ -220,11 +236,14 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
 
 ## Build, as follow-ups
 
-1. **Fenced session-record writes.** `Registry.Update`, a revision-checked read-modify-write that
-   refuses a write from an older lease epoch than the record's, replacing the seventeen `Put`
-   callers and covering the task index and session deletes. Until the election exists, every
-   write carries epoch 0.
-2. **Leader election in the gateway.** Acquire, renew and step down; all of `Run`'s and
+1. **Fenced session-record writes.** `Registry.Put` becomes a write conditional on the revision it
+   checked, refusing a write from an epoch older than the term marker's or the stored record's.
+   The task index and session deletes take the same check. The seventeen callers don't change,
+   and within one term the last write still wins, as it does with one active replica today. The
+   registry gains the call that raises the marker, which the election makes. Until the election
+   exists, every write carries epoch 0.
+2. **Leader election in the gateway.** It lands after the relay's ack-after-render change.
+   Acquire (identity: pod name and per-process id), raise the term marker, renew and step down; all of `Run`'s and
    `realMain`'s work gated on the lease; the step-down order and budget above; the relay's delayed
    bind after a takeover from an expired lease; release on SIGTERM. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
@@ -258,4 +277,3 @@ door conversations in KV. Fenced writes (step 1) are the one piece phase one alr
   more in-progress acks per held event. Worth measuring after the build.
 - **The A2A door across a failover.** Its conversations could move to KV so a client can poll the
   new active replica, or the door can say plainly that a failover ends its in-flight requests.
-- **The default replica count** on installs that don't set one.
