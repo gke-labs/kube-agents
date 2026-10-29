@@ -151,7 +151,8 @@ the presubmit exports nothing new until it chooses to. The exchange:
    does not write to the record, so it reaches the log and nothing graded). The front door's
    token counts come from one probed read after the terminal (`usage=chain`), which sums the `usage` artifact of the root
    turn and every wake that continued its chain
-   (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), and
+   (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
+   the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
    leaves them null when it carries none. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,

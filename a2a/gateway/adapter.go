@@ -570,14 +570,19 @@ type ConversationState struct {
 	// Usage is what the front door's own turns cost: the usage artifact's
 	// parts summed (lib.UsageTotal) over TaskID's stream and, for a
 	// delegation chain's root, every wake that continued it, whichever link
-	// the read follows. A child is another addressee's work and is not in
-	// it. Nil when the stream was not read, when no turn published usage,
-	// and when a link's stream could not be read. Each executor publishes a
-	// turn's usage before its terminal, so a read that shows the root final
-	// carries all of it. Set only on a probe whose context asked for it
-	// (withChainUsage): summing a chain reads one stream per link, which a
-	// caller polling the read route has no use for on every poll.
-	Usage *lib.Usage
+	// the read follows. ChildUsage is the same sum over the chain's child
+	// tasks, the addressees the front door delegated to (the platform
+	// router that files the cards among them), kept apart because it is
+	// another addressee's work. Each is nil when none of its turns
+	// published usage. UsagePartial is set when a link's stream could not
+	// be read, so the sums leave out what that link cost. Each executor
+	// publishes a turn's usage before its terminal, so a read after the
+	// root's end carries all of it. Set only on a probe whose context asked
+	// for it (withChainUsage): summing a chain reads one stream per link,
+	// which a caller polling the read route has no use for on every poll.
+	Usage        *lib.Usage
+	ChildUsage   *lib.Usage
+	UsagePartial bool
 }
 
 // chainUsageKey marks a probe's context as asking for

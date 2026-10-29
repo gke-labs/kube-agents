@@ -1272,10 +1272,11 @@ func TestASettledChainProbesAsItsLastTask(t *testing.T) {
 }
 
 // TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain: a harness reads the
-// front door's cost off the root, so a probe that asks for it sums the usage
-// of the root's own turn and of every wake that continued it, whichever link
-// the read follows, and never a child's, which is another addressee's work.
-// A probe that did not ask reads no extra streams and carries none.
+// chain's cost off the root, so a probe that asks for it sums the usage of
+// the root's own turn and of every wake that continued it, whichever link
+// the read follows, and the children's apart, since a child is another
+// addressee's work. A probe that did not ask reads no extra streams and
+// carries none.
 func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 	r, spawn, obs := startObservedRig(t, doorDelegation(t))
 	ctx := context.Background()
@@ -1308,8 +1309,8 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 		completeTask(t, exec, "delegated to platform")
 		return child
 	}
-	// wakeAfter ends the child, whose own usage must not count, and returns
-	// the wake its end started.
+	// wakeAfter ends the child, whose usage counts apart from the front
+	// door's, and returns the wake its end started.
 	wakeAfter := func(child *lib.Envelope, spawns int) (*lib.TaskExecution, *lib.Envelope) {
 		t.Helper()
 		cexec := r.execFor(t, child, targetPlatform)
@@ -1344,8 +1345,8 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 		rec, _ := r.g.reg.Get(ctx, conv)
 		return rec.ActiveTask == nil
 	})
-	if plain, err := r.g.probeConversation(ctx, conv, origin.TaskID); err != nil || plain.Usage != nil {
-		t.Fatalf("a probe that did not ask carries usage %+v (err %v); want none", plain.Usage, err)
+	if plain, err := r.g.probeConversation(ctx, conv, origin.TaskID); err != nil || plain.Usage != nil || plain.ChildUsage != nil {
+		t.Fatalf("a probe that did not ask carries usage %+v / %+v (err %v); want none", plain.Usage, plain.ChildUsage, err)
 	}
 	st, err := r.g.probeConversation(withChainUsage(ctx), conv, origin.TaskID)
 	if err != nil {
@@ -1355,6 +1356,11 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 	if !st.Final || st.Usage == nil || *st.Usage != want {
 		t.Fatalf("probe of the root = %+v (usage %+v), want final with usage %+v: the root and both wakes, no child",
 			st, st.Usage, want)
+	}
+	wantChildren := lib.Usage{InputTokens: 200000, OutputTokens: 20000}
+	if st.ChildUsage == nil || *st.ChildUsage != wantChildren || st.UsagePartial {
+		t.Fatalf("child usage = %+v (partial %v), want %+v: both children, apart from the front door",
+			st.ChildUsage, st.UsagePartial, wantChildren)
 	}
 }
 

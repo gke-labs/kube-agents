@@ -492,6 +492,12 @@ type probeReport struct {
 	// carries every turn's, since each executor publishes a turn's usage
 	// before its terminal.
 	Usage *lib.Usage `json:"usage,omitempty"`
+	// ChildUsage is the same sum over the chain's child tasks, the
+	// addressees the front door delegated to, and UsagePartial says a
+	// link's stream could not be read, so both sums are short of that link
+	// (ConversationState). Present, like Usage, only on a read that asked.
+	ChildUsage   *lib.Usage `json:"childUsage,omitempty"`
+	UsagePartial bool       `json:"usagePartial,omitempty"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1918,6 +1924,8 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string, chainU
 		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
 		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
 		Usage:          state.Usage,
+		ChildUsage:     state.ChildUsage,
+		UsagePartial:   state.UsagePartial,
 	}
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.

@@ -215,9 +215,10 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 #: The trajectory entry name the harness's inject transport gives a task's
 #: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
 #: that read the bus directly would use the same name). Such a record's
-#: ``tokens`` are the front door's usage as the gateway's probe reported it,
-#: and all null when it reported none (a gateway older than the field, or a
-#: turn that published no usage); its liveness signal is then the
+#: ``tokens`` are the chain's usage as the gateway's probe reported it, and
+#: its ``total`` is null when it reported none (a gateway older than the
+#: field, or turns that published no usage), whatever the delegated workers
+#: billed; its liveness signal is then the
 #: executor's own events instead: an entry of this
 #: name whose ``args.final`` is true (the task ended), or whose ``args.state``
 #: is ``working`` (the executor spawned the persona; a task the harness

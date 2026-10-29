@@ -331,6 +331,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # that names the task and asks (``usage=chain``); None is a door older
     # than the field, or a turn that published none, and sends no key.
     probe_usage: dict[str, Any] | None = None
+    # The chain's child tasks' usage and the partial flag, sent beside it.
+    probe_child_usage: dict[str, Any] | None = None
+    probe_usage_partial: bool = False
 
     def poll_fails(self) -> bool:
         """Whether this GET is one of the scripted failures."""
@@ -375,6 +378,10 @@ class _StubGatewayServer(ThreadingHTTPServer):
         if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
+            if self.probe_child_usage is not None:
+                report["childUsage"] = dict(self.probe_child_usage)
+            if self.probe_usage_partial:
+                report["usagePartial"] = True
         if active:
             # Scripted states advance per read of the ACTIVE task, so the
             # preflight read (before any POST) does not consume one.
@@ -3409,19 +3416,26 @@ def test_the_inject_total_adds_the_workers_as_the_api_lanes_does(
     assert result.tokens["front_door"]["total"] == 1700
 
 
-def test_the_workers_total_folds_into_a_null_or_counted_front_door() -> None:
-    """With no front-door usage the total is the workers'; a workers' total of
-    zero adds nothing and leaves a null total null rather than a zero the
-    scorer reads as no model call."""
+def test_the_workers_total_folds_only_into_a_counted_total() -> None:
+    """``front_door`` is written whenever there is a ``workers`` object, as on
+    the api path. The workers' total joins a counted total; with no chain
+    usage the total stays null, so the scorer's liveness rung reads the
+    task's terminal rather than passing on the workers' spend alone."""
+    tokens = harness._inject_tokens({"input": 1500, "output": 200}, {"input": 900, "output": 90})
+    tokens["workers"] = {"total": 12}
+    harness._fold_worker_total(tokens)
+    assert tokens["total"] == 1500 + 200 + 990 + 12
+    assert tokens["front_door"]["total"] == 1700 and tokens["front_door"]["input"] == 1500
+
     tokens = harness._inject_tokens(None)
     tokens["workers"] = {"total": 12}
     harness._fold_worker_total(tokens)
-    assert tokens["total"] == 12 and tokens["input"] is None
+    assert tokens["total"] is None and tokens["front_door"]["total"] is None
 
     tokens = harness._inject_tokens(None)
-    tokens["workers"] = {"total": 0}
+    tokens["workers"] = None
     harness._fold_worker_total(tokens)
-    assert tokens["total"] is None and "front_door" not in tokens
+    assert "front_door" not in tokens
 
 
 def test_no_usage_read_follows_a_terminal_past_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3475,3 +3489,68 @@ def test_a_timeouts_cancel_settle_carries_the_usage_onto_the_record(
 
     assert result.metadata["terminal_state"] == "canceled"
     assert (result.tokens["input"], result.tokens["output"], result.tokens["total"]) == (1500, 200, 1700)
+
+
+
+def test_the_chains_children_count_apart_and_join_the_total(stub_gateway: _StubGatewayServer) -> None:
+    """The chain's child tasks (the platform router that files the cards,
+    the api transport's front door) are a tier of their own: ``children``
+    holds their buckets and ``total`` adds them to the front door's."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "all quiet")
+    stub_gateway.probe_usage = USAGE
+    stub_gateway.probe_child_usage = {"inputTokens": 900, "outputTokens": 90}
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert (result.tokens["input"], result.tokens["output"]) == (1500, 200)
+    assert result.tokens["children"] == {"input": 900, "output": 90, "total": 990}
+    assert result.tokens["total"] == 2690
+    assert "usage_partial" not in result.tokens
+
+
+def test_a_partial_usage_is_read_again_and_marked_when_it_stays_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A door that could not read a link marks its answer partial. The fold
+    keeps it but reads once more; a full answer replaces it, and one still
+    partial is marked on the record's tokens and its note."""
+    def finished(answers: list[dict[str, Any]]) -> inject.Fold:
+        task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+        monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+        monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+            "entries": completed_transcript("task-1", "done"),
+            "lastSeq": 6,
+            "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed"},
+        })
+        replies = list(answers)
+        monkeypatch.setattr(inject, "_request", lambda *args, **kwargs: replies.pop(0))
+        exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+        assert replies == []
+        return exchange.fold
+
+    partial = probe_body(usage={"inputTokens": 1000, "outputTokens": 100}, usagePartial=True)
+    full = probe_body(usage=USAGE)
+    fold = finished([partial, full])
+    assert fold.usage == {"input": 1500, "output": 200} and not fold.usage_partial
+
+    fold = finished([partial, partial])
+    assert fold.usage == {"input": 1000, "output": 100} and fold.usage_partial
+    tokens = harness._inject_tokens(fold.usage, fold.child_usage, fold.usage_partial)
+    assert tokens["total"] == 1100 and tokens["usage_partial"] is True
+    result = harness._inject_result(
+        inject.Exchange(fold, inject.OUTCOME_TERMINAL, "c", "task-1", None), {}
+    )
+    assert result.tokens["usage_partial"] is True
+    assert result.metadata["tokens_note"].endswith(harness._INJECT_TOKENS_PARTIAL_NOTE)
+
+
+def test_status_turns_sum_the_tiers_and_the_flag() -> None:
+    """The delegation wait adds each status turn's tokens into the run's, so
+    the children tier sums bucket by bucket and the partial flag is set by
+    any turn."""
+    base = harness._inject_tokens({"input": 10, "output": 1}, {"input": 5, "output": 1})
+    turn = harness._inject_tokens({"input": 20, "output": 2}, {"input": 7, "output": 1}, partial=True)
+    harness._sum_tokens(base, turn)
+    assert (base["input"], base["output"], base["total"]) == (30, 3, 47)
+    assert base["children"] == {"input": 12, "output": 2, "total": 14}
+    assert base["usage_partial"] is True

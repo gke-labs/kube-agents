@@ -1718,7 +1718,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		if terr != nil {
 			readTask = nil
 		}
-		state.Usage = g.frontDoorUsage(ctx, rec, taskID, read, readTask)
+		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
@@ -1745,28 +1745,29 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 	return state, nil
 }
 
-// frontDoorUsage is what the front door's own turns of taskID cost: the
-// usage artifact's parts of taskID's stream and, when taskID is a delegation
-// chain's root, of every wake that continued it, summed (lib.UsageTotal). A
-// child is another addressee's work and is never counted. The stream the
-// probe already folded (read, readTask; nil when it found no events) is not
-// read twice. Nil when no turn published usage, and when a link's stream
-// could not be read: a sum short of a turn would under-report, and nil says
-// "not known" instead.
-func (g *Gateway) frontDoorUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) *lib.Usage {
+// chainUsage is what taskID's turns cost, from the usage artifact's parts
+// summed (lib.UsageTotal) per tier. front is the front door's own turns:
+// taskID's stream and, when taskID is a delegation chain's root, every wake
+// that continued it. children is the chain's child tasks, the addressees the
+// front door delegated to (the platform router that files the cards among
+// them). Either is nil when none of its turns published usage. partial
+// reports that a link's stream could not be read, so the sums leave out
+// whatever that link cost. The stream the probe already folded (read,
+// readTask; nil when it found no events) is not read twice.
+func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) (front, children *lib.Usage, partial bool) {
 	links := []TaskRef{{ID: taskID}}
 	if ref, ok := rec.TaskRefFor(taskID); ok {
 		links[0] = ref
 		if ref.Role != taskRoleChild && ref.rootID() == taskID {
 			for _, other := range rec.Tasks {
-				if other.Role == taskRoleWake && other.rootID() == taskID {
+				if other.ID != taskID && other.rootID() == taskID {
 					links = append(links, other)
 				}
 			}
 		}
 	}
-	var turns []lib.Usage
-	for _, link := range links {
+	var frontTurns, childTurns []lib.Usage
+	for i, link := range links {
 		folded := readTask
 		if link.ID != read {
 			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
@@ -1776,18 +1777,30 @@ func (g *Gateway) frontDoorUsage(ctx context.Context, rec *SessionRecord, taskID
 			case isTaskNotFound(err):
 				folded = nil
 			default:
-				return nil
+				partial = true
+				continue
 			}
 		}
 		if folded == nil {
 			continue
 		}
 		for _, p := range artifactParts(folded, lib.ArtifactUsage) {
-			if u, ok := lib.UsageOf(p); ok {
-				turns = append(turns, u)
+			u, ok := lib.UsageOf(p)
+			if !ok {
+				continue
+			}
+			if i > 0 && link.Role == taskRoleChild {
+				childTurns = append(childTurns, u)
+			} else {
+				frontTurns = append(frontTurns, u)
 			}
 		}
 	}
+	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// usageSum is turns folded by lib.UsageTotal, or nil when there are none.
+func usageSum(turns []lib.Usage) *lib.Usage {
 	if len(turns) == 0 {
 		return nil
 	}

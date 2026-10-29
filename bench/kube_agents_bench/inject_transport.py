@@ -215,19 +215,26 @@ EVENT_ENTRY_ACTIVITY = "a2a.activity"
 PROBE_ACTIVITY_KEY = "activity"
 PROBE_ACTIVITY_DROPPED_KEY = "activityDropped"
 PROBE_PROGRESS_KEY = "progress"
-# What the front door's turns cost: the probe body's ``usage``, which the door
-# sends only on a read that asks for it (``usage=chain``), since summing a
-# delegation chain reads one stream per link. It is the ``usage`` artifact
-# summed over the root turn and every wake that continued its chain, never a
-# child's (``ConversationState.Usage``), and absent when no turn published
-# usage and on a door older than the field. Each executor publishes a turn's
-# usage before its terminal, so the harness asks once, after the terminal
-# (:meth:`InjectTask._read_usage`). Hermes reports the prompt whole, cached
-# reads included, with no split, so the harness maps ``inputTokens`` and
-# ``outputTokens`` alone.
+# What the chain's turns cost, which the door sends only on a read that asks
+# for it (``usage=chain``), since summing a delegation chain reads one stream
+# per link (``ConversationState``): ``usage`` is the ``usage`` artifact summed
+# over the front door's own turns, the root and every wake that continued its
+# chain; ``childUsage`` the same over the chain's child tasks, the addressees
+# the front door delegated to (the platform router that files the cards);
+# each absent when none of its turns published usage, and both on a door
+# older than the fields. ``usagePartial`` says a link's stream could not be
+# read, so the sums are short of it. Each executor publishes a turn's usage
+# before its terminal, so the harness asks after the terminal
+# (:meth:`InjectTask._read_usage`), and once more while the answer is
+# partial (:data:`USAGE_READ_ATTEMPTS`). Hermes reports the prompt whole,
+# cached reads included, with no split, so the harness maps ``inputTokens``
+# and ``outputTokens`` alone.
 USAGE_PARAM = "usage"
 USAGE_CHAIN = "chain"
 PROBE_USAGE_KEY = "usage"
+PROBE_CHILD_USAGE_KEY = "childUsage"
+PROBE_USAGE_PARTIAL_KEY = "usagePartial"
+USAGE_READ_ATTEMPTS = 2
 USAGE_INPUT_KEY = "inputTokens"
 USAGE_OUTPUT_KEY = "outputTokens"
 # The keys of one activity part, as the executors publish them, and the two
@@ -616,6 +623,17 @@ def _readable_count(value: Any) -> int | None:
     return int(value)
 
 
+def _usage_counts(raw: Any) -> dict[str, int | None] | None:
+    """A usage object's two counts, ``{"input": n, "output": n}``, a count that
+    cannot be read as ``None``; ``None`` whole when ``raw`` is no object."""
+    if not isinstance(raw, dict):
+        return None
+    return {
+        "input": _readable_count(raw.get(USAGE_INPUT_KEY)),
+        "output": _readable_count(raw.get(USAGE_OUTPUT_KEY)),
+    }
+
+
 def budget_floor(grace_seconds: float) -> float:
     """The smallest budget that can be classified: the grace plus the margin."""
     return grace_seconds + GRACE_MARGIN_SECONDS
@@ -729,10 +747,13 @@ class Fold:
     # adopt, so ``activity`` is an earlier read's (:meth:`note_trace_stale`).
     activity_stale: bool = False
     progress: str = ""
-    # The front door's token counts, from the one read after the terminal
-    # that asks for them (:meth:`InjectTask._read_usage`); ``None`` until it
-    # answers with them.
+    # The front door's and the chain's children's token counts, from the
+    # read after the terminal that asks for them (:meth:`InjectTask._read_usage`);
+    # ``None`` until it answers with them. ``usage_partial`` is that read's
+    # word that a link could not be read, so the counts are short of it.
     usage: dict[str, int | None] | None = None
+    child_usage: dict[str, int | None] | None = None
+    usage_partial: bool = False
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -1124,6 +1145,9 @@ class Probe:
     # the body's ``usage`` (:data:`PROBE_USAGE_KEY`), a count that cannot be
     # read as ``None``; ``None`` whole when the body had no usage.
     usage: dict[str, int | None] | None = None
+    # The same for ``childUsage``, and the body's ``usagePartial``.
+    child_usage: dict[str, int | None] | None = None
+    usage_partial: bool = False
     last_post: str = ""
     error: str = ""
     # The conversation's A2A contextId, from the gateway's session record;
@@ -1165,13 +1189,6 @@ class Probe:
                     malformed += 1
                 else:
                     dropped = readable
-        raw_usage = raw.get(PROBE_USAGE_KEY)
-        usage: dict[str, int | None] | None = None
-        if isinstance(raw_usage, dict):
-            usage = {
-                "input": _readable_count(raw_usage.get(USAGE_INPUT_KEY)),
-                "output": _readable_count(raw_usage.get(USAGE_OUTPUT_KEY)),
-            }
         return cls(
             backend=str(raw.get("backend") or ""),
             inject_only=bool(raw.get("injectOnly")),
@@ -1191,7 +1208,9 @@ class Probe:
             activity_dropped=dropped,
             activity_malformed=malformed,
             progress=str(raw.get(PROBE_PROGRESS_KEY) or ""),
-            usage=usage,
+            usage=_usage_counts(raw.get(PROBE_USAGE_KEY)),
+            child_usage=_usage_counts(raw.get(PROBE_CHILD_USAGE_KEY)),
+            usage_partial=raw.get(PROBE_USAGE_PARTIAL_KEY) is True,
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
             context_id=str(raw.get("contextId") or ""),
@@ -1605,19 +1624,18 @@ class InjectTask:
         return Exchange(fold, outcome, self.conversation, task_id, probe)
 
     def _read_usage(self, fold: Fold, task_id: str, deadline: float) -> None:
-        """One probed read for the front door's usage, after the terminal.
+        """A probed read for the chain's usage, after the terminal.
 
         Each executor publishes a turn's usage before its terminal, so a read
-        made now carries every turn's; it asks the door for the chain's sum
-        (:data:`USAGE_PARAM`), which the per-poll probe leaves out. Made only
-        inside the wait's deadline and bounded by what is left of it, so a
-        run already past its budget, or a cancel past its settle bound,
-        spends no time on it. Best effort: a read that fails, or a door that
-        sends no usage, leaves the counts unknown.
+        made now carries every turn's; it asks the door for the chain's sums
+        (:data:`USAGE_PARAM`), which the per-poll probe leaves out. An answer
+        the door marks partial (a link it could not read) is kept but read
+        once more, up to :data:`USAGE_READ_ATTEMPTS`, and a later full answer
+        replaces it. Made only inside the wait's deadline and bounded by what
+        is left of it, so a run already past its budget, or a cancel past its
+        settle bound, spends no time on it. Best effort: a read that fails, or
+        a door that sends no usage, leaves the counts as they stand.
         """
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
         seqs = [e.get("seq") for e in fold.entries]
         after = max((seq for seq in seqs if isinstance(seq, int)), default=0)
         params: dict[str, Any] = {
@@ -1634,15 +1652,26 @@ class InjectTask:
             + "?"
             + urllib.parse.urlencode(params)
         )
-        timeout = min(remaining, POLL_TIMEOUT_MARGIN_SECONDS + PROBES_PER_POLL * PROBE_BOUND_SECONDS)
-        try:
-            answered = Probe.from_body(_request(url, timeout, self.token))
-        except InjectUnavailable as exc:
-            _log.info("inject: could not read the usage of %s after its terminal: %s", task_id, exc)
-            return
-        if answered is not None and answered.could_look and answered.task_id == task_id:
-            if answered.usage is not None:
-                fold.usage = answered.usage
+        for _ in range(USAGE_READ_ATTEMPTS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            timeout = min(remaining, POLL_TIMEOUT_MARGIN_SECONDS + PROBES_PER_POLL * PROBE_BOUND_SECONDS)
+            try:
+                answered = Probe.from_body(_request(url, timeout, self.token))
+            except InjectUnavailable as exc:
+                _log.info("inject: could not read the usage of %s after its terminal: %s", task_id, exc)
+                return
+            if answered is None or not answered.could_look or answered.task_id != task_id:
+                return
+            if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
+                return
+            fold.usage = answered.usage
+            fold.child_usage = answered.child_usage
+            fold.usage_partial = answered.usage_partial
+            if not answered.usage_partial:
+                return
+            _log.info("inject: the usage of %s is partial; reading it once more", task_id)
 
     def _never_started(self, fold: Fold, task_id: str, probe: Probe) -> Exchange:
         """The read showed nothing on the stream past the grace: nobody took it."""
