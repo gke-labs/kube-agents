@@ -582,6 +582,7 @@ class Retired(Base):
                     self.assertIsInstance(self.ledger()["announced"], dict)
                 else:
                     self.assertIn("has a malformed announced block; refusing to overwrite it", out)
+                    self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
                     self.assertEqual(sandbox.calls, [])
 
 
@@ -1306,6 +1307,7 @@ class Failures(Base):
                 code, out = self.run_tick(sandbox)
                 self.assertEqual(code, 0)
                 self.assertIn(f"has a malformed entry for {TARGET}; refusing to overwrite it", out)
+                self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
                 self.assertEqual(sandbox.calls, [])
 
     def test_a_sentinel_inside_tenant_text_does_not_shift_the_envelope(self) -> None:
@@ -1327,6 +1329,7 @@ class Failures(Base):
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn("is not valid JSON", out)
+        self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
         self.assertEqual(sandbox.calls, [])
         self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"targets": {')
 
@@ -1403,6 +1406,7 @@ class Failures(Base):
                 code, out = self.run_tick(sandbox)
                 self.assertEqual(code, 0)
                 self.assertIn(f"has a malformed entry for {key.strip()}", out)
+                self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
                 self.assertEqual(sandbox.calls, [])
                 self.assertFalse((self.home / "reports").exists())
 
@@ -2549,6 +2553,7 @@ class DeclaredScope(Base):
         self.assertEqual(code, 0)
         self.assertEqual(sandbox.calls, [])
         self.assertIn("the roster names 'p1 p2', which is not a project id or number; spell each project as its id, in UPGRADE_READINESS_PROJECTS separated by commas", out)
+        self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_ROSTER, next=watch.FAILED_NEEDS_ADMIN)), out)
 
     def test_a_management_project_spelling_with_a_space_fails_the_tick_before_any_sandbox_call(self) -> None:
         """Every source of the roster is held to the same grammar: spec.harness.projectId
@@ -2564,6 +2569,7 @@ class DeclaredScope(Base):
                 self.assertEqual(code, 0)
                 self.assertEqual(sandbox.calls, [])
                 self.assertIn(f"the roster names {spelling!r}, which is not a project id or number", out)
+                self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_ROSTER, next=watch.FAILED_NEEDS_ADMIN)), out)
 
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
