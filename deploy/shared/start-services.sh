@@ -329,9 +329,10 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
-# verdict on the pod: five failed scheduling attempts, since the scheduler
-# retries on every cluster change and at least every five minutes, and
-# WATCHER_FAILEDSCHEDULING_MIN_SPAN below on top. The autoscaler's own events take precedence over it: a
+# verdict on the pod: five failed scheduling attempts, with
+# WATCHER_FAILEDSCHEDULING_MIN_SPAN below on top, because the scheduler
+# retries on every cluster change and the count alone climbs in seconds.
+# The autoscaler's own events take precedence over it: a
 # NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
 # any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
 # or the other arrives seconds after the pod's first attempt. Both are in the
@@ -343,9 +344,11 @@ WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 # How long such a FailedScheduling has to have lasted, by the event's own first
 # and last sighting, before the count backstop passes it. The count alone
 # climbs in seconds while a node scale-down drains a node: no verdict is
-# recorded, the scheduler retries the evicted pod on every change, and the pod
-# is placed seconds later. A pod still stuck is sighted again within the
-# scheduler's five-minute flush and fires then. Set to 0 to switch it off.
+# recorded, the scheduler retries the evicted pod's replacement on every
+# change, and it is placed seconds later. A pod still stuck is sighted again
+# within the scheduler's five-minute flush and fires then. A Go duration
+# (2m, 90s); a bare number stops the watcher from starting. Set to 0 to
+# switch it off.
 WATCHER_FAILEDSCHEDULING_MIN_SPAN="${WATCHER_FAILEDSCHEDULING_MIN_SPAN:-2m}"
 
 # How long a TriggeredScaleUp on a pod holds its FailedScheduling events,

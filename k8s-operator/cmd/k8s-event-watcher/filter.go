@@ -175,7 +175,7 @@ const (
 	// is re-sighted at least every five minutes, the scheduler's
 	// unschedulable-queue flush, so this delays its card to that sighting and
 	// never silences it; on an events.k8s.io/v1 recorder the next sighting is
-	// the series refresh, which already gates the count
+	// the series refresh, which at the default count already gates the count
 	// (failedSchedulingStaleAfter). Measured over 30 days on six clusters,
 	// 182 pods with no verdict were Pending for 4s at the median and 65s at
 	// the longest, and every one of the 40 the count alone passed scheduled
@@ -559,9 +559,9 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     drives the count to five in seconds, for a pod placed seconds later.
 //     Zero timestamps fail open, as the settle gate's do; zero turns it off.
 //
-// Measured on the event's own stamps, never on the watcher's clock: a replay
-// after a restart reads as it did live. The span is the only time-based hold,
-// and it applies only with no autoscaler verdict on record.
+// The scale-up hold and the span are measured on the event's own stamps,
+// never on the watcher's clock, so a replay after a restart reads as it did
+// live; the span is the only hold on an event's age with no verdict on record.
 // Each decision logs one line naming the pod and what decided it, which is
 // what a reader has in the pod log; the gate labels on
 // k8s_event_watcher_events_filtered_total are the same decisions counted.
