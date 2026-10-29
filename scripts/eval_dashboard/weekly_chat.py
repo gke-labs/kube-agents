@@ -12,7 +12,8 @@ each tick until the summary moves to the next week (weekly_email.py's week
 ends the Sunday before today, UTC: Sunday 7 or 8 PM Toronto).
 
 It posts the card (cardsV2) with the text as its fallback, or the text alone
-when the summary has no card, the way post_health.py posts: the Smoke Health app's token in
+when the summary has no card or Chat refuses the card (HTTP 400: nothing was
+posted), the way post_health.py posts: the Smoke Health app's token in
 CI_HEALTH_CHAT_TOKEN and the space in CI_HEALTH_CHAT_SPACE (or the webhook
 alternative), through post_health.Sender. CI_HEALTH_MUTE=true posts nothing
 and records nothing, so a week muted on Monday posts once unmuted, within
@@ -61,6 +62,9 @@ STATE_POSTED_KEY = "posted_at"
 # more URLs matched no objects", as collect.py reads them); any other failure
 # is not "never posted".
 NOT_FOUND_RE = re.compile(r"matched no objects|NotFound|404")
+# Chat refusing the card itself: nothing was posted, so the text alone goes
+# out instead, still once.
+HTTP_BAD_REQUEST = 400
 
 
 def log(message: str) -> None:
@@ -142,7 +146,11 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
     except (OSError, subprocess.CalledProcessError) as exc:
         log(f"weekly summary for the week ending {week_end}: {args.state} could not be written ({exc}); not posting, the next tick retries")
         return 1
-    if not sender.send(text, card):
+    sent = sender.send(text, card)
+    if not sent and card is not None and sender.status == HTTP_BAD_REQUEST:
+        log(f"weekly summary for the week ending {week_end}: Chat refused the card (HTTP {HTTP_BAD_REQUEST}); posting the text instead")
+        sent = sender.send(text)
+    if not sent:
         log(f"ERROR: weekly summary for the week ending {week_end}: the post failed after the week was recorded in "
             f"{args.state}; it is NOT retried and this week's summary is missed (delete the object to post it again)")
         return 1

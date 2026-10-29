@@ -357,7 +357,9 @@ CARD_DASHBOARD = "Dashboard"
 CARD_ALL_BUGS = "All open bugs"
 ALL_BUGS_QUERY = "is:issue is:open label:{label}"
 # The nightly tier runs on a spec.mode: next install (nightly.py).
-CARD_FOOTER = f'<font color="{FAINT}">Model: {{models}} · next mode</font>'
+CARD_FOOTER = f'<font color="{FAINT}">{{label}}: {{models}} · next mode</font>'
+CARD_MODEL = "Model"
+CARD_MODELS = "Models"
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title}</title></head>
 <body style="margin:0;padding:0;background:{page_bg};">
@@ -1246,11 +1248,11 @@ def chat_card(week: dict) -> dict:
             row, count = rows_by_slug[slug], week["shown_bugs"][slug]
             text = CARD_ATTENTION_ITEM.format(dot=CARD_DOT_LOW if row["pct"] < LESS_THAN_HALF_PCT else CARD_DOT, name=esc(row["name"]),
                                               state=attention_state(row), bugs=CHAT_BUG if count == 1 else CHAT_BUGS.format(count=count))
-            items.append({"decoratedText": {"text": text, "button": card_link(CARD_VIEW, bugs_url(week["repo"], slug))}})
+            items.append({"decoratedText": {"text": text, "wrapText": True, "button": card_link(CARD_VIEW, bugs_url(week["repo"], slug))}})
         sections.append({"header": CARD_ATTENTION_TITLE, "widgets": items})
 
     areas = {"header": CARD_BY_AREA_TITLE, "widgets": [
-        {"decoratedText": {"text": CARD_AREA_ITEM.format(name=esc(r["name"]), bar=card_bar(r["pct"]), pct=r["pct"])}} for r in week["rows"]]}
+        {"decoratedText": {"text": CARD_AREA_ITEM.format(name=esc(r["name"]), bar=card_bar(r["pct"]), pct=r["pct"]), "wrapText": True}} for r in week["rows"]]}
     if len(week["rows"]) > CARD_AREAS_SHOWN:
         areas.update(collapsible=True, uncollapsibleWidgetsCount=CARD_AREAS_SHOWN)
     sections.append(areas)
@@ -1265,11 +1267,13 @@ def chat_card(week: dict) -> dict:
         time = CARD_TIME.format(typical=minutes(overall["agent_s_median"]), p90=minutes(overall["agent_s_p90"]), slowest=slowest)
     sections.append({"header": CARD_TIME_TITLE, "widgets": [card_text(time)]})
 
+    footer = week["footer"]
     all_bugs = ISSUES_SEARCH_URL.format(repo=week["repo"], query=urllib.parse.quote(ALL_BUGS_QUERY.format(label=BUG_LABEL), safe=""))
     sections.append({"widgets": [
         {"buttonList": {"buttons": [card_link(CARD_REPORT, REPORT_URL), card_link(CARD_DASHBOARD, DASHBOARD_URL),
                                     card_link(CARD_ALL_BUGS, all_bugs)]}},
-        card_text(CARD_FOOTER.format(models=esc(footer_models(week)))),
+        card_text(CARD_FOOTER.format(label=CARD_MODELS if len(set(footer["models"]) | set(footer["prev_models"])) > 1 else CARD_MODEL,
+                                     models=esc(footer_models(week)))),
     ]})
     return {"cardId": CARD_ID, "card": {
         "header": {"title": CARD_TITLE, "subtitle": CARD_SUBTITLE.format(range=date_range(days[0], days[-1])),

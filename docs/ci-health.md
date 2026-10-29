@@ -1110,9 +1110,11 @@ area needs attention), every area's pass rate as a ten-step bar, best first
 (collapsed to the first three), the task time (the median, the 90th percentile
 and the area with the slowest median), buttons to the page, the dashboard and
 all open nightly bugs, and the models the week ran. The message carries the
-same week in a few lines of plain text as the card's fallback, for
-notifications and clients that show no cards; that text also names the three
-strongest areas and the median's change when the week has a trend. The
+same week in a few lines of text, without Chat's markup, as the card's
+fallback for notifications; that text also names the three strongest areas and
+the median's change when the week has a trend. If Chat refuses the card (HTTP
+400, so nothing was posted), the step posts that text, with its links, instead.
+The
 render step writes both (`--chat-out`) only when the page passes, from the
 numbers the page printed, so the two cannot disagree and a refused week posts
 nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on

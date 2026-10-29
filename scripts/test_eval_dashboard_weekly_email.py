@@ -943,6 +943,8 @@ class ChatCard(Base):
         self.assertEqual(areas["header"], "By area")
         self.assertEqual(card_texts(areas), ["Chat  ▰▰▰▰▰▰▰▰▰▰  100%", "Observability  ▰▰▰▰▰▱▱▱▱▱  50%",
                                              "Cost  ▰▰▰▱▱▱▱▱▱▱  33%"])
+        # Long rows wrap rather than cut off the figures at the end.
+        self.assertTrue(all(w["decoratedText"]["wrapText"] for w in attention["widgets"] + areas["widgets"]))
         # Three areas: nothing to collapse.
         self.assertNotIn("collapsible", areas)
         self.assertEqual(time, {"header": "Task time", "widgets": [
@@ -982,7 +984,7 @@ class ChatCard(Base):
         _, card = self.card(runs, store_of(runs, models={d: OTHER_MODEL for d in THIS_WEEK}))
         lead = card_texts(card["card"]["sections"][0])
         self.assertEqual(lead[-1], f"This week ran {OTHER_MODEL}; last week ran {MODEL}, so the change compares two models.")
-        self.assertIn(f"Model: {OTHER_MODEL} (this week), {MODEL} (last week) · next mode", card_texts(card["card"]["sections"][-1])[1])
+        self.assertIn(f"Models: {OTHER_MODEL} (this week), {MODEL} (last week) · next mode", card_texts(card["card"]["sections"][-1])[1])
 
     def test_no_area_needing_attention_omits_the_section_and_no_timing(self):
         cases = {c: d for c, d in CASES.items() if d == "chat"}
@@ -1017,7 +1019,14 @@ class ChatCard(Base):
     def test_the_message_carries_the_text_as_the_fallback(self):
         week, card = self.card(timed_runs())
         body = post_health.Sender.body(we.chat_text(week), card)
-        self.assertEqual(body, {"fallbackText": we.chat_text(week), "cardsV2": [card]})
+        # The fallback is a notification's plain text: Chat's markup is dropped.
+        self.assertEqual(body["cardsV2"], [card])
+        fallback = body["fallbackText"]
+        self.assertTrue(fallback.startswith("kube-agents weekly health · Oct 12–18\n63% of nightly test runs passed"))
+        self.assertIn("• Observability: 50%, few scenarios, 1 open bug", fallback)
+        self.assertIn("full report · dashboard", fallback)
+        self.assertNotIn("*", fallback)
+        self.assertNotIn("<", fallback)
         self.assertEqual(post_health.Sender.body("plain"), {"text": "plain"})
 
 
