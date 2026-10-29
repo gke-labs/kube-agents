@@ -296,7 +296,8 @@ class DigestLineTest(unittest.TestCase):
         started = datetime.datetime(2026, 9, 10, 0, 0, 59, tzinfo=UTC)  # Wed 8:00 PM ET
         build = str((int(started.timestamp() * 1000) - nightly.PROW_BUILD_ID_EPOCH_MS) << nightly.PROW_BUILD_ID_TIME_SHIFT)
         self.assertEqual(nightly.build_started(build, started + datetime.timedelta(hours=1)), started)
-        self.assertEqual(nightly.build_started("9" * 40, started), started, "too large to be a date: the first sighting")
+        self.assertEqual(nightly.build_started("9" * 40, started), started, "not a snowflake: the first sighting")
+        self.assertEqual(nightly.build_started("1234", started), started, "not a snowflake: the first sighting")
         # First seen 40 minutes late, as the collector's late cron does.
         data["pending_builds"] = [{"build_id": build, "first_seen": (started + datetime.timedelta(minutes=40)).isoformat(), "tier": "nightly"}]
         self.assertEqual(self.line(data, started + datetime.timedelta(hours=12, minutes=25)), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "cut at its deadline, not yet recorded: still running")

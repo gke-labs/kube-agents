@@ -99,19 +99,22 @@ EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while it started this recently: the
 # longest part's budget is 12 hours (oss-test-infra: timeout 12h on the main
-# and main-b parts), plus Prow's 5-minute grace and 25 minutes for a late
-# collector tick to record finished.json. Past that the build is a pod that
+# and main-b parts), plus Prow's 5-minute grace and the minutes a pod cut
+# at its deadline takes to end (seen at 12h04m-12h06m). Past that the build is a pod that
 # died without uploading, which the collector keeps on pending_builds for
 # two days; it is not a running night. Keep it under 12h39m: the summer
 # digest window opens at 12:40 UTC, and must read a dead 00:00 UTC night as
 # missing, not still running.
 RUNNING_MAX_AGE = datetime.timedelta(hours=12, minutes=30)
-# A Prow build ID is a snowflake: milliseconds since this epoch, shifted
-# left this many bits. It dates a build's start exactly; first_seen, the
+# A Prow build ID is a snowflake of this many digits: milliseconds since
+# this epoch, shifted left this many bits (scripts/pool_pressure.py reads
+# it the same way). It dates a build's start exactly; first_seen, the
 # collector's first sighting, lags it by 30-70 minutes because GitHub runs
 # the */15 cron late, too unevenly for an age cut to absorb.
+PROW_BUILD_ID_DIGITS = 19
 PROW_BUILD_ID_EPOCH_MS = 1288834974657
 PROW_BUILD_ID_TIME_SHIFT = 22
+MILLIS_PER_SECOND = 1000
 # A night whose start is older than this when the digest goes out is not
 # "last night": the 00:00 UTC run starts 13 (EDT) or 14 (EST) hours before
 # the 9 AM ET digest, so its 12-hour budget has ended by then; 36 hours
@@ -777,15 +780,14 @@ def nightly_job(data: dict) -> str:
 
 
 def build_started(build: str, first_seen: datetime.datetime) -> datetime.datetime:
-    """When a pending build started, read from its snowflake ID. An ID that
-    decodes to after ``first_seen`` is not a snowflake (a build cannot be
-    seen before it starts), and its first sighting stands in; so does one
-    too large to be a date."""
-    ms = (int(build) >> PROW_BUILD_ID_TIME_SHIFT) + PROW_BUILD_ID_EPOCH_MS
-    try:
-        started = datetime.datetime.fromtimestamp(ms / 1000, UTC)
-    except (OverflowError, OSError, ValueError):
+    """When a pending build started, read from its snowflake ID. An ID of
+    another length, or one that decodes to after ``first_seen`` (a build
+    cannot be seen before it starts), is not a snowflake, and its first
+    sighting stands in."""
+    if len(build) != PROW_BUILD_ID_DIGITS:
         return first_seen
+    ms = (int(build) >> PROW_BUILD_ID_TIME_SHIFT) + PROW_BUILD_ID_EPOCH_MS
+    started = datetime.datetime.fromtimestamp(ms / MILLIS_PER_SECOND, UTC)
     return min(started, first_seen)
 
 
