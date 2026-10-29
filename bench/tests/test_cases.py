@@ -69,7 +69,7 @@ def test_the_case_keys_are_devops_benchs_fields_and_aliases_plus_ours():
     case may use; its loader-set ``folder`` is not one."""
     assert DEVOPS_BENCH_CASE_KEYS == (set(Task.model_fields) - {"folder"}) | {"task_id", "goal", "input"}
     assert "folder" not in CASE_KEYS
-    assert {"domain", "fixtures", "expected_fail"} <= CASE_KEYS
+    assert {"domain", "fixtures", "expected_fail", "scope_exclude"} <= CASE_KEYS
 
 
 def test_kanban_smoke_reads_as_the_shell_read_it(kanban_task):

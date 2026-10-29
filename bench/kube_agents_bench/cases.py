@@ -67,10 +67,11 @@ __all__ = [
 #   ``goal`` and ``input`` for ``prompt``), which the model cannot list.
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
-#   ``tool_calls_optional``, ``audit_streams`` -- and ``task_version``, a
-#   case's own revision note that nothing reads. A new one is added here, in a
-#   pull request before any case a pull-request job grades uses it (the
-#   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
+#   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` -- and
+#   ``task_version``, a case's own revision note that nothing reads. A new one
+#   is added here, in a pull request before any case a pull-request job grades
+#   uses it (the presubmit roster, or a lane list such as
+#   hack/eval/gitlab-cases.txt).
 _DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
 _DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
 DEVOPS_BENCH_CASE_KEYS = (
@@ -79,7 +80,7 @@ DEVOPS_BENCH_CASE_KEYS = (
 REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
-        "audit_streams", "task_version",
+        "audit_streams", "scope_exclude", "task_version",
     }
 )
 CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
