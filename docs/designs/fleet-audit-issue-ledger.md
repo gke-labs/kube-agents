@@ -804,11 +804,16 @@ cluster entry, the Config Connector objects whose `Ready` condition is `False`
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §2, `kcc_unready`), and
 `finish` parses the fix's file as the Config Connector index parses a clone and matches each object
 it declares on kind, `metadata.name`, `metadata.namespace` when the file sets one, and `clusterRef`
-when the file object and the recorded object both set one. A match that is not certain gives no
+when the file object and the recorded object both set one. When the file declares more than one
+Config Connector object, only the finding's own object counts (`NodePool/<n>` the
+`ContainerNodePool` `<n>` on the finding's cluster, `Cluster/<n>` the `ContainerCluster` `<n>`,
+another kind the objects of that name), and a file with no object of the finding gives no note. A
+match that is not certain gives no
 note: the same object not ready on more than one host cluster with nothing to tell them apart
 (Config Controller puts the objects of each instance in `config-control`), or, when the file sets
 no namespace, more than one object that fits. A ready object is not in the list, so when more than
-one cluster entry ran Config Connector (carries `kcc_unready`, also empty), the same name can be
+one cluster entry ran Config Connector (carries `kcc_unready`, also empty) or may run it (carries
+`kcc_unread`), the same name can be
 ready on one host and not ready on another. Then a match is certain only when the recorded object's
 target project (its `cnrm.cloud.google.com/project-id` annotation, which the collector records as
 `project`) is known and equals the file object's project annotation, or the finding's project when
@@ -834,11 +839,14 @@ fits the note cap: the worker's note is cut, and the text `finish` wrote at its 
 Unlike a route note, it saves no `uncut_note`, so the carry removes the note but does not bring
 back the text it cut. The pass first removes an earlier copy of the note from every remediation,
 and the carry removes it too, so a note never shows a stall that this run's manifest does not. A
-cluster whose read failed (`kcc_unread`) gives no stall and a warning in the log: the absence of the
-note never says that Config Connector applies a file. The same match, or a `Cluster/` or `NodePool/`
-finding whose own object is not ready when the fix's file declares a Config Connector object, makes the `pr-merged-persists` row and the comment on the
-merged pull request state the stall in place of "the remediation was incomplete, or something
-outside this repository reverted it".
+cluster whose read failed (`kcc_unread`) records no objects, so no note names an object there, and
+the log has a warning; it also counts as a possible host, so the rule for more than one host applies
+to the matches on the other clusters. The absence of the note never says that Config Connector
+applies a file. The same match makes the `pr-merged-persists` row and the comment on the merged pull
+request state the stall in place of "the remediation was incomplete, or something outside this
+repository reverted it". So does a `Cluster/` or `NodePool/` finding whose own object is not ready,
+when the fix is `manifest` and its file declares a Config Connector object (in a file of several,
+the finding's own), or when the fix is `gcloud` or `manual`.
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 

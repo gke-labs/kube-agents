@@ -127,7 +127,7 @@ uses the kubeconfig its sweep fetched. These reads end `kcc_health.RUN_DEADLINE_
 the collector starts, so the manifest prints inside the 600 s terminal call; an entry whose read
 cannot start in time gets `kcc_unread`. Only cluster entries are read: a `project/<id>` entry at
 location `global` is skipped, and an entry with no kubeconfig file gets `kcc_unread`. When more than
-one entry carries `kcc_unready`, `finish` names an object only when its `project` is known and
+one entry carries `kcc_unready` or `kcc_unread` (a failed read can hide a host), `finish` names an object only when its `project` is known and
 agrees with the fix; with one such entry, a known `project` that differs from the fix's is still no
 match (the issue-ledger design, §6). `finish` adds a note to a
 `manifest` fix whose file declares one of the objects, and states the stall on a merged fix that
