@@ -18803,16 +18803,15 @@ def _remediation_file_index(finding: dict, root: Path) -> dict[KccKey, KccDeclar
 def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dict[KccKey, KccDeclaration]:
     """The Config Connector objects of the fix's file that the fix is about.
 
-    A file with one object: that object. A file with more: only the one that
-    is the finding's own object (`NodePool/<n>` is the `ContainerNodePool`
-    whose GKE name is `<n>` on the finding's cluster, `Cluster/<n>` the
-    `ContainerCluster` `<n>`, another kind the objects of that
-    `metadata.name`, of that kind when the file declares it), because a stall of another object in the same file
-    says nothing about this fix. Empty when no object is the finding's own:
-    then the audit cannot tell which object the fix changes.
+    Only the finding's own object, also when the file declares one object
+    (`NodePool/<n>` is the `ContainerNodePool` whose GKE name is `<n>` on the
+    finding's cluster, `Cluster/<n>` the `ContainerCluster` `<n>`, another
+    kind the objects of that `metadata.name`, of that kind when the file
+    declares it). A stall of another object in the same file says nothing
+    about this fix: a `Deployment` fix in a file that also declares its
+    `IAMServiceAccount` did not change that account. Empty when no object is
+    the finding's own: then the fix gets no Config Connector text.
     """
-    if len(index) <= 1:
-        return index
     prefix, _, name = str(finding.get("object") or "").partition("/")
     if not name:
         return {}

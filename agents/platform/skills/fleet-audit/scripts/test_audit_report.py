@@ -22879,7 +22879,9 @@ class TestStalledKccRemediations(unittest.TestCase):
             "  name: gpu-pool\n  namespace: config-control\nspec:\n  location: us-central1\n"
             "  clusterRef:\n    name: prod-a\n",
         )
-        return kcc_finding(path="pools/gpu-pool.yaml")
+        finding = kcc_finding(path="pools/gpu-pool.yaml")
+        finding.update(cluster="acme/us-central1/prod-a", object="NodePool/gpu-pool")
+        return finding
 
     @staticmethod
     def two_hosts(*entries):
@@ -23070,6 +23072,7 @@ metadata:
         for hub2 in ({"kcc_unready": []}, {"kcc_unread": "`kubectl get gcp -A` did not finish in 240s"}):
             with self.subTest(hub2=list(hub2)):
                 finding = kcc_finding(path="topics/events.yaml")
+                finding["object"] = "PubSubTopic/events"
                 manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
                 del manifest["clusters"][1]["kcc_unready"]
                 manifest["clusters"][1].update(hub2)
@@ -23093,6 +23096,7 @@ metadata:
         ):
             with self.subTest(hub2=hub2):
                 finding = kcc_finding(path="topics/events.yaml")
+                finding["object"] = "PubSubTopic/events"
                 manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
                 del manifest["clusters"][1]["kcc_unready"]
                 manifest["clusters"][1].update(hub2)
@@ -23106,6 +23110,7 @@ metadata:
             "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
         )
         finding = kcc_finding(path="topics/events.yaml")
+        finding["object"] = "PubSubTopic/events"
         manifest = self.two_hosts(("acme/us-central1/hub-1", [dict(KCC_TOPIC, name="events", project="acme")]), ("acme/us-east1/hub-2", []))
         del manifest["clusters"][1]["kcc_unready"]
         manifest["clusters"][1]["outcome"] = "unreachable"
@@ -23155,6 +23160,33 @@ metadata:
         mine["cluster"] = "acme/us-central1/prod"
         self.disclose([mine], kcc_manifest(pool))
         self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, mine)
+
+    def test_a_single_config_connector_object_that_is_not_the_findings_gives_no_note(self):
+        """apps/web.yaml holds Deployment shop/web and IAMServiceAccount
+        shop/web-sa; the fix is for the Deployment; web-sa is stalled. The fix
+        did not change the account, so no Config Connector text."""
+        self.write(
+            "apps/web.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n---\n"
+            "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: web-sa\n  namespace: shop\n",
+        )
+        finding = make_finding(fid="w", cluster="acme/us-central1/prod-usc1", obj="Deployment/web",
+                               remediation={"kind": "manifest", "path": "apps/web.yaml", "note": "Add a probe."})
+        account = {"kind": "IAMServiceAccount", "namespace": "shop", "name": "web-sa", "why": "UpdateFailed: Error 403"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(account)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.assertNotIn("Config Connector", audit_report.render_persists_comment(AUDIT, finding, NOW))
+
+    def test_a_single_config_connector_object_that_is_the_findings_gives_the_note(self):
+        self.write(
+            "iam/web-sa.yaml",
+            "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: web-sa\n  namespace: shop\n",
+        )
+        finding = make_finding(fid="a", cluster="acme/us-central1/prod-usc1", obj="IAMServiceAccount/web-sa",
+                               remediation={"kind": "manifest", "path": "iam/web-sa.yaml", "note": "Grant the role."})
+        account = {"kind": "IAMServiceAccount", "namespace": "shop", "name": "web-sa", "why": "UpdateFailed: Error 403"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(account)), ["a"])
+        self.assertIn("`IAMServiceAccount shop/web-sa`", finding["remediation"]["note"])
 
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
@@ -23308,13 +23340,14 @@ class TestStalledKccInFinish(HarnessTestCase):
             "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
         }
         manifest = _full_manifest(candidates=[candidate])
-        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
+        # The file's one object is the finding's own (`no-network-policy`).
+        manifest["clusters"][0]["kcc_unready"] = [dict(KCC_CLUSTER, name="no-network-policy"), KCC_TOPIC]
         return manifest
 
     def doc_and_file(self):
         target = self.workspace / KCC_CLUSTER_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
+        target.write_text(KCC_CLUSTER_DECLARATION.replace("prod-usc1", "no-network-policy"), encoding="utf-8")
         finding = make_finding(
             remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."}
         )
@@ -33827,12 +33860,13 @@ class TestStoreLedger(HarnessTestCase):
         self.claim()
         target = self.workspace / KCC_CLUSTER_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
+        # The file's one object is the finding's own (`no-network-policy`).
+        target.write_text(KCC_CLUSTER_DECLARATION.replace("prod-usc1", "no-network-policy"), encoding="utf-8")
         finding = make_finding(
             remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."}
         )
         manifest = _full_manifest(candidates=[{**self.netpol_candidate(), "severity": "critical"}])
-        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
+        manifest["clusters"][0]["kcc_unready"] = [dict(KCC_CLUSTER, name="no-network-policy"), KCC_TOPIC]
         manifest_path = self.tmp_path / "manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.start()
