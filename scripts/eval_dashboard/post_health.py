@@ -97,7 +97,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli, nightly, periodics
+    from eval_dashboard import gate_issue, ghcli, nightly, nightly_latency, periodics
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
@@ -108,6 +108,7 @@ try:
         POOL_UNMEASURED,
         PROW_JOB_TIMEOUT,
         SECONDS_PER_MINUTE,
+        fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
         near_deadline_margin,
@@ -117,7 +118,7 @@ try:
     )
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli, nightly, periodics
+    from eval_dashboard import gate_issue, ghcli, nightly, nightly_latency, periodics
     from eval_dashboard.health import (
         CAPACITY_ROLES,
         POOL_BREACH,
@@ -125,6 +126,7 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
         POOL_UNMEASURED,
         PROW_JOB_TIMEOUT,
         SECONDS_PER_MINUTE,
+        fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
         near_deadline_margin,
@@ -284,6 +286,9 @@ FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the p
 # own role), and so would "edit main.tf" in the hours after a size change has
 # merged, while the postsubmit is still rolling it; the hint covers both.
 FIXTURE_CAPACITY_HINT = "default-pool-headroom reads capacity, not an unapplied stack: seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, and a re-apply changes nothing. The fix is the pool's size in bench/tf/fleet/main.tf (seeded_a_default): if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands; otherwise the pool needs a larger machine type or node count."
+# When every drift line is one no re-apply clears (health.fixture_no_reapply,
+# #4005), the retest line names the remedy instead of the reconcile.
+FIXTURE_NO_REAPPLY_LEAD = "No re-apply of bench/tf/fleet clears this drift."
 # A reconcile run older than this is printed with its date in the digest.
 RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
@@ -334,11 +339,12 @@ POOL_JOB_HISTORY_URL = (
     f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{POOL_PRESSURE_JOB}"
 )
 
-# gsutil is how the state object is read and written; publish.py uses the
-# same header so a reader never gets an hour-stale copy.
-GSUTIL = "gsutil"
+# `gcloud storage` is how the state object is read and written; publish.py
+# sets the same Cache-Control so a reader never gets an hour-stale copy.
+GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
 GS_PREFIX = "gs://"
-CACHE_CONTROL = "Cache-Control: no-cache"
+CACHE_CONTROL_FLAG = "--cache-control=no-cache"
 
 UTC = timezone.utc
 
@@ -355,7 +361,7 @@ def log(message: str) -> None:
 def read_state(location: str, runner=subprocess.run) -> dict | None:
     """The last posted state, or None when there is none yet."""
     if location.startswith(GS_PREFIX):
-        result = runner([GSUTIL, "-q", "cat", location], capture_output=True, text=True)
+        result = runner([GCLOUD, STORAGE_GROUP, "cat", location], capture_output=True, text=True)
         if result.returncode != 0:
             return None
         text = result.stdout
@@ -378,7 +384,7 @@ def write_state(location: str, state: dict, runner=subprocess.run) -> None:
             handle.write(text)
             name = handle.name
         try:
-            runner([GSUTIL, "-q", "-h", CACHE_CONTROL, "cp", name, location], check=True)
+            runner([GCLOUD, STORAGE_GROUP, "cp", CACHE_CONTROL_FLAG, name, location], check=True)
         finally:
             os.unlink(name)
         return
@@ -772,7 +778,11 @@ def fixture_drift_sentence(health: dict, since: str) -> str:
 
 def fixture_drift_advice(health: dict) -> str:
     """The retest line and the hint, by what drifted: a re-apply for a planted
-    object out of shape, the pool's size for a capacity role, both when mixed."""
+    object out of shape, the pool's size for a capacity role, both when mixed,
+    and the real remedy when no re-apply clears any drift line."""
+    remedy = fixture_no_reapply(health.get("incident") or {})
+    if remedy:
+        return f"{FIXTURE_NO_REAPPLY_LEAD} {remedy}"
     roles = set((health.get("incident") or {}).get("roles") or [])
     if roles and roles <= CAPACITY_ROLES:
         return f"Retest once the pool has headroom. {FIXTURE_CAPACITY_HINT}"
@@ -1227,12 +1237,60 @@ def _periodic_footer(words: dict, history_url: str) -> str:
     return f"{runbook}Build: {history_url}"
 
 
+def shared_cause_groups(notes: dict[str, dict]) -> list[list[str]]:
+    """The failed jobs, two or more, whose builds ended with the same last log
+    line: one cause, one message. A job with no last line, or alone with
+    its own, is not grouped."""
+    by_line: dict[str, list[str]] = {}
+    for job, note in sorted(notes.items()):
+        if note.get("verdict") == periodics.VERDICT_FAILED and note.get(periodics.KEY_LAST_LINE):
+            by_line.setdefault(note[periodics.KEY_LAST_LINE], []).append(job)
+    return [jobs for jobs in by_line.values() if len(jobs) > 1]
+
+
+def render_shared_cause(jobs: list[str], notes: dict[str, dict]) -> str:
+    """One block for jobs whose builds died on the same log line: where and
+    the line, then each job as its own block would say it (what it does, its
+    run, its detail lines, its own node and Warning pod event), the effects,
+    a footer per job."""
+    words = {job: _job_words(job, notes[job]) for job in jobs}
+    places = " and ".join(dict.fromkeys(words[job]["place"] for job in jobs))
+    lines = [
+        f"🟠 *{places}: {len(jobs)} jobs failed on the same log line.*",
+        f"Each build's log ends on the same line, `{notes[jobs[0]][periodics.KEY_LAST_LINE]}`; one place to look first.",
+    ]
+    for job in jobs:
+        note = notes[job]
+        does = f"`{job}` {words[job]['does']}." if words[job].get("does") else f"`{job}`."
+        dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
+        how = f": {note['summary']}" if note.get("summary") else ""
+        lines.append(f"{does} Its {clock(parse_iso(note.get('finished_at')))} run (build {note['build']}){dry} failed{how}.")
+        lines.extend(f"- {line}" for line in note.get("detail") or [])
+        # The shared line is in the header; the node and the event are this job's.
+        own = periodics.cause_text({key: value for key, value in note.items() if key != periodics.KEY_LAST_LINE})
+        if own:
+            lines.append(f"- how it died: {own}")
+    effects = " ".join(dict.fromkeys(words[job]["effect"] for job in jobs if words[job].get("effect")))
+    lines.append(" ".join(part for part in ("Effect:", effects, periodics.SCOPE_LINE) if part))
+    lines.extend(f"`{job}`: {_periodic_footer(words[job], notes[job]['history_url'])}" for job in jobs)
+    return "\n".join(lines)
+
+
 def render_periodic(health: dict, prev: dict | None) -> str:
     """One block per job with news, four lines each: where and what stopped
-    happening; which job, what it does, which run and how it failed; what that
-    costs and the scope; the runbook and the build."""
+    happening; which job, what it does, which run and how it failed (and how
+    the build died: the log line that says so, the node and a Warning pod
+    event, when read); what that costs and the scope; the runbook and the
+    build. Failed jobs whose builds died on the same log line share one block."""
+    news = periodic_news(health, prev)
     blocks = []
-    for job, note in sorted(periodic_news(health, prev).items()):
+    grouped: set[str] = set()
+    for jobs in shared_cause_groups(news):
+        blocks.append(render_shared_cause(jobs, news))
+        grouped.update(jobs)
+    for job, note in sorted(news.items()):
+        if job in grouped:
+            continue
         when = clock(parse_iso(note.get("finished_at")))
         words = _job_words(job, note)
         does = f"`{job}` {words['does']}." if words.get("does") else f"`{job}`."
@@ -1258,6 +1316,9 @@ def render_periodic(health: dict, prev: dict | None) -> str:
         how = f": {note['summary']}" if note.get("summary") else ""
         lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
         lines.extend(f"- {line}" for line in note.get("detail") or [])
+        cause = periodics.cause_text(note)
+        if cause:
+            lines.append(f"- how it died: {cause}")
         lines.append(effect)
         lines.append(footer)
         blocks.append("\n".join(lines))
@@ -1357,7 +1418,8 @@ def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str
         elif note.get("verdict") == periodics.VERDICT_TOKEN:
             lines.append(f"🟡 {words['place']}: {words['absence']} (build {note['build']} passed {dated_clock(parse_iso(note.get('finished_at')), now)}; {'; '.join(note.get('detail') or [])}); {note['history_url']}")
         else:
-            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
+            cause = periodics.cause_text(note)
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}{f'; {cause}' if cause else ''}); {note['history_url']}")
     return lines
 
 
@@ -1551,6 +1613,23 @@ def pool_digest_line(pool: dict) -> str:
     )
 
 
+def nightly_latency_line(data: dict, now: datetime) -> str | None:
+    """The latency block's night line (nightly_latency.py) for the one-line
+    nightly summary: last night only, when it carried timing; the line says
+    so when the night is cut short or partial. It runs on the morning the
+    section failed, so a failure of its own is no line, never a lost
+    digest."""
+    try:
+        night, _ = nightly.last_night(data, now)
+        if night is None:
+            return None
+        return nightly_latency.night_line(nightly.night_reports(data, running=nightly.running_nights(data, now)))
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: nightly latency line skipped")
+        return None
+
+
 def render_digest(health: dict, now: datetime, data: dict | None = None, section=None, coverage=()) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- last night's nightly run. ``section`` is what
@@ -1559,7 +1638,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     the one line on the night with a link to its report -- the counts, what
     is newly failing against the night before, the opening chat turn's p50
     and p95 when the reps carried it, and the wall clock, or that the night
-    was truncated or missing -- and a reason adds a line saying why the
+    was truncated or missing -- then the latency block's night line
+    (nightly_latency.py) when last night carried timing, and a reason adds
+    a line saying why the
     section is missing. ``coverage`` is ``coverage_lines``'s: one line per
     domain with no blocking presubmit seat, none while every domain has one."""
     metrics = health.get("metrics") or {}
@@ -1602,6 +1683,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
             lines.append("")
     elif data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
+        latency = nightly_latency_line(data, now)
+        if latency:
+            lines.append(latency)
         lines.append(NIGHTLY_URL)
         if isinstance(section, str):
             lines.append(NIGHTLY_SKIPPED.format(reason=section))

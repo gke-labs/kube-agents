@@ -453,7 +453,8 @@ holds a line in `hack/eval/blocking-roster.txt` only when all five hold. Rules (
 judgments on the record, so the admission pull request shows them, in the roster-admission
 block of [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md). Rules (c),
 (d) and (e) can be read from the files, so `scripts/test_eval_rosters.py` checks them on every
-pull request.
+pull request. The block stays in every pull request: one that adds no roster line answers it
+with "Not a roster admission."
 
 - **(a) A recorded red.** The case has failed for the right reason before: against `main`
   without the fix it guards, the red half of the loop in

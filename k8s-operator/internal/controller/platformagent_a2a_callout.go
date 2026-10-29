@@ -103,7 +103,8 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	1 -> serviceAccount, user, account, grants
 //	2 -> adds narrowing
 //	3 -> adds profile and topics (the AgentProfile entry)
-const a2aIdentityMapSchema = "3"
+//	4 -> adds tier (one AgentProfile entry per tier, #3655)
+const a2aIdentityMapSchema = "4"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
