@@ -3242,6 +3242,13 @@ class ScopeTest(HomesMixin):
         self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
         self.assertEqual(deleted, [])
 
+    def test_an_unknown_relayed_describe_names_its_cluster_in_the_log(self):
+        logged: list = []
+        row = {"status": 500, "error": {"error": {"code": 500, "status": "INTERNAL", "message": "Internal error"}}}
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            self.assertIsNone(rec._read_get("p", "us-central1", "seeded-a", row))
+        self.assertIn("seeded-a (p/us-central1)", logged[0])
+
     def test_a_not_found_body_under_another_status_is_unknown(self):
         profiles, identities = self._profiles("odd")
         _, relay = self._relay(lists={self.MGMT: self._ok_list()},

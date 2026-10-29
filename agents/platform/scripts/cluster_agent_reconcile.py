@@ -578,7 +578,7 @@ def _read_list(project: str, row) -> tuple[list | None, str]:
     return None, outcome
 
 
-def _read_get(project: str, row) -> bool | None:
+def _read_get(project: str, location: str, cluster: str, row) -> bool | None:
     """A relayed `clusters.get` answer as `_cluster_exists` answers: True, False or None.
 
     False only for the API's own NotFound: a 404 whose body is a Google error with status
@@ -597,7 +597,8 @@ def _read_get(project: str, row) -> bool | None:
         _denied_this_run.add(project)
     elif classified == OUTCOME_API_DISABLED:
         _api_disabled_this_run.add(project)
-    log(f"relayed describe in {project} answered {status or 'nothing'} (treating as unknown): {text}")
+    log(f"describe {cluster} ({project}/{location}) through the relay answered {status or 'nothing'} "
+        f"(treating as unknown): {text}")
     return None
 
 
@@ -652,7 +653,7 @@ def _relay_describes(keys: dict[str, dict], deadline: float) -> dict[str, tuple[
         return {}
     return _relay_batch("describing", {name: "/".join(t) for name, t in triples.items()},
                         {"clusters": [list(t) for t in triples.values()]}, lambda answer: answer["gets"],
-                        lambda name, row: (_read_get(triples[name][0], row), ""), deadline)
+                        lambda name, row: (_read_get(*triples[name], row), ""), deadline)
 
 
 def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
@@ -665,7 +666,8 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
     (None, outcome) means the list could not be read; ([], "ok") means the project
     genuinely has no clusters. The caller degrades identically either way — PRUNE
     reads this list only as proof that a cluster exists, and deletes only on a
-    NotFound from `_cluster_exists`, so a bad list can never delete anything — but
+    NotFound from the cluster's own lookup (`_read_get` through the relay,
+    `_cluster_exists` on the gcloud fallback), so a bad list can never delete anything — but
     the outcome is what tells the bootstrap gate, and the snapshot,
     which projects the roster it is about to read actually covers.
     """
