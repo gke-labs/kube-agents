@@ -201,7 +201,14 @@ operation it supports onto routes. One entry per route:
   headers such as `Authorization`, `Content-Type`, `Accept` and `User-Agent` pass. This matters as much as the
   route: on Hermes, an allowed turn or create route also takes fields that set a session's system
   prompt, its model lock, its source or its memory scope, and none of today's callers send them;
+- where the harness reports the session a request ran in, if it does (Hermes sends
+  `X-Hermes-Session-Id` on a `/v1/responses` answer; the bench already reads it,
+  `bench/kube_agents_bench/harness.py:717`);
 - whether the response streams.
+
+A field named under `session`, `chain` or `name` is also listed in `body` or `query`: the
+descriptor states every accepted field once in the lists, and the other keys only say what the door
+does with some of them.
 
 For Hermes, for example:
 
@@ -217,16 +224,15 @@ operations:
   turn.respond:
     - method: POST
       path: /v1/responses
-      chain: { body: previous_response_id } # resolved by the door, §4.4
       name: { body: conversation } # namespaced per class by the door
-      body:
-        [model, input, instructions, conversation, previous_response_id, stream]
+      reports_session: { header: X-Hermes-Session-Id }
+      body: [model, input, conversation]
       stream: true
   session.create:
     - method: POST
       path: /api/sessions
-      session: { body: [...] } # every key the harness reads an id from
-      body: [title]
+      session: { body: session_id }
+      body: [session_id, title]
   session.turn:
     - { method: POST, path: "/api/sessions/{session}/chat", body: [message] }
     - method: POST
@@ -350,11 +356,12 @@ session:
     the session exists and has no messages from anyone else, and dropped otherwise.
   - On `turn.respond`, the door records the response ids it returned, and to which class, in the
     same registry as the origins (the Session KV server's per-session metadata), so a door restart
-    loses nothing. It accepts a `previous_response_id` only if that id was returned to the same class, and
-    it namespaces `conversation` names per class, so two classes can't land in one chain by
-    choosing the same name. A turn with neither starts a new session, which the door records from
-    the session id the harness reports in its response. If the harness doesn't report one, the
-    descriptor can't offer `turn.respond` with origin scoping (§9).
+    loses nothing. It namespaces `conversation` names per class, so two classes can't land in one chain by
+    choosing the same name. A turn whose (namespaced) conversation the class doesn't hold yet, or a
+    turn with no conversation, starts a new session, which the door records from the session id the
+    harness reports (`reports_session`). No caller sends `previous_response_id` today, so the
+    example doesn't accept it. If one is added, the door accepts it only if that id was returned to
+    the same class.
   - The door never stamps an origin onto a session that already exists. An existing session with no
     record stays unreadable, rather than becoming the first caller's.
 - **Around the door:** the in-pod starters write their origin when they start a session: the
@@ -549,9 +556,9 @@ tells an operator whether anything of theirs would be refused.
    a per-route idle timeout.
 5. **ops and `session.list`.** Moving the e2e liveness probe to `health` would leave ops with no
    session operation at all. Is that worth doing in phase 2?
-6. **Which session `/v1/responses` used.** Origin recording for a new chain needs the harness to
-   report the session id it ran the turn in. Does Hermes' response carry it? If not, `turn.respond`
-   needs either a harness change or a door-assigned session for each new chain.
+6. **A harness that doesn't report its session.** Hermes does (`X-Hermes-Session-Id`). For a
+   harness that doesn't, should the descriptor refuse to offer `turn.respond`, or should the door
+   assign the session itself?
 7. **Chat sessions in the console's rail.** Should the console keep listing Slack and Google Chat
    sessions by title (§4.4)? If yes, `session.list` for console gains those origins, read-only.
 8. **Origin enum ownership.** The origin values are shared with memory scoping. Should the enum
