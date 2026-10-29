@@ -1359,6 +1359,31 @@ class InstallerCommonTest(unittest.TestCase):
                     if absent:
                         self.assertNotIn(absent, content)
 
+    def test_tfvars_refuse_a_misspelt_vertex_manage_serving_project(self):
+        # Read as off, a typo would revoke the gateway's grant on the serving
+        # project, so the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "flase", "managed"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"VERTEX_MANAGE_SERVING_PROJECT='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+            for value, expected in (("False", "false"), ("yes", "true")):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(f"vertex_manage_serving_project = {expected}", dest.read_text())
+
     def test_tfvars_refuse_scoped_sa_pool_values_terraform_cannot_take(self):
         # upgrade.sh regenerates from install.env without install.sh's checks,
         # so the generator names the key and writes nothing; a misspelt switch
