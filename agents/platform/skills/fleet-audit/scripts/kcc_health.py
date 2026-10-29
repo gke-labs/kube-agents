@@ -10,12 +10,13 @@ clusters were healthy, so no stream saw it.
 
 `finish` must not read a cluster (docs/designs/fleet-audit-collector-manifest.md):
 the collectors do the reading. This module is the one read they share
-(`read_objects`). On each cluster a collector swept, it lists the
-CustomResourceDefinitions once to find the Config Connector kinds (a group that
-ends in `.cnrm.cloud.google.com`, in the `gcp` category), then makes one list
-request per kind (`kubectl get --raw /apis/<group>/<version>/<plural>`), on a
-pool of `KIND_READ_WORKERS`, and puts the result on that cluster's manifest
-entry. `kubectl get gcp -A` does the same work one kind after another, and
+(`read_objects`). On each cluster a collector swept, it reads the API
+server's discovery once (`kubectl api-resources`, which needs no RBAC grant) to
+find the Config Connector kinds (a group that ends in `.cnrm.cloud.google.com`,
+in the `gcp` category), then makes one list request per kind (`kubectl get
+--raw /apis/<group>/<version>/<plural>`), on a pool of `KIND_READ_WORKERS`
+with no more than `PROXY_SLOTS` requests in flight in the process, and puts
+the result on that cluster's manifest entry. `kubectl get gcp -A` does the same work one kind after another, and
 through the credential proxy its 230 requests took longer than the read's
 time limit on a cluster with the add-on.
 
@@ -34,9 +35,9 @@ time limit on a cluster with the add-on.
   is ready, not yet reached, or still updating or deleting.
 - `kcc_unread`: why the read did not give an answer (a timeout, a forbidden
   read, output that is not a list). This is "unknown", never "healthy".
-- Neither key on a `collected` entry: the cluster has no Config Connector
-  CustomResourceDefinition in the `gcp` category, so Config Connector does
-  not run on that cluster.
+- Neither key on a `collected` entry: the cluster serves no Config Connector
+  kind in the `gcp` category, so Config Connector does not run on that
+  cluster.
 
 The reads start after the sweep and must end inside the collector's time
 budget (`RUN_DEADLINE_S` from the collector's start), so the manifest prints
@@ -60,13 +61,16 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, NamedTuple
 
-# The category Config Connector registers across every CRD it installs, so one
-# read returns every object it owns.
+# The category Config Connector registers across every CRD it installs.
+# `read_objects` keeps the kinds in it and lists each in parallel, because
+# `kubectl get gcp -A` lists the ~230 kinds one after another, too slowly
+# through the credential proxy.
 KCC_CATEGORY = "gcp"
 # The one condition every Config Connector kind carries.
 KCC_READY_CONDITION = "Ready"
@@ -89,37 +93,50 @@ MAX_WHY_CHARS = 240
 # What `why` says when the condition carries neither a reason nor a message.
 NO_REASON_GIVEN = "no reason given"
 # collect.py's `KCC_READ_TIMEOUT_S`: the most time the whole read of one
-# cluster (the CRD list and every kind's list) may take.
+# cluster (the discovery and every kind's list) may take.
 READ_TIMEOUT_S = 240
 # The suffix of every Config Connector API group.
 KCC_GROUP_SUFFIX = ".cnrm.cloud.google.com"
-# The CRD list, as one line per CRD: group, plural, kind, categories, and the
-# storage version. jsonpath keeps the output small: the Config Connector CRDs
-# carry large schemas, and a full `-o json` list could reach the credential
-# proxy's output cap.
-CRD_FIELD_SEPARATOR = "\t"
-CRD_JSONPATH = (
-    "{range .items[*]}{.spec.group}{\"\\t\"}{.spec.names.plural}{\"\\t\"}{.spec.names.kind}"
-    "{\"\\t\"}{.spec.names.categories}{\"\\t\"}{.spec.versions[?(@.storage==true)].name}{\"\\n\"}{end}"
-)
-CRD_LIST_FIELDS = 5
-# The words of a categories field as jsonpath prints it (`["gcp"]`).
-CATEGORY_WORD = re.compile(r"[A-Za-z0-9-]+")
-# The timeout of the CRD list, and of one kind's list request; both are also
+# The discovery that finds the Config Connector kinds: `kubectl api-resources`
+# reads the API server's discovery documents, which every authenticated
+# identity may read, so no RBAC grant is needed to learn that a cluster serves
+# no Config Connector kind. With aggregated discovery it is one or two
+# requests. `-o wide` adds the verbs and the categories; `--no-headers` leaves
+# one resource per line.
+DISCOVERY_ARGV = ("kubectl", "api-resources", "-o", "wide", "--no-headers")
+# The words of an `api-resources -o wide` line after NAME and SHORTNAMES:
+# APIVERSION, NAMESPACED, KIND, VERBS, CATEGORIES. SHORTNAMES can be empty, so
+# a line is read from its NAMESPACED column (`true` or `false`).
+NAMESPACED_VALUES = ("true", "false")
+DISCOVERY_LIST_SEPARATOR = ","
+LIST_VERB = "list"
+# What `kubectl api-resources` says, and exits 1 with, when an aggregated API
+# (often `metrics.k8s.io`) did not answer. The resources it printed are still
+# good unless the group that did not answer is a Config Connector group.
+PARTIAL_DISCOVERY_MARKER = "unable to retrieve the complete list of server APIs"
+# The timeout of the discovery, and of one kind's list request; both are also
 # cut to the time left.
-CRD_LIST_TIMEOUT_S = 60
+DISCOVERY_TIMEOUT_S = 60
 KIND_READ_TIMEOUT_S = 60
-# How many kinds are listed at once on one cluster: the credential proxy's
-# admitted count at its default limit, which every pool in this directory pins
-# (collect.py's `MAX_WORKERS`, held equal by test_collect.py's `TestSweepPool`).
-# A wider pool only queues in the proxy, and a request that waits there past
-# its slot wait is refused, which would make the read unknown. Four at a time
-# lists the ~230 kinds of a Config Connector install in about a quarter of the
-# time `kubectl get gcp -A` takes, one kind after another. Each request is its
-# own `kubectl` process and its own response, so no response nears the
-# proxy's output cap.
+# How many kinds one cluster's read lists at once. Each request is its own
+# `kubectl` process and its own response, so no response nears the proxy's
+# output cap.
 KIND_READ_WORKERS = 4
-# What the API server says for a kind whose CRD went away after the CRD list:
+# How many Config Connector requests run at once in this process, across all
+# clusters: the credential proxy's admitted count at its default limit, which
+# every pool in this directory pins (collect.py's `MAX_WORKERS`, held equal by
+# test_collect.py). The collectors read several clusters at once, each with
+# its own kind pool, so without this bound 4 x 4 requests would queue in the
+# proxy, which refuses a request that waits past its slot wait and so makes a
+# host's read unknown. Every `kubectl` call of the read takes a slot first
+# (`_with_proxy_slot`). Other reads of the compliance sweep threads at the
+# same time are not counted here, so the proxy's queue can still hold up to
+# `PROXY_SLOTS - 1` more requests than this bound.
+PROXY_SLOTS = 4
+_PROXY_SLOT_POOL = threading.BoundedSemaphore(PROXY_SLOTS)
+# What a step says when no slot or no time was left before the deadline.
+NO_SLOT_DETAIL = "no proxy slot was free before the read's deadline"
+# What the API server says for a kind whose CRD went away after the discovery:
 # that kind holds no object, so it is skipped.
 KIND_GONE_MARKERS = ("NotFound", "the server could not find the requested resource")
 # The outcomes of a read (`KccRead.status`).
@@ -148,8 +165,6 @@ BUDGET_SPENT_REASON = (
 )
 # What `default_run` returns for a command it killed, as `timeout(1)` does.
 TIMEOUT_RC = 124
-# The API server's answer when it does not serve the category.
-RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
 # How much of stderr goes into a `kcc_unread` reason.
 MAX_ERROR_CHARS = 300
 # The manifest outcome of a cluster the collector read.
@@ -318,13 +333,14 @@ def _needs_namespace_projects(fields: dict) -> bool:
     return any(not record.get("project") for record in fields.get(UNREADY_FIELD) or [])
 
 
-def read_namespace_projects(fields: dict, kubeconfig: Path, *, run: RunFn, timeout_s: int) -> None:
+def read_namespace_projects(fields: dict, kubeconfig: Path, *, run: RunFn, deadline: float, clock: ClockFn = time.monotonic) -> None:
     """Fill the unready objects' missing projects from one namespaces read.
-    A failed read leaves them unknown."""
-    result = run(
-        ["kubectl", "get", "namespaces", "-o", "json"], env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=timeout_s
+    A failed read, or one that cannot start before `deadline`, leaves them
+    unknown."""
+    result = _with_proxy_slot(
+        run, ["kubectl", "get", "namespaces", "-o", "json"], kubeconfig, NAMESPACES_TIMEOUT_S, deadline, clock
     )
-    if result.rc != 0:
+    if result is None or result.rc != 0:
         return
     try:
         parsed = json.loads(result.stdout)
@@ -335,7 +351,7 @@ def read_namespace_projects(fields: dict, kubeconfig: Path, *, run: RunFn, timeo
 
 
 class KccKind(NamedTuple):
-    """One Config Connector kind, as the CRD list names it."""
+    """One Config Connector kind, as the discovery names it."""
 
     group: str
     version: str
@@ -348,7 +364,7 @@ class KccRead(NamedTuple):
 
     `status` is one of the `READ_*` outcomes; `items` holds every object of
     every kind when it is `READ_LISTED`; `detail` says what went wrong
-    otherwise; `kinds` is how many Config Connector kinds the CRD list named;
+    otherwise; `kinds` is how many Config Connector kinds the discovery named;
     `timeout_s` is the most time the read had.
     """
 
@@ -359,9 +375,9 @@ class KccRead(NamedTuple):
     timeout_s: int
 
 
-def crd_list_argv() -> list[str]:
-    """The CRD list that finds the Config Connector kinds."""
-    return ["kubectl", "get", "customresourcedefinitions", "-o", f"jsonpath={CRD_JSONPATH}"]
+def discovery_argv() -> list[str]:
+    """The discovery that finds the Config Connector kinds."""
+    return list(DISCOVERY_ARGV)
 
 
 def kind_argv(kind: KccKind) -> list[str]:
@@ -369,20 +385,41 @@ def kind_argv(kind: KccKind) -> list[str]:
     return ["kubectl", "get", "--raw", f"/apis/{kind.group}/{kind.version}/{kind.plural}"]
 
 
-def kcc_kinds(crd_lines: str) -> list[KccKind]:
-    """The Config Connector kinds in the CRD list's output: a group that ends
-    in `KCC_GROUP_SUFFIX`, the `gcp` category, and a storage version."""
+def kcc_kinds(discovery: str) -> list[KccKind]:
+    """The Config Connector kinds in `kubectl api-resources -o wide` output: a
+    group that ends in `KCC_GROUP_SUFFIX`, the `gcp` category, and the `list`
+    verb."""
     kinds: list[KccKind] = []
-    for line in crd_lines.splitlines():
-        fields = line.split(CRD_FIELD_SEPARATOR)
-        if len(fields) < CRD_LIST_FIELDS:
+    for line in discovery.splitlines():
+        words = line.split()
+        marks = [index for index, word in enumerate(words) if word in NAMESPACED_VALUES]
+        if not words or not marks or marks[0] < 2 or len(words) <= marks[0] + 1:
             continue
-        group, plural, kind, categories, version = (field.strip() for field in fields[:CRD_LIST_FIELDS])
-        if not group.endswith(KCC_GROUP_SUFFIX) or KCC_CATEGORY not in CATEGORY_WORD.findall(categories):
-            continue
-        if plural and kind and version:
-            kinds.append(KccKind(group, version.split()[0], plural, kind))
-    return sorted(kinds)
+        at = marks[0]
+        group, _, version = words[at - 1].rpartition("/")
+        kind = words[at + 1]
+        verbs = words[at + 2].split(DISCOVERY_LIST_SEPARATOR) if len(words) > at + 2 else []
+        categories = words[at + 3].split(DISCOVERY_LIST_SEPARATOR) if len(words) > at + 3 else []
+        if group.endswith(KCC_GROUP_SUFFIX) and KCC_CATEGORY in categories and LIST_VERB in verbs and version:
+            kinds.append(KccKind(group, version, words[0], kind))
+    return sorted(set(kinds))
+
+
+def _with_proxy_slot(
+    run: RunFn, argv: list[str], kubeconfig: Path, timeout_s: int, deadline: float, clock: ClockFn
+) -> "Result | None":
+    """`run(argv)` while holding one of the `PROXY_SLOTS`, or None when no
+    slot is free, or no step's time is left, before `deadline`."""
+    wait = deadline - clock()
+    if wait <= 0 or not _PROXY_SLOT_POOL.acquire(timeout=wait):
+        return None
+    try:
+        left = _time_left(deadline, clock)
+        if not left:
+            return None
+        return run(argv, env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=min(timeout_s, left))
+    finally:
+        _PROXY_SLOT_POOL.release()
 
 
 def _excerpt(stderr: str) -> str:
@@ -399,31 +436,31 @@ def read_objects(
 ) -> KccRead:
     """List every Config Connector object on one cluster before `deadline`.
 
-    One CRD list finds the kinds, then one list request per kind runs on a
-    pool of `workers` (`KIND_READ_WORKERS` when not given). Each step's timeout is cut to the time left, and a
+    Discovery (`kubectl api-resources`) finds the kinds, then one list
+    request per kind runs on a pool of `workers` (`KIND_READ_WORKERS` when
+    not given). Every `kubectl` call takes a proxy slot first
+    (`_with_proxy_slot`). Each step's timeout is cut to the time left, and a
     step that cannot start in time is not run, so the read ends by
     `deadline`. A kind that does not list makes the whole read unknown,
-    except a kind whose CRD went away after the CRD list.
+    except a kind whose CRD went away after the discovery.
     """
-    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     timeout_s = max(int(deadline - clock()), 0)
-    left = _time_left(deadline, clock)
-    if not left:
-        return KccRead(READ_TIMED_OUT, [], "no time was left to start the read", 0, timeout_s)
-    listed = run(crd_list_argv(), env=env, timeout=min(CRD_LIST_TIMEOUT_S, left))
-    if listed.rc == TIMEOUT_RC:
-        return KccRead(READ_TIMED_OUT, [], "the CustomResourceDefinition list did not finish", 0, timeout_s)
-    if listed.rc != 0:
-        return KccRead(READ_FAILED, [], f"the CustomResourceDefinition list exited {listed.rc} ({_excerpt(listed.stderr)})", 0, timeout_s)
-    kinds = kcc_kinds(listed.stdout)
+    found = _with_proxy_slot(run, discovery_argv(), kubeconfig, DISCOVERY_TIMEOUT_S, deadline, clock)
+    if found is None:
+        return KccRead(READ_TIMED_OUT, [], f"the discovery did not start: {NO_SLOT_DETAIL}", 0, timeout_s)
+    if found.rc == TIMEOUT_RC:
+        return KccRead(READ_TIMED_OUT, [], "the discovery did not finish", 0, timeout_s)
+    partial = found.rc != 0 and PARTIAL_DISCOVERY_MARKER in found.stderr and KCC_GROUP_SUFFIX not in found.stderr
+    if found.rc != 0 and not partial:
+        return KccRead(READ_FAILED, [], f"the discovery exited {found.rc} ({_excerpt(found.stderr)})", 0, timeout_s)
+    kinds = kcc_kinds(found.stdout)
     if not kinds:
         return KccRead(READ_ABSENT, [], "", 0, timeout_s)
 
     def one(kind: KccKind) -> tuple[str, list, str]:
-        room = _time_left(deadline, clock)
-        if not room:
-            return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: no time was left to list it"
-        result = run(kind_argv(kind), env=env, timeout=min(KIND_READ_TIMEOUT_S, room))
+        result = _with_proxy_slot(run, kind_argv(kind), kubeconfig, KIND_READ_TIMEOUT_S, deadline, clock)
+        if result is None:
+            return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: {NO_SLOT_DETAIL}"
         if result.rc == TIMEOUT_RC:
             return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: the list did not finish"
         if result.rc != 0:
@@ -537,7 +574,7 @@ def _annotate_entry(
     if _needs_namespace_projects(fields):
         left = _time_left(deadline, clock)
         if left:
-            read_namespace_projects(fields, kubeconfig, run=run, timeout_s=min(NAMESPACES_TIMEOUT_S, left))
+            read_namespace_projects(fields, kubeconfig, run=run, deadline=deadline, clock=clock)
     return fields
 
 

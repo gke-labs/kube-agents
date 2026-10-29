@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import unittest
 from pathlib import Path
@@ -44,9 +45,17 @@ FAKE_GROUP = "test.cnrm.cloud.google.com"
 DEFAULT_KIND = "ComputeFirewall"
 
 
-def crd_line(kind, group=FAKE_GROUP, categories='["gcp"]'):
-    """One line of the CRD list, as `kcc_health.CRD_JSONPATH` prints it."""
-    return "\t".join((group, f"{kind.lower()}s", kind, categories, "v1beta1"))
+def crd_line(kind, group=FAKE_GROUP, categories="gcp", shortnames=""):
+    """One line of `kubectl api-resources -o wide --no-headers`, as kubectl
+    aligns it (SHORTNAMES can be empty)."""
+    return "   ".join(
+        word for word in (f"{kind.lower()}s", shortnames, f"{group}/v1beta1", "true", kind,
+                          "delete,deletecollection,get,list,patch,create,update,watch", categories) if word
+    )
+
+
+def is_discovery(argv):
+    return argv[:2] == ["kubectl", "api-resources"]
 
 
 def serve_kcc(argv, answer):
@@ -57,11 +66,11 @@ def serve_kcc(argv, answer):
     none). A Result that says the type is not served: no Config Connector
     CRD. Any other Result: the answer to every kind's list request.
     """
-    absent = answer.rc != 0 and kcc_health.RESOURCE_TYPE_ABSENT_MARKER in answer.stderr
+    absent = answer.rc != 0 and "doesn't have a resource type" in answer.stderr
     items = json.loads(answer.stdout)["items"] if answer.rc == 0 and answer.stdout.startswith("{") else []
-    if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+    if is_discovery(argv):
         if absent:
-            return kcc_health.Result(0, "apps\tdeployments\tDeployment\t\tv1\n", "")
+            return kcc_health.Result(0, "deployments   deploy   apps/v1   true   Deployment   get,list   all\n", "")
         kinds = sorted({item["kind"] for item in items} or {DEFAULT_KIND})
         return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
     if argv[:3] == ["kubectl", "get", "--raw"]:
@@ -188,12 +197,15 @@ class ReadObjectsTest(unittest.TestCase):
     def read(self, run, **kwargs):
         return kcc_health.read_objects(Path("kubeconfig"), run=run, deadline=kwargs.pop("deadline", 1e9), clock=kwargs.pop("clock", lambda: 0.0), **kwargs)
 
-    def test_the_kinds_come_from_the_crd_list_and_other_crds_are_ignored(self):
+    def test_the_kinds_come_from_discovery_and_other_resources_are_ignored(self):
         lines = "\n".join((
-            crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com"),
+            crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com", shortnames="gcppubsubtopic,gcppubsubtopics"),
             crd_line("ConfigConnectorContext", group="core.cnrm.cloud.google.com", categories=""),
             crd_line("Widget", group="example.com"),
-            "\t".join(("compute.cnrm.cloud.google.com", "computeaddresses", "ComputeAddress", '["gcp","all"]', "v1beta1")),
+            "computeaddresses   compute.cnrm.cloud.google.com/v1beta1   true   ComputeAddress   get,list,watch   all,gcp",
+            "bindings   v1   true   Binding   create",
+            "nodes   no   v1   false   Node   get,list",
+            "computenolists   compute.cnrm.cloud.google.com/v1beta1   true   ComputeNoList   get   gcp",
         ))
         self.assertEqual(
             kcc_health.kcc_kinds(lines),
@@ -220,13 +232,14 @@ class ReadObjectsTest(unittest.TestCase):
         self.assertEqual(sorted(item["metadata"]["name"] for item in read.items), ["fleet-events", "pool-a", "prod-usc1"])
         self.assertEqual(len([argv for argv in calls if argv[:3] == ["kubectl", "get", "--raw"]]), 3)
         self.assertFalse([argv for argv in calls if "gcp" in argv], "no category read: it lists the kinds one after another")
+        self.assertFalse([argv for argv in calls if "customresourcedefinitions" in argv], "discovery needs no RBAC; a CRD list does")
         self.assertEqual([r["name"] for r in kcc_health.read_fields(read)["kcc_unready"]], ["prod-usc1", "fleet-events"])
 
     def test_an_item_with_no_kind_takes_the_kind_of_its_crd(self):
         bare = {key: value for key, value in STALLED_TOPIC.items() if key != "kind"}
 
         def run(argv, *, env=None, timeout=None):
-            if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+            if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic") + "\n", "")
             return listing(bare)
 
@@ -238,7 +251,7 @@ class ReadObjectsTest(unittest.TestCase):
         kinds = [f"Kind{n}" for n in range(3 * kcc_health.KIND_READ_WORKERS)]
 
         def run(argv, *, env=None, timeout=None):
-            if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+            if is_discovery(argv):
                 return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
             with lock:
                 running[0] += 1
@@ -261,7 +274,7 @@ class ReadObjectsTest(unittest.TestCase):
         ):
             with self.subTest(status=status):
                 def run(argv, *, env=None, timeout=None):
-                    if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+                    if is_discovery(argv):
                         return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
                     if argv[3].endswith("pubsubtopics"):
                         return answer
@@ -274,9 +287,72 @@ class ReadObjectsTest(unittest.TestCase):
                 self.assertIn("not known", fields["kcc_unread"])
                 self.assertIn(words, fields["kcc_unread"] if status != kcc_health.READ_TIMED_OUT else fields["kcc_unread"] + read.detail)
 
-    def test_a_kind_that_went_away_after_the_crd_list_is_skipped(self):
+    def test_discovery_that_misses_an_aggregated_api_still_finds_the_kinds(self):
+        """`kubectl api-resources` exits 1 when an aggregated API (often
+        metrics.k8s.io) does not answer, and still prints what it found."""
+        partial = "error: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1: the server is currently unable to handle the request"
+
         def run(argv, *, env=None, timeout=None):
-            if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+            if is_discovery(argv):
+                return kcc_health.Result(1, crd_line("PubSubTopic") + "\n", partial)
+            return listing(STALLED_TOPIC)
+
+        self.assertEqual(self.read(run).status, kcc_health.READ_LISTED)
+
+        def missing_kcc(argv, *, env=None, timeout=None):
+            return kcc_health.Result(1, "", partial.replace("metrics.k8s.io", "pubsub.cnrm.cloud.google.com"))
+
+        self.assertEqual(self.read(missing_kcc).status, kcc_health.READ_FAILED)
+
+    def test_a_refused_discovery_is_unknown_never_absent(self):
+        fields = kcc_health.read_fields(self.read(lambda argv, **kw: kcc_health.Result(1, "", "Unauthorized")))
+        self.assertIn("not known", fields["kcc_unread"])
+
+    def test_no_more_than_the_proxy_slots_run_at_once_across_clusters(self):
+        """Four clusters read at once, each with its own kind pool: the
+        requests in flight never exceed `PROXY_SLOTS`, the proxy's admitted
+        count."""
+        lock = threading.Lock()
+        running = [0, 0]
+        kinds = [f"Kind{n}" for n in range(12)]
+
+        def run(argv, *, env=None, timeout=None):
+            with lock:
+                running[0] += 1
+                running[1] = max(running[1], running[0])
+            time.sleep(0.01)
+            with lock:
+                running[0] -= 1
+            if is_discovery(argv):
+                return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
+            return listing()
+
+        with ThreadPoolExecutor(max_workers=collect.MAX_WORKERS) as pool:
+            reads = list(pool.map(lambda _: self.read(run), range(collect.MAX_WORKERS)))
+        self.assertTrue(all(read.status == kcc_health.READ_LISTED for read in reads))
+        self.assertGreater(running[1], 1)
+        self.assertLessEqual(running[1], kcc_health.PROXY_SLOTS)
+
+    def test_a_step_that_gets_no_slot_before_the_deadline_does_not_start(self):
+        calls = []
+        kcc_health._PROXY_SLOT_POOL.acquire()
+        try:
+            for _ in range(kcc_health.PROXY_SLOTS - 1):
+                kcc_health._PROXY_SLOT_POOL.acquire()
+            now = [0.0]
+            read = kcc_health.read_objects(
+                Path("kubeconfig"), run=lambda argv, **kw: calls.append(argv), deadline=0.05, clock=lambda: now[0]
+            )
+        finally:
+            for _ in range(kcc_health.PROXY_SLOTS):
+                kcc_health._PROXY_SLOT_POOL.release()
+        self.assertEqual(calls, [])
+        self.assertEqual(read.status, kcc_health.READ_TIMED_OUT)
+        self.assertIn("no proxy slot", read.detail)
+
+    def test_a_kind_that_went_away_after_the_discovery_is_skipped(self):
+        def run(argv, *, env=None, timeout=None):
+            if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
             if argv[3].endswith("pubsubtopics"):
                 return kcc_health.Result(1, "", "Error from server (NotFound): the server could not find the requested resource")
@@ -284,12 +360,12 @@ class ReadObjectsTest(unittest.TestCase):
 
         self.assertEqual(self.read(run).status, kcc_health.READ_LISTED)
 
-    def test_no_config_connector_crd_adds_nothing(self):
+    def test_no_config_connector_kind_served_adds_nothing(self):
         read = self.read(lambda argv, **kw: serve_kcc(argv, kcc_health.Result(1, "", "doesn't have a resource type")))
         self.assertEqual(read.status, kcc_health.READ_ABSENT)
         self.assertEqual(kcc_health.read_fields(read), {})
 
-    def test_a_failed_crd_list_is_unknown_never_absent(self):
+    def test_a_failed_discovery_is_unknown_never_absent(self):
         for answer in (kcc_health.Result(1, "", "Forbidden"), kcc_health.Result(kcc_health.TIMEOUT_RC, "", "killed")):
             with self.subTest(rc=answer.rc):
                 fields = kcc_health.read_fields(self.read(lambda argv, **kw: answer))
@@ -345,9 +421,9 @@ class AnnotateManifestTest(unittest.TestCase):
         self.assertIn("did not finish", slow["kcc_unread"])
         self.assertNotIn("kcc_unread", gone)
         self.assertEqual(read["kcc_unready"], [])
-        crd_lists = [argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]]
-        self.assertEqual(len(crd_lists), 3, "one CRD list per read cluster")
-        self.assertTrue(all(argv == kcc_health.crd_list_argv() for argv in crd_lists))
+        discoveries = [argv for argv, _ in run.calls if is_discovery(argv)]
+        self.assertEqual(len(discoveries), 3, "one discovery per read cluster")
+        self.assertTrue(all(argv == kcc_health.discovery_argv() for argv in discoveries))
         for argv, kubeconfig in run.calls:
             self.assertTrue(kubeconfig.startswith(str(self.dir)), kubeconfig)
 
@@ -608,7 +684,7 @@ class DeadlineTest(unittest.TestCase):
         timeouts = []
 
         def run(argv, *, env=None, timeout=None):
-            step = "gcloud" if argv[0] == "gcloud" else ("crd" if argv[2] == "customresourcedefinitions" else "kind")
+            step = "gcloud" if argv[0] == "gcloud" else ("crd" if is_discovery(argv) else "kind")
             timeouts.append((step, timeout))
             if deadline is not None:
                 self.assertLessEqual(self.now + timeout, deadline, f"{step} was given more than the time left")
@@ -686,7 +762,7 @@ class CopiedConstantsTest(unittest.TestCase):
             "CREDENTIALS_TIMEOUT_S": collect.DEFAULT_TIMEOUT_S,
             "MAX_WHY_CHARS": collect.MAX_KCC_WEDGE_MESSAGE_CHARS,
             "TIMEOUT_RC": collect.TIMEOUT_RC,
-            "RESOURCE_TYPE_ABSENT_MARKER": collect.RESOURCE_TYPE_ABSENT_MARKER,
+            "PROXY_SLOTS": collect.MAX_WORKERS,
             "KCC_CATEGORY": collect.KCC_CATEGORY,
             "KCC_READY_CONDITION": collect.KCC_READY_CONDITION,
         }

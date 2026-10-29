@@ -8129,8 +8129,8 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
 }
 
 # The category Config Connector registers across every CRD it installs.
-# `kcc_health.read_objects` lists the CRDs in it and then each kind in
-# parallel, because `kubectl get gcp -A` lists the ~230 kinds one after
+# `kcc_health.read_objects` finds the kinds in it through discovery and then
+# lists each kind in parallel, because `kubectl get gcp -A` lists the ~230 kinds one after
 # another, too slowly through the credential proxy.
 KCC_CATEGORY = "gcp"
 
@@ -8147,7 +8147,7 @@ AUTOPILOT_ALLOWLIST_KINDS = (
 
 # The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because the
 # Config Connector read is not one list call: it is now the time limit of the
-# whole `kcc_health.read_objects` read (a CRD list and one list per kind, in
+# whole `kcc_health.read_objects` read (discovery and one list per kind, in
 # parallel), not of one `kubectl` process. The history below is of the
 # category read it replaced. `kubectl` expands `gcp` to every CRD
 # carrying the category -- 221 of them on this fleet's hub -- and issues a list
@@ -8389,8 +8389,9 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # as an inapplicable check rather than as a clean one -- a cluster with no
     # Config Connector has not cleared anything.
     # `kcc_health.read_objects`, the one Config Connector read the collectors
-    # share: a CRD list finds the Config Connector kinds, then one list request
-    # per kind runs in parallel. `kubectl get gcp -A` does the same requests one
+    # share: discovery (`kubectl api-resources`, no RBAC needed) finds the
+    # Config Connector kinds, then one list request per kind runs in parallel,
+    # with no more than `kcc_health.PROXY_SLOTS` in flight in the process. `kubectl get gcp -A` does the same requests one
     # after another, and through the credential proxy its 230 requests took
     # longer than `KCC_READ_TIMEOUT_S` on the hub. The whole read still ends
     # inside that time.
@@ -8405,7 +8406,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # namespaces are already in the context from the NetworkPolicy read.
     kcc_health.fill_namespace_projects(context["kcc_health"].get(kcc_health.UNREADY_FIELD) or [], context.get("namespaces") or [])
     # Each outcome of the read gets the reason that is true of it. Only "no
-    # Config Connector CRD here" means the check does not apply; a timeout, a
+    # Config Connector kind served here" means the check does not apply; a timeout, a
     # refused list or an unreadable answer is a read that did not happen, and
     # the cluster most likely to produce one is the hub the check exists for.
     kcc_reason = ""
@@ -8425,8 +8426,8 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         )
     elif kcc_read.status == kcc_health.READ_ABSENT:
         kcc_reason = (
-            "Config Connector is not installed on this cluster: it has no "
-            "CustomResourceDefinition in a Config Connector group with the "
+            "Config Connector is not installed on this cluster: its API "
+            "discovery serves no Config Connector kind in the "
             f"`{KCC_CATEGORY}` category. Nothing here declares a GCP resource. "
             "This fleet runs one Config Connector, on the hub cluster."
         )
@@ -8454,11 +8455,11 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         context.setdefault("not_applicable", {})["kcc-object-wedged"] = kcc_reason
     else:
         kcc_command = (
-            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_health.crd_list_argv())}, then "
+            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_health.discovery_argv())}, then "
             f"`kubectl get --raw /apis/<group>/<version>/<plural>` for each of its "
             f"{kcc_read.kinds} Config Connector kind(s)"
         )
-        listed = Run(kcc_health.crd_list_argv(), 0, json.dumps(kcc_read.items, sort_keys=True), "", time.monotonic() - kcc_started)
+        listed = Run(kcc_health.discovery_argv(), 0, json.dumps(kcc_read.items, sort_keys=True), "", time.monotonic() - kcc_started)
         commands["kcc-object-wedged"] = _record(kcc_command, listed)
 
     # Config Sync's sync objects, for §2.17. Ungated like the `gcp` read above
