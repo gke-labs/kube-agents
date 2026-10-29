@@ -15,7 +15,8 @@
 # working for one release alongside `exclude.clusters`. Per run this deterministic engine:
 #   • CREATE — scaffolds a profile for every cluster in scope that doesn't have one yet;
 #   • PRUNE  — deletes a profile whose cluster is *definitively* gone (a NotFound/404 from
-#     `gcloud container clusters describe`), whose cluster is excluded (a triple in
+#     the GKE API: the relayed `clusters.get`, or `gcloud container clusters describe` on
+#     the fallback), whose cluster is excluded (a triple in
 #     `spec.scope.exclude.clusters`, or a bare name in RECONCILE_EXCLUDE), or whose project the
 #     scope has dropped, under the three conditions `reconcile()` states. Any other error path
 #     — auth, network, timeout, quota, an unreadable identity — is treated as "unknown" and
@@ -548,7 +549,9 @@ def _transport_failure(row) -> bool:
         return False
     error = row.get("error")
     error = error if isinstance(error, dict) else {}
-    if error.get("skipped"):
+    # A read timeout means the broker took the connection and had not finished within a
+    # window the helper chose: that read's "unknown", like the broker's own UPSTREAM_TIMEOUT.
+    if error.get("skipped") or error.get("exception") == "ReadTimeout":
         return False
     return not row.get("status") or row.get("status") == 401 or error.get("code") in _RELAY_UNREACHABLE_CODES
 
@@ -556,7 +559,8 @@ def _transport_failure(row) -> bool:
 def _check_relay_batch(rows: list) -> None:
     """Raise _RelayUnusable when every read in a batch failed in the relay, not at Google."""
     if rows and all(_transport_failure(row) for row in rows):
-        raise _RelayUnusable(f"all {len(rows)} read(s) failed before reaching the API")
+        raise _RelayUnusable(f"all {len(rows)} read(s) failed in the relay, e.g. status {rows[0].get('status') or 0}: "
+                             f"{json.dumps(rows[0].get('error') or {})[:LOG_ROW_PREVIEW_CHARS]}")
 
 
 def _read_list(project: str, row) -> tuple[list | None, str]:

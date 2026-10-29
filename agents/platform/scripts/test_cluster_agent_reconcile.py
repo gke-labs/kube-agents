@@ -3295,10 +3295,32 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["kept"], ["cluster-a"])
         self.assertEqual(2, len(batches))
 
+    def test_calls_the_broker_was_slow_to_answer_are_unknown_and_the_relay_stays_on(self):
+        # A ReadTimeout means the broker took the connection: those reads are unknown, as
+        # UPSTREAM_TIMEOUT is, and PRUNE still describes through the relay.
+        profiles, identities = self._profiles("a")
+        batches, relay = self._relay(
+            lists={self.MGMT: {"status": 0, "error": {"exception": "ReadTimeout", "text": "read timed out"}}},
+            gets={self._key("a"): {"status": 200}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(([], []), (lists, describes))
+        self.assertEqual(report["projects"][self.MGMT], rec.OUTCOME_UNREACHABLE)
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertEqual(2, len(batches))
+
+    def test_the_whole_batch_fallback_logs_why(self):
+        logged: list = []
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: {"status": 0, "error": {
+            "exception": "RuntimeError", "text": "CREDENTIAL_PROXY_URL is not set"}}})
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            self._relayed_run(relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+        self.assertTrue(any("CREDENTIAL_PROXY_URL is not set" in line and "not usable" in line for line in logged))
+
     def test_a_describe_batch_that_failed_in_the_relay_falls_back_to_gcloud(self):
         profiles, identities = self._profiles("a", "b")
         _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
-            self._key("a"): {"status": 0, "error": {"exception": "ReadTimeout"}},
+            self._key("a"): {"status": 0, "error": {"exception": "ConnectTimeout"}},
             self._key("b"): {"status": 401, "error": {"error": "unauthorized"}}})
         report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
         self.assertEqual([], lists)
