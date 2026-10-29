@@ -321,7 +321,7 @@ FIXTURE_NOT_READY = {
     # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration
     # plants the stalled object on such a cluster and removes it.
     "fleet-audit-manifest-fix-names-stalled-config-connector": (
-        "#3576: needs a cluster that runs Config Connector in the pool fleet, for the "
+        "#4218: needs a cluster that runs Config Connector in the pool fleet, for the "
         "stalled ContainerNodePool the stack plants; no pool project runs Config Connector"
     ),
     "fanout-bound-ten-cards": (
