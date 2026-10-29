@@ -1425,7 +1425,7 @@ class PrCommentsSweepTest(unittest.TestCase):
         """A 403 or 404 needs a person; a hop that never reached the forge says the forge was not asked."""
         cases = {
             "FORGE_FORBIDDEN": ("GitHub accepted Kage's credentials but refused", "an admin needs to"),
-            "FORGE_NOT_FOUND": ("GitHub couldn't find the pull request", "an admin needs to"),
+            "FORGE_NOT_FOUND": ("GitHub couldn't find the repository", "an admin needs to"),
             forge.REASON_SANDBOX_UNREACHABLE: ("Kage's connection to GitHub failed before it could ask", "keeps trying"),
             forge.REASON_UNREACHABLE: ("Kage's connection to GitHub failed before it could ask", "keeps trying"),
             "FORGE_UNAVAILABLE": ("GitHub didn't respond", "keeps trying"),
@@ -1455,6 +1455,8 @@ class PrCommentsSweepTest(unittest.TestCase):
                 self.assertIn(f"{name}'s rate limit was reached", warnings[0])
         self.assertEqual(gate._forge_name("gitlab.com/group/sub/project"), "GitLab")
         self.assertEqual(gate._forge_name("acme/toolkit"), "GitHub")
+        self.assertEqual(gate._forge_name("git.corp.example/acme/infra"), "git.corp.example")
+        self.assertEqual(gate._forge_name("ghe.example.com/acme/infra"), "ghe.example.com")
 
     def test_a_persisting_failure_posts_once(self):
         first, _ = self._unreadable_tick()

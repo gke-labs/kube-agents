@@ -155,8 +155,8 @@ UNREADABLE_WHY = {
         "needs to give the credential read access to this repository."
     ),
     "FORGE_NOT_FOUND": (
-        "{forge} couldn't find the pull request with Kage's credentials: the repository is gone, renamed, or "
-        "hidden from them. Retrying won't help; an admin needs to fix the repository's name or its access."
+        "{forge} couldn't find the repository with Kage's credentials: it is gone, renamed, or hidden from "
+        "them. Retrying won't help; an admin needs to fix the repository's name or its access."
     ),
     forge.REASON_SANDBOX_UNREACHABLE: UNREADABLE_WHY_UNREACHABLE,
     forge.REASON_UNREACHABLE: UNREADABLE_WHY_UNREACHABLE,
@@ -166,6 +166,10 @@ UNREADABLE_WHY = {
 # a host is the bare `owner/name` GitHub shorthand.
 FORGE_NAMES = {**dict.fromkeys(repo_ref.GITHUB_HOSTS, "GitHub"), repo_ref.GITLAB_CANONICAL_HOST: "GitLab"}
 FORGE_NAME_HOSTLESS = "GitHub"
+# A registered `host/path` on a self-managed instance parses hostless, since
+# `repo_ref` lifts only the hosts it knows. A GitHub owner cannot contain a dot,
+# so a dotted first segment is that host.
+HOST_LABEL_SEPARATOR = "."
 PR_LINK = "[{name}#{number}]({url})"
 PR_REF = "{repo}#{number}"
 PR_REF_SEPARATOR = "#"
@@ -219,6 +223,9 @@ def _forge_name(repo: str, url: str = "") -> str:
     if not host:
         parsed = repo_ref.try_parse(repo)
         host = parsed.host if parsed else ""
+        if parsed and not host:
+            first = parsed.segments[0]
+            host = first if HOST_LABEL_SEPARATOR in first and len(parsed.segments) > 1 else ""
     return FORGE_NAMES.get(host.lower(), host or FORGE_NAME_HOSTLESS)
 
 
