@@ -3369,6 +3369,23 @@ def test_a_post_ahead_of_the_placeholder_is_not_the_answer_when_no_edit_comes(
     assert reply["status"] == "error"
 
 
+def test_await_quiet_waits_out_late_posts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With cards=done the stop waits until the conversation has posted
+    nothing for the quiet window, reading past what came before it."""
+    clock = [0.0]
+    monkeypatch.setattr(harness.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(harness.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
+    reads = [([{"kind": "post", "messageId": "m", "text": "card report"}], 9)]
+
+    class Stopper:
+        def read_posts(self, after: int, budget: float) -> tuple[list[dict[str, str]], int]:
+            clock[0] += 5.0
+            return reads.pop(0) if reads else ([], after)
+
+    assert harness._await_quiet(Stopper(), 6) == 9
+    assert clock[0] >= harness._QUIET_SECONDS
+
+
 def test_no_answer_to_the_stop_records_an_error_entry(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

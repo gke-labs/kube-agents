@@ -32,7 +32,8 @@ block (``|-``), since a folded one joins the directive to the ask.
 
 ``cards=done`` moves the stop later: the harness waits off the board until
 every card the turn filed is terminal, for at most ``wait=<seconds>``
-(:data:`DEFAULT_WAIT_SECONDS`), and stops then, so a case can grade what a
+(:data:`DEFAULT_WAIT_SECONDS`), then until the conversation has gone quiet
+(the harness's `_await_quiet`), and stops then, so a case can grade what a
 stop says about work that already landed. Whichever way the stop goes, the
 harness reads the gateway's answer to it off the conversation and records it
 as :data:`STOP_REPLY_ENTRY`: ``completed`` with the answer as its result, or

@@ -294,6 +294,11 @@ _INJECT_STOP_SUFFIX = "/stop"
 # relay.
 _STOP_REPLY_WAIT_SECONDS = 90.0
 _STOP_REPLY_POLL_SECONDS = 1.0
+# With cards=done, how long the conversation must post nothing before the stop
+# goes, and the longest the harness waits for that: a finished card's report
+# and the turn it wakes land within seconds to a couple of minutes.
+_QUIET_SECONDS = 30.0
+_QUIET_MAX_SECONDS = 300.0
 # The lines the gateway posts while a card stop runs (a2a/gateway/cardstop.go,
 # cardStopPlaceholder and cardStopDoorNotice), which are not its answer.
 _STOP_PLACEHOLDERS = frozenset({
@@ -1756,6 +1761,28 @@ def _stop_reply_cursor(exchange: Any) -> int:
     return max(seqs, default=0)
 
 
+def _await_quiet(stopper: inject.InjectTask, after: int) -> int:
+    """Read the conversation past ``after`` until :data:`_QUIET_SECONDS` go by
+    with nothing new on it, for at most :data:`_QUIET_MAX_SECONDS`; the
+    sequence read past.
+
+    Raises:
+        InjectUnavailable: The gateway could not be reached.
+    """
+    deadline = time.monotonic() + _QUIET_MAX_SECONDS
+    quiet_since = time.monotonic()
+    while time.monotonic() < deadline:
+        if time.monotonic() - quiet_since >= _QUIET_SECONDS:
+            return after
+        posts, after = stopper.read_posts(after, min(_QUIET_SECONDS, max(0.0, deadline - time.monotonic())))
+        if posts:
+            quiet_since = time.monotonic()
+        else:
+            time.sleep(min(max(0.0, deadline - time.monotonic()), _STOP_REPLY_POLL_SECONDS))
+    _log.warning("stop: the conversation was still posting after %.0fs; stopping anyway", _QUIET_MAX_SECONDS)
+    return after
+
+
 def _read_stop_reply(stopper: inject.InjectTask, after: int) -> dict[str, Any]:
     """The gateway's answer to a stop it took, read past ``after`` for up to
     :data:`_STOP_REPLY_WAIT_SECONDS`: the edit that replaces the stop's
@@ -2668,6 +2695,11 @@ class KubeAgentsHarness(AgentHarness):
                 # exchange (a card's report), so only the stop's answer is read.
                 cursor = _stop_reply_cursor(exchange)
                 try:
+                    if stop.cards_done:
+                        # The cards have ended; their reports and any turn they
+                        # woke still post. The stop waits for the thread to go
+                        # quiet, as a person reading it would.
+                        cursor = _await_quiet(stopper, cursor)
                     _, cursor = stopper.read_posts(cursor, 0)
                 except inject.InjectUnavailable as exc:
                     _log.warning("inject: reading past the conversation before the stop failed: %s", exc)
