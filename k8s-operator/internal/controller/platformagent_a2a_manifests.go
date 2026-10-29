@@ -2351,6 +2351,14 @@ func renderA2ANATSCluster(agent *agentv1alpha1.PlatformAgent, pw func(key string
 cluster {
   name: ` + a2aNATSName(agent) + `
   port: ` + strconv.Itoa(a2aNATSRoutePort) + `
+  # One route per peer, not nats-server's default pool of three. Each pooled
+  # connection carries a share of the accounts' interest, and a restarted
+  # server can come back with some of its pool to a peer missing (measured on
+  # 2.10.29: two of four connections, and the APP account's interest on a
+  # missing one), so a client on that server gets "no responders" for every
+  # stream led by the peer until the next restart. A single route per peer
+  # carries every account; this bus's traffic needs no more.
+  pool_size: -1
   authorization {
     user: ` + a2aNATSRouteUser + `
     password: "` + pw(a2aRoutePasswordKey) + `"

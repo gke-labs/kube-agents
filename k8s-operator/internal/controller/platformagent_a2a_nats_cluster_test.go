@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -431,6 +433,57 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	for i, s := range servers {
 		if !s.JetStreamIsClustered() {
 			t.Errorf("server %d is not running clustered JetStream", i)
+		}
+		// One route per peer (pool_size -1): two, not a pool of four.
+		if n := s.NumRoutes(); n != 2 {
+			t.Errorf("server %d holds %d route connections, want exactly one per peer (2)", i, n)
+		}
+	}
+
+	// Interest crosses every route in the APP account: a subscriber on each
+	// server receives what the other two publish. A client on a server
+	// missing a peer's interest would see "no responders" for every stream
+	// that peer leads, which is the failure pool_size -1 exists for.
+	seedPassword := string(creds.Data[a2aSeedPasswordKey])
+	connect := func(s *natsserver.Server) *nats.Conn {
+		t.Helper()
+		nc, err := nats.Connect(s.ClientURL(), a2aTestBusTLS(t), nats.UserInfo("seed", seedPassword))
+		if err != nil {
+			t.Fatalf("connect as seed to %s: %v", s.Name(), err)
+		}
+		t.Cleanup(nc.Close)
+		return nc
+	}
+	const subject = "a2a.topics.shared.blueprint"
+	for i, sub := range servers {
+		nc := connect(sub)
+		ch := make(chan *nats.Msg, 4)
+		if _, err := nc.ChanSubscribe(subject, ch); err != nil {
+			t.Fatal(err)
+		}
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for j, pub := range servers {
+			if j == i {
+				continue
+			}
+			pc := connect(pub)
+			got := false
+			for !got && time.Now().Before(deadline) {
+				if err := pc.Publish(subject, []byte(fmt.Sprintf("%d->%d", j, i))); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-ch:
+					got = true
+				case <-time.After(200 * time.Millisecond):
+				}
+			}
+			if !got {
+				t.Errorf("a publish on server %d never reached a subscriber on server %d", j, i)
+			}
 		}
 	}
 
