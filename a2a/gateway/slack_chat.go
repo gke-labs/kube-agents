@@ -70,7 +70,9 @@ const (
 	// slackChatCardRunning is what a waiting item's task card draws, as
 	// slack_status.py's CARD_STATUS does: Slack's task_card takes
 	// in_progress, complete and error only, and refuses the whole message
-	// with invalid_blocks for pending. The item's title says it waits.
+	// with invalid_blocks for pending. The card's icon no longer tells a
+	// waiting item from a running one, so the emitter's title carries it
+	// (chat_message.py composes "waiting on you").
 	slackChatCardRunning = chatmsg.StatusInProgress
 	// slackChatRawTextCell is the Slack table cell type that shows its text
 	// as written.

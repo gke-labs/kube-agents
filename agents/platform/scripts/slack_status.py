@@ -125,7 +125,7 @@ REPEATED_COMMA = re.compile(r"\s*,[\s,]*")
 
 # --- the plan --------------------------------------------------------------
 
-#: Block Kit task statuses.
+#: Plan row statuses; a task_card draws them through CARD_STATUS.
 TASK_PENDING = "pending"
 TASK_RUNNING = "in_progress"
 TASK_COMPLETE = "complete"
