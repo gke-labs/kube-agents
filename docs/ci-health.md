@@ -230,7 +230,7 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line. The GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, their two nightlies each; `docs/ci-pool-projects.md` 5.8) are not collected yet: its runs show in Prow only until the dashboard reads a lane per forge.
+history or digest line. The GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, their two nightlies each; `docs/ci-pool-projects.md` 5.8) are not collected yet: their runs show in Prow only until the dashboard reads a lane per forge.
 
 ## Hysteresis
 

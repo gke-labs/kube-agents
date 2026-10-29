@@ -121,18 +121,23 @@ readonly GITLAB_CE_TOKEN_PREFIX="glpat-"
 readonly GITLAB_CE_TOKEN_RANDOM_BYTES=10
 # The tunnel from the job pod to the private host: a relay pod in the host
 # cluster (socat, pinned) listening on an unprivileged port and forwarding to
-# the forge's 443, a port-forward to it on the job pod's loopback 443, and a
-# line in the hosts file; both knobs exist for a run that is not root.
+# the forge's 443, a port-forward to it on the job pod's loopback 443 (every
+# consumer dials the bare host on 443, so no other port serves; the job runs
+# as root, as the Prow pod does), kept up by a loop that restarts it when the
+# API stream drops, and a line in the hosts file (the knob is the tests').
 readonly FORGE_RELAY_POD="forge-relay"
 readonly FORGE_RELAY_IMAGE="alpine/socat:1.8.1.3@sha256:603174b77eebaba25ba8f8ebb15e1234d6600409554e95d6fb203fd106150287"
 readonly FORGE_RELAY_PORT=8443
-readonly FORGE_RELAY_READY_TIMEOUT="120s"
-readonly FORGE_TUNNEL_LOCAL_PORT="${FORGE_TUNNEL_LOCAL_PORT:-443}"
+readonly FORGE_TUNNEL_LOCAL_PORT=443
 readonly FORGE_TUNNEL_HOSTS_FILE="${FORGE_TUNNEL_HOSTS_FILE:-/etc/hosts}"
 readonly FORGE_TUNNEL_READY_SECONDS=60
 readonly FORGE_TUNNEL_POLL_SECONDS="${FORGE_TUNNEL_POLL_SECONDS:-2}"
+readonly FORGE_TUNNEL_RESTART_SECONDS=2
+readonly FORGE_TUNNEL_CHECK_MAX_TIME=10
+readonly FORGE_TUNNEL_LOG_TAIL_LINES=3
 readonly FORGE_STATE_TUNNEL_PID="forge-tunnel-pid"
 readonly FORGE_STATE_TUNNEL_LOG="forge-tunnel.log"
+readonly FORGE_STATE_TUNNEL_CONTEXT="forge-tunnel-context"
 
 # shellcheck source=hack/ci-env.sh
 source "${SCRIPT_DIR}/ci-env.sh"
@@ -206,6 +211,7 @@ FORGE_AGENT_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/${FORGE_AGENT_TOKEN_FILE_NAME}"
 FORGE_LEDGER_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/${FORGE_LEDGER_TOKEN_FILE_NAME}"
 FORGE_TUNNEL_PID_FILE="${EVAL_FORGE_STATE_DIR}/${FORGE_STATE_TUNNEL_PID}"
 FORGE_TUNNEL_LOG_FILE="${EVAL_FORGE_STATE_DIR}/${FORGE_STATE_TUNNEL_LOG}"
+FORGE_TUNNEL_CONTEXT_FILE="${EVAL_FORGE_STATE_DIR}/${FORGE_STATE_TUNNEL_CONTEXT}"
 
 FORGE_VM_NAME="${FORGE_NAME_PREFIX}-${EVAL_FORGE}"
 FORGE_ADDRESS_NAME="${FORGE_NAME_PREFIX}-${EVAL_FORGE}"
@@ -249,20 +255,24 @@ delete_forge_vms() { # <label> [row]: deletes every VM list_forge_vms names
 hosts_entry() { printf '127.0.0.1 %s' "${EVAL_FORGE_HOST}"; }
 
 close_tunnel() {
-  local pid
+  local pid context=()
   if [ -s "${FORGE_TUNNEL_PID_FILE}" ]; then
     read -r pid < "${FORGE_TUNNEL_PID_FILE}"
-    kill "${pid}" 2>/dev/null && echo "Forge ${ACTION}: port-forward ${pid} stopped" || echo "Forge ${ACTION}: port-forward ${pid} was already gone"
+    # The keeper loop first, then the port-forward it holds, so no restart follows the kill.
+    pkill -P "${pid}" 2>/dev/null || true
+    kill "${pid}" 2>/dev/null && echo "Forge ${ACTION}: port-forward keeper ${pid} stopped" || echo "Forge ${ACTION}: port-forward keeper ${pid} was already gone"
     rm -f "${FORGE_TUNNEL_PID_FILE}"
   fi
+  [ ! -s "${FORGE_TUNNEL_CONTEXT_FILE}" ] || context=(--context "$(cat "${FORGE_TUNNEL_CONTEXT_FILE}")")
   if [ -w "${FORGE_TUNNEL_HOSTS_FILE}" ] && grep -qxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}"; then
     grep -vxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" > "${FORGE_TUNNEL_HOSTS_FILE}.forge" && cat "${FORGE_TUNNEL_HOSTS_FILE}.forge" > "${FORGE_TUNNEL_HOSTS_FILE}"
     rm -f "${FORGE_TUNNEL_HOSTS_FILE}.forge"
     echo "Forge ${ACTION}: hosts entry for ${EVAL_FORGE_HOST} removed"
   fi
-  # The relay pod: by name, in whatever context the kubeconfig holds; a run
-  # that never reached the cluster has none to delete.
-  kubectl delete pod "${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --ignore-not-found --wait=false >/dev/null 2>&1 \
+  # The relay pod: by name, in the context `up` recorded (a task cluster's
+  # get-credentials may have moved the current one); a run that never reached
+  # the cluster has none to delete.
+  kubectl ${context[@]+"${context[@]}"} delete pod "${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --ignore-not-found --wait=false >/dev/null 2>&1 \
     && echo "Forge ${ACTION}: relay pod ${FORGE_RELAY_POD} deleted (if it was there)" \
     || echo "Forge ${ACTION}: no cluster credentials to delete ${FORGE_RELAY_POD} with; the pod, if any, goes with the install's teardown"
 }
@@ -283,7 +293,7 @@ forge_down() {
   delete_forge_vms "forge" "${EVAL_FORGE}"
   # Only what `up` wrote: the directory is the caller's (EVAL_FORGE_STATE_DIR=/tmp
   # would otherwise go with it); it is removed when nothing else is in it.
-  rm -f "${FORGE_CA_FILE}" "${FORGE_RECORD_FILE}" "${FORGE_AGENT_TOKEN_FILE}" "${FORGE_LEDGER_TOKEN_FILE}" "${FORGE_TUNNEL_PID_FILE}" "${FORGE_TUNNEL_LOG_FILE}"
+  rm -f "${FORGE_CA_FILE}" "${FORGE_RECORD_FILE}" "${FORGE_AGENT_TOKEN_FILE}" "${FORGE_LEDGER_TOKEN_FILE}" "${FORGE_TUNNEL_PID_FILE}" "${FORGE_TUNNEL_LOG_FILE}" "${FORGE_TUNNEL_CONTEXT_FILE}"
   rmdir "${EVAL_FORGE_STATE_DIR}" 2>/dev/null || true
   echo "✓ Forge down finished in $((SECONDS - started))s; the forge's files are gone from ${EVAL_FORGE_STATE_DIR}"
 }
@@ -415,6 +425,7 @@ chmod 700 /var/gitlab/private
 [ -s /var/gitlab/ca.crt ] || md ca-crt > /var/gitlab/ca.crt
 [ -s /var/gitlab/private/agent-token ] || md agent-token > /var/gitlab/private/agent-token
 [ -s /var/gitlab/private/ledger-token ] || md ledger-token > /var/gitlab/private/ledger-token
+printf 'PRIVATE-TOKEN: %s\n' "$(cat /var/gitlab/private/agent-token)" > /var/gitlab/private/agent-header
 chmod 600 "/var/gitlab/config/ssl/${HOST}.key" /var/gitlab/private/*
 mark script-start
 docker pull "$IMAGE" >/dev/null 2>&1 && mark image-pulled || { echo "FORGE failed pull ${IMAGE}"; exit 1; }
@@ -425,7 +436,7 @@ else
   # below runs as root inside the container, and sign-up is off.
   ROOT_PW=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
   docker run -d --name gitlab --hostname "$HOST" --restart unless-stopped -p 443:443 --shm-size 256m \
-    -v /var/gitlab/config:/etc/gitlab -v /var/gitlab/logs:/var/log/gitlab -v /var/gitlab/data:/var/opt/gitlab \
+    -v /var/gitlab/config:/etc/gitlab -v /var/gitlab/logs:/var/log/gitlab -v /var/gitlab/data:/var/opt/gitlab -v /var/gitlab/private:/var/gitlab/private:ro \
     -e GITLAB_OMNIBUS_CONFIG="external_url 'https://${HOST}'; letsencrypt['enable']=false; nginx['redirect_http_to_https']=false; nginx['ssl_certificate']='/etc/gitlab/ssl/${HOST}.crt'; nginx['ssl_certificate_key']='/etc/gitlab/ssl/${HOST}.key'; gitlab_rails['initial_root_password']='${ROOT_PW}'; gitlab_rails['gitlab_signup_enabled']=false; prometheus_monitoring['enable']=false; gitlab_kas['enable']=false" \
     "$IMAGE" >/dev/null && mark container-started
 fi
@@ -436,8 +447,8 @@ for i in $(seq 1 240); do
 done
 [ "${code:-}" = "200" ] || { echo "FORGE failed never-ready code=${code:-none}"; docker logs gitlab 2>&1 | tail -5; exit 1; }
 if [ ! -e /var/gitlab/private/seeded ]; then
-  docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" \
-    -e AGENT_TOKEN="$(cat /var/gitlab/private/agent-token)" -e LEDGER_TOKEN="$(cat /var/gitlab/private/ledger-token)" gitlab gitlab-rails runner '
+  # The tokens reach rails from the mounted files, never through argv or the environment.
+  docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" gitlab gitlab-rails runner '
 admin = User.find_by_username("root")
 pw = SecureRandom.hex(24)
 res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10).execute
@@ -445,12 +456,12 @@ u = res.respond_to?(:payload) ? (res.payload[:user] || res[:user]) : res
 raise "user create failed: #{res.inspect}" unless u && u.persisted?
 {"agent" => ["api", "write_repository"], "ledger" => ["api"]}.each do |name, scopes|
   t = u.personal_access_tokens.build(name: name, scopes: scopes, expires_at: ENV["TOKEN_DAYS"].to_i.days.from_now)
-  t.set_token(ENV[name.upcase + "_TOKEN"]); t.save!
+  t.set_token(File.read("/var/gitlab/private/" + name + "-token").strip); t.save!
 end
 puts "rails-ok"' >/tmp/rails.out 2>&1 && mark rails-done || { echo "FORGE failed rails"; grep -vE '^\s+from ' /tmp/rails.out | head -12; exit 1; }
-  API="https://${HOST}/api/v4"; H="PRIVATE-TOKEN: $(cat /var/gitlab/private/agent-token)"
-  api() { curl -s --cacert /var/gitlab/ca.crt --resolve "${HOST}:443:127.0.0.1" -H "$H" "$@"; }
-  GID=$(api -X POST "$API/groups" -d "name=${GROUP}" -d "path=${GROUP}" -d visibility=private | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
+  API="https://${HOST}/api/v4"
+  api() { curl -s --cacert /var/gitlab/ca.crt --resolve "${HOST}:443:127.0.0.1" -H @/var/gitlab/private/agent-header "$@"; }
+  GID=$(api -X POST "$API/groups" -d "name=${GROUP}" -d "path=${GROUP}" -d visibility=private | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
   [ -n "$GID" ] || { echo "FORGE failed group-create"; exit 1; }
   code=$(api -X POST "$API/projects" -d "name=${PROJECT}" -d "path=${PROJECT}" -d "namespace_id=${GID}" -d visibility=private -d initialize_with_readme=true -o /dev/null -w '%{http_code}')
   [ "$code" = "201" ] || { echo "FORGE failed project-create http=${code}"; exit 1; }
@@ -528,7 +539,8 @@ wait_for_serial_ready() { # <timeout seconds>
 # instance metadata, which compute.instances.get returns and the agent under
 # test holds (compute.viewer in the leased project). Once the forge is up they
 # live on the VM's disk alone; this runs before the deploy, so no agent exists
-# while they are there.
+# while they are there. The insert's audit entry carries no metadata values
+# (read on a dev project's instances.insert entry, 2026-10-28).
 remove_key_from_metadata() {
   gcloud compute instances remove-metadata "${FORGE_VM_NAME}" --zone="${FORGE_VM_ZONE}" --project="${PROJECT_ID}" \
     --keys="${FORGE_ROW_SECRET_METADATA_KEYS}" >/dev/null || {
@@ -590,13 +602,17 @@ open_tunnel() {
     echo "ERROR: could not create the relay pod ${FORGE_RELAY_POD} in ${CLUSTER_NAME}." >&2
     return 1
   }
-  kubectl wait --for=condition=Ready "pod/${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --timeout="${FORGE_RELAY_READY_TIMEOUT}" >/dev/null || {
-    echo "ERROR: the relay pod ${FORGE_RELAY_POD} did not become Ready within ${FORGE_RELAY_READY_TIMEOUT}." >&2
+  kubectl wait --for=condition=Ready "pod/${FORGE_RELAY_POD}" -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" --timeout="${FORGE_CLUSTER_CHECK_TIMEOUT}" >/dev/null || {
+    echo "ERROR: the relay pod ${FORGE_RELAY_POD} did not become Ready within ${FORGE_CLUSTER_CHECK_TIMEOUT}." >&2
     return 1
   }
   [ -d "${EVAL_FORGE_STATE_DIR}" ] || install -d -m 700 "${EVAL_FORGE_STATE_DIR}"
-  nohup kubectl port-forward -n "${FORGE_CLUSTER_CHECK_NAMESPACE}" "pod/${FORGE_RELAY_POD}" --address 127.0.0.1 \
-    "${FORGE_TUNNEL_LOCAL_PORT}:${FORGE_RELAY_PORT}" > "${FORGE_TUNNEL_LOG_FILE}" 2>&1 &
+  kubectl config current-context > "${FORGE_TUNNEL_CONTEXT_FILE}" 2>/dev/null || true
+  # A port-forward dies with its API stream (a control-plane roll, the relay's
+  # node); the keeper restarts it for the run's length, and `down` kills both.
+  nohup bash -c 'while :; do kubectl port-forward -n "$1" "pod/$2" --address 127.0.0.1 "$3:$4"; sleep "$5"; done' _ \
+    "${FORGE_CLUSTER_CHECK_NAMESPACE}" "${FORGE_RELAY_POD}" "${FORGE_TUNNEL_LOCAL_PORT}" "${FORGE_RELAY_PORT}" "${FORGE_TUNNEL_RESTART_SECONDS}" \
+    > "${FORGE_TUNNEL_LOG_FILE}" 2>&1 &
   echo "$!" > "${FORGE_TUNNEL_PID_FILE}"
   if ! grep -qxF "$(hosts_entry)" "${FORGE_TUNNEL_HOSTS_FILE}" 2>/dev/null; then
     [ -w "${FORGE_TUNNEL_HOSTS_FILE}" ] || {
@@ -607,13 +623,13 @@ open_tunnel() {
   fi
   deadline=$(( SECONDS + FORGE_TUNNEL_READY_SECONDS ))
   while [ "${SECONDS}" -lt "${deadline}" ]; do
-    code="$(curl -sS --cacert "${FORGE_CERT_DIR}/ca.crt" --resolve "${EVAL_FORGE_HOST}:${FORGE_TUNNEL_LOCAL_PORT}:127.0.0.1" --max-time 10 -o /dev/null -w '%{http_code}' \
-      "https://${EVAL_FORGE_HOST}:${FORGE_TUNNEL_LOCAL_PORT}${FORGE_ROW_READY_PATH}" 2>/dev/null)" || true
+    code="$(curl -sS --cacert "${FORGE_CERT_DIR}/ca.crt" --resolve "${EVAL_FORGE_HOST}:${FORGE_TUNNEL_LOCAL_PORT}:127.0.0.1" --max-time "${FORGE_TUNNEL_CHECK_MAX_TIME}" -o /dev/null -w '%{http_code}' \
+      "https://${EVAL_FORGE_HOST}${FORGE_ROW_READY_PATH}" 2>/dev/null)" || true
     [ "${code}" = "200" ] && break
     sleep "${FORGE_TUNNEL_POLL_SECONDS}"
   done
   if [ "${code:-}" != "200" ]; then
-    echo "ERROR: the tunnel to ${EVAL_FORGE_HOST} did not answer on 127.0.0.1:${FORGE_TUNNEL_LOCAL_PORT} within ${FORGE_TUNNEL_READY_SECONDS}s (got '${code:-nothing}'); the port-forward's log: $(tail -n 3 "${FORGE_TUNNEL_LOG_FILE}" 2>/dev/null | tr '\n' ' ')" >&2
+    echo "ERROR: the tunnel to ${EVAL_FORGE_HOST} did not answer on 127.0.0.1:${FORGE_TUNNEL_LOCAL_PORT} within ${FORGE_TUNNEL_READY_SECONDS}s (got '${code:-nothing}'); the port-forward's log: $(tail -n "${FORGE_TUNNEL_LOG_TAIL_LINES}" "${FORGE_TUNNEL_LOG_FILE}" 2>/dev/null | tr '\n' ' ')" >&2
     return 1
   fi
   echo "✓ Tunnel open: ${EVAL_FORGE_HOST} answers on 127.0.0.1:${FORGE_TUNNEL_LOCAL_PORT} through ${FORGE_RELAY_POD} (pid $(cat "${FORGE_TUNNEL_PID_FILE}"))"
@@ -662,7 +678,8 @@ forge_up() {
       FORGE_ROW_SECRET_METADATA_KEYS="${FORGE_KEY_METADATA_KEY}"; FORGE_ROW_METADATA_FILES=""
       ready_timeout="${GHES_READY_TIMEOUT_SECONDS}" ;;
     gitlab)
-      read -r group suffix <<<"$(gitlab_project_lifted)" || { echo "ERROR: could not lift GITLAB_FORGE_GROUP/GITLAB_FORGE_PROJECT_SUFFIX from hack/ci-deploy.sh." >&2; exit 1; }
+      read -r group suffix <<<"$(gitlab_project_lifted || true)"
+      [ -n "${group:-}" ] && [ -n "${suffix:-}" ] || { echo "ERROR: could not lift GITLAB_FORGE_GROUP/GITLAB_FORGE_PROJECT_SUFFIX from hack/ci-deploy.sh; not creating a VM whose project the eval would not find." >&2; exit 1; }
       FORGE_GITLAB_PROJECT="${group}/${PROJECT_ID}${suffix}"
       FORGE_ROW_MACHINE_TYPE="${GITLAB_CE_MACHINE_TYPE}"; FORGE_ROW_DISK_FLAG="--boot-disk-size=${GITLAB_CE_BOOT_DISK}"
       FORGE_ROW_STARTUP_FN=gitlab_startup_script; FORGE_ROW_READY_PATH="${GITLAB_CE_READY_PATH}"

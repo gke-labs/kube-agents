@@ -72,7 +72,7 @@ STUB_GCLOUD = textwrap.dedent(
 FORGE_KNOBS_ABSENT = (
     "JOB_NAME", "EVAL_GHES_HOST", "EVAL_GITLAB_CE_HOST", "FORGE_SKIP_CLUSTER_CHECK", "FORGE_VM_ZONE", "AR_REPO",
     "FORGE_IMAGE_TAG", "GHES_READY_TIMEOUT_SECONDS", "GITLAB_CE_READY_TIMEOUT_SECONDS", "FORGE_BUILD_TIMEOUT_SECONDS",
-    "FORGE_BUILD_CLIENT_BOUND_SECONDS", "FORGE_READY_POLL_SECONDS", "FORGE_TUNNEL_LOCAL_PORT", "FORGE_TUNNEL_HOSTS_FILE",
+    "FORGE_BUILD_CLIENT_BOUND_SECONDS", "FORGE_READY_POLL_SECONDS", "FORGE_TUNNEL_HOSTS_FILE",
     "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "SEED_EXIT", "MAKE_CERTS_LEAF_ONLY",
 )
 
@@ -86,7 +86,8 @@ STUB_KUBECTL = textwrap.dedent(
     printf 'kubectl %s\\n' "$*" >> "${STUB_CALLS}"
     case "$*" in
       "port-forward "*) exec sleep 600 ;;
-      "wait "*|"delete pod "*|"run forge-relay "*) exit 0 ;;
+      "wait "*|"delete pod "*|"--context "*|"run forge-relay "*) exit 0 ;;
+      "config current-context") echo host-ctx; exit 0 ;;
     esac
     printf '%s' "${KUBECTL_CODE:-200}"
     exit "${KUBECTL_EXIT:-0}"
@@ -202,7 +203,6 @@ class ForgeScriptTest(unittest.TestCase):
                 "FORGE_READY_POLL_SECONDS": "0",
                 "TMPDIR": str(self.scratch),
                 "FORGE_TUNNEL_HOSTS_FILE": str(self.hosts),
-                "FORGE_TUNNEL_LOCAL_PORT": "18443",
                 "FORGE_TUNNEL_POLL_SECONDS": "0",
                 "BUILD_ID": "1234",
                 "PULL_NUMBER": "99",
@@ -449,11 +449,12 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn("--image=alpine/socat:1.8.1.3@sha256:", relay)
         self.assertIn(f"TCP-LISTEN:8443,fork,reuseaddr TCP:{FORGE_IP}:443", relay)
         self.assertTrue(self.calls_of("kubectl wait --for=condition=Ready pod/forge-relay"))
-        self.assertTrue(self.calls_of("kubectl port-forward -n default pod/forge-relay --address 127.0.0.1 18443:8443"))
+        self.assertTrue(self.calls_of("kubectl port-forward -n default pod/forge-relay --address 127.0.0.1 443:8443"))
         pid = int((self.state_dir / "forge-tunnel-pid").read_text().strip())
-        os.kill(pid, 0)  # alive after up returns: the deploy and the eval use it
+        os.kill(pid, 0)  # the keeper is alive after up returns: the deploy and the eval use its port-forward
+        self.assertEqual((self.state_dir / "forge-tunnel-context").read_text().strip(), "host-ctx", "the context the relay lives in, for down")
         self.assertIn("127.0.0.1 gitlab.eval.internal", self.hosts.read_text())
-        self.assertTrue(any("--resolve gitlab.eval.internal:18443:127.0.0.1" in c and "/users/sign_in" in c for c in self.calls_of("curl ")))
+        self.assertTrue(any("--resolve gitlab.eval.internal:443:127.0.0.1" in c and "https://gitlab.eval.internal/users/sign_in" in c for c in self.calls_of("curl ")))
         # The seed: the helper, the agent token in the environment, the manifest on stdin.
         seed = self.calls_of("ci_gitlab_forge seed-file")[0]
         for part in (f"--project-id {PROJECT}", "--path clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "--host gitlab.eval.internal", "token-set=True"):
@@ -465,6 +466,7 @@ class ForgeScriptTest(unittest.TestCase):
             self.assertTrue(token.startswith("glpat-") and len(token) == 26, token)
             self.assertEqual(oct((self.state_dir / name).stat().st_mode & 0o777), "0o600")
             self.assertNotIn(token, proc.stdout + proc.stderr)
+            self.assertNotIn(token, create, "the token rides in a file, never in the create's argv")
         self.assertEqual(oct((self.state_dir / "ca.crt").stat().st_mode & 0o777), "0o644")
         self.assertEqual(list(self.scratch.iterdir()), [], "the key, the tokens and the startup script are gone after up")
 
@@ -478,7 +480,7 @@ class ForgeScriptTest(unittest.TestCase):
             os.kill(pid, 0)
         self.assertNotIn("gitlab.eval.internal", self.hosts.read_text())
         self.assertIn("127.0.0.1 localhost", self.hosts.read_text(), "the rest of the hosts file is left alone")
-        self.assertTrue(self.calls_of("kubectl delete pod forge-relay"))
+        self.assertTrue(self.calls_of("kubectl --context host-ctx delete pod forge-relay"), "the relay is deleted in the context up recorded")
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce --zone=us-central1-a"))
         self.assertFalse(self.state_dir.exists())
 
@@ -486,7 +488,7 @@ class ForgeScriptTest(unittest.TestCase):
         self.provision()
         proc = self.run_forge("up", forge="gitlab-ce", CURL_CODE="000")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("the tunnel to gitlab.eval.internal did not answer on 127.0.0.1:18443", proc.stderr)
+        self.assertIn("the tunnel to gitlab.eval.internal did not answer on 127.0.0.1:443", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce"))
         self.assertTrue(self.calls_of("kubectl delete pod forge-relay"))
         self.assertNotIn("gitlab.eval.internal", self.hosts.read_text())
@@ -500,6 +502,23 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertIn(f"seeding clusters/seeded-a/seeded-reliability/checkout-gateway.yaml into gke-agentic/{PROJECT}-infra on gitlab.eval.internal failed", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-gitlab-ce"))
         self.assertFalse(self.state_dir.exists())
+
+    def test_down_on_gitlab_ce_twice_is_clean(self):
+        self.provision()
+        self.assertEqual(self.run_forge("up", forge="gitlab-ce").returncode, 0)
+        self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
+        proc = self.run_forge("down", forge="gitlab-ce")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.hosts.read_text(), "127.0.0.1 localhost\n")
+
+    def test_up_on_gitlab_ce_refuses_a_deploy_without_the_project_constants(self):
+        self.provision()
+        deploy = self.hack / "ci-deploy.sh"
+        deploy.write_text(deploy.read_text().replace('GITLAB_FORGE_GROUP="gke-agentic"\n', ""))
+        proc = self.run_forge("up", forge="gitlab-ce")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("could not lift GITLAB_FORGE_GROUP/GITLAB_FORGE_PROJECT_SUFFIX", proc.stderr)
+        self.assertFalse(self.calls_of("instances create") or self.calls_of("make-certs"))
 
     def test_up_on_gitlab_ce_refuses_a_hosts_file_it_cannot_write(self):
         self.provision()
