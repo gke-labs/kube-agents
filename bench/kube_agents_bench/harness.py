@@ -2138,6 +2138,13 @@ class KubeAgentsHarness(AgentHarness):
         if reply.metadata.get("outcome") == inject.OUTCOME_NOT_ACCEPTED:
             # Any other refusal: the door, not the agent.
             return _infra_failure(f"{pushed_report.DIRECTIVE}: {'; '.join(reply.errors) or 'the reply was refused'}")
+        if reply.metadata.get("infra_failure") is not None:
+            # The reply's exchange was lost in transport or classified as
+            # infrastructure by the door's read: the run is that failure, as
+            # _infra_failure records it (empty output, empty trajectory, the
+            # marker), not a merged record that reads as a completed task
+            # beside an infrastructure failure.
+            return reply
         return pushed_report.merge(opening, reply, entry)
 
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:

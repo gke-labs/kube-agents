@@ -419,6 +419,22 @@ def test_a_reply_absorbed_three_times_is_infrastructure(monkeypatch):
     assert got.metadata.get("final_message") is None
 
 
+def test_an_infra_failed_reply_is_the_runs_infra_failure_not_a_merge(monkeypatch):
+    """A reply turn lost in transport keeps _infra_failure's shape: no output, no
+    trajectory, the marker alone; the opening's completed task is not merged in."""
+    conversation = "inject:devops-bench-abc/chat-reply-under-pushed-report/2"
+    infra = harness._infra_failure("the inject exchange failed: tunnel died")
+    monkeypatch.setattr(harness, "_agent_shell", _stored)
+    monkeypatch.setattr(harness.KubeAgentsHarness, "_execute_inject", lambda self, prompt, **kw: infra)
+    got = harness.KubeAgentsHarness()._reply_under_pushed_report(
+        _opening(conversation), _completed_exchange(conversation, "ctx-77"), pushed_report.parse(PROMPT)
+    )
+    assert got is infra
+    assert got.output == "" and got.trajectory == []
+    assert "task_id" not in got.metadata and "pushed_report" not in got.metadata
+    assert got.errors and got.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+
+
 def test_every_activity_marker_must_vouch_on_a_two_turn_record():
     clean = {"name": scoring.INJECT_ACTIVITY_EVENT, "args": {"dropped": 0}}
     lossy = {"name": scoring.INJECT_ACTIVITY_EVENT, "args": {"dropped": 2}}
