@@ -156,6 +156,21 @@ const (
 	// on its own. The value is the issue's decision, chosen over three
 	// (defaultMinCount) to sit past a normal scale-up's first attempts.
 	defaultFailedSchedulingMinCount = 5
+	// failedSchedulingMinSpan is how long, by its own first and last sighting,
+	// a FailedScheduling with no autoscaler verdict must have lasted before the
+	// count backstop passes it. The count alone climbs in seconds whenever the
+	// cluster churns: a node scale-down cordons and taints a node and deletes
+	// its pods, the scheduler retries the evicted pod's replacement on each
+	// change, and no verdict is ever recorded against it (measured live: count
+	// five three seconds after the first attempt, the pod placed five seconds
+	// later). A pod still stuck is re-sighted at least every five minutes, the
+	// scheduler's unschedulable-queue flush, so this delays its card to that
+	// sighting and never silences it. Measured over 30 days on six clusters,
+	// 182 pods with no verdict were Pending for 4s at the median and 65s at
+	// the longest, and every one of the 40 the count alone passed scheduled
+	// inside 65s; two minutes holds all of them with twice the margin. Any
+	// value up to the five-minute flush gives a stuck pod the same worst case.
+	failedSchedulingMinSpan = 2 * time.Minute
 	// defaultScaleUpHold is cluster-autoscaler's default max-node-provision-time.
 	// A scale-up the autoscaler has not delivered by then is one it has given
 	// up on, so a pod still pending past it is reported on the count.
@@ -358,6 +373,10 @@ const (
 	// gateFailedSchedulingMinCount is a FailedScheduling held on the count
 	// backstop, with no autoscaler verdict on record.
 	gateFailedSchedulingMinCount filterGate = "failedscheduling_min_count"
+	// gateFailedSchedulingMinSpan is a FailedScheduling past the count
+	// backstop whose sightings do not yet span failedSchedulingMinSpan, with
+	// no autoscaler verdict on record.
+	gateFailedSchedulingMinSpan filterGate = "failedscheduling_min_span"
 	// gateFailedSchedulingStale is a FailedScheduling the scheduler stopped
 	// re-emitting long enough ago that the pod is no longer pending; see
 	// failedSchedulingStaleAfter.
@@ -516,9 +535,14 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     later, while no single object had passed four. The per-object count
 //     damps that burst; the price is a slower card on a cluster without an
 //     autoscaler while the message keeps changing.
+//   - Past the count, the event's own sightings must span
+//     failedSchedulingMinSpan. A scale-down drain records no verdict and
+//     drives the count to five in seconds, for a pod placed seconds later.
+//     Zero timestamps fail open, as the settle gate's do.
 //
 // Not a settle timer: a live event is never delayed by wall-clock time, only
-// by what the autoscaler said or by how often the scheduler has repeated it.
+// by what the autoscaler said, how often the scheduler has repeated it, and
+// over how long its own sightings say it did.
 // Each decision logs one line naming the pod and what decided it, which is
 // what a reader has in the pod log; the gate labels on
 // k8s_event_watcher_events_filtered_total are the same decisions counted.
@@ -564,6 +588,11 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 		log.Printf("held %s pod=%s/%s (count=%d < %d, no autoscaler verdict on record)",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, f.cfg.failedSchedulingMinCount)
 		return gateFailedSchedulingMinCount
+	}
+	if !settled(ev, failedSchedulingMinSpan) {
+		log.Printf("held %s pod=%s/%s (count=%d, lasted %s < %s, no autoscaler verdict on record)",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second), failedSchedulingMinSpan)
+		return gateFailedSchedulingMinSpan
 	}
 	return gateAccepted
 }
