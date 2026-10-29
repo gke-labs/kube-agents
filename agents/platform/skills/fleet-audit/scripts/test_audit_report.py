@@ -23165,6 +23165,9 @@ metadata:
         self.assertEqual(audit_report.KCC_PROJECT_ANNOTATION, kcc_health.KCC_PROJECT_ANNOTATION)
         self.assertEqual(audit_report.KCC_UNREADY_FIELD, kcc_health.UNREADY_FIELD)
         self.assertEqual(audit_report.KCC_UNREAD_FIELD, kcc_health.UNREAD_FIELD)
+        self.assertEqual(audit_report.KCC_CLUSTER_STATUS_FIELD, kcc_health.CLUSTER_STATUS_FIELD)
+        self.assertEqual(audit_report.KCC_READABLE_STATUSES, kcc_health.READABLE_STATUSES)
+        self.assertEqual(audit_report.KCC_PROJECT_TARGET_PREFIX, kcc_health.PROJECT_TARGET_PREFIX)
 
     def test_a_fix_to_a_file_with_no_config_connector_object_gets_no_config_connector_text(self):
         """The finding's node pool is unready, but the fix edits a
