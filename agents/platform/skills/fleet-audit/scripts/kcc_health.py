@@ -121,6 +121,20 @@ GLOBAL_LOCATION = "global"
 # is not read and is not a host.
 CLUSTER_STATUS_FIELD = "cluster_status"
 READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
+# The flag that turns the read on. A collector reads Config Connector only
+# with it: only `finish` uses the result, and the SOP commands of the
+# scheduled audits pass it, while the chat route runs the same collectors
+# without it and pays nothing for a read that nothing uses.
+FLAG = "--config-connector"
+FLAG_HELP = (
+    "after the sweep, read Config Connector on each collected cluster and record kcc_unready or "
+    "kcc_unread on its entry, for finish; the SOP commands of the scheduled audits pass it, chat runs do not"
+)
+# The carried key a collector sets on a cluster whose `clusters list` record
+# shows the Config Connector add-on enabled
+# (`addonsConfig.configConnectorConfig.enabled`). Those clusters are read
+# first, so a large fleet cannot spend the time budget before it reaches them.
+ADDON_FIELD = "config_connector_addon"
 # The second read, on a host whose unready objects carry no project
 # annotation: Config Connector takes the project from the object's
 # namespace annotation then, so the namespaces give it. Its own timeout,
@@ -314,6 +328,18 @@ def read_cluster(kubeconfig: Path, *, run: RunFn = default_run, timeout_s: int =
     return entry_fields(parsed, result.rc, result.stderr, timeout_s)
 
 
+def add_flag(parser) -> None:
+    """Add `FLAG` to a collector's argument parser (`args.config_connector`)."""
+    parser.add_argument(FLAG, action="store_true", help=FLAG_HELP)
+
+
+def addon_enabled(cluster: dict) -> bool:
+    """Whether a `clusters list` record shows the Config Connector add-on on."""
+    addons = cluster.get("addonsConfig") if isinstance(cluster.get("addonsConfig"), dict) else {}
+    config = addons.get("configConnectorConfig") if isinstance(addons.get("configConnectorConfig"), dict) else {}
+    return bool(config.get("enabled"))
+
+
 def run_deadline(started: float) -> float:
     """The `deadline` for `annotate_manifest`, from the collector's start."""
     return started + RUN_DEADLINE_S
@@ -416,6 +442,9 @@ def annotate_manifest(
     ]
     if not targets:
         return
+    # Clusters with the add-on first (`ADDON_FIELD`); the sort is stable, so
+    # the rest keep the collector's order.
+    targets.sort(key=lambda entry: not entry.get(ADDON_FIELD))
 
     def one(entry: dict) -> dict:
         try:

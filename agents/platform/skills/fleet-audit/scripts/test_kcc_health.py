@@ -429,6 +429,25 @@ class AnnotateManifestTest(unittest.TestCase):
                 kcc_health.annotate_manifest(read, deadline=self.deadline, run=run, clock=self.clock)
                 self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding()], read, root), expected)
 
+    def test_clusters_with_the_add_on_are_read_first(self):
+        run = FakeRun({"hub": listing(), "edge": listing(), "slow": listing()})
+        mapped = []
+
+        def mapper(fn, items):
+            items = list(items)
+            mapped.extend(entry["name"] for entry in items)
+            return map(fn, items)
+
+        manifest = self.manifest()
+        manifest["clusters"][2]["config_connector_addon"] = True
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, mapper=mapper, clock=self.clock)
+        self.assertEqual(mapped, ["acme/us-west1/slow", "acme/us-central1/hub", "acme/us-east1/edge"])
+
+    def test_the_add_on_is_read_from_the_clusters_list_record(self):
+        self.assertTrue(kcc_health.addon_enabled({"addonsConfig": {"configConnectorConfig": {"enabled": True}}}))
+        self.assertFalse(kcc_health.addon_enabled({"addonsConfig": {"configConnectorConfig": {}}}))
+        self.assertFalse(kcc_health.addon_enabled({}))
+
 
 class DeadlineTest(unittest.TestCase):
     """The reads end inside the collector's time budget, so the manifest

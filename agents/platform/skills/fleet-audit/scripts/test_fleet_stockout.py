@@ -3658,10 +3658,23 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         out = io.StringIO()
         with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "RUN_DEADLINE_S", 0):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                fs.main([])
+                fs.main(["--config-connector"])
         entry = json.loads(out.getvalue())["clusters"][0]
         self.assertEqual(entry["candidates"], [])
         self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
 
     def test_main_adds_the_config_connector_read_before_it_prints(self):
         """A stockout fix can edit a `ContainerNodePool` declaration, so `main`
@@ -3676,7 +3689,7 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         out = io.StringIO()
         with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest", side_effect=annotate):
             with contextlib.redirect_stdout(out):
-                fs.main([])
+                fs.main(["--config-connector"])
         self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
 
     def test_main_hands_the_flags_to_the_resolver(self):

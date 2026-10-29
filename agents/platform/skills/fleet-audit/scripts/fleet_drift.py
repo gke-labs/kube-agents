@@ -2024,6 +2024,9 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         note = limitations.get(cluster_key)
         if note:
             entry["limitations"] = note
+        if kcc_health.addon_enabled(c):
+            # Read first by the Config Connector read after the sweep.
+            entry[kcc_health.ADDON_FIELD] = True
         skipped = not_applicable.get(cluster_key)
         if skipped:
             entry["checks_not_applicable"] = skipped
@@ -2153,17 +2156,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
+    kcc_health.add_flag(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     # The Config Connector reads below end inside a budget measured from here.
     started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # After the sweep, in a new pool of the sweep's size: a credential fetch
-    # and one `kubectl get gcp` per collected cluster, as `kcc_unready` or
-    # `kcc_unread` on its entry. The reads end inside the collector's time
-    # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map)
+    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command of
+    # the scheduled audit passes it, the chat route does not.
+    if args.config_connector:
+        # After the sweep, in a new pool of the sweep's size: a credential fetch
+        # and one `kubectl get gcp` per collected cluster, as `kcc_unready` or
+        # `kcc_unread` on its entry. The reads end inside the collector's time
+        # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map)
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         # The manifest is still written -- the shell has already redirected

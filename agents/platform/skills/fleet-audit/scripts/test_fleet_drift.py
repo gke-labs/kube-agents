@@ -1787,6 +1787,13 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertEqual(statuses["c0"], "STOPPING")
         self.assertEqual(statuses["c1"], "RUNNING")
 
+    def test_a_cluster_with_the_config_connector_add_on_is_marked(self):
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)]
+        clusters[0]["addonsConfig"] = {"configConnectorConfig": {"enabled": True}}
+        marked = {entry["name"].rpartition("/")[2]: entry.get("config_connector_addon") for entry in self.manifest(clusters)["clusters"]}
+        self.assertEqual(marked["c0"], True)
+        self.assertIsNone(marked["c1"])
+
     def test_an_undersized_autopilot_cohort_still_declares_them(self):
         """The live fleet's shape: two Autopilot clusters in one cohort against
         a floor of three, so no facet compared and every facet slug is missing
@@ -2657,10 +2664,23 @@ class CandidateSummaryTest(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "RUN_DEADLINE_S", 0):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                fd.main([])
+                fd.main(["--config-connector"])
         entry = json.loads(out.getvalue())["clusters"][0]
         self.assertEqual(entry["candidates"], [])
         self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "annotate_manifest") as annotate:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fd.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
 
     def test_main_adds_the_config_connector_read_before_it_prints(self):
         """A drift fix can edit a `ContainerCluster` declaration, so `main`
@@ -2674,7 +2694,7 @@ class CandidateSummaryTest(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(fd, "collect_fleet", return_value=manifest), mock.patch.object(fd.kcc_health, "annotate_manifest", side_effect=annotate):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-                fd.main([])
+                fd.main(["--config-connector"])
         printed = json.loads(out.getvalue())
         self.assertEqual(printed["clusters"][0]["kcc_unready"], [{"seen": "acme/us-central1/hub"}])
 
