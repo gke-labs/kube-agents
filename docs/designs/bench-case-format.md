@@ -70,7 +70,8 @@ runs only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. The harness writes three entries for such a case,
 `harness_stop_sent`, `harness_cards_stopped` and `harness_stop_reply` (the gateway's answer to
 the stop, as its result), and the case's `tool_called` objectives name them, with a `result`
-pattern for the answer.
+pattern for the answer. Under `cards=done` the cards have ended before the stop, so
+`harness_cards_stopped` reads `error` and such a case does not assert it.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that

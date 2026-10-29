@@ -580,9 +580,9 @@ func (g *Gateway) abandonCardStop(ctx context.Context, rec *SessionRecord, autho
 // the stop could not promise. A stop that found nothing open says nothing is
 // running, which is now true: the executor looked. It looked at cards only,
 // so with a newer turn running (turnRunning) it says no card was open. Last
-// come the pull requests the conversation's cards recorded opening or
-// updating before the stop (cardStopWriteClauses); none named is not a claim
-// that nothing was written.
+// come the pull requests the conversation's cards had opened before the
+// stop (cardStopWriteClauses); none named is not a claim that nothing was
+// written.
 func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	var clauses []string
 	if n := r.Unresolved; n > 0 && len(r.Stopped) > 0 {

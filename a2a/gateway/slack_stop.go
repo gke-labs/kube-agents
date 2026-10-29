@@ -126,8 +126,7 @@ func (run CardStopRun) unconfirmedFinal() string {
 // exactly one card that did not stop beside work that did, which is named.
 // Titles are cleaned as the card stop's are (cardStopTitle), so a title can
 // mention no one and link nowhere. Whatever the line, a pull request the
-// thread's cards recorded opening or updating is named after it
-// (slackStopWritesLine).
+// thread's cards had opened is named after it (slackStopWritesLine).
 func slackStopReply(r *lib.CardStopResult, turnCancelled, newerTurnRunning bool) string {
 	unpromised := r.Failed + r.Pending + r.Unresolved
 	stoppedSome := turnCancelled || len(r.Stopped) > 0
