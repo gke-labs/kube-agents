@@ -27,37 +27,97 @@ FLEET_STEP = 1.0
 NUMBER_FORMAT = "%.1f"
 FLEET_DECIMALS = 1
 CHART_CONFIG = {"displayModeBar": False}
+# The largest fleet the forecast chart reaches, for the verdict when no line reaches its limit.
+FORECAST_CEILING = "10,000"
 PROFILE_CAPTION = (
     "{projects:,} projects, {autopilot:.0%} of clusters on Autopilot, {workloads:,} workloads a day "
     "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape."
 )
-INSTALLS_NOTE = (
-    "One install holds about **{capacity:.0f} clusters**, where {limit} reaches its fixed limit. "
-    "This fleet needs **{installs:,} installs** of about {per_install:.0f} clusters each."
+STORY = (
+    "Pick a fleet size and a container size. The forecast says whether one kube-agents install "
+    "holds that fleet with those containers, which limit it reaches first, and, when one install "
+    "cannot hold it, how many installs it needs and what each one needs. Part 2 shows the "
+    "measurements behind every number."
 )
-PLAN_LINE = "Per install: **{nodes} × {machine}**, {memory} of memory and {cpu} of CPU requested."
-TOTAL_LINE = "All {installs:,} installs: **{nodes:,} × {machine}**, {vcpu:,} vCPU and {memory:,.0f} GiB of node memory."
+CONTAINERS_OK = (
+    "**Container limits: enough.** With these container sizes, no container reaches its memory or "
+    "CPU limit for this fleet in one install."
+)
+CONTAINERS_RAISE = (
+    "**Container limits: not enough.** {count} container limits are too low for this fleet in one "
+    "install. The first one reached is **{first}**{where}. Raise them to the sizes listed below, "
+    "or split the fleet into installs."
+)
+FIXED_OK = (
+    "**Fixed limits: one install holds this fleet.** It has {clusters:,.0f} clusters; one install "
+    "was measured holding {held:.0f} clusters of daily work, and Stall Watch reads up to about "
+    "{stall:.0f} clusters every half hour."
+)
+FIXED_SPLIT = (
+    "**Fixed limits: one install cannot hold this fleet.** It has {clusters:,.0f} clusters. No "
+    "setting raises these limits, so the fleet needs **{installs:,} installs of about "
+    "{per_install:.0f} clusters** (measured: one install held {held:.0f} clusters), or "
+    "**{stall_installs:,} installs** to have Stall Watch read every cluster each half hour."
+)
+SHELL_FIXED_LINE = (
+    "- **Sandbox shell: 2 CPU, fixed by the kube-agents operator, not by GKE.** Every brokered command "
+    "starts there, so the command path carries about 1.5 commands per second. At {held:.0f} clusters "
+    "the shell peaked at {shell:.0%} of it."
+)
+SHELL_SETTABLE_LINE = (
+    "- **Sandbox shell: sized like the other containers here,** which assumes an operator change. "
+    "Past {held:.0f} clusters nothing is measured, so the next limit there is unknown."
+)
+FIXED_WHY = """The limits no setting raises:
+
+{shell_line}
+- **Credential proxy: 8 commands at once.** A command that waits 60 seconds is refused.
+- **Agent: 10 requests at once.** The 11th is refused.
+- **Stall Watch: one cluster at a time, about {seconds:.0f} seconds each,** within a 25-minute budget every half hour, so one pass covers about {stall:.0f} clusters.
+
+The model's straight lines, which take each input's largest increase over all operations, are more cautious: they put the shell at its limit at about {model:.0f} clusters, because a user's upgrade readiness report loads it. At the measured size that report runs slower; it does not fail."""
+INSTALL_LINE = (
+    "- **Nodes per install:** {nodes} × {machine}, for {memory} of memory and {cpu} of CPU requested; "
+    "a data volume of at least {pvc}."
+)
+TOTAL_LINE = (
+    "- **All {installs:,} installs:** {total_nodes:,} × {machine}, {vcpu:,} vCPU and {node_memory:,.0f} GiB "
+    "of node memory."
+)
+NEED_ONE = "One install holds this fleet. Its containers need:"
+SIZED_MEASURED = "(From the runs measured at {clusters:.0f} clusters, plus 30%.)"
+SIZED_MODEL = "(From the model's lines: this size is past every measured fleet.)"
+NEED_INTRO = "Split into {installs:,} installs of about {per_install:.0f} clusters each. Each install needs:"
+SHELL_TOGGLE = "Assume an operator change lets the sandbox shell be sized too"
+SHELL_HELP = (
+    "GKE would run a larger shell. Its 2 CPU and 2 GiB are fixed by the kube-agents operator "
+    f"({hl.SHELL_RESOURCES_SOURCE}), and no PlatformAgent field changes them today."
+)
+LIMITS_TABLE_CAPTION = (
+    "Memory in MiB, CPU in cores; 0 is no limit. A container's limit can go up to what one node "
+    "holds: on GKE Standard about 120 CPU and 480 GiB on an n2-standard-128 node; GKE Autopilot "
+    "caps a Pod lower, by compute class. The sandbox shell's 2 CPU and 2 GiB are set by the "
+    "kube-agents operator, not by GKE, unless the option above assumes otherwise."
+)
 NO_MACHINE = "No listed machine type holds the largest pod: {memory} of memory and {cpu} of CPU."
 NEED_CAPTION = (
-    "Each limit is the predicted peak plus 30%. `spec.deployment.resources` replaces the agent "
-    "container's whole block; `credentialProxy.resources` and `agentAPIAuth.resources` replace only "
-    "the keys they set. On Autopilot, set the requests to these values."
-)
-LIMITS_CAPTION = (
-    "The limits question 1 checks. Start from the defaults of a Standard install, what GKE Autopilot "
-    "without bursting gives each container (its request becomes its limit), or the limits question 2 "
-    "recommends for this fleet; then change any cell. Memory in MiB, CPU in cores; 0 is no limit. The "
-    "sandbox shell's 2 CPU and 2 GiB are fixed by the operator."
+    "Each size is the predicted peak for one install plus 30%. Set them in the PlatformAgent: "
+    "`spec.deployment.resources` replaces "
+    "the agent container's whole block; `credentialProxy.resources` and `agentAPIAuth.resources` "
+    "replace only the keys they set. On Autopilot, set the requests to these values."
 )
 FORECAST_CAPTION = (
-    "Each line is a key prediction as a share of its limit above, for this fleet's cluster shape at every "
-    "size; a cross marks where it reaches the limit. Dots are measured runs. The shaded range is measured, "
-    "the rest predicted; dashed lines mark the example fleets."
+    "Each line is a key prediction as a share of its limit at the chosen container size, for this "
+    "fleet's cluster shape at every size; a cross marks where it reaches the limit. Dots are measured "
+    "runs. The shaded range is measured, the rest predicted; dashed lines mark the example fleets."
 )
-WHY_CAPTION = (
-    "Every measured run, with no input from this page: each resource in its own unit, one line per "
-    "container fitted through the runs, for clusters shaped like the measured base, against the default "
-    "limits."
+EVIDENCE_STORY = (
+    "The runs behind Part 1, on one experiment install (GKE Standard, mode next): {runs} runs at 2 to "
+    "{clusters:.0f} test clusters, each cluster 2 to 4 nodes and 100 to 4,000 objects. Phases 1 to 3 "
+    "measured one stress point at a time, onboarding and the first-run audits; Phase 4 measured only "
+    "an install's daily work, with the agent and proxy limits raised so that the peaks show the need. "
+    "These charts take no input from Part 1: each resource in its own unit, one line per container "
+    "fitted through the runs, for clusters shaped like the measured base, against the default limits."
 )
 CURVE_NOTE = (
     "Why the lines curve upward: they are not exponential. The model is a straight line in each "
@@ -124,11 +184,17 @@ base = hl.base_fleet(records)
 defaults = hl.usual_limits(records)
 measured = hl.measured_clusters(records)
 
-st.divider()
-section_title("Fleet", "Pick a size, then change any input.")
+# --- Part 1 ---------------------------------------------------------------------------------
+st.header("Part 1: Limits forecast")
+st.markdown(STORY)
+
+size_column, limit_column = st.columns(2)
 profiles = {profile.label: profile for profile in hl.FLEET_PROFILES}
-choice = st.selectbox(
-    "Example fleet", [*profiles, hl.CUSTOM_PROFILE], index=len(profiles) - 1, key=f"{KEY_PREFIX}:profile"
+choice = size_column.selectbox(
+    "Fleet size", [*profiles, hl.CUSTOM_PROFILE], index=len(profiles) - 1, key=f"{KEY_PREFIX}:profile"
+)
+preset = limit_column.selectbox(
+    "Container size", hl.LIMIT_PRESETS, index=hl.LIMIT_PRESETS.index(hl.LIMITS_M), key=f"{KEY_PREFIX}:limit_preset"
 )
 profile = profiles.get(choice)
 if profile:
@@ -138,55 +204,159 @@ if profile:
         )
     )
 start = profile.fleet(base) if profile else base
-fleet: dict[str, float] = {}
-fleet_columns = st.columns(FLEET_COLUMNS)
-for index, (factor, spec) in enumerate(hl.FACTORS.items()):
-    fleet[factor] = fleet_columns[index % FLEET_COLUMNS].number_input(
-        spec.input_label,
-        min_value=0.0,
-        value=round(float(start[factor]), FLEET_DECIMALS),
-        step=FLEET_STEP,
-        format=NUMBER_FORMAT,
-        help=spec.help or None,
-        key=f"{KEY_PREFIX}:fleet:{factor}:{scope}:{choice}",
-    )
+with st.expander("Fine-tune the fleet"):
+    fleet: dict[str, float] = {}
+    fleet_columns = st.columns(FLEET_COLUMNS)
+    for index, (factor, spec) in enumerate(hl.FACTORS.items()):
+        fleet[factor] = fleet_columns[index % FLEET_COLUMNS].number_input(
+            spec.input_label,
+            min_value=0.0,
+            value=round(float(start[factor]), FLEET_DECIMALS),
+            step=FLEET_STEP,
+            format=NUMBER_FORMAT,
+            help=spec.help or None,
+            key=f"{KEY_PREFIX}:fleet:{factor}:{scope}:{choice}",
+        )
 plan = hl.install_plan(records, containers, fleet)
-recommendations = hl.recommendations(records, plan.fleet, containers)
-
-st.divider()
-section_title("Container limits on GKE", LIMITS_CAPTION)
-preset = st.radio("Start from", hl.LIMIT_PRESETS, horizontal=True, key=f"{KEY_PREFIX}:limit_preset")
-starting = {
-    hl.LIMITS_DEFAULT: defaults,
-    hl.LIMITS_AUTOPILOT: hl.usual_requests(records),
-    hl.LIMITS_RECOMMENDED: {**defaults, **hl.recommended_limits(recommendations)},
-}[preset]
-number_column = st.column_config.NumberColumn(min_value=0.0, format=NUMBER_FORMAT)
-edited = st.data_editor(
-    hl.limit_table(starting, [name for name in containers if name in defaults]),
-    hide_index=True,
-    width="stretch",
-    disabled=[hl.LIMIT_CONTAINER_COLUMN],
-    column_config={hl.LIMIT_MEMORY_COLUMN: number_column, hl.LIMIT_CPU_COLUMN: number_column},
-    key=f"{KEY_PREFIX}:limits:{scope}:{preset}:{choice}",
-)
+# What one install holds: the largest measured fleet that held, or the model's line without one.
+held = hl.measured_install_capacity(records) or plan.capacity
+stall_seconds = hl.stall_watch_seconds_per_cluster(records)
+stall_clusters = hl.STALL_WATCH_BUDGET_SECONDS / stall_seconds if stall_seconds else None
+per_install_clusters = min(fleet[hl.CLUSTERS], held) if held else plan.fleet[hl.CLUSTERS]
+installs = max(-(-int(round(fleet[hl.CLUSTERS])) // int(per_install_clusters)), 1) if per_install_clusters else plan.installs
+install_fleet = hl.scaled_fleet(fleet, fleet[hl.CLUSTERS] / installs)
+recommendations, sized_from = hl.measured_recommendations(records, install_fleet, containers)
+shell_settable = st.toggle(SHELL_TOGGLE, value=False, help=SHELL_HELP, key=f"{KEY_PREFIX}:shell_settable")
+with st.expander("Fine-tune the container limits"):
+    st.caption(LIMITS_TABLE_CAPTION)
+    number_column = st.column_config.NumberColumn(min_value=0.0, format=NUMBER_FORMAT)
+    edited = st.data_editor(
+        hl.limit_table(
+            hl.preset_limits(preset, records, recommendations, shell_settable),
+            [name for name in containers if name in defaults],
+        ),
+        hide_index=True,
+        width="stretch",
+        disabled=[hl.LIMIT_CONTAINER_COLUMN],
+        column_config={hl.LIMIT_MEMORY_COLUMN: number_column, hl.LIMIT_CPU_COLUMN: number_column},
+        key=f"{KEY_PREFIX}:limits:{scope}:{preset}:{choice}:{shell_settable}",
+    )
 limits = hl.limits_from_table(edited)
 
-st.divider()
-section_title("1. Are these container limits enough for this fleet?", "One install, with the limits above.")
 resource_checks = hl.resource_checks(records, fleet, containers, limits)
 threshold_checks = hl.threshold_checks(records, fleet, containers)
-failing = [check for check in resource_checks + threshold_checks if check.status == hl.FAIL]
 forecast = hl.bottleneck_series(records, fleet, limits)
 first = hl.first_crossing(forecast)
-if first is None:
-    verdict = "With these limits, no key limit is reached at any fleet size up to 10,000 clusters."
-elif first[1] <= forecast[0].clusters[0]:
-    verdict = f"With these limits, **{first[0].label}** is past its limit at every fleet size."
+container_failing = [check for check in resource_checks if check.status == hl.FAIL]
+
+st.subheader("Can this fleet be handled?")
+if not container_failing:
+    st.success(CONTAINERS_OK)
 else:
-    verdict = f"With these limits, the first limit reached is **{first[0].label}**, at about {first[1]:,.0f} clusters."
-summary = f"{len(failing)} limits fail for this fleet. " if failing else "Every limit holds for this fleet. "
-(st.error if failing else st.success)(summary + verdict)
+    first_failing = hl.first_limit(container_failing) or container_failing[0]
+    where = ""
+    if first is not None and first[1] > forecast[0].clusters[0]:
+        where = f", at about {first[1]:,.0f} clusters"
+    elif first is not None:
+        where = ", already at the smallest fleet"
+    st.error(CONTAINERS_RAISE.format(count=len(container_failing), first=first_failing.label, where=where))
+stall_reach = stall_clusters or held
+if held and fleet[hl.CLUSTERS] <= min(held, stall_reach):
+    st.success(FIXED_OK.format(clusters=fleet[hl.CLUSTERS], held=held, stall=stall_reach))
+elif held:
+    st.error(
+        FIXED_SPLIT.format(
+            clusters=fleet[hl.CLUSTERS],
+            installs=installs,
+            per_install=fleet[hl.CLUSTERS] / installs,
+            held=held,
+            stall_installs=max(-(-int(round(fleet[hl.CLUSTERS])) // max(int(stall_reach), 1)), 1),
+        )
+    )
+shell_peak = max(
+    (run.value(hl.CPU_PEAK, hl.SHELL_CONTAINER) or 0.0 for run in records if run.totals.get(hl.CLUSTERS) == held),
+    default=0.0,
+)
+shell_limit = defaults.get(hl.SHELL_CONTAINER, {}).get(hl.LIMIT_CPU) or 1.0
+with st.expander("Why these limits cannot be raised"):
+    st.markdown(
+        FIXED_WHY.format(
+            shell_line=(SHELL_SETTABLE_LINE if shell_settable else SHELL_FIXED_LINE).format(
+                held=held or 0.0, shell=shell_peak / shell_limit
+            ),
+            held=held or 0.0,
+            seconds=stall_seconds or 0.0,
+            stall=stall_clusters or 0.0,
+            model=plan.capacity or 0.0,
+        )
+    )
+
+st.subheader("How big it needs to be")
+needs = hl.size_needs(recommendations, limits)
+bullets = []
+for need in needs:
+    size = f"{hl.cpu_cores_text(need.cpu_cores)} CPU, {hl.memory_text(need.memory_bytes)}"
+    if need.container in hl.FIXED_LIMIT_CONTAINERS:
+        # A fixed container cannot be given the margin, so its peak itself is compared with the limit.
+        fixed = need.current
+        peak_cpu = (need.cpu_cores or 0.0) / (1 + hl.SAFETY_MARGIN)
+        fixed_cpu = fixed.get(hl.LIMIT_CPU) or 0.0
+        state = "within it" if not fixed_cpu or peak_cpu <= fixed_cpu else "past it, so commands slow down"
+        bullets.append(
+            f"- **{need.name}:** peaks at about {hl.cpu_cores_text(peak_cpu)} CPU of its fixed "
+            f"{hl.cpu_cores_text(fixed_cpu)} CPU, {hl.memory_text(fixed.get(hl.LIMIT_MEMORY))}, which no setting "
+            f"raises ({state})."
+        )
+    elif need.enough:
+        bullets.append(f"- **{need.name}:** needs about {size}; the chosen size is enough.")
+    else:
+        current = need.current
+        bullets.append(
+            f"- **{need.name}:** needs about {size}; the chosen size gives "
+            f"{hl.cpu_cores_text(current.get(hl.LIMIT_CPU))} CPU, {hl.memory_text(current.get(hl.LIMIT_MEMORY))}: raise it."
+        )
+bullets.append("- **LiteLLM, the operator and the rest:** their defaults are enough.")
+nodes = hl.node_plan(recommendations, hl.latest_replicas(records))
+pvc = hl.predict(records, hl.PVC_USED, None, install_fleet)
+if nodes.pods and nodes.machine is not None:
+    bullets.append(
+        INSTALL_LINE.format(
+            per_install=install_fleet[hl.CLUSTERS],
+            nodes=nodes.nodes,
+            machine=nodes.machine.name,
+            memory=hl.memory_quantity(nodes.total_memory_bytes),
+            cpu=hl.cpu_quantity(nodes.total_cpu_cores),
+            pvc=hl.storage_quantity(hl.with_margin(pvc.value)) if pvc else hl.NO_VALUE,
+        )
+    )
+    if installs > 1:
+        bullets.append(
+            TOTAL_LINE.format(
+                installs=installs,
+                total_nodes=nodes.nodes * installs,
+                machine=nodes.machine.name,
+                vcpu=nodes.nodes * installs * nodes.machine.vcpu,
+                node_memory=nodes.nodes * installs * nodes.machine.memory_gib,
+            )
+        )
+heading = NEED_INTRO.format(installs=installs, per_install=install_fleet[hl.CLUSTERS]) if installs > 1 else NEED_ONE
+heading += " " + (SIZED_MEASURED.format(clusters=sized_from) if sized_from else SIZED_MODEL)
+st.markdown(heading + "\n\n" + "\n".join(bullets))
+st.caption(NEED_CAPTION)
+if nodes.pods and nodes.machine is None:
+    st.error(
+        NO_MACHINE.format(
+            memory=hl.memory_quantity(nodes.largest_memory_bytes), cpu=hl.cpu_quantity(nodes.largest_cpu_cores)
+        )
+    )
+
+st.subheader("Which limit the fleet reaches first")
+if first is None:
+    st.markdown(f"With these container sizes, no key limit is reached up to {FORECAST_CEILING} clusters.")
+elif first[1] <= forecast[0].clusters[0]:
+    st.markdown(f"With these container sizes, **{first[0].label}** is past its limit at every fleet size.")
+else:
+    st.markdown(f"With these container sizes, the first limit reached is **{first[0].label}**, at about {first[1]:,.0f} clusters.")
 st.plotly_chart(
     bottleneck_chart(
         forecast,
@@ -202,58 +372,11 @@ st.plotly_chart(
     key=f"{KEY_PREFIX}:forecast:{scope}",
 )
 st.caption(FORECAST_CAPTION)
-table(hl.resource_rows(resource_checks))
-# Restarts and OOMKills are listed only when one is predicted: a column of passes per container says nothing.
-table(
-    hl.threshold_rows(
-        check for check in threshold_checks if check.status != hl.PASS or check.metric not in (hl.RESTARTS, hl.OOMKILLS)
-    )
-)
 
+# --- Part 2 ---------------------------------------------------------------------------------
 st.divider()
-section_title("2. What node size and container limits does this fleet need?", NEED_CAPTION)
-if plan.installs > 1:
-    st.warning(
-        INSTALLS_NOTE.format(
-            capacity=plan.capacity, limit=plan.limit.label, installs=plan.installs, per_install=plan.fleet[hl.CLUSTERS]
-        )
-    )
-table(hl.recommendation_rows(recommendations))
-nodes = hl.node_plan(recommendations, hl.latest_replicas(records))
-if nodes.pods and nodes.machine is not None:
-    lines = [
-        PLAN_LINE.format(
-            nodes=nodes.nodes,
-            machine=nodes.machine.name,
-            memory=hl.memory_quantity(nodes.total_memory_bytes),
-            cpu=hl.cpu_quantity(nodes.total_cpu_cores),
-        )
-    ]
-    if plan.installs > 1:
-        lines.append(
-            TOTAL_LINE.format(
-                installs=plan.installs,
-                nodes=nodes.nodes * plan.installs,
-                machine=nodes.machine.name,
-                vcpu=nodes.nodes * plan.installs * nodes.machine.vcpu,
-                memory=nodes.nodes * plan.installs * nodes.machine.memory_gib,
-            )
-        )
-    pvc = hl.predict(records, hl.PVC_USED, None, plan.fleet)
-    if pvc is not None:
-        lines.append(f"Data volume: `spec.storage.size` of at least {hl.storage_quantity(hl.with_margin(pvc.value))}.")
-    st.markdown("  \n".join(lines))
-elif nodes.pods:
-    st.error(
-        NO_MACHINE.format(
-            memory=hl.memory_quantity(nodes.largest_memory_bytes), cpu=hl.cpu_quantity(nodes.largest_cpu_cores)
-        )
-    )
-st.markdown("**Limits that resources cannot fix**")
-table(hl.unfixable_rows(hl.threshold_checks(records, plan.fleet, containers)))
-
-st.divider()
-section_title("Why: the limits as the fleet grows", WHY_CAPTION)
+st.header("Part 2: Empirical evidence")
+st.markdown(EVIDENCE_STORY.format(runs=len(records), clusters=measured))
 log_axis = st.toggle("Logarithmic axis", value=True, key=f"{KEY_PREFIX}:log_axis")
 for first_metric in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
     row = st.columns(CHART_COLUMNS)
@@ -279,26 +402,26 @@ for first_metric in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
             )
 st.caption(CURVE_NOTE)
 
-with st.expander("Measured runs"):
-    operation_column, factor_column = st.columns(2)
-    operation = operation_column.selectbox("Operation", hl.operations(records), key=f"{KEY_PREFIX}:operation:{scope}")
-    operation_factors = hl.factors(records, operation)
-    if not operation_factors:
-        st.info("This operation has base runs only.")
-    else:
-        factor = factor_column.selectbox(
-            "Factor", operation_factors, format_func=hl.factor_label, key=f"{KEY_PREFIX}:factor:{scope}:{operation}"
-        )
-        charts = hl.metric_charts(records, operation, factor, containers, fleet)
-        for first in range(0, len(charts), CHART_COLUMNS):
-            row = st.columns(CHART_COLUMNS)
-            for column, chart in zip(row, charts[first : first + CHART_COLUMNS]):
-                with column:
-                    st.markdown(f"**{chart.title}**")
-                    st.plotly_chart(
-                        harness_limit_chart(chart, colors),
-                        width="stretch",
-                        config=CHART_CONFIG,
-                        key=f"{KEY_PREFIX}:chart:{scope}:{operation}:{factor}:{chart.metric}",
-                    )
-        st.caption(CHART_CAPTION)
+st.subheader("Every metric, run by run")
+operation_column, factor_column = st.columns(2)
+operation = operation_column.selectbox("Operation", hl.operations(records), key=f"{KEY_PREFIX}:operation:{scope}")
+operation_factors = hl.factors(records, operation)
+if not operation_factors:
+    st.info("This operation has base runs only.")
+else:
+    factor = factor_column.selectbox(
+        "Factor", operation_factors, format_func=hl.factor_label, key=f"{KEY_PREFIX}:factor:{scope}:{operation}"
+    )
+    charts = hl.metric_charts(records, operation, factor, containers, fleet)
+    for first_chart in range(0, len(charts), CHART_COLUMNS):
+        row = st.columns(CHART_COLUMNS)
+        for column, chart in zip(row, charts[first_chart : first_chart + CHART_COLUMNS]):
+            with column:
+                st.markdown(f"**{chart.title}**")
+                st.plotly_chart(
+                    harness_limit_chart(chart, colors),
+                    width="stretch",
+                    config=CHART_CONFIG,
+                    key=f"{KEY_PREFIX}:chart:{scope}:{operation}:{factor}:{chart.metric}",
+                )
+    st.caption(CHART_CAPTION)

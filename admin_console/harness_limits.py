@@ -196,6 +196,7 @@ INTERPOLATED_LABEL = "within the measured range"
 MEASURED_LABEL = "measured at the base point"
 BASE_VALUE_LABEL = "base value"
 NO_VALUE = "—"
+NO_LIMIT_TEXT = "no limit"
 LIMIT_LABEL = "{container} limit"
 PVC_CAPACITY_LABEL = "PVC capacity {capacity}"
 # The columns of the editable limits table.
@@ -409,9 +410,20 @@ AGENT_CONTAINER = "platform-agent"
 FIXED_LIMIT_CONTAINERS = (SHELL_CONTAINER,)
 # The containers whose limits a fleet's size moves; the others keep their defaults in every measured fleet.
 SIZED_CONTAINERS = (AGENT_CONTAINER, "agent-api-auth", PROXY_CONTAINER, SHELL_CONTAINER)
+# The names the summary uses for the containers it sizes.
+CONTAINER_NAMES = MappingProxyType(
+    {
+        AGENT_CONTAINER: "Agent",
+        "agent-api-auth": "Event watcher",
+        PROXY_CONTAINER: "Credential proxy",
+        SHELL_CONTAINER: "Sandbox shell",
+    }
+)
 MINUTES_PER_DAY = 1440.0
 # The fleet choice that starts every input at the measured base instead of an example fleet.
 CUSTOM_PROFILE = "Custom: the measured base"
+# The basis of a recommendation read from measured runs rather than a fitted line.
+MEASURED_BASIS = "measured"
 # The checks the bottleneck chart draws, in the order a growing fleet reaches them.
 BOTTLENECK_CHECKS = (
     (CPU_PEAK, PROXY_CONTAINER),
@@ -425,10 +437,41 @@ BOTTLENECK_CHECKS = (
 LIMIT_REACHED = 1.0
 # Where the container limits table starts: the install's defaults, what Autopilot without bursting
 # gives (each request becomes the limit), or the recommended limits for this fleet.
-LIMITS_DEFAULT = "Defaults of a Standard install"
-LIMITS_AUTOPILOT = "GKE Autopilot without bursting (limits equal the requests)"
-LIMITS_RECOMMENDED = "Recommended for this fleet (question 2)"
-LIMIT_PRESETS = (LIMITS_DEFAULT, LIMITS_AUTOPILOT, LIMITS_RECOMMENDED)
+# Container sizes, smallest first. S is what GKE Autopilot without bursting gives (each request
+# becomes the limit), M the defaults of a Standard install, L a raised size a large fleet uses. XL
+# is the most a container can practically get on GKE Standard: a Pod has to fit on one node, and
+# one n2-standard-128 node has about 127 CPU and 495 GiB allocatable; 120 CPU and 480 GiB leave
+# room for the node's DaemonSets. The sandbox shell keeps the operator's fixed 2 CPU and 2 GiB in
+# every size unless the page assumes an operator change that makes it settable.
+LIMITS_S = "S: GKE Autopilot without bursting (limits equal the requests)"
+LIMITS_M = "M: defaults of a Standard install"
+LIMITS_L = "L: agent 8 CPU / 16 GiB, credential proxy 8 CPU / 8 GiB, event watcher 2 CPU / 4 GiB"
+LIMITS_XL = "XL: the largest practical on GKE Standard, one n2-standard-128 node per container (120 CPU / 480 GiB)"
+LIMITS_RECOMMENDED = "Recommended for this fleet"
+LIMIT_PRESETS = (LIMITS_S, LIMITS_M, LIMITS_L, LIMITS_XL, LIMITS_RECOMMENDED)
+LARGEST_CPU = 120.0
+LARGEST_MEMORY = 480 * GIB
+RAISED_LIMITS = MappingProxyType(
+    {
+        LIMITS_L: {
+            "platform-agent": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 16 * GIB},
+            "envoy-credential-proxy": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GIB},
+            "agent-api-auth": {LIMIT_CPU: 2.0, LIMIT_MEMORY: 4 * GIB},
+            SHELL_CONTAINER: {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GIB},
+        },
+        LIMITS_XL: {
+            name: {LIMIT_CPU: LARGEST_CPU, LIMIT_MEMORY: LARGEST_MEMORY}
+            for name in ("platform-agent", "envoy-credential-proxy", "agent-api-auth", SHELL_CONTAINER)
+        },
+    }
+)
+# Where the operator fixes the sandbox shell's resources, for the page to point at.
+SHELL_RESOURCES_SOURCE = "k8s-operator/internal/controller/shell_sandbox_manifests.go"
+# The operation whose triggered window measured a Stall Watch pass, and the pass's budget.
+STALL_WATCH_OPERATION = "steady_10m"
+STALL_WATCH_BUDGET_SECONDS = 1500.0
+# A run held its install when the shell stayed under this share of its fixed CPU and nothing was refused.
+HELD_SHELL_SHARE = 0.9
 # The breakdown charts: one metric each, in its own unit, one line per owner.
 BREAKDOWN_OWNERS = MappingProxyType(
     {
@@ -1731,6 +1774,125 @@ def recommended_limits(items: Iterable[Recommendation]) -> dict[str, dict[str, f
     }
 
 
+def preset_limits(
+    preset: str, records: Sequence[Record], recommendations: Iterable[Recommendation], shell_settable: bool = False
+) -> dict[str, dict[str, float]]:
+    """The container limits a size preset sets; the fixed containers keep their limits unless ``shell_settable``."""
+    defaults = usual_limits(records)
+    if preset == LIMITS_S:
+        chosen = {**defaults, **usual_requests(records)}
+    elif preset == LIMITS_RECOMMENDED:
+        chosen = {**defaults, **recommended_limits(recommendations)}
+    else:
+        chosen = {**defaults, **RAISED_LIMITS.get(preset, {})}
+    if not shell_settable:
+        for name in FIXED_LIMIT_CONTAINERS:
+            if name in defaults:
+                chosen[name] = defaults[name]
+    return chosen
+
+
+def measured_install_capacity(records: Sequence[Record]) -> float | None:
+    """The largest measured fleet at which every run held: no refusal, the shell under 90% of its fixed CPU."""
+    shell_limit = usual_limits(records).get(SHELL_CONTAINER, {}).get(LIMIT_CPU)
+    by_size: dict[float, list[Record]] = {}
+    for record in records:
+        if record.totals.get(CLUSTERS):
+            by_size.setdefault(record.totals[CLUSTERS], []).append(record)
+    held = [
+        size
+        for size, runs in by_size.items()
+        if all(
+            not (run.value(PROXY_REFUSALS) or 0.0)
+            and not (run.value(RUN_SLOT_REFUSALS) or 0.0)
+            and (shell_limit is None or (run.value(CPU_PEAK, SHELL_CONTAINER) or 0.0) < HELD_SHELL_SHARE * shell_limit)
+            for run in runs
+        )
+    ]
+    return max(held) if held else None
+
+
+def stall_watch_seconds_per_cluster(records: Iterable[Record]) -> float | None:
+    """The median Stall Watch pass time per cluster, from the windows that started one and saw it finish."""
+    rates = sorted(
+        seconds / record.totals[CLUSTERS]
+        for record in records
+        if record.operation == STALL_WATCH_OPERATION
+        and record.totals.get(CLUSTERS)
+        and (seconds := record.value(JOB_SECONDS)) is not None
+    )
+    return rates[len(rates) // 2] if rates else None
+
+
+@dataclass(frozen=True)
+class SizeNeed:
+    """What one sized container needs for a fleet, against the limit it has now."""
+
+    container: str
+    name: str
+    memory_bytes: float | None
+    cpu_cores: float | None
+    current: dict[str, float]
+
+    @property
+    def enough(self) -> bool:
+        memory = self.current.get(LIMIT_MEMORY) or math.inf
+        cpu = self.current.get(LIMIT_CPU) or math.inf
+        return (self.memory_bytes or 0.0) <= memory and (self.cpu_cores or 0.0) <= cpu
+
+
+def size_needs(
+    recommendations: Iterable[Recommendation], limits: Mapping[str, Mapping[str, float]]
+) -> list[SizeNeed]:
+    """The containers a fleet's size moves, each with its recommended size and its current limit."""
+    by_name = {item.container: item for item in recommendations}
+    return [
+        SizeNeed(name, CONTAINER_NAMES.get(name, name), by_name[name].memory_bytes, by_name[name].cpu_cores,
+                 dict(limits.get(name, {})))
+        for name in SIZED_CONTAINERS
+        if name in by_name
+    ]
+
+
+def measured_recommendations(
+    records: Sequence[Record], fleet: Mapping[str, float], containers: Sequence[str]
+) -> tuple[list[Recommendation], float | None]:
+    """Recommendations from the runs at the smallest measured fleet that is at least this one.
+
+    A container's peak there, from runs whose peak is neither left out of its fit nor held at
+    its limit, stands for its need; a container no such run measured keeps the model's line.
+    Returns the recommendations and the measured fleet size they come from, or None when the
+    fleet is past every measured size and the model's lines stand alone.
+    """
+    sizes = sorted({record.totals[CLUSTERS] for record in records if record.totals.get(CLUSTERS)})
+    at = next((size for size in sizes if size >= fleet[CLUSTERS]), None)
+    model = recommendations(records, fleet, containers)
+    if at is None:
+        return model, None
+    runs = [record for record in records if record.totals.get(CLUSTERS) == at]
+
+    def peak(metric: str, container: str) -> float | None:
+        values = [
+            value
+            for run in runs
+            if not run.excluded(metric) and not capped(run, metric, container)
+            and (value := run.value(metric, container)) is not None
+        ]
+        return max(values) if values else None
+
+    chosen = []
+    for item in model:
+        memory, cpu = peak(MEMORY_PEAK, item.container), peak(CPU_PEAK, item.container)
+        chosen.append(
+            Recommendation(
+                item.container,
+                Prediction(MEMORY_PEAK, item.container, memory, MEASURED_BASIS, ()) if memory is not None else item.memory,
+                Prediction(CPU_PEAK, item.container, cpu, MEASURED_BASIS, ()) if cpu is not None else item.cpu,
+            )
+        )
+    return chosen, at
+
+
 def measured_clusters(records: Iterable[Record]) -> float:
     """The largest fleet a run measured."""
     return max((record.totals.get(CLUSTERS, 0.0) for record in records), default=0.0)
@@ -2146,6 +2308,22 @@ def nodes_needed(machine: MachineType, memory_bytes: float, cpu_cores: float) ->
     by_memory = math.ceil(memory_bytes / machine.allocatable_memory_bytes - EPSILON)
     by_cpu = math.ceil(cpu_cores / machine.allocatable_cpu - EPSILON)
     return max(1, by_memory, by_cpu)
+
+
+def memory_text(value_bytes: float | None) -> str:
+    """Memory as a reader says it: "4 GiB", "512 MiB"; no limit when there is none."""
+    if not value_bytes:
+        return NO_LIMIT_TEXT
+    if value_bytes >= GIB:
+        return f"{math.ceil(value_bytes / GIB * 2) / 2:g} GiB"
+    return f"{math.ceil(value_bytes / MIB):,.0f} MiB"
+
+
+def cpu_cores_text(cores: float | None) -> str:
+    """CPU as a reader says it, rounded up to a tenth: "3.2"; no limit when there is none."""
+    if not cores:
+        return NO_LIMIT_TEXT
+    return f"{math.ceil(cores * 10) / 10:g}"
 
 
 def memory_quantity(value_bytes: float) -> str:

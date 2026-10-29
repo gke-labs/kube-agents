@@ -1059,9 +1059,10 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertFalse(any("Connect a project" in item.value for item in app.info))
         # The benchmark size is the default fleet, and both questions are answered for it.
         self.assertEqual(app.selectbox(key="harness_limits:profile").value, hl.FLEET_PROFILES[-1].label)
-        headings = " ".join(str(item.value) for item in app.subheader)
-        self.assertIn("1. Are these container limits enough for this fleet?", headings)
-        self.assertIn("2. What node size and container limits does this fleet need?", headings)
+        parts = " ".join(str(item.value) for item in app.header)
+        self.assertIn("Part 1: Limits forecast", parts)
+        self.assertIn("Part 2: Empirical evidence", parts)
+        self.assertIn("Can this fleet be handled?", " ".join(str(item.value) for item in app.subheader))
         self.assertNotIn("Raw records", [item.label for item in app.expander])
 
     def test_the_custom_fleet_starts_at_the_measured_base(self):
@@ -1071,13 +1072,15 @@ class HarnessLimitsPageTest(unittest.TestCase):
 
         self.assertEqual(failing.value, 1.0)
         self.assertNotIn("minute", failing.help)
-        self.assertTrue(any("Every limit holds" in item.value for item in app.success))
+        verdicts = [item.value for item in [*app.success, *app.error]]
+        self.assertTrue(any("Container limits" in text for text in verdicts))
+        self.assertTrue(any("Fixed limits" in text for text in verdicts))
 
     def test_the_benchmark_fleet_is_split_into_installs(self):
         app = self.open_page()
 
-        self.assertTrue(any("installs" in item.value for item in app.warning))
-        self.assertTrue(any("limits fail" in item.value for item in app.error))
+        self.assertTrue(any("one install cannot hold this fleet" in item.value for item in app.error))
+        self.assertTrue(any("Split into" in str(item.value) for item in app.markdown))
 
     def test_the_page_names_no_project_or_cluster(self):
         app = self.open_page()
@@ -1111,7 +1114,7 @@ class HarnessLimitsPageTest(unittest.TestCase):
         app = app.run()
 
         self.assertEqual(len(app.exception), 0, [item.value for item in app.exception])
-        self.assertTrue(any("limits fail" in item.value for item in app.error))
+        self.assertTrue(any("Container limits: not enough" in item.value for item in app.error))
 
 
 class LevelCountTest(unittest.TestCase):

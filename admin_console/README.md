@@ -206,19 +206,23 @@ connection. Until that file exists, the page shows
 sample. The plan, metrics and thresholds are those of the
 [harness bottlenecks design](../docs/designs/agent-harness-bottlenecks.md).
 
-The page starts from a fleet: one of four example fleets, S (4 clusters), M (45), L (250) and
-XL (2,500, the benchmark size), built from customer fleets with rounded figures and no names,
-then any input changed. The container limits come next, in an editable table that starts from
-the defaults of a Standard install, what GKE Autopilot without bursting gives each container
-(its request becomes its limit), or the limits question 2 recommends for the fleet. Question 1
-checks each container's predicted peak against those limits and the limits no resource moves;
-its chart shows each key limit as a share of its limit as the fleet grows, marks where each
-line reaches it, and names the first limit reached, or none. Question 2 gives a limit per
-container with its `PlatformAgent` field, the node pool, the data volume, and how many installs
-the fleet needs: one install holds clusters up to the first limit that no setting raises, such
-as the sandbox shell's fixed CPU. The last section takes no input from the page: memory, CPU,
-the credential proxy's longest wait and the response time in their own units, every measured
-run against the default limits, for clusters shaped like the measured base.
+The page has two parts. **Part 1, Limits forecast**, starts from a fleet size and a container
+size, each picked as a T-shirt size. The fleet sizes are S (4 clusters), M (45), L (250) and XL
+(2,500, the benchmark size), built from customer fleets with rounded figures and no names. The
+container sizes are S (what GKE Autopilot without bursting gives: each request becomes the limit),
+M (the defaults of a Standard install), L (raised for a large fleet) and XL (the most a container
+can practically get on GKE Standard, one n2-standard-128 node: 120 CPU and 480 GiB), or the sizes
+recommended for the fleet; both can be fine-tuned. Two verdicts follow, green or red: whether the
+container limits hold the fleet in one install, and whether the limits no setting raises do (the
+sandbox shell's CPU, which the operator fixes at 2 cores, the credential proxy's 8 command slots,
+the 10 run slots, and Stall Watch reading one cluster at a time). When one install cannot hold the
+fleet, the page gives how many installs it needs, from the largest measured fleet that held, and
+lists what each install needs: the containers' sizes, the node pool and the data volume. A chart
+shows each key limit as a share of the chosen limit as the fleet grows and marks where each is
+reached. An option assumes an operator change that lets the shell be sized too. **Part 2,
+Empirical evidence**, takes no input: memory, CPU, the credential proxy's longest wait and the
+response time in their own units, every measured run against the default limits, then each
+metric run by run.
 
 The collapsed **Measured runs** section plots each metric against one factor, one operation
 at a time. A factor sits at its measured value from the run's totals, per cluster for nodes
