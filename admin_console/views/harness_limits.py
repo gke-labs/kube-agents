@@ -258,7 +258,7 @@ needs = hl.size_needs(recommendations, limits)
 short = [
     f"{need.name} {resource}"
     for need in needs
-    if need.container not in hl.FIXED_LIMIT_CONTAINERS or shell_settable
+    if need.container not in hl.FIXED_LIMIT_CONTAINERS or shell_settable or preset == hl.LIMITS_S
     for resource in need.short
 ]
 size_name = "recommended" if preset == hl.LIMITS_RECOMMENDED else preset.split(":", 1)[0]
@@ -296,12 +296,18 @@ for need in needs:
         fixed = need.current
         peak_cpu = (need.cpu_cores or 0.0) / (1 + hl.SAFETY_MARGIN)
         fixed_cpu = fixed.get(hl.LIMIT_CPU) or 0.0
-        state = "within it" if not fixed_cpu or peak_cpu <= fixed_cpu else "past it, so commands slow down"
-        bullets.append(
-            f"- **{need.name}:** peaks at about {hl.cpu_cores_text(peak_cpu)} CPU of its fixed "
-            f"{hl.cpu_cores_text(fixed_cpu)} CPU, {hl.memory_text(fixed.get(hl.LIMIT_MEMORY))}, which no setting "
-            f"raises ({state})."
-        )
+        state = "within it" if not fixed_cpu or peak_cpu <= fixed_cpu else "past it, so every brokered command slows down"
+        given = f"{hl.cpu_cores_text(fixed_cpu)} CPU, {hl.memory_text(fixed.get(hl.LIMIT_MEMORY))}"
+        if preset == hl.LIMITS_S:
+            bullets.append(
+                f"- **{need.name}:** peaks at about {hl.cpu_cores_text(peak_cpu)} CPU; Autopilot without bursting "
+                f"gives it only its request, {given} ({state})."
+            )
+        else:
+            bullets.append(
+                f"- **{need.name}:** peaks at about {hl.cpu_cores_text(peak_cpu)} CPU of its fixed {given}, "
+                f"which no setting raises ({state})."
+            )
     elif need.enough:
         bullets.append(f"- **{need.name}:** needs about {size}; the chosen container size is enough.")
     else:

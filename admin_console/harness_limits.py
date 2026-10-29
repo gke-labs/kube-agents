@@ -1789,7 +1789,9 @@ def preset_limits(
         chosen = {**defaults, **recommended_limits(recommendations)}
     else:
         chosen = {**defaults, **RAISED_LIMITS.get(preset, {})}
-    if not shell_settable:
+    # GKE Autopilot without bursting gives every container its request, the operator's fixed ones
+    # included; on Standard a fixed container keeps the operator's limit unless it is assumed settable.
+    if not shell_settable and preset != LIMITS_S:
         for name in FIXED_LIMIT_CONTAINERS:
             if name in defaults:
                 chosen[name] = defaults[name]
