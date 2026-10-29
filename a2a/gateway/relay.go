@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -1005,8 +1006,8 @@ func (g *Gateway) retireTaskRoute(ctx context.Context, taskID string) {
 func withRetry(n int, f func() error) error {
 	var err error
 	for i := 0; i < n; i++ {
-		if err = f(); err == nil {
-			return nil
+		if err = f(); err == nil || errors.Is(err, ErrFenced) {
+			return err
 		}
 		time.Sleep(time.Duration(i+1) * kvRetryPause)
 	}
