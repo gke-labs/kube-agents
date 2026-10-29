@@ -65,7 +65,7 @@ first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py));
-`after=done`, bounded by `wait=<seconds>`, stops it once every filed card has ended instead. It
+`cards=done`, bounded by `wait=<seconds>`, stops it once every filed card has ended instead. It
 runs only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. The harness writes three entries for such a case,
 `harness_stop_sent`, `harness_cards_stopped` and `harness_stop_reply` (the gateway's answer to

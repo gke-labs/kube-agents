@@ -30,7 +30,7 @@ The directive line may carry ``observe=<seconds>`` after it; the default is
 :data:`DEFAULT_OBSERVE_SECONDS`. A case writes its prompt as a YAML literal
 block (``|-``), since a folded one joins the directive to the ask.
 
-``after=done`` moves the stop later: the harness waits off the board until
+``cards=done`` moves the stop later: the harness waits off the board until
 every card the turn filed is terminal, for at most ``wait=<seconds>``
 (:data:`DEFAULT_WAIT_SECONDS`), and stops then, so a case can grade what a
 stop says about work that already landed. Whichever way the stop goes, the
@@ -70,8 +70,8 @@ STOPPED_STATUS = "archived"
 STOP_REPLY_ENTRY = "harness_stop_reply"
 #: The optional field that moves the stop to after the filed cards ended, and
 #: its one value.
-AFTER_FIELD = "after="
-AFTER_DONE = "done"
+CARDS_FIELD = "cards="
+CARDS_DONE = "done"
 #: The optional field bounding that wait, in seconds, and its default and cap.
 WAIT_FIELD = "wait="
 DEFAULT_WAIT_SECONDS = 1800.0
@@ -85,7 +85,7 @@ class Stop:
     prompt: str
     observe_seconds: float
     #: Stop once every filed card is terminal rather than at once.
-    after_done: bool = False
+    cards_done: bool = False
     #: The longest wait for that, in seconds.
     wait_seconds: float = DEFAULT_WAIT_SECONDS
 
@@ -104,8 +104,8 @@ def parse(prompt: str) -> Stop | None:
 
     Raises:
         ValueError: The directive carries something other than at most one
-            each of ``observe=<seconds>``, ``after=done`` and ``wait=<seconds>``,
-            within bounds, or ``wait=`` without ``after=done``, or no ask
+            each of ``observe=<seconds>``, ``cards=done`` and ``wait=<seconds>``,
+            within bounds, or ``wait=`` without ``cards=done``, or no ask
             follows it.
     """
     if not is_stopped_ask(prompt):
@@ -116,27 +116,27 @@ def parse(prompt: str) -> Stop | None:
         raise ValueError(f"{STOP_DIRECTIVE} must stand alone, then a space before {OBSERVE_FIELD}<seconds>; got {words[0]}")
     fields: dict[str, str] = {}
     for word in words[1:]:
-        name = next((f for f in (OBSERVE_FIELD, AFTER_FIELD, WAIT_FIELD) if word.startswith(f)), None)
+        name = next((f for f in (OBSERVE_FIELD, CARDS_FIELD, WAIT_FIELD) if word.startswith(f)), None)
         if name is None or name in fields:
             raise ValueError(
                 f"{STOP_DIRECTIVE} takes at most one each of {OBSERVE_FIELD}<seconds>, "
-                f"{AFTER_FIELD}{AFTER_DONE} and {WAIT_FIELD}<seconds>, got {words[1:]}"
+                f"{CARDS_FIELD}{CARDS_DONE} and {WAIT_FIELD}<seconds>, got {words[1:]}"
             )
         fields[name] = word[len(name) :]
-    observe = _seconds(fields, OBSERVE_FIELD, DEFAULT_OBSERVE_SECONDS, MAX_OBSERVE_SECONDS)
-    after = fields.get(AFTER_FIELD)
-    if after is not None and after != AFTER_DONE:
-        raise ValueError(f"{STOP_DIRECTIVE}: {AFTER_FIELD} takes only {AFTER_DONE}, got {after}")
+    observe = _directive_seconds(fields, OBSERVE_FIELD, DEFAULT_OBSERVE_SECONDS, MAX_OBSERVE_SECONDS)
+    after = fields.get(CARDS_FIELD)
+    if after is not None and after != CARDS_DONE:
+        raise ValueError(f"{STOP_DIRECTIVE}: {CARDS_FIELD} takes only {CARDS_DONE}, got {after}")
     if WAIT_FIELD in fields and after is None:
-        raise ValueError(f"{STOP_DIRECTIVE}: {WAIT_FIELD} bounds {AFTER_FIELD}{AFTER_DONE}, which is missing")
-    wait = _seconds(fields, WAIT_FIELD, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS)
+        raise ValueError(f"{STOP_DIRECTIVE}: {WAIT_FIELD} bounds {CARDS_FIELD}{CARDS_DONE}, which is missing")
+    wait = _directive_seconds(fields, WAIT_FIELD, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS)
     ask = rest.strip()
     if not ask:
         raise ValueError(f"{STOP_DIRECTIVE} needs the ask on the lines after it")
-    return Stop(prompt=ask, observe_seconds=observe, after_done=after is not None, wait_seconds=wait)
+    return Stop(prompt=ask, observe_seconds=observe, cards_done=after is not None, wait_seconds=wait)
 
 
-def _seconds(fields: dict[str, str], name: str, default: float, cap: float) -> float:
+def _directive_seconds(fields: dict[str, str], name: str, default: float, cap: float) -> float:
     """The directive field ``name`` as seconds above 0 and at most ``cap``, or ``default``."""
     if name not in fields:
         return default

@@ -2841,11 +2841,11 @@ class KubeAgentsHarness(AgentHarness):
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)
 
-        # 0. With after=done, the stop waits until every card the turn filed
+        # 0. With cards=done, the stop waits until every card the turn filed
         # has ended, or the wait's bound: what it says about work already
         # landed is what such a case grades. A read that fails is waited
         # through; the reads after the stop decide.
-        if stop.after_done and session_id:
+        if stop.cards_done and session_id:
             wait_until = time.monotonic() + stop.wait_seconds
             while True:
                 got = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
