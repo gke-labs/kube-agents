@@ -46,6 +46,8 @@ To rotate the token, write a new value into the Secret. The server reads the mou
 
 A message sent through `send_message` reaches the A2A gateway through its console door, the same path the A2A console's chat pane takes, so the Planning Agent answers it or files kanban cards as for any chat message ([Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next)). Everything `inspect_pr` returns that a pull request's authors wrote is shown as data: fenced, capped on line boundaries with a count of what was cut, and introduced by a line saying it is the authors' content.
 
+The server also serves the workstation bridge's swarm view at `POST /mcp/swarm`, behind the same `Origin` refusal and bearer token. The bridge posts its conversation table and gets back the members and board posts it shows in its host's Swarm UI. The README describes what it reads and its limits.
+
 ## Conversations
 
 Every turn tool names its conversation. `conversation` is a name, `default` when omitted, and turns with the same name continue the same conversation. `conversation_token` is the token an earlier answer reported, as `<token>` or `console:<token>`, and continues that conversation whether or not the server still holds a name for it. There is no server-wide active conversation.
