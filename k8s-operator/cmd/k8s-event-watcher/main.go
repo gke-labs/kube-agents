@@ -138,6 +138,7 @@ type flags struct {
 	logLevel         string
 	dryRun           bool
 	metricsAddr      string
+	dataVolume       string
 	snapshotInterval time.Duration
 	gatewayURL       string
 	gatewayWait      time.Duration
@@ -184,6 +185,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.logLevel, "log-level", "info", "One of: debug, info, warn, error.")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "Print inject payloads to stdout without calling the daemon.")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "Prometheus /metrics + /healthz listener address (host:port). Empty = disabled.")
+	fs.StringVar(&f.dataVolume, "data-volume", "", "Path on the agent's data volume (normally /opt/data). When set, /metrics also exports the volume's size and free space, read at each scrape. Empty = not exported.")
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
 	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
 	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
@@ -1116,6 +1118,9 @@ func realMain(argv []string) error {
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()
+	if f.dataVolume != "" {
+		m.registry.MustRegister(newDataVolumeCollector(f.dataVolume, dataVolumeStatfs))
+	}
 
 	var inj *injector
 	if !f.dryRun {

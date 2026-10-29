@@ -204,8 +204,10 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `deploymentStatus.readyReplicas` | `integer` | no |  |  | ReadyReplicas indicates how many replicas are fully ready. |
 | `serviceStatus` | `object` | no |  |  | ServiceStatus holds internal/external endpoints. |
 | `serviceStatus.endpoint` | `string` | no |  |  | Endpoint is the primary URL or IP (including protocol and port) to reach the agent. |
-| `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state. |
+| `storageStatus` | `object` | no |  |  | StorageStatus tracks PVC binding state and the data volume's usage. |
 | `storageStatus.bound` | `boolean` | no |  |  | Bound indicates if the primary PVC has been successfully provisioned. |
+| `storageStatus.capacityBytes` | `integer` | no |  |  | CapacityBytes is the size of the filesystem on the agent's data volume, as the gateway pod's event watcher last read it. Absent when the watcher is disabled or the operator has no current reading from it. |
+| `storageStatus.freeBytes` | `integer` | no |  |  | FreeBytes is the space left on the agent's data volume for the agent's own non-root user, read with CapacityBytes. The DataVolumeNearlyFull condition is computed from the two. |
 | `telemetry` | `object` | no |  |  | Telemetry reports the resolved OpenTelemetry export configuration. |
 | `telemetry.otlpEndpoint` | `string` | no |  |  | OTLPEndpoint is the collector endpoint written into the agent pod. Empty when the source is None, which is the one case where the pod is given no endpoint at all. |
 | `telemetry.otlpEndpointSource` | `string` | no |  |  | OTLPEndpointSource is how the endpoint was chosen: DeploymentEnv, Spec, OperatorEnv, Discovered, Default, or None. None means discovery completed and this cluster has no collector, so the agent runs with OTEL_SDK_DISABLED=true and exports nothing; Default still means the GKE managed collector, and is what an install gets when discovery is switched off or could not complete. |
