@@ -163,3 +163,57 @@ func consumerInfo(t *testing.T, h *heldHarness) *jetstream.ConsumerInfo {
 	}
 	return info
 }
+
+// Deliveries that reach the client while a stop is draining are held for the
+// give-back, not nak'd ahead of it, so the next subscriber gets every
+// delivery back in stream order: the one the handler had and the ones still
+// buffered behind it.
+func TestDeferredDeliveriesArrivingDuringTheDrainComeBackInOrder(t *testing.T) {
+	h, first := newHeldHarness(t, "relay")
+	release := make(chan struct{})
+	var c1 deferredCollector
+	sub1, err := first.SubscribeDurableDeferred(h.ctx, h.cfg(), func(d DeferredDelivery) {
+		c1.add(d)
+		if d.Envelope().TaskID == "t1" {
+			<-release // the next deliveries wait in the client's buffer
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"t1", "t2", "t3"} {
+		h.submit(id)
+	}
+	waitUntil(t, "the first delivery in the handler", 5*time.Second, func() bool { return len(c1.snapshot()) == 1 })
+	stopped := make(chan struct{})
+	go func() { sub1.Stop(); close(stopped) }()
+	time.Sleep(200 * time.Millisecond) // the stop is draining, behind the handler
+	close(release)
+	<-stopped
+
+	second, err := Connect(h.ctx, h.url, WithName("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(second.Close)
+	var c2 deferredCollector
+	sub2, err := second.SubscribeDurableDeferred(h.ctx, h.cfg(), c2.add)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sub2.Stop)
+	waitUntil(t, "all three back on the second subscriber", 5*time.Second, func() bool { return len(c2.snapshot()) == 3 })
+	for i, want := range []string{"t1", "t2", "t3"} {
+		if got := c2.snapshot()[i].Envelope().TaskID; got != want {
+			t.Fatalf("redelivery %d is %s, want %s: the order went %v", i, got, want, taskIDs(c2.snapshot()))
+		}
+	}
+}
+
+func taskIDs(ds []DeferredDelivery) []string {
+	out := make([]string, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, d.Envelope().TaskID)
+	}
+	return out
+}

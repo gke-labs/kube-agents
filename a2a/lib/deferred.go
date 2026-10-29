@@ -66,10 +66,11 @@ type deferredState struct {
 	c       *Client
 	handler func(DeferredDelivery)
 
-	mu      sync.Mutex
-	ackWait time.Duration // the durable's, read at each bind
-	closed  bool          // stopped: late deliveries are given back
-	pending map[*deferredDelivery]struct{}
+	mu        sync.Mutex
+	ackWait   time.Duration // the durable's, read at each bind
+	closed    bool          // stopping: deliveries are held for the give-back, not handled
+	givenBack bool          // the give-back ran: a later delivery goes straight back
+	pending   map[*deferredDelivery]struct{}
 }
 
 // bound records the AckWait the heartbeat paces from.
@@ -99,10 +100,18 @@ func (d *deferredState) dispatch(msg jetstream.Msg, env *Envelope) {
 	// reads stopBeat when it settles it.
 	dd.stopBeat = dd.heartbeat(d.beat)
 	d.mu.Lock()
-	if d.closed {
+	switch {
+	case d.givenBack:
 		d.mu.Unlock()
 		dd.stopBeat()
 		_ = msg.Nak()
+		return
+	case d.closed:
+		// Stopping, and draining: held for the give-back, which returns
+		// every pending delivery in stream order. Nak'd here, it would be
+		// redelivered ahead of older ones still pending.
+		d.pending[dd] = struct{}{}
+		d.mu.Unlock()
 		return
 	}
 	d.pending[dd] = struct{}{}
@@ -121,6 +130,7 @@ func (d *deferredState) close() {
 func (d *deferredState) giveBack() {
 	d.mu.Lock()
 	d.closed = true
+	d.givenBack = true
 	pending := make([]*deferredDelivery, 0, len(d.pending))
 	for dd := range d.pending {
 		pending = append(pending, dd)
@@ -133,6 +143,9 @@ func (d *deferredState) giveBack() {
 	sort.Slice(pending, func(i, j int) bool { return pending[i].seq < pending[j].seq })
 	for i, dd := range pending {
 		_ = dd.Nak(time.Duration(i+1) * giveBackSpacing)
+		// Given back or not (a nak with no connection fails), nothing renews
+		// it after a stop: the server redelivers it within AckWait anyway.
+		dd.release()
 	}
 }
 
@@ -156,11 +169,16 @@ func (dd *deferredDelivery) settled(err error) error {
 	if err != nil {
 		return err
 	}
+	dd.release()
+	return nil
+}
+
+// release stops the delivery's heartbeat and tracking.
+func (dd *deferredDelivery) release() {
 	if dd.stopBeat != nil {
 		dd.stopBeat()
 	}
 	dd.state.mu.Lock()
 	delete(dd.state.pending, dd)
 	dd.state.mu.Unlock()
-	return nil
 }

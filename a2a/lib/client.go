@@ -550,6 +550,11 @@ type SubscribeConfig struct {
 	// Agreement overrides the client's envelope-subject agreement policy for
 	// this consumer. nil uses the client's.
 	Agreement *AgreementPolicy
+	// MaxAckPending caps the durable's unacknowledged deliveries; zero
+	// leaves the server's default (1000). A deferred-mode subscriber holds
+	// each delivery until it settles it, so the cap bounds how much it can
+	// hold before the server stops delivering to every holder.
+	MaxAckPending int
 }
 
 // filterSubjects is the consumer's filter set, however it was spelled.
@@ -697,8 +702,9 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 		return s.consume(cons)
 	}
 	consCfg := jetstream.ConsumerConfig{
-		Durable:   s.cfg.Durable,
-		AckPolicy: jetstream.AckExplicitPolicy,
+		Durable:       s.cfg.Durable,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: s.cfg.MaxAckPending,
 	}
 	if filters := s.cfg.filterSubjects(); len(filters) == 1 {
 		consCfg.FilterSubject = filters[0]

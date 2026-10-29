@@ -1028,7 +1028,10 @@ Envelope:
    (Amended 10/21: on the library's auto-ack subscriptions. A held subscription, whose
    handler holds each delivery for the task's life (a profile's intake, #3655), expects
    redelivery and leaves it to the caller, which recognises it by task id: a task that had
-   already started is failed, never re-run.)
+   already started is failed, never re-run. Amended 10/28: a deferred-ack subscription,
+   whose caller settles each delivery once the work it starts is done (the gateway's event
+   relay), expects redelivery too, after a stop gives back what it hadn't settled, and its
+   caller recognises a redelivery by stream sequence.)
 
 Payloads:
 

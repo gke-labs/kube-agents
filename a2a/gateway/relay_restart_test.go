@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -152,6 +153,7 @@ func (f *fakeDelivery) Term() error             { return nil }
 // gateway's in-memory relay state is empty, and the task is still live.
 func TestTheRelayRendersADeliveryItAlreadyRenderedOnce(t *testing.T) {
 	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
 	conv := "discord:g1/t-redelivered"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-red", Text: "how is the fleet?"}
 	origin := r.awaitTask(t, targetPlatform)
@@ -173,11 +175,135 @@ func TestTheRelayRendersADeliveryItAlreadyRenderedOnce(t *testing.T) {
 	}
 
 	r2, _ := restartRig(t, r)
+	waitRunning(t, r2)
 	r2.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
 	if n := postsContaining(r2, question); n != 0 {
 		t.Fatalf("the redelivered question was posted again on the next gateway (%d times)", n)
 	}
 	if d.acks != 2 {
 		t.Fatalf("acked %d times, want both deliveries acked", d.acks)
+	}
+}
+
+// holdingAdapter blocks the first post or edit carrying needle until release
+// closes, as a slow door would, and signals entered when it starts holding.
+type holdingAdapter struct {
+	*fakeAdapter
+	needle  string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (h *holdingAdapter) hold(text string) {
+	if strings.Contains(text, h.needle) {
+		h.once.Do(func() { close(h.entered) })
+		<-h.release
+	}
+}
+
+func (h *holdingAdapter) Post(conversation, text string) (string, error) {
+	h.hold(text)
+	return h.fakeAdapter.Post(conversation, text)
+}
+
+func (h *holdingAdapter) Edit(conversation, messageID, text string) error {
+	h.hold(text)
+	return h.fakeAdapter.Edit(conversation, messageID, text)
+}
+
+func (h *holdingAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	h.hold(m.Text)
+	return h.fakeAdapter.PostMessage(conversation, m)
+}
+
+func (h *holdingAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	h.hold(m.Text)
+	return h.fakeAdapter.EditMessage(conversation, messageID, m)
+}
+
+// TestABatchRenderingWhenTheGatewayStopsIsPostedOnce: a gateway stopped while
+// a batch is mid-render (its door slow on the answer) finishes that batch,
+// writes its record and acks it before it gives the rest back, so the next
+// gateway doesn't post the answer again.
+func TestABatchRenderingWhenTheGatewayStopsIsPostedOnce(t *testing.T) {
+	const answer = "slow door answer 77"
+	h := &holdingAdapter{needle: answer, entered: make(chan struct{}), release: make(chan struct{})}
+	r, _ := startRigWithSpawnerAdapter(t, "platform", defaultMaxSessions, nil, func(a *fakeAdapter) Adapter {
+		h.fakeAdapter = a
+		return h
+	})
+	waitRunning(t, r)
+	conv := "discord:g1/t-slow-door"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-slow", Text: "how is the fleet?"}
+	origin := r.awaitTask(t, targetPlatform)
+	completeTask(t, r.execFor(t, origin, targetPlatform), answer)
+	select {
+	case <-h.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the answer never reached the door")
+	}
+
+	// Stop while the post is held; release it once the stop is under way.
+	r.stop()
+	time.Sleep(300 * time.Millisecond)
+	close(h.release)
+	select {
+	case <-r.ran:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the first gateway did not stop")
+	}
+	if n := postsContaining(r, answer); n != 1 {
+		t.Fatalf("the stopping gateway posted the answer %d times, want once", n)
+	}
+
+	r2, _ := restartRig(t, r)
+	waitRunning(t, r2)
+	// The stopping gateway wrote the batch's record, sequences and all,
+	// though its run context was done: a crash after that write is covered.
+	rec, err := r2.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v %v", rec, err)
+	}
+	if ref, ok := rec.TaskRefFor(origin.TaskID); !ok || len(ref.RelayedSeqs) < 2 {
+		t.Fatalf("the stopping gateway didn't write the batch's record: %+v", ref)
+	}
+	time.Sleep(2 * time.Second)
+	if n := postsContaining(r2, answer); n != 0 {
+		t.Fatalf("the next gateway posted the answer again (%d times)", n)
+	}
+	if n := relayAckPending(t, r.url, r.g.relayDurable); n != 0 {
+		t.Fatalf("%d deliveries still held", n)
+	}
+}
+
+// TestADuplicateInOneBatchRendersOnce: a redelivery that shares a batch with
+// its original (a hold that outlived AckWait) renders once, and both copies
+// are acked.
+func TestADuplicateInOneBatchRendersOnce(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
+	conv := "discord:g1/t-dup-batch"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-dup", Text: "how is the fleet?"}
+	origin := r.awaitTask(t, targetPlatform)
+	const question = "which cluster, the dup one?"
+	payload, err := json.Marshal(lib.StatusUpdate{Status: lib.TaskStatus{State: lib.StateInputRequired,
+		Message: &lib.Message{Role: "agent", Parts: []lib.Part{{Kind: "text", Text: question}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: targetPlatform}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := lib.TaskEventsSubject(targetPlatform, origin.TaskID)
+	original := &fakeDelivery{env: env, subj: subject, seq: 500}
+	again := &fakeDelivery{env: env, subj: subject, seq: 500}
+	r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: original}, {env: env, subject: subject, d: again}})
+	if n := postsContaining(r, question); n != 1 {
+		t.Fatalf("the question was posted %d times, want once", n)
+	}
+	if original.acks != 1 || again.acks != 1 {
+		t.Fatalf("acks: original %d, redelivery %d; want both acked", original.acks, again.acks)
 	}
 }

@@ -857,8 +857,9 @@ func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
 }
 
 // relayedSeqCap bounds TaskRef.RelayedSeqs. Only an event rendered and not
-// yet acked can come again, and those are a task's last few.
-const relayedSeqCap = 32
+// yet acked can come again, and those are a task's most recent batch's, which
+// a burst of progress events can make long.
+const relayedSeqCap = 256
 
 // relayed reports whether taskID's event at stream sequence seq was already
 // rendered. A sequence of 0 (no metadata) is never taken as rendered.

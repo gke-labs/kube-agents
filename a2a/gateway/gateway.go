@@ -166,14 +166,17 @@ func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
 
 // Gateway wires the adapter, the session manager, and the bus client.
 type Gateway struct {
-	cfg     *Config
-	client  *lib.Client
-	reg     *Registry
-	adapter Adapter
-	pm      *PrincipalMap
-	ps      *Pseudonymizer
-	log     *slog.Logger
-	spawner spawner // nil until SpawnSessions arms (W4)
+	// relayInFlight counts the relay batches rendering (relayBatch), which a
+	// stop waits for.
+	relayInFlight inFlight
+	cfg           *Config
+	client        *lib.Client
+	reg           *Registry
+	adapter       Adapter
+	pm            *PrincipalMap
+	ps            *Pseudonymizer
+	log           *slog.Logger
+	spawner       spawner // nil until SpawnSessions arms (W4)
 	// usage reads what "/feedback summary" prints (feedback_summary.go);
 	// nil where the gateway has no cluster credentials, and the command then
 	// answers that the summary is unavailable.
@@ -599,16 +602,22 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// is queued, and stopping gives every unrendered one back to the stream,
 	// so a gateway that stops with events queued loses none of them.
 	sub, err := g.client.SubscribeDurableDeferred(ctx, lib.SubscribeConfig{
-		Stream:    lib.TasksStream,
-		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
-		Durable:   g.relayDurable,
-		Session:   gatewayParty.Session,
-		Agreement: &agreement,
+		Stream:        lib.TasksStream,
+		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:       g.relayDurable,
+		Session:       gatewayParty.Session,
+		Agreement:     &agreement,
+		MaxAckPending: relayMaxAckPending,
 	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}
-	defer sub.Stop()
+	// The batches already rendering finish first, then the subscription's
+	// stop gives every event not yet rendered back to the stream.
+	defer func() {
+		g.relayInFlight.drain(relayStopDrainTimeout)
+		sub.Stop()
+	}()
 
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
