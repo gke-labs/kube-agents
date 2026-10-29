@@ -23076,6 +23076,16 @@ metadata:
                 self.assertEqual(self.disclose([finding], manifest), [])
                 self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
 
+    def test_the_copied_constants_equal_the_collectors(self):
+        """audit_report.py does not import the collectors, so it copies two of
+        kcc_health.py's constants; this holds the copies equal."""
+        import kcc_health  # noqa: PLC0415
+
+        self.assertEqual(audit_report.KCC_TRANSIENT_REASONS, kcc_health.TRANSIENT_REASONS)
+        self.assertEqual(audit_report.KCC_PROJECT_ANNOTATION, kcc_health.KCC_PROJECT_ANNOTATION)
+        self.assertEqual(audit_report.KCC_UNREADY_FIELD, kcc_health.UNREADY_FIELD)
+        self.assertEqual(audit_report.KCC_UNREAD_FIELD, kcc_health.UNREAD_FIELD)
+
     def test_a_fix_to_a_file_with_no_config_connector_object_gets_no_config_connector_text(self):
         """The finding's node pool is unready, but the fix edits a
         `ComputeClass`: the merged fix did not change a Config Connector
