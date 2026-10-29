@@ -177,6 +177,11 @@ don't use these Services and keep working.
 
 ## Later: active-active
 
+Phase 1 is the plan for now. Scaling may change that, so nothing in phase 1 makes phase 2 harder:
+state that more than one replica would share goes to KV, not into the active replica's memory, and
+new code doesn't assume it's the only instance. A per-process cache that a replica can rebuild is
+fine; state another replica would need isn't.
+
 If throughput ever needs more than one active gateway, the prerequisites are known: queue groups
 on the console and notify subjects; one relay consumer per replica over a sharded filter (by
 conversation), so a task's events stay on one replica; the dedupe rings in KV; the supervisor
