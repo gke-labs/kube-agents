@@ -842,12 +842,22 @@ class DeadlineKills(unittest.TestCase):
         other = run(3, 3, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff")], result="FAILURE")
         out = adjudicate(data(lost, other, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 2))
-        # The same record without the suite's word is the PR's own red, as it
-        # always was: the field is what moves it.
-        graded_red = dict(lost)
+        # The same record without the suite's word is the PR's own red when
+        # rule 4's test says so (here: a pass on another PR built on the same
+        # main commit); the field is what moves it between the two counts.
+        graded_red = dict(lost, base_sha="abc1234")
         del graded_red["eval_outcome"], graded_red["not_evaluated"]
-        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        out = adjudicate(data(graded_red, dict(graded(2, 2, T0 - timedelta(minutes=30)), base_sha="abc1234")), T0)["metrics"]
         self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (1, 0))
+        # One red run with no same-base pass is not the PR's own in the digest
+        # either; the split is binary, so it lands on the gate's side.
+        del graded_red["base_sha"]
+        out = adjudicate(data(graded_red, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (0, 1))
+        # A second red run of the same PR, with another PR passing, makes both the PR's own.
+        again = dict(run(9, 1, T0 - timedelta(minutes=10), tasks=[task("agent-kanban-smoke", "fff"), task("security-overgrant-probe", "iii")], result="FAILURE"), eval_verdict="RED")
+        out = adjudicate(data(graded_red, again, graded(2, 2, T0 - timedelta(minutes=30))), T0)["metrics"]
+        self.assertEqual((out["pr_caused_reds"], out["infra_reds"]), (2, 0))
 
     def test_the_suites_word_on_an_aborted_build_is_not_the_not_evaluated_shape(self):
         # The field keys on Prow's FAILURE like lost_pod and deadline_kill:

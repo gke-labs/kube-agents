@@ -187,6 +187,8 @@ SHARED_BREAK_MIN_RED_SHARE = 0.5
 # Rule 4 without a same-base pass: this many red runs of the one pull request
 # (a retest, or a new push) before its case is called the pull request's.
 PR_CAUSED_MIN_RUNS = 2
+PR_CAUSED_SAME_BASE = "same_base"
+PR_CAUSED_REPEATED = "repeated"
 
 # --- Rule 2: quota storm -> DEGRADED (#1225, #1097, #1214) -------------------
 # Incident: the Gemini API key's fixed token quota (#1208) saturates under a
@@ -1014,6 +1016,30 @@ def _in_window(runs, now: datetime, window: timedelta):
     return [run for run in runs if now - window < run.finished <= now]
 
 
+def pr_caused_path(case: str, runs, population) -> tuple[str | None, list]:
+    """Rule 4 for one case: `runs` are the runs that collapsed it, all of one
+    pull request or the case is nobody's. It is that pull request's when the
+    evidence rules out a flake and a moving main: the case passed on another
+    pull request's run built on the same main commit (PR_CAUSED_SAME_BASE,
+    with those runs), or it failed on PR_CAUSED_MIN_RUNS of the pull request's
+    runs (a retest counts) while passing on another pull request
+    (PR_CAUSED_REPEATED, with the passing runs). One red run and no same-base
+    pass says nothing: (None, [])."""
+    prs = _prs(runs)
+    if len(prs) != 1:
+        return None, []
+    elsewhere = [run for run in population if case in run.passing_cases() and run.pr != prs[0]]
+    if not elsewhere:
+        return None, []
+    bases = {run.base_sha for run in runs if run.base_sha}
+    same_base = [run for run in elsewhere if run.base_sha and run.base_sha in bases]
+    if same_base:
+        return PR_CAUSED_SAME_BASE, same_base
+    if len({run.build_id for run in runs}) >= PR_CAUSED_MIN_RUNS:
+        return PR_CAUSED_REPEATED, elsewhere
+    return None, []
+
+
 def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
     """Rule 1. Returns {fires, cases, evidence, pr_caused, signature_runs}."""
     window = _in_window(full_runs, now, SHARED_BREAK_WINDOW)
@@ -1029,29 +1055,18 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         for case, runs in collapses.items()
         if len(runs) >= SHARED_BREAK_MIN_RUNS and len(_prs(runs)) >= SHARED_BREAK_MIN_PRS
     )
-    # Rule 4: a case failing on exactly one pull request is that pull
-    # request's, and carries no state, when the evidence rules out a flake
-    # and a moving main: the case passed on another pull request's run built
-    # on the same main commit, or it failed on PR_CAUSED_MIN_RUNS of this
-    # pull request's runs (a retest counts) while passing on another pull
-    # request. One red run and no same-base pass says nothing.
+    # Rule 4 (pr_caused_path): a case failing on exactly one pull request is
+    # that pull request's, and carries no state.
     pr_caused = []
     for case, runs in sorted(collapses.items()):
-        prs = _prs(runs)
-        if len(prs) != 1:
-            continue
-        elsewhere = [run for run in window if case in run.passing_cases() and run.pr != prs[0]]
-        if not elsewhere:
-            continue
-        bases = {run.base_sha for run in runs if run.base_sha}
-        same_base = [run for run in elsewhere if run.base_sha and run.base_sha in bases]
-        if same_base:
+        path, others = pr_caused_path(case, runs, window)
+        if path == PR_CAUSED_SAME_BASE:
             pr_caused.append(
-                f"PR-caused: {case} failing only on #{prs[0]} (passing on {len(_prs(same_base))} other PRs built on the same main commit)"
+                f"PR-caused: {case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
             )
-        elif len({run.build_id for run in runs}) >= PR_CAUSED_MIN_RUNS:
+        elif path == PR_CAUSED_REPEATED:
             pr_caused.append(
-                f"PR-caused: {case} failing on {len(runs)} runs of #{prs[0]} (passing on {len(_prs(elsewhere))} other PRs)"
+                f"PR-caused: {case} failing on {len(runs)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
             )
 
     concluded = [run for run in window if run.result in (RUN_SUCCESS, RUN_FAILURE)]
@@ -1503,15 +1518,16 @@ def percentile(values: list[float], pct: int) -> float | None:
 
 
 def pr_caused_reds(full_runs, roster: Roster) -> int:
-    """Rule 4 over a set of runs: red runs whose every collapsed admitted case
-    collapsed on no other pull request among them. A red with no admitted
-    collapse (an absolute rung, an empty record) is not this: it is the
-    environment's, and the digest counts it on the infra side."""
-    prs_by_case: dict[str, set] = {}
+    """Rule 4 over a set of runs, by the same test the evidence applies
+    (pr_caused_path): red runs whose every collapsed admitted case is their
+    pull request's own. A red with no admitted collapse (an absolute rung, an
+    empty record) is not this: it is the environment's, and the digest counts
+    it on the infra side."""
+    collapses: dict[str, list] = {}
     for run in full_runs:
         admitted = roster.at(run.started or run.finished)
         for case in run.collapsed_cases() & admitted:
-            prs_by_case.setdefault(case, set()).add(run.pr)
+            collapses.setdefault(case, []).append(run)
     count = 0
     for run in full_runs:
         # A killed run that recorded cases (#1875) stays in the population --
@@ -1524,7 +1540,7 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
         if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
-        if mine and all(prs_by_case[case] == {run.pr} for case in mine):
+        if mine and all(pr_caused_path(case, collapses[case], full_runs)[0] is not None for case in mine):
             count += 1
     return count
 

@@ -203,8 +203,9 @@ recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds and infra reds (setup deaths, lost pods and deadline kills that
-graded nothing are folded into the infra count), the typical run length and the typical wait before a run starts,
+PR-caused reds (by rule 4's test, below) and infra reds (setup deaths, lost
+pods and deadline kills that graded nothing are folded into the infra count),
+the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
 `metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
 and whether it was read at all, the infra-rep rate, `setup_deaths`,
