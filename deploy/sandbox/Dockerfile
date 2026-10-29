@@ -87,7 +87,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
-    tar -xzf /tmp/helm.tar.gz -C /tmp && \
+    tar -xzf /tmp/helm.tar.gz --no-same-owner -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
     rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
 

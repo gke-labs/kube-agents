@@ -425,6 +425,12 @@ check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
 check "leeway exists (topology drift CLI)" "v0.1.3" \
   "$("${SSH[@]}" 'leeway version' 2>&1)"
+# tar run as root keeps the owner an archive records unless told
+# --no-same-owner, and the helm and leeway archives both record uid 1001, which
+# is hermes here. Symlinks are skipped for the mode test: theirs is always 777.
+check "every file in /usr/local/bin is root's and writable by nobody else" "all root, go-w" \
+  "$(docker exec "$NAME" sh -c 'out=$(find /usr/local/bin \( ! -user root -o \( ! -type l -perm /022 \) \) 2>&1) &&
+    [ -z "$out" ] && echo "all root, go-w" || echo "$out"' 2>&1)"
 # Not SSH_OPTS: sftp spells the port -P, and -p means something else entirely.
 check "no sftp subsystem is advertised" "subsystem request failed" \
   "$(sftp -i "$WORK/id" -P "$PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
