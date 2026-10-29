@@ -74,6 +74,18 @@ def _clean_stash():
         "I couldn't check it. It will never run again on its own." + OFFER,
         "I couldn't check it. It can't run again on its own." + OFFER,
         "I couldn't check it, and it won't run again on its own. Should I have it try again?",
+        "I couldn't check it, and it won't run again on its own. Want me to try again?\n\n[next: retry the check]",
+        "I couldn't check it, and it won't run again on its own. Want me to try again?\n\n[next: try again]",
+        (
+            "The AI model's usage limit stopped the work after its retries ran out, and it will not run again "
+            "on its own." + OFFER
+        ),
+        "I couldn't check it, and it won't run again on its own. I'd be glad to rerun it. Want me to try again?",
+        "I couldn't check it, and it won't run again on its own. I'll try again if you'd like. Want me to try now?",
+        (
+            "I couldn't check it, and it won't run again on its own. Once the limit resets, you can ask me to "
+            "run it again. Want me to try again then?"
+        ),
         (
             "I couldn't check it, and it won't run again on its own. If you like, I can try again. Want me to try later?"
             "\n\n[next: try the check again]"
@@ -159,6 +171,32 @@ def test_an_honest_reply_passes(reply: str) -> None:
             "It won't run again on its own. Nothing is needed from you. Want me to try again?",
             [PROMISES],
             id="nothing is needed from you",
+        ),
+        pytest.param(
+            "It won't run right now, but the dispatcher will run it again once the limit resets. Want me to try again?",
+            [PROMISES],
+            id="an object between the verb and again",
+        ),
+        pytest.param(
+            "It won't run again on its own for now. The health check will automatically run once the limit resets."
+            " Want me to try again?",
+            [PROMISES],
+            id="will automatically run, no again",
+        ),
+        pytest.param(
+            "It won't run again until the limit resets and then it'll pick up where it left off. Want me to try again?",
+            [PROMISES],
+            id="the promise shares a sentence with the negation",
+        ),
+        pytest.param(
+            "It won't run again on its own. It'll pick up again once you've waited a few minutes. Want me to try again?",
+            [PROMISES],
+            id="a condition the user does not act on",
+        ),
+        pytest.param(
+            "It won't run again on its own. It will retry automatically if you give it a minute. Want me to try again?",
+            [PROMISES],
+            id="if you give it a minute",
         ),
         pytest.param(
             "I couldn't check it. It will not run again on its own.",

@@ -80,13 +80,14 @@ verification_spec:
         - '\bnothing\s+(will\s+)?(\w+\s+)?(retr\w*|re-?runs?|runs?|restart\w*|resumes?|picks?)\s+(it|this|that|the\s+[\w-]+)\b'
   # The defect: a promise that something retries it, or that the user need do
   # nothing. The second pattern reads one clause at a time (split at . ! ? ;
-  # , a line break, and "but"): a statement clause, not a question, that has
-  # a retry verb ("will automatically be retried", "the system is going to
-  # retry it", "it'll pick up") is a promise, unless the clause also carries
-  # a negator ("won't", "cannot", "no longer"), a condition on the user ("when
-  # you ask", "after you confirm"), an offer ("I can", "want me to") or is the
-  # declared step line. Clause-level rather than word lists between subject
-  # and verb, so an adverb or "going to" cannot slip a promise past it.
+  # , a line break, and but, and, then, though, although, while). A statement
+  # clause, not a question, is a promise when it has a retry verb in the
+  # present ("the dispatcher retries it", "it'll pick up", "run it again") or
+  # any retry verb after will, 'll, going to or automatically ("will
+  # automatically run", "will be retried"), unless the same clause carries a
+  # negator, a condition the user acts on ("when you ask", "after you
+  # confirm"), an offer ("I can", "want me", "should I"), the exhausted
+  # retries the reason names, or the declared step.
   - name: the-reply-promises-no-automatic-retry
     role: objective
     mode: assert
@@ -94,7 +95,7 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\bno\s+(\w+\s+){0,2}(action|need)\b(?!\s+(i|we)\b)|\b(don''t|do\s+not|won''t|needn''t)\s+(need|have)\s+to\s+do\b|\bnothing\s+(\w+\s+){0,2}(to\s+do|needed|required)\b|\bsit\s+tight\b'
-        - '(?:^|(?<=[.!?;,\n])|(?<=\bbut ))(?![^.!?;,\n]*(?:\b(?:not|never|no|nothing|nobody|cannot|unless)\b|n''t\b|\b(?:if|when|once|after|whenever|until|before)\s+(?:you|i\s+hear)\b|\bas\s+soon\s+as\s+you\b|\byou\s+(?:can|could|may|ask|say)\b|\bi\s+(?:can|could|would|''d)\b|\b(?:want|like)\s+me\b|^\s*\[next:))[^.!?;,\n]*\b(?:retr(?:y|ies|ied|ying)|re-?run\w*|resum(?:e|es|ed|ing)|restart\w*|pick(?:s|ed)?\s+(?:it\s+)?(?:back\s+)?up|(?:run|runs|ran|try|tries|tried)\s+again)\b[^.!?;,\n]*(?=[.!;,\n]|\Z)'
+        - '(?:^|(?<=[.!?;,\n])|(?<=\bbut )|(?<=\band )|(?<=\bthen )|(?<=\bthough )|(?<=\bwhile ))(?!(?:(?!\b(?:but|and|then|though|although|while)\b)[^.!?;,\n])*?(?:\b(?:not|never|no|nothing|nobody|cannot|unless)\b|n''t\b|\b(?:if|when|once|after|whenever|until|before)\s+you(?:''d|\s+would)?\s+(?:ask|say|tell|confirm|want|like|approve|reply|click|press|let)\b|\bas\s+soon\s+as\s+you\s+(?:ask|say|tell|confirm)\b|\byou\s+(?:can|could|may|ask|say)\b|\bi(?:\s+(?:can|could|would)|''d)\b|\b(?:want|like)\s+me\b|\b(?:should|shall)\s+i\b|\bretries\s+(?:\w+\s+)?(?:ran\s+out|were\s+\w+|exhausted)\b|\[next:))(?:(?!\b(?:but|and|then|though|although|while)\b)[^.!?;,\n])*?(?:\b(?:retry|retries|retrying|re-?runs?|re-?running|resumes?|resuming|restarts?|restarting|picks?\s+(?:it\s+)?(?:back\s+)?up|(?:run|runs|running|try|tries|trying|check|checks)\s+(?:\w+\s+){0,2}?again)\b|\b(?:will|''ll|going\s+to|automatically)\s+(?:\w+\s+){0,3}?(?:run|runs|retr\w*|re-?run\w*|check\w*|start\w*|resum\w*|restart\w*|pick\w*)\b)(?:(?!\b(?:but|and|then|though|although|while)\b)[^.!?;,\n])*(?=[.!;,\n]|\b(?:but|and|then|though|although|while)\b|\Z)'
   # Ends on the offer: a closing question that names the retry ("Want me to
   # try again?", "Should I check it again?"), or any closing question with a
   # declared step on a last line of its own (SOUL §2 step 5), which
