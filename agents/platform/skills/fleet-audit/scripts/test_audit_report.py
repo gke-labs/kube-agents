@@ -23057,6 +23057,25 @@ metadata:
         self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-a"), self.pool_stall("pool-b"))), [])
         self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
 
+    def test_a_host_whose_read_failed_still_counts_as_a_host(self):
+        """hub-1 lists PubSubTopic infra/events with no project; the fix
+        declares infra/events. When hub-2's read succeeds with everything
+        ready, there are two hosts and no note. When hub-2's read times out,
+        hub-2 is unknown, not absent, and the answer must be the same."""
+        self.write(
+            "topics/events.yaml",
+            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
+        )
+        topic = dict(KCC_TOPIC, name="events")
+        for hub2 in ({"kcc_unready": []}, {"kcc_unread": "`kubectl get gcp -A` did not finish in 240s"}):
+            with self.subTest(hub2=list(hub2)):
+                finding = kcc_finding(path="topics/events.yaml")
+                manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
+                del manifest["clusters"][1]["kcc_unready"]
+                manifest["clusters"][1].update(hub2)
+                self.assertEqual(self.disclose([finding], manifest), [])
+                self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
     def test_a_fix_to_a_file_with_no_config_connector_object_gets_no_config_connector_text(self):
         """The finding's node pool is unready, but the fix edits a
         `ComputeClass`: the merged fix did not change a Config Connector

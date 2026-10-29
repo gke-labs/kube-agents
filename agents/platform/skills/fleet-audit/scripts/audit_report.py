@@ -18659,8 +18659,9 @@ class KccHealth(NamedTuple):
     the targets whose read gave no answer. An object on an unread cluster is
     in neither list, so an empty `stalled` is never "everything is applying".
     `hosts` counts the entries that ran Config Connector (that carry
-    `kcc_unready`, also empty): with more than one, the same object name can
-    be ready on one host and not ready on another. `targets` holds the name
+    `kcc_unready`, also empty) or may run it (that carry `kcc_unread`): with
+    more than one, the same object name can be ready on one host and not
+    ready on another. `targets` holds the name
     of every manifest entry, so a match can see two clusters of one name in
     two projects.
     """
@@ -18684,7 +18685,9 @@ def kcc_health(manifest: dict | None) -> KccHealth:
         targets.append(host)
         if entry.get(KCC_UNREAD_FIELD):
             unread.append(host)
-        if isinstance(entry.get(KCC_UNREADY_FIELD), list):
+        # A failed read is a possible host: unknown is never "no Config
+        # Connector here", so two real hosts never count as one.
+        if isinstance(entry.get(KCC_UNREADY_FIELD), list) or entry.get(KCC_UNREAD_FIELD):
             hosts += 1
         for record in entry.get(KCC_UNREADY_FIELD) or []:
             if not isinstance(record, dict) or not record.get("kind") or not record.get("name"):
