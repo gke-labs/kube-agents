@@ -634,7 +634,11 @@ Layout:
   agent pod that holds session-kv's bearer. No other principal holds either subject, and the
   reply namespace is its own for the notify route's reason. The bridge's password is reachable
   from the agent's terminal like every grant in that pod, so a forged board can reach the Home
-  tab of an admitted member; it carries no authority beyond what it shows. Core NATS.
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS. A request
+  with a body is a board-health row's Retry or Drop (spec-chatops-gateway.md, "The board-health
+  card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
+  subjects and grants, and only the gateway may publish the request, so no other principal can
+  ask the bridge to act; session-kv acts only on cards still `blocked`.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for

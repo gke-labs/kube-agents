@@ -102,10 +102,21 @@ verification_spec:
   # finding carries it in its derived id
   # ("<check>.<cluster>.<namespace>.<object>"). Against the body it would
   # also pass on a scope table that swept the namespace and faulted
-  # nothing. Residual, stated: _shorten_id trims the LONGEST segment of an
-  # over-long id, which here is the host cluster's name, not this object
-  # segment — but a cluster rename that makes the object the longest
-  # segment would surface as this check failing, loudly.
+  # nothing. The ledger shortens an id over MAX_FINDING_ID (100) characters
+  # from its longest segments, and the cluster segment now carries the
+  # project and location (`kube-agents-evals-28/us-central1/platform-agent-host`),
+  # so the object segment is cut too: the full name `eval-vllm-serving`
+  # does not survive (#3667). Both phrases do: the namespace and the
+  # object's prefix, checked with audit_report.published_id for
+  # `platform-agent-host` (95 characters, not shortened) and for every
+  # longer cluster name, since shortening keeps the segments near-equal.
+  # For `agentic-harness-demo-fa2/us-central1/agentic-harness-demo-fa2-platform-agent-host`
+  # the credential id is
+  # `model-credential-plaintext-env.agentic-harness-demo-fa.eval-ai-defects.deployment-eval-vllm-s-33653d`.
+  # The object phrase is `eval-vllm`, not `eval-vllm-s`, on purpose: it
+  # survives the object cut down to 20 characters, so a namespace, check
+  # slug or id-length change of a few characters does not reopen #3667.
+  # Same approach as ai-security-manual-names-reconciler.
   - name: a-finding-was-filed-against-the-planted-workload
     role: objective
     # assert, not the converge default: the ledger is written once, at
@@ -116,7 +127,7 @@ verification_spec:
       type: ledger_issue_contains
       audit: ai-security-audit
       scope: finding_ids
-      required_phrases: ["eval-vllm-serving"]
+      required_phrases: ["eval-ai-defects", "eval-vllm"]
   # The credential finding specifically — the major-severity half of the
   # plant. The roster slug reaches the delta block only if a finding was
   # FILED under that check (the consistency-drift-outlier discriminator

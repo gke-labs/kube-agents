@@ -460,8 +460,8 @@ async def _drive(module) -> None:
     try:
         adapter = _StubAdapter(authorized=True)
         module.register(adapter)
-        if len(adapter._app.listeners) != 2:
-            raise _fail(f"register() wired {len(adapter._app.listeners)} listeners, expected 2")
+        if len(adapter._app.listeners) != 3:
+            raise _fail(f"register() wired {len(adapter._app.listeners)} listeners, expected 3")
         await module.answer(adapter, _ack, *_click(), module.CHOICE_KIND)
         kinds = [entry[0] for entry in adapter.log]
         if kinds != ["chat_update", "message"]:
