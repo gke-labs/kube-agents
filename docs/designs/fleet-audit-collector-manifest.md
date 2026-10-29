@@ -129,8 +129,9 @@ makes ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_a
 and takes the namespace annotations from its NetworkPolicy read. The drift, patch readiness and
 stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool` declaration,
 read each collected cluster once after their sweep, in a new worker pool of the sweep's size, but
-only with `--config-connector`: the scheduled SOP commands pass it, and the chat route, which runs
-the same collectors with no `finish`, does not. The drift and patch readiness collectors mark a
+only with `--config-connector`: the SOP command passes it whenever the audit runs by its SOP,
+scheduled or on demand, and a chat fleet question, which runs the same collectors with no `finish`,
+does not. The drift and patch readiness collectors mark a
 cluster whose `clusters list` record shows the Config Connector add-on enabled with
 `config_connector_addon`, and those clusters are read first. Drift and patch readiness fetch
 credentials for the read; stockout uses the kubeconfig its sweep fetched. When an unready object has

@@ -813,9 +813,11 @@ for a cluster or a node pool, the location of the finding's cluster.
 
 Only the finding's own object in the file counts, also when the file declares one Config Connector
 object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for
-`Cluster/<n>`, the `ContainerCluster` `<n>`; for another kind, the objects of that name, of that kind
-when the file declares it. A `Deployment` fix in a file that also declares its `IAMServiceAccount`
-did not change that account, so a stall of the account gives it no note. A file with no object of
+`Cluster/<n>`, the `ContainerCluster` `<n>`; for `<Kind>/<n>` of a Config Connector kind, the object
+of that kind and that name. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
+has no Config Connector object of its own, even when the file declares one of the same name: a
+`Deployment` fix in a file that also declares an `IAMServiceAccount` did not change that account, so
+a stall of the account gives it no note. A file with no object of
 the finding gives no note, no `kcc_stalled` and no fallback to the finding's own object.
 
 A match that is not certain gives no note. Two cases are by name: the same object is not ready on
@@ -842,8 +844,7 @@ The note is the last paragraph of the remediation note, starts "**Config Connect
 this file.**", and names each matched object and the controller's reason in code spans. When the
 reason is `DependencyNotReady` and the referenced object is not ready on the same host cluster, it
 follows the chain and names only the deepest unready object, the root cause, with a count of the
-ones between. It names at most two objects in the file and counts the rest. The note always fits
-the cap whole: the worker's text is cut or dropped first, then the text `finish` wrote before it.
+ones between. It names at most two objects in the file and counts the rest.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
@@ -852,13 +853,13 @@ that sets both `max_node_count` and `total_max_node_count` fails with `UpdateFai
 correct the declaration if the reason rejects the change, and that otherwise the change takes effect
 when Config Connector applies the object again.
 
-The note fits the note cap: the worker's note is cut, and the text `finish` wrote at its start stays
-whole when there is room for it. Unlike a route note, it saves no `uncut_note`, so the carry removes the note but does not
-bring back the text it cut. The pass first removes an earlier copy of the note from every
-remediation, and the carry removes it too, so a note never shows a stall that this run's manifest
-does not. A cluster whose read failed (`kcc_unread`) records no objects, so no note names an object
-there, and the log has a warning. The absence of the note never says that Config Connector applies
-a file.
+The note fits the note cap whole: the worker's note is cut first, then dropped, and then the text
+`finish` wrote at its start, so the Config Connector paragraph itself is never cut. Unlike a route
+note, it saves no `uncut_note`, so the carry removes the note but does not bring back the text it
+cut. The pass first removes an earlier copy of the note from every remediation, and the carry
+removes it too, so a note never shows a stall that this run's manifest does not. A cluster whose
+read failed (`kcc_unread`) records no objects, so no note names an object there, and the log has a
+warning. The absence of the note never says that Config Connector applies a file.
 
 The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
 the stall in place of "the remediation was incomplete, or something outside this repository
