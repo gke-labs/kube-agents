@@ -11603,7 +11603,7 @@ spec:
                 phase:
                   description:
                     Phase is the overall state (Pending, Provisioning, Ready,
-                    Failed).
+                    Degraded, Failed).
                   type: string
                 serviceStatus:
                   description: ServiceStatus holds internal/external endpoints.
