@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import itertools
 import json
 import logging
@@ -24,6 +25,7 @@ import math
 import os
 import re
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -50,6 +52,19 @@ WATCHER_START_SECONDS = 180
 WATCHER_POLL_SECONDS = 30
 # How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
 TRIGGER_DRAIN_SECONDS = 1800
+# The commands that change the test clusters or the install, and so hold the live-test lease.
+MUTATING_COMMANDS = ("run", "apply", "teardown")
+LEASE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "live_test_lease.py"
+LEASE_ENVS_VAR = "KUBE_AGENTS_LIVE_TEST_ENVS"
+LEASE_SESSION_VAR = "KUBE_AGENTS_LEASE_SESSION"
+LEASE_SESSION_PREFIX = "harness-scale-"
+LEASE_ENV_NAME = "harness-scale-host"
+LEASE_ENVS_NAME = "live-test-envs.json"
+LEASE_DIRECTORY_PREFIX = "harness-scale-lease-"
+# Long enough for a plan of about 30 runs; a plan sets lease_ttl_minutes for more.
+LEASE_TTL_MINUTES = 720
+# Operation kinds whose runs make model calls of their own: prompts, triggered jobs, an onboarding.
+MODEL_CALL_KINDS = ("prompt", "trigger_soak", "reset_soak")
 DRAIN_POLL_SECONDS = 60
 # The fits a run leaves out when work other than its own loaded the harness during it.
 RESOURCE_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
@@ -66,6 +81,9 @@ TOKEN_FITS = ("tokens_input", "tokens_output", "tokens_cached", "run_tokens_inpu
 STALL_WATCH_PERIOD_SECONDS = 1800
 STALL_WATCH_BASE_SECONDS = 120
 STALL_WATCH_SECONDS_PER_CLUSTER = 30
+# A trigger_soak's jobs: the slowest one's run time and how many completed, both read after the drain.
+JOB_SECONDS_METRIC = "job_seconds"
+JOBS_COMPLETED_METRIC = "jobs_completed"
 STALL_WATCH_NOTE = "the Stall Watch's half-hourly read of every cluster overlapped the run"
 # The operation kinds whose windows are shorter than the period; an hour-long soak holds two ticks every time.
 STALL_WATCH_KINDS = ("prompt", "restart_soak")
@@ -641,6 +659,9 @@ class Runner:
                     records.merge(self.data_file, [record])
                     if spec.operation.kind == TRIGGER_SOAK_KIND:
                         self.drain_jobs(spec.operation, record.started)
+                        record.metrics += self.job_metrics(spec.operation, record.started)
+                        # Written now: the Monitoring wait below can outlast the process.
+                        records.merge(self.data_file, [record])
                     awaiting.append((time.time(), record))
                     awaiting = self.flush_peaks(awaiting, wait=False)
                     self.backfill_peaks(skip={pending.key for _, pending in awaiting})
@@ -649,6 +670,28 @@ class Runner:
             relay.stop()
             self.flush_peaks(awaiting, wait=True)
         return not stopped
+
+    def dry_run(self, specs: list[RunSpec], force: bool) -> list[str]:
+        """What ``run`` would do, as lines: each level's cluster creates and deletes, and each run.
+
+        Reads the project's clusters and, unless ``force``, the data file and the install's build to
+        leave out runs already recorded; changes nothing.
+        """
+        pending = specs if force else self.pending(specs)
+        current = set(kube.clusters_with_prefix(self.project, self.zone, self.prefix, self.label))
+        lines = [f"{len(pending)} runs to do (of {len(specs)}); test clusters now: {len(current)}"]
+        for (factor, level), group in itertools.groupby(pending, key=lambda s: (s.factor, s.level)):
+            values = self.plan.level_values(factor, level)
+            wanted = set(self.cluster_names(int(values[CLUSTERS_TOTAL])))
+            create, delete = sorted(wanted - current), sorted(current - wanted)
+            lines.append(f"level {factor}={level:g}: {dict(values)}")
+            lines.append(f"  create {len(create)} clusters: {' '.join(create) or '-'}")
+            lines.append(f"  delete {len(delete)} clusters: {' '.join(delete) or '-'}")
+            for spec in group:
+                calls = "model calls" if spec.operation.kind in MODEL_CALL_KINDS else "no model call of its own"
+                lines.append(f"  run {spec.operation.name} #{spec.run} ({spec.operation.kind}, {calls})")
+            current = wanted
+        return lines
 
     def drain_jobs(self, op: Operation, since: str) -> None:
         """Wait up to ``trigger_drain_seconds`` for the jobs a trigger_soak started, so they do not load the next run.
@@ -668,6 +711,19 @@ class Runner:
                 return
             LOG.info("waiting for %s to finish before the next run", ", ".join(active))
             time.sleep(DRAIN_POLL_SECONDS)
+
+    def job_metrics(self, op: Operation, since: str) -> list[records.Metric]:
+        """How long the slowest job the run started took, and how many completed, read after the drain."""
+        try:
+            durations = operations.job_seconds(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
+        except (kube.CommandError, ValueError, TypeError) as exc:
+            # A run log the read cannot parse costs this run its job metrics, not the whole campaign.
+            LOG.warning("could not read how long the jobs took: %s", exc)
+            return []
+        metrics = [records.Metric(JOBS_COMPLETED_METRIC, float(len(durations)))]
+        if durations:
+            metrics.append(records.Metric(JOB_SECONDS_METRIC, max(durations.values())))
+        return metrics
 
     def carried_work(self) -> tuple[list[str], list[str]]:
         """Notes and fit exclusions for a run that jobs the latest trigger_soak started are still loading.
@@ -800,6 +856,39 @@ class Runner:
                                       self.settings["fixture_machine_type"], 0)
 
 
+@contextlib.contextmanager
+def hold_lease(plan: Plan, note: str):
+    """Hold the experiment install's live-test lease for as long as the block runs.
+
+    The lease is the repository's (scripts/live_test_lease.py, docs/designs/live-test-lease.md): a
+    ConfigMap in the install's namespace that another runner, an agent's live validation or a
+    person's work also takes before changing the install, so two of them cannot apply at once.
+    A lease another holder has refuses the run.
+    """
+    target = plan.target
+    with tempfile.TemporaryDirectory(prefix=LEASE_DIRECTORY_PREFIX) as directory:
+        envs = Path(directory) / LEASE_ENVS_NAME
+        envs.write_text(json.dumps({"installs": [
+            {"name": LEASE_ENV_NAME, "context": target["host_context"], "namespace": target["namespace"]}
+        ]}))
+        env = {**os.environ, LEASE_ENVS_VAR: str(envs), LEASE_SESSION_VAR: f"{LEASE_SESSION_PREFIX}{os.getpid()}"}
+        ttl = str(int(plan.settings.get("lease_ttl_minutes", LEASE_TTL_MINUTES)))
+
+        def lease(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run([sys.executable, str(LEASE_SCRIPT), *args, "--env", LEASE_ENV_NAME],
+                                  env=env, capture_output=True, text=True, check=False)
+
+        acquired = lease("acquire", "--ttl", ttl, "--note", note)
+        if acquired.returncode != 0:
+            raise SystemExit(f"the install's live-test lease is held elsewhere; not running:\n"
+                             f"{acquired.stdout}{acquired.stderr}")
+        LOG.info("holding the live-test lease on %s for up to %s minutes", target["host_cluster"], ttl)
+        try:
+            yield
+        finally:
+            lease("release")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["plan", "run", "apply", "teardown", "reclassify", "remonitor"])
@@ -811,6 +900,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many runs (0: all)")
     parser.add_argument("--delete-fleet", action="store_true", help="teardown: delete the test clusters")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="run: print each level's cluster creates and deletes and each run, and change nothing")
     args = parser.parse_args(argv)
     # SIGTERM ends the run like Ctrl-C does, so the churner, the relay and pending peaks are cleaned up.
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(TERMINATED_EXIT_CODE))
@@ -837,21 +928,31 @@ def main(argv: list[str] | None = None) -> int:
     kube.use_private_kubeconfig(private)
     atexit.register(private.unlink, missing_ok=True)
     runner = Runner(plan, data_file)
-    if args.command == "run":
-        # Non-zero when the run stopped at a level, so a script does not go on to its next step.
-        if not runner.run(specs, args.force, args.limit):
-            return STOPPED_EXIT_CODE
-    elif args.command == "reclassify":
+    if args.command == "run" and args.dry_run:
+        print("\n".join(runner.dry_run(specs, args.force)))
+        return 0
+    if args.command in MUTATING_COMMANDS:
+        with hold_lease(plan, f"harness scale {args.command} {args.config.name}"):
+            return _mutate(runner, args, specs)
+    if args.command == "reclassify":
         print(f"{runner.reclassify()} records changed")
     elif args.command == "remonitor":
         print(f"{runner.remonitor()} records changed")
-    elif args.command == "apply":
+    return 0
+
+
+def _mutate(runner: Runner, args: argparse.Namespace, specs: list[RunSpec]) -> int:
+    """The commands that change the test clusters or the install, run under the lease."""
+    if args.command == "run":
+        # Non-zero when the run stopped at a level, so a script does not go on to its next step.
+        return 0 if runner.run(specs, args.force, args.limit) else STOPPED_EXIT_CODE
+    if args.command == "apply":
         try:
             runner.apply_level(args.factor, args.level)
         finally:
             runner.stop_churn()
-    else:
-        runner.teardown(args.delete_fleet)
+        return 0
+    runner.teardown(args.delete_fleet)
     return 0
 
 

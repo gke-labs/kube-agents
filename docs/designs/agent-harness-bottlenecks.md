@@ -6,9 +6,11 @@ kube-agents runs the Platform Agent and its supporting components in one GKE clu
 
 This research measures the harness on small fleets. Each experiment increases one stress point. A stress point is one property of the fleet or of its use, for example the number of clusters. The research fits a model to the data and predicts the breaking points for larger fleets. The result is a chart that answers two questions. First: are the current container limits enough for a given fleet? Second: which node size and container limits does a given fleet need?
 
-The measurements cover fleets of 2 to 22 small clusters. A bottleneck is the part of the harness that stops a larger fleet first. The credential proxy is the first bottleneck. The credential proxy is the component that runs the agent's kubectl and gcloud commands. With the default limits, the proxy reached its CPU limit during onboarding at 6, 8 and 22 clusters. When the first-run audits run at once, it reaches the limit at every fleet size. Then commands wait. With the audits at once at 16 clusters, and during onboarding at 22, a command waited between 30 and 60 seconds. After 60 seconds the proxy refuses a command. The proxy's memory nears its limit at about 15 to 25 clusters. At 16 clusters the proxy needs about 2.5 CPU cores, and its default limit is 1. The agent's memory and the event watcher stay far below their limits. The agent's CPU reached 2 of its 3 cores.
+The measurements cover fleets of 2 to 40 small clusters. A bottleneck is the part of the harness that stops a larger fleet first. The credential proxy is the first bottleneck. The credential proxy is the component that runs the agent's kubectl and gcloud commands. With the default limits, the proxy reached its CPU limit during onboarding at 6, 8 and 22 clusters. When the first-run audits run at once, it reaches the limit at every fleet size. Then commands wait. With the audits at once at 16 clusters, and during onboarding at 22, a command waited between 30 and 60 seconds. After 60 seconds the proxy refuses a command. The proxy's memory nears its limit at about 15 to 25 clusters. At 16 clusters the proxy needs about 2.5 CPU cores, and its default limit is 1. The agent's memory and the event watcher stay far below their limits. The agent's CPU reached 2 of its 3 cores.
 
 More resources do not remove some bottlenecks. The agent runs at most 10 requests at once. The sandbox shell is the container where the agent's commands start. It passes at most about 1.5 commands per second. A question that checks the fleet takes a median of more than 2 minutes at every fleet size. An HPA (HorizontalPodAutoscaler) is an object that changes the number of Pods of a workload. A fleet with many Pods and HPAs makes the event watcher open thousands of sessions an hour, even with nothing failing.
+
+An install is one kube-agents deployment with its own Platform Agent. One install cannot hold a fleet of 2,500 clusters, the largest example fleet. With raised agent and proxy limits, one install held 40 clusters of its daily work, and the sandbox shell used 79% of its fixed CPU. A fleet of 2,500 clusters needs about 63 to 105 installs of 24 to 40 clusters each. That is about 190 to 320 nodes of type e2-standard-4. At 40 clusters per install, a question takes about 2 to 6 minutes, and Stall Watch reads each cluster about once an hour. The model's daily audits use about 1.5 to 5 billion input tokens a day across the fleet. That cost is the largest open question.
 
 # Context
 
@@ -343,6 +345,38 @@ What no setting changes, and what it would take:
 - The 10 run slots, Stall Watch's per-cluster loop and the session per incident are code, not resources.
 - The data volume: the agent's profiles used under 200 MiB at 22 clusters, so the default 50 GiB volume is not a limit in this range ([#3704](https://github.com/gke-labs/kube-agents/issues/3704) estimates about 3,200 clusters).
 
+## The largest example fleet: about 2,500 clusters
+
+The Harness limits page's example fleets are sizes built from customer fleets, rounded and without names: S (4 clusters), M (45), L (250) and XL (2,500 clusters, about 2,400 projects, 90% on Autopilot, about 260,000 workloads a day). Phase 4 measured what an onboarded install runs every day at 2 to 40 clusters, with the agent's limits raised to 6 CPU and 12 GiB and the credential proxy's to 4 CPU and 4 GiB, so the peaks show the need. Each level ran a 10-minute window that starts Stall Watch, one daily audit (`compliance-audit`) and two fan-out questions; the test clusters had 2 nodes and 100 objects each, and one point had 1,000 objects each. One run per point, so a point has no spread.
+
+| Clusters           | Agent CPU, memory | Proxy CPU | Shell CPU | Longest command wait | Stall Watch pass         | One daily audit     | Fan-out question |
+| ------------------ | ----------------- | --------- | --------- | -------------------- | ------------------------ | ------------------- | ---------------- |
+| 2                  | 0.36, 934 MiB     | 0.37      | 0.79      | under 0.1 s          | 2.0 min                  | 2.6 min             | —                |
+| 8                  | 0.55, 533 MiB     | 0.24      | 0.81      | under 0.1 s          | 7.0 min                  | 32 s (see below)    | —                |
+| 16                 | 0.43, 910 MiB     | 0.56      | 0.83      | under 0.1 s          | 13.6 min                 | 36 s (see below)    | —                |
+| 24                 | 1.07, 1,743 MiB   | 1.09      | 0.82      | 30–60 s (IAM outage) | 25 min, its whole budget | failed (IAM outage) | 239–291 s        |
+| 32                 | 0.64, 1,778 MiB   | 1.13      | 0.81      | 15–30 s              | —                        | 39 min              | 101–127 s        |
+| 40                 | 2.36, 3,146 MiB   | 2.45      | 1.58      | 2.5–5 s              | —                        | 34 min              | 129–375 s        |
+| 40 × 1,000 objects | 0.90, 1,766 MiB   | 2.33      | 1.48      | 2.5–5 s              | —                        | 45 min              | 137–157 s        |
+
+The data shows four things.
+
+- **One install holds 40 clusters of daily work.** Every container stayed inside its limit, no command was refused, and the shell peaked at 1.58 of its fixed 2 cores. The model's line for the shell, from the Phase 1 upgrade readiness runs (a report a user starts), reaches 2 cores at about 15 clusters, so that report is what loads the shell; at 40 clusters it would run slower, not fail.
+- **Stall Watch reads about 52 seconds per cluster,** one cluster at a time, within a 25-minute budget each half hour. It covers about 28 clusters per pass; at 40 clusters each cluster is read about once an hour.
+- **A full daily audit takes about 51 to 67 seconds per cluster** at 32 and 40 clusters. At 8 and 16 clusters the audit completed in about 30 seconds with almost no model tokens; the cron log shows no error, and whether it read every cluster is unknown, so those two times are not used.
+- **Model tokens grow fastest.** One daily audit used 3.1 to 13.9 million input tokens at 32 and 40 clusters, about 0.1 to 0.35 million per cluster.
+
+For the XL fleet, with today's code:
+
+| Clusters per install | Installs  | Nodes (3 × e2-standard-4 each)         | Stall Watch reads each cluster | Fits in one install's measured range |
+| -------------------- | --------- | -------------------------------------- | ------------------------------ | ------------------------------------ |
+| 40                   | 63        | about 190 (760 vCPU)                   | about once an hour             | yes, at the top of it                |
+| 24 to 28             | 90 to 105 | about 270 to 320 (1,080 to 1,260 vCPU) | every 30 minutes               | yes                                  |
+
+Each install sets the agent to about 3 CPU and 4 GiB and the credential proxy to about 3.5 CPU and 1 GiB, the 40-cluster peaks plus the 30% margin; the other containers keep their defaults. The delays, per install: a fan-out question takes about 2 to 6 minutes, a brokered command waits up to 5 to 30 seconds, and one daily audit takes 34 to 45 minutes, so the six daily audits take about 3.5 to 4.5 hours of each day. Across the fleet, the daily audits alone use about 1.5 to 5 billion input tokens a day (6 audits × 2,500 clusters × 0.1 to 0.35 million), before questions and triage; that needs a model quota and budget of its own.
+
+The XL fleet is supportable this way, with three limits. Each install answers only for its own clusters: a question across all 2,500 clusters needs a layer above the installs that does not exist. The test clusters are small, and the XL fleet's are not, so per-cluster costs are a lower bound and the upper end of each range is the safer plan. The model's own lines, which take each input's largest increase across all operations, give about 15 clusters per install, or about 170 installs; the measured daily work says up to 40.
+
 # Phase 1 results
 
 The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `eeb8a95c`, mode `next`, 2 test clusters at the base); the admin console's Harness limits page charts them and answers the two sizing questions. This section states what they show; the page and the file hold every number.
@@ -424,6 +458,19 @@ The 2-hour Phase 2 window at 22 clusters, with the audits one after another, sho
 - **Runs that shared the broker are left out of the resource fits.** Stall Watch reads every cluster through the broker at :00 and :30, so the 13 short prompt runs and 8 boot-burst windows that started inside one of its reads or held a tick are left out, as are the proxy load runs that had commands from outside the load. The length of a Stall Watch read (2 minutes plus 30 seconds per cluster) is set from the short runs on either side of a tick, not measured directly.
 - **A CPU line leaves out runs at the limit,** so where only low runs stay in, it can predict too little. The proxy's CPU answer uses the raised-limit runs for that reason.
 - **The raised-limit runs met model quota limits:** 54 provider 429s in the 16-cluster onboarding window.
+
+# Data to collect next
+
+The answers above rest on one run per point, small test clusters and fleets of at most 40 clusters. The next measurements, in the order they would change the answers most:
+
+- **Repeat runs at each point.** One run per point gives no spread: the two fan-out runs at 40 clusters took 129 and 375 seconds. Three runs per point at 8, 16, 24, 32 and 40 clusters would give the spread the 30% margin now stands in for.
+- **Larger clusters.** Every Phase 4 cluster had 2 nodes and 100 objects, and one point had 1,000. A grid of clusters (8, 16, 32, 40) × nodes per cluster (2, 10, 50) × objects per cluster (100, 1,000, 4,000) would show how much a real fleet's clusters add, which now makes each per-cluster cost a lower bound.
+- **Past 40 clusters.** The shell peaked at 79% of its fixed 2 CPU at 40 clusters, so the size where one install stops is between 40 and about 50, and it is not measured. Runs at 48, 56 and 64 clusters would find it; with an operator change that makes the shell settable, they would also find the next limit.
+- **Stall Watch at every size.** A triggered pass finished only at 2 and 8 clusters; at 16, 32 and 40 it met a scheduled pass and was skipped. Starting the window away from the half hour would measure the pass time at those sizes.
+- **The daily audit at 8 and 16 clusters.** It finished in about 30 seconds with almost no model tokens, against 34 to 45 minutes at 32 and 40; why is not known.
+- **A day of model tokens.** The token figures here come from single windows. A 24-hour soak at 16 and 40 clusters would measure the daily total that the 1.5 to 5 billion tokens a day for the largest example fleet is extrapolated from.
+- **An Autopilot host.** At the S container size the shell gets its 200m request on GKE Autopilot without bursting, against a 1.6-CPU peak. An install on Autopilot would show how slow the command path gets there.
+- **Many projects.** The largest example fleet has about 2,400 projects; the test fleet had one. The Cluster Agent reconcile lists every project in scope, so its time at hundreds of projects is the remaining unmeasured input.
 
 # Out of scope
 

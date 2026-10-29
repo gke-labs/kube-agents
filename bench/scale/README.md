@@ -59,6 +59,13 @@ python3 -m kube_agents_bench.scale.runner teardown <plan>             # remove f
 python3 -m kube_agents_bench.scale.runner teardown <plan> --delete-fleet
 ```
 
+`run --dry-run` prints what a run would do and changes nothing: each level's cluster creates and
+deletes, and each run, marked where it makes model calls of its own. `run`, `apply` and `teardown`
+hold the experiment install's live-test lease while they work
+([`docs/designs/live-test-lease.md`](../../docs/designs/live-test-lease.md)), so a second runner or
+an agent's live validation cannot change the install at the same time; a lease another holder has
+refuses the command. The lease lasts `lease_ttl_minutes` (default 720).
+
 An operation's `kind` says what a run does:
 
 - `prompt` sends the operation's `prompt` through the agent API, and at a `concurrent` value of N
@@ -93,6 +100,7 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
   default one;
 - `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
+- `lease_ttl_minutes`: how long a run's live-test lease lasts before another holder can take it.
 - `trigger_drain_seconds`: how long the run after a `trigger_soak` waits for its jobs to finish.
 
 The agent API is reached through the repository's `kubectl exec` relay
@@ -201,3 +209,5 @@ Metric names:
   reports them; `run_tokens_input` is the non-cached part of the prompt, so the run's share of the
   window is `run_tokens_input + run_tokens_cached` against `tokens_input`);
 - the fixtures: `churn_achieved_per_minute`.
+- the jobs a triggered window started, read after the drain: `job_seconds` (the slowest completed job's run
+  time) and `jobs_completed`.

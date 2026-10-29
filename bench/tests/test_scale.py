@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 import types
@@ -1017,6 +1018,15 @@ def test_a_pod_unread_at_the_start_adds_no_growth():
     assert collect._growth(collect.Snapshot(), after, "proxy", "kubeagents_tool_execution_duration_seconds_count") == 500.0
 
 
+def test_job_seconds_are_read_for_completed_runs_only(monkeypatch):
+    out = ("compliance-audit completed 2026-10-28T20:30:32.450605+00:00 2026-10-28T20:10:28.731243+00:00\n"
+           "stall-watch running None 2026-10-28T20:30:28.731243+00:00\n"
+           "obtainability-audit unclaimed None None\n")
+    monkeypatch.setattr(operations, "_gateway_pod", lambda *a: "pod")
+    monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: out)
+    durations = operations.job_seconds("ctx", "ns", "/home", ("compliance-audit", "stall-watch"), "2026-10-28T20:00:00Z")
+    assert durations == {"compliance-audit": pytest.approx(1203.72, abs=0.01)}
+
 
 def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     seen = {}
@@ -1029,3 +1039,80 @@ def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     monkeypatch.setenv("KUBECONFIG", "/shared/kubeconfig")
     kube.delete_cluster("p", "z", "scale-01")
     assert seen["kubeconfig"] and seen["kubeconfig"] != "/shared/kubeconfig"
+
+
+PHASE4 = REPO_BENCH / "scale" / "phase4.yaml"
+
+
+def test_a_triggered_window_writes_its_job_metrics_at_once(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    spec = next(s for s in plan.matrix() if s.factor == "clusters" and s.operation.kind == "trigger_soak")
+    stamped = records.Record(commit="e" * 40, mode="next", phase="phase4", factor=spec.factor, level=spec.level,
+                             operation=spec.operation.name, run=1, started="2026-10-29T00:00:00Z",
+                             ended="2026-10-29T00:10:00Z")
+    monkeypatch.setattr(run, "apply_level", lambda factor, level: {"clusters": spec.level})
+    monkeypatch.setattr(run, "backfill_peaks", lambda *a, **k: None)
+    monkeypatch.setattr(run, "pending", lambda specs: specs)
+    monkeypatch.setattr(run, "preflight", lambda: None)
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    monkeypatch.setattr(run, "execute", lambda s, values: stamped)
+    monkeypatch.setattr(run, "drain_jobs", lambda op, since: None)
+    monkeypatch.setattr(run, "flush_peaks", lambda awaiting, wait: [])
+    monkeypatch.setattr(runner.operations, "job_seconds", lambda *a: {"stall-watch": 418.5})
+    monkeypatch.setattr(runner.operations.Relay, "start", lambda self: None)
+    monkeypatch.setattr(runner.operations.Relay, "stop", lambda self: None)
+    assert run.run([spec], force=False) is True
+    [stored] = records.load(tmp_path / "data.json")["records"]
+    assert {m["name"]: m["value"] for m in stored["metrics"]} == {"jobs_completed": 1.0, "job_seconds": 418.5}
+
+
+@pytest.mark.parametrize("error", [kube.CommandError("exec failed"), ValueError("bad timestamp"), TypeError("None")])
+def test_a_job_log_that_cannot_be_read_costs_only_the_job_metrics(monkeypatch, tmp_path, error):
+    run = runner.Runner(load_plan(PHASE4, environ=ENV), tmp_path / "data.json")
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns"})()
+    op = next(o for o in run.plan.operations if o.kind == "trigger_soak")
+
+    def fail(*args):
+        raise error
+    monkeypatch.setattr(runner.operations, "job_seconds", fail)
+    assert run.job_metrics(op, "2026-10-29T00:00:00Z") == []
+
+
+def test_the_dry_run_lists_each_level_s_cluster_changes_and_runs(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    lines = run.dry_run([s for s in plan.matrix() if s.factor == "clusters" and s.level in (40, 32)], force=True)
+    assert lines[0] == "8 runs to do (of 8); test clusters now: 2"
+    assert any(line.startswith("  create 38 clusters:") for line in lines)
+    assert any(line.startswith("  delete 8 clusters: scale-33") for line in lines)
+    assert sum("(prompt, model calls)" in line for line in lines) == 4
+
+
+def test_a_lease_held_elsewhere_refuses_the_run(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 1, stdout="held by someone@host", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with pytest.raises(SystemExit, match="held elsewhere"):
+        with runner.hold_lease(plan, "test"):
+            pytest.fail("the block ran without the lease")
+    assert calls == ["acquire"]
+
+
+def test_a_held_lease_is_released_when_the_block_ends(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        assert kwargs["env"]["KUBE_AGENTS_LIVE_TEST_ENVS"]
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        assert calls == ["acquire"]
+    assert calls == ["acquire", "release"]

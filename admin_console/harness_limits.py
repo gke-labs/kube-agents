@@ -115,8 +115,9 @@ RUN_SLOT_REFUSALS = "run_slot_refusals"
 FAILED_PROMPTS = "failed_prompts"
 UNFINISHED_PROMPTS = "unfinished_prompts"
 RESPONSE = "response_seconds"
-# How long the slowest job a triggered window started took to run, in data that records it.
+# How long the slowest job a triggered window started took to run.
 JOB_SECONDS = "job_seconds"
+JOBS_COMPLETED = "jobs_completed"
 TOKENS_INPUT = "tokens_input"
 TOKENS_OUTPUT = "tokens_output"
 TOKENS_CACHED = "tokens_cached"
@@ -347,6 +348,8 @@ METRICS = MappingProxyType(
         FAILED_PROMPTS: MetricSpec("Failed prompts"),
         UNFINISHED_PROMPTS: MetricSpec("Prompts answered without the operation"),
         RESPONSE: MetricSpec("Response time", "s"),
+        JOB_SECONDS: MetricSpec("Scheduled job run time", "s"),
+        JOBS_COMPLETED: MetricSpec("Scheduled jobs completed"),
         TOKENS_INPUT: MetricSpec("Input tokens, every caller (whole prompt)"),
         TOKENS_OUTPUT: MetricSpec("Output tokens, every caller"),
         TOKENS_CACHED: MetricSpec("Cached tokens, every caller"),
