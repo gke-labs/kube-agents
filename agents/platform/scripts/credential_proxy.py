@@ -2647,6 +2647,9 @@ AGENT_API_SESSION_BODY_KEYS = ("id", "session_id", "sessionId", "gateway_session
 # The longest session id the agent API accepts (Hermes' _MAX_SESSION_HEADER_LEN).
 # Longer top-level strings are message text, not ids, and aren't checked.
 AGENT_API_SESSION_ID_MAX_LEN = 256
+# More distinct short top-level strings than this in one body are refused
+# rather than checked one by one. No caller of the door sends more than a few.
+AGENT_API_MAX_CHECKED_BODY_STRINGS = 256
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -2785,6 +2788,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         cls,
         raw_session_id: Any,
         workspace_root: str | Path | None = None,
+        connections: list[sqlite3.Connection] | None = None,
     ) -> bool:
         val = str(raw_session_id or "").strip()
         while (unquoted := urllib.parse.unquote(val)) != val:
@@ -2794,6 +2798,23 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return False
         if sid.lower().startswith("a2a-"):
             return True
+        if connections is not None:
+            return any(cls._descends_from_bridge_session(conn, sid) for conn in connections)
+        for db_path in cls._bridge_session_dbs(workspace_root):
+            try:
+                with contextlib.closing(
+                    sqlite3.connect(
+                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                    )
+                ) as conn:
+                    if cls._descends_from_bridge_session(conn, sid):
+                        return True
+            except Exception as exc:
+                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+        return False
+
+    @classmethod
+    def _bridge_session_dbs(cls, workspace_root: str | Path | None = None) -> list[Path]:
         root = Path(
             workspace_root
             or getattr(cls, "workspace_root", "")
@@ -2805,31 +2826,27 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         profiles_dir = root / "profiles"
         if profiles_dir.is_dir():
             db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
-        for db_path in db_paths:
-            if not db_path.is_file():
-                continue
-            try:
-                with contextlib.closing(
-                    sqlite3.connect(
-                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
-                    )
-                ) as conn:
-                    cur = sid
-                    seen = {cur}
-                    for _ in range(256):
-                        row = conn.execute(
-                            "SELECT parent_session_id FROM sessions WHERE id = ?",
-                            (cur,),
-                        ).fetchone()
-                        parent = str(row[0] or "").strip() if row else ""
-                        if not parent or parent in seen:
-                            break
-                        if parent.lower().startswith("a2a-"):
-                            return True
-                        seen.add(parent)
-                        cur = parent
-            except Exception as exc:
-                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+        return [db_path for db_path in db_paths if db_path.is_file()]
+
+    @staticmethod
+    def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
+        cur = sid
+        seen = {cur}
+        try:
+            for _ in range(256):
+                row = conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (cur,),
+                ).fetchone()
+                parent = str(row[0] or "").strip() if row else ""
+                if not parent or parent in seen:
+                    return False
+                if parent.lower().startswith("a2a-"):
+                    return True
+                seen.add(parent)
+                cur = parent
+        except Exception as exc:
+            LOGGER.debug("could not inspect a state.db for session %s: %s", sid, exc)
         return False
 
     @classmethod
@@ -2890,13 +2907,34 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     # Any other top-level string short enough to be a session id is
                     # checked too, so a field the harness reads an id from doesn't
                     # need to be named here first.
-                    for key, value in parsed.items():
-                        if key in AGENT_API_SESSION_BODY_KEYS or not isinstance(value, str):
-                            continue
-                        if len(value) <= AGENT_API_SESSION_ID_MAX_LEN and cls._is_bridge_session_id(
-                            value, workspace_root
-                        ):
-                            return True
+                    candidates = {
+                        value
+                        for key, value in parsed.items()
+                        if key not in AGENT_API_SESSION_BODY_KEYS
+                        and isinstance(value, str)
+                        and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
+                    }
+                    if len(candidates) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
+                        return True
+                    if candidates:
+                        with contextlib.ExitStack() as stack:
+                            connections = []
+                            for db_path in cls._bridge_session_dbs(workspace_root):
+                                try:
+                                    connections.append(
+                                        stack.enter_context(
+                                            contextlib.closing(
+                                                sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+                                            )
+                                        )
+                                    )
+                                except Exception as exc:
+                                    LOGGER.debug("could not open %s: %s", db_path, exc)
+                            if any(
+                                cls._is_bridge_session_id(value, workspace_root, connections)
+                                for value in candidates
+                            ):
+                                return True
         return False
 
     @staticmethod

@@ -323,6 +323,26 @@ class AgentAPIProxyTest(unittest.TestCase):
                     urllib.request.urlopen(request)
                 self.assertEqual(403, raised.exception.code)
 
+    def test_refuses_a_body_with_more_short_strings_than_it_checks(self):
+        for count, refused in ((256, False), (257, True)):
+            with self.subTest(count=count):
+                self.received_authorization = ""
+                body = {f"k{i}": f"v{i}" for i in range(count)}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps(body).encode(),
+                    method="POST",
+                )
+                if refused:
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)
+                    self.assertEqual(403, raised.exception.code)
+                    self.assertEqual("", self.received_authorization)
+                else:
+                    with urllib.request.urlopen(request) as response:
+                        self.assertEqual(b"proxied", response.read())
+
     def test_allows_body_keys_that_name_no_bridge_session(self):
         for path, body in (
             ("/api/sessions", {"id": "web-console-abc", "title": "Web console abc"}),
