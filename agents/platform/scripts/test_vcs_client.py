@@ -806,11 +806,23 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertTrue(Path(recent["path"]).exists())
         self.assertEqual(sorted(vcs_client.key_of(s) for s in vcs_client.all_sessions()), ["fix/new", "fix/recent"])
 
-    def test_a_clone_does_not_reap_its_own_destination(self):
-        vcs_client.clone("acme/infra", key="fix/one")
-        self._age(self._session("fix/one"), 48)
+    def test_a_clone_reaps_its_own_stale_destination_dirty_or_not(self):
+        """A copy an interrupted attempt left on this branch is the one the next
+        `prepare` for the branch meets; past the TTL it goes the way of every
+        other stale copy instead of standing as a refusal nobody can clear."""
+        first = vcs_client.clone("acme/infra", key="fix/one")
+        (Path(first["path"]) / "unfinished.txt").write_text("never committed\n")
+        self._age(self._session("fix/one"), 23)
+        with self.assertRaises(vcs_client.VcsError) as refused:
+            vcs_client.clone("acme/infra", key="fix/one")
+        self.assertIn("uncommitted change", str(refused.exception))
+        self.assertTrue((Path(first["path"]) / "unfinished.txt").exists())
+        self._age(self._session("fix/one"), 25)
         cloned = vcs_client.clone("acme/infra", key="fix/one")
+        self.assertEqual(cloned["path"], first["path"])
         self.assertTrue(Path(cloned["path"]).exists())
+        self.assertFalse((Path(cloned["path"]) / "unfinished.txt").exists())
+        self.assertEqual([vcs_client.key_of(s) for s in vcs_client.all_sessions()], ["fix/one"])
 
     def test_a_record_naming_a_path_outside_the_root_is_never_reaped(self):
         """The record is a file the sandbox user can write; its path must not become a delete primitive."""

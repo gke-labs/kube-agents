@@ -773,20 +773,23 @@ def _last_touched(session: dict, tree: Path) -> float:
     return max(stamps, default=0.0)
 
 
-def reap_stale_copies(keep: Path | None = None, *, ttl_hours: float | None = None) -> list[str]:
+def reap_stale_copies(*, ttl_hours: float | None = None) -> list[str]:
     """Delete working copies, and their records, that nobody has touched inside the TTL.
 
     Only copies with a record are considered, and only a record whose tree is
     under `ROOT`: the path is read from a file the sandbox user can write, and
-    this must not become a way to delete anything else. `keep` is the copy the
-    caller is about to take, so a clone never reaps its own destination.
+    this must not become a way to delete anything else. The caller's own
+    destination is not spared: a copy left by an interrupted attempt on this
+    branch, dirty or not, is the one a later `prepare` for the same branch
+    would otherwise meet as a refusal for as long as no clone for another
+    branch happened to run, and the TTL already answers for every other
+    branch's unpublished work.
     """
     ttl = COPY_TTL_HOURS if ttl_hours is None else ttl_hours
     if ttl <= 0:
         return []
     cutoff = time.time() - ttl * 3600.0
     root = ROOT.resolve()
-    spared = keep.resolve() if keep else None
     removed: list[str] = []
     for session in all_sessions():
         try:
@@ -794,7 +797,7 @@ def reap_stale_copies(keep: Path | None = None, *, ttl_hours: float | None = Non
             resolved = tree.resolve()
         except (KeyError, TypeError, OSError):
             continue
-        if tree.is_symlink() or resolved == spared or resolved.parent != root:
+        if tree.is_symlink() or resolved.parent != root:
             continue
         if _last_touched(session, tree) >= cutoff:
             continue
@@ -832,8 +835,10 @@ def clone(
     _refuse_a_collision(destination, answer["forge"], answer["repo"], key)
     # Here, because this is the one verb that adds to the scratch root. Best
     # effort: a copy that could not be tidied is not a reason to refuse a read.
+    # The destination itself is reaped like any other copy once it is past the
+    # TTL, so `_refuse_to_discard` below guards work someone touched inside it.
     try:
-        reap_stale_copies(keep=destination)
+        reap_stale_copies()
     except OSError:
         pass
     if destination.exists():

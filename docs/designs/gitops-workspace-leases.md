@@ -140,8 +140,8 @@ card's `prepare` either refuse or, with `--force`, delete the first card's unpub
 cards, two copies, and no lease between them — so there is nothing to lease and no
 `assert_lease_owner` for `submit` to call: `--workspace` and `--lease` are both retired flags that
 warn and are ignored. The lease's reaper went with the lease, and `clone` took its job: before
-bringing a copy down it deletes every other copy whose record, index and HEAD log are all older than
-`KUBE_AGENTS_VCS_TTL_HOURS` (default 24, 0 turns it off). Nothing else would — a landed `submit`
+bringing a copy down it deletes every copy, its own destination included, whose record, index and HEAD log are all older than
+`KUBE_AGENTS_VCS_TTL_HOURS` (default 24, 0 turns it off), so a copy an interrupted attempt left on a branch does not stand as a refusal for every later `prepare` on it. Nothing else would — a landed `submit`
 leaves its copy behind, and a second round re-clones the branch anyway. Where a repository is cloned twice, `--repo` no longer identifies a copy on
 its own; the directory the caller is standing in does, and a caller that is standing nowhere is
 refused with the paths. `prepare --branch <name>` brings the repository down and

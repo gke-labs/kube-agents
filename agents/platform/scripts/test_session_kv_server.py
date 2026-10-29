@@ -5,7 +5,9 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import unittest
 from unittest.mock import MagicMock, patch
@@ -3182,7 +3184,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(body.count("--force"), 1, body)
         self.assertIn("do not re-run it and never pass `--force`", body)
         self.assertIn("Complete this card with the refusal quoted in `result`", body)
-        self.assertIn("removed after its TTL (`reap_stale_copies`)", body)
+        self.assertIn("is removed by the next `prepare` for this branch, so a later card starts clean", body)
+        self.assertIn("one that arrives sooner meets the same refusal and completes the same way", body)
+        self.assertNotIn("reap_stale_copies", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
         self.assertNotIn("with uncommitted work on branch", body)
@@ -3204,9 +3208,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertIn("If the triage parent has no report (`result` is empty or its `status` is not `done`)", body)
         self.assertIn("Never change the live cluster directly", body)
         self.assertIn("open nothing", body)
-        import vcs_client
-        self.assertTrue(callable(vcs_client.reap_stale_copies))
-        self.assertGreater(vcs_client.COPY_TTL_HOURS, 0)
+        # The card's "24 hours by default" is vcs_client's default copy TTL.
+        self.assertEqual(float(os.environ.get("KUBE_AGENTS_VCS_TTL_HOURS", "24")), 24.0)
+        self.assertIn("(24 hours by default)", body)
 
     def test_without_a_live_sibling_call_2_has_the_one_parent(self):
         self.assertFalse(self.board.exists())
@@ -3259,7 +3263,10 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "t_bbbbbbbb")
 
     def test_a_malformed_card_id_is_kept_out_of_the_prompt(self):
-        for bad in ("t_../../etc", "T_0A43CF9C", "t_0a43cf9", "x_0a43cf9c", "t_0a43cf9c`; drop", "t_" + "f" * 33):
+        for bad in (
+            "t_../../etc", "T_0A43CF9C", "t_0a43cf9", "x_0a43cf9c", "t_0a43cf9c`; drop", "t_" + "f" * 33,
+            "t_0a43cf9c\n", " t_0a43cf9c", "t_0a43cf9c ",
+        ):
             with self.subTest(id=bad):
                 if self.board.exists():
                     self.board.unlink()
@@ -3269,6 +3276,59 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                 self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
                 self.assertFalse(any(bad in line for line in logs.output), logs.output)
                 self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+
+    def test_the_settled_statuses_are_the_card_stop_routes(self):
+        self.assertEqual(session_kv_server.CARD_STOP_SETTLED_STATUSES, frozenset(session_kv_server.KANBAN_SETTLED_STATUSES))
+        self.assertEqual(session_kv_server.KANBAN_SETTLED_STATUSES, ("done", "archived"))
+
+    def test_same_branch_starts_take_one_lock_only_with_the_opt_in_on(self):
+        replica_a = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-zwv24"}
+        replica_b = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-k8m12"}
+        other = {**self.PAYLOAD, "name": "other-pod"}
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False):
+            lock_a = session_kv_server._incident_start_lock(replica_a, "k8s-evt-a")
+            lock_b = session_kv_server._incident_start_lock(replica_b, "k8s-evt-b")
+            self.assertIs(lock_a, lock_b)
+            self.assertIsInstance(lock_a, type(threading.Lock()))
+            self.assertIn(lock_a, session_kv_server._INCIDENT_START_LOCKS)
+            self.assertIn(session_kv_server._incident_start_lock(other, "k8s-evt-c"), session_kv_server._INCIDENT_START_LOCKS)
+            for kind in (session_kv_server.INJECT_KIND_DRIFT, session_kv_server.INJECT_KIND_STALL):
+                self.assertIsInstance(session_kv_server._incident_start_lock({"kind": kind}, "s"), nullcontext)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.ENV, None)
+            self.assertIsInstance(session_kv_server._incident_start_lock(replica_a, "k8s-evt-a"), nullcontext)
+
+    def test_same_branch_starts_run_one_after_the_other(self):
+        # The second start's turn, and so its sibling lookup, begins only once
+        # the first start's turn has returned with its cards filed.
+        entered = threading.Event()
+        release = threading.Event()
+        turns = []
+
+        def turn(start):
+            turns.append(start.session_id)
+            entered.set()
+            release.wait(5)
+
+        def start(session_id, name):
+            return session_kv_server._TriageStart(session_id, {**self.PAYLOAD, "name": name}, None, None, 0.0)
+
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False), patch.object(
+            session_kv_server, "_attempt_triage_start_unlocked", side_effect=turn
+        ):
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first.start()
+            self.assertTrue(entered.wait(5))
+            second.start()
+            second.join(0.3)
+            self.assertTrue(second.is_alive())
+            self.assertEqual(turns, ["k8s-evt-a"])
+            release.set()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
+        self.assertFalse(first.is_alive() or second.is_alive())
 
     def test_an_unreadable_board_fails_open_to_the_one_parent(self):
         import sqlite3

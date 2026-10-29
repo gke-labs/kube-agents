@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zlib
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
@@ -320,14 +321,25 @@ INCIDENT_PR_ASSIGNEE = "platform"
 INCIDENT_PR_CARD_TITLE_PREFIX = "Open GitOps PR for "
 # The statuses at which a card no longer holds its children: Hermes'
 # dispatcher (`_parents_satisfied`) promotes a child once every parent is one
-# of these. A pull-request card in any other status (`todo`, `running`,
-# `blocked`) still owns its branch's checkout, and a new card for that branch
-# is parented on it so the dispatcher runs the two in sequence.
-INCIDENT_PR_SIBLING_SETTLED_STATUSES = ("done", "archived")
-# The shape of a Hermes card id (`t_` and the leading hex digits of a uuid4).
-# An id read from the board that does not match is not written into the
-# front door's prompt.
-INCIDENT_PR_SIBLING_ID_RE = re.compile(r"^t_[0-9a-f]{8,32}$")
+# of these. The sibling lookup and the card-stop route both read it: a
+# pull-request card in any other status (`todo`, `running`, `blocked`) still
+# owns its branch's checkout, and a new card for that branch is parented on
+# it so the dispatcher runs the two in sequence.
+KANBAN_SETTLED_STATUSES = ("done", "archived")
+# The shape of a Hermes card id: `t_` and the hex digits Hermes mints (eight
+# today, from `secrets.token_hex`). An id read from the board that does not
+# match in full is not written into the front door's prompt.
+INCIDENT_PR_SIBLING_ID_RE = re.compile(r"t_[0-9a-f]{8,32}")
+# Same-branch triage starts run one at a time while the opt-in is on, so the
+# second start's sibling lookup sees the card the first start's front-door
+# turn filed (`/chat` returns once the turn has filed its cards). The lock is
+# one of a fixed number of stripes keyed by the branch, so the table never
+# grows with the number of incidents; two branches sharing a stripe only wait
+# on each other. Held for at most one turn (TRIAGE_CHAT_TIMEOUT_S plus the
+# retry budget), so a waiter costs a pool slot for that long and no longer.
+INCIDENT_START_LOCK_STRIPES = 64
+# A wait on that lock at or past this many seconds is logged.
+INCIDENT_START_WAIT_LOG_S = 1.0
 # The newest unsettled pull-request card whose body names the branch. `instr`
 # rather than `LIKE`, so nothing in the branch is read as a wildcard.
 INCIDENT_PR_SIBLING_SQL = """
@@ -2855,9 +2867,15 @@ def _live_pull_request_sibling(branch: str) -> str:
     as a second parent of the new card, and the dispatcher runs them in turn.
 
     Read-only, and it fails open: no board yet, a board that cannot be read, a
-    status past `INCIDENT_PR_SIBLING_SETTLED_STATUSES`, or an id that is not
-    shaped like a card id all give "" and today's single-parent prompt. A
-    failure here is logged and never reaches the triage start thread.
+    status in `KANBAN_SETTLED_STATUSES`, or an id that is not shaped like a
+    card id all give "" and today's single-parent prompt. A failure here is
+    logged and never reaches the triage start thread.
+
+    The lookup runs when the start is dequeued, before the front door's turn
+    files anything, so two starts for one branch running at once would each
+    find no sibling; `_attempt_triage_start` holds the branch's start lock
+    (`_incident_start_lock`) across the turn so the second one looks after the
+    first has filed its cards.
     """
     if not branch:
         return ""
@@ -2868,7 +2886,7 @@ def _live_pull_request_sibling(branch: str) -> str:
             (
                 len(INCIDENT_PR_CARD_TITLE_PREFIX),
                 INCIDENT_PR_CARD_TITLE_PREFIX,
-                *INCIDENT_PR_SIBLING_SETTLED_STATUSES,
+                *KANBAN_SETTLED_STATUSES,
                 branch,
             ),
         ).fetchone()
@@ -2882,7 +2900,7 @@ def _live_pull_request_sibling(branch: str) -> str:
     except Exception as exc:  # noqa: BLE001 - a board that cannot be read must not stop the triage
         logger.warning(f"INCIDENT_PR_SIBLING_LOOKUP_FAILED branch={branch} error={type(exc).__name__}: {exc}")
         return ""
-    if not INCIDENT_PR_SIBLING_ID_RE.match(sibling):
+    if not INCIDENT_PR_SIBLING_ID_RE.fullmatch(sibling):
         if sibling:
             logger.warning(f"INCIDENT_PR_SIBLING_IGNORED branch={branch} id_len={len(sibling)}")
         return ""
@@ -2939,8 +2957,8 @@ def _triage_pr_task_body(payload: Dict[str, Any], session_id: str) -> str:
         f"revise it rather than opening a second. If `prepare` refuses because a copy of the repository is already there (its "
         f"message reads `there is already a copy at <path> with ...` and offers to replace it), do not re-run it and never pass "
         f"`--force`: that copy may hold another card's unpublished work, and you cannot tell from here. Complete this card with the "
-        f"refusal quoted in `result`; an untouched copy is removed after its TTL (`reap_stale_copies`), and the next card for this "
-        f"branch starts clean.\n"
+        f"refusal quoted in `result`. A copy nobody touches for the copy TTL (24 hours by default) is removed by the next `prepare` "
+        f"for this branch, so a later card starts clean; one that arrives sooner meets the same refusal and completes the same way.\n"
         f"4. **Never change the live cluster directly** — no `kubectl apply`, `patch`, `scale`, `edit` or `delete`, and no "
         f"write outside the Pull Request.\n"
         f"5. **Finish with `kanban_complete(result=..., summary=...)`.** `result` gives the Pull Request URL, the option it "
@@ -3050,6 +3068,10 @@ def _build_agent_query_with_pull_request(payload: Dict[str, Any], session_id: st
     makes the dispatcher run the pull-request cards one after the other, and
     `prepare` hands the later one the open pull request to revise. A `blocked`
     sibling holds the new card in `todo`, where `kanban_board_health` lists it.
+    Hermes copies `kanban_notify_subs` from every card named in `parents`
+    (`_inherit_notify_subs`; `deploy/docker/patches/kanban_auto_subscribe.py`
+    records it), so the new card also posts its lines into the earlier alert's
+    thread, which is where that incident's pull request was first announced.
     """
     event_reason = payload.get("reason") or TRIAGE_DEFAULT_REASON
     namespace = payload.get("namespace") or TRIAGE_DEFAULT_NAMESPACE
@@ -3890,7 +3912,34 @@ def _run_triage_start(start: _TriageStart) -> None:
         _triage_not_started(start, f"error-{type(exc).__name__}")
 
 
+_INCIDENT_START_LOCKS = [threading.Lock() for _ in range(INCIDENT_START_LOCK_STRIPES)]
+
+
+def _incident_start_lock(payload: Dict[str, Any], session_id: str):
+    """The lock a triage start holds across its front-door turn, or none.
+
+    Only an event start on an install that opens the pull request itself takes
+    one, keyed by the incident branch (`_incident_branch`): that is the one
+    turn whose prompt depends on what an earlier turn for the same branch
+    filed (`_live_pull_request_sibling`). Drift and stall starts, and every
+    start with the opt-in off, run as before.
+    """
+    if payload.get("kind") in (INJECT_KIND_DRIFT, INJECT_KIND_STALL) or not _incident_triage_opens_pull_request():
+        return nullcontext()
+    branch = _incident_branch(session_id, payload)
+    return _INCIDENT_START_LOCKS[zlib.crc32(branch.encode("utf-8")) % INCIDENT_START_LOCK_STRIPES]
+
+
 def _attempt_triage_start(start: _TriageStart) -> None:
+    began = time.monotonic()
+    with _incident_start_lock(start.payload, start.session_id):
+        waited = time.monotonic() - began
+        if waited >= INCIDENT_START_WAIT_LOG_S:
+            logger.info(f"INCIDENT_START_SERIALIZED session={start.session_id} waited={waited:.0f}s")
+        _attempt_triage_start_unlocked(start)
+
+
+def _attempt_triage_start_unlocked(start: _TriageStart) -> None:
     session_id = start.session_id
     waited = time.monotonic() - start.queued_at
     logger.info(f"TRIAGE_DEQUEUED session={session_id} waited={waited:.0f}s")
@@ -8220,7 +8269,7 @@ def get_task(task_id: str) -> Dict[str, Any]:
 
 # Hermes' terminal statuses. Every other status Hermes declares is open, and
 # open is what gets archived.
-CARD_STOP_SETTLED_STATUSES = frozenset({"done", "archived"})
+CARD_STOP_SETTLED_STATUSES = frozenset(KANBAN_SETTLED_STATUSES)
 # The open cards one call archives in a pass. A conversation's real tree is a
 # handful; past this the response says `truncated`, the pass keeps the deepest
 # cards (so no kept card gates a dropped one), and the re-scans take the rest.
