@@ -6,8 +6,9 @@
 - **Companions:** the persona format and adapters
   ([`a2a/lib/persona/README.md`](../../a2a/lib/persona/README.md), #3656), which this extends
   with an inbound API descriptor; [`spec-profiles-dispatch.md`](spec-profiles-dispatch.md)
-  (AgentProfiles, #3654); [`credential-proxy-single-pod.md`](credential-proxy-single-pod.md),
-  whose `api-proxy` role runs the door.
+  (AgentProfiles, #3654); the PlatformAgent API section of
+  [`credential-isolation-design.md`](../credential-isolation-design.md#platformagent-api), which
+  describes the door as it is today.
 
 Line references are to `main` at `b04752be`. `CP` is
 `agents/platform/scripts/credential_proxy.py` and `PM` is
@@ -22,10 +23,12 @@ proxy image with `CREDENTIAL_PROXY_ROLE=api-proxy` (PM:4154-4345), serving `Agen
 It does two things:
 
 - **It authenticates one shared key.** It compares `Authorization: Bearer <key>` in constant time
-  against `API_SERVER_EXTERNAL_KEY` (CP:2682-2687). Every holder of that key is the same caller
+  against `API_SERVER_EXTERNAL_KEY` (CP:2682-2687), which the operator fills from the
+  `API_SERVER_KEY` entry of the `apiServerSecretRef` Secret (PM:4321-4338). That Secret entry is
+  the real key; the `API_SERVER_KEY` the agent container itself sees is the non-secret sentinel. Every holder of that key is the same caller
   to the door.
 - **It forwards everything else.** GET, POST, PUT, PATCH and DELETE on any path go to the Hermes
-  API server on `127.0.0.1:8642`, re-signed with the in-pod loopback marker (CP:2666-2679,
+  API server on `127.0.0.1:8642`, re-signed with the in-pod non-secret sentinel (CP:2666-2679,
   CP:2716-2736). The one exception is a request that names an `a2a-*` session, or a child of one,
   in a header, a path segment or a top-level body key (CP:2770-2882). Those get 403.
 
@@ -78,7 +81,7 @@ code says two of those don't cross the door:
   `slack_sessions.go`, `a2adoor_google.go`). Its inject door on `:8099` is a server, with its own
   token (`a2a/gateway/inject.go:22-57`).
 - **The hermes-bridge goes around the door.** It posts to `127.0.0.1:8642/v1/chat/completions` in
-  the agent pod with the loopback marker and `a2a-<contextId>` session headers
+  the agent pod with the non-secret sentinel and `a2a-<contextId>` session headers
   (`a2a/hermes-bridge/api.go:56,473-482`). The door's `a2a-*` refusal exists to keep `:8643` key
   holders out of those sessions (CP:2835-2842).
 
@@ -96,7 +99,7 @@ triage reads use `kubectl exec` and sqlite, so none of those cross the door
 
 ### 3.2 Loopback callers
 
-These use the loopback marker on `127.0.0.1:8642` and never cross the door:
+These use the non-secret sentinel on `127.0.0.1:8642` and never cross the door:
 
 - the operator's readiness probe (PM:5180-5192);
 - `leader_elect.py`;
@@ -244,7 +247,7 @@ The descriptor's rules are what keep a harness from widening the door:
 - Paths are literal apart from `{session}`. There are no wildcards and no prefix matches.
 - The door matches the request's method and path exactly, and it forwards the same path it
   matched. Today it decodes and normalises for the `a2a-*` check (CP:2854-2866) but forwards the
-  raw path (CP:2724), and the harness decodes once, so the two could see different paths. The door
+  raw path (CP:2738), and the harness decodes once, so the two could see different paths. The door
   refuses any request whose raw path isn't already in canonical form, rather than trying to
   forward a rewritten one.
 - Headers, body keys and query parameters outside the route's lists are refused, not stripped, so
@@ -516,7 +519,7 @@ tells an operator whether anything of theirs would be refused.
 1. **Loopback scope.** Should the descriptor also govern in-pod callers, for example through a
    second door on loopback that the in-pod callers use with their own classes? That would bring the
    bridge and the Session KV server under the same table, at the cost of a hop for every turn.
-2. **`/p/{profile}` routes.** The door re-signs them with the loopback marker, and Hermes checks a
+2. **`/p/{profile}` routes.** The door re-signs them with the non-secret sentinel, and Hermes checks a
    profile-scoped key for a named profile. Do profile routes work through the door at all today?
    If not, the descriptor can leave them out.
 3. **Runs and jobs reachability.** Today `/api/jobs` and `/v1/runs` are open to a key holder.
