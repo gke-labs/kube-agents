@@ -20624,8 +20624,9 @@ def _row_namespace(finding: dict) -> str:
     namespace = str(finding.get("namespace") or "").strip()
     if _id_segment(namespace) == ID_EMPTY_SEGMENT:
         return ""
-    kind, _, name = str(finding.get("object") or "").rpartition("/")
-    if kind.rpartition("/")[2].lower() in NAMESPACE_KIND_SPELLINGS or (not kind and name == namespace):
+    kind, _, name = str(finding.get("object") or "").strip().rpartition("/")
+    kind = kind.rpartition("/")[2].strip()
+    if kind.lower() in NAMESPACE_KIND_SPELLINGS or (not kind and name.strip() == namespace):
         return ""
     return namespace
 
