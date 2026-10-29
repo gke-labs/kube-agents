@@ -360,6 +360,55 @@ class CronHelperJobsTest(unittest.TestCase):
         self.assertIn("| `every 5m` |", body)
 
 
+class GovernanceAuditsTest(unittest.TestCase):
+    """The governance page's matrix is the roster's audits, in README order."""
+
+    def test_the_block_is_registered_for_the_governance_page(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["governance-audits"],
+            ((generate_docs.GOVERNANCE_PAGE,), generate_docs.gen_governance_audits),
+        )
+
+    def test_each_audit_is_a_row_with_its_sop_watchdog_cadence_and_name(self):
+        audits = generate_docs.governance_audits()
+        self.assertTrue(audits)
+        body = generate_docs.gen_governance_audits()
+        rows = [line for line in body.splitlines()[2:]]
+        self.assertEqual(len(rows), len(audits))
+        for audit, row in zip(audits, rows):
+            self.assertEqual(
+                row,
+                "| `{sop}` | `{id}` | {cadence} | {name} |".format(
+                    sop=Path(audit["sop"]).name,
+                    id=audit["id"],
+                    cadence=generate_docs.CRON_CADENCE[audit["expr"]],
+                    name=generate_docs.md_escape(audit["name"]),
+                ),
+            )
+
+    def test_script_jobs_are_not_in_the_matrix(self):
+        body = generate_docs.gen_governance_audits()
+        for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER):
+            if job.get("no_agent"):
+                self.assertNotIn(f"`{job['id']}`", body)
+
+
+class CadenceCellTest(unittest.TestCase):
+    """One helper decides what every generated cadence cell shows."""
+
+    def test_a_glossed_expression_shows_its_gloss(self):
+        self.assertEqual(generate_docs.cadence_cell({"expr": "20 6 * * *"}), "Daily 06:20")
+
+    def test_an_unglossed_expression_shows_itself_or_the_fallback(self):
+        self.assertEqual(generate_docs.cadence_cell({"expr": "7 3 * * 2"}), "`7 3 * * 2`")
+        self.assertEqual(generate_docs.cadence_cell({"expr": "7 3 * * 2"}, "—"), "—")
+
+    def test_an_interval_schedule_shows_its_display(self):
+        schedule = {"kind": "interval", "minutes": 5, "display": "every 5m"}
+        self.assertEqual(generate_docs.cadence_cell(schedule), "`every 5m`")
+        self.assertEqual(generate_docs.schedule_expr(schedule), ("", "every 5m"))
+
+
 class CRDFieldBlocksTest(unittest.TestCase):
     """The three CRD field pages are registered, rendered as tables, and selectable."""
 
