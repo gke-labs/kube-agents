@@ -3285,3 +3285,63 @@ def test_a_stop_that_drops_once_in_transport_is_retried(
 
     assert drops == [1]
     assert answers[0][0] is True
+
+
+# A mid-turn stop (stop_hook.MID_TURN_DIRECTIVE): the `stop` goes from the
+# opening exchange's polls while the task is working, before its terminal.
+
+MID_TURN_ASK = f"{stop_hook.MID_TURN_DIRECTIVE} after=0.5 observe=60\nscale checkout-gateway to 4"
+
+
+def run_mid_turn_ask(
+    stub: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, *, finish_first: bool = False
+) -> tuple[Any, list[Any], list[bool]]:
+    """Run MID_TURN_ASK against a task that runs until the stop cancels it
+    (or, ``finish_first``, completes at once). Returns the result, what the
+    stop seam was handed, and, per stop sent, whether the opening task was
+    still running when it went."""
+    if finish_first:
+        stub.entries = completed_transcript(stub.task_id, "filed a card")
+    else:
+        stub.entries = running_transcript(stub.task_id)
+    real_submit = inject.InjectTask.submit
+    running_at_stop: list[bool] = []
+
+    def submit(self: Any) -> str:
+        if self.prompt == stop_hook.STOP_WORD:
+            running_at_stop.append(not any(e["kind"] == inject.ENTRY_TERMINAL for e in stub.entries))
+            refuse_no_task(stub)
+            stub.entries = stub.entries + [
+                entry(len(stub.entries) + 1, inject.ENTRY_TERMINAL, taskId=stub.task_id, state="canceled",
+                      source=inject.TERMINAL_SOURCE_EXECUTOR),
+            ]
+        return real_submit(self)
+
+    monkeypatch.setattr(inject.InjectTask, "submit", submit)
+    answers: list[Any] = []
+
+    def seam(self: Any, result: Any, session_id: str, stop: Any, *, send_stop: Any, poll_interval: float) -> None:
+        answers.append(send_stop())
+
+    monkeypatch.setattr(KubeAgentsHarness, "_stop_after_first_card", seam)
+    return KubeAgentsHarness().run(MID_TURN_ASK), answers, running_at_stop
+
+
+def test_a_mid_turn_stop_goes_while_the_opening_task_runs(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, answers, running_at_stop = run_mid_turn_ask(stub_gateway, monkeypatch)
+
+    assert stub_gateway.submissions[0]["text"] == "scale checkout-gateway to 4"
+    assert stub_gateway.submissions[-1]["text"] == stop_hook.STOP_WORD
+    assert running_at_stop == [True]
+    assert answers[0][0] is True
+
+
+def test_a_turn_that_ends_before_the_mid_turn_stop_sends_none(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, answers, running_at_stop = run_mid_turn_ask(stub_gateway, monkeypatch, finish_first=True)
+
+    assert running_at_stop == []
+    assert answers[0] == (False, "the opening turn ended before the stop could land while it ran")

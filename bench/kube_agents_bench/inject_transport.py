@@ -58,6 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
 
 __all__ = [
@@ -1497,7 +1498,13 @@ class InjectTask:
         self.task_id = probe.task_id
         return self.task_id
 
-    def await_terminal(self, task_id: str, *, deadline: float) -> Exchange:
+    def await_terminal(
+        self,
+        task_id: str,
+        *,
+        deadline: float,
+        on_poll: Callable[[Fold], None] | None = None,
+    ) -> Exchange:
         """Await the terminal of ``task_id``, folding what the relay posts.
 
         A function of a task id rather than of "the task I submitted", so the
@@ -1520,6 +1527,9 @@ class InjectTask:
             deadline: ``time.monotonic()`` instant after which the wait ends
                 on the read route's answer. The budget behind it clears the
                 floor (:func:`check_budget`).
+            on_poll: Called with the fold after each read has been folded in,
+                before the wait decides what the read means: the harness's
+                mid-turn stop sends from here (:mod:`stop_hook`).
 
         Raises:
             InjectUnavailable: The gateway could not be reached or was lost.
@@ -1540,6 +1550,8 @@ class InjectTask:
             if answered is not None:
                 probe = answered
                 adopted = self._note(fold, task_id, answered)
+            if on_poll is not None:
+                on_poll(fold)
                 if answered.could_look and answered.concerns(task_id) and not fold.final:
                     if answered.final:
                         if not adopted:
