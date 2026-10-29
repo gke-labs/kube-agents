@@ -330,7 +330,8 @@ So this design adds a **positive origin marker per session**, written by whoever
 session:
 
 - **The record:** `session id → origin`. Origin is one of a small enum: `console`, `eval`, `ops`,
-  `a2a`, `triage`, `scheduled`, `watcher`. The record lives with the session registry that already
+  `a2a`, `triage` (a session opened for a cluster event) and `scheduled` (a session a schedule
+  opened). The record lives with the session registry that already
   exists in the pod, the Session KV server, and is written once. A continuation after compression
   inherits its parent's origin through `parent_session_id`, the same walk the door already does for
   `a2a-*` children (CP:2789-2825).
@@ -346,8 +347,10 @@ session:
     descriptor can't offer `turn.respond` with origin scoping (§9).
   - The door never stamps an origin onto a session that already exists. An existing session with no
     record stays unreadable, rather than becoming the first caller's.
-- **Around the door:** the in-pod starters (the bridge for `a2a`, the Session KV server for
-  triage, the scheduler, the event watcher) write their origin when they start a session. These
+- **Around the door:** the in-pod starters write their origin when they start a session: the
+  bridge writes `a2a`, the Session KV server writes `triage` for the sessions it opens for cluster
+  events, and the harness's scheduler writes `scheduled`. The event watcher itself starts no
+  session; it only checks the agent API is up (§3.2). These
   are in-pod writers inside one trust boundary, so a declared origin is good enough for them.
 - **No record means no read.** A session with no origin record is readable by no class through the
   door. That fails closed where today's inference fails open.
@@ -445,12 +448,14 @@ tells an operator whether anything of theirs would be refused.
      their own.
    - The shared key stays valid as class `legacy`, allowed the union of today's operations, and is
      deprecated.
-   - The web console mounts the console key's Secret. Today it hard-codes the shared key's name
-     rather than following the CR's `apiServerSecretRef` (`web-console.yaml:32,187-191`), which
-     this phase removes.
+   - The web console mounts the console key's Secret. Today the chart gives the web console and
+     the CR's `apiServerSecretRef` the same Secret, from one value (`web-console.yaml:32,187-191`,
+     `platform-agent-cr.yaml:124-126`). A CR applied outside the chart with its own
+     `apiServerSecretRef` would leave the console on the chart's Secret, so the console key should
+     be named in one place that both read.
 4. **Record origins.**
    - The door records origins for its classes, and the in-pod starters (the bridge, the Session KV
-     server, the scheduler, the event watcher) record theirs.
+     server and the scheduler) record theirs.
    - Backfill existing sessions once: `a2a-*` and `web-console-*` from the id convention, triage
      and scheduled sessions from their own id patterns (`a2a/cmd/web-console/activity.go:152-155`),
      and the rest from the Session KV server's records.
@@ -542,6 +547,6 @@ tells an operator whether anything of theirs would be refused.
 
 One issue per rollout phase (§6), plus:
 
-- the web console's hard-coded Secret key name;
+- naming the console key's Secret in one place that the web console and the CR both read (§6, phase 3);
 - NetworkPolicy ingress narrowing (§8);
 - whichever open questions (§9) are decided as work.
