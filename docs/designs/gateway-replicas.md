@@ -8,12 +8,9 @@ with no gateway: chat turns aren't taken, task events aren't relayed, and the HT
 This document decides how the gateway runs at more than one replica, in the order the build lands.
 
 The goal is availability: a gateway that keeps answering through a rollout and survives losing a
-node. Throughput isn't the constraint today. One gateway is a small, I/O-bound process, and the
-work it fronts runs in the session pods, the bridge and the profile workers.
-
-It builds on the relay's delivery model (`spec-chatops-gateway.md`, the relay sections) and on the
-bus going highly available (the NATS HA work). Gateway HA without bus HA moves the single point of
-failure rather than removing it.
+node. It builds on the relay's delivery model (`spec-chatops-gateway.md`, the relay sections) and
+on the bus going highly available (the NATS HA work: three servers, streams and buckets at three
+replicas). Gateway HA without bus HA moves the single point of failure rather than removing it.
 
 ## What breaks with two replicas today
 
@@ -21,8 +18,8 @@ The code assumes one process in four places, each of which would misbehave on it
 
 - **Ingress reaches every replica.** The console's `chat.console.*.in` and the three
   `chat.notify.*` subjects are core NATS subscriptions with no queue group, so each replica takes
-  every frame and every notify: two turns per console message, two posts per notify. The
-  Discord client opens an unsharded session per process, and each session gets every message.
+  every frame and every notify: two turns per console message, two posts per notify. The Discord
+  client opens an unsharded session per process, and each session gets every message.
 - **The relay splits a task.** The `gateway-relay` durable hands deliveries to whichever replica
   pulls next, so one task's events land on both. Its render state (chunk assembly, steer counts,
   the rolling line, the console's result stash and cards-pending mark) is per process, and a split
@@ -32,7 +29,8 @@ The code assumes one process in four places, each of which would misbehave on it
   an `ActiveTask`, a `PodName`, a delegation link.
 - **The supervisor loops have no leader.** Reap, sweep and eviction run on every replica. Two can
   publish a supervisor terminal for one task, or delete a pod the other has just spawned and not
-  yet recorded.
+  yet recorded (`deleteIfUntracked` is safe today only because every spawn holds the in-process
+  conversation lock).
 
 The HTTP doors (inject and A2A) keep their conversations in memory too, so a request and its
 follow-up have to reach the same replica.
@@ -40,37 +38,51 @@ follow-up have to reach the same replica.
 ## Decision: active-standby first
 
 **Run two replicas, one active.** A Kubernetes Lease elects the active replica, which does
-everything the gateway does today. The standby runs, connects to nothing that takes work, and
-takes over when the lease moves. Every assumption above stays true, because only one replica acts
-at a time.
+everything the gateway does today. The standby holds a NATS connection and nothing else, and takes
+over when the lease moves. Every assumption above stays true, because only one replica acts at a
+time.
 
-Active-active, where replicas share the work, would need every one of those assumptions
-undone first: queue groups on the core subjects, task affinity on the relay, revision-checked
-writes everywhere, leader-elected loops, and door state in KV or routed to its owner. That's a
-rebuild of the gateway, for throughput nobody needs yet. It's the second phase below, and nothing
-in the first phase blocks it.
+Active-active, where replicas share the work, would need every one of those assumptions undone
+first: queue groups on the core subjects, task affinity on the relay, fenced writes everywhere,
+leader-elected loops, and door state in KV. That's a rebuild of the gateway. It's the second phase
+below. Minting needs nothing either way: a task's capability is created once under its random id.
 
 ### What only the active replica runs
 
-On acquiring the lease, a replica starts what `Run` starts today: the relay subscription, the
-chat backends (Slack Socket Mode, Discord, the Google Chat pull, the console and notify
-subscriptions, the board route), the HTTP doors, and the reap and sweep loops. On losing it, it
-stops them, in the order a shutdown stops them now: intake closes, the batches rendering finish,
-and the relay gives back every event it holds unrendered (the relay's deferred-ack mode).
+On acquiring the lease, a replica starts all of the gateway's work: what `Run` starts today (the
+relay subscription, the chat adapters, the console and board routes, the HTTP doors, the reap and
+sweep loops) and what `realMain` starts before it (the chat.notify notifiers, the Slack home
+channel's learning, answer feedback). All of it moves behind the lease.
 
-The standby holds a NATS connection, so it's warm, and nothing else. It doesn't open Slack's
-socket: Slack would hand it events, and a standby can't take them.
+On losing the lease, or on SIGTERM, it stops in this order:
+
+1. **Ingress first:** Slack's socket closes, Discord's session closes, the Google Chat pull and
+   the core subscriptions (console, notify) stop, and the doors start answering 503. Slack
+   spreads one app's events across its open sockets, so a socket left open on a deposed replica
+   would take a share of messages it can no longer act on.
+2. **The inbound queue:** turns already taken and not yet started are dropped, logged with their
+   conversation. They were acked by their backend, so this is a loss, bounded by the queue's
+   depth at that moment (see "What a failover loses").
+3. **The relay:** the batches rendering finish, and the relay gives back every event it holds
+   unrendered (its deferred-ack mode), in stream order.
+4. **The loops:** reap and sweep stop.
+
+Then it releases the lease.
 
 ### Handover
 
-- **Graceful (a rollout, a drain).** On SIGTERM the active replica stops its work as above, then
-  releases the lease. The standby, which has been retrying the lease, acquires it within its retry
-  period and starts. Events the old replica gave back are redelivered at once, in order. The gap
-  is the standby's retry period plus its start-up, about two seconds.
-- **Crash.** The lease expires (`leaseDuration`, 15s), the standby takes it and starts. Events the
-  dead replica held come back when the relay durable's AckWait (30s) runs out, since nothing gave
-  them back. The relay can't redeliver sooner without a shorter AckWait, which costs more
-  heartbeats; an open question below.
+- **Graceful (a rollout, a drain).** The active replica stops as above and releases the lease.
+  The standby, which has been retrying the lease every `retryPeriod` (2s, jittered to between 2 and
+  4.4s by client-go), acquires it and starts. Events the old replica gave back are redelivered at
+  once, in order. The gap is the standby's next retry plus its start-up (Slack's `auth.test` and
+  socket, Discord's identify, the relay's bind): a few seconds.
+- **Crash.** The lease expires (`leaseDuration`, 15s) and the standby takes it. The dead replica's
+  held relay events come back only when the relay durable's AckWait (30s) runs out, and a newer
+  event the new leader rendered first would leave them rendering late and out of order, possibly
+  after the task's terminal. So after a takeover from an expired lease, the new leader binds the
+  relay only once AckWait has passed since the old leader's last renewal. NATS sends a consumer's
+  pending redeliveries before new messages, so the dead leader's events come back first. Chat
+  ingress starts at once; the relay waits up to 30s.
 - **On the bus's side.** With the bus at three replicas, a stream or consumer leader election (a
   node drain, an upgrade's restart) can add its own few seconds to a redelivery. An ack sent during
   one can be lost, so an event already rendered comes back. The relay recognises it by its stream
@@ -80,18 +92,34 @@ socket: Slack would hand it events, and a standby can't take them.
 
 ### Fencing
 
-A replica that can't renew the lease within `renewDeadline` (10s) stops all its work before the
-lease can expire (15s), so two replicas never act on purpose at once. Clocks and pauses make that a
-target, not a guarantee, so the records are fenced too: session-record writes become
-revision-checked updates, retried on conflict. A stale replica's write then fails instead of
-clobbering the new leader's. A side effect it made before the write, a post, can still happen
-twice in the overlap. That's the same residue the relay already states for a crash between a post
-and its record write.
+A replica that can't renew the lease within `renewDeadline` (10s) steps down, and the stop has to
+fit in the 5s before the lease can expire (`leaseDuration`, 15s). Ingress and the inbound queue
+stop at once; the relay's render drain is bounded by that budget, and a batch still rendering when
+it runs out is abandoned and given back. That makes two replicas acting at once unlikely, not
+impossible: a paused process, or a clock that jumps, can still overlap the next leader.
+
+So writes are fenced by the Lease's own epoch. `leaseTransitions` counts every acquisition, so
+each leader's term has a number no earlier term shares. The session record carries the epoch of
+the term that last wrote it, and `Registry.Update` (a revision-checked read-modify-write) refuses
+a write from an older epoch than the record's, so a deposed leader's write fails rather than
+landing on top of the new one's. The task index and session deletes go through the same check.
+
+The epoch fences records, not every side effect. A deposed leader in the overlap can still post
+to a chat, publish a task or spawn a pod before it learns it lost. Its record write then fails, so
+what it did isn't on record: a post may be duplicated, and a spawned pod is untracked, which the
+new leader's sweep removes (the turn that spawned it is lost with it). That's the residue, and the
+step-down budget keeps its window to seconds.
 
 ### What a failover loses
 
-Process memory doesn't move. Most of it is a cache or is rebuilt from the stream; what isn't:
+Process memory doesn't move, and the bus doesn't hold what nobody was subscribed to.
 
+- **Ingress during the gap:** core NATS keeps nothing for a subject with no subscriber, so a
+  console frame (including the MCP server's turns), and every `chat.notify` report-back from a
+  card, published while no replica holds the subscription is lost. Discord replays nothing to a new
+  session. Slack redelivers what wasn't acked, and the Google Chat pull waits in its queue. The gap
+  is a few seconds on a graceful handover and 15s or more on a crash.
+- **The inbound queue at step-down:** turns taken and not started (above).
 - **Moved to KV in the build:** the console's cards-pending mark (already planned as its own
   change).
 - **Lost, cosmetic:** the notifier's map of update keys to posted messages (an update after a
@@ -99,78 +127,84 @@ Process memory doesn't move. Most of it is a cache or is rebuilt from the stream
   blocks, the once-per-sender dropped-message notice, the Slack interaction state of a question
   someone was answering.
 - **Lost, functional:** an HTTP door's in-memory conversation. A client that submitted to the old
-  replica and polls the new one finds nothing. Inject is a dev and eval door, and an eval run
-  rides out a rollout today by failing; the A2A door's clients see a task they can't read. An open
-  question below.
+  replica finds nothing on the new one. An open question below.
 
 ### Reaching the active replica over HTTP
 
-The inject and A2A doors' Services have no selector. Their endpoints are one EndpointSlice per
-Service, which the operator creates empty, and the active gateway writes its own pod IP into it.
-Readiness stays "healthy", not "active", so a rollout's new pod becomes Ready as a standby and the
-rollout proceeds (the alternatives below say why routing can't ride on readiness).
+The inject and A2A doors bind the pod's loopback, and their Services route nothing. They exist
+so `kubectl port-forward svc/...` can resolve a pod. With two replicas, that can resolve the
+standby. So:
 
-The takeover order bounds when a request can reach the wrong replica:
+- A standby's door answers every request with 503 and the active pod's name, which it reads from
+  the Lease's `holderIdentity`, so a client knows where to port-forward instead.
+- A client that has to reach the active replica port-forwards to `pod/<holder>`, read from the
+  Lease (`kubectl get lease`). The eval harness and the repository's scripts do that.
 
-1. The new leader acquires the Lease, then starts its work, doors included.
-2. Only then does it write its pod IP into the EndpointSlice, replacing whatever was there.
-3. A deposed leader stops serving door requests the moment it loses the Lease, or fails to renew
-   it within `renewDeadline`, before its other work stops. A request that still reaches it
-   before the EndpointSlice moves gets a 503 with `Retry-After`, never an answer from a replica
-   that no longer owns the conversation.
+No routing object moves on a handover, so none needs a grant. A port-forward to the old pod breaks
+when that pod goes, and the client re-resolves the holder.
 
-So both replicas can be addressed only between step 1 and the old endpoint's removal in step 2,
-and in that window the old one refuses rather than serves. kube-proxy picks up the change within
-its own sync interval, typically a second or two.
+### Alternatives considered
 
-If the EndpointSlice write fails, the active gateway keeps retrying with backoff while it holds
-the Lease, and logs and counts each failure. The doors are unreachable meanwhile, and the
-operator, which watches both, sets a `GatewayDoorsUnrouted` condition on the PlatformAgent while
-the EndpointSlice doesn't name the Lease holder's pod. Chat traffic, the relay and the console
-don't use these Services and keep working.
-
-### Alternatives considered for routing
-
-- **Readiness, or a readinessGate, true only on the active replica.** It deadlocks every
-  rollout. A Deployment counts an unready pod as unavailable. With `maxUnavailable: 0` the new
-  pod comes up as a standby and never goes Ready, so the old leader is never stopped. With
+- **Electing through a NATS KV key** instead of a Kubernetes Lease. It needs no Kubernetes grant,
+  and its revision would be an epoch. It lost because the doors' clients reach the active pod
+  with `kubectl`, which can read a Lease and not a bus key, and a Lease already counts its
+  transitions.
+- **Readiness true only on the active replica,** to route by Service. It deadlocks every
+  rollout: a Deployment counts an unready pod as unavailable, so with `maxUnavailable: 0` the new
+  pod never goes Ready as a standby and the old leader is never stopped, and with
   `maxUnavailable: 1` the old leader is the only available pod and can't be taken either. A
-  readinessGate counts toward Ready the same way, and setting it also needs `pods/status`.
-- **A label the active replica sets on its own pod, selected by the Services.** It works, but it
-  needs `patch` on every pod in the namespace (RBAC can't scope it to the gateway's own,
-  generated, pod names), and the label can outlive the lease on a replica that dies mid-update.
-- **The standby proxies door requests to the active replica** (address from the Lease holder). It
-  needs no grant beyond the Lease, but it adds an application-level proxy, an extra hop, a second
-  place for SSE streams to break, and a handover where the proxy itself is pointing at the old
-  leader.
+  readinessGate counts toward Ready the same way. And the doors aren't reached through Service
+  routing anyway.
+- **A label the active replica sets on its own pod.** It needs `patch` on every pod in the
+  namespace, which the gateway's Role refuses on purpose (a pod's image and labels are mutable, and
+  the sweep relies on the gateway holding no pod patch). The label also outlives a container that
+  restarts in the same pod.
+- **A selector-less Service with an EndpointSlice the gateway updates.** It routes nothing for a
+  door bound to loopback, and `kubectl port-forward svc/...` refuses a Service with no selector.
+- **The standby proxying door requests to the active replica.** It adds an application-level
+  proxy, an extra hop and a second place for SSE streams to break, where a 503 naming the holder
+  costs the client one retry.
 
 ## Operator changes
 
-- **Replicas from the CR,** default two on `next` installs, one allowed. Two is the floor for the
-  point of this; more replicas add standbys and nothing else in phase one.
-- **`RollingUpdate`** with `maxSurge: 1`, `maxUnavailable: 0`, replacing `Recreate`. The new pod
-  comes up as a standby before the old one is told to stop.
-- **A PodDisruptionBudget** of `maxUnavailable: 1`, so a node drain takes one replica at a time.
+- **Replicas from the CR,** default two on `next` installs, one allowed. More replicas add
+  standbys and nothing else in phase one.
+- **A readiness probe** that holds the pod not Ready until it has a NATS connection and has read
+  the Lease. Readiness means "healthy", active or not, so a rollout's new pod becomes Ready as a
+  standby.
+- **`RollingUpdate` with `maxSurge: 1`, `maxUnavailable: 0`,** replacing `Recreate`, so the new
+  pod comes up as a standby before an old one stops. A surge pod needs room under the agent
+  namespace's quota; where there's none, the rollout waits, which is the reason `Recreate` was
+  chosen. The operator renders `maxSurge: 0`, `maxUnavailable: 1` instead when the CR asks for one
+  replica. The ReplicaSet may stop the active pod before the standby, which costs a second, graceful
+  handover in one rollout; steering that (the pod-deletion-cost annotation) would need a pod
+  patch, so it isn't done.
+- **A PodDisruptionBudget** of `maxUnavailable: 1`, with `unhealthyPodEvictionPolicy:
+AlwaysAllow` as the callout's has, so a node drain takes one replica at a time and an unhealthy
+  replica never blocks a drain.
 - **A zone topology spread** (`ScheduleAnyway`), as the callout and verifier already have, so a
-  single-zone install still schedules.
+  single-zone install still schedules. On Autopilot the spread and the PDB behave as on Standard:
+  Autopilot honours a PDB on its own node upgrades, and `ScheduleAnyway` asks for no capacity it
+  can't provide.
 - **The Lease, created by the operator** in the agent's namespace, under a fixed name. RBAC can't
   scope `create` to a name, so the operator owns creation, and the gateway's ServiceAccount gets
-  only `get` and `update` on that one Lease (`resourceNames`).
-- **The doors' EndpointSlices, created by the operator** (one per door Service, initially empty).
-  The gateway's ServiceAccount gets `get` and `update` on those, by name, and nothing on pods.
+  only `get` and `update` on that one Lease (`resourceNames`). Nothing else changes in its Role.
 
 ## Build, as follow-ups
 
-1. **Revision-checked session-record writes.** `Registry.Update`, a read-modify-write retried on
-   conflict, replacing the seventeen `Put` callers. It's worth landing on its own: it also closes
-   the races the sweep and the reap have with a spawn today.
-2. **Leader election in the gateway.** Acquire, renew, step down; `Run`'s work gated on holding the
-   lease; the shutdown order on stepping down; release on SIGTERM. Tests on an embedded server
-   with two gateways: one acts, the other doesn't; the lease moves and the work follows.
-3. **Door routing:** the selector-less door Services, the operator-created EndpointSlices and the
-   `GatewayDoorsUnrouted` condition, and the gateway's write after it takes the Lease.
-4. **Operator:** replicas, the strategy, the PDB, the spread and the Lease Role. Its tests pin
-   each.
+1. **Fenced session-record writes.** `Registry.Update`, a revision-checked read-modify-write that
+   refuses a write from an older lease epoch than the record's, replacing the seventeen `Put`
+   callers and covering the task index and session deletes. Until the election exists, every
+   write carries epoch 0.
+2. **Leader election in the gateway.** Acquire, renew and step down; all of `Run`'s and
+   `realMain`'s work gated on the lease; the step-down order and budget above; the relay's delayed
+   bind after a takeover from an expired lease; release on SIGTERM. Tests on an embedded server
+   with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
+   takeover renders the dead leader's held events before newer ones.
+3. **The standby's doors:** 503 with the holder's pod name, and the scripts and the eval harness
+   port-forwarding to the holder.
+4. **Operator:** replicas, the readiness probe, the strategy, the PDB, the spread, the Lease and
+   its Role. Its tests pin each.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.
@@ -184,15 +218,15 @@ fine; state another replica would need isn't.
 
 If throughput ever needs more than one active gateway, the prerequisites are known: queue groups
 on the console and notify subjects; one relay consumer per replica over a sharded filter (by
-conversation), so a task's events stay on one replica; the dedupe rings in KV; the supervisor
-loops on their own lease; and the door conversations in KV. Revision-checked writes (step 1) are
-the one piece phase one already lands.
+conversation), so a task's events stay on one replica, since the relay's deferred-ack model assumes
+one consumer per durable; the dedupe rings in KV; the supervisor loops on their own lease; and the
+door conversations in KV. Fenced writes (step 1) are the one piece phase one already lands.
 
 ## Open questions
 
-- **The relay's AckWait on a crash.** 30s bounds how long a dead active replica's held events wait.
-  A shorter AckWait shortens that, at the cost of more in-progress acks per held event. Worth
-  measuring after the build.
+- **The relay's AckWait.** 30s bounds both how long a dead active replica's held events wait and
+  how long the relay waits after a crash takeover. A shorter AckWait shortens both, at the cost of
+  more in-progress acks per held event. Worth measuring after the build.
 - **The A2A door across a failover.** Its conversations could move to KV so a client can poll the
   new active replica, or the door can say plainly that a failover ends its in-flight requests.
 - **The default replica count** on installs that don't set one.
