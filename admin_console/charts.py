@@ -47,6 +47,15 @@ CONTAINER_LIMIT_KEY = "container limit"
 THRESHOLD_KEY = "threshold"
 CROSSING_KEY = "reaches its limit"
 CLUSTER_AXIS_TITLE = "Clusters × nodes each"
+SHARE_LIMIT_TEXT = "the limit (100%)"
+# Every label at a place on the x axis reads as the axis does: clusters × nodes each.
+SIZE_TEXT = "{clusters:,.0f} × {nodes:g}"
+MEASURED_RANGE_TEXT = "measured: up to {size}"
+PROFILE_TEXT = "{name}: {size}"
+FLEET_KEY = "this fleet: {size}"
+PREDICTION_KEY = "solid line: predicted peak"
+LIMIT_LABEL_SEPARATOR = "limit: "
+LIMIT_LABEL_FONT_SIZE = 11
 CROSSING_SYMBOL = "x"
 CROSSING_MARKER_SIZE = 13
 BOTTLENECK_CHART_HEIGHT = 440
@@ -58,7 +67,9 @@ MEASURED_RANGE_LABEL = "measured"
 MEASURED_RANGE_OPACITY = 0.12
 PROFILE_LINE_WIDTH = 1
 MEASURED_KEY = "measured run"
-BREAKDOWN_CHART_HEIGHT = 360
+BREAKDOWN_CHART_HEIGHT = 460
+BREAKDOWN_LEGEND_Y = -0.3
+BREAKDOWN_TOP_MARGIN = 30
 # A breakdown chart's value axis stops at twice the largest limit, so a line is seen crossing its limit.
 BREAKDOWN_LIMIT_HEADROOM = 2.0
 # Above the largest measured run by a quarter, so the dots sit inside the plot.
@@ -441,12 +452,17 @@ def harness_limit_chart(chart: MetricChart, colors: Mapping[str | None, str]) ->
     return _base_layout(figure, height=HARNESS_CHART_HEIGHT)
 
 
+def _size(clusters: float, nodes_per_cluster: float) -> str:
+    """A fleet size as the x axis writes it: clusters × nodes each."""
+    return SIZE_TEXT.format(clusters=clusters, nodes=round(nodes_per_cluster, 1))
+
+
 def _fleet_hover(fleet: Mapping[str, float]) -> str:
     """The fleet behind one point of the bottleneck chart, as tooltip lines."""
     clusters = fleet[CLUSTERS]
     return "<br>".join(
         (
-            f"{clusters:,.0f} clusters, {clusters * fleet[NODES]:,.0f} nodes ({fleet[NODES]:.1f} per cluster)",
+            f"{_size(clusters, fleet[NODES])} ({clusters * fleet[NODES]:,.0f} nodes)",
             f"{clusters * fleet[OBJECTS]:,.0f} objects ({fleet[OBJECTS]:,.0f} per cluster)",
             f"{fleet[CHURN]:,.0f} Pods created per minute, {fleet[FAILING_PODS]:,.0f} failing at once",
             f"{fleet[CONCURRENT]:,.0f} concurrent requests, {fleet[LISTING_PODS]:,.0f} Pods in the largest listing",
@@ -483,7 +499,10 @@ def bottleneck_chart(
                 showlegend=False,
                 marker={"color": colors[index % len(colors)], "size": CROSSING_MARKER_SIZE, "symbol": CROSSING_SYMBOL,
                         "line": {"color": TEXT, "width": THRESHOLD_LINE_WIDTH}},
-                hovertemplate=f"<b>{escape(item.label)}</b> reaches its limit at about %{{x:,.0f}} clusters<extra></extra>",
+                hovertemplate=(
+                    f"<b>{escape(item.label)}</b> reaches its limit at about "
+                    f"{_size(at, nodes_per_cluster)}<extra></extra>"
+                ),
             )
         )
     if crossings and any(at is not None for at in crossings):
@@ -491,7 +510,7 @@ def bottleneck_chart(
     figure.add_hline(
         y=LIMIT_SHARE,
         line={"color": PALETTE.danger, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
-        annotation_text=LIMIT_SHARE_LABEL,
+        annotation_text=SHARE_LIMIT_TEXT,
         annotation_position="bottom right",
         annotation_font_color=TEXT,
     )
@@ -505,7 +524,7 @@ def breakdown_chart(
     unit: str,
     profiles: tuple[FleetProfile, ...],
     measured: float,
-    fleet_clusters: float,
+    fleet_clusters: float | None,
     colors: Mapping[str | None, str],
     nodes_per_cluster: float,
     log_axis: bool = True,
@@ -515,9 +534,25 @@ def breakdown_chart(
     suffix = f" {unit}" if unit else ""
     figure = _growth_chart(series, profiles, measured, fleet_clusters, palette, nodes_per_cluster, log_axis,
                            value_format=",.2f", value_suffix=suffix, ticks=BREAKDOWN_TICKS)
+    # One labelled line per limit value: containers that share a size share a line and a label.
+    shared: dict[float, list[tuple[BottleneckSeries, str]]] = {}
     for item, color in zip(series, palette):
         if item.limit is not None:
-            figure.add_hline(y=item.limit, line={"color": color, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH})
+            shared.setdefault(item.limit, []).append((item, color))
+    for value, owners in shared.items():
+        color = owners[0][1] if len(owners) == 1 else PALETTE.neutral
+        if len(owners) == 1:
+            text = owners[0][0].limit_label
+        else:
+            size = owners[0][0].limit_label.split(LIMIT_LABEL_SEPARATOR, 1)[-1]
+            text = f"{', '.join(item.label for item, _ in owners)} limit: {size}"
+        figure.add_hline(
+            y=value,
+            line={"color": color, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+            annotation_text=escape(text),
+            annotation_position="top left",
+            annotation_font={"color": color, "size": LIMIT_LABEL_FONT_SIZE},
+        )
     limits = [item.limit for item in series if item.limit is not None]
     if limits:
         owned = any(item.label in colors for item in series)
@@ -532,14 +567,20 @@ def breakdown_chart(
         )
         figure.update_yaxes(range=[0, top])
     figure.update_yaxes(title=f"{title} ({unit})" if unit else title, rangemode="tozero")
-    return _base_layout(figure, height=BREAKDOWN_CHART_HEIGHT)
+    _base_layout(figure, height=BREAKDOWN_CHART_HEIGHT)
+    # Below the plot, so the legend does not cover the example fleets' and the limits' labels.
+    figure.update_layout(
+        legend={"orientation": "h", "yanchor": "top", "y": BREAKDOWN_LEGEND_Y, "xanchor": "left", "x": 0},
+        margin={"t": BREAKDOWN_TOP_MARGIN},
+    )
+    return figure
 
 
 def _growth_chart(
     series: list[BottleneckSeries],
     profiles: tuple[FleetProfile, ...],
     measured: float,
-    fleet_clusters: float,
+    fleet_clusters: float | None,
     colors: list[str],
     nodes_per_cluster: float,
     log_axis: bool,
@@ -578,9 +619,10 @@ def _growth_chart(
                     legendgroup=item.label,
                     showlegend=False,
                     marker={"color": color, "size": HARNESS_MARKER_SIZE, "symbol": EXCLUDED_SYMBOL if excluded else MEASURED_SYMBOL},
-                    customdata=[point.key for point in points],
+                    customdata=[[_size(point.clusters, point.nodes_per_cluster), point.key] for point in points],
                     hovertemplate=(
-                        f"<b>{label}</b>, measured: %{{y:{value_format}}}{value_suffix}<br>%{{x:,.0f}} clusters · %{{customdata}}"
+                        f"<b>{label}</b>, measured: %{{y:{value_format}}}{value_suffix}"
+                        "<br>%{customdata[0]} · %{customdata[1]}"
                         + (f" ({EXCLUDED_LABEL})" if excluded else "")
                         + "<extra></extra>"
                     ),
@@ -591,8 +633,9 @@ def _growth_chart(
     position = math.log10 if log_axis else (lambda value: value)
     figure.add_vrect(x0=first, x1=max(measured, first), fillcolor=PALETTE.neutral, opacity=MEASURED_RANGE_OPACITY, line_width=0)
     figure.add_annotation(
-        x=position(max(measured, first)), y=1, xref="x", yref="paper", text=MEASURED_RANGE_LABEL,
-        showarrow=False, xanchor="right", yanchor="top", font={"color": TEXT},
+        x=position(max(measured, first)), y=1, xref="x", yref="paper",
+        text=MEASURED_RANGE_TEXT.format(size=_size(measured, nodes_per_cluster)),
+        showarrow=False, xanchor="right", yanchor="top", font={"color": TEXT, "size": LIMIT_LABEL_FONT_SIZE},
     )
     for profile in profiles:
         figure.add_vline(
@@ -600,21 +643,24 @@ def _growth_chart(
             line={"color": PALETTE.neutral, "width": PROFILE_LINE_WIDTH, "dash": PREDICTION_DASH},
         )
         figure.add_annotation(
-            x=position(profile.clusters), y=1, xref="x", yref="paper", text=escape(profile.name),
+            x=position(profile.clusters), y=1, xref="x", yref="paper",
+            text=escape(PROFILE_TEXT.format(name=profile.name, size=_size(profile.clusters, nodes_per_cluster))),
             showarrow=False, yanchor="bottom", font={"color": TEXT},
         )
-    figure.add_vline(
-        x=max(fleet_clusters, first),
-        line={"color": PALETTE.accent, "width": HARNESS_LINE_WIDTH, "dash": FLEET_DASH},
-    )
-    _style_key(figure, FLEET_LABEL, dash=FLEET_DASH)
+    if fleet_clusters is not None:
+        figure.add_vline(
+            x=max(fleet_clusters, first),
+            line={"color": PALETTE.accent, "width": HARNESS_LINE_WIDTH, "dash": FLEET_DASH},
+        )
+        _style_key(figure, FLEET_KEY.format(size=_size(fleet_clusters, nodes_per_cluster)), dash=FLEET_DASH)
+    _style_key(figure, PREDICTION_KEY)
     _style_key(figure, MEASURED_KEY, symbol=MEASURED_SYMBOL)
     ticks = [value for value in (ticks or BOTTLENECK_TICKS) if first <= value <= series[0].clusters[-1]] if series else []
     figure.update_xaxes(
         title=CLUSTER_AXIS_TITLE,
         type="log" if log_axis else "linear",
         tickvals=ticks,
-        ticktext=[f"{value:,.0f} × {round(nodes_per_cluster, 1):g}" for value in ticks],
+        ticktext=[_size(value, nodes_per_cluster) for value in ticks],
         showgrid=True,
         gridcolor=GRID,
         zeroline=False,

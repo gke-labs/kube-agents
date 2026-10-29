@@ -1593,6 +1593,8 @@ class MeasuredShare:
     share: float
     key: str
     excluded: bool
+    # The run's own nodes per cluster, from its totals.
+    nodes_per_cluster: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1606,6 +1608,8 @@ class BottleneckSeries:
     measured: tuple[MeasuredShare, ...] = ()
     # The owner's threshold in the series' unit, for a breakdown chart; None on the combined chart.
     limit: float | None = None
+    # What the threshold is, for its label: "platform-agent limit: 8 GiB", "60 s: broker refuses".
+    limit_label: str = ""
 
 
 def _growth_counts() -> tuple[float, ...]:
@@ -1623,6 +1627,7 @@ def _growth(
     divisor: float,
     label: str,
     limit: float | None = None,
+    limit_label: str = "",
 ) -> BottleneckSeries | None:
     """One prediction and its measured runs as the fleet grows in clusters, each value divided by ``divisor``."""
     counts = _growth_counts()
@@ -1640,13 +1645,14 @@ def _growth(
             value / divisor,
             record.key,
             record.excluded(metric) or capped(record, metric, container),
+            record.totals.get(NODES, 0.0) / record.totals[CLUSTERS],
         )
         for record in records
         if record.totals.get(CLUSTERS)
         and (only is None or record.operation in only)
         and (value := record.value(metric, container)) is not None
     )
-    return BottleneckSeries(label, counts, tuple(values), fleets, measured, limit)
+    return BottleneckSeries(label, counts, tuple(values), fleets, measured, limit, limit_label)
 
 
 def _threshold(metric: str, container: str | None, limits: Mapping[str, Mapping[str, float]]) -> float | None:
@@ -1684,9 +1690,14 @@ def breakdown_series(
     spec = metric_spec(metric)
     series = []
     for owner in BREAKDOWN_OWNERS.get(metric, (None,)):
+        threshold = _threshold(metric, owner, limits)
+        if threshold and owner:
+            limit_label = f"{owner} limit: {format_value(metric, threshold)}"
+        else:
+            limit_label = FIXED_LINES[metric][-1].label if threshold else ""
         item = _growth(
             records, fleet, metric, owner, spec.scale, owner or spec.label,
-            limit=(threshold / spec.scale) if (threshold := _threshold(metric, owner, limits)) else None,
+            limit=threshold / spec.scale if threshold else None, limit_label=limit_label,
         )
         if item is not None:
             series.append(item)

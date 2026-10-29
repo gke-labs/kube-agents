@@ -268,7 +268,7 @@ for first_metric in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
                     spec.unit,
                     hl.FLEET_PROFILES,
                     measured,
-                    base[hl.CLUSTERS],
+                    None,
                     colors,
                     base[hl.NODES],
                     log_axis,
