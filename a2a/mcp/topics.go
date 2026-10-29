@@ -129,6 +129,10 @@ type readTopicsArgs struct {
 	Topic  string `json:"topic"`
 }
 
+// errTopicReadsBusy is every topic read in flight (maxTopicReads), a bound on
+// distinct uncached keys, apart from the bus reader slots errReadersBusy names.
+var errTopicReadsBusy = fmt.Errorf("this server is already reading %d topics; try again once a read finishes (each takes at most %s)", maxTopicReads, topicReadTimeout)
+
 // topicCache answers a repeated call from the last read for statusCacheTTL,
 // as the status does, and runs at most one read per key at a time. Each read
 // opens consumers the console cannot delete, which the server reaps only after
@@ -193,7 +197,7 @@ func (c *topicCache) answer(ctx context.Context, key string, read func(context.C
 		}
 		if len(c.inflight) >= maxTopicReads {
 			c.mu.Unlock()
-			return "", errReadersBusy
+			return "", errTopicReadsBusy
 		}
 		r = &topicRead{done: make(chan struct{})}
 		c.inflight[key] = r

@@ -1128,8 +1128,8 @@ func TestTopicReadsInFlightAreBounded(t *testing.T) {
 	}()
 	started := false
 	_, err := c.answer(context.Background(), "one-too-many", func(context.Context) (string, error) { started = true; return "", nil })
-	if !errors.Is(err, errReadersBusy) || started {
-		t.Fatalf("a read past the bound: err %v, started %v; want errReadersBusy and no read", err, started)
+	if !errors.Is(err, errTopicReadsBusy) || started {
+		t.Fatalf("a read past the bound: err %v, started %v; want errTopicReadsBusy and no read", err, started)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
