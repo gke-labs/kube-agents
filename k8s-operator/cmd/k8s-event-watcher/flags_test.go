@@ -163,7 +163,7 @@ func TestFlagsFilterThresholds(t *testing.T) {
 		t.Fatalf("parseFlags: %v", err)
 	}
 	got := f.filterThresholds()
-	want := filterThresholds{unhealthyMinCount: 2, backoffMinCount: 4, imagePullTransientMinCount: 6, failedSchedulingMinCount: 8, scaleUpHold: 7 * time.Minute}
+	want := filterThresholds{unhealthyMinCount: 2, backoffMinCount: 4, imagePullTransientMinCount: 6, failedSchedulingMinCount: 8, scaleUpHold: 7 * time.Minute, settle: defaultSettle}
 	if got != want {
 		t.Errorf("filterThresholds() = %+v; want %+v", got, want)
 	}

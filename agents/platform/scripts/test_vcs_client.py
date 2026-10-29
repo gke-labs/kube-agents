@@ -102,6 +102,8 @@ class ForgeCallTest(unittest.TestCase):
             # and an unserved type.
             {"type": "github", "url": "https://github.com/acme/ported"},
             {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/ported"},
+            {"type": "github", "url": "https://github.com/acme/forgejo"},
+            {"type": "forgejo", "url": "https://forgejo.example.com/acme/forgejo"},
             {"type": "github", "url": "https://github.com/acme/gitea"},
             {"type": "gitea", "url": "https://gitea.example.com/acme/gitea"},
             {"type": "github", "url": "https://github.com/acme/mirror"},
@@ -122,8 +124,8 @@ class ForgeCallTest(unittest.TestCase):
         vcs_client._registered_urls.cache_clear()
         self.assertEqual(
             ["acme/fleet", "github.com/acme/both", "github.com/acme/hand", "github.com/acme/ported",
-             "github.com/acme/gitea", "github.com/acme/mirror",
-             "gitlab.com/acme/both", "gitlab.com/group/sub/proj"],
+             "github.com/acme/forgejo", "github.com/acme/gitea", "github.com/acme/mirror",
+             "gitlab.com/acme/both", "gitlab.com/group/sub/proj", "gitea.example.com/acme/gitea"],
             names,
         )
         for repository in sent:

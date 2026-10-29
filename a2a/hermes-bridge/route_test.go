@@ -104,9 +104,204 @@ func TestAPI_TheTurnRecordsItsConversationRoute(t *testing.T) {
 	}
 	puts := store.seen()
 	want := routePut{path: "PUT /v1/sessions/a2a-ctx-route/route", auth: "Bearer kv-key",
-		body: conversationRoute{Platform: "slack", Conversation: "slack:dm/D123", ContextID: "ctx-route", Ask: askQuestion}}
+		body: conversationRoute{Platform: "slack", Conversation: "slack:dm/D123", ContextID: "ctx-route", Ask: askQuestion, ChatType: "dm"}}
 	if len(puts) != 1 || puts[0] != want {
 		t.Fatalf("route PUTs = %+v, want %+v", puts, want)
+	}
+}
+
+// The gateway's requester principal (hmac:<32-hex>) and audience kind ("dm" or
+// "group") ride the route PUT so the memory provider can isolate personal
+// memory per user and disable personal memory in group conversations.
+func TestAPI_TheTurnRecordsRequesterPrincipalAndAudienceKind(t *testing.T) {
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		writeCompletion(w, c.sessionID, "done")
+	})
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, "task-id-dm", "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": "gchat:spaces/DM1", "kind": "dm"}
+	auth["requester"] = map[string]any{"principal": "hmac:0123456789abcdef0123456789abcdef"}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, "task-id-dm", "ctx-id-dm", "corr-task-id-dm",
+		messagePayload(t, "task-id-dm", "ctx-id-dm", "remember my cluster"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", "task-id-dm"), env); err != nil {
+		t.Fatal(err)
+	}
+	task := waitTerminal(t, c, "task-id-dm")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	puts := store.seen()
+	want := routePut{
+		path: "PUT /v1/sessions/a2a-ctx-id-dm/route",
+		auth: "Bearer kv-key",
+		body: conversationRoute{
+			Platform:     "google_chat",
+			Conversation: "gchat:spaces/DM1",
+			ContextID:    "ctx-id-dm",
+			Ask:          askQuestion,
+			UserID:       "hmac:0123456789abcdef0123456789abcdef",
+			ChatType:     "dm",
+		},
+	}
+	if len(puts) != 1 || puts[0] != want {
+		t.Fatalf("route PUTs = %+v, want %+v", puts, want)
+	}
+}
+
+// A Google-authenticated A2A door conversation (backend: "a2a-google",
+// verifiedBy: "a2a-google-token") that carries a verified requester principal
+// records an identity-only route (Platform: "") for memory isolation without
+// marking a chat notify route as recorded or adding a route-lost note if the
+// PUT fails.
+func TestAPI_GoogleA2AConversationWithRequesterRecordsIdentityOnly(t *testing.T) {
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	stub := newAPIStub(t, nil)
+	startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+	c := gatewayClient(t, url)
+
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, "task-a2a-google-id", "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": "a2a:ctx-google-id", "kind": "dm"}
+	auth["requester"] = map[string]any{
+		"principal":  "hmac:fedcba9876543210fedcba9876543210",
+		"backend":    "a2a-google",
+		"verifiedBy": "a2a-google-token",
+	}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, "task-a2a-google-id", "ctx-google-id", "corr-google-id",
+		messagePayload(t, "task-a2a-google-id", "ctx-google-id", "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", "task-a2a-google-id"), env); err != nil {
+		t.Fatal(err)
+	}
+	task := waitTerminal(t, c, "task-a2a-google-id")
+	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
+		t.Fatalf("answer = %q carries the route-lost note for a Google A2A door", got)
+	}
+	puts := store.seen()
+	want := routePut{
+		path: "PUT /v1/sessions/a2a-ctx-google-id/route",
+		auth: "Bearer kv-key",
+		body: conversationRoute{
+			Conversation: "a2a:ctx-google-id",
+			ContextID:    "ctx-google-id",
+			UserID:       "hmac:fedcba9876543210fedcba9876543210",
+			ChatType:     "dm",
+		},
+	}
+	if len(puts) != 1 || puts[0] != want {
+		t.Fatalf("route PUTs = %+v, want %+v", puts, want)
+	}
+}
+
+// Shared-credential doors (console with nats-grant, inject with inject-bearer,
+// and static-token A2A with a2a-bearer) do not record a user identity route,
+// so the memory provider treats the a2a-* session as an interactive
+// unattributable DM rather than pooling or allowing self-asserted access to
+// personal memory.
+func TestAPI_SharedCredentialDoorsDoNotRecordUserRoute(t *testing.T) {
+	cases := []struct {
+		name         string
+		taskID       string
+		ctxID        string
+		conversation string
+		backend      string
+		verifiedBy   string
+	}{
+		{
+			name:         "console",
+			taskID:       "task-console",
+			ctxID:        "ctx-console",
+			conversation: "console:tok-1",
+			backend:      "console",
+			verifiedBy:   "nats-grant",
+		},
+		{
+			name:         "inject",
+			taskID:       "task-inject",
+			ctxID:        "ctx-inject",
+			conversation: "inject:eval/run-id",
+			backend:      "inject",
+			verifiedBy:   "inject-bearer",
+		},
+		{
+			name:         "a2a-bearer",
+			taskID:       "task-a2a-bearer",
+			ctxID:        "ctx-a2a-bearer",
+			conversation: "a2a:ctx-a2a-bearer",
+			backend:      "a2a",
+			verifiedBy:   "a2a-bearer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, http.StatusOK)
+			stub := newAPIStub(t, nil)
+			startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+			c := gatewayClient(t, url)
+
+			var auth map[string]any
+			if err := json.Unmarshal(authorityFor(t, mintFor(t, c, tc.taskID, "platform")), &auth); err != nil {
+				t.Fatal(err)
+			}
+			auth["audience"] = map[string]any{"conversation": tc.conversation, "kind": "dm"}
+			auth["requester"] = map[string]any{
+				"principal":  "hmac:fedcba9876543210fedcba9876543210",
+				"backend":    tc.backend,
+				"verifiedBy": tc.verifiedBy,
+			}
+			raw, err := json.Marshal(auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := lib.NewMessageEnvelope(gatewayParty, tc.taskID, tc.ctxID, "corr-"+tc.taskID,
+				messagePayload(t, tc.taskID, tc.ctxID, "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", tc.taskID), env); err != nil {
+				t.Fatal(err)
+			}
+			task := waitTerminal(t, c, tc.taskID)
+			if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
+				t.Fatalf("answer = %q carries the route-lost note for %s door", got, tc.name)
+			}
+			puts := store.seen()
+			if tc.backend == "console" {
+				// The console door posts back, so it records a route, but
+				// never the shared credential's principal.
+				if len(puts) != 1 || puts[0].body.Platform != "console" || puts[0].body.UserID != "" {
+					t.Fatalf("route PUTs = %+v, want one console route with no user_id", puts)
+				}
+				return
+			}
+			if len(puts) != 0 {
+				t.Fatalf("route PUTs = %+v, want none", puts)
+			}
+		})
 	}
 }
 
@@ -210,5 +405,52 @@ func TestAPI_NoRouteIsRecordedForAConversationWithoutOne(t *testing.T) {
 	}
 	if puts := store.seen(); len(puts) != 0 {
 		t.Fatalf("route PUTs = %+v, want none", puts)
+	}
+}
+
+// A console conversation's route carries the turn's task, which a card the
+// turn files snapshots so its report names the turn; a chat conversation's
+// does not, so its route stays the same from turn to turn and repeat PUTs
+// are skipped.
+func TestRouteFor_OnlyAConsoleRouteCarriesItsTask(t *testing.T) {
+	for _, tc := range []struct {
+		conversation, platform, task string
+	}{
+		{"console:tab-1", lib.NotifyPlatformConsole, "task-7"},
+		{"gchat:spaces/A/threads/B", lib.NotifyPlatformGchat, ""},
+	} {
+		env := &lib.Envelope{TaskID: "task-7", ContextID: "ctx-1",
+			Authority: json.RawMessage(`{"audience":{"conversation":"` + tc.conversation + `"}}`)}
+		got, err := routeFor(env)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.conversation, err)
+		}
+		want := conversationRoute{Platform: tc.platform, Conversation: tc.conversation, ContextID: "ctx-1", TaskID: tc.task}
+		if got != want {
+			t.Errorf("%s: route = %+v, want %+v", tc.conversation, got, want)
+		}
+	}
+}
+
+// A console route's task is what its card's report names: when the PUT for
+// a later turn fails, the earlier turn's record would make that turn's card
+// report under the wrong task, so the route is lost (the answer says so)
+// rather than standing. The same turn again still stands.
+func TestRecordRoute_AConsoleRouteForAnotherTurnIsNotTheSame(t *testing.T) {
+	store := newRouteStore(t, http.StatusOK)
+	b := &Bridge{cfg: Config{RouteURL: store.srv.URL, RouteKey: "kv-key", Logger: discardLogger()}, routeClient: http.DefaultClient}
+	turn1 := routeEnvelope(t, "ctx-c", "console:tab-1")
+	turn1.TaskID = "task-1"
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn1); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	store.setStatus(http.StatusInternalServerError)
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn1); err != nil {
+		t.Fatalf("a failed PUT for the same turn = %v, want nil: the earlier record stands", err)
+	}
+	turn2 := routeEnvelope(t, "ctx-c", "console:tab-1")
+	turn2.TaskID = "task-2"
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn2); err == nil {
+		t.Fatal("a failed PUT for another turn = nil, want the error: its card would report under task-1")
 	}
 }

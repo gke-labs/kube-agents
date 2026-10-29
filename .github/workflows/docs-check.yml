@@ -55,6 +55,12 @@ jobs:
       - name: Site pages carry no maintainer identifier
         run: make docs-check-audience
 
+      # Site prose stays within its recorded per-page ceilings for banned
+      # filler words, "is not a X, it is Y" epigrams, and paragraph, table-cell
+      # and sentence lengths (.agents/rules/documentation.md, "Write it straight").
+      - name: Site prose stays within its ratchet
+        run: make docs-check-prose
+
       # AGENTS.md and CLAUDE.md are loaded into every agent session before the
       # first prompt, so their size is a cost paid by every task here. Nothing
       # about that is visible in a diff, and the file quietly tripled in nine

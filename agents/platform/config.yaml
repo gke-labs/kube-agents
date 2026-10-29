@@ -78,10 +78,14 @@ mcp_servers:
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
       # Under next send_notification posts through the A2A gateway with
       # `a2a notify` (chat_notify.py) instead of `hermes send`: the platform it
-      # routes, and the bus address and identity the CLI connects with. The
-      # bus token is a file mount, not environment, so nothing else is needed.
+      # routes, and the bus address and identity the CLI connects with, and
+      # the CA it trusts the bus by: the bus requires TLS, and without
+      # NATS_CA_FILE the CLI checks the bus against the system roots and every
+      # post fails verification. The bus token is a file mount, not
+      # environment, so nothing else is needed.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
       NATS_URL: "${NATS_URL}"
+      NATS_CA_FILE: "${NATS_CA_FILE}"
       A2A_BUS_USER: "${A2A_BUS_USER}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       # The bearer token for the loopback Session KV server on 8699. The
@@ -171,6 +175,36 @@ mcp_servers:
         - list_node_pools
         - list_operations
 
+# Model-call deadlines for the gateway. This overrides the 600s stale bound in
+# deploy/shared/defaults/config.yaml, which this file is merged onto at image
+# build (deploy/docker/merge_configs.py merges maps leaf by leaf, so
+# request_timeout_seconds keeps the base value). stale_timeout_seconds is how
+# long Hermes waits for the first chunk, or for the next one, before it drops
+# the stream and retries (hermes_cli/timeouts.py).
+#
+# The Platform Agent runs as a kanban worker, so it uses 120s, not the front
+# door's 600s. The front door needs 600s because Gemini thinks in silence on
+# this path and a hard front-door prompt took 140-210s before its first chunk.
+# A worker hardly thinks: in the five-run latency benchmark
+# (gke-labs/kube-agents#3140) worker calls used about 100 reasoning tokens
+# each, and 99% of 6,059 worker calls sent their first chunk within 60s. The
+# slow ones were stalls, not thinks: most returned fewer than 120 tokens, three
+# in four missed the prompt cache, and each 600s stale kill matched a Vertex
+# 504. A 120s bound retries such a call up to 480s sooner. Hermes raises the
+# bound for a large prompt (to at least 240s above 50k context tokens and 300s
+# above 100k), so the gain is smaller there. agents/cluster/config.yaml sets the
+# same value for the Cluster Agents.
+#
+# A person can also chat with this profile directly (`hermes -p platform`), and
+# under the unsupported `experimental.platformFrontDoor` chat reaches it as the
+# front door. A hard question there can think in silence for more than 120s,
+# and Hermes then retries the call. Under platformFrontDoor the entrypoint only
+# fills keys this profile lacks, so an install that upgrades keeps the bound it
+# already has, and only a new install gets 120s.
+providers:
+  custom:
+    stale_timeout_seconds: 120
+
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
 #
@@ -219,27 +253,31 @@ platform_toolsets:
 toolsets:
   - kanban
 
-# Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrew when each ran its checks cluster by cluster: three separate runs
-# died on `Iteration budget exhausted (90/90)` — reported as a `timed_out` kanban
-# event, though the run was actively heartbeating and no clock ran out. Most
-# streams, cost and drift among them, now run one collector script that reads
-# the whole fleet in a single call, so a clean run costs the SOP read, the
-# collector, the recommendations and the publish harness. What still scales
-# with the fleet is the Compute Engine and networking audits, which have no
-# collector yet, and the by-hand fallback the SOPs prescribe for every cluster
-# or project a collector marks `unreachable` or `gate-failed` — a bad day on a
-# large fleet is the old per-cluster loop over part of it. 250, roughly triple
-# the observed near-miss, is kept as headroom for those paths.
+# Per-turn tool-calling iteration budget for the kanban workers: every
+# delegated chat request and issue-resolver card is spawned with HERMES_HOME
+# pinned to this profile and reads this value. Pinned rather than unset: a
+# worker is a `hermes chat` process, and the chat CLI's own defaults cap an
+# unset key at 500 (cli.py `_cli_config_defaults`), while the gateway's config
+# loader reads an unset key as no cap at all (hermes_cli/config_defaults.py).
+# 150 is 1.4 times the largest worker seen across a full presubmit run and a
+# full nightly run (2026-10-20: 156 and 132 cards, max 43 and 105 tool calls,
+# p90 22 and 36; the 105 was an upgrades audit requested through chat, which
+# runs inside a card and has no budget of its own).
 #
-# This belongs here rather than in the operator's generated root config because
-# both ways an audit can start read *this* file and not the root one: a cron run
-# on this profile's own roster (agents/platform/cron/jobs.json) is executed with
-# the profile active, and a kanban worker is spawned with HERMES_HOME pinned to
-# the profile. Scoping it here leaves the Chat Agent and the per-cluster Cluster
-# Agents on the default 90, where nothing has ever approached the ceiling.
+# The fleet audits need more: three runs died on `Iteration budget exhausted
+# (90/90)` when each ran its checks cluster by cluster, and the Compute Engine
+# and networking audits plus every SOP's by-hand fallback for an `unreachable`
+# or `gate-failed` cluster still take that path. Their roster entries carry
+# `max_turns: 250` (agents/platform/cron/jobs.json), which the image's scheduler
+# reads ahead of this value (deploy/docker/patches/apply_cron_job_max_turns.py);
+# before that patch this value was 250 and every worker ran with it (#1947).
+#
+# The operator's `spec.harness.tuning.platform.maxTurns` overlays this value; a
+# roster entry's own `max_turns` raises its job above whichever is in force and
+# never lowers it. The Chat Agent and the Cluster Agents leave the key unset,
+# so their gateway turns run uncapped and their workers at the CLI's 500.
 agent:
-  max_turns: 250
+  max_turns: 150
   # Toolsets this profile's turns never need, kept out of every model call. Gemini
   # on Vertex intermittently waits tens of seconds to minutes before its first
   # token when a request declares the full hermes-cli set (36 tools here), and

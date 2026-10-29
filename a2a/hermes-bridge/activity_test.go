@@ -196,9 +196,11 @@ print("the answer")
 
 	// Order on the wire: the trace precedes the turn's usage, the usage the
 	// result, and the result the final; the first activity part opens the
-	// artifact, the second appends.
+	// artifact, the second appends. Each plan step goes out when it closes:
+	// kubectl's at the next tool's call, the last one at the drain, still
+	// ahead of the result (activity_steps.go).
 	trail := eventTrail(t, replayEvents(t, url, "task-activity"))
-	want := []string{"submitted", "working", "activity", "activity", "usage", "result", "completed/final"}
+	want := []string{"submitted", "working", "activity", "steps", "activity", "usage", "steps", "result", "completed/final"}
 	if strings.Join(trail, " ") != strings.Join(want, " ") {
 		t.Fatalf("event trail = %v, want %v", trail, want)
 	}
@@ -359,7 +361,7 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	if !strings.Contains(out, "DIR="+want) {
 		t.Fatalf("child scope dir: %s", out)
 	}
-	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}
@@ -468,7 +470,7 @@ func TestActivity_EntryFieldsAreBounded(t *testing.T) {
 	var d hookDelivery
 	d.Event, d.ToolName, d.Timestamp = hookPostToolCall, long, long
 	d.Extra.ToolCallID, d.Extra.Status = long, "ok"
-	e, ok := a.observe(d)
+	e, ok, _ := a.observe(d)
 	if !ok || len(e.Tool) != activityToolNameCap || len(e.CallID) != activityCallIDCap || len(e.At) != activityWordCap {
 		t.Fatalf("entry fields not bounded: ok=%v tool=%d callId=%d at=%d", ok, len(e.Tool), len(e.CallID), len(e.At))
 	}
@@ -502,7 +504,7 @@ func TestActivity_UnreadableSignedDeliveryIsNotCounted(t *testing.T) {
 	if err := json.Unmarshal(good, &d); err != nil {
 		t.Fatal(err)
 	}
-	if e, ok := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
+	if e, ok, _ := a.observe(d); !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted {
 		t.Fatalf("post without an open pre was not published whole: %+v %v", e, ok)
 	}
 }
@@ -547,29 +549,34 @@ func TestActivityStatus(t *testing.T) {
 	}
 }
 
+// concurrentStubSleep is how long each stub in the concurrency test sleeps
+// between its two calls. Run together, both terminals land inside twice
+// it; run one after the other they cannot, which is what makes "at once" a
+// tested claim. It is also the margin for everything else in the run (two
+// stub starts, four deliveries, two terminals): under the race detector on
+// a loaded runner that overhead reached 1.6 s, which 1.5 s did not cover.
+const concurrentStubSleep = 3 * time.Second
+
 // Two tasks at once: each delivery lands on the task whose key signed it,
 // never on the other. The stubs overlap by sleeping after their calls.
 func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	startBridgeCfg(t, url, hermesStub(t, fmt.Sprintf(`
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
 call(tool, {"which": ord(prompt)}, "call-" + prompt)
-time.sleep(1.5)
+time.sleep(%g)
 call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
-`), func(c *Config) { c.Concurrency = 2 })
+`, concurrentStubSleep.Seconds())), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
-	// The two stubs each sleep 1.5 s between their calls; run together both
-	// terminals land well inside twice that, run one after the other they
-	// cannot. The bound is what makes "at once" a tested claim.
 	started := time.Now()
 	submit(t, c, "task-a", "A")
 	submit(t, c, "task-b", "B")
 	ta := waitTerminal(t, c, "task-a")
 	tb := waitTerminal(t, c, "task-b")
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
+	if elapsed := time.Since(started); elapsed > 2*concurrentStubSleep {
 		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
 	}
 	// The input carries the prompt as a number, since no string value rides
@@ -622,13 +629,13 @@ func TestActivity_ErrorTypeKeepsHermesVerdict(t *testing.T) {
 		return d
 	}
 	a := newActivityState(false)
-	if e, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
+	if e, _, _ := a.observe(mk("blocked", "")); e.Status != ActivityStatusError || e.ErrorType != "blocked" {
 		t.Fatalf("blocked -> %+v", e)
 	}
-	if e, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
+	if e, _, _ := a.observe(mk("error", "tool_error")); e.Status != ActivityStatusError || e.ErrorType != "tool_error" {
 		t.Fatalf("error/tool_error -> %+v", e)
 	}
-	if e, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
+	if e, _, _ := a.observe(mk("ok", "")); e.Status != ActivityStatusCompleted || e.ErrorType != "" {
 		t.Fatalf("ok -> %+v", e)
 	}
 }
@@ -1198,7 +1205,8 @@ func TestActivity_DedupeKeepsTheMostRecentIDs(t *testing.T) {
 		if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","delivery_id":"`+id+`","extra":{"tool_call_id":"`+id+`","status":"ok"}}`), &d); err != nil {
 			t.Fatal(err)
 		}
-		return a.observe(d)
+		e, ok, _ := a.observe(d)
+		return e, ok
 	}
 	for i := 0; i < activitySeenCap+1; i++ {
 		if _, ok := post(fmt.Sprintf("d-%d", i)); !ok {
@@ -1225,7 +1233,7 @@ func TestActivity_OneFieldsTypeDoesNotDropTheDelivery(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","tool_name":"terminal","tool_input":{"command":"ls"},"timestamp":{"x":1},"delivery_id":12,"extra":{"tool_call_id":7,"duration_ms":"fast","status":"ok","error_type":null}}`), &d); err != nil {
 		t.Fatalf("a field's type dropped the delivery: %v", err)
 	}
-	e, ok := a.observe(d)
+	e, ok, _ := a.observe(d)
 	if !ok || e.Tool != "terminal" || e.Status != ActivityStatusCompleted || e.DurationMs != 0 || e.CallID != "7" || e.At != "" {
 		t.Fatalf("observed %+v %v", e, ok)
 	}

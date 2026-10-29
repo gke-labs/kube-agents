@@ -320,6 +320,7 @@ jobs:
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          WEB_CONSOLE_ENABLED: ${{ vars.WEB_CONSOLE_ENABLED }}
           KMS_KEYRING: ${{ vars.KMS_KEYRING }}
           KMS_KEY: ${{ vars.KMS_KEY }}
           GITOPS_ORG: ${{ vars.GITOPS_ORG }}
@@ -367,7 +368,7 @@ jobs:
       - name: Generate Release Bot Token
         if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'
         id: release-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
@@ -455,13 +456,15 @@ jobs:
           workload_identity_provider: ${{ env.PROW_ARCHIVE_WIF_PROVIDER }}
           service_account: ${{ env.PROW_ARCHIVE_READER_SA }}
 
-      # Mandatory, and the reason is not obvious: the auth step exports
-      # GOOGLE_GHA_CREDS_PATH, which the gcloud CLI honours and gsutil does not.
-      # Without this line the poller's every `gsutil ls` fails on anonymous
-      # credentials, the build never appears, and the job reports `never_ran` —
-      # which reads as a broken eval lane rather than a missing login. This cost
-      # ci-health.yml forty failed ticks on 2026-09-10.
-      - name: Make the Prow-archive reader credential active for gsutil
+      # The auth step exports GOOGLE_GHA_CREDS_PATH; this login makes that
+      # credential the active account for the poller's `gcloud storage ls` and
+      # `cat` calls, the same way ci-health.yml does before its reads. (Those
+      # reads were gsutil's until 2026-10, and gsutil ignored the exported
+      # file: without this line every listing failed on anonymous credentials,
+      # the build never appeared, and the job reported `never_ran`, which
+      # reads as a broken eval lane rather than a missing login. That cost
+      # ci-health.yml forty failed ticks on 2026-09-10.)
+      - name: Make the Prow-archive reader credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Wait for the release-candidate eval verdict
@@ -540,7 +543,7 @@ jobs:
       # rulesets, the same half of the rule the nomination needs it for.
       - name: Generate Release Bot Token
         id: release-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
@@ -594,7 +597,7 @@ jobs:
       # job: a single job cannot refresh the credential it started with.
       - name: Generate Release Bot Token
         id: release-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}

@@ -161,7 +161,20 @@ ROUTE_PROBE_TIMEOUT_SECONDS = 5
 # the route), and its chat_id is the session that holds the route, whose
 # context id conversation_context reads back: the report is sent with
 # --conversation and --context rather than --thread.
-CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:")
+CONVERSATION_KEY_PREFIXES = ("gchat:", "slack:", "console:")
+# The console door's platform (lib.NotifyPlatformConsole). The gateway serves
+# its chat.notify route whenever the console runs, so it counts as served
+# with no environment variable naming it. Hermes has no console platform, and
+# its notifier turns a subscription's platform string into its Platform enum
+# before anything here runs, so the name is registered with Hermes's platform
+# registry when this module loads (_register_console_platform). Kanban-era:
+# the registration goes when kanban does.
+CONSOLE_PLATFORM = "console"
+CONSOLE_PLATFORM_LABEL = "kube-agents console (chat.notify only)"
+# Splits a console card's thread_id into the conversation key and the gateway
+# task of the turn that filed it (kanban_event_routing.CONSOLE_THREAD_TASK_SEP),
+# which the report names with --reply-to.
+CONSOLE_THREAD_TASK_SEP = "#"
 # The attribute the stand-in is cached under on the runner, which outlives the
 # per-tick collector and the per-delivery notification.
 RUNNER_ATTR = "_kage_chat_notify_adapter"
@@ -187,6 +200,15 @@ API_SERVER_KEY_ENV = "API_SERVER_KEY"
 # send()'s metadata (see "Chat messages" above), and the route record's ask.
 CHAT_METADATA_KEY = "kage_chat"
 UPDATE_METADATA_KEY = "kage_update"
+#: Metadata key marking a conversation post as an ask's answer: the delivered
+#: report of the card that settles every card of the ask's plan, its value that
+#: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
+#: draws its rating controls on it, under the ask the plan is bound to.
+ANSWER_METADATA_KEY = "kage_answer"
+#: The ``a2a notify`` flags a conversation post and its answer ride on.
+CONVERSATION_FLAG = "--conversation"
+ANSWER_FLAG = "--answer-to"
+UPDATE_FLAG = "--update"
 CONVERSATION_ASK_KEY = "ask"
 # The chat message's file for `a2a notify --chat-file`: written mode 0600 by
 # tempfile, removed once the command returns.
@@ -231,9 +253,37 @@ def chat_route(adapter: Any) -> bool:
     return callable(getattr(adapter, "send_chat", None))
 
 
+def served_platforms() -> set:
+    """The platforms whose deliveries go through the gateway's chat.notify route."""
+    return {p for p in (routed_platform(), conversation_platform(), CONSOLE_PLATFORM) if p}
+
+
 def active_platforms(names: set) -> set:
-    """``names`` plus the routed platforms, when there are any."""
-    return names | {p for p in (routed_platform(), conversation_platform()) if p}
+    """``names`` plus the platforms the gateway's route serves."""
+    return names | served_platforms()
+
+
+def _register_console_platform() -> None:
+    """Make ``Platform("console")`` resolve in Hermes, so a console card's subscription is read at all.
+
+    Process-global (source "builtin"), so every profile scope sees it. The
+    factory makes no adapter: nothing enables or connects a console platform,
+    and deliveries go through the conversation stand-in (resolve). Fails open,
+    logged: without it a console card's report is skipped, as it is today.
+    """
+    try:
+        from gateway.platform_registry import PlatformEntry, platform_registry
+
+        if not platform_registry.is_registered(CONSOLE_PLATFORM):
+            platform_registry.register(PlatformEntry(
+                name=CONSOLE_PLATFORM,
+                label=CONSOLE_PLATFORM_LABEL,
+                adapter_factory=lambda _config: None,
+                check_fn=lambda: True,
+                source="builtin",
+            ))
+    except Exception as exc:  # not inside Hermes (tests), or a registry without this shape
+        logger.warning("chat.notify: console platform not registered; console cards will not report: %s", exc)
 
 
 def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None) -> Any:
@@ -248,7 +298,7 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
     conversation = is_conversation(sub)
     name = str(getattr(platform, "value", platform) or "").lower()
     if conversation:
-        if not name or name != conversation_platform():
+        if not name or name not in (conversation_platform(), CONSOLE_PLATFORM):
             return None
     elif not routes(platform):
         return adapter
@@ -258,6 +308,12 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
         return None
     attr, cls = ((RUNNER_CONVERSATION_ATTR, ConversationNotifyAdapter) if conversation
                  else (RUNNER_ATTR, ChatNotifyAdapter))
+    # The conversation stand-ins are kept one per platform: a chat
+    # platform's and the console's are served side by side, and one shared
+    # slot would rebuild the stand-in, and re-probe the route, on every
+    # switch between them.
+    if conversation:
+        attr = f"{attr}_{name}"
     stand_in = getattr(runner, attr, None)
     if stand_in is None or stand_in.platform != platform:
         stand_in = cls(platform, runner)
@@ -577,7 +633,7 @@ def fold_fanout(conn: Any, claim: Optional[dict], now: Optional[float] = None) -
     if not claim:
         return claim
     sub = claim.get("sub") or {}
-    if (sub.get("platform") or "").lower() not in {p for p in (routed_platform(), conversation_platform()) if p}:
+    if (sub.get("platform") or "").lower() not in served_platforms():
         return claim
     child = sub.get("task_id") or ""
     events = list(claim.get("events") or [])
@@ -776,7 +832,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
                 raise
             argv += ["--chat-file", path]
         if update:
-            argv += ["--update", update]
+            argv += [UPDATE_FLAG, update]
         return argv, path
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -795,6 +851,11 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
             chat_argv, chat_file = [], ""
         argv += chat_argv
+        # Only a conversation post answers an ask; the CLI refuses the flag on
+        # a home channel post, which would lose the report.
+        answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
+        if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
+            argv += [ANSWER_FLAG, answer_to]
         # The chat message above was laid out from the text as written; what a person reads has no step line.
         argv += ["--", _visible(content)]
         try:
@@ -914,7 +975,13 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         context = conversation_context(chat_id)
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
-        return ["--conversation", thread, "--context", context]
+        if not thread.startswith(CONSOLE_PLATFORM + ":"):
+            return ["--conversation", thread, "--context", context]
+        conversation, _, task = thread.partition(CONSOLE_THREAD_TASK_SEP)
+        target = ["--conversation", conversation, "--context", context]
+        if task:
+            target += ["--reply-to", task]
+        return target
 
     def ask(self, chat_id: str) -> str:
         """The kind of ask the conversation was last asked, which the plan's mark keeps while cards run."""
@@ -930,3 +997,8 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         session = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
         await _self_post_chat_completion(self, text=event.text, session_id=session)
         event._gateway_accepted = True
+
+
+# Registered at import, which the notifier's trailer triggers before it reads
+# any subscription (apply_kanban_chat_notify.TRAILER).
+_register_console_platform()

@@ -200,8 +200,8 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // fourth under the cluster-view flag. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
 // only the gateway's identity would answer 401 to all of them. The gateway's
-// is there because its chat relays and its watchers go through the same
-// listener.
+// is there because its chat relays, its Pub/Sub platform adapter and its
+// watchers go through the same listener.
 //
 // Two identities rather than one is not a widening of who may call: both Pods
 // belong to this agent, and neither could reach the broker without a token this
@@ -209,7 +209,7 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // says which Pod called; the audience (credentialProxyChatAudience and its
 // siblings) says which role the call is for. The A2A gateway is told apart
 // the same way.
-func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
+func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent, mcpIdentityOwned bool) string {
 	callers := []string{
 		// The gateway Pod, which presents the chat and watcher tokens. The
 		// broker's own ServiceAccount is not a caller: the broker serves these
@@ -231,6 +231,14 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	if a2aSessionClusterViewEnabled(agent) {
 		callers = append(callers, a2aSessionBrokerCaller(agent))
 	}
+	// The MCP server's own ServiceAccount, under its flag
+	// (a2aMCPBrokerEnabled) and only while this PlatformAgent owns the
+	// account (a2aMCPIdentityOwned), never the namespace default it ran as
+	// before. Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which
+	// a2aMCPBrokerEnv renders beside it, the same way the session caller is.
+	if a2aMCPBrokerEnabled(agent) && mcpIdentityOwned {
+		callers = append(callers, a2aMCPBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
 }
 
@@ -244,9 +252,9 @@ func a2aSessionBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
 // the broker. Audience-bound and one hour long, so a copy that escapes the Pod
 // is worth an hour of broker access and nothing else.
 //
-// credentialProxyChatAudience, not credentialProxyAudience: the chat relays and
-// the remote MCP servers' mcp-remote children are the only things in this Pod
-// that call the broker, and minting for the chat audience is what stops this
+// credentialProxyChatAudience, not credentialProxyAudience: the chat relays,
+// the Pub/Sub platform adapter's relay and the remote MCP servers' mcp-remote
+// children are the only things in this Pod that call the broker, and minting for the chat audience is what stops this
 // token opening the shell's routes if it does escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
 func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	return corev1.Volume{

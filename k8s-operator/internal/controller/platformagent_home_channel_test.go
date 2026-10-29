@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	corev1 "k8s.io/api/core/v1"
 	"strings"
 	"testing"
 
@@ -210,5 +211,58 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetOnADegradedPark(t *te
 	if cond := meta.FindStatusCondition(got.Status.Conditions, homeChannelUnsetConditionType); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("expected %s True on a Degraded park with the stack rendered, got %+v (conditions %+v)",
 			homeChannelUnsetConditionType, cond, got.Status.Conditions)
+	}
+}
+
+// TestHomeChannelRecordObjectAndRole: the record is an owned ConfigMap with
+// no data (the gateway owns the keys), rendered on every next stack, Slack on
+// the gateway or not, torn down with the stack; the gateway Role reaches that
+// one name with get and patch only; the gateway Deployment carries the policy,
+// the record's name and its own image. The operator does not read the
+// record yet: the agent env and the condition follow the CR field alone.
+func TestHomeChannelRecordObjectAndRole(t *testing.T) {
+	a := slackTestAgent("next", true)
+	cm := buildHomeChannelRecord(a)
+	if cm.Name != a.Name+"-home-channel" || cm.Namespace != a.Namespace || len(cm.Data) != 0 {
+		t.Fatalf("record object = %+v", cm.ObjectMeta)
+	}
+	rules := buildA2AGatewayRole(a).Rules
+	rule := rules[len(rules)-1]
+	if len(rule.Resources) != 1 || rule.Resources[0] != "configmaps" ||
+		len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != cm.Name ||
+		strings.Join(rule.Verbs, ",") != "get,patch" {
+		t.Errorf("record rule = %+v", rule)
+	}
+	var torn bool
+	r := &PlatformAgentReconciler{}
+	for _, e := range r.a2aNamespacedTeardown(a) {
+		if c, ok := e.obj.(*corev1.ConfigMap); ok && c.Name == cm.Name {
+			torn = true
+		}
+	}
+	if !torn {
+		t.Error("the record is not in the next stack's teardown list")
+	}
+	gw := buildA2AGatewayDeployment(a)
+	env := envMapOf(gw.Spec.Template.Spec.Containers[0].Env)
+	if env[a2aSlackHomePolicyEnvVar].Value != "auto" || env[a2aHomeChannelRecordEnvVar].Value != cm.Name || env[a2aGatewaySelfImageEnvVar].Value != a2aGatewayImage() {
+		t.Errorf("gateway env: policy=%q record=%q self=%q", env[a2aSlackHomePolicyEnvVar].Value, env[a2aHomeChannelRecordEnvVar].Value, env[a2aGatewaySelfImageEnvVar].Value)
+	}
+	a.Spec.Integration.Slack.HomeChannelPolicy = "manual"
+	if got := envMapOf(buildA2AGatewayDeployment(a).Spec.Template.Spec.Containers[0].Env)[a2aSlackHomePolicyEnvVar].Value; got != "manual" {
+		t.Errorf("gateway policy env = %q, want manual", got)
+	}
+	// The policy and the record have no effect on the agent in this release.
+	for _, policy := range []string{"", "auto", "manual"} {
+		a.Spec.Integration.Slack.HomeChannelPolicy = policy
+		a.Spec.Integration.Slack.HomeChannel = ""
+		pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{})
+		agentEnv := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+		if _, ok := agentEnv[agentSlackHomeChannelEnvVar]; ok {
+			t.Errorf("policy %q: SLACK_HOME_CHANNEL rendered with no CR home", policy)
+		}
+		if homeChannelUnsetMessage(a) == "" {
+			t.Errorf("policy %q: no HomeChannelUnset with no CR home", policy)
+		}
 	}
 }

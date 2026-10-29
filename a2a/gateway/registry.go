@@ -265,6 +265,10 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// QuietCancel marks a cancel the Slack Stop button sent
+	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
+	// relay posts no "canceled" line for the task's terminal.
+	QuietCancel bool `json:"quietCancel,omitempty"`
 	// TerminalObserved marks that observeTaskTerminal has already been called
 	// for this task (e.g. by healActiveTask when recovering a stale terminal
 	// from the stream), so a queued or redelivered relayTerminal does not
@@ -343,6 +347,11 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// CardsAnswer, on a chain's root entry, records that a task of the chain
+	// handed the ask to kanban cards (cardsPending or handedOff at its
+	// terminal): a card's report answers the ask, so no relay answer in the
+	// chain, the wake's included, carries rating controls (answer feedback).
+	CardsAnswer bool `json:"cardsAnswer,omitempty"`
 	// AskMessageID is the backend id of the human message that started the
 	// chain, on its root entry only: the message the chain's mark is drawn
 	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
@@ -459,6 +468,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// markQuietCancel records that taskID's cancel came from the Slack Stop
+// button (TaskRef.QuietCancel).
+func (rec *SessionRecord) markQuietCancel(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].QuietCancel = true
 			return
 		}
 	}

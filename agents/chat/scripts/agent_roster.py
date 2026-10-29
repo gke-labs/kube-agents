@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-# agent_roster.py - Which specialist profiles exist, and what each is for.
+# agent_roster.py - Which specialist profiles exist, what each is for, which
+# cluster the install runs on, and which GCP projects its scope names.
 #
 # The Chat Agent needs this to pick an `assignee` before it delegates, and it
-# needs it on essentially every request. Two consumers read it:
+# needs it on essentially every request. The host and scope sections let it
+# answer "what projects are in scope?" and route "this cluster" without a
+# second roundtrip. Two consumers read it:
 #
 #   * ``router_server.py``'s ``list_agents`` MCP tool — the on-demand refresh
 #     path, for when a named agent is missing or the injected roster is stale.
@@ -20,7 +23,10 @@
 # Everything here degrades rather than raises. The profiles live on a shared
 # PVC, so an I/O or permission fault must not turn routing into a traceback.
 
+import hashlib
+import importlib
 import os
+import re
 import sys
 
 from pathlib import Path
@@ -47,7 +53,9 @@ NO_DESCRIPTION = "(no description provided)"
 PROFILE_CONFIG = "config.yaml"
 IDENTITY_BLOCK = "cluster_identity:"
 IDENTITY_NAME_KEY = "cluster"
-IDENTITY_PLACE_KEYS = ("project", "location")
+IDENTITY_PROJECT_KEY = "project"
+IDENTITY_LOCATION_KEY = "location"
+IDENTITY_PLACE_KEYS = (IDENTITY_PROJECT_KEY, IDENTITY_LOCATION_KEY)
 IDENTITY_KEYS = (IDENTITY_NAME_KEY, *IDENTITY_PLACE_KEYS)
 IDENTITY_INDENT = "  "
 YAML_QUOTES = "'\""
@@ -57,6 +65,64 @@ IDENTITY_FIELD_PREFIX = "cluster_"
 IDENTITY_NOTE = " (the {cluster} cluster agent{where})"
 IDENTITY_WHERE = "; {places}"
 IDENTITY_PLACE = "{key} {value}"
+
+# The cluster this pod runs on. The operator sets these on the agent container
+# outside kind (platformagent_manifests.go); the router MCP child gets them
+# through its `env:` block in agents/chat/config.yaml.
+HOST_CLUSTER_ENV = "GKE_CLUSTER_NAME"
+HOST_PROJECT_ENV = "GKE_PROJECT_ID"
+HOST_LOCATION_ENV = "GKE_LOCATION"
+HOST_ASSIGNEE_KEY = "assignee"
+HOST_DISPLAY_KEYS = (*IDENTITY_KEYS, HOST_ASSIGNEE_KEY)
+# Hermes hands a stdio MCP server the literal placeholder when the variable it
+# names is unset (gke_endpoint.py reads it the same way); that is not a value.
+UNEXPANDED_PLACEHOLDER_PREFIX = "${"
+HOST_IDENTITY_HEADING = 'Host Cluster Identity ("this cluster" / "this host cluster"):'
+# Cluster Agent profile names, as cluster_agent_profile.profile_name derives
+# them. Mirrored rather than imported: that module imports the sandbox and
+# endpoint modules, and this one runs ahead of every front-door turn.
+# test_agent_roster.py holds the two in step.
+PROFILE_NAME_MAX_LEN = 63
+
+# The projects in scope come from the platform agent's own reader,
+# agents/platform/scripts/fleet_scope_targets.py, which the image ships beside
+# this script (deploy/docker/Dockerfile copies both script directories into
+# /opt/defaults/scripts). One reader means the front door and the platform
+# agent's fleet_scope tool give the same answer, including the rows the
+# reconcile could not read and the partial marker before its first write.
+SCOPE_READER = "fleet_scope_targets"
+SCOPE_HEADING = "GCP Projects in Scope:"
+SCOPE_LINE = "- GCP projects in scope ({count}): {projects}"
+SCOPE_PARTIAL_LINE = (
+    "- GCP projects in scope (partial: {reason}): {projects}. Say the list is "
+    "partial when you answer."
+)
+SCOPE_PARTIAL_PENDING = (
+    "scope discovery has not completed yet; only the host and explicitly "
+    "declared projects can be listed"
+)
+SCOPE_PARTIAL_NUMERIC_HOST = (
+    "scope discovery has not completed yet and the host project is configured "
+    "by number, so only explicitly declared projects can be listed"
+)
+SCOPE_PARTIAL_UNRESOLVED = (
+    "the declaration names folders, organisations or selectors whose members "
+    "discovery has not resolved yet"
+)
+SCOPE_NONE_LISTED = "none read yet"
+# How many in-scope projects _format_scope names individually before counting
+# the rest: maxProjects admits up to 5000, and a folder or organisation past it
+# adds one over-cap row per remaining cluster-holding project
+# (bootstrap_scan_gate.py uses the same 20-project cap).
+SCOPE_NAMED_LIMIT = 20
+SCOPE_UNDECLARED = (
+    "- No project scope is declared for this install (spec.scope is unset), so "
+    "there is no fixed list to recite."
+)
+SCOPE_UNREADABLE = (
+    "- The scope declaration could not be read right now. Do not answer from "
+    "memory; route the question to `platform`."
+)
 
 
 def log(msg: str) -> None:
@@ -130,7 +196,7 @@ def _cluster_identity(home: Path) -> dict[str, str]:
         value = value.strip().strip(YAML_QUOTES)
         if sep and key in IDENTITY_KEYS and value:
             identity[key] = value
-    return identity if identity.get("cluster") else {}
+    return identity if identity.get(IDENTITY_NAME_KEY) else {}
 
 
 def discover(base: Path | None = None) -> list[dict[str, str]] | None:
@@ -157,7 +223,7 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
         return None
     for p in entries:
         try:
-            if not p.is_dir() or p.name == SELF_PROFILE:
+            if not p.is_dir() or p.name == SELF_PROFILE or p.name.startswith("."):
                 continue
             agent = {"name": p.name, "responsibilities": _responsibilities(p)}
             agent.update({IDENTITY_FIELD_PREFIX + k: v for k, v in _cluster_identity(p).items()})
@@ -237,10 +303,184 @@ def _identity_note(agent: dict[str, str]) -> str:
     return IDENTITY_NOTE.format(cluster=cluster, where=where)
 
 
+def _host_env(name: str) -> str:
+    """An environment value, or "" when unset or still a `${...}` placeholder."""
+    value = os.environ.get(name, "").strip()
+    return "" if value.startswith(UNEXPANDED_PLACEHOLDER_PREFIX) else value
+
+
+def _profile_name(project: str, cluster: str, location: str) -> str:
+    """The Cluster Agent profile name for a cluster (cluster_agent_profile.profile_name)."""
+    raw = f"cluster-{project}-{cluster}-{location}".lower()
+    name = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]+", "-", raw)).strip("-")
+    if len(name) > PROFILE_NAME_MAX_LEN:
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        name = f"{name[: PROFILE_NAME_MAX_LEN - 9]}-{digest}"
+    return name
+
+
+def _management_project_id(base: Path | None = None) -> str:
+    """The install's own project ID from fleet_scope.json's management row, or ""."""
+    reader = _scope_reader()
+    fn = getattr(reader, "management_project_id", None) if reader is not None else None
+    if not callable(fn):
+        return ""
+    root = PROFILES_BASE if base is None else base
+    try:
+        return fn(root.parent) or ""
+    except Exception as e:
+        log(f"cannot read the management project: {e}")
+        return ""
+
+
+def read_host_identity(
+    agents: list[dict[str, str]] | None,
+    base: Path | None = None,
+) -> dict[str, str] | None:
+    """The cluster this pod runs on, and its Cluster Agent when one exists.
+
+    No cluster name, no host: a project or location alone cannot say which
+    cluster "this cluster" is. The operator lets spec.harness.projectId be a
+    project number while the reconcile resolves it to the project ID in
+    fleet_scope.json's management row and scaffolds every profile on that ID,
+    so an all-digit GKE_PROJECT_ID is never printed as the project and completes
+    the triple from the snapshot instead (omitting project and assignee until
+    the snapshot records it, rather than guessing on cluster and location). A
+    derived-name fallback applies only to an unstamped profile directory so a
+    hyphen-boundary collision never overrides a disagreeing cluster_identity.
+    An assignee that is not a discovered profile is never advertised, because a
+    card filed to it is never dispatched.
+    """
+    cluster = _host_env(HOST_CLUSTER_ENV)
+    if not cluster:
+        return None
+    raw_project = _host_env(HOST_PROJECT_ENV)
+    project = _management_project_id(base) if raw_project.isdigit() else raw_project
+    location = _host_env(HOST_LOCATION_ENV)
+    host = {IDENTITY_NAME_KEY: cluster}
+    if project:
+        host[IDENTITY_PROJECT_KEY] = project
+    if location:
+        host[IDENTITY_LOCATION_KEY] = location
+    if project and location:
+        wanted = {
+            IDENTITY_NAME_KEY: cluster,
+            IDENTITY_PROJECT_KEY: project,
+            IDENTITY_LOCATION_KEY: location,
+        }
+        by_name = {a["name"]: a for a in agents or []}
+        match = next(
+            (
+                a["name"]
+                for a in agents or []
+                if all(a.get(IDENTITY_FIELD_PREFIX + k) == v for k, v in wanted.items())
+            ),
+            "",
+        )
+        derived = _profile_name(project, cluster, location)
+        derived_entry = by_name.get(derived)
+        unstamped = (
+            derived
+            if derived_entry is not None
+            and not any(derived_entry.get(IDENTITY_FIELD_PREFIX + k) for k in IDENTITY_KEYS)
+            else ""
+        )
+        assignee = match or unstamped
+        if assignee:
+            host[HOST_ASSIGNEE_KEY] = assignee
+    return host
+
+
+def _format_host(host: dict[str, str] | None) -> str:
+    if not host:
+        return ""
+    parts = [f"{k}={host[k]}" for k in HOST_DISPLAY_KEYS if host.get(k)]
+    return f"{HOST_IDENTITY_HEADING}\n- {', '.join(parts)}"
+
+
+def _scope_reader():
+    """fleet_scope_targets, or None when it cannot be imported.
+
+    In the pod it sits beside this file. The plugin loads this file by path, so
+    its directory is not on sys.path there; it is appended (not prepended) so
+    nothing installed is shadowed. A checkout keeps it under agents/platform.
+    """
+    here = Path(__file__).resolve().parent
+    for directory in (here, here.parent.parent / "platform" / "scripts"):
+        if (directory / f"{SCOPE_READER}.py").is_file() and str(directory) not in sys.path:
+            sys.path.append(str(directory))
+    try:
+        return importlib.import_module(SCOPE_READER)
+    except Exception as e:  # an import-time fault must not cost the roster
+        log(f"cannot import {SCOPE_READER}: {e}")
+        return None
+
+
+def _format_scope(base: Path | None = None) -> str:
+    """The projects the declared scope resolved to, as the fleet_scope tool reads them."""
+    reader = _scope_reader()
+    if reader is None:
+        return ""
+    # The router child gets these through `${...}` entries; an unset one arrives
+    # as the literal placeholder, which the reader would take for a path or a
+    # project. Unset is what it means.
+    for name in (reader.SCOPE_FILE_ENV, *reader.MANAGEMENT_PROJECT_ENVS):
+        if os.environ.get(name, "").startswith(UNEXPANDED_PLACEHOLDER_PREFIX):
+            os.environ.pop(name, None)
+    root = PROFILES_BASE if base is None else base
+    try:
+        targets = reader.declared_scope_targets(root.parent)
+    except Exception as e:  # ScopeRenderUnreadable, or a fault on the shared PVC
+        log(f"cannot read the declared scope: {e}")
+        return f"{SCOPE_HEADING}\n{SCOPE_UNREADABLE}"
+    if targets is None:
+        return f"{SCOPE_HEADING}\n{SCOPE_UNDECLARED}"
+    unresolved_row = getattr(reader, "UNRESOLVED_SCOPE_ROW", None)
+    entries: list[tuple[str, str | None]] = [
+        *((p, None) for p in targets.projects),
+        *((p, outcome) for p, outcome in targets.unread if p != unresolved_row),
+    ]
+    total = len(entries)
+    listed = [
+        p if outcome is None else f"{p} ({outcome})"
+        for p, outcome in entries[:SCOPE_NAMED_LIMIT]
+    ]
+    if total > SCOPE_NAMED_LIMIT:
+        omitted = entries[SCOPE_NAMED_LIMIT:]
+        outcome_counts: dict[str, int] = {}
+        for _, outcome in omitted:
+            if outcome is not None:
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        if outcome_counts:
+            breakdown = ", ".join(f"{n} {outcome}" for outcome, n in outcome_counts.items())
+            listed.append(f"and {len(omitted)} more ({breakdown})")
+        else:
+            listed.append(f"and {len(omitted)} more")
+    if targets.note:
+        note_reasons = {
+            getattr(reader, "RENDER_NOTE", None): SCOPE_PARTIAL_PENDING,
+            getattr(reader, "RENDER_NUMERIC_HOST_NOTE", None): SCOPE_PARTIAL_NUMERIC_HOST,
+        }
+        reason = note_reasons.get(targets.note, SCOPE_PARTIAL_PENDING)
+    elif any(p == unresolved_row for p, _ in targets.unread):
+        reason = SCOPE_PARTIAL_UNRESOLVED
+    else:
+        reason = ""
+    projects = ", ".join(listed) or SCOPE_NONE_LISTED
+    if reason:
+        return f"{SCOPE_HEADING}\n{SCOPE_PARTIAL_LINE.format(reason=reason, projects=projects)}"
+    return f"{SCOPE_HEADING}\n{SCOPE_LINE.format(count=total, projects=projects)}"
+
+
 def render(base: Path | None = None) -> str | None:
     """Discover and format in one call — what both consumers actually want.
 
     ``None`` means the roster could not be read at all. Both consumers treat
     that as "say nothing about the fleet" rather than "the fleet is empty".
     """
-    return format_roster(discover(base))
+    agents = discover(base)
+    roster = format_roster(agents)
+    if roster is None:
+        return None
+    extra = [b for b in (_format_host(read_host_identity(agents, base)), _format_scope(base)) if b]
+    return "\n\n".join([roster, *extra])

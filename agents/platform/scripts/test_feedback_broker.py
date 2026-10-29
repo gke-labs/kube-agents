@@ -473,7 +473,9 @@ class FormContractTest(unittest.TestCase):
 
     def test_confirmation_substring_matches_the_form_builder(self) -> None:
         code_gs = CODE_GS.read_text(encoding="utf-8")
-        match = re.search(r"CONFIRMATION_MESSAGE =\s*((?:'[^']*'\s*\+?\s*)+);", code_gs)
+        # A second run of blanks follows a string only after a "+", so the blanks
+        # between two strings are read one way rather than once per split.
+        match = re.search(r"CONFIRMATION_MESSAGE =\s*((?:'[^']*'\s*(?:\+\s*)?)+);", code_gs)
         self.assertIsNotNone(match, "no CONFIRMATION_MESSAGE in Code.gs")
         assert match
         message = "".join(re.findall(r"'([^']*)'", match.group(1)))

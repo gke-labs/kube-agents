@@ -5,7 +5,8 @@ The collector records three kinds of run under one schema (SCHEMA.md,
 ``runs[].tier``): the presubmit gate's, one per pull-request build of
 ``pull-kube-agents-smoke-test``; the nightly periodics', one per build of
 ``ci-kube-agents-eval-nightly`` (and of ``ci-kube-agents-eval-nightly-writers``
-when a night is split across two jobs, ``nightly.py``) against ``main`` with
+and ``ci-kube-agents-eval-nightly-main-b`` when a night is split across
+jobs, ``nightly.py``) against ``main`` with
 no pull request; and the GitLab lane's, one per build of
 ``pull-kube-agents-smoke-test-gitlab``, the forge-grading cases of the
 catalogue driven against a pool project's GitLab repository

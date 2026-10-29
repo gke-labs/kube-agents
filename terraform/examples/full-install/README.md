@@ -528,7 +528,7 @@ Add `third_party_image_registry` to mirror third-party images (cert-manager,
 LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
 their upstream registries.
 
-`IMAGE_TAG` is not optional here. The four first-party images take whatever tag
+`IMAGE_TAG` is not optional here. The first-party images take whatever tag
 the mirror step was given (`latest` if it was given none), while Terraform asks
 for `image_tag` — so a mirror populated at `latest` against an `image_tag` of
 `v1.2.3` holds no reference the install will ever request. `terraform apply`

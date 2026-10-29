@@ -40,13 +40,12 @@ readonly PLATFORM_AGENT_MODE_NEXT_PATCH='{"spec":{"mode":"next"}}'
 
 # The conditions the operator writes under `next`
 # (k8s-operator/internal/controller): BusProvisioned once the provisioning Job
-# has completed, BusCredentialsReady while the auth callout serves the current
-# identity map, and A2AGateway, present only while the gateway is withheld for
-# want of a chat backend, with this reason.
+# has completed, and BusCredentialsReady while the auth callout serves the
+# current identity map. Every next install runs the A2A gateway (on the
+# console door alone when no chat backend is configured), so the gate always
+# waits on its rollout.
 readonly PLATFORM_AGENT_MODE_BUS_PROVISIONED="BusProvisioned"
 readonly PLATFORM_AGENT_MODE_BUS_CREDENTIALS="BusCredentialsReady"
-readonly PLATFORM_AGENT_MODE_GATEWAY_CONDITION="A2AGateway"
-readonly PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON="NoChatBackend"
 
 # One budget for the whole gate, every wait inside it taking what is left.
 # Ready under `next` counts NATS, the callout, the provisioning Job and the A2A
@@ -220,11 +219,10 @@ platform_agent_mode_wait_condition() {
 # patch the CR still carries the Ready the operator wrote for today, and the
 # Ready condition's observedGeneration is what tells the two apart. Under
 # `next` Ready counts the NATS StatefulSet, the auth callout, the provisioning
-# Job (until BusProvisioned latches) and the A2A gateway unless the install
-# has no chat backend. Then the two conditions that say the bus is usable, and
-# each workload's rollout, so the tests do not start in the middle of one. The
-# verifier is gated by rollout alone because it is deliberately not a Ready
-# row. The A2A gateway is skipped only when the operator says it withheld it.
+# Job (until BusProvisioned latches) and the A2A gateway. Then the two
+# conditions that say the bus is usable, and each workload's rollout, so the
+# tests do not start in the middle of one. The verifier is gated by rollout
+# alone because it is deliberately not a Ready row.
 platform_agent_mode_wait_next() {
   local namespace="$1" context="${2:-}"
   local -a kc=(kubectl)
@@ -261,25 +259,7 @@ platform_agent_mode_wait_next() {
     platform_agent_mode_gate_rollout "${namespace}" "${context}" "${workload}" "${deadline}" || return 1
   done
 
-  # Empty is an answer here (the condition is absent while the gateway is
-  # rendered), so a dropped read is told from it by the exit status and
-  # retried inside the budget like every other read in the gate.
-  local gateway_reason=""
-  until gateway_reason="$("${kc[@]}" get platformagent "${PLATFORM_AGENT_MODE_CR_NAME}" -n "${namespace}" \
-    -o jsonpath="{.status.conditions[?(@.type==\"${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}\")].reason}" 2>/dev/null)"; do
-    gateway_reason=""
-    if [ "${SECONDS}" -ge "${deadline}" ]; then
-      echo "::error title=mode next: ${PLATFORM_AGENT_MODE_GATEWAY_CONDITION} unreadable::PlatformAgent/${PLATFORM_AGENT_MODE_CR_NAME}'s ${PLATFORM_AGENT_MODE_GATEWAY_CONDITION} condition could not be read within the gate's ${PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS}s, so whether to wait for the A2A gateway is unknown."
-      platform_agent_mode_dump_state "${namespace}" "${context}"
-      return 1
-    fi
-    sleep "${PLATFORM_AGENT_MODE_POLL_SECONDS}"
-  done
-  if [ "${gateway_reason}" = "${PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON}" ]; then
-    echo "${PLATFORM_AGENT_MODE_A2A_GATEWAY} is withheld (${PLATFORM_AGENT_MODE_GATEWAY_CONDITION}=False ${PLATFORM_AGENT_MODE_GATEWAY_DARK_REASON}): this install configures no chat backend, so there is no A2A gateway to wait for."
-  else
-    platform_agent_mode_gate_rollout "${namespace}" "${context}" "${PLATFORM_AGENT_MODE_A2A_GATEWAY}" "${deadline}" || return 1
-  fi
+  platform_agent_mode_gate_rollout "${namespace}" "${context}" "${PLATFORM_AGENT_MODE_A2A_GATEWAY}" "${deadline}" || return 1
 
   echo "✅ spec.mode ${PLATFORM_AGENT_MODE_NEXT}: everything the operator renders for it is ready."
 }

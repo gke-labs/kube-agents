@@ -114,6 +114,10 @@ type a2aAuthMapIdentity struct {
 	// adding them changed no other entry's bytes.
 	Profile string            `json:"profile,omitempty"`
 	Topics  *a2aAuthMapTopics `json:"topics,omitempty"`
+
+	// Tier is the tier a profile entry's pods run at (#3655): one entry, and
+	// one ServiceAccount, per tier the profile allows. Omitted elsewhere.
+	Tier string `json:"tier,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.

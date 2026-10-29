@@ -477,13 +477,14 @@ SOURCES: dict[str, Source] = {
     ),
     "a2a_session_grants": Source(
         "a2a/authcallout/session.go",
-        ("func sessionGrants", "func executorGrants", "lib.TaskEventsSubject(addressee,"),
+        ("func sessionGrants", "func executorGrants", "func executorTaskGrants", "lib.TaskEventsSubject(addressee,"),
     ),
-    # The other narrowing that starts from executorGrants: an AgentProfile's
-    # pods (the A2A profile resource, not a Hermes profile directory).
+    # The other narrowing that starts from executorTaskGrants: an
+    # AgentProfile's pods (the A2A profile resource, not a Hermes profile
+    # directory), on the task connection a task credential opens (#3889).
     "a2a_profile_grants": Source(
         "a2a/authcallout/profile_narrowing.go",
-        ("func profileGrants", "executorGrants(profile, pod)"),
+        ("func profileGrants", "func profileTaskGrants", "executorTaskGrants(profile, task, stem)"),
     ),
     # What the server actually loads, as opposed to what the Go builders say.
     # The writer-set tests read both and assert they agree: the Go map is what
@@ -639,6 +640,10 @@ SOURCES: dict[str, Source] = {
         "agents/cluster/config.yaml",
         ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
+    "tse_config": Source(
+        "agents/tse/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
     # --- the tool-call audit ---------------------------------------------
     # D1 reads that every profile config enables tool_call_audit. The Planning
     # Agent's config is the one the image ships as the default profile. A
@@ -668,6 +673,7 @@ SOURCES: dict[str, Source] = {
             "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
             "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
             "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+            "COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/",
         ),
     ),
     # --- supply chain -----------------------------------------------------

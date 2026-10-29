@@ -48,6 +48,7 @@ import re
 import ssl
 import urllib.parse
 from collections.abc import Mapping
+from pathlib import Path
 
 __all__ = [
     "FORGES",
@@ -60,6 +61,7 @@ __all__ = [
     "GITHUB_DEFAULT_HOST",
     "GITHUB_HOST_ENV_VAR",
     "GITHUB_TOKEN_ENV_VARS",
+    "GITHUB_TOKEN_FILE_ENV_VAR",
     "GITLAB_AGENT_LOGIN_ENV_VAR",
     "GITLAB_DEFAULT_HOST",
     "GITLAB_HOST_ENV_VAR",
@@ -76,8 +78,10 @@ __all__ = [
     "is_gitlab_token_bot",
     "issue_refs",
     "proposal_refs",
+    "missing_token_hint",
     "read_token",
     "token_env_vars",
+    "token_source",
     "web_host",
 ]
 
@@ -127,6 +131,14 @@ _GITLAB_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+|\d+)?$")
 #: read-scoped installation token ``hack/ci-eval-pr.sh`` mints; GitLab's is a
 #: group or project access token with ``read_api`` and the Reporter role.
 GITHUB_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
+#: A file holding the GitHub grading credential, read on every call and
+#: preferred over GITHUB_TOKEN_ENV_VARS while it holds one. The minted
+#: installation token lasts an hour from just before devops-bench starts, and
+#: a unit whose stack runs longer than that (oobe-first-run-audits' first
+#: repetition waits out a fresh install's own first-run stage) would grade
+#: with a dead one; hack/ci-eval-pr.sh writes the token here and renews it
+#: while the unit runs, which an environment variable read at startup cannot.
+GITHUB_TOKEN_FILE_ENV_VAR = "BENCH_GITHUB_TOKEN_FILE"
 GITLAB_TOKEN_ENV_VARS = ("BENCH_GITLAB_TOKEN",)
 
 # One path segment of a GitLab project path: a group, a subgroup or the
@@ -181,8 +193,58 @@ def token_env_vars(forge: str) -> tuple[str, ...]:
 
 
 def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """The grading credential: GITHUB_TOKEN_FILE_ENV_VAR's file on GitHub when
+    it holds one, else the first of :func:`token_env_vars` that is set. A
+    file that is unreadable, not UTF-8, empty, or anything but one line of
+    printable ASCII with no whitespace inside falls back to the variables,
+    which hold the token the unit started with: such a file cannot be a
+    token, and an embedded newline or a non-Latin-1 character would otherwise
+    raise out of the HTTP request's header instead of grading."""
     env = _env(environ)
+    token = _file_token(forge, env)
+    if token:
+        return token
     return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
+
+
+def _file_token(forge: str, env: Mapping[str, str]) -> str | None:
+    """GITHUB_TOKEN_FILE_ENV_VAR's token when it names a file holding one."""
+    token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
+    if forge == FORGE_GITLAB or not token_file:
+        return None
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return None
+    if token and token.isascii() and token.isprintable() and not any(c.isspace() for c in token):
+        return token
+    return None
+
+
+def token_source(forge: str, environ: Mapping[str, str] | None = None) -> str:
+    """Names the credential :func:`read_token` returns, for a diagnostic:
+    the file when it supplied the token, else the first variable that is set
+    (the forge's first variable when none is)."""
+    env = _env(environ)
+    if _file_token(forge, env):
+        return f"the token in the file {GITHUB_TOKEN_FILE_ENV_VAR} names ({env[GITHUB_TOKEN_FILE_ENV_VAR]})"
+    names = token_env_vars(forge)
+    name = next((n for n in names if env.get(n)), names[0])
+    return f"the token in {name}"
+
+
+def missing_token_hint(forge: str, environ: Mapping[str, str] | None = None) -> str:
+    """What to set when :func:`read_token` found nothing, saying so when
+    GITHUB_TOKEN_FILE_ENV_VAR is set but its file holds no usable token."""
+    env = _env(environ)
+    hint = f"set one of {', '.join(token_env_vars(forge))}"
+    token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
+    if forge != FORGE_GITLAB and token_file:
+        hint += (
+            f" ({GITHUB_TOKEN_FILE_ENV_VAR} names {token_file}, which was refused: "
+            "unreadable, empty, or not one line of printable ASCII)"
+        )
+    return hint
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*\Z")

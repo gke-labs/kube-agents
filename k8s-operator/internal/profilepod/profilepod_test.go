@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -103,6 +104,22 @@ func TestWithoutImageVolumesEachImageIsStagedIntoAnEmptyDir(t *testing.T) {
 			}
 			if _, ok := c.Resources.Limits[name]; !ok {
 				t.Errorf("init container %q has no %s limit", c.Name, name)
+			}
+		}
+		// The staged volume is bounded, and the staging container requests it
+		// plus stagingLogsAllowance as ephemeral storage, the limit equal.
+		wantLimit := toolStagingSizeLimit
+		if v.Name == personaVolumeName {
+			wantLimit = personaStagingSizeLimit
+		}
+		if v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.Cmp(resource.MustParse(wantLimit)) != 0 || v.EmptyDir.SizeLimit.Sign() != 1 {
+			t.Errorf("staged volume %q sizeLimit = %v, want %s and positive", v.Name, v.EmptyDir, wantLimit)
+		} else {
+			want := v.EmptyDir.SizeLimit.DeepCopy()
+			want.Add(resource.MustParse(stagingLogsAllowance))
+			req, lim := c.Resources.Requests[corev1.ResourceEphemeralStorage], c.Resources.Limits[corev1.ResourceEphemeralStorage]
+			if req.Cmp(want) != 0 || lim.Cmp(req) != 0 {
+				t.Errorf("init container %q ephemeral-storage request %s, limit %s; want both %s", c.Name, req.String(), lim.String(), want.String())
 			}
 		}
 		sc := c.SecurityContext

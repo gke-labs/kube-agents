@@ -40,7 +40,7 @@
 # names a pull request this run wrote, not closed unmerged, whose branch also
 # carries a pull request this run opened and closed, and which does not contain
 # that closed proposal's head revision, and the report names the closed one
-# too -- the inject lane's write safeguard excuses it only if it does. Without
+# too -- the lanes' write safeguard excuses it only if it does. Without
 # the branch clause, a worker refused
 # the name opens the same change on a fresh branch and passes -- which is what
 # the refusal told it to do. Without the revision clause, a worker that builds

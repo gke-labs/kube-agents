@@ -839,7 +839,7 @@ func TestPodReusable(t *testing.T) {
 	const deadline = 30 * time.Minute
 	base := func() *corev1.Pod {
 		return &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: "p", Annotations: map[string]string{annoReuse: reuseValue}},
+			ObjectMeta: metav1.ObjectMeta{Name: "p", Annotations: map[string]string{annoReuse: reuseValue, annoBusTransport: "tls-1"}},
 			Spec:       corev1.PodSpec{ActiveDeadlineSeconds: ptr.To(int64((4 * time.Hour) / time.Second))},
 			Status: corev1.PodStatus{
 				Phase:     corev1.PodRunning,
@@ -868,11 +868,16 @@ func TestPodReusable(t *testing.T) {
 		{"just enough time left", func(p *corev1.Pod) {
 			p.Status.StartTime = &metav1.Time{Time: now.Add(-4*time.Hour + deadline + 2*podDeadlineGrace + time.Minute)}
 		}, true},
+		// A pod spawned against another bus transport keeps the env it was
+		// given, so after the bus moved to TLS it retries forever and never
+		// reconnects. It is not handed a task.
+		{"spawned for another bus transport", func(p *corev1.Pod) { p.Annotations[annoBusTransport] = "plaintext-0" }, false},
+		{"spawned before the stamp existed", func(p *corev1.Pod) { delete(p.Annotations, annoBusTransport) }, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := base()
 			tc.mutate(p)
-			if got := podReusable(p, deadline, now); got != tc.want {
+			if got := podReusable(p, "tls-1", deadline, now); got != tc.want {
 				t.Errorf("podReusable = %v, want %v", got, tc.want)
 			}
 		})

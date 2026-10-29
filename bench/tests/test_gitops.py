@@ -447,6 +447,32 @@ def test_token_file_fallback(tmp_path: Any) -> None:
     assert gh.headers["Authorization"] == "Bearer filetoken"
 
 
+def test_the_renewed_grading_token_outranks_the_startup_one(tmp_path: Any) -> None:
+    renewed = tmp_path / "ledger-token"
+    renewed.write_text("renewedtoken\n")
+    env = ENV | {"BENCH_GITHUB_TOKEN_FILE": str(renewed)}
+    gh = FakeGitHub(pulls=[[]])
+    _run(env, gh, [])
+    assert gh.headers["Authorization"] == "Bearer renewedtoken"
+
+
+def test_a_token_renewed_mid_cycle_is_used_for_the_next_request(tmp_path: Any) -> None:
+    renewed = tmp_path / "ledger-token"
+    renewed.write_text("firsttoken\n")
+    env = ENV | {"BENCH_GITHUB_TOKEN_FILE": str(renewed)}
+    seen: list[str] = []
+
+    class RenewingGitHub(FakeGitHub):
+        def __call__(self, url: str, headers: Any) -> Any:
+            seen.append(dict(headers)["Authorization"])
+            renewed.write_text("secondtoken\n")
+            return super().__call__(url, headers)
+
+    gh = RenewingGitHub(pulls=[[]])
+    _run(env, gh, [])
+    assert seen[:2] == ["Bearer firsttoken", "Bearer secondtoken"]
+
+
 @pytest.mark.parametrize(
     ("url", "slug"),
     [

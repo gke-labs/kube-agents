@@ -415,6 +415,8 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
+		// A follow-up's synthesis step needs work of its own (beginTurn).
+		act.beginTurn()
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
@@ -579,6 +581,15 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+		return "", false
+	}
+	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {
+		// The model's reasoning, not an answer (#3206): withheld from the
+		// stream, final or turn answer alike. The turn ran and read tokens,
+		// so its usage goes out ahead of the terminal, as a failed turn's does.
+		b.withholdUnstructuredReasoning(run, sessionID, turn, answer)
+		b.publishTurnUsage(run, &out, took)
+		b.finalize(run, lib.StateFailed, unstructuredReasoningReason(sessionID, turn), nil)
 		return "", false
 	}
 	run.mu.Lock()

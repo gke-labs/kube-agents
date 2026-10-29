@@ -117,7 +117,8 @@ contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
-`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), and the `KAGE_SLACK_UX` flag —
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
@@ -958,6 +959,10 @@ key and replaces it with the fixed, non-secret sentinel before forwarding to por
 8642 on loopback.
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
+
+A proposed route allowlist for this door, owned by kube-agents and part of the
+harness contract, is in the draft
+[`designs/agent-api-door-allowlist.md`](designs/agent-api-door-allowlist.md).
 
 ### GitHub and Minty
 

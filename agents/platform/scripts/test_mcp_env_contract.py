@@ -295,6 +295,23 @@ class LocalServersDeclareTheEnvTheyReadTest(unittest.TestCase):
                 f"name, the silent 'No home channel set' loss",
             )
 
+    def test_the_bus_entries_track_what_a2a_notify_needs(self):
+        """The other read the walk cannot see: `a2a notify`'s, in Go.
+
+        Under next, send_notification runs `chat_notify.command`, which execs
+        the `a2a` CLI. The CLI reads the bus URL, the identity and the CA from
+        its environment, so none of the three appears as a Python read here,
+        and a block missing one fails only at runtime. Without the CA, every
+        post fails TLS verification against a bus that requires it.
+        """
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import chat_notify
+
+        env = merged_config()["mcp_servers"]["platform_control"].get("env") or {}
+        for name in (chat_notify.BUS_URL_ENV, chat_notify.BUS_USER_ENVS[0], chat_notify.BUS_CA_ENV):
+            self.assertIn(name, env, f"platform_control's env block does not pass {name}, which `a2a notify` reads")
+            self.assertEqual(env[name], "${%s}" % name)
+
 
 if __name__ == "__main__":
     unittest.main()

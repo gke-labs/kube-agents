@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import board_snapshot
+import findings_nudge
 import findings_queue
 
 NOW = datetime(2026, 10, 16, 13, 2, tzinfo=timezone.utc)
@@ -56,7 +57,9 @@ def kanban_db():
 class BoardSnapshotTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.profiles = Path(self.tmp.name)
+        # The profiles directory sits in the gateway home, where onboarding's markers are.
+        self.profiles = Path(self.tmp.name) / "profiles"
+        self.profiles.mkdir()
         for profile, cluster in (("platform", None), ("ca-seeded-a", "seeded-a"), ("ca-seeded-c", "seeded-c")):
             home = self.profiles / profile
             home.mkdir()
@@ -117,6 +120,75 @@ class BoardSnapshotTest(unittest.TestCase):
         findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])
         self.session.execute("UPDATE findings SET state = 'resolved'")
         self.assertEqual(self.snap()["clusters"][0], {"name": "seeded-a", "findings": 0})
+
+    def test_before_the_first_report_the_board_says_so(self):
+        home = self.profiles.parent
+        self.assertNotIn("first_report_pending", self.snap(), "no sweep filed: onboarding never ran")
+        (home / findings_nudge.SCAN_FILED_MARKER).write_text(f"task_id=t_1\n{findings_nudge.FILED_AT_PREFIX}{int(NOW.timestamp()) - 60}\n")
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertTrue(board["first_message_pending"])
+        (home / board_snapshot.FIRST_MESSAGE_MARKER).touch()
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertNotIn("first_message_pending", board)
+
+    def test_a_row_before_delivery_keeps_the_other_clusters_pending(self):
+        # One cluster's finding landed first; the rest are still unchecked.
+        (self.profiles.parent / findings_nudge.SCAN_FILED_MARKER).touch()
+        findings_queue.register_findings(self.session, [finding("seeded-a", "oom crash", "critical")])
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertEqual([c["findings"] for c in board["clusters"]], [1, 0])
+
+    def test_a_delivered_report_ends_the_pending_state(self):
+        home = self.profiles.parent
+        (home / findings_nudge.SCAN_FILED_MARKER).touch()
+        (home / findings_nudge.DELIVERED_MARKER).touch()
+        board = self.snap()
+        self.assertNotIn("first_report_pending", board)
+        self.assertNotIn("first_message_pending", board)
+
+    def test_a_conversation_claim_is_not_the_report_out(self):
+        # Under spec.mode next the claim can be released; the recorded outcome ends the state.
+        home = self.profiles.parent
+        (home / findings_nudge.SCAN_FILED_MARKER).touch()
+        (home / findings_nudge.CONVERSATION_MARKERS[0]).write_text("{}")
+        (home / findings_nudge.DELIVERED_MARKER).touch()
+        self.assertTrue(self.snap()["first_report_pending"])
+        (home / findings_nudge.CONVERSATION_DONE_MARKER).write_text("posted\n")
+        self.assertNotIn("first_report_pending", self.snap())
+
+    def test_registered_findings_end_the_pending_state_without_a_delivery(self):
+        # A conversation post that failed five times after registration: the fleet was checked.
+        home = self.profiles.parent
+        (home / findings_nudge.SCAN_FILED_MARKER).touch()
+        (home / findings_nudge.CONVERSATION_MARKERS[0]).write_text("{}")
+        findings_queue.register_findings(self.session, [finding("seeded-a", "oom crash", "critical")])
+        self.assertTrue(self.snap()["first_report_pending"])
+        (home / board_snapshot.FINDINGS_REGISTERED_MARKER).touch()
+        board = self.snap()
+        self.assertNotIn("first_report_pending", board)
+        self.assertNotIn("first_message_pending", board)
+        self.assertEqual([c["findings"] for c in board["clusters"]], [1, 0])
+
+    def test_a_never_primed_install_stays_pending(self):
+        # Nobody wrote within the plugin's week: delivery never ran, so nothing was registered.
+        home = self.profiles.parent
+        week_ago = int(NOW.timestamp()) - board_snapshot.FIRST_MESSAGE_MAX_AGE_SECONDS - 1
+        (home / findings_nudge.SCAN_FILED_MARKER).write_text(f"task_id=t_1\n{findings_nudge.FILED_AT_PREFIX}{week_ago}\n")
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertNotIn("first_message_pending", board)
+
+    def test_an_old_sweep_asks_for_no_message(self):
+        # Past a week the onboarding plugin primes nothing, so the note would mislead.
+        home = self.profiles.parent
+        week_ago = int(NOW.timestamp()) - board_snapshot.FIRST_MESSAGE_MAX_AGE_SECONDS - 1
+        (home / findings_nudge.SCAN_FILED_MARKER).write_text(f"task_id=t_1\n{findings_nudge.FILED_AT_PREFIX}{week_ago}\n")
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertNotIn("first_message_pending", board)
 
     def test_running_cards_carry_their_assignee_cluster(self):
         kb = kanban_db()

@@ -6,9 +6,10 @@
 # suite is stdlib unittest.
 #
 # This file is the single source of truth for the list. Every installer reads
-# it -- `make test-python-deps` locally and, in CI, both sweep jobs of
-# .github/workflows/python-tests.yml, the required one on .python-version and
-# the agent-image one on .agent-python-version -- because a hand-copied second
+# it -- `make test-python-deps` locally and, in CI, both sweeps of
+# .github/workflows/python-tests.yml, the required one's shards on
+# .python-version and the agent-image job on .agent-python-version (the job
+# that joins the shards installs only coverage and diff-cover) -- because a hand-copied second
 # list is how they drift into a suite that passes on a runner and cannot be run
 # on a laptop. No other workflow installs this file: the operator's own Python
 # test imports nothing third-party, and the rest install pyyaml or
@@ -73,7 +74,8 @@ pyyaml
 # hermes-agent through rich; nothing above pulls it in.
 markdown-it-py
 
-# `make coverage`, which the CI `test` job runs. coverage runs the unittest suite
+# `make coverage`, which the CI `test-shard` jobs run (the `test` job joins their
+# data with `make coverage-merge`). coverage runs the unittest suite
 # under measurement; diff-cover reads the resulting coverage.xml plus the
 # branch diff to report coverage of changed lines only. Neither is imported by
 # anything under test -- they are tooling, listed here so the local and CI

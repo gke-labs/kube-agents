@@ -62,7 +62,7 @@ class D1Attributable(unittest.TestCase):
         which task. A profile that does not enable the plugin writes no record,
         and nothing else notices.
         """
-        names = ("chat_config", "platform_config", "cluster_config")
+        names = ("chat_config", "platform_config", "cluster_config", "tse_config")
         # Every profile config in the tree, so a new profile cannot ship
         # without the plugin and still leave this test green.
         shipped = {

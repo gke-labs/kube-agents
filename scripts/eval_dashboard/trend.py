@@ -36,8 +36,8 @@ WHAT "SCORE" MEANS is written once, in ``docs/designs/eval-scorer.md``
 LATENCY IS ADVISORY, AND NOT FROM THE STORE. The store's records carry no
 timing, so the latency row under each card reads ``data.json``'s nightly
 runs, each night filed as ``nightly.filed_nights`` files it, with its own
-parts only (a main re-run night does not borrow its date's writers part,
-so writers reps count once): per night and scope (a case, a domain's cases,
+parts only (a main re-run night does not borrow its date's other parts,
+so their reps count once): per night and scope (a case, a domain's cases,
 every case), the p50 and the slow percentile (``LATENCY_SLOW_PCT``: the
 opening chat turn's p95, ``nightly.TURN1_TARGET_PCT``, which its target is
 defined on; the agent run's ``nightly.SLOW_PCT``) over the scope's reps
@@ -50,13 +50,27 @@ appends to it (a pull request's run is graded against it and never writes),
 so a trend read from the store is the nightly's by construction; the
 presubmit's judged scores stay on the run page.
 
-THE VERSION KEY. Each record carries the five-component key it was measured
-at (``setup_id``, ``scoring_version``, ``judge_model``, ``fleet``,
-``verifiers``). Records are compared in time order per case; where the key
-differs from the record before, that night is a marker naming the
-components that changed. Pooling (the trailing window, the spread) never
-crosses a key: a baseline measured on other software is not evidence about
-this one.
+THE VERSION KEY. Each record carries the key it was measured at
+(``setup_id``, ``scoring_version``, ``judge_model``, ``fleet``,
+``verifiers``, and ``mode`` when it is not today). Records are compared in
+time order per case; where the key differs from the record before, that
+night is a marker naming the components that changed. Pooling (the
+trailing window, the spread) never crosses a key: a baseline measured on
+other software is not evidence about this one.
+
+ONE SERIES PER MODE. The store holds next-mode records from the main
+nightly and today-mode records from before it moved to next, so one series
+per case would change key at every mode boundary.
+The top-level document is today's records alone (a record with no ``mode``
+is today, as every record before the component existed is), exactly what
+it was before next-mode records existed; ``next`` holds the same per-case
+and per-domain blocks built from the next-mode records, or null when the
+store holds none (a mode this module does not know is in neither).
+Latency stays top-level: it is read from the main nightly's runs (tier
+``nightly``), which grade next through the inject door, where the harness
+times the opening task from the door accepting it to its terminal. Nights
+graded before it did carry no turn-1 time, so only the agent time is drawn
+for them.
 
 Only stdlib, like ``nightly.py``.
 """
@@ -89,6 +103,11 @@ SPREAD_NIGHTS = 7
 DEFAULT_METRIC = "OutcomeValidity"
 DAY_MS = 24 * 3600 * 1000
 KEY_COMPONENTS = ("setup_id", "scoring_version", "judge_model", "fleet", "verifiers")
+# The version key's mode (bench/kube_agents_bench/baselines.py, MODE_TODAY
+# and MODE_NEXT): absent is today, and only a key in another mode spells it,
+# in the key id and as a suffix on the writer's versions segment.
+MODE_TODAY = "today"
+MODE_NEXT = "next"
 DOMAIN_UNKNOWN = nightly.DOMAIN_UNKNOWN
 # The latency row's two series and its percentiles: the median, and a slow
 # percentile per series. The opening turn's is the p95 its target is defined
@@ -103,17 +122,31 @@ UTC = datetime.timezone.utc
 # records
 
 
+def key_mode(key: dict | None) -> str:
+    """A key's mode: as written, or today when absent or empty."""
+    mode = key.get("mode") if isinstance(key, dict) else None
+    return mode if isinstance(mode, str) and mode else MODE_TODAY
+
+
+def _mode_suffix(key: dict | None) -> str:
+    mode = key_mode(key)
+    return "" if mode == MODE_TODAY else f"-{mode}"
+
+
 def key_id(key: dict) -> str:
     """The key as one readable string, the store's own directory order:
-    ``<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>``."""
+    ``<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>[-<mode>]``."""
     return (
         f"{key.get('setup_id') or 'unknown-setup'}/{key.get('judge_model') or 'unknown-judge'}/"
-        f"{key.get('scoring_version') or 'unknown'}-f{key.get('fleet')}-v{key.get('verifiers')}"
+        f"{key.get('scoring_version') or 'unknown'}-f{key.get('fleet')}-v{key.get('verifiers')}{_mode_suffix(key)}"
     )
 
 
 def key_document(key: dict) -> dict:
-    return {name: key.get(name) for name in KEY_COMPONENTS}
+    doc = {name: key.get(name) for name in KEY_COMPONENTS}
+    if key_mode(key) != MODE_TODAY:
+        doc["mode"] = key_mode(key)
+    return doc
 
 
 def path_segment(text) -> str:
@@ -134,7 +167,7 @@ def key_path(key: dict | None) -> str:
     writer rewrites."""
     if not key:
         return "unkeyed"
-    versions = f"{key.get('scoring_version') or 'unknown'}-f{key.get('fleet')}-v{key.get('verifiers')}"
+    versions = f"{key.get('scoring_version') or 'unknown'}-f{key.get('fleet')}-v{key.get('verifiers')}{_mode_suffix(key)}"
     return "/".join(path_segment(part) for part in (key.get("setup_id") or "unknown-setup", key.get("judge_model") or "unknown-judge", versions))
 
 
@@ -196,9 +229,9 @@ def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
     laptop run, a name outside the layout) stands alone under its stamp.
     ``anchors`` (nightly.night_builds) puts the builds of a night split
-    across two jobs under the one build the report files that night by, so
-    the night is one night here too, and a domain's point that night pools
-    the cases of both parts."""
+    across jobs (main, main-b, writers) under the one build the report files
+    that night by, so the night is one night here too, and a domain's point
+    that night pools the cases of all its parts."""
     build = record.get("build")
     if isinstance(build, str) and build and anchors:
         build = anchors.get(build, build)
@@ -381,8 +414,8 @@ def domain_points(cases: dict[str, dict]) -> list[dict]:
     night with the range of their means (``low``, ``high``, ``cases``).
     A night mixes keys only if its cases do; the page marks the key
     changes, it does not pool across them here because a domain's cases
-    share one nightly job and therefore one key (a night split across two
-    jobs pools both, and lists both keys under ``keys`` if they differ)."""
+    share one nightly job and therefore one key (a night split across jobs
+    pools them, and lists every key under ``keys`` if they differ)."""
     by_night: dict[str, dict] = {}
     for doc in cases.values():
         for point in doc["points"]:
@@ -435,8 +468,8 @@ def latency_document(data: dict, store_nights: list[dict], in_window) -> dict:
     """The ``latency`` block of the trend document: ``nights[]`` (``{id, at,
     build}``, oldest first) and, per scope, one point per night the scope
     recorded a rep (``latency_point``). A night is the Nightly page's
-    (``nightly.filed_nights``, its parts only; a case both parts recorded
-    counts as the main part recorded it) under the id the store's records
+    (``nightly.filed_nights``, its parts only; a case two parts recorded
+    counts as the first part in report order recorded it) under the id the store's records
     of it carry (``night_id``), dated by the store's night when it holds
     one, so the row's points sit under the bars above them, else by its
     parts' newest finish (or start). ``in_window`` is the page's window."""
@@ -541,6 +574,37 @@ def trend_document(store: dict | None, data: dict) -> dict:
     drawn_since_ms, window_days, lead_days = read_span(store)
     older_paths = older_by_case(store)
     in_window = lambda at: drawn_since_ms is None or (at is not None and at >= drawn_since_ms)
+    today = _series([r for r in every if key_mode(r["key"]) == MODE_TODAY], data, older_paths, in_window)
+    nxt = _series([r for r in every if key_mode(r["key"]) == MODE_NEXT], data, older_paths, in_window)
+    records, metric_list, nights = today["records"], today["metrics"], today["nights"]
+    return {
+        "source": store.get("source") if store and isinstance(store.get("source"), str) else None,
+        "read_at": store.get("read_at") if store and nightly.parse_iso(store.get("read_at")) is not None else None,
+        "error": store.get("error") if store and isinstance(store.get("error"), str) else None,
+        "window_days": window_days,
+        "lead_days": lead_days,
+        "max_objects": store.get("max_objects") if store and isinstance(store.get("max_objects"), int) else None,
+        "truncated": {str(k): v for k, v in (store.get("truncated") or {}).items() if isinstance(v, int)} if store and isinstance(store.get("truncated"), dict) else {},
+        "partial": partial_read(store),
+        "warnings": [w for w in (store.get("warnings") or []) if isinstance(w, str)] if store else [],
+        "records": records,
+        "metrics": metric_list,
+        "default_metric": today["default_metric"],
+        "spread_nights": SPREAD_NIGHTS,
+        "bar": {"rate": ADMISSION_RATE, "min_runs": ADMISSION_MIN_RUNS},
+        "keys": today["keys"],
+        "nights": nights,
+        "cases": today["cases"],
+        "domains": today["domains"],
+        "latency": latency_document(data if store else {}, nights, in_window),
+        "next": nxt if nxt["records"] or nxt["cases"] else None,
+    }
+
+
+def _series(every: list[dict], data: dict, older_paths: dict[str, dict[str, int]], in_window) -> dict:
+    """The per-case and per-domain blocks for one mode's records (``every``,
+    oldest first, lead-in included): ``{records, metrics, default_metric,
+    keys, nights, cases, domains}``, the shape the top level carries."""
     records = [r for r in every if in_window(at_ms({"at": r["recorded_at"]}))]
     domain_of = nightly.domains(data)
     anchors = nightly.night_builds(data)
@@ -575,25 +639,12 @@ def trend_document(store: dict | None, data: dict) -> dict:
         members = {name: doc for name, doc in cases.items() if doc["domain"] == domain}
         domains[domain] = {"cases": sorted(members), "points": domain_points(members), "key_changes": domain_key_changes(members)}
     metric_list = sorted(metrics, key=lambda m: (m != DEFAULT_METRIC, m))
-    nights = night_documents(records, data)
     return {
-        "source": store.get("source") if store and isinstance(store.get("source"), str) else None,
-        "read_at": store.get("read_at") if store and nightly.parse_iso(store.get("read_at")) is not None else None,
-        "error": store.get("error") if store and isinstance(store.get("error"), str) else None,
-        "window_days": window_days,
-        "lead_days": lead_days,
-        "max_objects": store.get("max_objects") if store and isinstance(store.get("max_objects"), int) else None,
-        "truncated": {str(k): v for k, v in (store.get("truncated") or {}).items() if isinstance(v, int)} if store and isinstance(store.get("truncated"), dict) else {},
-        "partial": partial_read(store),
-        "warnings": [w for w in (store.get("warnings") or []) if isinstance(w, str)] if store else [],
         "records": len(records),
         "metrics": metric_list,
         "default_metric": DEFAULT_METRIC if DEFAULT_METRIC in metrics else (metric_list[0] if metric_list else None),
-        "spread_nights": SPREAD_NIGHTS,
-        "bar": {"rate": ADMISSION_RATE, "min_runs": ADMISSION_MIN_RUNS},
         "keys": keys,
-        "nights": nights,
+        "nights": night_documents(records, data),
         "cases": cases,
         "domains": domains,
-        "latency": latency_document(data if store else {}, nights, in_window),
     }

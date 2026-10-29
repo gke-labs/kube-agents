@@ -15,9 +15,12 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # (#1607), the watched periodics' latest builds and the rest -- are optional;
 # an absence just drops its note.
 # The order is adjudicate ->
-# upload health.json -> append history -> render -> publish -> post ->
-# comment, so the Brief a reader opens from a message already shows the
-# verdict the message names.
+# upload health.json -> append history -> render -> publish -> file nightly
+# bugs -> post -> comment, so the Brief a reader opens from a message
+# already shows the verdict the message names.
+# The weekly health email renders after the bug filer and is
+# published beside data.json; its summary is posted to the same space once a
+# week, Monday from 9 AM Toronto (scripts/eval_dashboard/weekly_chat.py).
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -91,14 +94,17 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # health-history.jsonl beside it (download, append, upload: GCS has no
 # append); a failure there is a warning.
 #
-# Three things write to GitHub with this workflow's own token, which is why
+# Four things write to GitHub with this workflow's own token, which is why
 # the job asks for pull-requests: write and issues: write and nothing else
 # does: the poster files the tracking issue a new OUTAGE lacks (label
-# presubmit-gate; it adopts a human's if one names the same cases, and
-# never closes one), for a new lost_pods, fixture_drift or pool_drift
-# condition the issue its owner is owed (same label; it adopts a human's
-# naming the same nodes, roles or finding ids), and for a deadline_kill OUTAGE
-# the gate owner's (it adopts a human's titled for the deadline kills);
+# presubmit-gate; it adopts and labels a human's if one names the same
+# cases), for a new lost_pods, fixture_drift or pool_drift condition the
+# issue its owner is owed (same label; it adopts a human's naming the same
+# nodes, roles or finding ids), and for a deadline_kill OUTAGE the gate
+# owner's (it adopts a human's titled for the deadline kills); it re-reads
+# each carried issue every tick, drops a closed one, and comments on and
+# closes its own when the condition clears (docs/ci-health.md, "The
+# tracking issue");
 # scripts/eval_dashboard/gate_comment.py leaves one comment per
 # pull request whose smoke run went red -- or lost its build node, or was
 # killed at the job deadline -- since the last tick, edited in place on
@@ -112,7 +118,17 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # every tick in dry run -- it reads the open issues and prints what it would
 # file, comment and assign -- and writes only when the repository variable
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
-# runs) and CI_HEALTH_MUTE is not.
+# runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 9 AM
+# digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
+# the issues it filed that tick. The section turns owners' GitHub logins
+# into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
+# object, login -> Chat user id); without it the logins print as text.
+# A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
+# `presubmit-gate` issue open per domain with no blocking roster seat,
+# assigned to the domain owner, and closes it when the domain is covered
+# again. It is armed by the same NIGHTLY_BUGS_LIVE / CI_HEALTH_MUTE switch
+# and needs no permission beyond issues: write. It opens no roster pull
+# request: this job holds no branch write path.
 #
 # A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
 # runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
@@ -201,11 +217,14 @@ env:
   # of its own and shown in the Brief's "GitLab lane" section only.
   GITLAB_PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
-  # The nightly's writers periodic, the second job of a night split across
-  # two, in the same bucket. Until it has run the prefix holds no objects,
+  # The nightly's writers periodic, a job of a night split across jobs, in
+  # the same bucket. Until it has run the prefix holds no objects,
   # and until a writers build is on record any other listing failure but a
   # hang is a note too: it has a watermark of its own.
   NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
+  # The periodic that runs the nightly main part's second half (main-b) when
+  # that part runs as two jobs, in the same bucket; read the same way.
+  NIGHTLY_MAIN_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/
   # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
   # tier gitlab with no pull request, listed under the Brief's GitLab section.
   GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
@@ -223,10 +242,11 @@ env:
   COLLECT_TIMEOUT_S: "1500"
   # The refresh job's timeout-minutes in seconds (move the two together),
   # and what the store read must leave on that clock for the adjudicator,
-  # the render and the post after it (recent ticks spend 80-150 s on the
-  # whole job).
+  # the render, the nightly bug filer, the coverage-gap filer and the post
+  # after it (recent ticks spend 80-150 s on the whole job; the two filer
+  # steps are capped at 3 and 2 minutes).
   JOB_TIMEOUT_S: "1800"
-  JOB_TAIL_S: "240"
+  JOB_TAIL_S: "540"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
   # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
@@ -262,7 +282,7 @@ jobs:
     # The workflow-level grant plus the writes the header explains: the
     # gate comment on a pull request (a red run, a lost build node, or a
     # deadline kill), the tracking issue (an OUTAGE, or a lost_pods
-    # condition) and, once armed, the nightly bug.
+    # condition) and, once armed, the nightly bug and the coverage-gap issue.
     permissions:
       contents: read
       id-token: write
@@ -310,18 +330,18 @@ jobs:
           service_account: ${{ env.COLLECT_SA }}
 
       # setup-gcloud registers a credential only if one exists when it runs,
-      # and it runs before either auth step. gcloud honours the credential
-      # file the auth step exports through an environment variable; gsutil
-      # does not, and without this login every gsutil call in the job ran as
-      # an anonymous caller (401 on the bucket, 40 failed ticks on
-      # 2026-09-10). `gcloud auth login --cred-file` is what setup-gcloud
-      # would have done, and it makes the credential the active account for
-      # gcloud, gsutil and `gcloud auth print-access-token` alike. Moving
+      # and it runs before either auth step. `gcloud auth login --cred-file`
+      # is what setup-gcloud would have done: it makes the credential the
+      # active account for every gcloud call in the job, the `gcloud storage`
+      # reads and `gcloud auth print-access-token` alike. (The reads were
+      # gsutil's until 2026-10; gsutil ignored the credential file the auth
+      # step exports, and without this login every call ran as an anonymous
+      # caller: 401 on the bucket, 40 failed ticks on 2026-09-10.) Moving
       # setup-gcloud below this auth step would fix only this half; the
       # publisher half below needs the same login (or a second SDK download),
       # so one mechanism serves both. An empty path would send gcloud to the
       # interactive browser flow and hang the job, hence the `:?` guard.
-      - name: Make the Prow-archive reader credential active for gsutil
+      - name: Make the Prow-archive reader credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Collect (incremental, onto the published data.json)
@@ -336,7 +356,7 @@ jobs:
           # No prior document means a cold sweep, which this job does not
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
-          if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
+          if ! gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
             echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
@@ -345,6 +365,7 @@ jobs:
             --gitlab-pr-glob "$GITLAB_PR_GLOB" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
+            --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \
             --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
@@ -360,12 +381,12 @@ jobs:
           # is the staging deploy, not this dashboard, and it must not be able
           # to stall it: an RC listing that fails leaves
           # releases[] carried forward from the prior and stales nothing, and
-          # `gsutil ls` exits non-zero on a prefix with no objects, so a week
+          # `gcloud storage ls` exits non-zero on a prefix with no objects, so a week
           # with no release candidate would otherwise stop every publish. Both
           # RC warning shapes (the ls failure and the timeout) name the glob,
           # so dropping lines that mention the job name drops exactly those.
           if grep -v "post-kube-agents-eval-rc" work/collect.log \
-            | grep -Eq "warning: gsutil (ls|cat) .*(failed|timed out)"; then
+            | grep -Eq "warning: gcloud storage (ls|cat) .*(failed|timed out)"; then
             echo "::error::collect.py could not list or read the Prow archive; not publishing"
             exit 1
           fi
@@ -384,19 +405,22 @@ jobs:
         continue-on-error: true
         run: |
           mkdir -p work
-          # A NotFound is "the periodic has never run", which is what no note
+          # A NotFound ("matched no objects" from `cat` or `cp` of an absent
+          # object, "not found: 404" of an absent bucket; `objects describe`
+          # below says the latter of an absent object too, and is read by
+          # exit code alone) is "the periodic has never run", which is what no note
           # is meant to look like. Anything else -- a denied read above all --
           # would otherwise ship the whole feature dark: no note, no digest
           # figure, and no ⚪ either, because the dead-man's switch only ages
           # an artifact it managed to read. The two sibling reads below tell
           # the same two apart the same way.
-          if ! build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gsutil.err); then
-            grep -Eq "NotFound|No URLs matched|404" gsutil.err \
-              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
-            rm -f gsutil.err
+          if ! build=$(gcloud storage cat "$POOL_PRESSURE_LOGS/latest-build.txt" 2>gcloud.err); then
+            grep -Eq "matched no objects|not found: 404" gcloud.err \
+              || echo "::warning::could not read the pool-pressure build pointer (not a NotFound): $(tr '\n' ' ' <gcloud.err)"
+            rm -f gcloud.err
             exit 0
           fi
-          rm -f gsutil.err
+          rm -f gcloud.err
           [ -n "$build" ] || exit 0
           # The pointer moves at job start, so for the ~8 minutes the periodic
           # runs it names a build with no artifact. finished.json lands with
@@ -404,20 +428,20 @@ jobs:
           # before it holds a reading at most an hour old, well inside
           # POOL_STALE_AFTER. Skipping instead would drop the note from
           # health.json, the Brief and the digest for that tick.
-          if ! gsutil -q stat "$POOL_PRESSURE_LOGS/$build/finished.json"; then
+          if ! gcloud storage objects describe --format=none "$POOL_PRESSURE_LOGS/$build/finished.json" 2>/dev/null; then
             # Compared as Python ints, not by sort or awk: a build id is 19
             # digits, which a float rounds until neighbouring builds collide.
             # The one before it has to have finished too. An aborted build --
             # evicted pod, lost node -- publishes neither finished.json nor an
             # artifact, and reading it would write the sentinel and announce
             # that the periodic had stopped while it was minutes from
-            # publishing. Walking back costs one stat a build and lands on a
+            # publishing. Walking back costs one describe a build and lands on a
             # real reading, which ages on its own window_end if it is old.
             newest=$build
             build=""
             while read -r prior; do
-              if gsutil -q stat "$POOL_PRESSURE_LOGS/$prior/finished.json"; then build=$prior; break; fi
-            done < <(gsutil -q ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
+              if gcloud storage objects describe --format=none "$POOL_PRESSURE_LOGS/$prior/finished.json" 2>/dev/null; then build=$prior; break; fi
+            done < <(gcloud storage ls "$POOL_PRESSURE_LOGS/" | python3 -c 'import sys; ids=[int(name) for name in (line.strip().rstrip("/").rsplit("/", 1)[-1] for line in sys.stdin) if name.isdigit()]; print("\n".join(str(i) for i in sorted((i for i in ids if i < int(sys.argv[1])), reverse=True)[: int(sys.argv[2])]))' "$newest" "$POOL_FALLBACK_BUILDS")
             # Nothing finished behind it: the periodic's first build is still
             # running, or every build in reach was aborted. Neither is the
             # periodic publishing nothing, so say nothing.
@@ -427,7 +451,7 @@ jobs:
           # so a crash publishes a 0-byte object that copies fine. Parsing is
           # the only check that catches it, and it costs nothing on the object
           # health.py is about to parse anyway.
-          if ! gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
+          if ! gcloud storage cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json \
             || ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' work/pool-pressure.json 2>/dev/null; then
             # The build finished and published nothing usable, so the periodic
             # is running and failing. Ageing `window_end` cannot catch
@@ -486,17 +510,17 @@ jobs:
         if: steps.collect.outcome == 'success'
         continue-on-error: true
         run: |
-          # `gsutil stat` exits 1 for a missing object and for a failed
-          # call alike, so the error text is read (as the health-history
-          # step below does).
+          # `gcloud storage objects describe` exits 1 for a missing object
+          # and for a failed call alike, so the error text is read (as the
+          # health-history step below does).
           prior=unreachable
           for attempt in 1 2 3; do
-            if gsutil -q cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json 2>gsutil.err; then prior=present; break; fi
-            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then prior=absent; break; fi
-            echo "::warning::attempt $attempt: could not download the prior store.json (not a NotFound): $(tr '\n' ' ' <gsutil.err)"
+            if gcloud storage cp "$DASHBOARD_BUCKET/store.json" work/prior-store.json 2>gcloud.err; then prior=present; break; fi
+            if grep -Eq "matched no objects|not found: 404" gcloud.err; then prior=absent; break; fi
+            echo "::warning::attempt $attempt: could not download the prior store.json (not a NotFound): $(tr '\n' ' ' <gcloud.err)"
             if [ "$attempt" -lt 3 ]; then sleep 15; fi
           done
-          rm -f gsutil.err
+          rm -f gcloud.err
           case "$prior" in
             absent) echo "no published store.json yet; reading the whole span" ;;
             unreachable)
@@ -529,8 +553,8 @@ jobs:
           service_account: ${{ env.CI_HEALTH_SA }}
 
       # Same as the reader's login above: make this credential the active
-      # account for gsutil (and the Chat token mint) too.
-      - name: Make the publisher credential active for gsutil
+      # account for the `gcloud storage` writes (and the Chat token mint) too.
+      - name: Make the publisher credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Fetch data.json (after a failed collect) and the last-posted state
@@ -542,18 +566,37 @@ jobs:
           # to be published; after a failed one it is whatever the bucket
           # holds, which the adjudicator ages against the clock.
           if [ "$COLLECT_OUTCOME" != "success" ]; then
-            gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+            gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/data.json
           fi
           # No state yet is the first tick, not an error.
-          gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
-          gsutil -q cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
+          # The previous tick's Vertex 429 reading: the read step below keeps
+          # it when its own read reaches no project (rule 2 ages it itself).
+          gcloud storage cp "$DASHBOARD_BUCKET/vertex-429.json" work/vertex-429.json || true
           # The hourly seeded-fleet scan's latest document (the scan job
           # below); none yet means the scan has not run, and the adjudicator
           # then has no fixture_state to report.
-          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true
           # The same job's pool-state scan (pool-state.json); none yet means
           # it has not run, and there is no pool_state to report.
-          gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true
+          gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true
+
+      # Rule 2's evidence (scripts/eval_dashboard/vertex_429.py): the pool's
+      # Vertex AI 429 share, per project from Cloud Monitoring, as the
+      # publisher. Best-effort: a project the credential cannot read is
+      # recorded with its error, and no file at all leaves the storm rule to
+      # the runs, as before, saying the storm is unconfirmed.
+      - name: Read the pool's Vertex 429 rate
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          # On data.json's clock, which is the adjudicator's: the reading
+          # ends where the runs' window does, however late this step runs
+          # or however long the collect has been failing.
+          clock=$(python3 -c 'import json; print(json.load(open("work/data.json")).get("generated_at") or "")' 2>/dev/null || true)
+          if [ -n "$clock" ]; then set -- --now "$clock"; fi
+          python3 scripts/eval_dashboard/vertex_429.py --out work/vertex-429.json "$@"
 
       - name: Adjudicate
         run: |
@@ -563,11 +606,13 @@ jobs:
           # --fixture-state and --pool-state are the hourly scans' documents,
           # for the fixture_drift and pool_drift conditions. --periodics-dir is
           # what the step above fetched of the watched Prow periodics.
+          # --vertex-429 is the step above's reading, rule 2's evidence.
           python3 scripts/eval_dashboard/health.py \
             --data work/data.json \
             --prev work/health-prev.json \
             --posted-state work/health-state.json \
             --pool-pressure work/pool-pressure.json \
+            --vertex-429 work/vertex-429.json \
             --fixture-state work/fixture-state.json \
             --pool-state work/pool-state.json \
             --periodics-dir work/periodics \
@@ -576,7 +621,16 @@ jobs:
 
       - name: Upload health.json next to data.json
         run: |
-          gsutil -q -h "Cache-Control: no-cache" cp work/health.json "$DASHBOARD_BUCKET/health.json"
+          gcloud storage cp --cache-control=no-cache work/health.json "$DASHBOARD_BUCKET/health.json"
+
+      - name: Publish the Vertex 429 reading next to health.json
+        # Best-effort like the read: the adjudicator tolerates a missing
+        # reading, so a failed upload must not skip the post.
+        continue-on-error: true
+        run: |
+          if [ -f work/vertex-429.json ]; then
+            gcloud storage cp --cache-control=no-cache work/vertex-429.json "$DASHBOARD_BUCKET/vertex-429.json"
+          fi
 
       - name: Append this tick to health-history.jsonl
         continue-on-error: true
@@ -585,26 +639,27 @@ jobs:
           # object does not exist (the first tick) starts the feed empty; any
           # other failure -- a 5xx, a timeout, a permission denial -- stops
           # here, before an upload could replace the whole feed with one
-          # line. (`gsutil stat` cannot tell the two apart: it exits 1 for
-          # both, which is why the error text is read instead.)
+          # line. (`gcloud storage objects describe` cannot tell the two
+          # apart: it exits 1 for both, which is why the error text is read
+          # instead.)
           set +e
-          gsutil -q cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gsutil.err
+          gcloud storage cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gcloud.err
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
-            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then
+            if grep -Eq "matched no objects|not found: 404" gcloud.err; then
               echo "no health-history.jsonl yet; starting the feed"
               : > work/health-history.jsonl
             else
               echo "::warning::could not download health-history.jsonl (not a NotFound); not appending this tick:"
-              cat gsutil.err
-              rm -f gsutil.err
+              cat gcloud.err
+              rm -f gcloud.err
               exit 1
             fi
           fi
-          rm -f gsutil.err
+          rm -f gcloud.err
           python3 scripts/eval_dashboard/health_history.py --health work/health.json --history work/health-history.jsonl
-          if ! gsutil -q -h "Cache-Control: no-cache" cp work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
+          if ! gcloud storage cp --cache-control=no-cache work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
             echo "::warning::health-history.jsonl was not updated this tick"
             exit 1
           fi
@@ -654,8 +709,44 @@ jobs:
           fi
           rm -f gcloud.err
 
-      # The token goes to the poster step alone, as a masked step output
-      # rather than through GITHUB_ENV, so no later step sees it.
+      # Dry run unless armed (header). Reads data.json as the digest does, so
+      # after a failed collect it judges the bucket's copy, which holds the
+      # same nights. Before the post, so the digest's nightly section sees
+      # the issues this tick filed. Best-effort like the comment step: never
+      # reds the run.
+      - name: File bugs for persistent nightly failures (dry run unless armed)
+        continue-on-error: true
+        # Bounded, so a slow GitHub cannot run the job into its timeout and
+        # cancel the post after it (JOB_TAIL_S budgets this step too).
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mode=--dry-run
+          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+
+      # One `presubmit-gate` issue per domain with no blocking roster seat,
+      # assigned to the domain owner, kept current, closed when a roster case
+      # covers the domain again (docs/ci-health.md, "Coverage gaps"). Armed
+      # by the nightly bug filer's switch, not a variable of its own; the
+      # same github.token issue scope. Best-effort and bounded like the step
+      # above, inside JOB_TAIL_S, so it cannot cancel the post.
+      - name: File an issue per domain with no presubmit seat (dry run unless armed)
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mode=--dry-run
+          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
+          store_args=()
+          [ -f work/store.json ] && store_args=(--store work/store.json)
+          python3 scripts/eval_dashboard/coverage_gaps.py --data work/data.json "${store_args[@]}" "$mode"
+
+      # The token goes to the two poster steps alone (the next one and the
+      # weekly summary's), as a masked step output rather than through
+      # GITHUB_ENV, so no other step sees it.
       - name: Mint a Chat token
         id: chat_token
         if: env.CI_HEALTH_MUTE != 'true'
@@ -669,16 +760,26 @@ jobs:
         continue-on-error: true
         env:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
-          # For the tracking issue a new OUTAGE or lost_pods condition files (header).
+          # For the tracking issue a new OUTAGE or lost_pods condition files
+          # (header), and the digest's read of the nightly-red issues.
           GH_TOKEN: ${{ github.token }}
+          # GitHub login -> Chat user id (JSON object) for the digest's
+          # nightly section mentions; the ids are internal, so a secret. Empty
+          # without one: every login is then printed as plain text.
+          CI_HEALTH_CHAT_MENTIONS: ${{ secrets.CI_HEALTH_CHAT_MENTIONS || '' }}
         run: |
           # --digest-hour is a Toronto hour (the poster's default zone).
           # --data is the data.json this tick collected (or, after a failed
-          # collect, the bucket's): the digest's nightly line reads last
+          # collect, the bucket's): the digest's nightly section reads last
           # night's run from it.
+          # --store, when the store was read, gives the digest's coverage-gap
+          # lines the evidence store's verdict on each best candidate.
+          store_args=()
+          [ -f work/store.json ] && store_args=(--store work/store.json)
           python3 scripts/eval_dashboard/post_health.py \
             --health work/health.json \
             --data work/data.json \
+            "${store_args[@]}" \
             --state "$DASHBOARD_BUCKET/health-state.json" \
             --digest-hour 9
 
@@ -698,17 +799,46 @@ jobs:
             --health work/health.json \
             --state "$DASHBOARD_BUCKET/gate-comment-state.json"
 
-      # Dry run unless armed (header). Reads data.json as the digest does, so
-      # after a failed collect it judges the bucket's copy, which holds the
-      # same nights. Best-effort like the comment step: never reds the run.
-      - name: File bugs for persistent nightly failures (dry run unless armed)
+      # The weekly health email (docs/ci-health.md, "The weekly health
+      # email"), published beside data.json as health-email.html. After the
+      # bug filer, so a streak it filed for this tick counts as tracked, and
+      # after the post, so it never delays it. It is
+      # rendered only when every integrity check passes; a refusal prints its
+      # reasons and leaves the last published copy in place. Same gate as the
+      # render: a failed collect has nothing new to publish. Best-effort, like
+      # the filer. It also writes the week's Chat summary, which the next
+      # step posts. Nothing mails it: TODO(#3440) the mail route and its
+      # permissions.
+      - name: Render the weekly health email
+        id: weekly_email
+        if: steps.collect.outcome == 'success'
         continue-on-error: true
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mode=--dry-run
-          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+          store_args=()
+          [ -f work/store.json ] && store_args+=(--store work/store.json)
+          python3 scripts/eval_dashboard/weekly_email.py --data work/data.json "${store_args[@]}" --out work/health-email.html --chat-out work/weekly-chat.json
+          gcloud storage cp --cache-control=no-cache work/health-email.html "$DASHBOARD_BUCKET/health-email.html"
+
+      # The weekly summary (docs/ci-health.md, "The weekly health email"):
+      # posted once a week, on the first tick from Monday 9 AM Toronto, for
+      # the week the page just published covers; weekly-chat-state.json
+      # records the week posted, so later ticks and re-runs stay silent. Only
+      # after a render that passed and was uploaded, so the post never links
+      # a stale page. Muted like the post above; best-effort, retried next
+      # tick.
+      - name: Post the weekly health summary (Mondays)
+        if: steps.weekly_email.outcome == 'success' && env.CI_HEALTH_MUTE != 'true'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
+        run: |
+          python3 scripts/eval_dashboard/weekly_chat.py \
+            --message work/weekly-chat.json \
+            --state "$DASHBOARD_BUCKET/weekly-chat-state.json"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'
@@ -767,10 +897,11 @@ jobs:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.CI_HEALTH_SA }}
 
-      # The same login the tick does (its comment explains why): gsutil and
+      # The same login the tick does (its comment explains why): the
+      # `gcloud storage` writes and
       # `gcloud auth print-access-token --impersonate-service-account` both
-      # need the credential to be the active account.
-      - name: Make the publisher credential active for gsutil and gcloud
+      # take the credential from the active account.
+      - name: Make the publisher credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Fetch the previous scan
@@ -779,7 +910,7 @@ jobs:
           # The previous document rides along as `previous` in the new one,
           # which is how the adjudicator asks "drifted last scan too?" from
           # one file. None yet is the first scan.
-          gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state-prior.json || echo "no previous fixture-state.json; first scan"
+          gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state-prior.json || echo "no previous fixture-state.json; first scan"
 
       # Never reds on what it finds: a project the publisher cannot read, a
       # missing grant, a hung API server are all "not checked" with a reason
@@ -797,7 +928,7 @@ jobs:
       - name: Upload fixture-state.json next to health.json
         id: fleet_upload
         run: |
-          gsutil -q -h "Cache-Control: no-cache" cp work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
+          gcloud storage cp --cache-control=no-cache work/fixture-state.json "$DASHBOARD_BUCKET/fixture-state.json"
           python3 -c '
           import json
           doc = json.load(open("work/fixture-state.json"))
@@ -816,7 +947,7 @@ jobs:
       - name: Fetch the previous pool-state scan
         if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
-          gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
+          gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state-prior.json || echo "no previous pool-state.json; first scan"
 
       # Never reds on what it finds: a project the publisher cannot read, a
       # missing role, a hung API are all "not checked" with a reason in the
@@ -844,7 +975,7 @@ jobs:
         if: ${{ success() || steps.fleet_scan.outcome == 'failure' || steps.fleet_upload.outcome == 'failure' }}
         run: |
           test -s work/pool-state.json || { echo "::error::the pool-state scan wrote no document"; exit 1; }
-          gsutil -q -h "Cache-Control: no-cache" cp work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"
+          gcloud storage cp --cache-control=no-cache work/pool-state.json "$DASHBOARD_BUCKET/pool-state.json"
           python3 -c '
           import json
           doc = json.load(open("work/pool-state.json"))

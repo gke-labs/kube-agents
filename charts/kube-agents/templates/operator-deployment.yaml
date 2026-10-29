@@ -48,7 +48,20 @@ spec:
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
+            {{- /* `| default dict`: a `helm upgrade --reuse-values` from a release
+                   that predates operator.metrics reaches this line with it nil,
+                   as the agentSandbox guard below explains; such a release keeps
+                   the listener off until the value is set. */}}
+            {{- if (.Values.operator.metrics | default dict).enabled }}
+            # Plain HTTP on the pod network: the scrape is GKE Managed
+            # Prometheus from gke-gmp-system, which does not carry a bearer
+            # token the manager's authn/authz filter would accept; the
+            # operator's NetworkPolicy (operator-netpol.yaml) bounds who reads it.
+            - --metrics-bind-address=:{{ include "kube-agents.operatorMetricsPort" . }}
+            - --metrics-secure=false
+            {{- else }}
             - --metrics-bind-address=0
+            {{- end }}
           image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.operator.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           env:
@@ -130,6 +143,11 @@ spec:
             - containerPort: 8081
               name: health
               protocol: TCP
+            {{- if (.Values.operator.metrics | default dict).enabled }}
+            - containerPort: {{ include "kube-agents.operatorMetricsPort" . }}
+              name: metrics
+              protocol: TCP
+            {{- end }}
             {{- if .Values.operator.webhooks.enabled }}
             # 10250, not controller-runtime's default 9443: it is the only non-443 port
             # GKE's automatic control-plane-to-node firewall rule permits, so a private

@@ -201,3 +201,32 @@ func TestEveryRenderedRoleIsOnThisList(t *testing.T) {
 		}
 	}
 }
+
+// TestTheGatewayReadsItsOwnPlatformAgentAndNothingElseOfTheKind: the
+// "/feedback summary" read (a2a/gateway/feedback_summary.go) is a get on the
+// one named PlatformAgent, and no rule of the gateway Role, this one or any
+// added beside it, reaches list, watch or a write on the kind.
+func TestTheGatewayReadsItsOwnPlatformAgentAndNothingElseOfTheKind(t *testing.T) {
+	agent := a2aTestAgent()
+	gw := buildA2AGatewayRole(agent)
+	var reads int
+	for _, rule := range gw.Rules {
+		// Every rule, not only the one that reads: a list or a write added
+		// beside the pinned get is the widening this test exists to refuse.
+		for _, verb := range []string{"list", "watch", "create", "update", "patch", "delete"} {
+			if ruleReaches(rule, agentv1alpha1.GroupVersion.Group, "platformagents", verb) {
+				t.Errorf("the gateway may only get its PlatformAgent, not %s", verb)
+			}
+		}
+		if !ruleReaches(rule, agentv1alpha1.GroupVersion.Group, "platformagents", "get") {
+			continue
+		}
+		reads++
+		if len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != agent.Name {
+			t.Errorf("the PlatformAgent read must be pinned to %q by resourceNames, got %v", agent.Name, rule.ResourceNames)
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("the gateway Role should carry exactly one PlatformAgent read, found %d", reads)
+	}
+}

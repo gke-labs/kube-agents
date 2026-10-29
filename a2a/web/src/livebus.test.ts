@@ -8,8 +8,10 @@
  *   node dev/seed.mjs
  *   A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=dev-web npm test -- livebus
  *
- * Against the install: port-forward svc/platform-agent-a2a-nats 9222, set
- * A2A_WEB_PASS from the creds Secret's web-password, same command.
+ * Against the install: port-forward svc/platform-agent-a2a-console 8080:8080,
+ * set A2A_WS_URL=ws://localhost:8080/bus (the console server's proxy; the
+ * bus's own 9222 serves TLS under the bus CA) and A2A_WEB_PASS from the creds
+ * Secret's web-password.
  *
  * The console case sends a turn as the `console` user. Locally a fake
  * gateway answers it (it needs the dev `gateway` user):

@@ -36,7 +36,7 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
   or AI Agent without cloning the repository manually.
 </Aside>
 
-Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.4.0`; a GitLab install needs `0.9.0` or later):
+Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.19.0`; a GitLab install needs `0.9.0` or later):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
@@ -93,7 +93,7 @@ Only run the real install after I say yes.
    cd kube-agents-<RELEASE_VERSION>
    ```
 
-   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.4.0`; a GitLab install needs `0.9.0` or later):
+   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.19.0`; a GitLab install needs `0.9.0` or later):
 
    ```bash
    git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
@@ -128,7 +128,7 @@ Only run the real install after I say yes.
    kubectl get pods -n kubeagents-system
    ```
 
-   You should see one `PlatformAgent` resource plus pods for the operator (`kube-agents-controller-manager`), LiteLLM (`litellm`), and three for the Platform Agent itself: the gateway (`platform-agent-gateway`), the shell sandbox (`platform-agent-shell`), and the credential broker (`platform-agent-credential-proxy`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When all three agent pods are `Running` and Google Chat is configured, DM your Chat app and it should reply.
+   You should see one `PlatformAgent` resource plus pods for the operator (`kube-agents-controller-manager`), LiteLLM (`litellm`), and three for the Platform Agent itself: the gateway (`platform-agent-gateway`), the shell sandbox (`platform-agent-shell`), and the credential broker (`platform-agent-credential-proxy`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When all three agent pods are `Running` and Google Chat is configured, DM your Chat app and it should reply. With no chat platform configured, reach the agent through the A2A console a `next` install serves, through the [web console](/kube-agents/deploy/web-console/) if you installed with `--enable-web-console`, or with the terminal command the installer prints; [User interfaces](/kube-agents/reference/user-interfaces/) has the port-forward for each.
 
    The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential broker before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container in the `platform-agent-credential-proxy` pod rather than the relay reporting the error.
 
@@ -144,7 +144,7 @@ Only run the real install after I say yes.
 
 5. **Talk to the agent.**
 
-   With Google Chat or Slack enabled, DM the app. Both are opt-in and off by default, so an install that enabled neither talks to the agent over `kubectl exec` instead — the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes, with your cluster, region, project and namespace already filled in:
+   With Google Chat or Slack enabled, DM the app. Both are opt-in and off by default, so an install that enabled neither talks to the agent through the A2A console a `next` install serves ([User interfaces](/kube-agents/reference/user-interfaces/#a2a-console)) or over `kubectl exec` — the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes, with your cluster, region, project and namespace already filled in:
 
    ```bash
    gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
@@ -167,7 +167,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
 
    It prints `next`. An empty line means `today`, and nothing below applies.
 
-2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and, once a chat backend is configured, the A2A gateway. A first boot can take over fifteen minutes.
+2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and the A2A gateway, which every `next` install runs (on the console door alone when no chat backend is configured). A first boot can take over fifteen minutes.
 
    ```bash
    kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=25m
@@ -190,7 +190,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
    | `BusProvisioned`      | `True` | `ProvisionJobComplete` |
    | `BusCredentialsReady` | `True` | `CalloutServing`       |
 
-   `A2AGateway` and `A2AVerifier` appear only when something needs a look. `A2AGateway` `False` with `NoChatBackend` means no chat backend is enabled, so the operator runs no A2A gateway, and the install still reaches `Ready` with a message saying so; with `WaitingForReplica` a backend has come back and the gateway's replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
+   `A2AGateway` and `A2AVerifier` appear only when something needs a look. With no chat backend enabled the A2A gateway runs on the console door alone. `A2AGateway` `False` with `WaitingForReplica` appears only after an upgrade from an operator that ran no A2A gateway without a chat backend: the gateway is back at one replica, and that replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused. `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
 
 4. **List the A2A pods.** Every pod the A2A stack runs carries the label `app.kubernetes.io/part-of=a2a-next`, so this lists them apart from step 4's pods:
 
@@ -204,11 +204,11 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
    | `platform-agent-a2a-callout-…`          | 2                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-verifier-…`         | 2                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-console-…`          | 1                             | `Running`                                                                                                                                                              |
-   | `platform-agent-a2a-gateway-…`          | 1, with a chat backend only   | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-gateway-…`          | 1                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-provision-<hash>-…` | 1 per run, more if it retries | `Completed`; a failed attempt stays `Error`; all removed 24 hours after the Job finishes                                                                               |
    | `<profile>-<animal>-<hex>`              | 1 per session                 | For a `/session` conversation, `Running` until 30 minutes after its last message, and for 4 hours at most; for a `delegate` message, `Running` while its one task runs |
 
-   The A2A gateway creates a session pod only for a conversation switched to `/session` or a message that starts with `delegate`; other tasks run in the agent pod. It runs up to `spec.harness.tuning.maxSessions` (10 by default) at once, and a fresh install has none.
+   The A2A gateway creates a session pod only for a conversation switched to `/session` or a message that starts with `delegate`; other tasks run in the agent pod. It runs up to `spec.harness.tuning.maxSessions` (10 by default) at once, and a fresh install has none. The console pod serves the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console), a browser page over the bus with a chat pane, reached with `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`.
 
 5. **Check the agent's bridge.** The operator adds a `hermes-bridge` container to the agent pod once the bus is provisioned, so the `platform-agent-gateway` pod is replaced once during a first boot. The bridge takes tasks off the bus and runs them on the agent's API server.
 
@@ -236,6 +236,10 @@ The installer collected your answers, wrote `install.env` and `terraform.tfvars`
 When adopting an existing cluster, four settings stay `gcloud` pre-steps because a Terraform data source cannot express them: CMEK database encryption, Workload Identity pool enablement, node-pool migration to `GKE_METADATA` (requires `--migrate-node-pools`), and legacy Calico NetworkPolicy enforcement (requires `--enable-network-policy`; `--accept-no-network-policy` installs without it instead and changes nothing on the cluster). On freshly created clusters, setting the managed OpenTelemetry collection scope stays a `gcloud` post-step (no provider field exists). The one-shot GitHub App key import into KMS also runs outside Terraform, so the PEM never enters state.
 
 Changing your mind later is the same engine: running the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) opens a Day-2 control panel whose **Save & Apply** regenerates `terraform.tfvars` and re-applies.
+
+## Verify and explore your install
+
+Once `Ready` holds, in either mode, check the install by talking to it. [First prompts](/kube-agents/install/first-prompts/) gives the one message to send first, what a healthy answer contains and how long it took on a measured run, what the first message also brings with it, and five things to ask next.
 
 ## Common flags and toggles
 

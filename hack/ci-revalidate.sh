@@ -11,9 +11,11 @@
 # definition that has not yet hoisted it, where it saves the matrix alone.
 #
 # Three things count as a verdict this run could only repeat. The first is a
-# green build at THIS head (#1202): Tide credits a presubmit only against the
-# base SHA it ran on, so every merge to main retests, or batches, every other
-# green pull request whose head has not changed -- over the three weeks to
+# green build at THIS head (#1202), or at an earlier head with the same tree
+# (an empty commit, or a message-only rewrite: the matrix gets the same
+# files, so it is the same head in all but name): Tide credited a presubmit only against the
+# base SHA it ran on, so every merge to main retested, or batched, every other
+# green pull request whose head had not changed -- over the three weeks to
 # 2026-10-05 that was 150 Tide-started runs against 831 merges, 34 of them on
 # a pull request that had already merged, and batches held the pool for 53
 # hours in all with nothing merging while one was in flight. A head that
@@ -35,14 +37,16 @@
 # excuse it: it predates the first and answers a push, which is the
 # author's act, where the first answers a retest nobody asked for. Widening
 # it is a separate decision with its own record, not a consequence of this
-# one. The third is an admin /override of this job's context at THIS head:
+# one. The first rule's same-tree case answers a push too, and still skips
+# main's side: that push hands the matrix identical files, where an inert
+# push changes some. The third is an admin /override of this job's context at THIS head:
 # the override plugin posts a success status reading "Overridden by <user>"
 # (kubernetes-sigs/prow, pkg/plugins/override), which only a repository
 # admin can obtain, and it is the admin's decision that this head merges
-# without the job passing. A retest Tide starts after main moves posts
-# `pending` over that status and, run in full, comes back with whatever red
+# without the job passing. A retest Tide started after main moved posted
+# `pending` over that status and, run in full, came back with whatever red
 # the override was given for -- so the override had to be repeated after
-# every merge, and the phantom retest Tide starts on a pull request it has
+# every merge, and the phantom retest Tide started on a pull request it had
 # just merged by override ran the whole matrix for nobody (#2464 on
 # 2026-10-06: two overrides six minutes apart, then a phantom). Reusing
 # the override is the same trade as reusing a green, at the admin's
@@ -71,11 +75,11 @@
 # and skips the build as an override's standing rather than a run. A reuse
 # of a green is not marked: a build that reused a real green is attested in
 # its own right, and marking it would push the real green past the scan's
-# depth on a pull request Tide retests often. A run that cannot write the
+# depth on a pull request that is retested often. A run that cannot write the
 # record (no ARTIFACTS directory, an unwritable file) does not reuse an
 # override.
 #
-# A batch job (Tide testing several pull requests merged together) is
+# A batch job (one in which Tide tested several pull requests merged together) is
 # revalidated pull by pull: every one must hold a reusable verdict, else the
 # batch runs in full. PULL_REFS carries the batch's pulls; a serial presubmit
 # names its one pull in PULL_NUMBER and PULL_PULL_SHA.
@@ -103,10 +107,10 @@
 # and the check UI no longer says so. For an inert delta that is the same judgement a
 # passing /retest would render -- the delta cannot feed the eval differently,
 # so the red was flake or infrastructure by construction. For the same head
-# it is not: a full run that reached the matrix at a newer base (a step-0
+# (or the same tree) it is not: a full run that reached the matrix at a newer base (a step-0
 # fall-through, or the escape hatch) can red on the combination the reuse
 # does not test, and the rule still prefers the older green because the rule
-# is that the head passed once. Read a same-head red as either, not as
+# is that the head passed once. Read a same-head or same-tree red as either, not as
 # noise; reproducing one needs a non-inert push or EVAL_SKIP_REVALIDATION=1
 # in the job env.
 #
@@ -222,7 +226,7 @@ readonly REVALIDATION_OVERRIDE_CANCEL_PREFIX="Override cancelled by"
 # comment-URL event is always there (#2464's head carries both).
 readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/pull"
 # How many of the newest builds to inspect for a green one. Each costs one
-# gsutil cat (~1s); an active PR rarely stacks this many pushes between
+# gcloud storage cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
 # A green from before the job changed what it grades is not a verdict this
@@ -565,7 +569,7 @@ revalidate_from_green_history() {
 
   local history_dir="${REVALIDATION_HISTORY_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}"
   local listing
-  if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
+  if ! listing="$(gcloud storage ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
     _revalidation_no_green "no finished ${REVALIDATION_JOB_NAME} build for PR #${pull_number} (first run on this PR, or GCS unreadable)"
     return 1
   fi
@@ -594,7 +598,7 @@ revalidate_from_green_history() {
   local build prev_green="" finished_revision="" candidate_parsed candidate_revision
   while read -r build; do
     [ -n "${build}" ] || continue
-    candidate_parsed="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
+    candidate_parsed="$(gcloud storage cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
 import json
 import sys
 
@@ -630,7 +634,7 @@ EOF_REVALIDATION_CANDIDATES
   # the same Refs.String() shape as PULL_REFS, so a pull entry may carry a
   # third ":<ref>" field; only the first two are read.
   local started shas prev_base prev_head
-  if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
+  if ! started="$(gcloud storage cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
     _revalidation_no_green "green build ${prev_green} of PR #${pull_number} has no readable started.json"
     return 1
   fi
@@ -746,8 +750,8 @@ print("attested")
   esac
 
   # The head itself has passed: the first kind of reusable verdict. The
-  # base is not compared -- a retest Tide starts because main moved, serial
-  # or batch, is exactly this case, and the header says what that trades
+  # base is not compared -- a retest Tide started because main moved, serial
+  # or batch, was exactly this case, and the header says what that trades
   # away. No git work is needed: the attested record names the head, and
   # the head is this run's.
   if [ "${prev_head}" = "${cur_head}" ]; then
@@ -772,6 +776,23 @@ print("attested")
       fi
     fi
   done
+
+  # The same tree at a new head counts as the same head: an empty commit, or
+  # one that only rewrites the message, hands the matrix the same files, so
+  # it is the first kind of verdict and the base is not compared. A push to
+  # put a pull request back in the merge queue is this case. A tree that
+  # cannot be read falls through to the inert rule below.
+  local prev_tree cur_tree
+  if prev_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${prev_head}^{tree}" 2>/dev/null)" \
+    && cur_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${cur_head}^{tree}" 2>/dev/null)" \
+    && [ "${prev_tree}" = "${cur_tree}" ]; then
+    echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this tree already passed"
+    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
+    echo "Same tree ${cur_tree} at head ${prev_head} then, ${cur_head} now; base ${prev_base} then, ${cur_base} now -- a tree that passed once passes"
+    REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
+    return 0
+  fi
 
   # --no-renames is load-bearing: with rename detection (git's default) a
   # `git mv hack/tool.sh docs/tool.md` lists ONLY the inert destination, and
@@ -814,11 +835,11 @@ revalidate_against_green_history() {
     echo "Step 0: full run: EVAL_SKIP_REVALIDATION=1 (escape hatch)"
     return 1
   fi
-  if ! command -v gsutil >/dev/null 2>&1; then
-    echo "Step 0: full run: no gsutil on PATH to read the job history with"
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "Step 0: full run: no gcloud on PATH to read the job history with"
     return 1
   fi
-  # Preflighted like gsutil so a missing interpreter logs its own reason
+  # Preflighted like gcloud so a missing interpreter logs its own reason
   # instead of every finished.json silently classifying as not-green.
   if ! command -v python3 >/dev/null 2>&1; then
     echo "Step 0: full run: no python3 on PATH to parse the job records with"
@@ -831,7 +852,7 @@ revalidate_against_green_history() {
   # shell's) cannot narrow a batch to one pull; a serial presubmit names its
   # one pull in PULL_NUMBER and PULL_PULL_SHA.
   # Prow's decoration exports 40-hex SHAs. The ones this run was handed are
-  # held to that shape before any of them reaches gsutil or git, as the
+  # held to that shape before any of them reaches gcloud storage or git, as the
   # recovered ones are: a value shaped like an option would otherwise reach
   # `git diff` as one, and an empty file list reads as an inert delta.
   if [ -n "${PULL_BASE_SHA:-}" ] && ! [[ "${PULL_BASE_SHA}" =~ ${REVALIDATION_SHA_RE} ]]; then

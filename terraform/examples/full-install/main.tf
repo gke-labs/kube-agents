@@ -12,6 +12,10 @@ locals {
     # credential broker's relay on the Trace role granted below; the API has
     # to be on for the grant to buy anything.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences on the GKE Hub role granted below; the API has
+    # to be on for the grant to buy anything.
+    "gkehub.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -117,12 +121,14 @@ locals {
       }
     } : {},
     var.enable_slack ? {
-      slack = {
+      slack = merge({
         enabled         = true
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      }
+        }, var.slack_home_channel_policy != "" ? {
+        homeChannelPolicy = var.slack_home_channel_policy
+      } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},
@@ -156,6 +162,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -327,6 +334,13 @@ locals {
       try(var.extra_helm_values.platformAgent.harness.driftDetector.enabled, null) != true) ||
       try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
     )
+  )
+
+  # Whether the release will deploy the web console, by either door that
+  # reaches the field (web_console_enabled or extra_helm_values.webConsole.enabled).
+  web_console_requested = (
+    var.web_console_enabled ||
+    try(tobool(var.extra_helm_values.webConsole.enabled) == true, false)
   )
 }
 
@@ -1140,6 +1154,18 @@ resource "helm_release" "kube_agents" {
         gsaName = module.github_minter[0].service_account_id
       } : {}
     )
+    # The browser chat page for installs with no chat platform. Its image
+    # follows platformAgent.deployment.image.tag and global.imageRegistry,
+    # and its Service is ClusterIP by construction. agentIdentity is what the
+    # console's identity box shows: the console holds no credentials to read
+    # IAM, so the agent's GSA and project roles are recorded here at apply.
+    webConsole = {
+      enabled = var.web_console_enabled
+      agentIdentity = {
+        gcpServiceAccount = module.kube_agents_iam.service_account_email
+        roles             = sort(module.kube_agents_iam.agent_project_roles)
+      }
+    }
     plugins = {
       pubsubPlatform = merge(
         {
@@ -1323,6 +1349,16 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.extra_helm_values_countermands_detector
       error_message = "enable_drift_detector is true, but extra_helm_values sets platformAgent.harness.driftDetector.enabled to something other than true, and Helm merges that document over the one this composition computes -- so the CR decides against the flag: a null leaf deletes the field and the CRD's default false applies, a false leaf arrives as false. The sink, topic and subscription are provisioned and bill either way, and no detector reads them. Remove the enabled leaf from extra_helm_values -- enable_drift_detector already writes it, and the rest of your driftDetector block is still merged in -- or set it to true."
+    }
+
+    # The web console holds the Platform Agent's API key with no login of its
+    # own; its deny-all-ingress NetworkPolicy is what confines access to
+    # kubectl port-forward. On a cluster that enforces no NetworkPolicy
+    # (create_cluster = false with accept_no_network_policy = true), any pod in
+    # the cluster could reach the console Service and drive the agent.
+    precondition {
+      condition     = !local.web_console_requested || module.gke_cluster.network_policy_enforced
+      error_message = "the web console requires a cluster that enforces NetworkPolicy (web_console_enabled = true or webConsole.enabled in extra_helm_values cannot be used when NetworkPolicy is not enforced, such as create_cluster = false with accept_no_network_policy = true): its deny-all-ingress NetworkPolicy is what confines access to kubectl port-forward, and without enforcement any pod in the cluster can reach the console Service and drive the agent."
     }
   }
 }

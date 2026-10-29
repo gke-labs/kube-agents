@@ -73,8 +73,12 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # together with a green `--check` (both sides move at once) and nothing would catch it.
 _DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
-_DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
+# Ephemeral-storage requests: the footprint's 5Gi, LiteLLM's 1280Mi per replica (its tmp
+# emptyDir's sizeLimit plus logs) on two replicas, and the cleanup hook's 1088Mi.
+_LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (5 * 1024 + 2 * 1280 + 1088) * 1024**2
+# The same three additions, because each sets its limit equal to its request.
+_DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
 _CLEANUP_HOOK_REQUEST_MILLIS = 50
 _CLEANUP_HOOK_LIMIT_MILLIS = 200
@@ -115,8 +119,8 @@ _DECIMAL_SI_HARD_BYTES = 1000000000
 _LITELLM_REPLICAS = 2
 _LITELLM_CPU_LIMIT_MILLIS = 500 * _LITELLM_REPLICAS
 _LITELLM_CPU_REQUEST_MILLIS = 100 * _LITELLM_REPLICAS
-# An ephemeral-storage request no chart workload sets by default, so the totals move by
-# exactly this much when one does.
+# An ephemeral-storage request set on LiteLLM in place of its 1280Mi default, so the
+# totals move by the difference, per replica.
 _EPHEMERAL_SET_GIB = 3
 # What the shell StatefulSet leaves behind: persistentVolumeClaimRetentionPolicy is
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
@@ -890,6 +894,14 @@ class PreflightDecisionTest(unittest.TestCase):
             base["requestsStorage"] + _HINDSIGHT_STORAGE_BYTES,
         )
 
+    def test_web_console_adds_its_pod_and_resources_to_the_totals(self) -> None:
+        """Enabling webConsole adds its one replica and resource requests."""
+        base = self._requirements()
+        with_console = self._requirements(["webConsole.enabled=true"])
+        self.assertEqual(with_console["pods"], base["pods"] + 1)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
+
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.
 
@@ -931,7 +943,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(without_requests["requestsCpu"], base["requestsCpu"] + diff_millis)
 
     def test_chart_workload_ephemeral_storage_is_counted(self) -> None:
-        """Only the footprint contributed ephemeral storage, so a chart-set value was free."""
+        """A chart-set value replaces LiteLLM's default request, per replica, in the sum."""
         base = self._requirements()
         with_ephemeral = self._requirements(
             [f"litellm.resources.requests.ephemeral-storage={_EPHEMERAL_SET_GIB}Gi"]
@@ -939,7 +951,7 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(
             with_ephemeral["requestsEphemeral"],
             base["requestsEphemeral"]
-            + _EPHEMERAL_SET_GIB * 1024**3 * _LITELLM_REPLICAS,
+            + (_EPHEMERAL_SET_GIB * 1024**3 - _LITELLM_EPHEMERAL_REQUEST_BYTES) * _LITELLM_REPLICAS,
         )
 
     def test_an_empty_hindsight_storage_key_fails_loudly(self) -> None:
@@ -1174,7 +1186,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        self.assertIn('"limits.ephemeral-storage":"5Gi"', res.stderr)
+        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"10048Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -1203,7 +1216,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        self.assertIn('"ephemeral-storage":"5Gi"', res.stderr)
+        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"10048Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""
@@ -1502,7 +1516,7 @@ class DocumentedFootprintTest(unittest.TestCase):
         gib = 1024**3
         # Check that the quota summary sentence quotes the exact current totals without stale figures.
         m_sentence = re.search(
-            r"(\d+)\s+pods,\s+(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB of `requests\.storage`,\s+and\s+(\d+)\s+GiB of ephemeral-storage requests against\s+(\d+)\s+GiB of limits\.",
+            r"(\d+)\s+pods,\s+(\d+)\s+persistent volume claims totalling\s+(\d+)\s+GiB of `requests\.storage`,\s+and\s+([\d,]+)\s+MiB of ephemeral-storage requests against\s+([\d,]+)\s+MiB of limits\.",
             page,
         )
         self.assertIsNotNone(
@@ -1519,14 +1533,16 @@ class DocumentedFootprintTest(unittest.TestCase):
             required["requestsStorage"] // gib,
             "stale claim storage",
         )
+        # In MiB: the chart workloads' requests are not whole GiB, and a floor to
+        # GiB would understate what a quota has to hold.
         self.assertEqual(
-            int(m_sentence.group(4)),
-            required["requestsEphemeral"] // gib,
+            int(m_sentence.group(4).replace(",", "")),
+            required["requestsEphemeral"] // 1024**2,
             "stale ephemeral-storage requests",
         )
         self.assertEqual(
-            int(m_sentence.group(5)),
-            required["limitsEphemeral"] // gib,
+            int(m_sentence.group(5).replace(",", "")),
+            required["limitsEphemeral"] // 1024**2,
             "stale ephemeral-storage limits",
         )
 
@@ -1599,6 +1615,9 @@ class DocumentedFootprintTest(unittest.TestCase):
         )
         worker_cpu_limit = self._extract_match(
             r'workerCPULimit\s*=\s*"([^"]+)"', spawn_src, "workerCPULimit"
+        )
+        worker_ephemeral = self._extract_match(
+            r'workerEphemeralStorageRequest\s*=\s*"([^"]+)"', spawn_src, "workerEphemeralStorageRequest"
         )
         worker_mem_limit = self._extract_match(
             r'workerMemoryLimit\s*=\s*"([^"]+)"', spawn_src, "workerMemoryLimit"
@@ -1783,9 +1802,11 @@ class DocumentedFootprintTest(unittest.TestCase):
             rf"each `delegate:` from chat, and each conversation moved to `/session` "
             rf"\(one pod for the whole conversation, kept until it has been idle 30 minutes "
             rf"or for 4 hours at most\), spawns an "
-            rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU "
-            rf"and {re.escape(worker_mem)} memory \(limits {re.escape(worker_cpu_limit)} CPU, "
-            rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)})\), "
+            rf"`a2a-worker` session pod requesting {re.escape(worker_cpu)} CPU, "
+            rf"{re.escape(worker_mem)} memory and {re.escape(worker_ephemeral)} ephemeral storage "
+            rf"\(limits {re.escape(worker_cpu_limit)} CPU, "
+            rf"(?:{re.escape(worker_mem_limit)}|{re.escape(worker_mem_limit_prose)}), "
+            rf"{re.escape(worker_ephemeral)}\), "
             rf"up to `maxSessions` at once"
         )
         self.assertRegex(page, worker_clause)

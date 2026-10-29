@@ -476,12 +476,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([e[0] for e in adapter.log], ["chat_update"])
 
     def test_not_recommended_is_not_the_recommendation(self):
-        report = REPORT.replace(
-            "- ✅ **Recommended: Option B**",
-            "- ❌ **Not Recommended: Option A** — it hides the cause.\n- ✅ **Recommended: Option B**",
-        )
-        triage = runtime.parse_triage(report)
-        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
+        for not_recommended in ("- ❌ **Not Recommended: Option A**", "- ❌ __Not Recommended: Option A__"):
+            with self.subTest(line=not_recommended):
+                report = REPORT.replace(
+                    "- ✅ **Recommended: Option B**",
+                    f"{not_recommended} — it hides the cause.\n- ✅ **Recommended: Option B**",
+                )
+                triage = runtime.parse_triage(report)
+                self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
 
     def test_a_title_ending_in_the_suffix_clicks_through_to_its_apply_reply(self):
         for title in ("Roll back (recommended)", "Roll back (recommended) (recommended)"):
@@ -699,6 +701,184 @@ class RuntimeTest(unittest.TestCase):
         self.assertIn("apply Option A: Roll back to 14:02", text)
         self.assertIn("apply Option B: Restore the secret", text)
         self.assertNotIn("(recommended)", text)
+
+    def test_open_pull_request_omits_the_recommended_choice_button(self):
+        open_pr_report = REPORT.replace(
+            "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+            "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+            "- **To authorize:** a GitOps Pull Request for the recommended fix is being opened automatically, "
+            "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+        )
+        triage = runtime.parse_triage(open_pr_report)
+        self.assertEqual(
+            triage["choices"],
+            [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+        )
+        self.assertEqual(triage["fold_title"], runtime.FOLD_TITLE_OPTIONS)
+        adapter = _Adapter()
+        self.deliver(adapter, result=open_pr_report)
+        update = adapter.log[0][1]
+        action_texts = [
+            btn["text"]["text"]
+            for block in update["blocks"]
+            if block.get("type") == "actions"
+            for btn in block.get("elements", [])
+        ]
+        self.assertEqual(action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+
+        open_pr_single = SINGLE.replace(
+            "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.",
+            "- **To authorize:** a GitOps Pull Request for this fix is being opened automatically.",
+        )
+        single = runtime.parse_triage(open_pr_single)
+        self.assertEqual(single["choices"], [])
+        self.assertEqual(single["fold_title"], runtime.FOLD_TITLE_SINGLE)
+        runtime._edited.clear()
+        adapter_single = _Adapter()
+        self.deliver(adapter_single, result=open_pr_single)
+        single_blocks = adapter_single.log[0][1]["blocks"]
+        self.assertEqual([b["type"] for b in single_blocks], ["rich_text", "container"])
+
+        # Under spec.mode: next (kube-agents.chat/v1), chat_triage carries the same filtered choices.
+        chat_multi, _ = runtime.chat_triage(open_pr_report)
+        self.assertEqual([c["text"] for c in chat_multi["choices"]], ["Roll back to 14:02"])
+        chat_single, _ = runtime.chat_triage(open_pr_single)
+        self.assertEqual(chat_single.get("choices", []), [])
+
+        # A wrapped open-PR `To authorize:` bullet still omits the recommended button.
+        wrapped_report = REPORT.replace(
+            "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+            "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+            "- **To authorize:** a GitOps Pull Request for the recommended fix is being\n"
+            "  opened automatically, or reply **'apply Option A'** to open another option.",
+        )
+        self.assertEqual(len(runtime.parse_triage(wrapped_report)["choices"]), 1)
+        # Three other Markdown renderings of the same clause: underscore emphasis on the label, a
+        # wrapped bullet whose continuation line opens with bold, and underscore emphasis on the
+        # marker words. Each yields the same filtered choices and the same action block as the
+        # bold form above.
+        for label, rendering_multi, rendering_single in (
+            (
+                "underscore",
+                "- __To authorize__: a GitOps Pull Request for the recommended fix is being opened automatically, "
+                "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+                "- __To authorize__: a GitOps Pull Request for this fix is being opened automatically.",
+            ),
+            (
+                "wrapped bold",
+                "- **To authorize:** a GitOps Pull Request for the recommended fix\n"
+                "  **is being opened automatically**, or reply **'apply Option A'** / **'apply Option B'** "
+                "to open a Pull Request for a different option.",
+                "- **To authorize:** a GitOps Pull Request for this fix\n  **is being opened automatically**.",
+            ),
+            (
+                "underscore marker",
+                "- **To authorize:** a GitOps Pull Request for the recommended fix _is being opened automatically_, "
+                "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+                "- **To authorize:** a GitOps Pull Request for this fix __is being opened automatically__.",
+            ),
+        ):
+            with self.subTest(rendering=label):
+                rendered_report = REPORT.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                    "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                    rendering_multi,
+                )
+                self.assertEqual(
+                    runtime.parse_triage(rendered_report)["choices"],
+                    [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+                )
+                runtime._edited.clear()
+                adapter_rendered = _Adapter()
+                self.deliver(adapter_rendered, result=rendered_report)
+                rendered_action_texts = [
+                    btn["text"]["text"]
+                    for block in adapter_rendered.log[0][1]["blocks"]
+                    if block.get("type") == "actions"
+                    for btn in block.get("elements", [])
+                ]
+                self.assertEqual(rendered_action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+                rendered_single = SINGLE.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.",
+                    rendering_single,
+                )
+                self.assertEqual(runtime.parse_triage(rendered_single)["choices"], [])
+                runtime._edited.clear()
+                adapter_rendered_single = _Adapter()
+                self.deliver(adapter_rendered_single, result=rendered_single)
+                self.assertEqual(
+                    [b["type"] for b in adapter_rendered_single.log[0][1]["blocks"]], ["rich_text", "container"]
+                )
+        # The recommendation line may carry underscore emphasis too. It names the choice the filter
+        # drops, so a miss there keeps both lettered buttons on an open-PR card, and the recommended
+        # one would open the same pull request again. On a reply-wanted report the same line marks
+        # the choice recommended.
+        for recommended_line in ("- ✅ __Recommended: Option B__", "- ✅ _Recommended: Option B_"):
+            with self.subTest(recommended_line=recommended_line):
+                underscored_open_pr = open_pr_report.replace("- ✅ **Recommended: Option B**", recommended_line)
+                self.assertEqual(
+                    runtime.parse_triage(underscored_open_pr)["choices"],
+                    [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+                )
+                runtime._edited.clear()
+                adapter_underscored = _Adapter()
+                self.deliver(adapter_underscored, result=underscored_open_pr)
+                underscored_action_texts = [
+                    btn["text"]["text"]
+                    for block in adapter_underscored.log[0][1]["blocks"]
+                    if block.get("type") == "actions"
+                    for btn in block.get("elements", [])
+                ]
+                self.assertEqual(underscored_action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+                underscored_report = REPORT.replace("- ✅ **Recommended: Option B**", recommended_line)
+                self.assertEqual(
+                    [rec for _label, _reply, rec in runtime.parse_triage(underscored_report)["choices"]], [False, True]
+                )
+        # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
+        # continuation line, keeps every button: stripping one would leave a report that asks for
+        # `apply` with no button for it, on an install that is not opening anything. Nor do the
+        # marker words count once the bullet has ended: on a sibling bullet, after a blank line, on an
+        # unindented line opening with `*` or `-` (a `**Note:**` paragraph, not a wrapped bold run,
+        # which is indented), or past a thematic break, a CRLF one included (a heading line never
+        # reaches the pattern; `_sections` drops it).
+        for clause in (
+            "- **To authorize:** reply **'apply'** and a GitOps Pull Request will be opened with this fix.",
+            "- **To authorize:** reply **'apply'** and a GitOps Pull Request is being opened for review.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n  Once you reply, a Pull Request will be opened for review.",
+            "- **To authorize:** a GitOps Pull Request for the recommended fix will be opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n- **Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n* **Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n**Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n*Note:* a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n---\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n***\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\r\n---\r\nA Pull Request for the drift finding is being opened automatically.",
+        ):
+            with self.subTest(clause=clause):
+                off_report = REPORT.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                    "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                    clause,
+                )
+                self.assertEqual(len(runtime.parse_triage(off_report)["choices"]), 2)
+
+        # A drift or controller-stall report on an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true
+        # still invites `reply **'apply'**`, and keeps its recommended/single choice button on deliver().
+        with mock.patch.dict(os.environ, {"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": "true"}):
+            drift_triage = runtime.parse_triage(REPORT)
+            self.assertEqual(len(drift_triage["choices"]), 2)
+            self.assertEqual(len(runtime.parse_triage(SINGLE)["choices"]), 1)
+            runtime._edited.clear()
+            adapter_drift = _Adapter()
+            self.deliver(adapter_drift, result=REPORT)
+            drift_action_texts = [
+                btn["text"]["text"]
+                for block in adapter_drift.log[0][1]["blocks"]
+                if block.get("type") == "actions"
+                for btn in block.get("elements", [])
+            ]
+            self.assertIn("Restore the secret (recommended)", drift_action_texts)
 
     def test_the_alert_title_is_read_from_the_alerts_routing_row(self):
         self.assertEqual(runtime.alert_title(CHANNEL, ALERT_TS, self.db), "")

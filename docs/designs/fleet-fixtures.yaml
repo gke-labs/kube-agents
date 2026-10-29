@@ -111,6 +111,20 @@ fixtures:
       the posture is observable on apply day; its case still needs a ledger,
       which the idle pool supplies from day 7.
 
+  - role: guaranteed-qos-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/ledger-writer
+    namespace: seeded-qos
+    defect: >-
+      Two replicas whose container sets requests equal to limits (10m /
+      32Mi), so the pods are Guaranteed QoS and a lower request lowers the
+      limit with it. The container burns its 10m CPU limit, so it is
+      throttled there already. A request cut has to name this dependency;
+      the waste audit never names the workload (CPU in use, both dimensions
+      under its resize floor).
+
   - role: stalled-controller
     slot: a
     available_from_day: 0
@@ -226,7 +240,9 @@ fixtures:
       so the held version can be absent from REGULAR; while another roster or
       validMasterVersions still offers it (so on 2026-10-14; nothing in the
       stack keeps it) upgrade check 3.1 branch (a) does not fire and the
-      cluster carries branch (b) at major. See
+      cluster carries branch (b) at major. A held version newer than every
+      REGULAR patch of its minor is drift (`not_ahead_of_channel` in
+      fixtures.json): agents read it as current or ahead, not behind. See
       docs/designs/bench-fleet-catalog.md.
 
   - role: drift-outlier
@@ -239,7 +255,41 @@ fixtures:
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
       under 24 hours old from every cohort, and its cohort floor is three
       clusters: replacing c silences the finding for a day, and so does
-      replacing any cluster on a project whose fleet predates slot d.
+      replacing any cluster on a project whose fleet predates slot d. The
+      hourly scan reports a c under a day old as drift.
+
+  - role: drift-peer-a
+    slot: a
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot a's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-b
+    slot: b
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot b's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-d
+    slot: d
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot d's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
 
   - role: readiness-surge-blocked
     slot: b
@@ -272,6 +322,21 @@ fixtures:
       A PodDisruptionBudget with maxUnavailable 0 over the pinned workload, so
       disruptionsAllowed is 0 permanently and no drain that touches it can
       finish.
+
+  - role: readiness-lb-drain-timeout
+    slot: b
+    available_from_day: 0
+    objects:
+      - backendservice/drain-timeout-<prefix>-b
+      - healthcheck/drain-timeout-<prefix>-b
+    defect: >-
+      A Compute Engine backend service on the default pool's instance group
+      whose connection draining timeout is 720 seconds, a fifth over the 600
+      seconds GKE waits per node during a pool upgrade, behind a TCP health
+      check and no forwarding rule, so it routes nothing and costs nothing;
+      every default-pool node recreate on this cluster waits the 720 seconds
+      on it, which stays under the 30 minutes after which GKE fails the node
+      step.
 
   - role: readiness-failclosed-webhook
     slot: b
@@ -394,6 +459,19 @@ fixtures:
     defect: >-
       cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
 
+  - role: scaled-zero-gateway
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/storefront
+      - deployment/envoy-seeded-scaled-zero-storefront-edge
+      - service/storefront
+      - gateway/storefront-edge
+      - httproute/storefront
+    namespace: seeded-scaled-zero
+    defect: >-
+      Not a defect: an environment switched off on purpose. The backend and the Gateway's proxy Deployment are at replicas 0, and the Gateway reports Programmed=False (NoResources), the status Envoy Gateway v1.9.2 wrote for that shape. No controller runs. A stall check that reports it is wrong
+
   - role: zonal-skew-scheduling
     slot: d
     available_from_day: 0
@@ -420,6 +498,7 @@ fixtures:
     available_from_day: 0
     objects:
       - deployment/capacity-starved-worker
+      - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
       Four replicas at 120m CPU against two e2-small nodes, so those that do

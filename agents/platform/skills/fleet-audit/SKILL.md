@@ -43,6 +43,7 @@ watchdog — **not** a prettified form of the audit id:
 | `stockout-prevention`         | `[audit] Fleet Stockout Prevention & Capacity Audit — 7 findings (2 critical)` |
 | `gcp-networking-fabric-audit` | `[audit] GCP Networking Fabric & VPC IPAM Audit — 7 findings (2 critical)`     |
 | `gce-compute-fleet-audit`     | `[audit] GCE Compute Engine and MIG Fleet Audit — 7 findings (2 critical)`     |
+| `upgrade-retrospective`       | `[audit] Upgrade Retrospective — 7 findings (0 critical)`                      |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
 fails if the two drift apart. Do not restate a title anywhere else.
@@ -96,8 +97,11 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    ```bash
    /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <findings_path> \
      [--repo "<owner>/<repo>"] [--manifest-file <path> | --no-collector-manifest "<why>"] \
-     [--decline-fix <finding-id> "<why>" ...]
+     [--decline-fix <finding-id> "<why>" ...] [--scheduled]
    ```
+
+   Pass `--scheduled` only when the cron prompt tells you to; never on a run a person asked for
+   (`references/finish.md`).
 
    Exit 0 published. Exit 2 (`FINDINGS REJECTED`) published nothing and kept the run yours: fix
    what the message names and run `finish` again, never `start`. A `BROKER UNAVAILABLE` exit 2 is
@@ -106,8 +110,8 @@ Run every script by its full path. A kanban worker starts in its card's workspac
 
 5. **Report.** On a scheduled run with `silent_ok: true`, the final response is exactly
    `[SILENT]`. Otherwise report `issue_url` in full and every URL in `prs_opened` and
-   `prs_still_open`; on `status: "NO_FORGE"` the report is `summary` verbatim. An on-demand run is
-   never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
+   `prs_still_open`; on `status: "NO_FORGE"` or `"STORE_LEDGER"` the report is `summary` verbatim.
+   An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 
 ## Reference files
 
@@ -123,7 +127,7 @@ the SOP and these references.
 | `on-demand.md`         | for a request to trigger a cron job or run several audits; for the in-flight guard  |
 | `lifecycle.md`         | for what each `start` field means, the workspace modes, content-mode reads, `draft` |
 | `findings-document.md` | before you write the findings document                                              |
-| `finish.md`            | before `finish`, and to read its output, an exit 2, `partial` or `NO_FORGE`         |
+| `finish.md`            | before `finish`; for its output, exit 2, `partial`, `NO_FORGE`, `STORE_LEDGER`      |
 | `clean-run.md`         | for a run with zero findings, a `HELD` ledger, or `silent_ok`                       |
 | `remediation.md`       | for a `manifest` fix, a `/remediate` comment, or a direct ask to fix a finding      |
 | `ledger.md`            | for what a finding's ledger state means, and the ledger's size limits               |

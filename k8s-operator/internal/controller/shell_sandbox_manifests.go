@@ -664,11 +664,11 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// Two claims, because one of them must be unreachable from the account
 			// that can write the other. See shellSandboxSshdPath.
 			//
-			// VolumeClaimTemplates is immutable, so an install that already has a
-			// sandbox needs its StatefulSet deleted (--cascade=orphan keeps the
-			// pod up meanwhile) before the operator can lay this down. The feature
-			// is experimental and off by default, which is what makes that
-			// acceptable rather than a migration.
+			// VolumeClaimTemplates is immutable, so a change here is refused on an
+			// install that already has a sandbox. applyShellSandboxStatefulSet
+			// answers that refusal by deleting the StatefulSet with Orphan
+			// propagation and creating it again, which leaves the pod and its
+			// claims running throughout.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
 					// Sized from the agent's own /opt/data claim, not independently.
@@ -762,7 +762,7 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 		// See shellSandboxHermesHomePath. Empty and read-only: the point is the
 		// mount, not what is behind it.
 		Name:         shellSandboxHermesHomeVolume,
-		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxHermesHomeSizeLimit))}},
 	}, buildShellSandboxCredentialProxyTokenVolume(), buildGitopsStateVolume(agent)}
 	return volumes
 }
@@ -1131,7 +1131,7 @@ func buildShellSandboxClientKeyVolumes() []corev1.Volume {
 		},
 		{
 			Name:         shellSandboxClientKeyVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxClientKeySizeLimit))}},
 		},
 	}
 }
@@ -1169,12 +1169,14 @@ fi`,
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("10m"),
-				corev1.ResourceMemory: resource.MustParse("16Mi"),
+				corev1.ResourceCPU:              resource.MustParse("10m"),
+				corev1.ResourceMemory:           resource.MustParse("16Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse(shellSandboxClientKeyEphemeralRequest),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceCPU:              resource.MustParse("100m"),
+				corev1.ResourceMemory:           resource.MustParse("64Mi"),
+				corev1.ResourceEphemeralStorage: resource.MustParse(shellSandboxClientKeyEphemeralRequest),
 			},
 		},
 		SecurityContext: &corev1.SecurityContext{

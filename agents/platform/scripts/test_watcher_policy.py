@@ -286,5 +286,72 @@ class K8sTest(unittest.TestCase):
                 self.assertRegex(decision.rule_id, r"^[a-z0-9]+(\.[a-z0-9-]+)+$")
 
 
+ALERTS = "projects/kagents-dev/subscriptions/gke-stockout-alerts-sub"
+OTHER = "projects/kagents-dev/subscriptions/second-route-sub"
+PLATFORM_SET = frozenset({ALERTS, OTHER})
+
+
+class PlatformPubsubTest(unittest.TestCase):
+    """The platform adapter's relay: the same four calls, on a set of subscriptions."""
+
+    def test_the_four_calls_are_allowed_on_every_listed_subscription(self):
+        for sub in (ALERTS, OTHER):
+            cases = [
+                ("GET", "v1/" + sub, b"", "gcp.pubsub.subscription-get"),
+                ("POST", "v1/" + sub + ":pull", json.dumps({"maxMessages": 10}).encode(), "gcp.pubsub.subscription-pull"),
+                ("POST", "v1/" + sub + ":acknowledge", json.dumps({"ackIds": ["a"]}).encode(), "gcp.pubsub.subscription-acknowledge"),
+                ("POST", "v1/" + sub + ":modifyAckDeadline", json.dumps({"ackIds": ["a"], "ackDeadlineSeconds": 0}).encode(),
+                 "gcp.pubsub.subscription-modifyAckDeadline"),
+            ]
+            for method, path, body, rule in cases:
+                with self.subTest(sub=sub, path=path):
+                    decision = w.evaluate_pubsub(method, PUBSUB, path, body, PLATFORM_SET)
+                    self.assertTrue(decision.allowed, decision)
+                    self.assertEqual(decision.rule_id, rule)
+
+    def test_a_subscription_outside_the_set_is_refused(self):
+        for other in (SUB, "projects/another-project/subscriptions/gke-stockout-alerts-sub"):
+            with self.subTest(other=other):
+                decision = w.evaluate_pubsub("POST", PUBSUB, "v1/" + other + ":pull", b"{}", PLATFORM_SET)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.rule_id, w.RULE_PUBSUB_SUBSCRIPTION)
+
+    def test_an_empty_set_refuses_every_pubsub_call(self):
+        decision = w.evaluate_pubsub("POST", PUBSUB, "v1/" + ALERTS + ":pull", b"{}", frozenset())
+        self.assertEqual(decision.rule_id, w.RULE_PUBSUB_SUBSCRIPTION)
+
+    def test_the_gke_host_and_every_other_host_are_refused(self):
+        for host in (w.GKE_HOST, "iamcredentials.googleapis.com", "container.googleapis.com"):
+            with self.subTest(host=host):
+                decision = w.evaluate_pubsub("GET", host, "v1/projects/p/locations/l/clusters/c", b"", PLATFORM_SET)
+                self.assertEqual(decision.rule_id, w.RULE_PUBSUB_ROUTE)
+
+    def test_other_verbs_topics_and_bodies_are_refused_as_for_the_watcher(self):
+        for method, path, body, rule in (
+            ("POST", "v1/" + ALERTS + ":seek", b"{}", w.RULE_PUBSUB_ROUTE),
+            ("DELETE", "v1/" + ALERTS, b"", w.RULE_PUBSUB_METHOD),
+            ("POST", "v1/projects/kagents-dev/topics/t:publish", b"{}", w.RULE_PUBSUB_ROUTE),
+            ("POST", "v1/" + ALERTS, b"{}", w.RULE_PUBSUB_METHOD),
+            ("POST", "v1/" + ALERTS + ":pull", json.dumps({"maxMessages": "10"}).encode(), w.RULE_PUBSUB_BODY),
+            ("POST", "v1/" + ALERTS + ":acknowledge", json.dumps({"ackIds": [1]}).encode(), w.RULE_PUBSUB_BODY),
+        ):
+            with self.subTest(method=method, path=path):
+                decision = w.evaluate_pubsub(method, PUBSUB, path, body, PLATFORM_SET)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.rule_id, rule)
+
+    def test_the_platform_relay_names_itself_and_repeats_no_caller_text(self):
+        decision = w.evaluate_pubsub("POST", PUBSUB, "v1/projects/MARKER/subscriptions/MARKER:pull", b"{}", PLATFORM_SET)
+        self.assertFalse(decision.allowed)
+        self.assertNotIn("MARKER", decision.message)
+        self.assertNotIn("watcher", decision.message)
+
+    def test_the_watcher_evaluator_is_unchanged(self):
+        decision = w.evaluate_gcp("POST", PUBSUB, "v1/" + ALERTS + ":pull", b"{}", SUB)
+        self.assertEqual(decision.rule_id, w.RULE_GCP_SUBSCRIPTION)
+        self.assertEqual(decision.message, "The watcher relay reaches only the drift detector's configured subscription.")
+        self.assertEqual(w.evaluate_gcp("GET", PUBSUB, "v1/" + SUB, b"", SUB).rule_id, "gcp.watcher.subscription-get")
+
+
 if __name__ == "__main__":
     unittest.main()

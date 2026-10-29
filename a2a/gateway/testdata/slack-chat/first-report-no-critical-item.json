@@ -1,0 +1,159 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "First look at your fleet: done",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "1 cluster scanned in full · no critical item in this scan's 9 checks",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "4 smaller items are queued.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "startup probes",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "ResourceQuota and LimitRange",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "read-only root filesystems",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Shielded Nodes",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Dataplane V2",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Managed Service for Prometheus",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "node auto-upgrade",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "static Google Cloud keys in pods",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "added capabilities",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "What the scan checked",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "See all 4 items",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "See all 4 items"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

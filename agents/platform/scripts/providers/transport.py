@@ -497,9 +497,13 @@ class HttpTransport:
         ca_file: str = "",
         ca_source: str = "",
         whoami_graphql: str = "",
+        allow_http: bool = False,
     ) -> None:
-        if not base_url.startswith("https://"):
+        allowed_schemes = ("https://", "http://") if allow_http else ("https://",)
+        if not base_url.startswith(allowed_schemes):
             raise ValueError("a forge API is reached over https only")
+        if ca_file and base_url.startswith("http://"):
+            raise ValueError("a forge over http cannot use a ca_file")
         self._base = base_url.rstrip("/")
         self._host = self._base.split("://", 1)[1].split("/", 1)[0]
         # A GraphQL endpoint that answers `viewer { login }`, for a forge whose

@@ -1,0 +1,154 @@
+{{- if and .Values.platformAgent.enabled (.Values.platformAgent.healthRules | default dict).enabled }}
+{{- /*
+The health cohorts as Managed Prometheus rules, one Rules object per install,
+evaluated by the managed rule-evaluator against this namespace's metrics. Every
+alert reads the operator's gauges (usage_gauges.go in k8s-operator), per agent,
+by agent_namespace and agent; the ratios are recorded once and the alerts read
+the recorded series, so a dashboard and an alert see one number.
+
+Three rules of PromQL here, each held by tests/test_chart_platform_agent_health_rules.py:
+
+- An increase() is folded with `sum by` over the agent's labels: an operator
+  roll-over splits a window's increase across the old and the new pod's series,
+  disjoint in time, and the sum is the total where a max would keep the larger
+  fragment. An instantaneous read is `max by`, which folds the old leader's
+  series for its staleness window without doubling a reading.
+- A recorded series carries the scoping labels the rule-evaluator appends
+  (project_id, location, cluster, namespace) and an inline `max by` side does
+  not, so every `and` and `unless` matches `on (agent_namespace, agent)`.
+- A day-long condition is a plain `for`. A window in the expression over a
+  subquery would survive a rule-evaluator restart, which resets a pending
+  alert, but it fires on a young series: five minutes of Degraded after an
+  upgrade reads as "Degraded throughout the day" when the day's other
+  samples do not exist. A restart delays an alert; a young series would
+  invent one. The stalled-onboarding rule reads the status's own
+  lastHumanActiveTime for the same reason: an increase() over a series
+  younger than its window is zero, and the status time carries its history.
+  Its "nobody has ever spoken" case is the chat counter present at zero, not
+  the time's absence: under the served-CRD skew the operator holds the time's
+  sample back while createdTime stays, and absence would read as silence for
+  the whole fleet.
+
+Off by default: see values.yaml. The thresholds are required rather than
+defaulted here, and the schema requires every key of the block, so a
+--reuse-values upgrade from a release that predates them fails with a message
+rather than rendering rules at numbers this template made up. The rules read
+the operator's scrape, so enabling them without it is refused at render.
+*/ -}}
+{{- $t := required "platformAgent.healthRules.thresholds is required when platformAgent.healthRules.enabled is true; a --reuse-values upgrade from a release that predates the key needs --reset-then-reuse-values or the thresholds set" .Values.platformAgent.healthRules.thresholds }}
+{{- if not (and .Values.operator.enabled (include "kube-agents.operatorPodMonitoring" .)) }}
+{{- fail "platformAgent.healthRules.enabled is true but the operator's PodMonitoring does not render (operator.enabled, operator.metrics.enabled or operator.metrics.podMonitoring is off, or the cluster serves no monitoring.googleapis.com/v1/PodMonitoring): the rules read the operator's gauges and would never fire" }}
+{{- end }}
+{{- $agent := .Values.platformAgent.name }}
+{{- $by := "agent_namespace, agent" }}
+{{- $on := printf "on (%s)" $by }}
+{{- $sum := printf "sum by (%s)" $by }}
+{{- $max := printf "max by (%s)" $by }}
+{{- $usage := "kubeagents_platformagent_usage" }}
+{{- $times := "kubeagents_platformagent_usage_time_seconds" }}
+{{- $phase := "kubeagents_platformagent_phase" }}
+{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
+{{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: {{ $agent }}-health-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: kubeagents-health-ratios
+      rules:
+        - record: kubeagents:platformagent:chat_turns_errored_ratio_1d
+          expr: {{ $sum }} (increase({{ $usage }}{field="chatTurnsErroredTotal"}[1d])) / {{ $sum }} (increase({{ $usage }}{field="chatMessagesInboundTotal"}[1d]))
+        - record: kubeagents:platformagent:broker_failure_ratio_1d
+          expr: {{ $sum }} (increase({{ $usage }}{field="brokerFailuresTotal"}[1d])) / {{ $sum }} (increase({{ $usage }}{field="toolExecutionsTotal"}[1d]))
+        - record: kubeagents:platformagent:commands_blocked_ratio_1d
+          expr: {{ $sum }} (increase({{ $usage }}{field="toolExecutionsBlockedTotal"}[1d])) / {{ $sum }} (increase({{ $usage }}{field="toolExecutionsTotal"}[1d]))
+        - record: kubeagents:platformagent:proposals_rejected_ratio_14d
+          expr: {{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) / ({{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) + {{ $sum }} (increase({{ $usage }}{field="remediationsMergedTotal"}[14d])))
+        - record: kubeagents:platformagent:proposals_merge_rate_14d
+          expr: {{ $sum }} (increase({{ $usage }}{field="remediationsMergedTotal"}[14d])) / {{ $sum }} (increase({{ $usage }}{field="remediationsProposedTotal"}[14d]))
+    - name: kubeagents-health-at-risk
+      rules:
+        - alert: KubeAgentsAgentDegraded
+          expr: {{ $max }} ({{ $phase }}{phase=~"Degraded|Failed"}) == 1
+          for: {{ $t.degradedFor }}
+          labels:
+            severity: at_risk
+          annotations:
+            summary: "{{ $who }} has been Degraded or Failed for {{ $t.degradedFor }}"
+        - alert: KubeAgentsClustersUnwatched
+          expr: {{ $max }} ({{ $usage }}{field="clustersRegistered"}) > {{ $max }} ({{ $usage }}{field="clustersMonitored"})
+          for: {{ $t.unwatchedClustersFor }}
+          labels:
+            severity: at_risk
+          annotations:
+            summary: "{{ $who }} has registered clusters its watcher does not reach, for {{ $t.unwatchedClustersFor }}"
+        - alert: KubeAgentsChatTurnsErroring
+          expr: kubeagents:platformagent:chat_turns_errored_ratio_1d > {{ $t.chatTurnsErroredRatio }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="chatMessagesInboundTotal"}[1d])) >= {{ $t.chatTurnsErroredMinMessages }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: at_risk
+          annotations:
+            summary: "{{ $who }} failed {{ "{{ $value | humanizePercentage }}" }} of its chat turns in a day"
+        - alert: KubeAgentsBrokerFailing
+          expr: kubeagents:platformagent:broker_failure_ratio_1d > {{ $t.brokerFailureRatio }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="toolExecutionsTotal"}[1d])) >= {{ $t.brokerFailureMinCalls }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: at_risk
+          annotations:
+            summary: "{{ $who }}: the broker failed {{ "{{ $value | humanizePercentage }}" }} of brokered work in a day"
+        - alert: KubeAgentsBackgroundTasksGivingUp
+          expr: {{ $sum }} (increase({{ $usage }}{field="backgroundTasksGaveUpTotal"}[7d])) >= {{ $t.backgroundTasksGaveUp7d }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: at_risk
+          annotations:
+            summary: '{{ $who }}: {{ "{{ $value | printf \"%.0f\" }}" }} background tasks gave up in 7 days'
+    - name: kubeagents-health-friction
+      rules:
+        - alert: KubeAgentsStalledOnboarding
+          expr: (time() - {{ $max }} ({{ $times }}{field="createdTime"})) > {{ $t.stalledOnboardingDays }} * 86400 and {{ $on }} ((time() - {{ $max }} ({{ $times }}{field="lastHumanActiveTime"})) > {{ $t.stalledOnboardingSilentDays }} * 86400 or {{ $on }} {{ $max }} ({{ $usage }}{field="chatMessagesInboundTotal"}) == 0)
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: friction
+          annotations:
+            summary: "{{ $who }} is older than {{ $t.stalledOnboardingDays }} days and no person has sent it a message in {{ $t.stalledOnboardingSilentDays }} days"
+        - alert: KubeAgentsProposalsRejected
+          expr: kubeagents:platformagent:proposals_rejected_ratio_14d >= {{ $t.proposalsRejectedRatio }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) >= {{ $t.proposalsRejectedMin14d }} and {{ $on }} ({{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) + {{ $sum }} (increase({{ $usage }}{field="remediationsMergedTotal"}[14d]))) >= {{ $t.proposalsDecidedMin14d }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: friction
+          annotations:
+            summary: "{{ $who }}: {{ "{{ $value | humanizePercentage }}" }} of its decided proposals were closed unmerged in 14 days"
+        - alert: KubeAgentsProposalsUnmerged
+          expr: kubeagents:platformagent:proposals_merge_rate_14d < {{ $t.proposalsMergeRateBelow }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="remediationsProposedTotal"}[14d])) >= {{ $t.proposalsProposedMin14d }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: friction
+          annotations:
+            summary: "{{ $who }} merged {{ "{{ $value | humanizePercentage }}" }} of the proposals it opened in 14 days"
+        - alert: KubeAgentsCommandsBlocked
+          expr: kubeagents:platformagent:commands_blocked_ratio_1d > {{ $t.commandsBlockedRatio }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="toolExecutionsTotal"}[1d])) >= {{ $t.commandsBlockedMinCalls }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: friction
+          annotations:
+            summary: "{{ $who }}: policy blocked {{ "{{ $value | humanizePercentage }}" }} of brokered commands in a day"
+        - alert: KubeAgentsNegativeFeedback
+          expr: {{ $sum }} (increase({{ $usage }}{field="negativeFeedbackTotal"}[1d])) >= {{ $t.negativeFeedbackPerDay }}
+          for: {{ $t.ratiosFor }}
+          labels:
+            severity: friction
+          annotations:
+            summary: '{{ $who }} received {{ "{{ $value | printf \"%.0f\" }}" }} thumbs-downs in a day'
+        - alert: KubeAgentsScrapeBroken
+          expr: max by (job) (up{job=~"{{ join "|" $jobs }}"}) == 0
+          for: {{ $t.scrapeBrokenFor }}
+          labels:
+            severity: friction
+          annotations:
+            summary: "Managed Prometheus has scraped nothing from {{ "{{ $labels.job }}" }} for {{ $t.scrapeBrokenFor }}; the install's Tier 2 telemetry is dark"
+{{- end }}

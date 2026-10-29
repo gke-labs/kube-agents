@@ -21,7 +21,7 @@ import json
 import pathlib
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 AUDIT_SCRIPT = pathlib.Path(__file__).with_name("gitops-audit.py")
 # Ceiling on one `gh pr view`; a PR that takes longer to read is reported as unavailable.

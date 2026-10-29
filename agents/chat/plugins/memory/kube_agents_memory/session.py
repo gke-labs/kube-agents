@@ -5,9 +5,10 @@ fixed for its lifetime:
 
 * **attributed** — a DM from a known user. Personal and shared memory, read and
   write, automatic capture on.
-* **unattributable** — a multi-party thread. There are people here, and their
-  personal memory exists; this session just cannot tell which of them is
-  speaking, so it may not touch any of it.
+* **unattributable** — a multi-party thread, or an interactive session whose
+  user identity is missing. There are people here, and their personal memory
+  exists; this session just cannot tell which of them is speaking, so it may
+  not touch any of it.
 * **unattended** — cron, the k8s event watcher. No person is in the
   conversation at all, so there is no personal memory in play to get wrong.
 * **read-only** — a specialist profile. Shared memory, reads only, no write tool
@@ -26,12 +27,16 @@ stock Hindsight provider is in `client.py`; anything the model reads is in
 `prompts.py`.
 """
 
+from contextlib import closing
 import hashlib
 import inspect
 import json
 import logging
+import os
+from pathlib import Path
 import re
-from typing import Any, Dict, FrozenSet, List, Optional
+import sqlite3
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -57,6 +62,76 @@ from .prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+A2A_SESSION_PREFIX = "a2a-"
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+MAX_PARENT_SESSION_HOPS = 256
+SQLITE_TIMEOUT_SECONDS = 2.0
+COMPRESSION_END_REASON = "compression"
+INTERACTIVE_PLATFORMS = frozenset({"google_chat", "slack", "discord", "telegram"})
+
+
+def _resolve_a2a_session_id(session_id: str, kwargs: Dict[str, Any]) -> str:
+    """Return the originating ``a2a-*`` session id, walking compression parents if needed."""
+    sid = str(session_id or "").strip()
+    if sid.startswith(A2A_SESSION_PREFIX):
+        return sid
+    if not sid:
+        return ""
+    hermes_home_str = kwargs.get("hermes_home") or os.environ.get("HERMES_HOME") or "/opt/data"
+    state_db = Path(str(hermes_home_str)) / "state.db"
+    if not state_db.is_file():
+        return ""
+    try:
+        with closing(sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
+            cur = sid
+            seen = {cur}
+            for _ in range(MAX_PARENT_SESSION_HOPS):
+                row = conn.execute(
+                    "SELECT s.parent_session_id FROM sessions s "
+                    "JOIN sessions p ON p.id = s.parent_session_id "
+                    "WHERE s.id = ? AND p.end_reason = ? "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL",
+                    (cur, COMPRESSION_END_REASON),
+                ).fetchone()
+                parent = str(row[0] or "").strip() if row else ""
+                if not parent or parent in seen:
+                    break
+                if parent.startswith(A2A_SESSION_PREFIX):
+                    return parent
+                seen.add(parent)
+                cur = parent
+    except Exception as e:
+        logger.debug("%s: could not walk state.db parent_session_id for %s: %s", PROVIDER_NAME, sid, e)
+    return ""
+
+
+def _resolve_a2a_session_route(session_id: str, kwargs: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """Return ``(is_a2a, user_id, chat_type)`` from ``session_kv.db`` for ``a2a-*`` sessions."""
+    a2a_sid = _resolve_a2a_session_id(session_id, kwargs)
+    if not a2a_sid:
+        return False, "", ""
+    db_path = os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH)
+    if not db_path or not os.path.isfile(db_path):
+        return True, "", ""
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", (a2a_sid,)
+            ).fetchone()
+        if not row or not row[0]:
+            return True, "", ""
+        meta = json.loads(row[0])
+        route = meta.get("conversation_route") if isinstance(meta, dict) else None
+        if not isinstance(route, dict):
+            return True, "", ""
+        user_id = str(route.get("user_id") or "").strip()
+        chat_type = str(route.get("chat_type") or "").strip().lower()
+        return True, user_id, chat_type
+    except Exception as e:
+        logger.debug("%s: could not read conversation_route for %s: %s", PROVIDER_NAME, a2a_sid, e)
+        return True, "", ""
 
 
 def sanitize_user_id(user_id: str) -> str:
@@ -131,26 +206,43 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._unattended = False
         self._read_only = memory_is_read_only()
 
-        user_id = sanitize_user_id(kwargs.get("user_id") or "")
+        raw_user = str(kwargs.get("user_id") or "").strip()
+        if raw_user == "default":
+            raw_user = ""
+        chat_type = str(kwargs.get("chat_type") or "").strip().lower()
+        platform = str(kwargs.get("platform") or "").strip().lower()
+
+        is_a2a, a2a_user, a2a_chat_type = _resolve_a2a_session_route(self._session_id, kwargs)
+        if is_a2a:
+            if not raw_user and a2a_user:
+                raw_user = a2a_user
+            if not chat_type and a2a_chat_type:
+                chat_type = a2a_chat_type
+
+        user_id = sanitize_user_id(raw_user)
 
         # Refuse personal memory when the session can carry more than one human.
         #
         # agent._user_id is frozen once at Agent construction, and
         # build_session_key() (gateway/session.py) deliberately omits the
         # participant id inside a thread unless `thread_sessions_per_user` is on.
-        # So in a shared thread the second speaker reuses the first speaker's
-        # cached Agent, and a per-user tag would recall person A's memories into
-        # person B's prompt and retain B's turns under A's name. Nothing in the
-        # provider protocol identifies the speaker — system_prompt_block() takes
-        # no arguments and handle_tool_call() is passed no identity — so it fails
-        # closed. Shared memory, visible to everyone by design, is unaffected.
-        chat_type = str(kwargs.get("chat_type") or "").strip().lower()
-        session_is_shared = bool(
-            chat_type
-            and chat_type != "dm"
-            and kwargs.get("thread_id")
-            and not thread_sessions_are_per_user()
-        )
+        # On A2A (`is_a2a`), the gateway shares one `context_id` per group
+        # conversation without passing `thread_id`. So in a shared thread the
+        # second speaker reuses the first speaker's cached Agent, and a per-user
+        # tag would recall person A's memories into person B's prompt and retain
+        # B's turns under A's name. Nothing in the provider protocol identifies
+        # the speaker — system_prompt_block() takes no arguments and
+        # handle_tool_call() is passed no identity — so it fails closed. Shared
+        # memory, visible to everyone by design, is unaffected.
+        if is_a2a:
+            session_is_shared = bool(chat_type and chat_type != "dm")
+        else:
+            session_is_shared = bool(
+                chat_type
+                and chat_type != "dm"
+                and kwargs.get("thread_id")
+                and not thread_sessions_are_per_user()
+            )
 
         if session_is_shared:
             self._personal_disabled_reason = SHARED_SESSION_NOTICE
@@ -160,9 +252,19 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             )
         elif not user_id:
             self._personal_disabled_reason = NO_IDENTITY_NOTICE
-            self._unattended = True
-            logger.info("%s: personal memory disabled for session %s (no user identity)",
-                        PROVIDER_NAME, session_id)
+            # Only non-interactive background sessions (cron, k8s event watcher)
+            # are unattended. An A2A conversation or interactive DM whose route
+            # or user identity is missing still has a human speaker, so
+            # `_unattended` stays False and unqualified writes are refused
+            # rather than silently routed to `shared`.
+            is_interactive = bool(
+                is_a2a
+                or chat_type == "dm"
+                or platform in INTERACTIVE_PLATFORMS
+            )
+            self._unattended = not is_interactive
+            logger.info("%s: personal memory disabled for session %s (no user identity, unattended=%s)",
+                        PROVIDER_NAME, session_id, self._unattended)
         else:
             self._user_tag = f"{USER_TAG_PREFIX}{user_id}"
 

@@ -11,7 +11,7 @@ path is broken; see [Detecting a broken leg](#detecting-a-broken-leg).
 A watchdog on a named profile runs with the right brain and no voice.
 
 `profile-cron-tick` fires the specialist's job under its own `HERMES_HOME`, so it
-keeps that profile's persona, skills, model and turn budget — which is the whole
+keeps that profile's persona and the entry's skills, model and turn budget — which is the whole
 reason the watchdogs live on the Platform Agent's roster rather than as kanban
 cards. What it does not get is a way to say anything useful to the person who
 cares.
@@ -108,7 +108,9 @@ and the link, unless the relayed line counts a finding. When the issue cannot be
 the leg posts the relayed line in bold with the link. Not parsing includes a title
 of 0 findings, a body listing no finding, a "<n> new" above the
 title's count, a title whose count disagrees with the finding total the relayed
-line states, and a relayed line with no total that counts no non-zero new,
+line states, an issue that disagrees with the count the line leads with (fleet-audit's own
+line states no total and leads with the count of its most severe findings, "2 critical
+findings", which must be the issue's count at that severity, with none more severe), and a relayed line with no total that counts no non-zero new,
 resolved or severity count or calls the run clean, held, carried or nothing
 reproduced (a zero-finding partial or held run leaves the ledger open over its old
 title, or over a refreshed coverage title when a gap opened the ledger). A run that speaks only
@@ -171,6 +173,26 @@ gateway lays it out, buttons included, as it lays out a card's post in a convers
 The text headline rides beside it as the fallback the gateway posts when the message
 breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
 
+A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
+no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
+the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
+the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
+summary's headline, its finding rows, its other lines under them, and "Look at the first
+one" with no link button. Where the card does not post, `headline_from_summary` goes out
+as text, and the fallbacks are those of the ledger card.
+
+`kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
+says: the script leaves its rows, each with the ids of the cards it stands for, in a file
+beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
+only when its text is the report being relayed, with the flag on and a channel known.
+`_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
+under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
+(`chat_from_card`), with Retry and Drop under each row; its outcomes, and the report going
+out as text where the card does not post, are the audit card's. A tap on either is no turn:
+it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
+edits the row
+([the job's section](../../agents/platform/cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)).
+
 ## Why no agent turn runs over the report
 
 The relay first ran one Chat Agent turn over each report, told to reproduce it
@@ -226,10 +248,24 @@ age and repository rule, with one exception: a later `finish` of a repository wh
 `start` opened and an earlier `finish` filled, while the record's last step is within the
 two hours, is the same run. It adds its report under the earlier one's, below a label line,
 and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
-report, the later one fills the entry in its place. The earlier `finish` saves its
+report, the later one fills the entry in its place. The first `finish` of the repository in the
+run saves the previous run's finding ids on the entry before it touches the ledger, with every id
+that run filed, rendered or not, so a finding a body over budget cut is not the run's new; a later
+`finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
+whole run, and its line states the run's new and resolved findings, or says the change is unknown
+when the first `finish` had no trusted memory of the previous run. With the ids, the first
+`finish` saves what it read about the last scheduled run, so the line on that chat report that
+says the change since the last scheduled run also covers the whole run (`run_since_scheduled`).
+The JSON line of the later `finish` still counts against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
+`finish` does not save the mid-run memory it reads after an earlier one filled the entry without
+them. A no-forge or HELD report, or an entry without those
+ids, keeps a label that says its counts are against the earlier `finish`: the report above, or
+what it published. The earlier `finish` saves its
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
-it writes the report store. When that was `false` the later one is not silent either and its automatic
-sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
+it writes the report store. With it, it saves `news`: true when it reported news or opened a pull
+request. When `news` was true the later one is not silent either and its automatic
+sweep opens no pull request (`earlier_finish`, `silent_floor`). The floor does not read `silent_ok`,
+because an on-demand `finish` always gets `silent_ok: false`, also when it reported nothing new. A `finish` with no `start` fills no entry,
 but while a current record holds this repository's entry with a saved verdict it is taken for a
 later `finish` of that run, and the
 relay posts that run's report again with its own under it. The relay
@@ -238,11 +274,15 @@ shell sandbox (`sandbox_exec.read_bytes`).
 
 The relay posts the finished repositories' reports as one message, followed by
 a line naming each repository the run started and did not finish. It posts each
-run once: the run it last posted per job is kept in `audit_report_runs`. A run
+run once: the run it last posted per job is kept in `audit_report_runs`. The
+onboarding report's audits note reads that table's `posted_at` too: a post at or
+after a run's claim is that run's, a summary or a failure notice. Once a failure notice
+has replaced the row, nothing in it says whether an earlier run posted, so the note
+names that audit (`bootstrap_delivery._relay_posts`). A run
 that failed is delivered as the scheduler's failure line, which the relay
 plugin recognises by its exact opening and the job's name
 (`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image
-build) and flags; the relay posts that line as written, as on main, and marks
+build) and flags; the relay posts that line in plain words (below) and marks
 the record on disk posted, so a later run cannot post an earlier run's report
 as its own. The flag is read off the text, which the model can also write, so
 when the record's last step is at or after the delivering run's start (its
@@ -256,6 +296,27 @@ and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
 silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
 `also_delivered_to` on every delivery and `report_to_chat` never does, so a
 mid-run `report_to_chat` is posted as written.
+
+The scheduler's failure line names a CLI and a config file nobody in the
+channel can reach, so for any job, audit or not, the relay posts it as one plain
+line instead (`scheduler_failure_line`): "**The Workload Reliability Audit didn't
+run.** The AI model's usage limit was reached. It will try again tomorrow."
+The reason is the scheduler's own, in plain words, or "It hit an error" for one
+the relay does not name, and the scheduler's line goes to the server's log
+(`logs/session_kv_server.log`, which fluent-bit ships). "tomorrow" is for a job
+whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
+any other says "It will try again at its next scheduled run." A failure no
+retry clears says so instead of promising one: rejected credentials, and the
+scheduler's blocked-configuration line (which it sends once, running the job no
+more until the configuration is fixed), end with "An admin needs to fix this
+before it can run; the details are in the agent's log." There is no clock time: under `spec.mode: next`, the default
+for a first install, the gateway escapes Slack's `<!date^…>` token, and a time
+in one zone is wrong for most readers. A failure posts once: `scheduler_failure_posts` keeps the reason each
+job last posted, and the same reason is withheld until the job's `completed` row
+in the run ledger starts after that post, or until any delivery from the job
+that is not a failure line, whose own report is the sign it runs again. A
+different reason posts at once, and a ledger the relay cannot read posts rather
+than withholds.
 
 Each report ends with a `Ledger: <url>` line, which the Slack headline reads,
 so a run over one repository gets its card. A message that carries the line
@@ -653,14 +714,19 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either. For a fleet-audit job the relay posts that failure summary as written
-too, and in place of any other final message it posts the rendered report. One case the scheduler's check misses: it matches the bare marker only,
+either. The relay posts that failure summary in plain words, once until the job
+runs again, and for a fleet-audit job it posts the rendered report in place of
+any other final message. One case the scheduler's check misses: it matches the bare marker only,
 and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
 scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
 sender and carries no such guard; no roster job uses `"all"`.
+
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+That sentence controls silence, not delivery: a prompt without it only makes the job noisier
+([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 
 ## How the switch is wired: `chat` is a platform
 
@@ -842,7 +908,8 @@ privilege the pod does not already hold.
   token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
   own ledger. With no repository to use, the job falls back to the log line
-  alone. Two installs that manage one repository would share one issue; the
+  alone. A forge with no issue verbs, or no labels, keeps no ledger either: the
+  ALERT line says `ledger=log-only`, and that is not a fault. Two installs that manage one repository would share one issue; the
   fleet-audit ledgers have the same property, and an install-specific ledger
   repository is the answer for both.
 - An **`ALERT chat_delivery_watch` line** appended to
@@ -870,10 +937,12 @@ pod-to-operator path and a new grant first. One such path exists now: the
 operator reads the event watcher's and the credential broker's metrics
 listeners for the usage counters ([design](usage-counters-producer.md)), and it
 carries integer totals and nothing about a report, so the grant is still the
-missing piece. The operator binds no metrics endpoint of its own in the shipped
-deploy; the ones the agent's pods expose are the event watcher's and the
-credential broker's, scraped through the chart's `PodMonitoring`s beside
-LiteLLM's and Hindsight's, and neither carries anything about a report. Those are the next step, with this
+missing piece. The operator's own metrics endpoint, bound since the usage
+gauges landed, serves copies of that status and controller-runtime's series
+([the status as gauges](usage-counters-producer.md#the-status-as-gauges)); the
+ones the agent's pods expose are the event watcher's and the credential
+broker's, scraped through the chart's `PodMonitoring`s beside LiteLLM's and
+Hindsight's, and none of them carries anything about a report. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

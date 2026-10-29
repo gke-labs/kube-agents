@@ -1,0 +1,168 @@
+name: Notify on Broken Release Stage
+
+# Open a `ci:release-stage-broken` issue when a release pipeline run fails,
+# keep it current while the pipeline stays red, close it when the next run
+# passes, and tell the CI-health Chat space on the open and the close.
+# `scripts/release/notify_release_stage_broken.py` holds the reasoning, the
+# watched list and the issue and message formats; this file is the schedule,
+# the guards and the Chat credential.
+#
+# The watched workflows (`WATCHED_WORKFLOWS` in the script: the RC, staging
+# promotion and GA pipelines) run on `workflow_dispatch` from their
+# schedulers, so a red run is a red row in the Actions tab and nothing more:
+# on 2026-10-20 and 2026-10-21 the promotion pipeline failed two nights
+# running and the GA scheduler skipped two mornings before anyone asked
+# (#1978).
+#
+# A sweep, not a `workflow_run` trigger. Posting to Chat needs `id-token:
+# write` to mint the Chat app's token (the same identity, space and mint
+# `ci-health.yml` uses), and `tests/conformance/test_B_write_path.py` (B4)
+# requires a `workflow_run` job holding that permission to gate on
+# `workflow_run.conclusion == 'success'`, which a failure notifier cannot. The
+# sweep reconciles every watched workflow against its newest completed run
+# that said anything and writes nothing when the issues already say so, so it
+# is safe to run at any time; the pipelines take between forty minutes and six
+# hours, so a bound of fifteen minutes on the delay costs nothing. The sweep
+# goes red when a watched name matches no workflow, which is how a rename
+# that would otherwise silently disable it shows up.
+#
+# Chat is best-effort and the issue is the record: a failed authentication or
+# mint leaves the token empty, the script says "chat not configured" and
+# files the issue anyway. The repository variable `CI_HEALTH_MUTE=true`
+# silences the Chat half here as it does in `ci-health.yml`; the issues
+# still file. The Chat token is minted only from `main` and never under a
+# dry run, so a dispatch from a branch (the way to try a branch's script,
+# with `dry_run` set) holds no Chat credential; it still holds the job's
+# own GITHUB_TOKEN with `issues: write`, which `dry_run` keeps from
+# writing.
+#
+# No other setup: it writes to this repository with its own GITHUB_TOKEN and
+# creates the label the first time it needs one. Issues opened with
+# GITHUB_TOKEN do not trigger further workflows, so this cannot start a loop.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  #checkov:skip=CKV_GHA_7:A boolean that decides whether the sweep writes, and a run id passed to the script through the environment; nothing is built and no input is interpolated into a shell
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print what would be filed and posted, and write nothing
+        type: boolean
+        default: true
+      run_id:
+        description: A completed run of a watched workflow; the script reconciles that workflow against its newest main run, instead of sweeping every watched pipeline
+        type: string
+        default: ""
+
+# One run at a time, none cancelled: two sweeps reading the same red run
+# together would both find no issue for it and both open one. A third arrival
+# cancels the one waiting, which costs nothing, since the one that runs reads
+# the same state.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  # The Chat app's identity, space, mute switch and workload-identity
+  # provider: the same values `ci-health.yml` declares, so the two posters
+  # cannot drift apart. The first three take the same repository variables
+  # as overrides; the provider is a literal in both files.
+  WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+  CI_HEALTH_SA: ${{ vars.CI_HEALTH_SA || 'eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com' }}
+  CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
+  CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
+
+jobs:
+  notify:
+    name: Notify on Broken Release Stage
+    # The repository guard is required of any credentialed workflow that starts
+    # on its own (AGENTS.md, Pull Request Hygiene): a fork inherits the schedule
+    # and none of the credentials, so without it every fork sync mails its owner.
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the script
+      actions: read # list workflows and runs, a run's jobs, and their logs
+      issues: write # open, update and close the tracking issue, and its label
+      id-token: write # mint the Chat app's token through workload identity
+    steps:
+      # The default branch on a schedule; a dispatch checks out the ref it was
+      # dispatched from.
+      - name: Checkout the script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Only from main, only when writing, and only while not muted: a dry
+      # run posts nothing, so it mints nothing. A refusal here is not a
+      # failed sweep (see the header): the Chat half is skipped and the
+      # issue still files.
+      - name: Authenticate to Google Cloud (Chat app identity)
+        id: auth
+        if: github.ref == 'refs/heads/main' && env.CI_HEALTH_MUTE != 'true' && inputs.dry_run != true
+        continue-on-error: true
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_HEALTH_SA }}
+
+      # Best-effort like the step before it: a setup hiccup costs the Chat
+      # post, not the reconcile.
+      - name: Set up Cloud SDK
+        id: gcloud
+        if: steps.auth.outcome == 'success'
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # The token goes to the script step alone, as a masked step output
+      # rather than through GITHUB_ENV, so no later step sees it. The auth
+      # action's default token does not carry the chat.bot scope, so one is
+      # minted with it, as ci-health.yml does.
+      - name: Mint a Chat token
+        id: chat_token
+        if: steps.gcloud.outcome == 'success'
+        continue-on-error: true
+        run: |
+          token="$(gcloud auth print-access-token --scopes=https://www.googleapis.com/auth/chat.bot)"
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      # The run id and the dry-run flag go in through the environment, never
+      # into the script text. The script reads the conclusions, the jobs and
+      # the logs back from the API rather than trusting any input for them.
+      # `DRY_RUN` is the dispatch's boolean, which GitHub renders as the
+      # string "true"; the schedule has no inputs and always writes.
+      # `RELEASE_STAGE_ANNOTATE` turns a newest run stuck queued or running
+      # past the script's ceiling into a warning annotation on this job (the
+      # sweep is silent for that workflow until it completes); the script's
+      # unit tests run without it. `RELEASE_STAGE_CHAT_EXPECTED` repeats the
+      # mint's condition: when it is true and the token is empty or the post
+      # fails, the script annotates the same way, since this workflow is
+      # the only place a persistent mint failure would show; the issue files
+      # either way.
+      - name: Reconcile the release pipelines' issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
+          RELEASE_STAGE_ANNOTATE: "true"
+          RELEASE_STAGE_CHAT_EXPECTED: ${{ github.ref == 'refs/heads/main' && env.CI_HEALTH_MUTE != 'true' && inputs.dry_run != true }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          args=(--sweep)
+          if [ -n "$RUN_ID" ]; then
+            args=(--run-id "$RUN_ID")
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/release/notify_release_stage_broken.py "${args[@]}"

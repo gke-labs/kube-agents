@@ -343,5 +343,5 @@ func connect(ctx context.Context, log *slog.Logger, url string, onClosed func())
 		opts = append(opts, tokenOpts...)
 	}
 	_ = ctx
-	return nats.Connect(url, opts...)
+	return nats.Connect(url, append(opts, lib.TLSOptions()...)...)
 }

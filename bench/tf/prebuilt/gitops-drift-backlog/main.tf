@@ -17,13 +17,13 @@
 # 4. Read the ledger and the board, and write the verdict ConfigMap the task's
 #    safeguard reads.
 #
-# Verdicts. ok and the five red ones are written and exit 0, so the agent's
+# Verdicts. ok and the seven red ones are written and exit 0, so the agent's
 # turn still runs and the safeguard reds the repetition. Everything else is
 # the environment, exits non-zero, and the repetition is excluded:
 #   ok                  every backlog record has a row marked backlog, digested
-#                       or recorded headless, and no card; every late record
-#                       that must be carded has a card; the live record has
-#                       its card.
+#                       or recorded headless, and no card of its own; the
+#                       digest is one new board card; every late record that
+#                       must be carded has a card; the live record has its card.
 #   backlog-triaged     a backlog record has a notified row, a session, or a card.
 #   backlog-not-marked  a backlog record has a row with no backlog mark (or the
 #                       ledger has no backlog column, which is main).
@@ -31,6 +31,13 @@
 #   live-marked-backlog the live record was marked backlog.
 #   late-edit-not-carded a late record that must be carded (a lone principal's,
 #                       or one sent by kubectl) has no card.
+#   digest-card-missing the digest's rows ended as a board card (backlog 3)
+#                       and exactly one digest card covering this run's ledger
+#                       rows, counting the backlog principal's records, did not
+#                       appear; or they ended as a chat post (backlog 2) and
+#                       such a card appeared.
+#   digest-mark-unexpected the digest's rows carry a mark that is neither 3
+#                       nor 2, or more than one mark.
 
 locals {
   kubectl = "kubectl"
@@ -240,6 +247,33 @@ resource "null_resource" "drift_backlog" {
               print(i)
       " "$@"
       }
+      # How many digest cards the board holds, then the body of the newest. The
+      # count taken before the detector stop scopes the check to this run.
+      # The digest cards that cover this run's rows: the card key is the ledger id
+      # range the daemon claimed, so a card from an earlier repetition, or one
+      # that merged an earlier repetition's leftover rows with this run's, is
+      # told apart by the range rather than by a count taken before the run.
+      # Prints the card count, the backlog principal's count in the newest such
+      # card, and that card's body.
+      digest_cards() {
+        agent_exec "$agent_python" -c "
+      import re, sqlite3, sys
+      principal, uids = sys.argv[1], sys.argv[2:]
+      ledger = sqlite3.connect('file:${local.ledger_db}', uri=True)
+      lo, hi = ledger.execute('select min(id), max(id) from intercepted_events where object_uid in (%s)' % ','.join('?' * len(uids)), uids).fetchone()
+      board = sqlite3.connect('file:${local.kanban_board}', uri=True)
+      bodies = []
+      for key, body in board.execute(\"select idempotency_key, body from tasks where idempotency_key like 'drift-backlog-%' order by created_at, rowid\"):
+          m = re.fullmatch(r'drift-backlog-(\d+)-(\d+)', key or '')
+          if m and lo is not None and int(m.group(1)) <= lo and int(m.group(2)) >= hi:
+              bodies.append(body or '')
+      newest = bodies[-1] if bodies else ''
+      n = re.search(re.escape(principal) + r' \((\d+)\)', newest)
+      print(len(bodies))
+      print(n.group(1) if n else 0)
+      print(newest.replace(chr(10), ' '))
+      " "$@" 2>/dev/null
+      }
       card_is_finished() {
         agent_exec "$agent_python" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect('file:${local.kanban_board}',uri=True).execute(\"select count(*) from tasks where body like ? and status in ('done','blocked','archived')\", ('%'+sys.argv[1]+'%',)).fetchone()[0] else 1)" \
           "$1" >/dev/null 2>&1
@@ -247,7 +281,7 @@ resource "null_resource" "drift_backlog" {
       write_verdict() {
         echo "verdict=$1 detail=$2" >&2
         case "$1" in
-          ok | backlog-triaged | backlog-not-marked | digest-pending | live-marked-backlog | late-edit-not-carded) ;;
+          ok | backlog-triaged | backlog-not-marked | digest-pending | live-marked-backlog | late-edit-not-carded | digest-card-missing | digest-mark-unexpected) ;;
           *) return 0 ;;
         esac
         ${local.kubectl} create configmap "${local.verdict_configmap}" -n "$NS" \
@@ -402,7 +436,38 @@ resource "null_resource" "drift_backlog" {
         exit 0
       fi
 
-      write_verdict ok "$${#backlog_ids[@]} backlog records recorded with no card and given their digest; $${#card_ids[@]} late records carded; live card finished"
+      # The ledger says how the digest ended: 3 is a board card (no chat platform
+      # enabled, which is every eval install), 2 is a chat post. The card check
+      # follows that mark, so an install with chat is not red for having no card.
+      digest_mark="$(printf '%s\n' "$rows" | awk -F'|' 'NF {print $4}' | sort -u | tr '\n' ' ')"
+      digest_after="$(digest_cards "$BACKLOG_PRINCIPAL" "$${backlog_ids[@]}")"
+      digest_card_count="$(printf '%s\n' "$digest_after" | sed -n 1p)"
+      digest_card_count="$${digest_card_count:-0}"
+      digest_principal_count="$(printf '%s\n' "$digest_after" | sed -n 2p)"
+      digest_principal_count="$${digest_principal_count:-0}"
+      digest_body="$(printf '%s\n' "$digest_after" | sed -n 3p)"
+      case "$${digest_mark// /}" in
+        3)
+          # The principal's count may exceed this run's rows when an earlier
+          # repetition's leftover rows were digested with them.
+          if [ "$digest_card_count" -ne 1 ] || [ "$digest_principal_count" -lt "${var.backlog_record_count}" ]; then
+            write_verdict digest-card-missing "the digest rows ended as a board card (3) but exactly one digest card covering this run's rows and counting $BACKLOG_PRINCIPAL (${var.backlog_record_count}) or more did not appear: $digest_card_count card(s), count $digest_principal_count; newest body: $${digest_body:0:200}"
+            exit 0
+          fi
+          ;;
+        2)
+          if [ "$digest_card_count" -ne 0 ]; then
+            write_verdict digest-card-missing "the digest rows ended as a chat post (2) yet $digest_card_count digest card(s) cover this run's rows"
+            exit 0
+          fi
+          ;;
+        *)
+          write_verdict digest-mark-unexpected "the digest rows carry a mark that is neither a board card (3) nor a chat post (2): '$digest_mark'"
+          exit 0
+          ;;
+      esac
+
+      write_verdict ok "$${#backlog_ids[@]} backlog records recorded with no card and given their digest card; $${#card_ids[@]} late records carded; live card finished"
       echo "backlog digested: no card for $${#backlog_ids[@]} backlog records, live card for $live_id finished"
     EOT
   }

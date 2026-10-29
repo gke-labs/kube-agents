@@ -61,7 +61,7 @@ const (
 // reservedProfiles are the Hermes profiles that live under the same directory
 // and are never a cluster's -- cluster_agent_profile.py's RESERVED_PROFILES --
 // so ReadIdentities says nothing about them whatever state they are in.
-var reservedProfiles = map[string]bool{"default": true, "platform": true}
+var reservedProfiles = map[string]bool{"default": true, "platform": true, "tse": true}
 
 // ErrNoClusterIdentity and ErrNoProfileConfig are the reasons ReadIdentities
 // reports for a cluster- prefixed profile whose config reads cleanly and

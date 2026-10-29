@@ -157,6 +157,8 @@ HEALTH = "health-chat-request-runs-collector"
 SCRATCH_CHECK = "the-collector-used-the-chat-scratch-dir"
 PATCH = f"{SKILLS}/fleet-audit/scripts/patch_readiness.py"
 NETWORKING = "networking-chat-request-runs-collector"
+CARD = "t_1"
+AS_TYPED = "after_result_pattern"
 
 
 def _verifier(case: str, name: str) -> WorkerCommandsVerifier:
@@ -165,12 +167,30 @@ def _verifier(case: str, name: str) -> WorkerCommandsVerifier:
     return WorkerCommandsVerifier(**check["check"])
 
 
-def _passes(verifier: WorkerCommandsVerifier, *commands: str) -> bool:
-    """The verifier's verdict on worker logs holding these rows, one per line."""
-    for command in commands:
-        assert "\n" not in command, command
+def _call(command: str, at: float) -> dict:
+    """One tagged terminal call of the worker card, as worker_trajectory records it."""
+    return {
+        "name": "terminal",
+        "args": {"command": command},
+        "result": "",
+        "status": "completed",
+        "agent": "platform",
+        "task": CARD,
+        "session": "s_1",
+        "at": at,
+    }
+
+
+def _verdict(verifier: WorkerCommandsVerifier, rows: list[str], typed: list[str]) -> bool:
+    """The verifier's verdict on one card whose log holds ``rows`` and whose
+    tagged calls read ``typed``: a check without ``after_result_pattern``
+    grades the rows, one with it grades the calls."""
+    for row in rows:
+        assert "\n" not in row, row
     transcript.set(
-        output="", trajectory=[], worker_commands=[{"command": c} for c in commands]
+        output="",
+        trajectory=[_call(c, 100.0 + i) for i, c in enumerate(typed)],
+        worker_commands=[{"task": CARD, "command": r} for r in rows],
     )
     try:
         result = verifier.verify(timeout_sec=5)
@@ -178,6 +198,12 @@ def _passes(verifier: WorkerCommandsVerifier, *commands: str) -> bool:
         transcript.clear()
     assert result.status != "error", result.reason
     return result.success
+
+
+def _passes(verifier: WorkerCommandsVerifier, *commands: str) -> bool:
+    """The verdict on commands that render to themselves: one line, no chain,
+    the same text on the log row and in the tagged call."""
+    return _verdict(verifier, list(commands), list(commands))
 
 
 def _run(case: str) -> str:
@@ -344,3 +370,40 @@ RECONFIGURE_CHECKS = {
 )
 def test_reconfigure_safeguard_reads_the_gcloud_argv(case, command, passes):
     assert _passes(_verifier(case, RECONFIGURE_CHECKS[case]), command) is passes
+
+
+# The commands as the workers typed them in the recorded runs the issue names
+# (#3128), and the one-line rendering Hermes v2026.9.14 writes to the card log
+# (``summarize_shell_command`` in its ``agent/display.py``): a chain collapses
+# to its first command plus `` + N commands``, and a second line is joined
+# into the first, so the collector is not on the row the harness reads.
+AI_SECURITY_CHAIN = REAL_RUNS["ai-security-chat-request-runs-collector"][1]
+AI_SECURITY_CHAIN_ROW = "mkdir -p /opt/data/scratch + 2 commands"
+UPGRADE_TWO_LINES = (
+    f"mkdir -p /opt/data/scratch/chat\n{CHAT_DIR} python3 {PATCH} {SCOPE}"
+    " > /opt/data/scratch/chat_manifest_security-patch-orchestrator.json"
+)
+UPGRADE_TWO_LINES_ROW = f"mkdir -p /opt/data/scratch/chat {CHAT_DIR} python3 {PATCH} {SCOPE}"
+AS_TYPED_CHECKS = [
+    ("ai-security-chat-request-runs-collector", "the-ai-security-collector-ran", AI_SECURITY_CHAIN, AI_SECURITY_CHAIN_ROW),
+    (UPGRADE, "the-upgrade-collector-ran", UPGRADE_TWO_LINES, UPGRADE_TWO_LINES_ROW),
+    (UPGRADE, SCRATCH_CHECK, UPGRADE_TWO_LINES, UPGRADE_TWO_LINES_ROW),
+]
+
+
+def _check(case: str, name: str) -> dict:
+    doc = yaml.safe_load((TASKS / case / "task.yaml").read_text())
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == name]
+    return check["check"]
+
+
+@pytest.mark.parametrize("case,name,typed,row", AS_TYPED_CHECKS, ids=[c[1] for c in AS_TYPED_CHECKS])
+def test_required_checks_read_the_command_as_typed_not_the_rendered_row(case, name, typed, row):
+    check = _check(case, name)
+    assert check[AS_TYPED] == "(?!)", "the switch opens no window and reads the calls as typed"
+    assert _verdict(WorkerCommandsVerifier(**check), [row], [typed])
+    # The row alone is what the check read before the switch: the collector
+    # is behind the chain or on the joined line, so the same run failed.
+    without = {k: v for k, v in check.items() if k != AS_TYPED}
+    assert not _verdict(WorkerCommandsVerifier(**without), [row], [typed])
+

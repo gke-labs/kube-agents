@@ -194,6 +194,13 @@ KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
 # install configuration and do not belong in install.defaults.env; they are
 # named here so that no front door spells one differently from the others.
 readonly KUBE_AGENTS_HELM_RELEASE="kube-agents"
+# The web console's Service (charts/kube-agents/templates/web-console.yaml
+# names it <release>-web-console) and the port it listens on, which the chart
+# fixes at 8080.
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_SERVICE="${KUBE_AGENTS_HELM_RELEASE}-web-console"
+# shellcheck disable=SC2034  # read by install.sh
+readonly WEB_CONSOLE_PORT="8080"
 # shellcheck disable=SC2034  # read by install.sh and upgrade.sh
 readonly KUBE_AGENTS_OPERATOR_DEPLOYMENT="kube-agents-controller-manager"
 readonly PLATFORM_AGENT_DEPLOYMENT="platform-agent-gateway"
@@ -249,12 +256,15 @@ readonly GCHAT_SPACE_PREFIX="spaces/"
 # whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
 # U+205F and U+3000. The operator and the gateway trim a home channel this
 # way, so a value pasted with a no-break space is still the space they use.
-readonly -a GO_TRIMSPACE_CHARS=(
+# Assigned, then marked readonly: a `readonly -a` here is local to the
+# function the front doors source this file from, on bash 3.2 (macOS).
+GO_TRIMSPACE_CHARS=(
   $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
   $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
   $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
   $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
 )
+readonly GO_TRIMSPACE_CHARS
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -4447,6 +4457,27 @@ gke_describe_error_is_not_found() {
   printf '%s' "${1:-}" | grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN"
 }
 
+is_existing_cluster_network_policy_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  local create_cluster_flag="${4:-${TFVARS_CREATE_CLUSTER:-true}}"
+  [ "$create_cluster_flag" = "false" ] || return 0
+
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    return 2
+  fi
+  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
+  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
+  return 0
+}
+
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4951,6 +4982,34 @@ write_tfvars_from_state() {
     print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
     return 1
   fi
+  # Refused when the web console is on and the operator has accepted an
+  # unconfined cluster: the web console holds the Platform Agent's API key with
+  # no login of its own, and its deny-all-ingress NetworkPolicy is the only
+  # thing keeping other pods in the cluster from reaching it. Checked here so
+  # upgrade.sh and `install.sh --menu` cannot write a tfvars that enables the
+  # console when both keys are set in install.env without install.sh's
+  # preflight, when the cluster still enforces no NetworkPolicy. install.sh
+  # (which passes KUBE_AGENTS_GENERATE_API_SERVER_KEY=true) defers this check to
+  # check_existing_cluster_network_policy_preflight. On an adopted cluster that
+  # enforces NetworkPolicy (Autopilot, or a Standard cluster that has since
+  # enabled Dataplane V2 or Calico on the "confine it later" route), the live
+  # probe below finds enforcement active and lets upgrade.sh and --menu proceed
+  # despite a stale ACCEPT_NO_NETWORK_POLICY=true.
+  if ! is_truthy "${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-false}" && \
+     is_truthy "${ACCEPT_NO_NETWORK_POLICY:-false}" && \
+     is_truthy "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"; then
+    local np_rc=0
+    is_existing_cluster_network_policy_satisfied "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$create_cluster" || np_rc=$?
+    if [ "$np_rc" -eq 2 ]; then
+      print_error "Could not query NetworkPolicy configuration for existing cluster '${CLUSTER_NAME}'."
+      print_info "Failed to read cluster details from GCP while validating WEB_CONSOLE_ENABLED=true with ACCEPT_NO_NETWORK_POLICY=true. Check cluster name, region, permissions, and network connectivity."
+      return 1
+    elif [ "$np_rc" -ne 0 ]; then
+      print_error "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true."
+      print_info "The web console holds the Platform Agent's API key with no login of its own, and its NetworkPolicy is what keeps other pods in the cluster from reaching it. Enable NetworkPolicy enforcement on the cluster (and remove any stale ACCEPT_NO_NETWORK_POLICY=true from install.env if the cluster already enforces it), or set WEB_CONSOLE_ENABLED=false in install.env."
+      return 1
+    fi
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -5160,6 +5219,7 @@ write_tfvars_from_state() {
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
     echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"
+    echo "web_console_enabled      = $(hcl_bool "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}")"
     echo "memory_enabled           = $(hcl_bool "${MEMORY_ENABLED:-$DEFAULT_MEMORY_ENABLED}")"
     echo "memory_provider          = $(hcl_str "$memory_provider")"
     echo "user_profile_enabled     = $(hcl_bool "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}")"

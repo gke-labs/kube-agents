@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # The deployer drops an injected variable this stack does not declare and
-# raises on a task.yaml variable it does not declare, so this file and
-# bench/tasks/fleet-audit-clean-close-reads-clean/task.yaml are a matched pair.
+# raises on a task.yaml variable it does not declare, so this file and the
+# task.yaml of bench/tasks/fleet-audit-clean-close-reads-clean and of
+# bench/tasks/fleet-audit-on-demand-run-reports are matched.
 
 variable "host_cluster_name" {
   type        = string
@@ -63,4 +64,15 @@ variable "gitops_repo" {
   type        = string
   description = "owner/name of the GitOps repository; empty resolves it the way audit_report.py does"
   default     = ""
+}
+
+variable "ledger_kind" {
+  type        = string
+  description = "The ledger to open: \"finding\" (one finding on a retired cluster) or \"gap\" (no finding, one coverage gap)"
+  default     = "finding"
+
+  validation {
+    condition     = contains(["finding", "gap"], var.ledger_kind)
+    error_message = "ledger_kind must be \"finding\" or \"gap\"."
+  }
 }

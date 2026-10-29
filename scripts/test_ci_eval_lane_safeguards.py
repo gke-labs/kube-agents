@@ -1,14 +1,11 @@
-"""The inject lane's safeguards step in hack/ci-eval-pr.sh (#2079).
+"""The lane safeguards step in hack/ci-eval-pr.sh (#2079, #2611).
 
-Under AGENT_TRANSPORT=inject the step exports BENCH_GITOPS_REPO from the
+On every transport -- the api lane as well as the inject lane, so both are
+graded against the same bar -- the step exports BENCH_GITOPS_REPO from the
 leased project's mapping, materialises every task in the matrix as
 `<scratch>/<case>/task.yaml` with hack/eval/inject-lane-safeguards.yaml's
-entries appended, and `unit_task_path` hands devops-bench that copy; on any
-other transport the step exports nothing, copies nothing and the helper is
-the identity, so the api lane's matrix and task files are byte for byte what
-they were -- it only reads the same file for which cases request a pull
-request, since #2260 runs those in the second phase on both lanes for the
-repository reset's sake. The step is lifted out of the shipped script and run under bash
+entries appended, and `unit_task_path` hands devops-bench that copy. The
+step is lifted out of the shipped script and run under bash
 over the real files, with `uv run python -m kube_agents_bench.lane` answered
 by the real module under python3, so the assertions are against the code
 that ships rather than a copy of it.
@@ -34,6 +31,11 @@ HACK_DIR = REPO_ROOT / "hack"
 BENCH_DIR = REPO_ROOT / "bench"
 LANE_FILE = HACK_DIR / "eval" / "inject-lane-safeguards.yaml"
 LANE_ENTRY = "no-github-writes-the-case-did-not-request"
+# The read credential the step requires on GitHub without a ledger key;
+# every run gets it unless the test says otherwise.
+READ_CREDENTIAL = {"BENCH_GITHUB_TOKEN": "test-read-token"}
+# What the shell running the tests may export that the step reads.
+STEP_INPUTS = ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "EVAL_FORGE", "EVAL_LEDGER_APP_KEY_FILE", "BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # `uv run python -m ...` answered by python3 with bench/ on the path: the
 # real lane module, without the virtualenv the presubmit has. Anything else
@@ -77,7 +79,7 @@ def constants() -> str:
 
 def safeguards_step() -> str:
     """The step and the helper after it, up to the correctness-floor comment."""
-    return lifted_block(r"^# ─── The inject lane's safeguards.*?^unit_task_path\(\) \{.*?^\}$")
+    return lifted_block(r"^# ─── The lanes' safeguards.*?^unit_task_path\(\) \{.*?^\}$")
 
 
 def presubmit_tasks() -> list[str]:
@@ -93,7 +95,12 @@ def requesting_among(tasks: list[str]) -> str:
     return ",".join(n for n in (pathlib.Path(t).parent.name for t in tasks) if n in INJECT_LANE_REQUESTING)
 
 
-def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file: pathlib.Path = LANE_FILE) -> subprocess.CompletedProcess:
+def run_step(
+    env: dict | None = None,
+    tasks: list[str] | None = None,
+    lane_file: pathlib.Path = LANE_FILE,
+    credential: dict | None = None,
+) -> subprocess.CompletedProcess:
     tasks = presubmit_tasks() if tasks is None else tasks
     tasks_array = "TASKS=(" + " ".join(f'"{t}"' for t in tasks) + ")"
     step = safeguards_step().replace(
@@ -117,16 +124,18 @@ def run_step(env: dict | None = None, tasks: list[str] | None = None, lane_file:
         ]
     )
     # "Not set by the test" has to mean unset, not whatever the shell running
-    # the tests exports: the transport switch and the two repository
-    # variables, which a developer who drove the lane by hand has in theirs.
+    # the tests exports: the transport switch, the two repository variables
+    # and the forge and its read credential, which a developer who drove the
+    # lane by hand has in theirs.
     # The step's `mktemp -d` lands under TMPDIR, which is a directory of the
     # test's own so nothing is left behind.
-    clean = {k: v for k, v in os.environ.items() if k not in ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO")}
+    clean = {k: v for k, v in os.environ.items() if k not in STEP_INPUTS}
+    credential = READ_CREDENTIAL if credential is None else credential
     # Kept on the result, not in a `with`: the tests read the copies the step
     # wrote, so the directory lives until the result is dropped.
     scratch = tempfile.TemporaryDirectory()
     result = subprocess.run(
-        ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch.name, **(env or {})}
+        ["bash", "-c", body], capture_output=True, text=True, check=False, env={**clean, "TMPDIR": scratch.name, **credential, **(env or {})}
     )
     result.scratch = scratch  # type: ignore[attr-defined]
     return result
@@ -147,44 +156,21 @@ def spec_names(task_yaml: pathlib.Path) -> list[str]:
     return [e["name"] for e in doc.get("verification_spec") or []]
 
 
-class ApiLaneUntouchedTest(unittest.TestCase):
-    """The api lane's task files and matrix are what they were; what it
-    shares with the inject lane since #2260 is the second phase, so it reads
-    the lane file for the requesting list and nothing else."""
-
-    def test_no_export_no_copy_and_the_helper_is_the_identity(self):
-        for env in ({}, {"AGENT_TRANSPORT": "api"}):
-            with self.subTest(env=env):
-                result = run_step(env)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(value(result, "REPO"), "<unset>")
-                self.assertEqual(value(result, "REQUESTING"), requesting_among(presubmit_tasks()))
-                self.assertEqual(value(result, "DIR"), "")
-                for line in tagged(result, "PATH"):
-                    name, path = line.split(" ", 1)
-                    self.assertEqual(path, f"./tasks/{name}/task.yaml")
-                self.assertNotIn("carries the lane's safeguards", result.stdout)
-                self.assertIn("each after the repository is reset", result.stdout)
-                # The writer phase on this lane grades no window, so its units
-                # keep the launch stagger, not the inject lane's settle.
-                self.assertEqual(value(result, "PAUSE"), "5")
-                self.assertEqual(value(result, "PAUSE"), lifted_block(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=(\d+)\n").split("=")[1].strip())
-
-    def test_a_lane_file_that_cannot_be_read_stops_the_api_lane_too(self):
-        # The requesting list is what orders the second phase, and the reset
-        # before a writer unit is only safe inside it: no list, no run.
-        result = run_step({"AGENT_TRANSPORT": "api"}, lane_file=pathlib.Path("/nonexistent/lane.yaml"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not read which cases request a pull request", result.stderr)
-
-
 class InjectLaneTest(unittest.TestCase):
+    """The step under AGENT_TRANSPORT=inject; ApiLaneTest below runs every
+    test here again on the api lane, where the step does the same."""
+
+    TRANSPORT = {"AGENT_TRANSPORT": "inject"}
+
+    def lane(self, **env: str) -> dict:
+        return {**self.TRANSPORT, **env}
+
     def test_every_task_gets_a_copy_with_the_lane_entries_appended(self):
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"})
+        result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
-        # This lane's writer units wait the safeguard's settle, not the stagger.
-        self.assertEqual(value(result, "PAUSE"), "120")
+        # The writer units wait the safeguard's settle, not the stagger.
+        self.assertEqual(value(result, "PAUSE"), "30")
         scratch = pathlib.Path(value(result, "DIR"))
         self.assertTrue(scratch.is_dir())
         paths = dict(line.split(" ", 1) for line in tagged(result, "PATH"))
@@ -194,7 +180,7 @@ class InjectLaneTest(unittest.TestCase):
                 self.assertEqual(path, str(scratch / name / "task.yaml"))
                 original = spec_names(BENCH_DIR / "tasks" / name / "task.yaml")
                 self.assertEqual(spec_names(pathlib.Path(path)), original + [LANE_ENTRY])
-        self.assertIn("every task in the matrix carries the lane's safeguards", result.stdout)
+        self.assertIn("every task in the matrix carries the lane safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
         # The presubmit cases that request a pull request, by their own
         # checks or the file's `requesting:` list: the second phase holds
@@ -202,42 +188,43 @@ class InjectLaneTest(unittest.TestCase):
         # the list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
         # phase. pdb-remediation-pr, which asks for its pull request by its
-        # own check, was the presubmit's one requesting case until its
-        # demotion to the nightly (2026-10-17, #3120), so today the list is
-        # empty and the log says "none";
+        # own check, was the presubmit's one requesting case from 2026-10-14
+        # until its demotion to the nightly (2026-10-17, #3120); from
+        # 2026-10-23 that case was vcs-spent-branch-reuse, and since
+        # pdb-remediation-pr's return on 2026-10-26 the log names both;
         # test_the_requesting_cases_are_named_for_the_second_phase below
         # covers a matrix that holds them.
         requesting = requesting_among(presubmit_tasks())
         self.assertNotIn("obtainability-remediation-proposal", requesting.split(","))
         self.assertEqual(value(result, "REQUESTING"), requesting)
-        self.assertIn(f"run after every other unit: {requesting or 'none'}\n", result.stdout)
+        self.assertIn(f"each after the repository is reset: {requesting or 'none'}\n", result.stdout)
 
     def test_the_requesting_cases_are_named_for_the_second_phase(self):
         # Every pinned requesting case the presubmit matrix does not seat,
         # added to it: each is named once, in matrix order.
         seated = {pathlib.Path(t).parent.name for t in presubmit_tasks()}
         tasks = presubmit_tasks() + [f"./tasks/{c}/task.yaml" for c in INJECT_LANE_REQUESTING if c not in seated]
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, tasks=tasks)
+        result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"), tasks=tasks)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(value(result, "REQUESTING").split(",")), sorted(INJECT_LANE_REQUESTING))
         self.assertEqual(value(result, "REQUESTING"), requesting_among(tasks))
-        self.assertIn(f"run after every other unit: {requesting_among(tasks)}\n", result.stdout)
+        self.assertIn(f"each after the repository is reset: {requesting_among(tasks)}\n", result.stdout)
 
     def test_the_task_files_under_bench_tasks_are_not_written(self):
         before = {p: p.read_bytes() for p in (BENCH_DIR / "tasks").glob("*/task.yaml")}
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"})
+        result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual({p: p.read_bytes() for p in before}, before)
 
     def test_a_local_runs_own_repository_stands_in_for_the_mapping(self):
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "gke-agentic/throwaway-infra"})
+        result = run_step(self.lane(EVAL_GITOPS_REPO="gke-agentic/throwaway-infra"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/throwaway-infra")
 
     def test_a_repository_the_lane_entry_pins_another_owner_for_stops_the_lane(self):
         """The safeguard's `owner: gke-agentic` would error on every repetition
         over a repository elsewhere; the step refuses before the lease."""
-        result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "someone/throwaway-infra"})
+        result = run_step(self.lane(EVAL_GITOPS_REPO="someone/throwaway-infra"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("is not under gke-agentic", result.stderr)
         self.assertIn("BENCH_GITOPS_REPO=someone/throwaway-infra is not a repository they can grade", result.stderr)
@@ -248,19 +235,49 @@ class InjectLaneTest(unittest.TestCase):
         set, so that is the repository the safeguard has to read; Prow
         refuses the override at deploy time, so in CI this is the mapping."""
         result = run_step(
-            {"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra", "EVAL_GITOPS_REPO": "gke-agentic/throwaway-infra"}
+            self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra", EVAL_GITOPS_REPO="gke-agentic/throwaway-infra")
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(value(result, "REPO"), "gke-agentic/throwaway-infra")
 
     def test_no_repository_stops_the_lane_before_anything_runs(self):
-        for env in ({"AGENT_TRANSPORT": "inject"}, {"AGENT_TRANSPORT": "inject", "EVAL_GITOPS_REPO": "none"}):
+        for env in (self.lane(), self.lane(EVAL_GITOPS_REPO="none")):
             with self.subTest(env=env):
                 result = run_step(env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("no GitOps repository is known for PROJECT_ID=kube-agents-evals-21", result.stderr)
                 self.assertIn("inject-lane-safeguards.yaml", result.stderr)
                 self.assertNotIn("REPO=", result.stdout)
+
+    def test_no_github_read_credential_stops_the_lane_before_anything_runs(self):
+        """GitHubWritesVerifier errors without BENCH_GITHUB_TOKEN or
+        GITHUB_TOKEN, so on GitHub with no ledger key to mint one from the
+        step refuses, as it does without a repository."""
+        repo = {"EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}
+        for forge in ({}, {"EVAL_FORGE": "github"}):
+            with self.subTest(forge=forge):
+                result = run_step(self.lane(**repo, **forge), credential={})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("no GitHub read credential", result.stderr)
+                self.assertIn("neither BENCH_GITHUB_TOKEN nor GITHUB_TOKEN is set", result.stderr)
+                self.assertIn("cannot read the repository, so the run does not start", result.stderr)
+                self.assertNotIn("REPO=", result.stdout)
+
+    def test_any_read_credential_or_a_ledger_key_lets_the_lane_start(self):
+        """Prow mounts BENCH_GITHUB_TOKEN or sets EVAL_LEDGER_APP_KEY_FILE
+        (the preflight mints from it); under gitlab read_gitlab_tokens has
+        unset both GitHub names and set the GitLab token instead."""
+        repo = {"EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}
+        for credential in (
+            {"BENCH_GITHUB_TOKEN": "t"},
+            {"GITHUB_TOKEN": "t"},
+            {"EVAL_LEDGER_APP_KEY_FILE": "/etc/ledger-app-key/key.pem"},
+            {"EVAL_FORGE": "gitlab"},
+        ):
+            with self.subTest(credential=credential):
+                result = run_step(self.lane(**repo), credential=credential)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(value(result, "REPO"), "gke-agentic/kube-agents-evals-21-infra")
 
     def test_a_lane_entry_a_case_already_names_stops_the_lane(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -270,12 +287,12 @@ class InjectLaneTest(unittest.TestCase):
                 f"id: clash\nprompt: hi\nverification_spec:\n  - name: {LANE_ENTRY}\n    role: objective\n    check:\n      type: report_contains\n      required_phrases: [x]\n"
             )
             result = run_step(
-                {"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"},
+                self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"),
                 tasks=[str(task_dir / "task.yaml")],
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("lane safeguard's name", result.stderr)
-        self.assertIn("could not append the inject lane's safeguards", result.stderr)
+        self.assertIn("could not append the lane safeguards", result.stderr)
 
     def test_a_missing_or_malformed_lane_file_stops_the_lane(self):
         with tempfile.TemporaryDirectory() as scratch:
@@ -283,9 +300,21 @@ class InjectLaneTest(unittest.TestCase):
             bad.write_text("safeguards: {}\n")
             for lane_file in (pathlib.Path(scratch) / "missing.yaml", bad):
                 with self.subTest(lane_file=lane_file.name):
-                    result = run_step({"AGENT_TRANSPORT": "inject", "EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}, lane_file=lane_file)
+                    result = run_step(self.lane(EVAL_LEDGER_REPO_FOR_TEST="gke-agentic/kube-agents-evals-21-infra"), lane_file=lane_file)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("could not append the inject lane's safeguards", result.stderr)
+                    self.assertIn("could not append the lane safeguards", result.stderr)
+
+
+class ApiLaneTest(InjectLaneTest):
+    """The api lane (`today`) carries the same safeguards as the inject lane
+    (`next`), so the two modes face the same bar (#2611): every test above,
+    with the transport the api lane exports, and with none at all."""
+
+    TRANSPORT = {"AGENT_TRANSPORT": "api"}
+
+
+class NoTransportTest(InjectLaneTest):
+    TRANSPORT: dict = {}
 
 
 class TwoPhaseFanOutTest(unittest.TestCase):
@@ -311,13 +340,14 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         """
     )
 
-    def run_fanout(self, requesting: str) -> list[str]:
+    def run_fanout(self, requesting: str, stopped: str = "") -> list[str]:
         body = "\n".join(
             [
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
-                lifted_block(r"^# Two phases on the inject lane.*?^fi$"),
+                f'STOPPED_ASK_CASES="{stopped}"',
+                lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
         )
@@ -348,16 +378,28 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertFalse(any("every other unit is done" in line for line in lines))
         self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 8)
 
-    def test_the_settle_equals_the_safeguards_clock_skew_default(self):
+    def test_a_stopped_ask_runs_in_the_second_phase_without_requesting(self):
+        """A failed stop lets its card open a pull request; in the first
+        phase the write safeguard would charge it only if named, and alone in
+        the second, whose window is exclusive, it reds the stopped ask."""
+        lines = self.run_fanout("", stopped="v")
+        self.assertIn("TOTAL=8", lines)
+        v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END v")]
+        self.assertEqual(len(v_starts), 2)
+        self.assertLess(max(others_ended), min(v_starts))
+        self.assertTrue(any("the stopped asks (v)" in line for line in lines))
+
+    def test_the_settle_equals_the_lane_safeguards_clock_skew(self):
         """The settle exists so a write in the last seconds of the unit before
-        is outside the next window, whose lower edge is the check's default
-        skew; the two numbers have to agree."""
+        is outside the next window, whose lower edge is the lane entry's
+        max_clock_skew_sec; the two numbers have to agree, and the entry has
+        to set one rather than fall back to the check's default."""
         script = SCRIPT.read_text(encoding="utf-8")
         settle = re.search(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", script, re.MULTILINE).group(1)
-        verifiers = (REPO_ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text(encoding="utf-8")
-        body = verifiers[verifiers.index("class GitHubWritesVerifier") :]
-        default = re.search(r"max_clock_skew_sec: float = Field\(default=(\d+)\.0", body).group(1)
-        self.assertEqual(settle, default)
+        lane_file = eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8")
+        skews = re.findall(r"^\s+max_clock_skew_sec: (\d+)$", lane_file, re.MULTILINE)
+        self.assertEqual(skews, [settle])
         self.assertIsNotNone(re.search(r"^readonly EVAL_UNIT_LAUNCH_STAGGER_SECONDS=\d+$", script, re.MULTILINE))
 
 
@@ -365,10 +407,49 @@ class WiringTest(unittest.TestCase):
     def test_the_step_sits_after_the_exclusions_and_before_the_task_names(self):
         src = SCRIPT.read_text(encoding="utf-8")
         exclusions = src.index("# ─── The inject lane's exclusions")
-        step = src.index("# ─── The inject lane's safeguards")
+        step = src.index("# ─── The lanes' safeguards")
         names = src.index("TASK_NAMES=()")
         self.assertLess(exclusions, step)
         self.assertLess(step, names)
+
+    def test_the_stopped_asks_are_named_after_the_lane_step_and_before_the_nightly_part(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        step = src.index("# ─── The lanes' safeguards")
+        stopped = src.index('STOPPED_ASK_CASES=""')
+        part = src.index("# ─── The nightly part")
+        self.assertLess(step, stopped)
+        self.assertLess(stopped, part)
+
+
+class StoppedAsksTest(unittest.TestCase):
+    """The second phase's stopped asks are read from each task's prompt by
+    the harness's own grammar, on the inject lane only."""
+
+    STOP_CASE = "./tasks/chat-stop-halts-delegated-remediation/task.yaml"
+    OTHER_CASE = "./tasks/agent-kanban-smoke/task.yaml"
+
+    def run_block(self, transport: str) -> str:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                UV_STUB,
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'EVAL_INJECT_TRANSPORT="inject"',
+                f'AGENT_TRANSPORT="{transport}"',
+                f'TASKS=("{self.STOP_CASE}" "{self.OTHER_CASE}")',
+                lifted_block(r'^STOPPED_ASK_CASES="".*?^fi$'),
+                'echo "STOPPED=${STOPPED_ASK_CASES}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next(line for line in result.stdout.splitlines() if line.startswith("STOPPED="))
+
+    def test_the_inject_lane_names_the_stopped_ask_and_nothing_else(self):
+        self.assertEqual(self.run_block("inject"), "STOPPED=chat-stop-halts-delegated-remediation")
+
+    def test_another_lane_names_none(self):
+        self.assertEqual(self.run_block("api"), "STOPPED=")
 
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")
@@ -380,10 +461,11 @@ class WiringTest(unittest.TestCase):
         # the record's report.
         self.assertIn('finish_case "${task}" "${name}"', unit)
 
-    def test_the_leftovers_report_runs_after_the_fanout_on_the_inject_lane_only(self):
+    def test_the_leftovers_report_runs_after_the_fanout_on_every_lane(self):
         src = SCRIPT.read_text(encoding="utf-8")
         report = re.search(r"^report_github_leftovers\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
-        self.assertIn('[ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ]', report)
+        self.assertNotIn("AGENT_TRANSPORT", report)
+        self.assertIn('[ -z "${BENCH_GITOPS_REPO:-}" ]', report)
         self.assertIn("python -m kube_agents_bench.github_writes", report)
         self.assertIn('--since "${EVAL_RUN_STARTED_AT}"', report)
         self.assertIn('mint_ledger_token "leftovers"', report)
@@ -404,7 +486,7 @@ class WiringTest(unittest.TestCase):
                 'AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"',
                 'BENCH_GITOPS_REPO="acme/infra"',
                 'EVAL_RUN_STARTED_AT="2026-01-01T00:00:00Z"',
-                "unset EVAL_FORGE" if forge is None else f'EVAL_FORGE="{forge}"',
+                "unset EVAL_FORGE EVAL_FORGE_KIND" if forge is None else f'EVAL_FORGE="{forge}"; EVAL_FORGE_KIND="{forge}"',
                 f"mint_ledger_token() {{ return {mint_rc}; }}",
                 f"uv() {{ return {list_rc}; }}",
                 lifted_block(r"^report_github_leftovers\(\) \{.*?^\}$"),

@@ -1,0 +1,1060 @@
+{
+  "name": "first-report-twenty-rows",
+  "source": "agents/chat/scripts/test_inventory_card.py::CasesTest.test_the_shared_cases_are_these_fixtures",
+  "notes": "inventory_card.chat: a first-report limit past the spec's 20 rows. select lists 20, so the shown file, the rows, the queued count and the See-all count agree.",
+  "input": {
+    "first_report": {
+      "items": {
+        "items": [
+          {
+            "id": "f001",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-01",
+            "namespace": "shop",
+            "object": "api-01",
+            "title": "api-01 is in CrashLoopBackOff on cluster-01"
+          },
+          {
+            "id": "f002",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-02",
+            "namespace": "shop",
+            "object": "api-02",
+            "title": "api-02 is in CrashLoopBackOff on cluster-02"
+          },
+          {
+            "id": "f003",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-03",
+            "namespace": "shop",
+            "object": "api-03",
+            "title": "api-03 is in CrashLoopBackOff on cluster-03"
+          },
+          {
+            "id": "f004",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-04",
+            "namespace": "shop",
+            "object": "api-04",
+            "title": "api-04 is in CrashLoopBackOff on cluster-04"
+          },
+          {
+            "id": "f005",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-05",
+            "namespace": "shop",
+            "object": "api-05",
+            "title": "api-05 is in CrashLoopBackOff on cluster-05"
+          },
+          {
+            "id": "f006",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-06",
+            "namespace": "shop",
+            "object": "api-06",
+            "title": "api-06 is in CrashLoopBackOff on cluster-06"
+          },
+          {
+            "id": "f007",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-07",
+            "namespace": "shop",
+            "object": "api-07",
+            "title": "api-07 is in CrashLoopBackOff on cluster-07"
+          },
+          {
+            "id": "f008",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-08",
+            "namespace": "shop",
+            "object": "api-08",
+            "title": "api-08 is in CrashLoopBackOff on cluster-08"
+          },
+          {
+            "id": "f009",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-09",
+            "namespace": "shop",
+            "object": "api-09",
+            "title": "api-09 is in CrashLoopBackOff on cluster-09"
+          },
+          {
+            "id": "f010",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-10",
+            "namespace": "shop",
+            "object": "api-10",
+            "title": "api-10 is in CrashLoopBackOff on cluster-10"
+          },
+          {
+            "id": "f011",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-11",
+            "namespace": "shop",
+            "object": "api-11",
+            "title": "api-11 is in CrashLoopBackOff on cluster-11"
+          },
+          {
+            "id": "f012",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-12",
+            "namespace": "shop",
+            "object": "api-12",
+            "title": "api-12 is in CrashLoopBackOff on cluster-12"
+          },
+          {
+            "id": "f013",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-13",
+            "namespace": "shop",
+            "object": "api-13",
+            "title": "api-13 is in CrashLoopBackOff on cluster-13"
+          },
+          {
+            "id": "f014",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-14",
+            "namespace": "shop",
+            "object": "api-14",
+            "title": "api-14 is in CrashLoopBackOff on cluster-14"
+          },
+          {
+            "id": "f015",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-15",
+            "namespace": "shop",
+            "object": "api-15",
+            "title": "api-15 is in CrashLoopBackOff on cluster-15"
+          },
+          {
+            "id": "f016",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-16",
+            "namespace": "shop",
+            "object": "api-16",
+            "title": "api-16 is in CrashLoopBackOff on cluster-16"
+          },
+          {
+            "id": "f017",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-17",
+            "namespace": "shop",
+            "object": "api-17",
+            "title": "api-17 is in CrashLoopBackOff on cluster-17"
+          },
+          {
+            "id": "f018",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-18",
+            "namespace": "shop",
+            "object": "api-18",
+            "title": "api-18 is in CrashLoopBackOff on cluster-18"
+          },
+          {
+            "id": "f019",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-19",
+            "namespace": "shop",
+            "object": "api-19",
+            "title": "api-19 is in CrashLoopBackOff on cluster-19"
+          },
+          {
+            "id": "f020",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-20",
+            "namespace": "shop",
+            "object": "api-20",
+            "title": "api-20 is in CrashLoopBackOff on cluster-20"
+          },
+          {
+            "id": "f021",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-21",
+            "namespace": "shop",
+            "object": "api-21",
+            "title": "api-21 is in CrashLoopBackOff on cluster-21"
+          },
+          {
+            "id": "f022",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-22",
+            "namespace": "shop",
+            "object": "api-22",
+            "title": "api-22 is in CrashLoopBackOff on cluster-22"
+          },
+          {
+            "id": "f023",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-23",
+            "namespace": "shop",
+            "object": "api-23",
+            "title": "api-23 is in CrashLoopBackOff on cluster-23"
+          },
+          {
+            "id": "f024",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-24",
+            "namespace": "shop",
+            "object": "api-24",
+            "title": "api-24 is in CrashLoopBackOff on cluster-24"
+          },
+          {
+            "id": "f025",
+            "check": "crashloop-backoff",
+            "project": "wide-prod",
+            "cluster": "cluster-25",
+            "namespace": "shop",
+            "object": "api-25",
+            "title": "api-25 is in CrashLoopBackOff on cluster-25"
+          }
+        ]
+      },
+      "scores": {
+        "scores": {
+          "f001": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f002": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f003": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f004": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f005": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f006": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f007": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f008": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f009": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f010": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f011": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f012": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f013": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f014": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f015": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f016": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f017": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f018": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f019": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f020": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f021": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f022": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f023": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f024": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          },
+          "f025": {
+            "rubric": {
+              "B": 8,
+              "L": 10,
+              "detect": 3,
+              "recover": 3,
+              "C": 1.0
+            },
+            "recommendation": {
+              "action": "Fix the crash.",
+              "rationale": "why",
+              "risk": "The service is down."
+            },
+            "remediation": {
+              "kind": "manual",
+              "note": "how"
+            },
+            "verification": {
+              "kind": "manual",
+              "command": "",
+              "still_failing_when": "the object is unchanged"
+            }
+          }
+        },
+        "complete_clusters": [
+          "wide-prod/cluster-01",
+          "wide-prod/cluster-02",
+          "wide-prod/cluster-03",
+          "wide-prod/cluster-04",
+          "wide-prod/cluster-05",
+          "wide-prod/cluster-06",
+          "wide-prod/cluster-07",
+          "wide-prod/cluster-08",
+          "wide-prod/cluster-09",
+          "wide-prod/cluster-10",
+          "wide-prod/cluster-11",
+          "wide-prod/cluster-12",
+          "wide-prod/cluster-13",
+          "wide-prod/cluster-14",
+          "wide-prod/cluster-15",
+          "wide-prod/cluster-16",
+          "wide-prod/cluster-17",
+          "wide-prod/cluster-18",
+          "wide-prod/cluster-19",
+          "wide-prod/cluster-20",
+          "wide-prod/cluster-21",
+          "wide-prod/cluster-22",
+          "wide-prod/cluster-23",
+          "wide-prod/cluster-24",
+          "wide-prod/cluster-25"
+        ]
+      },
+      "limits": {
+        "first_report_criticals": 25
+      },
+      "shown": {
+        "items": [
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-01.shop.api-01"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-02.shop.api-02"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-03.shop.api-03"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-04.shop.api-04"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-05.shop.api-05"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-06.shop.api-06"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-07.shop.api-07"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-08.shop.api-08"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-09.shop.api-09"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-10.shop.api-10"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-11.shop.api-11"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-12.shop.api-12"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-13.shop.api-13"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-14.shop.api-14"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-15.shop.api-15"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-16.shop.api-16"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-17.shop.api-17"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-18.shop.api-18"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-19.shop.api-19"]
+          },
+          {
+            "class": "critical",
+            "ids": ["crashloop-backoff.wide-prod.cluster-20.shop.api-20"]
+          }
+        ]
+      }
+    }
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "First look at your fleet: 20 things to fix first",
+        "detail": "25 clusters scanned in full \u00b7 9 configuration checks",
+        "rows": [
+          {
+            "text": "api-01 is in CrashLoopBackOff on cluster-01",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-02 is in CrashLoopBackOff on cluster-02",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-03 is in CrashLoopBackOff on cluster-03",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-04 is in CrashLoopBackOff on cluster-04",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-05 is in CrashLoopBackOff on cluster-05",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-06 is in CrashLoopBackOff on cluster-06",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-07 is in CrashLoopBackOff on cluster-07",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-08 is in CrashLoopBackOff on cluster-08",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-09 is in CrashLoopBackOff on cluster-09",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-10 is in CrashLoopBackOff on cluster-10",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-11 is in CrashLoopBackOff on cluster-11",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-12 is in CrashLoopBackOff on cluster-12",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-13 is in CrashLoopBackOff on cluster-13",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-14 is in CrashLoopBackOff on cluster-14",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-15 is in CrashLoopBackOff on cluster-15",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-16 is in CrashLoopBackOff on cluster-16",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-17 is in CrashLoopBackOff on cluster-17",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-18 is in CrashLoopBackOff on cluster-18",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-19 is in CrashLoopBackOff on cluster-19",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          },
+          {
+            "text": "api-20 is in CrashLoopBackOff on cluster-20",
+            "severity": "critical",
+            "detail": "The service is down. Fix the crash."
+          }
+        ],
+        "after": [
+          "5 more items are queued, 5 of them critical. I'll bring up to 2 critical a day."
+        ],
+        "fold": {
+          "title": "What the scan checked",
+          "text": "startup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities"
+        },
+        "choices": [
+          {
+            "text": "Fix the first one",
+            "reply": "Fix the first one: api-01 is in CrashLoopBackOff on cluster-01",
+            "primary": true
+          },
+          {
+            "text": "See all 25 items"
+          }
+        ]
+      }
+    }
+  ]
+}

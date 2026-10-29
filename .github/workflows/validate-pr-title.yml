@@ -18,7 +18,7 @@ on:
 # context is a required check that GitHub records per commit: a new head with
 # no run of its own could never merge. A cancelled run on the same head (two
 # edits seconds apart) is superseded by the newer check run under the same
-# name, which is what branch protection and Tide both read.
+# name, which is what GitHub's required-check rule reads.
 #
 # The head SHA is in the key, not just the number, the way `risk_classify.yml`
 # keys its group, and for the same reason (#1364): `edited` does not advance

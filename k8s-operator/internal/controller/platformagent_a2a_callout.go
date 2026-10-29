@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -102,7 +103,8 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	1 -> serviceAccount, user, account, grants
 //	2 -> adds narrowing
 //	3 -> adds profile and topics (the AgentProfile entry)
-const a2aIdentityMapSchema = "3"
+//	4 -> adds tier (one AgentProfile entry per tier, #3655)
+const a2aIdentityMapSchema = "4"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -119,6 +121,12 @@ const (
 	// addressee names (renderA2AReservedAddressees). The callout refuses to
 	// start without it, so it and the image that reads it ship together.
 	a2aCalloutReservedAddresseesEnvVar = "A2A_RESERVED_ADDRESSEES"
+
+	// a2aCalloutTaskSigningKeysEnvVar names the callout's list of
+	// task-signing public keys (#3889), comma separated. Optional to the
+	// callout, which honours no task connection without it, and refused
+	// there if malformed (authcallout.ParseTaskSigningKeys).
+	a2aCalloutTaskSigningKeysEnvVar = "A2A_TASK_SIGNING_PUBLIC_KEYS"
 
 	// a2aReservedAddresseesSeparator joins the list. The callout's
 	// authcallout.ParseReservedAddressees splits on a bare comma.
@@ -408,6 +416,15 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 // and so whoever writes the sidecar can already name any scope they like. The
 // override bought nothing and cost a silent clobber. The bridge sets neither
 // name, so it still takes the downward API and still gets the ENOENT repair.
+//
+// NATS_CA_FILE and the bus CA mount go on with the switch, as overrides. The
+// bus requires TLS, and a bridge the CR declares carries its own NATS_URL and
+// credentials (a2a/docs/hermes-bridge.md) but nothing that trusts the
+// operator's CA, so without these it fails verification and crash-loops the
+// agent pod. The name is ours, and a CR value pointing at another file would
+// choose which server the sidecar accepts as the bus. The mount is skipped
+// where the container already has one by that volume name or at that path, as
+// the rendered bridge does by inheritance.
 func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 	if len(containers) == 0 {
 		return containers
@@ -425,11 +442,18 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 		}
 		switchOverride := []corev1.EnvVar{
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+			a2aNATSCAFileEnvVar(),
 		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.
 		c.Env = mergeEnvVars(mergeEnvVars(namespaceDefault, c.Env), switchOverride)
+		mount := a2aNATSCABundleMount()
+		if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			return m.Name == mount.Name || m.MountPath == mount.MountPath
+		}) {
+			c.VolumeMounts = append(slices.Clone(c.VolumeMounts), mount)
+		}
 		out = append(out, c)
 	}
 	return out
@@ -518,8 +542,8 @@ const a2aAuthDelegatorRole = "system:auth-delegator"
 // Each would rewrite the other's Subjects on every reconcile, so one namespace's
 // callout silently loses TokenReview and refuses every connection with an error
 // indistinguishable from a bad token; and teardown then fails the ownership
-// check and returns "refusing to delete unowned" forever. The controller
-// already spells cluster-scoped names this way elsewhere.
+// check and leaves the binding to the other agent. The controller already
+// spells cluster-scoped names this way elsewhere.
 func a2aCalloutClusterRoleBindingName(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("kubeagents:a2a-callout-tokenreview:%s:%s", agent.Namespace, agent.Name)
 }
@@ -615,8 +639,11 @@ func a2aCalloutPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string
 	return map[string]string{"app": a2aCalloutName(agent)}
 }
 
-// buildA2ACalloutDeployment renders the service.
-func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
+// buildA2ACalloutDeployment renders the service. taskSigningPublic is the
+// task-signing public key (ensureA2ATaskSigningKeySecret), rendered as a value:
+// the callout gets the public half and never a reference to the Secret holding
+// the seed.
+func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPublic string) *appsv1.Deployment {
 	name := a2aCalloutName(agent)
 	labels := a2aLabels(agent, "callout")
 	selector := a2aCalloutPodSelector(agent)
@@ -700,6 +727,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+							a2aNATSCAFileEnvVar(),
 							{Name: "NATS_USER", Value: a2aCalloutConfUser},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -719,6 +747,12 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							// on a fixed name: a narrowed pod named after
 							// one would be handed them. Plain names.
 							{Name: a2aCalloutReservedAddresseesEnvVar, Value: renderA2AReservedAddressees()},
+							// The task-signing public key, whose
+							// credentials narrow a worker's task
+							// connection to one task. Public, so a plain
+							// value: a reference to its Secret would be a
+							// reference to the dispatcher's seed.
+							{Name: a2aCalloutTaskSigningKeysEnvVar, Value: taskSigningPublic},
 							// The seeds. This Deployment is the only
 							// thing that reads them, and the issuer is the
 							// key that decides what every connection on
@@ -742,7 +776,8 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								Key:                  a2aCalloutXKeySeedKey,
 							}}},
 						},
-						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
+						VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
+						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aCalloutStatusPort),
@@ -779,6 +814,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
+					Volumes: []corev1.Volume{a2aNATSCABundleVolume(agent)},
 				},
 			},
 		},
@@ -863,8 +899,8 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 // informer later in the same pass, and the apply's response is the one
 // number that says whether the copy it gets is the object this pass wrote
 // or the one before it (a2aGatewayWaitsForCallout).
-func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (int64, error) {
-	callout := buildA2ACalloutDeployment(agent)
+func (r *PlatformAgentReconciler) reconcileA2ACallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, taskSigningPublic string) (int64, error) {
+	callout := buildA2ACalloutDeployment(agent, taskSigningPublic)
 	// Namespaced objects get an owner reference so they are reclaimed with
 	// the CR. The one cluster-scoped object cannot: a cluster-scoped object
 	// owned by a namespaced one is treated as an orphan by the garbage

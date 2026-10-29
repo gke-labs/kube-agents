@@ -840,7 +840,7 @@ func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.T
 			rec.Tasks[i].ChainEnd = &end
 		}
 	}
-	g.observeTaskTerminal(rec.Key, child.rootID(), end.State, end.Source, end.Reason)
+	g.observeTaskTerminal(rec, child.rootID(), end.State, end.Source, end.Reason)
 	// The chain ends at the child, so its mark settles here, as the chain's
 	// end the observers were just told (terminalMark leaves a child's
 	// terminal to this or to the wake).

@@ -160,3 +160,22 @@ func TestFeedbackLinksAreTheOnesThePersonasHandOut(t *testing.T) {
 		t.Errorf("form short link = %q", FeedbackFormURL)
 	}
 }
+
+func TestIsFeedbackSummaryCommand(t *testing.T) {
+	for _, in := range []string{"/feedback summary", "  /FEEDBACK  Summary ", "/feedback\tsummary"} {
+		if !IsFeedbackSummaryCommand(in) {
+			t.Errorf("IsFeedbackSummaryCommand(%q) = false, want true", in)
+		}
+		if !IsCommand(in) {
+			t.Errorf("IsCommand(%q) = false: the gateway answers the summary form in place, so a button must not carry it", in)
+		}
+	}
+	for _, in := range []string{"/feedback", "/feedback summary please", "/feedback summarize", "summary", "/session summary", "/feedback the summary posted twice"} {
+		if IsFeedbackSummaryCommand(in) {
+			t.Errorf("IsFeedbackSummaryCommand(%q) = true, want false", in)
+		}
+	}
+	if IsCommand("/feedback summary please") {
+		t.Error("IsCommand(\"/feedback summary please\") = true; with more text it is the agent's turn")
+	}
+}

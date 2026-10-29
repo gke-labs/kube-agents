@@ -13,8 +13,8 @@ result.
 What the pages *show* from brief.json is `test_eval_dashboard_pages.py`'s
 job, in headless Chrome; this file pins what render.py *computes*.
 
-The publish tests never touch a bucket. The gsutil argv is asserted as a
-value (``gsutil_command``), and ``publish`` is only ever *executed* against a
+The publish tests never touch a bucket. The ``gcloud storage cp`` argv is asserted
+as a value (``gcloud_storage_command``), and ``publish`` is only ever *executed* against a
 local directory -- a gs:// target in these tests gets a recording fake for a
 runner, and the local-path test uses a runner that fails the test if called.
 """
@@ -432,9 +432,10 @@ class RosterPageTest(unittest.TestCase):
         dates = render.demotion_dates(REPO_ROSTER_DOC)
         self.assertEqual(dates.get("compliance-rbac-overgrant"), "2026-09-02")
         self.assertEqual(dates.get("rca-remediation-pr"), "2026-09-02")
-        # The hold-out bullet's date, not overridden by its later "Admitted
-        # on the record since the split" bullet (#3120).
-        self.assertEqual(dates.get("pdb-remediation-pr"), "2026-10-17")
+        # Its hold-out bullet (demoted 10-17, #3120) left the page with its
+        # return to the roster on 2026-10-26, and its "Admitted on the record
+        # since the split" bullets carry no "demoted <date>" phrase.
+        self.assertIsNone(dates.get("pdb-remediation-pr"))
         self.assertEqual(dates.get("consistency-authorized-networks-probe"), "2026-10-21")  # #3598
 
     def test_case_status_rules(self):
@@ -693,15 +694,15 @@ class PublishTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         return out_dir
 
-    def test_gsutil_command_construction(self):
+    def test_gcloud_storage_command_construction(self):
         files = [pathlib.Path("/o/data.json"), pathlib.Path("/o/index.html")]
         self.assertEqual(
-            publish.gsutil_command(files, "gs://bucket/dash"),
-            ["gsutil", "-h", "Cache-Control: no-cache", "cp",
+            publish.gcloud_storage_command(files, "gs://bucket/dash"),
+            ["gcloud", "storage", "cp", "--cache-control=no-cache",
              "/o/data.json", "/o/index.html", "gs://bucket/dash/"],
         )
 
-    def test_gs_target_would_run_gsutil_but_is_never_executed_here(self):
+    def test_gs_target_would_run_gcloud_storage_but_is_never_executed_here(self):
         out_dir = self._rendered_out_dir()
         calls = []
 
@@ -711,7 +712,7 @@ class PublishTest(unittest.TestCase):
         publish.publish(str(out_dir), "gs://bucket/dash", runner=recording_runner)
         (argv, check), = calls
         self.assertTrue(check)
-        self.assertEqual(argv[:4], ["gsutil", "-h", "Cache-Control: no-cache", "cp"])
+        self.assertEqual(argv[:4], ["gcloud", "storage", "cp", "--cache-control=no-cache"])
         self.assertEqual(argv[-1], "gs://bucket/dash/")
         for name in ("index.html", "grid.html", "cases.html", "nightly.html", "run.html", "brief.json", "data.json"):
             self.assertIn(str(out_dir / name), argv)

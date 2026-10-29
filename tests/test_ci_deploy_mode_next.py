@@ -11,7 +11,7 @@ the flag set names the six next-stack images and fills the operator.extraEnv
 values the release expands (the five image overrides, the inject door's flag,
 and two settings of the bridge the operator renders: its image and its
 concurrency; its executor is left to the bridge's default, api, which the
-start-line wait requires), the Cloud Build's `a2a` and `a2a-bridge`
+start-line wait requires; and the card stop), the Cloud Build's `a2a` and `a2a-bridge`
 steps run with `docker` stubbed build and push those six in order with the
 bridge FROM this build's platform image, the two guards (Prow run with no
 pull request that is not a job on the allow-list, the concurrency's grammar)
@@ -96,19 +96,21 @@ _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a Tide batch), the today lane's
-# periodic and the next-mode nightlies; the today nightly and a made-up job
-# stand for every other Prow run.
+# periodic, the main nightly's three parts and the GitLab next nightly; the
+# today-mode GitLab nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-today",
-    "ci-kube-agents-eval-nightly-next-claude",
+    "ci-kube-agents-eval-nightly",
+    "ci-kube-agents-eval-nightly-main-b",
+    "ci-kube-agents-eval-nightly-writers",
     "ci-kube-agents-eval-nightly-gitlab-next",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
-_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
+_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly-gitlab"
 _OTHER_JOB_NAME = "ci-x"
 
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
@@ -400,6 +402,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}",
         ]
+        # The card stop, armed on the lane so chat-stop-halts-delegated-remediation
+        # grades it, under the name the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[8].name={go_constant(_A2A_MANIFESTS, 'a2aCardStopEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[8].value=true",
+        ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -534,7 +544,7 @@ class FlagSetIsNextTest(unittest.TestCase):
     def test_the_release_candidate_path_names_the_candidates_published_images(self) -> None:
         """The release-candidate eval grades next (#2007): section 4 under the
         flag with RC_COMMIT_SHA set submits no build and hands the operator the
-        same eight values, with the five A2A references and the bridge's under
+        same nine values, with the five A2A references and the bridge's under
         the published registry at the candidate's commit, the image names
         REQUIRED_RELEASE_IMAGES publishes."""
         result = run_build_section(
@@ -551,6 +561,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[5], "operator.extraEnv[5].value=true")
         self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
         self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
+        self.assertEqual(values[8], "operator.extraEnv[8].value=true")
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -596,9 +607,9 @@ class FlagSetIsNextTest(unittest.TestCase):
                 if refused:
                     self.assertIn(f"no PULL_NUMBER (JOB_NAME={job})", result.stderr)
                     # The consequence the error names is the one the tree has:
-                    # a flagged run records nothing, so the refused job would
-                    # go missing from main's record, not move it.
-                    self.assertIn("record nothing to main's", result.stderr)
+                    # a flagged run records under next's key, so the refused
+                    # job's today-mode dashboard record would go missing.
+                    self.assertIn("leaving\n       its today-mode dashboard record silently missing", result.stderr)
                     self.assertNotIn("would record next-mode samples", result.stderr)
                     self.assertEqual(result.stdout, "")
                 elif flag == "1" and prow == "true" and not pull:
@@ -852,11 +863,12 @@ class TasksBudgetSizingTest(unittest.TestCase):
         lane's release is unchanged; the operator forwards the name to the shell
         sandbox and audit_report.py reads it (pinned across the three files)."""
         script = _CI_DEPLOY.read_text()
-        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.S)
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
         self.assertIsNotNone(block, "MODE_NEXT_ENV_ARGS is not filled under EVAL_MODE_NEXT=1")
         assert block is not None
-        self.assertIn('--set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
-        self.assertIn('--set-string "platformAgent.deployment.env[2].value=false"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[3].value=false"', block.group(1))
+        self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
@@ -1161,7 +1173,9 @@ class ProvisionRerunGateTest(unittest.TestCase):
     def test_the_status_words_are_the_operators(self) -> None:
         consts = constants()
         controller = text(_CONTROLLER / "platformagent_controller.go")
-        self.assertIn(f'agent.Status.Phase = "{consts["CR_PHASE_DEGRADED"]}"', controller)
+        # The phase is a constant the usage gauges' vocabulary shares (usage_gauges.go).
+        self.assertIn("agent.Status.Phase = degradedPhase", controller)
+        self.assertRegex(controller, rf'degradedPhase\s+= "{consts["CR_PHASE_DEGRADED"]}"')
         self.assertIn(f'r.updateStatusDegraded(ctx, instance, "{consts["CR_READY_REASON_PROVISION_FAILED"]}", a2aState.message', controller)
         self.assertRegex(controller, r'Type:\s*"Ready",\s*Status:\s*metav1\.ConditionFalse,\s*Reason:\s*reason,')
         self.assertIn('ObservedGeneration int64 `json:"observedGeneration,omitempty"`', text(_API_TYPES))

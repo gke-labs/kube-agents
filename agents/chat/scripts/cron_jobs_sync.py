@@ -108,20 +108,16 @@ above are the residual.
 """
 
 import argparse
-import contextlib
 import json
 import os
 import re
 import socket
 import sys
-import threading
-import time
 from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
+# Beside this script in /opt/defaults/scripts (deploy/docker/Dockerfile copies
+# both directories there); the lock and its timeout have one owner.
+from profile_scaffold import cron_jobs_lock
 
 # The one key the image ships whose value the *deployment* nevertheless owns.
 #
@@ -146,83 +142,6 @@ ORIGIN_KEY = "origin"
 
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
 DEFAULT_LEGACY_CRON_RISK = "low"
-DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS: float = 15.0
-
-_jobs_lock_state = threading.local()
-
-
-@contextlib.contextmanager
-def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
-    """Serialize reads and writes to jobs.json against Hermes' own cron calls.
-
-    Hermes (cron/jobs.py) protects load_jobs -> modify -> save_jobs with a
-    cross-process advisory lock on <cron_dir>/.jobs.lock. Taking the same
-    flock around the startup sync prevents racing with an in-pod `hermes cron`
-    command (such as `hermes cron pause` on restart).
-    """
-    if timeout is None:
-        timeout = DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS
-    held = getattr(_jobs_lock_state, "held", None)
-    if held is None:
-        held = {}
-        _jobs_lock_state.held = held
-
-    lock_dir = cron_dir.resolve()
-    if lock_dir in held:
-        held[lock_dir] += 1
-        try:
-            yield
-        finally:
-            held[lock_dir] -= 1
-            if held[lock_dir] == 0:
-                del held[lock_dir]
-        return
-
-    cron_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = cron_dir / ".jobs.lock"
-    try:
-        lock_fd = open(lock_path, "a+", encoding="utf-8-sig")
-    except OSError as exc:
-        log(f"WARN: could not open cron jobs lock {lock_path} ({exc}); proceeding without lock")
-        yield
-        return
-
-    acquired = False
-    try:
-        if fcntl is not None:
-            deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= deadline:
-                        log(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
-                        break
-                    time.sleep(0.05)
-                except OSError as exc:
-                    log(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
-                    break
-        else:
-            acquired = True
-
-        held[lock_dir] = 1
-        try:
-            yield
-        finally:
-            del held[lock_dir]
-    finally:
-        if acquired and fcntl is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except (OSError, IOError):
-                pass
-        try:
-            lock_fd.close()
-        except (OSError, IOError):
-            pass
-
 
 def log(msg: str) -> None:
     print(f"[CRON-JOBS-SYNC] {msg}", file=sys.stderr)
@@ -447,7 +366,7 @@ def sync(
         log(f"no runtime job file at {runtime_path}; leaving it to the defaults copy")
         return 0
 
-    with cron_jobs_lock(runtime_path.parent):
+    with cron_jobs_lock(runtime_path.parent, warn=log):
         try:
             _, image_jobs = load_jobs(image_path)
         except (OSError, ValueError) as e:

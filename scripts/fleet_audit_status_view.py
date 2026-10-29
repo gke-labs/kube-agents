@@ -154,11 +154,14 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 #: one a reader should look at, and green would hide it. HELD is a clean run
 #: the ledger stayed open over, which is a reason to look, not a success, and
 #: NO_FORGE a run with nowhere to publish, whose findings only the store holds.
+#: STORE_LEDGER published like OPENED and UPDATED: its ledger is in the store
+#: because the forge has no issue tracker, and its fixes opened on the forge.
 STATUS_STYLE = {
     "CLEAN": "green",
     "HELD": "yellow",
     "NO_FORGE": "yellow",
     "OPENED": "cyan",
+    "STORE_LEDGER": "cyan",
     "UPDATED": "cyan",
     "never ran": "dim",
 }

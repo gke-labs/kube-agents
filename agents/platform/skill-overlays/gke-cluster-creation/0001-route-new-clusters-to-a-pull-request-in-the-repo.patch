@@ -29,7 +29,7 @@ diff --git a/SKILL.md b/SKILL.md
  > `list_operations`, `get_operation`
  
  ## Workflow
-@@ -34,10 +35,17 @@ for all new clusters.
+@@ -34,10 +35,18 @@ for all new clusters.
      vs. Availability, Autopilot vs. Standard node management).
  4.  **Configure networking**: auto-create subnet (default) or bring-your-own.
  5.  **Review golden path settings**: present the default configuration block
@@ -41,17 +41,18 @@ diff --git a/SKILL.md b/SKILL.md
 +    carry.
 +6.  **Propose**: Write the configuration as a pull request in the format the
 +    GitOps repository's `provisioning/` path already holds: Config Connector
-+    YAML through the `gcp-config-connector` skill. A Terraform repository, an
-+    empty `provisioning/` path, or no usable repository is a stated stop
-+    (`SOUL.md` §3, items 6 and 7). Never create the cluster directly: the
-+    `gke` MCP server offers no create tool, and the broker refuses
++    YAML through the `gcp-config-connector` skill, Terraform HCL through the
++    `gcp-terraform` skill. An empty `provisioning/` path or no usable
++    repository is a stated stop (`SOUL.md` §3, items 6 and 7). Never
++    create the cluster directly: the `gke` MCP server offers no create
++    tool, and the broker refuses
 +    `gcloud container clusters create`.
 +7.  **Track**: Once the pull request merges and the reconciler starts the
 +    create, use `get_operation` to monitor its progress.
  8.  **Verify**: Use `get_cluster` with `readMask="*"` to confirm golden path
      settings applied.
  
-@@ -107,24 +115,7 @@ practices:
+@@ -107,24 +116,7 @@ practices:
  This is the default. All settings match
  `../gke-golden-path/assets/golden-path-autopilot.yaml`.
  
@@ -77,7 +78,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -154,17 +145,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+@@ -154,17 +146,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
  Relaxes some golden path defaults for cost savings and easier access in
  non-production.
  
@@ -96,7 +97,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -185,27 +166,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
+@@ -185,27 +167,7 @@ gcloud container clusters create-auto <CLUSTER_NAME> \
  Best when Autopilot cannot be used (e.g., custom kernel tuning, specific node OS
  requirements). Creates 3 nodes across zones by default.
  
@@ -125,7 +126,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -241,26 +202,19 @@ Best for: AI/ML Inference, small model serving. Can be provisioned via
+@@ -241,26 +203,19 @@ Best for: AI/ML Inference, small model serving. Can be provisioned via
  Autopilot + ComputeClass or via Standard node pool with `g2-standard-4`
  (`nvidia-l4`). *Note: Requires `g2-standard-4` quota.*
  
@@ -156,7 +157,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -289,23 +243,7 @@ Best for: Large-scale LLM / AI model training and hypercompute inference. *Note:
+@@ -289,23 +244,7 @@ Best for: Large-scale LLM / AI model training and hypercompute inference. *Note:
  High hourly cost and strict quota requirements (`a3-highgpu-8g` /
  `nvidia-h100-80gb-hbm3`).*
  
@@ -181,7 +182,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ```json
  {
-@@ -342,15 +280,13 @@ gcloud container clusters create <CLUSTER_NAME> \
+@@ -342,15 +281,13 @@ gcloud container clusters create <CLUSTER_NAME> \
  -   **EXPLAIN TRADE-OFFS** when presenting templates or mode choices to the user
      if they haven't specified one (e.g., Autopilot vs Standard, Cost vs
      Availability).

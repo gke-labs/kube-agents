@@ -1,0 +1,107 @@
+# Domain: incident triage (AutoOps). Journey: a crash loop lasts long enough
+# to be forwarded, the pod then recovers, and once it has emitted nothing for
+# WATCHER_QUIET_AFTER (15m) the watcher sends a k8s-event-followup on the
+# alert's session; the Session KV server posts "Quiet since HH:MM UTC" into
+# the alert's thread and leaves the same line as a comment on the triage card
+# (issue #612: a thread that falls silent is indistinguishable from a dropped
+# investigation). The card's comment is what this case reads, since the
+# harness grades the agent's reply and not a chat thread.
+#
+# The stack is bench/tf/prebuilt/autoops-incident in its transient shape with
+# crash_seconds = 240: the container keeps crashing for four minutes, which
+# outlasts the 2m settle period, so a card is filed; it then runs, its last
+# BackOff ages, and the apply returns once the watcher has logged the
+# follow-up, about 15 minutes after that last event. The card's own triage
+# runs meanwhile and may itself report the pod recovered; neither reading of
+# the state is graded here, only that the follow-up reached the card.
+#
+# Isolation class: namespace-scoped. Eligible tier: nightly (tofu; the plant
+# waits out the quiet period).
+---
+id: autoops-quiet-followup
+name: AutoOps follows up on an alert whose object went quiet
+
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/autoops-incident"
+  teardown: true
+  variables:
+    incident_namespace: "eval-autoops-quiet"
+    workload_name: "eval-quiet-workload"
+    crash_seconds: 240
+    wait_for: "followup"
+
+validated: false
+
+domain: incident-triage
+owner: lapis2002
+
+prompt: |
+  An automated incident was raised about twenty minutes ago against a workload
+  in the 'eval-autoops-quiet' namespace of GKE cluster '{{CLUSTER_NAME}}', and a
+  triage task for it is on the kanban board.
+
+  Report what the board holds for it. Do not diagnose anything yourself: do not
+  inspect the namespace, the workload, or its events.
+
+  1. Find the card. Call kanban_list separately for status 'running', 'done',
+     'blocked' and 'archived'. Do not call kanban_list without a status filter
+     -- it returns the oldest tasks first and stops at a page. The card you want
+     is the most recent one concerning that namespace.
+  2. Call kanban_show on its id. If its status is still 'running', keep
+     re-checking until it is 'done', 'blocked' or 'archived'.
+  3. Reproduce in your reply, verbatim and in order: the card's result, and
+     then every comment on the card, each as its own paragraph under a line
+     reading "Comments:". Do not summarise or shorten them.
+
+  Make no changes to the cluster.
+expected_output: |
+  critical requirements:
+  - The reply reproduces the triage card's result and then its comments.
+  - Among the comments is the watcher's quiet follow-up, a line beginning
+    "Quiet since HH:MM UTC" saying the workload has emitted no new events and
+    that this is silence rather than a confirmed recovery.
+  - The agent reads the board and does not investigate the namespace itself.
+  - Nothing is changed in the cluster.
+
+verification_spec:
+  - name: board-was-read
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_list"]
+      require_success: true
+
+  - name: card-names-the-workload
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["eval-quiet-workload"]
+
+  - name: the-quiet-followup-reached-the-card
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # session_kv_server._followup_message's opening words. Red on a server
+      # that does not handle k8s-event-followup, and on a watcher that never
+      # sends one: the plant waits out its bound and returns either way, so
+      # the agent reads a card with no follow-up on it and the check reds.
+      required_patterns: ['(?i)quiet since \d{2}:\d{2} UTC']
+
+  - name: nothing-scaled-the-workload-away
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: eval-quiet-workload
+      namespace: eval-autoops-quiet
+      path: "spec.replicas"
+      op: eq
+      value: 1

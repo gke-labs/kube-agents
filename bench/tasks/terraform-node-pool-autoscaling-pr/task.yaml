@@ -37,11 +37,10 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
-# Red until #3565: the branch's one run opened the right pull request but never
-# loaded gcp-terraform, because submit-suggestion does not hand a .tf edit to
-# it, so tofu fmt did not run (run_20261020_171548_104044). The red on main
-# fails the same check. Flip this when #3565 lands.
-expected_fail: true
+# Was expected_fail until #3565 (#3828): submit-suggestion did not hand a .tf
+# edit to gcp-terraform, so tofu fmt never ran. With the hand-off it went 3/3
+# on the GitOps lane (2026-10-23; runs run_20261023_014820_505331,
+# run_20261023_015247_509583, run_20261023_015639_279569).
 
 # Slug per docs/designs/domains.yaml.
 domain: remediation

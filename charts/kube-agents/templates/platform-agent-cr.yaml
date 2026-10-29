@@ -188,11 +188,12 @@ spec:
       {{- $stallWatchFields | nindent 6 }}
     {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
-    {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
+    {{- $stockout := (.Values.plugins | default dict).stockoutInvestigator | default dict }}
+    {{- if and $stockout.enabled (ne $stockout.applyTuning false) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
@@ -210,6 +211,10 @@ spec:
       {{- end }}
       {{- with $tuning.cluster }}
       cluster:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tuning.profiles }}
+      profiles:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
@@ -772,6 +777,9 @@ spec:
   {{- if and (has "gitlab" (splitList "," $providers)) (not (has "gitlab" $enum)) }}
   {{- fail "platformAgent.integration.forges declares a gitlab forge, but the installed PlatformAgent CRD does not accept provider gitlab, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- if and (has "gitea" (splitList "," $providers)) (not (has "gitea" $enum)) }}
+  {{- fail "platformAgent.integration.forges declares a gitea forge, but the installed PlatformAgent CRD does not accept provider gitea, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- /* The same for caBundleRef: a CRD that prunes it leaves the forge's certificate untrusted, with nothing to say why. */}}
   {{- $caBundled := false }}
   {{- range $forges }}
@@ -815,6 +823,12 @@ spec:
         provider: {{ .provider | default "github" | quote }}
         {{- with .host }}
         host: {{ . | quote }}
+        {{- end }}
+        {{- with .scheme }}
+        scheme: {{ . | quote }}
+        {{- end }}
+        {{- with .port }}
+        port: {{ . | int }}
         {{- end }}
         {{- with .namespace }}
         namespace: {{ . | quote }}
@@ -876,13 +890,13 @@ spec:
     slack:
       enabled: true
       # The CRD requires both token refs when Slack is enabled; they point
-      # into the credentials Secret by convention.
+      # into the credentials Secret by default unless custom refs are provided.
       botTokenSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: SLACK_BOT_TOKEN
+        name: {{ (dig "botTokenSecretRef" "name" "" $integ.slack) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "botTokenSecretRef" "key" "" $integ.slack) | default "SLACK_BOT_TOKEN" | quote }}
       appTokenSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: SLACK_APP_TOKEN
+        name: {{ (dig "appTokenSecretRef" "name" "" $integ.slack) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appTokenSecretRef" "key" "" $integ.slack) | default "SLACK_APP_TOKEN" | quote }}
       {{- with $integ.slack.allowedUsers }}
       allowedUsers:
         {{- toYaml . | nindent 8 }}
@@ -893,16 +907,34 @@ spec:
       {{- with $integ.slack.homeChannelName }}
       homeChannelName: {{ . | quote }}
       {{- end }}
+      {{- if eq (toString $integ.slack.answerFeedback) "false" }}
+      answerFeedback: false
+      {{- end }}
+      {{- with $integ.slack.homeChannelPolicy }}
+      {{- $policyCRD := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $policyCRD }}
+      {{- $slackProps := dict }}
+      {{- range $policyCRD.spec.versions }}
+      {{- if eq .name "v1alpha1" }}
+      {{- $slackProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "integration" "properties" "slack" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $slackProps "homeChannelPolicy") }}
+      {{- fail "platformAgent.integration.slack.homeChannelPolicy needs a PlatformAgent CRD that has spec.integration.slack.homeChannelPolicy, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      homeChannelPolicy: {{ . | quote }}
+      {{- end }}
     {{- end }}
     {{- if $integ.teams.enabled }}
     teams:
       enabled: true
       appIdSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: TEAMS_APP_ID
+        name: {{ (dig "appIdSecretRef" "name" "" $integ.teams) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appIdSecretRef" "key" "" $integ.teams) | default "TEAMS_APP_ID" | quote }}
       appPasswordSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: TEAMS_APP_PASSWORD
+        name: {{ (dig "appPasswordSecretRef" "name" "" $integ.teams) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appPasswordSecretRef" "key" "" $integ.teams) | default "TEAMS_APP_PASSWORD" | quote }}
       {{- with $integ.teams.tenantId }}
       tenantId: {{ . | quote }}
       {{- end }}

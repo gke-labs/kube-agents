@@ -17,12 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/nats-io/nkeys"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func calloutKeysSecret(data map[string][]byte) *corev1.Secret {
@@ -130,6 +133,108 @@ func TestKeysOfTheWrongTypeAreRefused(t *testing.T) {
 			data[tc.key] = tc.val
 			if _, ok := readA2ACalloutKeys(calloutKeysSecret(data)); ok {
 				t.Error("accepted; the Secret is regenerated as a set rather than served like this")
+			}
+		})
+	}
+}
+
+// Only a Secret this PlatformAgent controls is read or repaired, as for the
+// door's token. One at the keys' name that something else created is refused,
+// whether its seeds are valid or not, and left as it was; an owned Secret that
+// is incomplete is still repaired as a set.
+func TestTheCalloutKeysSecretIsOnlyReadWhenOwned(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	// A real UID, so the other-UID case compares two non-empty UIDs.
+	agent.UID = "platform-agent-uid"
+	_, valid, err := generateA2ACalloutKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	notController := false
+	for name, tc := range map[string]struct {
+		data   map[string][]byte
+		owners []metav1.OwnerReference
+	}{
+		"no owner, valid seeds":   {data: valid},
+		"no owner, corrupt seeds": {data: map[string][]byte{"issuer-seed": []byte("not a seed")}},
+		// An owner reference that isn't the controller, and a controller
+		// reference to a PlatformAgent of the same name but another UID (one
+		// deleted and recreated), are not this PlatformAgent's either.
+		"a non-controller owner reference": {data: valid, owners: []metav1.OwnerReference{{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: agent.UID, Controller: &notController}}},
+		"a controller reference with another UID": {data: valid, owners: []metav1.OwnerReference{{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: "another-uid", Controller: func() *bool { b := true; return &b }()}}},
+	} {
+		data := tc.data
+		t.Run("a Secret with "+name+" is refused", func(t *testing.T) {
+			planted := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace, OwnerReferences: tc.owners}, Data: data}
+			r, cl := mcpTestReconciler(t, planted)
+			keys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
+			if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned Secret") {
+				t.Fatalf("an unowned callout keys Secret was taken (keys %v, err %v)", keys != nil, err)
+			}
+			after := &corev1.Secret{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: planted.Name, Namespace: planted.Namespace}, after); err != nil {
+				t.Fatal(err)
+			}
+			if len(after.Data) != len(data) || metav1.IsControlledBy(after, agent) {
+				t.Error("the unowned Secret was changed")
+			}
+		})
+	}
+
+	t.Run("an owned, incomplete Secret is repaired", func(t *testing.T) {
+		owned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace},
+			Data: map[string][]byte{"issuer-seed": []byte("not a seed")}}
+		if err := ctrl.SetControllerReference(agent, owned, setupScheme()); err != nil {
+			t.Fatal(err)
+		}
+		r, cl := mcpTestReconciler(t, owned)
+		keys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
+		if err != nil || keys == nil {
+			t.Fatalf("an owned, incomplete Secret was not repaired: %v", err)
+		}
+		after := &corev1.Secret{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: owned.Name, Namespace: owned.Namespace}, after); err != nil {
+			t.Fatal(err)
+		}
+		stored, ok := readA2ACalloutKeys(after)
+		if !ok || stored.IssuerPublic != keys.IssuerPublic || stored.XKeyPublic != keys.XKeyPublic {
+			t.Error("the repaired Secret does not hold the keys the repair returned")
+		}
+	})
+}
+
+// The NATS credentials Secret follows the same rule: one at its name that
+// this PlatformAgent doesn't control is refused, not adopted or repaired.
+func TestTheNATSCredsSecretIsOnlyReadWhenOwned(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.UID = "platform-agent-uid"
+	const planted = "0123456789abcdef0123456789abcdef"
+	notController := false
+	for name, owners := range map[string][]metav1.OwnerReference{
+		"no owner": nil,
+		"a non-controller owner reference": {{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: agent.UID, Controller: &notController}},
+		"a controller reference with another UID": {{
+			APIVersion: "kubeagents.x-k8s.io/v1alpha1", Kind: "PlatformAgent", Name: agent.Name, UID: "another-uid", Controller: func() *bool { b := true; return &b }()}},
+	} {
+		t.Run("a Secret with "+name+" is refused", func(t *testing.T) {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCredsSecretName(agent), Namespace: agent.Namespace, OwnerReferences: owners},
+				Data: map[string][]byte{a2aBridgePasswordKey: []byte(planted)}}
+			r, cl := mcpTestReconciler(t, secret)
+			got, err := r.ensureA2ACredsSecret(ctx, agent)
+			if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned Secret") {
+				t.Fatalf("an unowned NATS credentials Secret was taken (got %v, err %v)", got != nil, err)
+			}
+			after := &corev1.Secret{}
+			if err := cl.Get(ctx, types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace}, after); err != nil {
+				t.Fatal(err)
+			}
+			if len(after.Data) != 1 || string(after.Data[a2aBridgePasswordKey]) != planted {
+				t.Error("the unowned Secret was changed")
 			}
 		})
 	}

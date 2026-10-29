@@ -633,6 +633,19 @@ func TestValidate_ProfilesDirFlagRules(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			// Shared mode sends the operator's id on every inject, where the
+			// same pattern would refuse it one alert at a time with nothing
+			// said at startup.
+			name: "shared mode refuses a target-session the daemon could not have issued",
+			f: flags{
+				mode:          "shared",
+				dryRun:        true,
+				targetSession: "gateway:conv@1",
+				dedupWindow:   1,
+			},
+			wantErr: "--target-session \"gateway:conv@1\" is not a session id the daemon issues",
+		},
+		{
 			name: "dry-run still validates dedup-window",
 			f: flags{
 				mode:        "per-incident",

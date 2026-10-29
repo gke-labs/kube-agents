@@ -390,6 +390,36 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     # -- prepare ----------------------------------------------------------
 
+    def _gitea_only(self):
+        for name, value in (
+            ("get_managed_repos", lambda: [GITEA_REPO]),
+            ("resolve_repo", lambda workspace=None: GITEA_REPO),
+            ("validate_repo_org", lambda repo: repo),
+        ):
+            patch = mock.patch.object(gitops_workspace, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_a_gitea_only_install_sends_the_broker_the_host_qualified_name(self):
+        self._gitea_only()
+        branch = "platform-agent/incident-abc"
+        prepared = self.prepare(branch, repo=GITEA_REPO)
+        self.assertEqual(prepared["repo"], GITEA_REPO)
+        self.edit(prepared)
+        code, _ = self.run_subject(
+            "submit", "--branch", branch, "--repo", GITEA_REPO,
+            "--title", "t", "--body", "b",
+        )
+        self.assertEqual(code, 0)
+        self.assertIn(branch, self.remote_branches())
+        named = {payload["repository"] for _, payload in self.broker.calls if "repository" in payload}
+        self.assertEqual(named, {GITEA_REPO})
+
+    def test_a_gitea_only_install_needs_no_repo_flag(self):
+        self._gitea_only()
+        prepared = self.prepare("platform-agent/incident-def")
+        self.assertEqual(prepared["repo"], GITEA_REPO)
+
     def test_prepare_cuts_a_new_branch_from_the_base(self):
         prepared = self.prepare()
         self.assertEqual(prepared["repo"], "acme/infra")
@@ -1954,6 +1984,62 @@ class LiftedNameReachesTheBrokerTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 submit_suggestion.handle_submit(args)
         self.assertEqual(["github.com/acme/fleet"], seen)
+
+
+
+GITEA_HOST = "gitea-http.gitea.svc.cluster.local"
+GITEA_REPO = f"{GITEA_HOST}/demo/gke-fleet-iac"
+
+
+class TestRepositoryOnAnotherForge(unittest.TestCase):
+    """A managed repository on Gitea, which the broker reaches only host-qualified."""
+
+    def setUp(self):
+        for name, value in (
+            ("get_managed_repos", lambda: [GITEA_REPO]),
+            ("validate_repo_org", lambda repo: repo),
+        ):
+            patch = mock.patch.object(gitops_workspace, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_the_host_qualified_name_is_accepted_as_it_is(self):
+        self.assertEqual(submit_suggestion.validate_repo(GITEA_REPO), GITEA_REPO)
+
+    def test_a_bare_path_is_not_guessed_onto_another_forge(self):
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.validate_repo("demo/gke-fleet-iac")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_a_bare_slug_that_is_also_a_managed_github_repo_stays_on_github(self):
+        with mock.patch.object(
+            gitops_workspace, "get_managed_repos", lambda: ["demo/gke-fleet-iac", GITEA_REPO]
+        ):
+            self.assertEqual(
+                submit_suggestion.validate_repo("demo/gke-fleet-iac"), "demo/gke-fleet-iac"
+            )
+
+    def test_an_unmanaged_host_qualified_name_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.validate_repo(f"{GITEA_HOST}/demo/other")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_a_path_managed_on_two_forges_is_refused_rather_than_guessed(self):
+        second = "git.example.com/demo/gke-fleet-iac"
+        with mock.patch.object(
+            gitops_workspace, "get_managed_repos", lambda: [GITEA_REPO, second]
+        ):
+            with self.assertRaises(ValueError) as caught:
+                submit_suggestion.validate_repo("demo/gke-fleet-iac")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_an_unreadable_managed_list_is_still_refused(self):
+        with mock.patch.object(
+            gitops_workspace, "get_managed_repos",
+            mock.Mock(side_effect=RuntimeError("kubectl failed: Forbidden")),
+        ):
+            with self.assertRaises(RuntimeError):
+                submit_suggestion.validate_repo("demo/gke-fleet-iac")
 
 
 if __name__ == "__main__":

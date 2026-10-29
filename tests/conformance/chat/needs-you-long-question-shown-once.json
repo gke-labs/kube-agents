@@ -1,0 +1,19 @@
+{
+  "name": "needs-you-long-question-shown-once",
+  "source": "agents/platform/scripts/test_slack_moments.py::NeedsYouTest.test_a_long_first_line_shows_its_question_once",
+  "notes": "A first line past the headline's cap gives its first sentence, the question, as the headline and the rest of the line as the detail, so the question is drawn once and no word is lost.",
+  "input": {
+    "reason": "Which GitOps repository should I open the pull request against to revert the ConfigMap change? The GitOps state ConfigMap currently lists no managed repositories, so I cannot tell which one holds the change."
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which GitOps repository should I open the pull request against to revert the ConfigMap change?",
+        "detail": "The GitOps state ConfigMap currently lists no managed repositories, so I cannot tell which one holds the change.",
+        "tone": "attention"
+      }
+    }
+  ]
+}

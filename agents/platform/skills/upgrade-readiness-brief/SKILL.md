@@ -35,7 +35,7 @@ gets the same shape in chat. Read only. Register nothing, decide nothing, upgrad
      findings (a budget over a single replica, a pool past the skew ceiling and a webhook in the
      upgrade's path are critical; a budget over several replicas, a webhook refusing only what it matches
      today and a pool at the ceiling are major; a covering exclusion is minor; a readiness rule's
-     blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry), name objects where the
+     blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, and minor for the plan-level `rollout-sequence-precheck`), name objects where the
      queue would give ids, say "live brief, composed now; the weekly review has not run" in the
      headline, and close with the live form of the last line: there is no report file and no id to
      reply with until the Saturday review registers them.

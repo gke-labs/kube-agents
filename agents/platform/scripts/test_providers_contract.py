@@ -29,7 +29,15 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from providers import AVAILABLE, COLLABORATION_VERBS, ForgeUnsupported
+from providers import (
+    AVAILABLE,
+    COLLABORATION_VERBS,
+    ISSUE_VERBS,
+    LABEL_FIELDS,
+    Forge,
+    ForgeUnsupported,
+    LabelsUnsupported,
+)
 from providers.credentials import (
     BrokeredCredential,
     MintedReadCredential,
@@ -598,6 +606,57 @@ class ContractTest(unittest.TestCase):
                 self.assertTrue(answer["proposalNoun"])
                 for verb in forge.verbs:
                     self.assertIn(verb, answer["verbs"])
+
+    def test_capabilities_say_whether_labels_work(self):
+        # Label fields ride on other verbs, so `verbs` cannot say this; a
+        # caller that keeps its items apart by label reads it here.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                self.assertIs(forge.capabilities("acme/infra")["labels"], forge.labels)
+
+    def test_a_forge_declares_labels_exactly_when_it_serves_label_ensure(self):
+        # The two say one thing. A forge that served `label-ensure` and
+        # declared no labels would refuse every label it had just created.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                self.assertEqual(forge.labels, "label-ensure" in forge.verbs)
+
+    def test_a_forge_with_labels_lets_every_label_field_through(self):
+        for name, forge, _ in self.instances():
+            if not forge.labels:
+                continue
+            with self.subTest(forge=name):
+                for field in LABEL_FIELDS:
+                    forge.refuse_labels("proposal-list", {field: ["x"]})
+                forge.refuse_labels("label-ensure", {"name": "x"})
+
+    def test_a_forge_serves_the_issue_verbs_all_together_or_not_at_all(self):
+        # A ledger kept in issues reads their absence to keep it elsewhere; a
+        # forge with half of them would send it to a refusal halfway through.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                served = [verb for verb in ISSUE_VERBS if verb in forge.verbs]
+                self.assertIn(served, ([], list(ISSUE_VERBS)))
+
+    def test_a_forge_with_no_labels_refuses_every_label_field_by_name(self):
+        # No forge in this install has no labels yet, so the property is held
+        # on the base class every forge inherits it from.
+        class NoLabels(Forge):
+            name = "no-labels"
+            verbs = ("proposal-list",)
+
+        forge = NoLabels()
+        for field in LABEL_FIELDS:
+            with self.subTest(field=field):
+                with self.assertRaises(LabelsUnsupported) as caught:
+                    forge.refuse_labels("proposal-list", {field: ["x"]})
+                self.assertEqual(caught.exception.status, 501)
+                self.assertEqual(caught.exception.fields.get("code"), "LABELS_UNSUPPORTED")
+                self.assertIn(field, str(caught.exception))
+        with self.assertRaises(LabelsUnsupported):
+            forge.refuse_labels("label-ensure", {"name": "x"})
+        forge.refuse_labels("proposal-list", {"labels": [], "excludeLabels": None})
+        self.assertIs(forge.capabilities("acme/infra")["labels"], False)
 
     def test_a_file_url_is_composed_on_the_forge_s_own_host(self):
         # A link in an issue must open the file on this forge, and the sandbox

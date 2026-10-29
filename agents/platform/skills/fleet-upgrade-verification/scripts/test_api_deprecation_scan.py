@@ -214,6 +214,17 @@ class ParseManifestsTest(unittest.TestCase):
         self.assertEqual(docs, [])
         self.assertTrue(reason.startswith("JSON did not parse"), reason)
 
+    def test_a_document_the_loader_accepts_but_the_walk_cannot_is_skipped(self):
+        # Python 3.14's json accepts nesting far past the recursion limit, so the
+        # RecursionError moves from the loader into the document walk.
+        deep: list = []
+        for _ in range(sys.getrecursionlimit() + 100):
+            deep = [deep]
+        with patch.object(scan.json, "loads", return_value=deep):
+            docs, reason = scan.parse_manifests("deep.json", b"[]")
+        self.assertEqual(docs, [])
+        self.assertTrue(reason.startswith("JSON did not parse"), reason)
+
     def test_a_bad_scalar_in_one_file_does_not_hide_a_hit_in_another(self):
         snapshot = scan.Snapshot(source="local directory t", sha=None, files={
             "a.yaml": b"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x, annotations: {reviewed: 2001-02-30}}\n",

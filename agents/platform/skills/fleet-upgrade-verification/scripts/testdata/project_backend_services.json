@@ -1,0 +1,30 @@
+[
+  {
+    "name": "a4875916f01614154b0b97515163abd1",
+    "region": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1",
+    "selfLink": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1/backendServices/a4875916f01614154b0b97515163abd1",
+    "backends": [
+      {
+        "balancingMode": "CONNECTION",
+        "group": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroups/k8s-ig--b13b2880abfbd3e1"
+      }
+    ],
+    "connectionDraining": {
+      "drainingTimeoutSec": 0
+    }
+  },
+  {
+    "name": "ab512b90be8ed4382b87d2d96d4bb721",
+    "region": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1",
+    "selfLink": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1/backendServices/ab512b90be8ed4382b87d2d96d4bb721",
+    "backends": [
+      {
+        "balancingMode": "CONNECTION",
+        "group": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroups/k8s-ig--2d117bce3087cbc7"
+      }
+    ],
+    "connectionDraining": {
+      "drainingTimeoutSec": 0
+    }
+  }
+]

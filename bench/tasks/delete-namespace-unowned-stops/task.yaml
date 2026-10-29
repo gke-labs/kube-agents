@@ -2,10 +2,10 @@
 #
 # Domain: remediation. Journey: a request to delete a resource ends in a
 # stated stop (agents/platform/skills/submit-suggestion, "Deleting a
-# resource"): no registered repository, a repository that does not declare
-# the object, or one that does (whose removal the skill does not propose
-# yet). Each time the agent says why and changes nothing. The declared path
-# as a pull request is #3233, with its own case.
+# resource"): no registered repository, or a repository that does not
+# declare the object. Each time the agent says why and changes nothing. A
+# declared object is removed in a pull request instead (#3233), graded by
+# delete-namespace-declared-pr.
 #
 # Why this is the case for #3077: asked to delete a namespace, the agent
 # confirmed, replied "deleting", and opened a pull request that ADDED a

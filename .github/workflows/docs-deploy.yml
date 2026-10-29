@@ -9,15 +9,21 @@ name: Docs Deploy
 #
 # On the upstream `gke-labs/kube-agents` repo, Pages is enabled and the
 # site is live at https://gke-labs.github.io/kube-agents/.
+#
+# Published installer scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`) are
+# extracted from the numerically highest published pure-numeric GA GitHub
+# Release (`X.Y.Z`) rather than from `main` (where `BAKED_RELEASE_VERSION` is
+# empty) or raw Git tags (which `release-publish.yml` pushes before promoting
+# GHCR images and the Helm chart). `release-publish.yml` dispatches this
+# workflow on `main` right after `Publish GitHub Release` succeeds so newly cut
+# GA releases update Pages automatically whenever they become the highest
+# published GA version (matching `releases/latest`).
 
 on:
   push:
     branches: [main]
     paths:
       - "docs/site/**"
-      - "install.sh"
-      - "uninstall.sh"
-      - "upgrade.sh"
       - ".github/workflows/docs-deploy.yml"
   workflow_dispatch:
 
@@ -49,13 +55,92 @@ jobs:
         run: npm ci
         working-directory: docs/site
 
-      - name: Copy root installer & upgrade scripts to site public directory
-        run: cp ../../install.sh ../../uninstall.sh ../../upgrade.sh public/
+      - name: Stage latest GA release installer & upgrade scripts to site public directory
+        id: stage_scripts
         working-directory: docs/site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          upstream_repo="gke-labs/kube-agents"
+          upstream_url="${UPSTREAM_REPO_URL:-https://github.com/gke-labs/kube-agents.git}"
+          repo_name="${REPO_NAME:-${GITHUB_REPOSITORY:-${upstream_repo}}}"
+          tag_remote="origin"
+
+          # Query only completed, non-draft, non-prerelease GitHub Releases so a
+          # mid-flight or failed release-publish.yml run (which pushes refs/tags/X.Y.Z
+          # before promoting GHCR images and publishing the Helm chart) is never
+          # staged onto Pages. Capture gh output at top level so set -e aborts on any
+          # API/transport/auth error instead of falling back silently.
+          release_tags="$(gh api --paginate "repos/${repo_name}/releases?per_page=100" --jq '.[] | select((.draft | not) and (.prerelease | not)) | .tag_name')"
+          ga_tag="$(printf '%s\n' "$release_tags" | awk '/^[0-9]+\.[0-9]+\.[0-9]+$/ { print }' | LC_ALL=C sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+
+          # Forks typically publish no GitHub Releases of their own; fall back to
+          # upstream's published GA releases only on forks while failing closed on
+          # gke-labs/kube-agents itself.
+          if [ -z "$ga_tag" ] && [ "$repo_name" != "$upstream_repo" ]; then
+            echo "No published GA GitHub Release found on ${repo_name}; falling back to ${upstream_repo}."
+            tag_remote="$upstream_url"
+            upstream_tags="$(gh api --paginate "repos/${upstream_repo}/releases?per_page=100" --jq '.[] | select((.draft | not) and (.prerelease | not)) | .tag_name')"
+            ga_tag="$(printf '%s\n' "$upstream_tags" | awk '/^[0-9]+\.[0-9]+\.[0-9]+$/ { print }' | LC_ALL=C sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+          fi
+          if [ -z "$ga_tag" ]; then
+            echo "::error::No published GA release matching ^[0-9]+\\.[0-9]+\\.[0-9]+$ found via GitHub Releases." >&2
+            exit 1
+          fi
+
+          fetch_args=()
+          if [ "$tag_remote" = "origin" ] && [ -n "${GH_TOKEN:-}" ]; then
+            origin_url="$(git remote get-url origin 2>/dev/null || true)"
+            if [[ "$origin_url" == https://github.com/* ]]; then
+              basic_auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+              fetch_args=(
+                -c "http.https://github.com/.extraheader="
+                -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic_auth}"
+              )
+            fi
+          fi
+
+          git ${fetch_args[@]+"${fetch_args[@]}"} fetch --no-tags --depth=1 "$tag_remote" "+refs/tags/${ga_tag}:refs/tags/${ga_tag}"
+          mkdir -p public
+          for script in install.sh uninstall.sh upgrade.sh; do
+            git show "refs/tags/${ga_tag}:${script}" > "public/${script}"
+            chmod +x "public/${script}"
+          done
+          echo "Staged install.sh, uninstall.sh, and upgrade.sh from published GA release ${ga_tag} (${tag_remote})."
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            echo "ga_tag=${ga_tag}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build site
         run: npm run build
         working-directory: docs/site
+
+      - name: Verify built Pages scripts carry stamped release version
+        id: verify_scripts
+        working-directory: docs/site
+        env:
+          EXPECTED_GA_TAG: ${{ steps.stage_scripts.outputs.ga_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_GA_TAG:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid or empty EXPECTED_GA_TAG='${EXPECTED_GA_TAG:-}'." >&2
+            exit 1
+          fi
+          expected_line="BAKED_RELEASE_VERSION=\"${EXPECTED_GA_TAG}\""
+          for script in install.sh uninstall.sh upgrade.sh; do
+            if [ ! -s "dist/${script}" ]; then
+              echo "::error::Missing or empty built Pages script dist/${script}." >&2
+              exit 1
+            fi
+            stamped="$(grep -E '^BAKED_RELEASE_VERSION=' "dist/${script}" || true)"
+            if [ "$stamped" != "$expected_line" ]; then
+              echo "::error::dist/${script} carries '${stamped}', expected '${expected_line}'." >&2
+              exit 1
+            fi
+          done
+          echo "Verified dist/{install,uninstall,upgrade}.sh carry ${expected_line}."
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
