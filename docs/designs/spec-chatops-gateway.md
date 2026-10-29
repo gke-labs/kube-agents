@@ -2067,7 +2067,9 @@ block whose first row is the column names; then the buttons, choices before link
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
 are the presenter's `kage.choice.<n>` and `kage.link.<n>`. A progress message's `plan` is
 one top-level `task_card` per item, each row's steps listed under it and marked `✓`, the last
-step of an `in_progress` row `◌`; not Slack's `plan` block, which Slack draws as its title alone,
+step of an `in_progress` row `◌`; a `pending` item draws `in_progress` with its steps all `✓`,
+because a `task_card` takes only `in_progress`, `complete` and `error` and Slack refuses the whole
+message with `invalid_blocks` for `pending` (its title already says it waits); not Slack's `plan` block, which Slack draws as its title alone,
 folded, and allows once per message, so the plan's `title` is the fallback text's only. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
 red `#E01E5A`) holding every block under the headline. Slack refuses a `container` inside the
 attachment a side bar is, and an attachment draws after every top-level block, so a message with

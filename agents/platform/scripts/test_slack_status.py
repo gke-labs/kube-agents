@@ -214,6 +214,18 @@ class PlanTest(unittest.TestCase):
             blocks = s.plan_blocks(None, [_row(status=status), _row("t_b")])
             self.assertEqual([b["type"] for b in blocks], ["task_card", "task_card"])
 
+    def test_a_waiting_row_draws_in_progress_with_its_steps_done(self):
+        # Slack's task_card takes in_progress, complete and error; pending fails the message with invalid_blocks.
+        [task] = s.plan_blocks(None, [_row(lines=["found two", "asked which"], steps=2, status=s.TASK_PENDING)])
+        self.assertEqual((task["status"], task["title"]), ("in_progress", s.WAITING_ON_YOU))
+        items = task["details"]["elements"][0]["elements"]
+        self.assertEqual([i["elements"][0]["text"] for i in items], ["✓ found two", "✓ asked which"])
+
+    def test_every_card_status_is_one_slack_accepts(self):
+        for status in (*s.TASK_STATUSES, "bogus"):
+            [task] = s.plan_blocks(None, [_row(status=status)])
+            self.assertIn(task["status"], {"in_progress", "complete", "error"})
+
     def test_no_plan_block_folds_the_rows_under_a_title(self):
         # Slack draws a plan block as its title alone, folded: a fan-out read as "N cards",
         # and one card as the thread's ask rather than the card's step.
