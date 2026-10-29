@@ -750,8 +750,9 @@ class LongLivedAllowlistGuardTest(GithubMinterInputsTest):
 class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
     """A GitHub variable a human typed still means what it meant in install.env.
 
-    These settings reach install.sh as `--enable-*` flags, whose validator
-    matches exactly true|false and exits 1 naming the flag. The same variables
+    These settings reach install.sh as boolean flags (`--enable-*`,
+    `--vertex-manage-serving-project`), whose validators match exactly
+    true|false and exit 1 naming the flag. The same variables
     also reach it through the rendered install.env, where is_truthy accepts
     True/yes/y/1/on. An environment spelled `True` deployed fine on the file
     route, so it has to keep deploying on the flag route.
@@ -765,6 +766,7 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "ENABLE_GVISOR": "--enable-gvisor",
         "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
         "WEB_CONSOLE_ENABLED": "--enable-web-console",
+        "ENABLE_DRIFT_DETECTOR": "--enable-drift-detector",
         "VERTEX_MANAGE_SERVING_PROJECT": "--vertex-manage-serving-project",
     }
 

@@ -204,8 +204,9 @@ the `secrets: inherit` gap
 
 `ENABLE_GKE_BACKUP_PLAN`, `ENABLE_GVISOR`, `HERMES_DASHBOARD_ENABLED`, `WEB_CONSOLE_ENABLED`,
 `ENABLE_DRIFT_DETECTOR`, and `VERTEX_MANAGE_SERVING_PROJECT` are checked there too,
-for spelling rather than presence. All six reach `install.sh` as
-`--enable-*` flags, whose validator takes `true` or `false` and nothing else, while
+for spelling rather than presence. All six reach `install.sh` as boolean flags
+(`--enable-*`, `--vertex-manage-serving-project`), whose validators take `true` or
+`false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
 `True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into
 the first, so an environment that deployed on `True` keeps deploying; a spelling
