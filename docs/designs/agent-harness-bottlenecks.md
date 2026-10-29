@@ -459,6 +459,19 @@ The 2-hour Phase 2 window at 22 clusters, with the audits one after another, sho
 - **A CPU line leaves out runs at the limit,** so where only low runs stay in, it can predict too little. The proxy's CPU answer uses the raised-limit runs for that reason.
 - **The raised-limit runs met model quota limits:** 54 provider 429s in the 16-cluster onboarding window.
 
+# Data to collect next
+
+The answers above rest on one run per point, small test clusters and fleets of at most 40 clusters. The next measurements, in the order they would change the answers most:
+
+- **Repeat runs at each point.** One run per point gives no spread: the two fan-out runs at 40 clusters took 129 and 375 seconds. Three runs per point at 8, 16, 24, 32 and 40 clusters would give the spread the 30% margin now stands in for.
+- **Larger clusters.** Every Phase 4 cluster had 2 nodes and 100 objects, and one point had 1,000. A grid of clusters (8, 16, 32, 40) × nodes per cluster (2, 10, 50) × objects per cluster (100, 1,000, 4,000) would show how much a real fleet's clusters add, which now makes each per-cluster cost a lower bound.
+- **Past 40 clusters.** The shell peaked at 79% of its fixed 2 CPU at 40 clusters, so the size where one install stops is between 40 and about 50, and it is not measured. Runs at 48, 56 and 64 clusters would find it; with an operator change that makes the shell settable, they would also find the next limit.
+- **Stall Watch at every size.** A triggered pass finished only at 2 and 8 clusters; at 16, 32 and 40 it met a scheduled pass and was skipped. Starting the window away from the half hour would measure the pass time at those sizes.
+- **The daily audit at 8 and 16 clusters.** It finished in about 30 seconds with almost no model tokens, against 34 to 45 minutes at 32 and 40; why is not known.
+- **A day of model tokens.** The token figures here come from single windows. A 24-hour soak at 16 and 40 clusters would measure the daily total that the 1.5 to 5 billion tokens a day for the largest example fleet is extrapolated from.
+- **An Autopilot host.** At the S container size the shell gets its 200m request on GKE Autopilot without bursting, against a 1.6-CPU peak. An install on Autopilot would show how slow the command path gets there.
+- **Many projects.** The largest example fleet has about 2,400 projects; the test fleet had one. The Cluster Agent reconcile lists every project in scope, so its time at hundreds of projects is the remaining unmeasured input.
+
 # Out of scope
 
 For now we won't cover these topics, which are limitations of this research.
