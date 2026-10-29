@@ -222,7 +222,7 @@ if profile:
         )
     )
 start = profile.fleet(base) if profile else base
-with st.expander("Fine-tune the fleet"):
+with st.expander("Change the fleet size"):
     fleet: dict[str, float] = {}
     fleet_columns = st.columns(FLEET_COLUMNS)
     for index, (factor, spec) in enumerate(hl.FACTORS.items()):
