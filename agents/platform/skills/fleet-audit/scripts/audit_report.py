@@ -18649,6 +18649,7 @@ class KccStall(NamedTuple):
     object was read on: the cluster that runs that Config Connector.
     `project` is the GCP project the object manages (its
     `cnrm.cloud.google.com/project-id` annotation), `""` when not known.
+    `location` is the object's `spec.location`, `""` when it has none.
     """
 
     kind: str
@@ -18659,6 +18660,7 @@ class KccStall(NamedTuple):
     cluster: str
     host: str = ""
     project: str = ""
+    location: str = ""
 
 
 class KccHealth(NamedTuple):
@@ -18720,6 +18722,7 @@ def kcc_health(manifest: dict | None) -> KccHealth:
                     str(record.get("cluster") or ""),
                     host,
                     str(record.get("project") or ""),
+                    str(record.get("location") or ""),
                 )
             )
     return KccHealth(stalled, unread, hosts, tuple(targets))
@@ -18830,6 +18833,19 @@ def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dic
     }
 
 
+def _finding_location(finding: dict) -> str:
+    """The location of `finding`'s `project/location/name` cluster, or `""`."""
+    parts = str(finding.get("cluster") or "").split("/")
+    return parts[1] if len(parts) == CLUSTER_TARGET_SEGMENTS else ""
+
+
+def _location_agrees(stall: KccStall, location: str) -> bool:
+    """A known location on the recorded object that differs from `location`
+    is never a match: `prod` in `us-central1` is not `prod` in
+    `europe-west1`, and every cluster has a `default-pool`."""
+    return not (stall.location and location and stall.location != location)
+
+
 def _finding_project(finding: dict) -> str:
     """The project of `finding`'s `project/location/name` cluster, or `""`."""
     parts = str(finding.get("cluster") or "").split("/")
@@ -18871,11 +18887,15 @@ def _remediation_file_stalls(
     it must also be known (`_project_certain`).
     """
     matched: list[KccStall] = []
-    for (kind, _, cluster_ref, _), declaration in index.items():
+    cluster_kinds = _KCC_OBJECT_KINDS["Cluster"] + _KCC_OBJECT_KINDS["NodePool"]
+    for (kind, _, cluster_ref, file_location), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
         file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
         project = declaration.project or _finding_project(finding)
+        # The file's `spec.location`, else, for a cluster or a node pool, the
+        # location of the finding's cluster.
+        location = file_location or (_finding_location(finding) if kind in cluster_kinds else "")
         fits = [
             stall
             for stall in stalled
@@ -18883,6 +18903,7 @@ def _remediation_file_stalls(
             and stall.name == declaration.name
             and (not declaration.namespace or stall.namespace == declaration.namespace)
             and not (file_ref and stall.cluster and stall.cluster != file_ref)
+            and _location_agrees(stall, location)
             and _project_certain(stall, project, kcc_hosts)
         ]
         if len({stall.host for stall in fits}) > 1:
@@ -18894,7 +18915,11 @@ def _remediation_file_stalls(
 
 
 def _object_stalls(
-    finding: dict, stalled: list[KccStall], kcc_hosts: int, targets: tuple[str, ...] = ()
+    finding: dict,
+    stalled: list[KccStall],
+    kcc_hosts: int,
+    targets: tuple[str, ...] = (),
+    namespaces: frozenset[str] = frozenset(),
 ) -> list[KccStall]:
     """The unready objects that are `finding`'s own object: a `Cluster/` or
     `NodePool/` finding, matched on the name GKE reports (the object's
@@ -18905,7 +18930,10 @@ def _object_stalls(
     nothing when the manifest holds a cluster of the same name in another
     project (`targets`): its name and `clusterRef` cannot tell the two
     apart. Objects that fit on more than one host cluster name nothing, as
-    in `_remediation_file_stalls`: the match is not certain."""
+    in `_remediation_file_stalls`: the match is not certain. A known location
+    must be the finding's cluster location (`_location_agrees`), and when
+    the fix's file sets namespaces (`namespaces`), the object must be in one
+    of them."""
     prefix, _, name = str(finding.get("object") or "").partition("/")
     kinds = _KCC_OBJECT_KINDS.get(prefix)
     if not kinds or not name:
@@ -18923,6 +18951,8 @@ def _object_stalls(
         if stall.kind in kinds
         and (stall.resource or stall.name) == name
         and (stall.kind not in pool_kinds or stall.cluster == cluster)
+        and _location_agrees(stall, _finding_location(finding))
+        and (not namespaces or stall.namespace in namespaces)
         and not (stall.project and stall.project != project)
         and _project_certain(stall, project, kcc_hosts)
         and (stall.project or not namesakes)
@@ -19053,7 +19083,10 @@ def disclose_stalled_kcc_remediations(
         in_file = _remediation_file_stalls(finding, index, stalled, health.hosts) if index else []
         is_manifest = isinstance(remediation, dict) and remediation.get("kind") == MANIFEST_REMEDIATION_KIND
         object_fallback = bool(stalled) and (bool(index) or not is_manifest)
-        matched = in_file or (_object_stalls(finding, stalled, health.hosts, health.targets) if object_fallback else [])
+        namespaces = frozenset(declaration.namespace for declaration in index.values() if declaration.namespace)
+        matched = in_file or (
+            _object_stalls(finding, stalled, health.hosts, health.targets, namespaces) if object_fallback else []
+        )
         if matched:
             finding[KCC_STALLED_FINDING_FIELD] = kcc_stalled_objects(matched, stalled)
         if in_file and isinstance(remediation, dict):

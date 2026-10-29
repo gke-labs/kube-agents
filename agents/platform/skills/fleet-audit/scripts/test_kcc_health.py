@@ -110,6 +110,11 @@ class UnreadyObjectsTest(unittest.TestCase):
             ],
         )
 
+    def test_the_location_is_recorded(self):
+        located = kcc_object("ContainerCluster", "prod", status="False", reason="UpdateFailed", spec={"location": "us-central1"})
+        self.assertEqual(kcc_health.unready_objects([located])[0]["location"], "us-central1")
+        self.assertNotIn("location", kcc_health.unready_objects([STALLED_TOPIC])[0])
+
     def test_the_target_project_comes_from_the_objects_annotation(self):
         annotated = kcc_object("ContainerCluster", "prod", namespace="config-control", status="False", reason="UpdateFailed")
         annotated["metadata"]["annotations"] = {"cnrm.cloud.google.com/project-id": "pa"}

@@ -17,7 +17,8 @@ the result on that cluster's manifest entry:
   other than a transient one (`TRANSIENT_REASONS`: Config Connector is still
   applying or deleting the object), each as
   `{kind, namespace, name, why}`, plus `resource` (the object's
-  `spec.resourceID`), `cluster` (a `ContainerNodePool`'s `clusterRef`) and
+  `spec.resourceID`), `cluster` (a `ContainerNodePool`'s `clusterRef`),
+  `location` (the object's `spec.location`) and
   `project` (the GCP project the object manages, from its
   `cnrm.cloud.google.com/project-id` annotation, else from the same
   annotation on its namespace) where they are set. When no object on a host
@@ -217,6 +218,9 @@ def unready_objects(items: list) -> list[dict]:
             record["resource"] = resource
         if kind == KCC_NODE_POOL_KIND and _cluster_ref(spec):
             record["cluster"] = _cluster_ref(spec)
+        location = str(spec.get("location") or "")
+        if location:
+            record["location"] = location
         annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
         project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
         if project:

@@ -23111,6 +23111,51 @@ metadata:
         manifest["clusters"][1]["outcome"] = "unreachable"
         self.assertEqual(self.disclose([finding], manifest), ["release-channel"])
 
+    def eu_prod_fix(self, namespace=""):
+        """A fix for `proj-b/europe-west1/prod` whose file declares that
+        ContainerCluster, project proj-b, with or without a namespace."""
+        ns = f"  namespace: {namespace}\n" if namespace else ""
+        self.write(
+            "clusters/prod-eu.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: prod\n" + ns +
+            "  annotations:\n    cnrm.cloud.google.com/project-id: proj-b\nspec:\n  location: europe-west1\n",
+        )
+        finding = kcc_finding(path="clusters/prod-eu.yaml")
+        finding.update(cluster="proj-b/europe-west1/prod", object="Cluster/prod")
+        return finding
+
+    US_PROD = {"kind": "ContainerCluster", "namespace": "us", "name": "prod", "why": "UpdateFailed", "project": "proj-b", "location": "us-central1"}
+
+    def test_a_stall_in_another_location_is_not_a_match(self):
+        finding = self.eu_prod_fix()
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.US_PROD)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.disclose([finding], kcc_manifest(dict(self.US_PROD, location="europe-west1")))
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+
+    def test_the_own_object_fallback_needs_the_files_namespace(self):
+        """The file sets namespace `eu`; the in-file match refuses `us/prod`,
+        and the fallback to the finding's own object must refuse it too."""
+        no_location = {key: value for key, value in self.US_PROD.items() if key != "location"}
+        for stall in (self.US_PROD, no_location):
+            with self.subTest(location=stall.get("location")):
+                finding = self.eu_prod_fix(namespace="eu")
+                self.disclose([finding], kcc_manifest(stall))
+                self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_default_pool_of_another_location_is_not_the_findings(self):
+        """Every cluster has a `default-pool`; two clusters named prod in two
+        locations differ only by location."""
+        pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "prod-default", "why": "UpdateFailed",
+                "resource": "default-pool", "cluster": "prod", "location": "us-central1"}
+        mine = make_finding(fid="p", cluster="acme/europe-west1/prod", obj="NodePool/default-pool",
+                            remediation={"kind": "gcloud", "note": "x"})
+        self.disclose([mine], kcc_manifest(pool))
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, mine)
+        mine["cluster"] = "acme/us-central1/prod"
+        self.disclose([mine], kcc_manifest(pool))
+        self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, mine)
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""
