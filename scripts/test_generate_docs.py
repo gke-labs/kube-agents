@@ -237,11 +237,10 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertTrue(body.rstrip().endswith(group.rstrip()))
 
     def test_a_persona_group_with_no_skills_is_left_out(self):
-        grouped = generate_docs.group_skills({"fleet-audit": "d"}, {}, {})
-        self.assertEqual(grouped[generate_docs.TSE_SKILL_GROUP], [])
-        with mock.patch.object(
-            generate_docs, "read_persona_skills", return_value=({"fleet-audit": "d"}, {}, {})
-        ):
+        grouped = generate_docs.group_skills({"fleet-audit": "d"}, {})
+        for group, _ in generate_docs.PERSONA_SKILL_GROUPS:
+            self.assertEqual(grouped[group], [])
+        with mock.patch.object(generate_docs, "read_persona_skills", return_value={}):
             body = generate_docs.gen_skill_catalog()
         self.assertNotIn(generate_docs.TSE_SKILL_GROUP, body)
         self.assertNotIn(generate_docs.CLUSTER_SKILL_GROUP, body)

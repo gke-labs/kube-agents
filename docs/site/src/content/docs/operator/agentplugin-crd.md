@@ -66,7 +66,7 @@ spec:
 
 ## Shipped plugins
 
-Two plugins ship in the repository under [`agentplugins/`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins), each a Helm chart that creates an `AgentPlugin` plus the OCI image it mounts:
+The plugins that ship in the repository live under [`agentplugins/`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins), each a Helm chart that creates an `AgentPlugin` plus the OCI image it mounts:
 
 - [`pubsub-platform`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/pubsub-platform) — a Pub/Sub ingress adapter that pulls filtered Cloud Logging alerts from a subscription, deduplicates them, and turns what survives into agent work.
 - [`gke-stockout-investigator`](https://github.com/gke-labs/kube-agents/tree/main/agentplugins/gke-stockout-investigator) — a skill, installed into the `platform` profile, that diagnoses GKE scale-up failures and proposes a GitOps remediation pull request. Its alerts arrive through the adapter.
