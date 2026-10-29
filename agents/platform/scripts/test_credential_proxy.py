@@ -343,6 +343,32 @@ class AgentAPIProxyTest(unittest.TestCase):
                     with urllib.request.urlopen(request) as response:
                         self.assertEqual(b"proxied", response.read())
 
+    def test_one_request_opens_each_state_db_once(self):
+        self._seed_state_db_sessions([("plain-parent", None, None)])
+        opened = []
+        real = credential_proxy.AgentAPIProxyHandler._open_bridge_session_dbs.__func__
+
+        def counting(cls, stack, workspace_root=None):
+            opened.append(1)
+            return real(cls, stack, workspace_root)
+
+        with mock.patch.object(
+            credential_proxy.AgentAPIProxyHandler, "_open_bridge_session_dbs", classmethod(counting)
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/sessions/plain-parent/chat",
+                headers={
+                    "Authorization": "Bearer external-secret",
+                    "Content-Type": "application/json",
+                    "X-Hermes-Session-Id": "plain-parent",
+                },
+                data=json.dumps({"message": "hi", "note": "plain-other"}).encode(),
+                method="POST",
+            )
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(b"proxied", response.read())
+        self.assertEqual(1, len(opened))
+
     def test_allows_body_keys_that_name_no_bridge_session(self):
         for path, body in (
             ("/api/sessions", {"id": "web-console-abc", "title": "Web console abc"}),
@@ -351,6 +377,11 @@ class AgentAPIProxyTest(unittest.TestCase):
             ("/api/sessions/web-console-abc/chat", {"message": "a2a-x"}),
             ("/v1/responses", {"input": "a2a-x"}),
             ("/v1/responses", {"input": "hi", "instructions": "A2A-x"}),
+            ("/api/sessions", {"session_id": "web-console-abc", "title": "a2a-x"}),
+            ("/api/sessions", {"session_id": "web-console-abc", "system_prompt": "a2a-x"}),
+            ("/api/sessions/web-console-abc/chat", {"message": "hi", "system_message": "a2a-x"}),
+            ("/v1/runs/run-1/steer", {"text": "a2a-x"}),
+            ("/api/jobs", {"name": "a2a-x", "prompt": "a2a-x"}),
             ("/v1/runs", {"session_id": "plain", "input": "hi", "stream": True, "limit": 3}),
         ):
             with self.subTest(path=path, body=body):

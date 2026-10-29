@@ -2650,9 +2650,40 @@ AGENT_API_SESSION_ID_MAX_LEN = 256
 # More distinct short top-level strings than this in one body are refused
 # rather than checked one by one. No caller of the door sends more than a few.
 AGENT_API_MAX_CHECKED_BODY_STRINGS = 256
-# Free-text request-body keys: the agent API reads a message or instructions
-# from these, never a session id, so the generic check skips them.
-AGENT_API_FREE_TEXT_BODY_KEYS = ("message", "input", "instructions")
+# Free-text request-body keys: the agent API reads a message, a prompt, a title
+# or a name from these, never a session id, so the generic check skips them.
+AGENT_API_FREE_TEXT_BODY_KEYS = (
+    "message",
+    "input",
+    "instructions",
+    "text",
+    "title",
+    "name",
+    "prompt",
+    "system_prompt",
+    "system_message",
+)
+
+
+class _BridgeSessionDbs:
+    """The state.db connections one request's bridge-session checks share,
+    opened on first use and closed with the request."""
+
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self.workspace_root = workspace_root
+        self._stack = contextlib.ExitStack()
+        self._connections: list[sqlite3.Connection] | None = None
+
+    def connections(self) -> list[sqlite3.Connection]:
+        if self._connections is None:
+            self._connections = AgentAPIProxyHandler._open_bridge_session_dbs(self._stack, self.workspace_root)
+        return self._connections
+
+    def __enter__(self) -> "_BridgeSessionDbs":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stack.close()
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -2693,6 +2724,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _proxy(self) -> None:
+        with _BridgeSessionDbs(self.workspace_root) as dbs:
+            self._proxy_with(dbs)
+
+    def _proxy_with(self, dbs: "_BridgeSessionDbs") -> None:
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {self.external_key}"
         if not hmac.compare_digest(supplied, expected):
@@ -2700,7 +2735,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
         if self._targets_bridge_session(
-            self.path, self.headers, workspace_root=self.workspace_root
+            self.path, self.headers, workspace_root=self.workspace_root, dbs=dbs
         ):
             self._drain_request_body()
             self.send_error(HTTPStatus.FORBIDDEN)
@@ -2723,7 +2758,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(content_length) if content_length else None
         if body and self._targets_bridge_session(
-            self.path, self.headers, body=body, workspace_root=self.workspace_root
+            self.path, self.headers, body=body, workspace_root=self.workspace_root, dbs=dbs
         ):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -2868,6 +2903,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         headers: Any,
         body: bytes | None = None,
         workspace_root: str | Path | None = None,
+        dbs: "_BridgeSessionDbs | None" = None,
     ) -> bool:
         """Return True when an external request names an `a2a-*` bridge session or child.
 
@@ -2878,6 +2914,9 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
         `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
         """
+        if dbs is None:
+            with _BridgeSessionDbs(workspace_root) as own:
+                return cls._targets_bridge_session(path, headers, body, workspace_root, own)
         for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
             raw_values = (
                 headers.get_all(header, [])
@@ -2885,7 +2924,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 else [headers.get(header, "")]
             )
             for raw_val in raw_values:
-                if cls._is_bridge_session_id(raw_val, workspace_root):
+                if cls._is_bridge_session_id(raw_val, connections=dbs.connections()):
                     return True
         raw_path = urllib.parse.urlsplit(path).path
         while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
@@ -2898,7 +2937,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 return True
             if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
                 if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
-                    raw_segments[idx + 1], workspace_root
+                    raw_segments[idx + 1], connections=dbs.connections()
                 ):
                     return True
         if body:
@@ -2926,11 +2965,8 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     }
                     if len(candidates) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
                         return True
-                    if candidates:
-                        with contextlib.ExitStack() as stack:
-                            connections = cls._open_bridge_session_dbs(stack, workspace_root)
-                            if any(cls._is_bridge_session_id(value, connections=connections) for value in candidates):
-                                return True
+                    if any(cls._is_bridge_session_id(value, connections=dbs.connections()) for value in candidates):
+                        return True
         return False
 
     @staticmethod
