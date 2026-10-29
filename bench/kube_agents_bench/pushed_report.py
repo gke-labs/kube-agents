@@ -47,7 +47,7 @@ script that never ran to completion is infrastructure
 (:class:`PlantUnavailable`); one that ran in the image and failed there is
 an errored run (:class:`PlantBroken`), because the fault is the image's.
 
-Imported by ``cases.py`` and, through it, by the repository's ``scripts``
+Imported by ``scripts/test_eval_rosters.py`` in the repository's ``scripts``
 test sweep, which installs no ``devops_bench``: nothing here imports it at
 module scope.
 """

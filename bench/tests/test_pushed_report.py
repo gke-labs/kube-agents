@@ -71,10 +71,10 @@ def test_the_api_transport_refuses_the_replay(monkeypatch):
 
 
 def test_the_module_imports_without_devops_bench():
-    """cases.py imports it into the scripts test sweep, which installs no devops_bench."""
+    """scripts/test_eval_rosters.py imports it into the scripts test sweep, which installs no devops_bench."""
     code = (
         "import sys; sys.modules['devops_bench'] = None; sys.modules['devops_bench.agents'] = None; "
-        "import kube_agents_bench.pushed_report, kube_agents_bench.cases; print('ok')"
+        "import kube_agents_bench.pushed_report; print('ok')"
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False)
     assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr
