@@ -241,8 +241,16 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     answer is kept in metadata. The trajectory is the opening turn's, the
     plant's entry, then the reply turn's, so a ``tool_called`` on
     :data:`PLANT_ENTRY` reads it and the lane's safeguards read both turns.
-    Errors are both turns', the opening's first.
+    Errors are both turns', the opening's first. Tokens are both turns' too:
+    the reply's buckets with the opening's added in, bucket by bucket and
+    into the nested ones, as the card-wake merge sums two turns (an inject
+    record's tokens are the chain's usage as the door reported it, null
+    where it reported none, and a null bucket adds nothing).
     """
+    from kube_agents_bench.card_wake import _add_tokens  # devops_bench-bound; imported where a result exists
+
+    tokens = dict(reply.tokens)
+    _add_tokens(tokens, opening.tokens)
     metadata = {**opening.metadata, **reply.metadata}
     metadata["pushed_report"] = {
         "opening_final_message": str(opening.metadata.get("final_message") or opening.output),
@@ -253,7 +261,7 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     return type(reply)(
         output=reply.output,
         trajectory=[*opening.trajectory, entry, *reply.trajectory],
-        tokens=reply.tokens,
+        tokens=tokens,
         errors=[*opening.errors, *reply.errors],
         metadata=metadata,
     )

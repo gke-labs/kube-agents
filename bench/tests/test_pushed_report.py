@@ -185,6 +185,24 @@ def test_merge_grades_the_reply_turn_and_keeps_both_trajectories():
     assert merged.tokens == {"total": 1}
 
 
+def test_merge_sums_both_turns_tokens_bucket_by_bucket():
+    """An inject record's tokens are the chain's usage; the run's are both turns'."""
+    opening = AgentResult(
+        output="OK", trajectory=[], tokens={"input": 10, "output": 2, "total": 12, "cached": None,
+                                              "children": {"input": 3, "output": 1, "total": 4}},
+        errors=[], metadata={},
+    )
+    reply = AgentResult(
+        output="np-quartz-7", trajectory=[], tokens={"input": 100, "output": 20, "total": 120, "cached": None,
+                                                     "children": {"input": 30, "output": 10, "total": 40}, "usage_partial": True},
+        errors=[], metadata={},
+    )
+    merged = pushed_report.merge(opening, reply, pushed_report.plant_entry("a2a-ctx-1", "inject:c", {"stored": True}))
+    assert merged.tokens == {"input": 110, "output": 22, "total": 132, "cached": None,
+                             "children": {"input": 33, "output": 11, "total": 44}, "usage_partial": True}
+    assert opening.tokens["total"] == 12 and reply.tokens["total"] == 120
+
+
 # The two-turn orchestration in the harness: the opening turn's conversation
 # and identity are what the reply is sent on, the plant is keyed to the
 # conversation's Hermes session, and the run is graded on the reply.
