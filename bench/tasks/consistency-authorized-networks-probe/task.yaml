@@ -9,7 +9,7 @@
 # (2026-10-23); the case stays nightly by decision (#3605): with that route
 # reverted it still passed 10/10 on the inject lane (#4116), where the route
 # check is set aside, so a presubmit seat could not fail when the fix is
-# undone. The today lane grades the route.
+# undone. No CI lane grades the route today (the route comment below).
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
@@ -105,10 +105,13 @@ verification_spec:
       any_of_phrases:
         ["authorized network", "authorizednetworks", "authorized-networks"]
   # The route (#3605, #3609): the comparison is the drift collector's run.
-  # Graded on api-lane runs only (the today lanes, which grade over the
-  # agent API); an inject-lane run (the blocking presubmit since #3156, the
-  # main nightly since #3783) sets worker_commands checks aside as not
-  # applicable (#2039), so there the reply check alone grades. Same shape as
+  # Graded on api-lane runs only; an inject-lane run (the blocking presubmit
+  # since #3156, the nightly halves since #3783) sets worker_commands checks
+  # aside as not applicable (#2039), so there the reply check alone grades.
+  # Since #3969 retired the today-mode nightly, no CI job runs this file over
+  # the agent API, so the route is graded only when an api-lane run carries
+  # the case (as #3975's measuring run on pull-kube-agents-smoke-test-today
+  # did). Same shape as
   # drift-chat-request-runs-collector's the-drift-collector-ran.
   - name: the-comparison-ran-the-drift-collector
     role: objective

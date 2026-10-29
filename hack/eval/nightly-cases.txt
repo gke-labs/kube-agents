@@ -955,9 +955,10 @@
 # it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
 # 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
 # reverted (#4116), so a presubmit seat could not fail when the fix is undone:
-# the case stays nightly by decision (#3605), where the today lane grades its
-# route check. The domain's roster seat is consistency-drift-outlier since
-# 2026-10-26.
+# the case stays nightly by decision (#3605). No CI lane grades its route
+# check today (the nightly halves run through the inject door, the api-lane
+# jobs run the presubmit list only since #3969). The domain's roster seat is
+# consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change

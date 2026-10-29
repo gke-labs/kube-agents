@@ -144,7 +144,7 @@ with a filed issue naming the exit condition:
   #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
   2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
   `would-demote`. 15 of the 37 were Vertex 429s
-  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), fix open in
+  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), a fix proposed in
   [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
   being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
   still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
@@ -164,8 +164,11 @@ with a filed issue naming the exit condition:
   probe still passed 10/10 on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
   2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
   current models read the block correctly on their own, so a presubmit seat could not fail when
-  the fix it guards is undone. It stays a nightly case, where the today lane grades the route;
-  the domain's seat is consistency-drift-outlier's.
+  the fix it guards is undone. It stays a nightly case; the domain's seat is
+  consistency-drift-outlier's. No CI lane grades its route check today: the nightly halves run
+  through the inject door since #3783, and the api-lane jobs run the presubmit list only since
+  #3969 retired the today-mode nightly, so the route is graded only on an api-lane run that
+  carries the case, as #3975's today-lane measuring run did.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
