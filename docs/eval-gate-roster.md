@@ -159,16 +159,19 @@ with a filed issue naming the exit condition:
   second objective grades that the collector ran; #3448 was closed unmerged on 2026-10-26.
   Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26, agent on
   Claude): 9/9 scored on the inject lane and 10/10 on the api lane with the route objective
-  graded. Its roster line was withdrawn the same week
-  ([#3605](https://github.com/gke-labs/kube-agents/issues/3605)): with #3609's route reverted the
+  graded. Its roster line was withdrawn the same week, on #3975's review thread: with #3609's
+  route reverted the
   probe still passed 10/10 on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
   2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
   current models read the block correctly on their own, so a presubmit seat could not fail when
   the fix it guards is undone. It stays a nightly case; the domain's seat is
   consistency-drift-outlier's. No CI lane grades its route check today: the nightly halves run
-  through the inject door since #3783, and the api-lane jobs run the presubmit list only since
-  #3969 retired the today-mode nightly, so the route is graded only on an api-lane run that
-  carries the case, as #3975's today-lane measuring run did.
+  through the inject door since #3783, and since #3969 retired the today-mode nightly the
+  api-lane jobs that remain carry the presubmit list (the GitLab nightly its own list), not the
+  nightly file, so the route is graded only on an api-lane run that carries the case, as #3975's
+  today-lane measuring run did. Enters again only once a CI lane grades that route check (an
+  api-lane job that runs the nightly file, or the case on a list such a job reads) and the record
+  under it holds; #3598 stays open as that tracker, its Gemini-nightly bar retired with the lane.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
