@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -180,36 +181,44 @@ func TestTheRoutesServiceAndBudgetFitAClusterThatIsStillForming(t *testing.T) {
 	}
 }
 
-// 6222 is admitted from the bus's own servers and from nothing else, and only
-// on a multi-server bus.
+// 6222 is admitted from the bus's own servers and from nothing else, whatever
+// the server count: the rule does not follow the count, so no pass that reads
+// a count other than the one running (a refused spec edit that sets
+// busReplicas renders the fence without converting the bus) can cut a running
+// cluster's routes. Its scope is exactly one port, TCP 6222, and exactly one
+// peer, the bus's own pods in the agent's namespace.
 func TestTheBusFenceAdmitsRoutesFromItsOwnServersOnly(t *testing.T) {
-	routeRules := func(agent *agentv1alpha1.PlatformAgent) []int {
-		var idx []int
-		for i, rule := range buildA2ANATSNetworkPolicy(agent).Spec.Ingress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == a2aNATSRoutePort {
-					idx = append(idx, i)
+	desiredOne := a2aTestAgentWithBusReplicas(1)
+	desiredOne.Status.BusReplicas = 3 // a running cluster the spec would convert
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"default":                       a2aTestAgent(),
+		"busReplicas 1":                 a2aTestAgentWithBusReplicas(1),
+		"busReplicas 3":                 a2aTestAgentWithBusReplicas(3),
+		"spec 1 over a running cluster": desiredOne,
+	} {
+		t.Run(name, func(t *testing.T) {
+			np := buildA2ANATSNetworkPolicy(agent)
+			var rules []networkingv1.NetworkPolicyIngressRule
+			for _, rule := range np.Spec.Ingress {
+				for _, p := range rule.Ports {
+					if p.Port != nil && p.Port.IntValue() == a2aNATSRoutePort {
+						rules = append(rules, rule)
+					}
 				}
 			}
-		}
-		return idx
-	}
-	if got := routeRules(a2aTestAgentWithBusReplicas(1)); len(got) != 0 {
-		t.Errorf("a single-server bus's fence admits 6222 (rules %v)", got)
-	}
-	agent := a2aTestAgent()
-	np := buildA2ANATSNetworkPolicy(agent)
-	got := routeRules(agent)
-	if len(got) != 1 {
-		t.Fatalf("a cluster's fence has %d rules naming 6222, want exactly one", len(got))
-	}
-	rule := np.Spec.Ingress[got[0]]
-	if len(rule.Ports) != 1 {
-		t.Errorf("the route rule admits other ports too: %+v", rule.Ports)
-	}
-	if len(rule.From) != 1 || rule.From[0].PodSelector == nil || rule.From[0].NamespaceSelector != nil ||
-		len(rule.From[0].PodSelector.MatchLabels) != 1 || rule.From[0].PodSelector.MatchLabels["app"] != a2aNATSName(agent) {
-		t.Errorf("the route rule's peers are not exactly the bus's own pods: %+v", rule.From)
+			if len(rules) != 1 {
+				t.Fatalf("the fence has %d rules naming 6222, want exactly one", len(rules))
+			}
+			rule := rules[0]
+			if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP || rule.Ports[0].EndPort != nil {
+				t.Errorf("the route rule admits more than TCP 6222: %+v", rule.Ports)
+			}
+			if len(rule.From) != 1 || rule.From[0].PodSelector == nil || rule.From[0].NamespaceSelector != nil || rule.From[0].IPBlock != nil ||
+				len(rule.From[0].PodSelector.MatchLabels) != 1 || rule.From[0].PodSelector.MatchLabels["app"] != a2aNATSName(agent) ||
+				len(rule.From[0].PodSelector.MatchExpressions) != 0 {
+				t.Errorf("the route rule's peers are not exactly the bus's own pods: %+v", rule.From)
+			}
+		})
 	}
 }
 
@@ -1018,5 +1027,82 @@ func TestAFlipToTodayClearsTheBusServerCount(t *testing.T) {
 	}
 	if fresh.Status.BusReplicas != 0 {
 		t.Errorf("status.busReplicas = %d after the flip to today, want 0", fresh.Status.BusReplicas)
+	}
+}
+
+// A NATS pod the hostname spread holds Pending is named with the scheduler's
+// reason by the status pod scan, not blamed on the CR's RuntimeClass, which
+// the pod does not ask for: the remedy that message gives (a gVisor node pool)
+// does not add the node the spread waits for.
+func TestAnUnschedulableBusServerIsNotBlamedOnTheRuntimeClass(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")}}
+	if len(requestedRuntimeClasses(agent)) == 0 {
+		t.Fatal("precondition: the CR requests a RuntimeClass")
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-2", Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)}},
+		Status: corev1.PodStatus{Phase: corev1.PodPending, Conditions: []corev1.PodCondition{{
+			Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: "Unschedulable",
+			Message: "0/2 nodes are available: 2 node(s) didn't match pod topology spread constraints.",
+		}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	_, _, msg := r.getDeploymentStatusDetails(context.Background(), agent, true)
+	if strings.Contains(msg, "RuntimeClass") || strings.Contains(msg, "gVisor") {
+		t.Errorf("a bus server Pending under the spread is blamed on the RuntimeClass: %q", msg)
+	}
+	if !strings.Contains(msg, "topology spread") {
+		t.Errorf("the scheduler's reason is not in the message: %q", msg)
+	}
+}
+
+// The Ready message names a server short of the configured count, and says
+// nothing when every server is Ready.
+func TestTheReadyMessageNamesAMissingBusServer(t *testing.T) {
+	agent := a2aTestAgent()
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Status = appsv1.StatefulSetStatus{Replicas: 3, ReadyReplicas: 2}
+	ready := func(name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)}},
+			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}}
+	}
+	pending := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-2", Namespace: agent.Namespace, Labels: map[string]string{"app": a2aNATSName(agent)}},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Message: "0/2 nodes are available: 2 node(s) didn't match pod topology spread constraints."}}}}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(sts, ready(a2aNATSName(agent)+"-0"), ready(a2aNATSName(agent)+"-1"), pending).
+		WithStatusSubresource(&appsv1.StatefulSet{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	note := r.a2aNATSShortNote(context.Background(), agent)
+	if !strings.Contains(note, "2 of 3 NATS servers") || !strings.Contains(note, a2aNATSName(agent)+"-2: 0/2 nodes are available") {
+		t.Errorf("note = %q, want the count and the Pending server with the scheduler's reason", note)
+	}
+	if strings.Contains(note, "-0:") || strings.Contains(note, "-1:") {
+		t.Errorf("note names a Ready server: %q", note)
+	}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(sts), sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status.ReadyReplicas = 3
+	if err := cl.Status().Update(context.Background(), sts); err != nil {
+		t.Fatal(err)
+	}
+	if note := r.a2aNATSShortNote(context.Background(), agent); note != "" {
+		t.Errorf("note on a fully Ready bus = %q, want none", note)
+	}
+}
+
+// The pruned status.busReplicas record schedules its own reprobe and is
+// forgotten with the CR.
+func TestThePrunedBusReplicasRecordIsReprobedAndForgotten(t *testing.T) {
+	r := &PlatformAgentReconciler{}
+	agent := a2aTestAgent()
+	r.prunedBusReplicasStatus.Store(client.ObjectKeyFromObject(agent), time.Now())
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Errorf("requeue with a pruned busReplicas record = %s, want the reprobe interval %s", got, usageStatusReprobeInterval)
+	}
+	r.forgetUsageStatus(agent)
+	if r.busReplicasStatusPruned(agent) {
+		t.Error("the pruned busReplicas record outlived forgetUsageStatus")
 	}
 }
