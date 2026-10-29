@@ -26,7 +26,9 @@ older than the event's ``event_ts`` (or ``ts``). Both come from Slack's clock
 and an edit's event is stamped as it is made, so a real edit lands inside the
 window, while a later change to a parent edited once still carries that old
 ``edited.ts`` and would otherwise replay the opening ask. An event ts that does
-not parse keeps the change, so a missing field never drops a real edit. A
+not parse keeps the change, so a missing field never drops a real edit. One
+narrow gap is left: a bare change arriving within the window of the parent's
+edit, with a restart in between, still reads as that edit. A
 metadata change, a link unfurl and a bot-side rewrite of another message are not edits. The
 insertion returns None for a change that is not, after upstream's processed-ts
 check, so the edit-to-mention case keeps its single turn and everything
