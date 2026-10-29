@@ -40,7 +40,7 @@ from typing import Any
 import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import stop_hook
+from kube_agents_bench import scope_exclude, stop_hook
 
 __all__ = [
     "CASE_KEYS",
@@ -67,7 +67,8 @@ __all__ = [
 #   ``goal`` and ``input`` for ``prompt``), which the model cannot list.
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
-#   ``tool_calls_optional``, ``audit_streams`` -- and ``task_version``, a
+#   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
+#   ``scope_exclude.py``) -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
 #   pull request before any case a pull-request job grades uses it (the
 #   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
@@ -79,7 +80,7 @@ DEVOPS_BENCH_CASE_KEYS = (
 REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
-        "audit_streams", "task_version",
+        "audit_streams", scope_exclude.KEY, "task_version",
     }
 )
 CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
