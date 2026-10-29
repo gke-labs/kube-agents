@@ -1248,6 +1248,36 @@ spec:
           name: gitops-state-volume
 status: {}
 ---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  unhealthyPodEvictionPolicy: AlwaysAllow
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -365,8 +365,8 @@ const (
 	// Chat through the broker's relay and the messages wait in Pub/Sub,
 	// whereas Slack on a next install is the gateway's own socket, and an
 	// install with no Chat has no such queue to name.
-	credentialBrokerDownMessageSuffix     = "; while the credential broker is away, brokered commands fail"
-	credentialBrokerDownChatMessageSuffix = " and Google Chat messages wait in Pub/Sub"
+	credentialBrokerDownMessageSuffix     = "; while the credential broker is away, brokered commands fail" // #nosec G101 -- Condition message, not a credential
+	credentialBrokerDownChatMessageSuffix = " and Google Chat messages wait in Pub/Sub"                     // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
