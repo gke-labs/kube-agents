@@ -535,10 +535,10 @@ def tokens_text(count: float) -> str:
 
 
 def tokens_change(overall: dict) -> int | None:
-    """This week's tokens against last week's, in whole percent, over the
-    scenarios with a full count in both weeks, so a scenario whose counts
-    went partial does not move it; None without a trend this week or such
-    a scenario."""
+    """This week's tokens against last week's, in whole percent: the median
+    over the scenarios with a full count in both weeks of each scenario's
+    own median over its full counts, so a scenario's partial counts do not
+    move it; None without a trend this week or such a scenario."""
     now, before = overall["paired_tokens_median"], overall["prev_paired_tokens_median"]
     if overall["trend"] is None or now is None or not before:
         return None
@@ -904,8 +904,10 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     tokens = [n for c in common for n in this_cases[c]["tokens"]]
     overall["tokens_median"] = statistics.median(tokens) if tokens else None
     paired = [c for c in common if this_cases[c]["tokens"] and prev_cases[c]["tokens"]]
-    paired_tokens = [n for c in paired for n in this_cases[c]["tokens"]]
-    prev_paired_tokens = [n for c in paired for n in prev_cases[c]["tokens"]]
+    # Each paired scenario counts once, by its own median, so how many full
+    # counts it kept this week does not weigh it.
+    paired_tokens = [statistics.median(this_cases[c]["tokens"]) for c in paired]
+    prev_paired_tokens = [statistics.median(prev_cases[c]["tokens"]) for c in paired]
     overall["paired_tokens_median"] = statistics.median(paired_tokens) if paired_tokens else None
     overall["prev_paired_tokens_median"] = statistics.median(prev_paired_tokens) if prev_paired_tokens else None
     overall["counted_runs"] = len(tokens)

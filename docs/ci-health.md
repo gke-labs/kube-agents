@@ -1077,8 +1077,10 @@ A repetition's tokens are its record's `total`
 `total`, input plus output stands in, but that sum misses what the workers
 billed, so it counts as partial like a record marked `partial`. Partial counts
 are left out of the median and their number is shown. The change compares
-the two weeks' medians over the scenarios with a full count in both, so a
-scenario whose counts went partial does not move it. The tokens tile and the Chat line are
+the two weeks' figures over the scenarios with a full count in both weeks.
+Each such scenario's median is taken over its full counts in each week, and a
+week's figure is the median of those per-scenario medians, so every scenario
+weighs the same and its partial counts do not move it. The tokens tile and the Chat line are
 left out when no repetition the week compared carries a count.
 
 The page is written only when every check passes; otherwise the script prints

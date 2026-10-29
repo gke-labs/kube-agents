@@ -1060,6 +1060,21 @@ class Tokens(Base):
         self.assertEqual(we.chat_tokens(week), "🔢 Tokens: typical 200k per run (same as last week)")
         self.assertIn("; same as last week", page)
 
+    def test_a_scenario_keeping_one_full_count_does_not_move_the_change(self):
+        # Chat at 50k and the rest at 150k, both weeks. This week every
+        # non-chat scenario keeps one full count, the rest partial. Pooled,
+        # the 63 chat counts would pull the median to 50k (a 67% drop);
+        # each scenario weighs the same, so nothing changed.
+        runs = with_tokens(timed_runs(), lambda day, case: 50_000 if CASES[case] == "chat" else 150_000,
+                           partial=lambda day, case, n: day in THIS_WEEK and CASES[case] != "chat"
+                           and (day, n) != (THIS_WEEK[0], 1))
+        week, page = self.produce_week(runs)
+        self.assertEqual(week["overall"]["paired_tokens_median"], 150_000)
+        self.assertEqual(week["overall"]["prev_paired_tokens_median"], 150_000)
+        self.assertEqual(we.tokens_change(week["overall"]), 0)
+        self.assertIn("(same as last week)", we.chat_tokens(week))
+        self.assertIn("; same as last week", page)
+
     def test_the_page_and_the_card_show_the_same_numbers(self):
         for runs in (tokened_runs(), with_tokens(timed_runs(), lambda day, case: 1_234_567),
                      with_tokens(timed_runs(), lambda day, case: 200_000 if day in LAST_WEEK else 150_000)):
