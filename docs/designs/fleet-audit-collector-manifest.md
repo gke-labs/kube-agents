@@ -114,43 +114,45 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 
 `kcc_unready` and `kcc_unread` come from `kcc_health.py`. `kcc_unready` lists the Config Connector
 objects on that cluster whose `Ready` condition is `False`; `kcc_unread` says why the read of that
-cluster gave no answer, which is unknown and never healthy. Each `kcc_unready` entry is
-`{kind, namespace, name, why}`, with `resource` (the object's `spec.resourceID`), `cluster` (a
+cluster gave no answer, which is unknown and never healthy. Each `kcc_unready` entry is `{kind,
+namespace, name, why}`, with `resource` (the object's `spec.resourceID`), `cluster` (a
 `ContainerNodePool`'s `clusterRef`), `location` (the object's `spec.location`) and `project` where
 they are set. `project` is the object's `cnrm.cloud.google.com/project-id` annotation, else the same
 annotation on its namespace, else the namespace's name, as Config Connector itself decides it; the
-namespace name counts only when the namespaces read succeeded and returned that namespace. An empty list means the cluster runs Config Connector and nothing there
-is unready. An object with no `Ready` condition yet is left out, and so is one whose reason is
-`Updating` or `Deleting`: Config Connector sets those while it still applies the object.
+namespace name counts only when the namespaces read succeeded and returned that namespace. An empty
+list means the cluster runs Config Connector and nothing there is unready. An object with no `Ready`
+condition yet is left out, and so is one whose reason is `Updating` or `Deleting`: Config Connector
+sets those while it still applies the object.
 
-The compliance collector writes the keys from its read for `kcc-object-wedged`
-([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12), and
-takes the namespace annotations from its NetworkPolicy read. The drift, patch readiness and stockout
-collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool` declaration, read each
-collected cluster once after their sweep, in a new worker pool of the sweep's size, but only with
-`--config-connector`: the scheduled SOP commands pass it, and the chat route, which runs the same
-collectors with no `finish`, does not. The drift and patch readiness collectors mark a cluster whose
-`clusters list` record shows the Config Connector add-on enabled with `config_connector_addon`, and
-those clusters are read first. Drift and patch
-readiness fetch credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
-unready object has no project annotation, one `kubectl get namespaces` on that cluster gives the
-namespace annotations; when it fails, the project stays unknown. These reads end
-`kcc_health.RUN_DEADLINE_S` (540 s) after the collector starts, so the manifest prints inside the
-600 s terminal call; an entry whose read cannot start in time gets `kcc_unread`.
+The compliance collector always writes the keys, from the read its own `kcc-object-wedged` check
+makes ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12),
+and takes the namespace annotations from its NetworkPolicy read. The drift, patch readiness and
+stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool` declaration,
+read each collected cluster once after their sweep, in a new worker pool of the sweep's size, but
+only with `--config-connector`: the scheduled SOP commands pass it, and the chat route, which runs
+the same collectors with no `finish`, does not. The drift and patch readiness collectors mark a
+cluster whose `clusters list` record shows the Config Connector add-on enabled with
+`config_connector_addon`, and those clusters are read first. Drift and patch readiness fetch
+credentials for the read; stockout uses the kubeconfig its sweep fetched. When an unready object has
+no project annotation, one `kubectl get namespaces` on that cluster gives the namespace annotations;
+when it fails, the project stays unknown. These reads end `kcc_health.RUN_DEADLINE_S` (540 s) after
+the collector starts, so the manifest prints inside the 600 s terminal call; an entry whose read
+cannot start in time gets `kcc_unread`.
 
 Some entries are not read and get neither key: an entry with no project or no location, a
-`project/<id>` entry at location `global`, and an entry whose `cluster_status` (GKE's status, which
-the drift collector records because it marks every listed cluster `collected`) is not `RUNNING` or
-`RECONCILING`. An entry with no kubeconfig file gets `kcc_unread`. On a `collected` cluster entry
-that is read, neither key means that the API server does not serve the `gcp` category, so Config
-Connector does not run there.
+`project/<id>` entry at location `global`, and an entry whose `cluster_status` is not `RUNNING` or
+`RECONCILING`. The drift collector records `cluster_status` on every entry, because it marks every
+listed cluster `collected`; the stockout and compliance collectors record it on the entries of
+clusters that are not running. An entry with no kubeconfig file gets `kcc_unread`. On a `collected`
+cluster entry that is read, neither key means that the API server does not serve the `gcp` category,
+so Config Connector does not run there.
 
 `finish` counts the possible Config Connector hosts: the entries with either key, and, in the
 manifest of a collector that reads Config Connector, each cluster entry that it never read
 (`unreachable` or `gate-failed`) unless its `cluster_status` says it is not running. With more than
 one, `finish` names an object only when its `project` is known and agrees with the fix. With one, a
 known `project` that differs from the fix's is still no match. `finish` adds a note to a `manifest`
-fix whose file declares one of the objects, and states the stall on a merged fix that still
+fix whose file declares the finding's own object, and states the stall on a merged fix that still
 reproduces (the issue-ledger design, §6).
 
 Rules for a collector: every enumerated target appears with an `outcome`; a gate failure (zero-byte

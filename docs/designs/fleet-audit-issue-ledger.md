@@ -811,10 +811,12 @@ file sets one, and `clusterRef` when the file object and the recorded object bot
 `location` on the recorded object (its `spec.location`) must equal the file's `spec.location` or,
 for a cluster or a node pool, the location of the finding's cluster.
 
-When the file declares more than one Config Connector object, only the finding's own object counts:
-for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for `Cluster/<n>`, the
-`ContainerCluster` `<n>`; for another kind, the objects of that name, of that kind when the file
-declares it. A file with no object of the finding gives no note.
+Only the finding's own object in the file counts, also when the file declares one Config Connector
+object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for
+`Cluster/<n>`, the `ContainerCluster` `<n>`; for another kind, the objects of that name, of that kind
+when the file declares it. A `Deployment` fix in a file that also declares its `IAMServiceAccount`
+did not change that account, so a stall of the account gives it no note. A file with no object of
+the finding gives no note, no `kcc_stalled` and no fallback to the finding's own object.
 
 A match that is not certain gives no note. Two cases are by name: the same object is not ready on
 more than one host cluster and nothing tells them apart (Config Controller puts the objects of each
@@ -838,9 +840,10 @@ its location is known, so a `default-pool` of another cluster of the same name d
 
 The note is the last paragraph of the remediation note, starts "**Config Connector is not applying
 this file.**", and names each matched object and the controller's reason in code spans. When the
-reason is `DependencyNotReady`, it also names the object that the message references when that
-object is not ready on the same host cluster, and so on down the chain. It names at most two
-objects in the file, each with the unready objects it waits on, and counts the rest.
+reason is `DependencyNotReady` and the referenced object is not ready on the same host cluster, it
+follows the chain and names only the deepest unready object, the root cause, with a count of the
+ones between. It names at most two objects in the file and counts the rest. The note always fits
+the cap whole: the worker's text is cut or dropped first, then the text `finish` wrote before it.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
@@ -850,7 +853,7 @@ correct the declaration if the reason rejects the change, and that otherwise the
 when Config Connector applies the object again.
 
 The note fits the note cap: the worker's note is cut, and the text `finish` wrote at its start stays
-whole. Unlike a route note, it saves no `uncut_note`, so the carry removes the note but does not
+whole when there is room for it. Unlike a route note, it saves no `uncut_note`, so the carry removes the note but does not
 bring back the text it cut. The pass first removes an earlier copy of the note from every
 remediation, and the carry removes it too, so a note never shows a stall that this run's manifest
 does not. A cluster whose read failed (`kcc_unread`) records no objects, so no note names an object
