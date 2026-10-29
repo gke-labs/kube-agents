@@ -2008,6 +2008,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             "project": project_name,
             "location": c.get("location") or c.get("zone") or "",
             "autopilot": cluster_mode(c) == "autopilot",
+            # GKE's status, carried for the Config Connector read after the
+            # sweep (`kcc_health.annotate_manifest`), which reads only a
+            # running cluster: this entry is `collected` in every status.
+            "cluster_status": c.get("status") or "",
             # Still `collected` when a cohort floored out. Nothing was
             # compared, but nothing the model can run by hand would compare it
             # either -- the peers do not exist -- and `gate-failed` asks for

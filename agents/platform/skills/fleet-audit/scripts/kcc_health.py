@@ -110,6 +110,14 @@ OUTCOME_COLLECTED = "collected"
 # location `global`, hold the project-level reads and have no kubeconfig.
 PROJECT_TARGET_PREFIX = "project/"
 GLOBAL_LOCATION = "global"
+# GKE's cluster status, where a collector records it on the entry (the drift
+# collector marks every listed cluster `collected`, in any status), and the
+# statuses in which the cluster's API server answers. A cluster that is
+# PROVISIONING, STOPPING or in ERROR cannot run the Config Connector
+# controllers usefully, and a read there only spends the time budget, so it
+# is not read and is not a host.
+CLUSTER_STATUS_FIELD = "cluster_status"
+READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 # What `kcc_unread` says when the kubeconfig file is not there. kubectl does
 # not fail on a missing `KUBECONFIG` file: it reads the defaults or the
 # in-cluster account, which is another cluster.
@@ -321,7 +329,9 @@ def annotate_manifest(
     """Read every collected cluster in `manifest` once and add its keys.
 
     Only `collected` cluster entries that name a project and a location are
-    read: a `project/<id>` entry at location `global` is not a cluster. An
+    read: a `project/<id>` entry at location `global` is not a cluster, and
+    an entry whose `cluster_status` is not RUNNING or RECONCILING is not read
+    and gets no key. An
     entry that already carries either key was read by its collector. No read
     runs without a kubeconfig file: that entry gets `kcc_unread`.
     `deadline` is a `clock` time (`run_deadline`): every read ends before it,
@@ -342,6 +352,7 @@ def annotate_manifest(
         and entry.get("location")
         and entry.get("location") != GLOBAL_LOCATION
         and not str(entry.get("name") or "").startswith(PROJECT_TARGET_PREFIX)
+        and (not entry.get(CLUSTER_STATUS_FIELD) or entry.get(CLUSTER_STATUS_FIELD) in READABLE_STATUSES)
         and UNREADY_FIELD not in entry
         and UNREAD_FIELD not in entry
     ]

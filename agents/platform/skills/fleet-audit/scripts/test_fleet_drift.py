@@ -1778,6 +1778,15 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         self.assertNotIn("checks_not_applicable", entry)
         self.assertLessEqual(set(self.NA), {c["check"] for c in entry["commands"]})
 
+    def test_every_entry_carries_the_cluster_status(self):
+        """The Config Connector read after the sweep reads only a running
+        cluster, and this collector marks every cluster `collected`."""
+        clusters = [cluster(f"c{i}", labels={"environment": "prod"}) for i in range(4)]
+        clusters[0]["status"] = "STOPPING"
+        statuses = {entry["name"].rpartition("/")[2]: entry["cluster_status"] for entry in self.manifest(clusters)["clusters"]}
+        self.assertEqual(statuses["c0"], "STOPPING")
+        self.assertEqual(statuses["c1"], "RUNNING")
+
     def test_an_undersized_autopilot_cohort_still_declares_them(self):
         """The live fleet's shape: two Autopilot clusters in one cohort against
         a floor of three, so no facet compared and every facet slug is missing

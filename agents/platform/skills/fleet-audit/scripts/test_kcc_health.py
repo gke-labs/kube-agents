@@ -313,6 +313,41 @@ class AnnotateManifestTest(unittest.TestCase):
             self.assertNotIn("kcc_unread", entry)
             self.assertNotIn("kcc_unready", entry)
 
+    def test_a_cluster_that_is_not_running_is_not_read_and_is_not_a_host(self):
+        """The drift collector marks every listed cluster `collected`. A hub
+        with an unannotated stalled ContainerNodePool gives the note; a
+        STOPPING cluster beside it must not take the note away, and no read
+        runs on it."""
+        import audit_report  # noqa: PLC0415
+
+        pool = kcc_object(
+            "ContainerNodePool", "gpu-pool", status="False", reason="UpdateFailed",
+            spec={"clusterRef": {"name": "prod-usc1"}},
+        )
+        run = FakeRun({"hub": listing(pool)})
+        manifest = {
+            "clusters": [
+                {"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "cluster_status": "RUNNING"},
+                {"name": "acme/us-east1/going", "project": "acme", "location": "us-east1", "outcome": "collected", "cluster_status": "STOPPING"},
+            ]
+        }
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        hub, going = manifest["clusters"]
+        self.assertNotIn("kcc_unread", going)
+        self.assertNotIn("kcc_unready", going)
+        self.assertFalse([kc for _, kc in run.calls if "_going_" in kc])
+        root = Path(self.dir).parent / "repo"
+        (root / "pools").mkdir(parents=True)
+        (root / "pools" / "gpu.yaml").write_text(
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n  name: gpu-pool\n"
+            "  namespace: infra\nspec:\n  location: us-central1\n  clusterRef:\n    name: prod-usc1\n"
+        )
+        finding = {
+            "id": "f", "cluster": "acme/us-central1/prod-usc1", "object": "NodePool/gpu-pool",
+            "remediation": {"kind": "manifest", "path": "pools/gpu.yaml", "note": "Raise the ceiling."},
+        }
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, root), ["f"])
+
 
 class DeadlineTest(unittest.TestCase):
     """The reads end inside the collector's time budget, so the manifest
