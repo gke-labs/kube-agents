@@ -542,6 +542,11 @@ func New(o Options) (*Gateway, error) {
 			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
 		}, busBoardReader(o.Client))
 	}
+	// The board-health card's Retry and Drop, over the same route
+	// (slack_board.go); the adapter admits the presser by the Home tab's rule.
+	if sink, ok := o.Adapter.(BoardActSink); ok {
+		sink.SetBoardActor(busBoardActor(o.Client))
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner

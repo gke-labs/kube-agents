@@ -121,6 +121,12 @@ says every stuck task again, which is the loud side to fail on. The other
 findings (invariant violations, the engine's other rules) are rare and stay
 stateless, under ``REPORT_HEADER``.
 
+A run whose stuck tasks are all it says also leaves the card file
+(``CARD_SUFFIX``, beside the record): the rows as said, each with the ids of
+the cards it stands for, and the text. The relay lays it out in Slack with
+Retry and Drop on each row (``board_health_card.py``); every other run removes
+it, and a card whose text is not the report is not used.
+
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 (a hand run updates the record; point ``KANBAN_HEALTH_STATE`` elsewhere to keep it)
 """
@@ -179,9 +185,10 @@ OMISSION_LINE_RESERVE = 120
 # chat adapters (and the gateway under `spec.mode: next`) turn into each
 # platform's bold.
 STUCK_HEADLINE = (
-    "**{count} task is stuck and needs someone to decide.**",
-    "**{count} tasks are stuck and need someone to decide.**",
+    "{count} task is stuck and needs someone to decide.",
+    "{count} tasks are stuck and need someone to decide.",
 )
+STUCK_BOLD = "**{text}**"
 STUCK_ROW_TITLE = "**{title}**"
 STUCK_GROUP_SUFFIX = " ({count} tasks)"
 UNTITLED_TASK = "Untitled task"
@@ -242,6 +249,13 @@ STATE_SCHEMA_VERSION = 1
 STATE_VERSION_KEY = "version"
 STATE_SAID_KEY = "said"
 STATE_SAID_AT_KEY = "said_at"
+# The card the relay lays out with Retry and Drop on each row
+# (board_health_card.py): the stuck rows as said, each with the ids it stands
+# for, written beside the record when the stuck tasks are said alone and
+# removed on every other run. It carries the text it was said with, so the
+# relay lays it out only for the post it describes.
+CARD_SUFFIX = ".card.json"
+CARD_SCHEMA_VERSION = 1
 
 # The line a run where the engine did not answer returns, and how `report`
 # tells that run from a clean one: its stuck cards are unknown, not absent.
@@ -504,38 +518,85 @@ def status_line(person: bool, age_hours: float) -> str:
     return STOPPED_LINE.format(age=age) if age else STOPPED_LINE_NO_AGE
 
 
-def render_stuck_tasks(tasks: list) -> list:
-    """The stuck tasks as chat lines: a headline counting every task, then a row per title.
+def stuck_rows(tasks: list) -> tuple[str, list, int]:
+    """The stuck tasks as a headline counting every task, a row per title, and how many tasks no row shows.
 
     Rows are newest first. Tasks sharing a title as shown (``plain_title``)
     and whether they wait on a person are one row with their count, aged by the
     one that has waited longest, so two rows never read the same. Past
-    ``MAX_STUCK_ROWS`` the rest are counted. Empty for no tasks.
+    ``MAX_STUCK_ROWS`` the rest are counted. Each row is ``title``, ``count``,
+    ``status`` (its status line), ``held`` (its holding-back line, or "") and
+    ``tasks``, the ids it stands for, which Retry and Drop act on.
     """
-    if not tasks:
-        return []
     groups = collections.OrderedDict()
     for task in tasks:
         groups.setdefault((plain_title(task["title"]), task["person"]), []).append(task)
-    rows = sorted(
+    ordered = sorted(
         groups.values(),
         key=lambda group: (min(t["age_hours"] for t in group), group[0]["title"]),
     )
+    rows = [
+        {
+            "title": plain_title(group[0]["title"]),
+            "count": len(group),
+            "status": status_line(group[0]["person"], max(t["age_hours"] for t in group)),
+            "held": held_line(group) or "",
+            "tasks": [t["task_id"] for t in group],
+        }
+        for group in ordered[:MAX_STUCK_ROWS]
+    ]
     noun = STUCK_HEADLINE[0] if len(tasks) == 1 else STUCK_HEADLINE[1]
-    lines = [noun.format(count=len(tasks))]
-    for group in rows[:MAX_STUCK_ROWS]:
-        title = STUCK_ROW_TITLE.format(title=plain_title(group[0]["title"]))
-        if len(group) > 1:
-            title += STUCK_GROUP_SUFFIX.format(count=len(group))
-        oldest = max(t["age_hours"] for t in group)
-        lines.extend(["", title, status_line(group[0]["person"], oldest)])
-        held = held_line(group)
-        if held:
-            lines.append(held)
-    hidden = sum(len(group) for group in rows[MAX_STUCK_ROWS:])
+    return noun.format(count=len(tasks)), rows, sum(len(group) for group in ordered[MAX_STUCK_ROWS:])
+
+
+def render_stuck_tasks(tasks: list) -> list:
+    """The stuck tasks as chat lines (``stuck_rows``): the headline, then each row. Empty for no tasks."""
+    if not tasks:
+        return []
+    headline, rows, hidden = stuck_rows(tasks)
+    lines = [STUCK_BOLD.format(text=headline)]
+    for row in rows:
+        title = STUCK_ROW_TITLE.format(title=row["title"])
+        if row["count"] > 1:
+            title += STUCK_GROUP_SUFFIX.format(count=row["count"])
+        lines.extend(["", title, row["status"]])
+        if row["held"]:
+            lines.append(row["held"])
     if hidden:
         lines.extend(["", STUCK_MORE_LINE.format(count=hidden)])
     return lines
+
+
+def stuck_card(tasks: list, text: str) -> dict:
+    """The card file's contents for stuck tasks said as ``text`` (``CARD_SUFFIX``)."""
+    headline, rows, hidden = stuck_rows(tasks)
+    return {
+        STATE_VERSION_KEY: CARD_SCHEMA_VERSION,
+        "text": text,
+        "headline": headline,
+        "rows": rows,
+        "more": STUCK_MORE_LINE.format(count=hidden) if hidden else "",
+    }
+
+
+def card_path(home: Path, env=None) -> Path:
+    """The card file, beside the record (``state_path``)."""
+    return state_path(home, env).with_suffix(CARD_SUFFIX)
+
+
+def save_card(path: Path, card: dict | None) -> None:
+    """Write the card atomically, or remove it for None. A card that cannot be
+    written leaves the post as text: the relay finds no card for it."""
+    try:
+        if card is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + STATE_TMP_SUFFIX)
+        tmp.write_text(json.dumps(card, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def state_path(home: Path, env=None) -> Path:
@@ -855,9 +916,11 @@ def main(argv=None, *, env=None, now=None) -> int:
     except sqlite3.Error as exc:
         if state != recorded:
             save_state(path, state)
+        save_card(card_path(home, env), None)
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
     out = []
+    said = []
     # An engine that did not answer leaves the ids as they were: saving would
     # forget every task said, and the next answer would say them all again.
     if tasks is not None:
@@ -865,13 +928,18 @@ def main(argv=None, *, env=None, now=None) -> int:
         # Rendered before the record is saved, so a card that fails to render
         # is not remembered as said.
         out = render_stuck_tasks(tasks) if due else []
+        said = tasks if due else []
     # Compared with what is on disk, so a forgotten post is written down even
     # on a day the new record matches the empty one.
     if state != recorded:
         save_state(path, state)
+    # The card is the stuck tasks alone: a report that also carries the other
+    # findings posts as text.
+    card = stuck_card(said, "\n".join(out)) if said and not lines else None
     if lines:
         out.extend([""] if out else [])
         out.extend([REPORT_HEADER, *lines])
+    save_card(card_path(home, env), card)
     if out:
         print("\n".join(out))
     return 0

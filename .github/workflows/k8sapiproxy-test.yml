@@ -6,11 +6,13 @@ name: k8s-api-proxy Tests
 # missing.
 #
 # The trigger arrangement is a2a-test.yml's, for the reasons its header
-# comment gives: `Run k8s-api-proxy Tests` is meant to be a required check, so
-# on a pull request and in the merge queue the job always starts and the
-# `Detect changes` step decides whether to test; on a push to main the
-# `paths:` filter decides instead. Keep the `paths:` list and the
-# `k8sapiproxy:` filter below identical.
+# comment gives: `Run k8s-api-proxy Tests` is a required check, so on a pull
+# request and in the merge queue the job always starts and the `Detect changes`
+# step decides whether to test, which keeps unrelated changes unblocked; on a
+# push to main the `paths:` filter decides instead, which is what lets
+# main-broken-notify.yml read the push history. Keep the `paths:` list and the
+# `k8sapiproxy:` filter below identical; tests/test_push_paths_match_change_filter.py
+# fails when they differ.
 on:
   pull_request:
     branches: [main, "release/**"]

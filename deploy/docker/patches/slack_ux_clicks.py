@@ -12,7 +12,7 @@ picker) and on buttons a plugin registered. Nothing handles the buttons
 ``slack_presenter`` lays out, so Slack delivers the ``block_actions`` and the
 click does nothing.
 
-With the flag on, :func:`register` adds two listeners:
+With the flag on, :func:`register` adds three listeners:
 
 * A choice button (``<prefix>.choice.<n>``) is the clicker answering in the
   thread with the button's text as Slack showed it. Not its ``value``: the
@@ -51,6 +51,9 @@ With the flag on, :func:`register` adds two listeners:
   can do nothing its clicker could not do by typing the label.
 * A link button (``<prefix>.link.<n>``) is acknowledged and nothing else;
   Slack has already opened the url.
+* A board-health row's Retry or Drop (``kage_board.retry``, ``kage_board.drop``)
+  acts on the cards the row stands for and edits the row; never a turn. See
+  the section above :func:`board_action`.
 
 When the clicked message is a card's question (``gateway/slack_ux_moments.py``),
 the turn also names the card, after the label or the shown line its value
@@ -110,9 +113,13 @@ typed apply runs no turn, whether or not its rewrite lands.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import re
+import time
+import urllib.request
 from collections import OrderedDict
 from typing import Any
 
@@ -245,6 +252,34 @@ SLACK_TEXT_MAX = 40000
 SECTION_TEXT_MAX = 3000
 MESSAGE_BLOCKS_MAX = 50
 
+#: The board-health card's Retry and Drop (``board_health_card.ACTION_ID`` and
+#: ``ROW_BLOCK_ID``, copied: that module is not on this process's path). A
+#: button's value is its row's card ids; its actions block's id names the row.
+BOARD_ACTION_ID_PATTERN = re.compile(r"^kage_board\.(retry|drop)$")
+BOARD_KIND = "kage board"
+BOARD_VALUE_SEPARATOR = ","
+#: The line a tapped row's buttons give way to, or, when a row's tap did not
+#: land, sit above: its block id is the row's with this suffix.
+BOARD_NOTE_SUFFIX = ".note"
+#: Session KV's loopback route that acts on a row (``POST /v1/board/actions``),
+#: spelled as ``kanban_notifier.SESSION_KV_URL`` spells the server, and the
+#: variable holding its bearer. The route answers inside the card stop's 24 s
+#: bound; the wait is a little longer.
+SESSION_KV_URL = "http://127.0.0.1:8699"
+BOARD_ACTIONS_PATH = "/v1/board/actions"
+SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
+BOARD_ACTION_TIMEOUT_SECONDS = 30.0
+#: The route's outcomes for a card: acted on; no longer blocked; no such card.
+BOARD_DONE = "done"
+BOARD_SETTLED_OUTCOMES = frozenset({"moved", "gone"})
+#: What a tapped row says, naming the clicker and the time; the time as Slack's
+#: date token, which each reader sees in their own time zone.
+BOARD_DONE_LINES = {"retry": "✓ Retrying. {name}, {time}", "drop": "Dropped. {name}, {time}"}
+BOARD_MOVED_LINE = "No longer stuck. {name}, {time}"
+BOARD_FAILED_LINES = {"retry": "Couldn't retry it just now. Try again.", "drop": "Couldn't drop it just now. Try again."}
+SLACK_TIME = "<!date^{epoch}^{{time}}|{fallback}>"
+SLACK_TIME_FALLBACK = "%H:%M UTC"
+
 #: ``(channel, ts, kind)`` a click answered.
 _answered: OrderedDict[tuple, None] = OrderedDict()
 #: The keys of ``_answered`` whose rewrite landed.
@@ -270,7 +305,7 @@ def enabled() -> bool:
 
 
 def register(adapter: Any) -> None:
-    """Add the choice and link listeners to ``adapter._app``.
+    """Add the choice, link and board listeners to ``adapter._app``.
 
     A choice click's turn is the label Slack showed, or the value when it is
     that label naming a whole line the message shows; either way, a click on a
@@ -282,7 +317,12 @@ def register(adapter: Any) -> None:
 
     adapter._app.action(_presenter.CHOICE_ACTION_ID_PATTERN)(on_choice)
     adapter._app.action(_presenter.LINK_ACTION_ID_PATTERN)(_presenter.ack_link_click)
-    logger.info("slack_ux_clicks: choice and link button handlers registered")
+
+    async def on_board(ack, body, action):
+        await board_action(adapter, ack, body, action)
+
+    adapter._app.action(BOARD_ACTION_ID_PATTERN)(on_board)
+    logger.info("slack_ux_clicks: choice, link and board button handlers registered")
 
 
 def _unescape(text: str) -> str:
@@ -810,3 +850,142 @@ async def answer(adapter: Any, ack: Any, body: dict, action: dict, kind: str) ->
     if team_id:
         synthetic["team"] = team_id
     await adapter._handle_slack_message(synthetic)
+
+
+# --------------------------------------------------------------------------
+# Retry and Drop on the board-health card (agents/platform/scripts/board_health_card.py).
+#
+# Each stuck row carries the ids of the cards it stands for in its buttons'
+# value. A tap is authorized as a choice click is (the adapter's interactive
+# authorization, then the channel gate a typed message meets), and acts
+# through session-kv's ``POST /v1/board/actions``, which unblocks or archives
+# only cards still blocked. It is never a turn. The row is then edited in
+# place: its buttons give way to "✓ Retrying. <name>, <time>" or "Dropped.
+# <name>, <time>" (or "No longer stuck. <name>, <time>" when the cards had already moved);
+# a tap that did not land keeps the buttons, with a line saying so, and the
+# row can be tapped again. One tap per row at a time, in this process.
+# --------------------------------------------------------------------------
+
+#: ``(channel, ts, row block id)`` of a row whose tap is running or landed.
+_board_tapped: OrderedDict[tuple, None] = OrderedDict()
+#: ``(channel, ts)`` of a card a tap edited: the lock its edits take, and the
+#: blocks the last one sent, or None before any landed.
+_board_edits: OrderedDict[tuple, tuple[asyncio.Lock, list | None]] = OrderedDict()
+
+
+def _board_request(verb: str, tasks: list[str], by: str) -> list[dict]:
+    """POST the row's cards to session-kv; its per-card results. Raises on any failure."""
+    token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        SESSION_KV_URL + BOARD_ACTIONS_PATH,
+        data=json.dumps({"action": verb, "tasks": tasks, "by": by}).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=BOARD_ACTION_TIMEOUT_SECONDS) as response:  # noqa: S310 - loopback
+        body = json.loads(response.read() or b"{}")
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list):
+        raise ValueError("session-kv answered with no results")
+    return results
+
+
+def board_outcome(results: list[dict]) -> str:
+    """One word for a row: ``failed`` when any card was not settled, so the row keeps
+    its buttons and a second tap reaches the cards left; else ``done`` when any card
+    was acted on, ``moved`` when every card was already unstuck or gone."""
+    outcomes = {str((r or {}).get("outcome") or "") for r in results}
+    if not outcomes or outcomes - BOARD_SETTLED_OUTCOMES - {BOARD_DONE}:
+        return "failed"
+    return BOARD_DONE if BOARD_DONE in outcomes else "moved"
+
+
+def board_line(verb: str, outcome: str, name: str, now: float) -> str:
+    """The row's line after a tap: who and when for one that settled it, a retry ask otherwise."""
+    if outcome not in (BOARD_DONE, "moved"):
+        return BOARD_FAILED_LINES[verb]
+    stamp = SLACK_TIME.format(epoch=int(now), fallback=time.strftime(SLACK_TIME_FALLBACK, time.gmtime(now)))
+    template = BOARD_DONE_LINES[verb] if outcome == BOARD_DONE else BOARD_MOVED_LINE
+    return template.format(name=name, time=stamp)
+
+
+def board_row_blocks(blocks: Any, block_id: str, line: str, settled: bool) -> list[dict]:
+    """``blocks`` with the row's line put in: in place of its buttons when ``settled``,
+    else just above them, replacing any line an earlier tap left."""
+    note_id = block_id + BOARD_NOTE_SUFFIX
+    note = {"type": "context", "block_id": note_id, "elements": [{"type": "mrkdwn", "text": line}]}
+    out: list[dict] = []
+    for block in blocks or ():
+        if not isinstance(block, dict) or block.get("block_id") == note_id:
+            continue
+        if block.get("block_id") == block_id:
+            out.append(note)
+            if not settled:
+                out.append(block)
+            continue
+        out.append(block)
+    return out
+
+
+async def board_action(adapter: Any, ack: Any, body: dict, action: dict) -> None:
+    """Authorize a Retry or Drop tap, act on its row's cards, and edit the row to say so."""
+    started = await adapter._begin_interaction(ack, body, action, BOARD_KIND)
+    if started is None:
+        return
+    team_id, action_id, value, message, msg_ts, channel_id, _user_name, user_id = started
+    matched = BOARD_ACTION_ID_PATTERN.match(str(action_id or ""))
+    block_id = str(action.get("block_id") or "")
+    tasks = [task for task in str(value or "").split(BOARD_VALUE_SEPARATOR) if task]
+    if not (matched and block_id and tasks and msg_ts and channel_id and user_id):
+        logger.warning("slack_ux_clicks: dropping a %s tap on %s with no row, card or user", BOARD_KIND, msg_ts or "an unknown message")
+        return
+    if _gated_out(adapter, channel_id, body):
+        logger.info("slack_ux_clicks: ignoring a %s tap in %s, which the adapter ignores", BOARD_KIND, channel_id)
+        return
+    key = (channel_id, msg_ts, block_id)
+    if key in _board_tapped:
+        logger.info("slack_ux_clicks: dropping a second %s tap on %s %s", BOARD_KIND, msg_ts, block_id)
+        return
+    _board_tapped[key] = None
+    while len(_board_tapped) > ANSWERED_MAX:
+        _board_tapped.popitem(last=False)
+    verb = matched.group(1)
+    name = await clicker_name(adapter, body, user_id, channel_id, team_id)
+    try:
+        outcome = board_outcome(await asyncio.to_thread(_board_request, verb, tasks, name))
+    except Exception as exc:  # noqa: BLE001 - the row says it did not land, and keeps its buttons
+        logger.warning("slack_ux_clicks: %s on %s did not land: %s", verb, ", ".join(tasks), exc)
+        outcome = "failed"
+    settled = outcome != "failed"
+    if not settled:
+        _board_tapped.pop(key, None)
+    logger.info("slack_ux_clicks: %s by %s on %s: %s", verb, user_id, ", ".join(tasks), outcome)
+    line = board_line(verb, outcome, name, time.time())
+    message_key = (channel_id, msg_ts)
+    if message_key not in _board_edits:
+        _board_edits[message_key] = (asyncio.Lock(), None)
+        while len(_board_edits) > ANSWERED_MAX:
+            _board_edits.popitem(last=False)
+    lock = _board_edits[message_key][0]
+    # One edit of a message at a time, each from the blocks the last one sent: a
+    # tap's payload holds the message as it was when tapped, and another row's
+    # edit may have landed since.
+    async with lock:
+        sent = _board_edits.get(message_key, (lock, None))[1]
+        blocks = board_row_blocks(sent if sent is not None else message.get("blocks"), block_id, line, settled)
+        try:
+            await adapter._get_client(channel_id, team_id=team_id).chat_update(
+                channel=channel_id, ts=msg_ts, text=str(message.get("text") or ""), blocks=blocks,
+            )
+            _board_edits[message_key] = (lock, blocks)
+        except Exception as exc:  # noqa: BLE001 - the cards moved either way; a re-tap redraws the row
+            # A failed tap was released already; popping again could free a newer
+            # tap's claim. The edit may have landed though its answer did not, so
+            # the next edit builds from its own tap's payload.
+            if settled:
+                _board_tapped.pop(key, None)
+            _board_edits[message_key] = (lock, None)
+            logger.warning("slack_ux_clicks: could not edit the board row on %s: %s", msg_ts, exc)
