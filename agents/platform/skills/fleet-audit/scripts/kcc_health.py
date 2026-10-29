@@ -117,13 +117,6 @@ NO_KUBECONFIG_REASON = (
     "no kubeconfig at {path}, so the read did not run and whether Config Connector applies "
     "its objects here is not known."
 )
-# Where the fetched kubeconfigs go: collect.py's `KUBECONFIG_DIR`, which
-# `collect.usable_kubeconfig_dir` makes usable.
-KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
-# The file name of one cluster's kubeconfig in `KUBECONFIG_DIR`: the name
-# collect.py's `kubeconfig_path` gives it, so every collector writes one file
-# for a cluster.
-KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
 
 class Result(NamedTuple):
@@ -276,9 +269,12 @@ def _time_left(deadline: float, clock: ClockFn) -> int:
 
 
 def _annotate_entry(
-    entry: dict, run: RunFn, kubeconfig_dir: Path, deadline: float, clock: ClockFn, kubeconfig_for: KubeconfigFn | None
+    entry: dict, run: RunFn, deadline: float, clock: ClockFn, kubeconfig_for: KubeconfigFn | None
 ) -> dict:
     """Fetch one cluster's credentials and read it; the keys for its entry.
+
+    The kubeconfig goes where `collect.kubeconfig_path` puts it, so every
+    collector writes one file for a cluster.
 
     Each step's timeout is cut to the time left before `deadline`, so the
     read ends before it. A step that cannot start in time is not run.
@@ -291,9 +287,9 @@ def _annotate_entry(
         left = _time_left(deadline, clock)
         if not left:
             return _budget_spent()
-        from collect import prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+        from collect import kubeconfig_path, prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
 
-        kubeconfig = kubeconfig_dir / KUBECONFIG_NAME.format(project=project, cluster=cluster, location=location)
+        kubeconfig = kubeconfig_path(project, cluster, location)
         note = prepare_kubeconfig(kubeconfig)
         if note:
             return {UNREAD_FIELD: f"{note}, so whether Config Connector applies its objects here is not known."}
@@ -318,7 +314,6 @@ def annotate_manifest(
     *,
     deadline: float,
     run: RunFn = default_run,
-    kubeconfig_dir: Path = KUBECONFIG_DIR,
     mapper: MapFn = map,
     clock: ClockFn = time.monotonic,
     kubeconfig_for: KubeconfigFn | None = None,
@@ -355,7 +350,7 @@ def annotate_manifest(
 
     def one(entry: dict) -> dict:
         try:
-            return _annotate_entry(entry, run, kubeconfig_dir, deadline, clock, kubeconfig_for)
+            return _annotate_entry(entry, run, deadline, clock, kubeconfig_for)
         except Exception as exc:  # noqa: BLE001 -- the manifest stands without this read
             return {UNREAD_FIELD: f"the read raised {type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS]}
 
@@ -366,11 +361,11 @@ def annotate_manifest(
                 entry.update(_budget_spent())
             return
         if kubeconfig_for is None:
-            from collect import usable_kubeconfig_dir  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+            import collect  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
 
             # Made usable once before the pool opens, as fleet_stockout.py
             # does: the threads would otherwise race one another's move-aside.
-            note = usable_kubeconfig_dir(kubeconfig_dir)
+            note = collect.usable_kubeconfig_dir(collect.KUBECONFIG_DIR)
             if note:
                 for entry in targets:
                     entry[UNREAD_FIELD] = f"{note}, so whether Config Connector applies its objects here is not known."

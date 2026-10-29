@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
+import collect  # noqa: E402
 import kcc_health  # noqa: E402
 
 
@@ -164,6 +165,10 @@ class AnnotateManifestTest(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.dir = Path(scratch.name) / ".kubeconfigs"
+        # collect.py owns the directory and the file name.
+        patcher = mock.patch.object(collect, "KUBECONFIG_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.now = 0.0
         self.deadline = kcc_health.run_deadline(0.0)
 
@@ -196,7 +201,7 @@ class AnnotateManifestTest(unittest.TestCase):
             }
         )
         manifest = self.manifest()
-        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
         hub, edge, slow, gone, read = manifest["clusters"]
         self.assertEqual([r["name"] for r in hub["kcc_unready"]], ["prod-usc1", "fleet-events"])
         self.assertNotIn("kcc_unready", edge)
@@ -220,13 +225,13 @@ class AnnotateManifestTest(unittest.TestCase):
             return map(fn, items)
 
         manifest = self.manifest()
-        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, mapper=mapper, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, mapper=mapper, clock=self.clock)
         self.assertEqual(mapped, ["acme/us-central1/hub", "acme/us-east1/edge", "acme/us-west1/slow"])
 
     def test_a_credential_failure_is_unknown(self):
         run = FakeRun({}, credentials_rc=1)
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
-        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
         self.assertIn("get-credentials exited 1", manifest["clusters"][0]["kcc_unread"])
 
     def test_a_read_that_raises_is_unknown_and_keeps_the_manifest(self):
@@ -234,7 +239,7 @@ class AnnotateManifestTest(unittest.TestCase):
             raise RuntimeError("boom")
 
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
-        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
         self.assertIn("RuntimeError", manifest["clusters"][0]["kcc_unread"])
 
 
@@ -244,7 +249,7 @@ class AnnotateManifestTest(unittest.TestCase):
         run = FakeRun({"hub": listing()})
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
         with mock.patch("collect.usable_kubeconfig_dir", return_value="owned by uid 0") as rule:
-            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
         rule.assert_called_once_with(self.dir)
         self.assertIn("owned by uid 0", manifest["clusters"][0]["kcc_unread"])
         self.assertEqual(run.calls, [])
@@ -253,9 +258,20 @@ class AnnotateManifestTest(unittest.TestCase):
         run = FakeRun({"hub": listing()})
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
         with mock.patch("collect.prepare_kubeconfig", return_value=None) as prepare:
-            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
         prepare.assert_called_once_with(self.dir / "kubeconfig_acme_hub_us-central1.yaml")
         self.assertEqual(manifest["clusters"][0]["kcc_unready"], [])
+
+    def test_the_kubeconfig_path_is_collects(self):
+        """`collect.kubeconfig_path` names the file, not a copy of its rule."""
+        run = FakeRun({"hub": listing()})
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        named = self.dir / "named_by_collect_hub_.yaml"
+        with mock.patch.object(collect, "kubeconfig_path", return_value=named) as path:
+            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        path.assert_called_once_with("acme", "hub", "us-central1")
+        self.assertEqual({kubeconfig for _, kubeconfig in run.calls}, {str(named)})
+        self.assertFalse(hasattr(kcc_health, "KUBECONFIG_NAME"))
 
     def test_a_kubeconfig_the_collector_fetched_is_reused(self):
         run = FakeRun({"hub": listing(STALLED_TOPIC)})
@@ -264,7 +280,7 @@ class AnnotateManifestTest(unittest.TestCase):
         swept.parent.mkdir(parents=True)
         swept.write_text("apiVersion: v1\n")
         kcc_health.annotate_manifest(
-            manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock, kubeconfig_for=lambda entry: swept
+            manifest, deadline=self.deadline, run=run, clock=self.clock, kubeconfig_for=lambda entry: swept
         )
         self.assertEqual(run.calls, [(["kubectl", "get", "gcp", "-A", "-o", "json"], str(swept))])
         self.assertEqual([r["name"] for r in manifest["clusters"][0]["kcc_unready"]], ["fleet-events"])
@@ -276,7 +292,7 @@ class AnnotateManifestTest(unittest.TestCase):
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
         missing = self.dir / "kubeconfig_acme_hub_us-central1.yaml"
         kcc_health.annotate_manifest(
-            manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock, kubeconfig_for=lambda entry: missing
+            manifest, deadline=self.deadline, run=run, clock=self.clock, kubeconfig_for=lambda entry: missing
         )
         self.assertEqual(run.calls, [])
         self.assertIn("no kubeconfig", manifest["clusters"][0]["kcc_unread"])
@@ -291,7 +307,7 @@ class AnnotateManifestTest(unittest.TestCase):
                 {"name": "acme/global/odd", "project": "acme", "location": "global", "outcome": "collected"},
             ]
         }
-        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
         self.assertEqual(run.calls, [])
         for entry in manifest["clusters"]:
             self.assertNotIn("kcc_unread", entry)
@@ -306,6 +322,10 @@ class DeadlineTest(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.dir = Path(scratch.name) / ".kubeconfigs"
+        # collect.py owns the directory and the file name.
+        patcher = mock.patch.object(collect, "KUBECONFIG_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.now = 0.0
 
     def clock(self):
@@ -343,7 +363,7 @@ class DeadlineTest(unittest.TestCase):
         deadline = kcc_health.run_deadline(0.0)
         run, timeouts = self.slow_run(10, 105)
         manifest = self.entries("a", "b", "c")
-        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, clock=self.clock)
         self.assertLessEqual(self.now, deadline)
         self.assertLessEqual(deadline, kcc_health.TERMINAL_TIMEOUT_S - kcc_health.PRINT_MARGIN_S)
         a, b, c = manifest["clusters"]
@@ -359,7 +379,7 @@ class DeadlineTest(unittest.TestCase):
         deadline = kcc_health.run_deadline(0.0)
         run, timeouts = self.slow_run(59, 1000)
         manifest = self.entries("a")
-        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, clock=self.clock)
         self.assertEqual(timeouts, [("gcloud", 60), ("kubectl", 61)])
         self.assertIn("did not finish in 61s", manifest["clusters"][0]["kcc_unread"])
         self.assertLessEqual(self.now, deadline)
@@ -369,7 +389,7 @@ class DeadlineTest(unittest.TestCase):
         deadline = kcc_health.run_deadline(0.0)
         run, timeouts = self.slow_run(1, 1)
         manifest = self.entries("a")
-        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, kubeconfig_dir=self.dir, clock=self.clock)
+        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, clock=self.clock)
         self.assertEqual(timeouts, [("gcloud", 40), ("kubectl", 39)])
         self.assertEqual(manifest["clusters"][0]["kcc_unready"], [])
 
@@ -379,7 +399,7 @@ class DeadlineTest(unittest.TestCase):
 
         manifest = self.entries("a")
         kcc_health.annotate_manifest(
-            manifest, deadline=kcc_health.run_deadline(0.0), run=self.slow_run(1, 1)[0], kubeconfig_dir=self.dir, mapper=mapper, clock=self.clock
+            manifest, deadline=kcc_health.run_deadline(0.0), run=self.slow_run(1, 1)[0], mapper=mapper, clock=self.clock
         )
         self.assertIn("RuntimeError", manifest["clusters"][0]["kcc_unread"])
 
