@@ -5,10 +5,11 @@ shared with the renderer and the publisher -- see SCHEMA.md in this directory
 before changing any field. `render.py` turns one data.json (schema_version 1)
 into six pages -- `index.html` (the incident Brief), `run.html` (the per-run
 PR view), `grid.html` (every case by every run, with the merges and
-incidents marked), `cases.html` (how reliable each test is) and
-`nightly.html` (last night's run of the nightly tier, `nightly.py`) and
-`trend.html` (scores over time on main from the evidence store `store.py`
-reads, `trend.py`) -- plus
+incidents marked), `cases.html` (how reliable each test is, and its
+scenarios view: what kube-agents can do, scenario by scenario, with a
+confidence level per case), `nightly.html` (last night's run of the nightly
+tier, `nightly.py`) and `trend.html` (scores over time on main from the
+evidence store `store.py` reads, `trend.py`) -- plus
 `brief.json`, the document they all render from: the per-run classification
 `classify.py` produces (the one place the "is this red mine?" rule lives)
 and the per-case record; and a copy of the data file. `publish.py` ships an
