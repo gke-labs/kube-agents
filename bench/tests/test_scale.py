@@ -670,7 +670,7 @@ def test_cluster_creation_runs_at_most_the_bound_at_once(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
     monkeypatch.setattr(run, "_create_cluster", create)
-    monkeypatch.setattr(runner.kube, "has_context", lambda *a: True)
+    monkeypatch.setattr(runner.kube, "get_credentials", lambda *a: None)
     monkeypatch.setattr(run, "wait_registered", lambda count: None)
     run.ensure_clusters(5)
     assert peak[0] == 2
@@ -1131,3 +1131,15 @@ def test_a_run_another_phase_recorded_is_skipped_with_a_warning(monkeypatch, tmp
     with caplog.at_level("WARNING"):
         assert spec not in run.pending([spec])
     assert "already recorded by phase3" in caplog.text
+
+
+def test_every_test_cluster_s_credentials_are_refreshed(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE4, environ=ENV), tmp_path / "data.json")
+    fetched = []
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    monkeypatch.setattr(runner.kube, "has_context", lambda name: True)
+    monkeypatch.setattr(runner.kube, "get_credentials", lambda project, zone, name: fetched.append(name))
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    run.ensure_clusters(2)
+    # A cluster created again under an old name keeps no stale endpoint.
+    assert fetched == ["scale-01", "scale-02"]

@@ -222,10 +222,11 @@ class Runner:
                 jobs += [pool.submit(kube.delete_cluster, self.project, self.zone, name) for name in extra]
                 for job in jobs:
                     job.result()
-        # One at a time: gcloud writes the kubeconfig without a lock.
+        # One at a time: gcloud writes the kubeconfig without a lock. Every cluster, not only one
+        # without a context: a cluster deleted and created again under its name has a new endpoint,
+        # and the old context would keep dialling the address the deleted cluster had.
         for name in wanted:
-            if not kube.has_context(kube.context_name(self.project, self.zone, name)):
-                kube.get_credentials(self.project, self.zone, name)
+            kube.get_credentials(self.project, self.zone, name)
         self.wait_registered(count)
 
     def _create_cluster(self, name: str) -> None:
