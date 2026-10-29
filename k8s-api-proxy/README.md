@@ -7,8 +7,12 @@ with credentials the sandbox never holds. So far it has the policy (`pkg/k8sapip
 and the HTTP handler around it (`handler.go`), which authenticates through a pluggable
 `CallerAuthenticator`, removes the caller's credentials (including a bearer token in
 `Sec-WebSocket-Protocol`), impersonation, `Audit-ID` and `Connection`-named headers, and forwards
-through a pluggable `UpstreamTransport`. `pkg/upstream` implements the transport, and nothing
-implements the authenticator yet or serves or deploys the handler.
+through a pluggable `UpstreamTransport`. `NewTokenReviewAuthenticator` (`auth.go`) is the
+`CallerAuthenticator`: it accepts a bearer token that a TokenReview on the host cluster finds
+valid for the proxy's own audience, from a ServiceAccount on an allowlist, and caches each review
+for ten seconds by default. Requiring an audience other than the API server's keeps a token sent to the
+proxy from working against the API server directly. `pkg/upstream` implements the transport, and
+nothing serves or deploys the handler yet.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID, to the API server through the pod's service account. Any other `gke_` cluster is reached
