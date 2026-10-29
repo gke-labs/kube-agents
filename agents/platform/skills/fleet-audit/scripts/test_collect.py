@@ -455,6 +455,11 @@ class TestSweepPool(unittest.TestCase):
         for path in pooled:
             with self.subTest(collector=path.name):
                 mod = importlib.import_module(path.stem)
+                if path.name == "kcc_health.py":
+                    # Not a sweep collector: the Config Connector read the
+                    # collectors share, whose per-kind pool pins the same figure.
+                    self.assertEqual(mod.KIND_READ_WORKERS, collect.MAX_WORKERS)
+                    continue
                 self.assertTrue(
                     hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
                     f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
@@ -4739,12 +4744,12 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
                 # check is declared inapplicable and `checks_run` below is
                 # rightly rejected for naming checks that examined nothing.
                 return Run(argv, 0, json.dumps(dump_of(compliance_pod("app"))), "", 0.1)
-            if argv[:3] == ["kubectl", "get", collect.KCC_CATEGORY]:
+            if is_kcc_read(argv):
                 # One healthy Config Connector object. An empty list here is
                 # not the same thing: it declares `kcc-object-wedged`
                 # inapplicable, and the full roster this test asserts against
                 # would then rightly be rejected for naming a check nothing ran.
-                return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.1)
+                return serve_kcc(argv, [kcc_object("ComputeFirewall", "allow-ssh")])
             if argv[:2] == ["kubectl", "get"] and argv[2] in collect.CONFIGSYNC_SYNC_KINDS:
                 # One healthy RootSync, for the reason the `gcp` read above
                 # answers with one healthy object: served and empty would
@@ -4838,8 +4843,43 @@ def compliance_pod(name, ns="default", **meta_overrides):
     return doc
 
 
+# The group of every fake Config Connector kind, and the kind a cluster that
+# runs Config Connector lists when it holds no object.
+KCC_FAKE_GROUP = "test.cnrm.cloud.google.com"
+KCC_DEFAULT_KIND = "ComputeFirewall"
+
+
+def kcc_crd_line(kind):
+    """One line of the CRD list, as `kcc_health.CRD_JSONPATH` prints it."""
+    return "\t".join((KCC_FAKE_GROUP, f"{kind.lower()}s", kind, '["gcp"]', "v1beta1"))
+
+
+def is_kcc_read(argv):
+    """Whether `argv` is a step of `kcc_health.read_objects`."""
+    return argv[:3] in (["kubectl", "get", "customresourcedefinitions"], ["kubectl", "get", "--raw"])
+
+
+def serve_kcc(argv, kcc_items):
+    """One step of the Config Connector read (`kcc_health.read_objects`).
+
+    `kcc_items` None: no Config Connector CRD. A list: the cluster runs
+    Config Connector and holds those objects, and its CRDs are their kinds
+    (`KCC_DEFAULT_KIND` when it holds none). A callable: the CRD list names
+    `KCC_DEFAULT_KIND`, and the callable answers that kind's list request.
+    """
+    if argv[2] == "customresourcedefinitions":
+        if kcc_items is None:
+            return Run(argv, 0, "apps\tdeployments\tDeployment\t\tv1\n", "", 0.05)
+        kinds = sorted({item["kind"] for item in kcc_items} if not callable(kcc_items) and kcc_items else {KCC_DEFAULT_KIND})
+        return Run(argv, 0, "".join(kcc_crd_line(kind) + "\n" for kind in kinds), "", 0.05)
+    if callable(kcc_items):
+        return kcc_items(argv)
+    plural = argv[3].rsplit("/", 1)[1]
+    return Run(argv, 0, json.dumps(dump_of(*(i for i in kcc_items or [] if f"{i['kind'].lower()}s" == plural))), "", 0.05)
+
+
 def kcc_object(kind, name, ns="kubeagents-system", ready="True", reason="UpToDate", message="The resource is up to date"):
-    """A Config Connector object as `kubectl get gcp -A -o json` returns it.
+    """A Config Connector object as one kind's list request returns it.
 
     `ready=None` omits the condition entirely, which is what KCC has written
     in the seconds between an apply and its first reconcile.
@@ -7802,18 +7842,16 @@ class TestComplianceCollectCluster(unittest.TestCase):
                     # A cluster without Dataplane V2's CRD, and the default:
                     # only this answer reads as "no cluster-wide policies".
                     return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "ccnp"', 0.05)
-                if kinds == collect.KCC_CATEGORY:
-                    if kcc_items is None:
-                        # A cluster not running Config Connector, which is
-                        # every cluster in a fleet but the one hosting it, and
-                        # so the default here.
-                        return Run(argv, 1, "", 'error: the server doesn\'t have a resource type "gcp"', 0.05)
-                    # A callable answers the read itself -- for the malformed
-                    # responses `run_and_gate` cannot distinguish from an
-                    # absent CRD, which no list of objects can express.
+                if is_kcc_read(argv):
+                    # `kcc_items` None is a cluster not running Config
+                    # Connector, which is every cluster in a fleet but the one
+                    # hosting it, and so the default here. A callable answers
+                    # the kind's list request -- for the failed and malformed
+                    # responses no list of objects can express.
                     if callable(kcc_items):
-                        return kcc_items(argv, **kwargs)
-                    return Run(argv, 0, json.dumps(dump_of(*kcc_items)), "", 0.05)
+                        answer = kcc_items
+                        return serve_kcc(argv, lambda kind_argv: answer(kind_argv, **kwargs))
+                    return serve_kcc(argv, kcc_items)
                 if kinds in collect.CONFIGSYNC_SYNC_KINDS:
                     if callable(configsync_items):
                         return configsync_items(argv, **kwargs)
@@ -8098,7 +8136,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
         result = self.run_with(kcc_items=[kcc_object("ComputeFirewall", "allow-ssh")])
         self.assertIsNone(self.kcc_reason(result))
         entry = next(c for c in result["commands"] if c["check"] == "kcc-object-wedged")
-        self.assertIn("get gcp -A", entry["command"])
+        self.assertIn("get customresourcedefinitions", entry["command"])
+        self.assertIn("kubectl get --raw /apis/<group>/<version>/<plural>", entry["command"])
         self.assertEqual(entry["rc"], 0)
 
     def test_config_connector_installed_but_declaring_nothing_is_its_own_reason(self):
@@ -8163,8 +8202,8 @@ class TestComplianceCollectCluster(unittest.TestCase):
             [{"kind": "PubSubTopic", "namespace": "kubeagents-system", "name": "fleet-events", "why": "UpdateFailed: Error 403"}],
         )
         self.assertNotIn("kcc_unread", result)
-        reads = [argv for argv in self.issued if argv[:3] == ["kubectl", "get", collect.KCC_CATEGORY]]
-        self.assertEqual(len(reads), 1, "the key must come from the check's own read, not a second one")
+        crd_lists = [argv for argv in self.issued if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]]
+        self.assertEqual(len(crd_lists), 1, "the key must come from the check's own read, not a second one")
 
     def test_a_failed_gcp_read_is_recorded_as_unknown_on_the_entry(self):
         result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
@@ -8185,11 +8224,23 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertFalse([argv for argv in self.issued if argv[:3] == ["kubectl", "get", "namespaces"]])
 
     def test_a_timed_out_gcp_read_names_the_timeout_it_had(self):
-        """collect.py passes its own timeout to `kcc_health.entry_fields`, so
-        `kcc_unread` states the timeout the read really had."""
-        with mock.patch.object(collect, "KCC_READ_TIMEOUT_S", 7):
-            result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 7.0))
-        self.assertIn("did not finish in 7s", result["kcc_unread"])
+        """The compliance read ends inside `KCC_READ_TIMEOUT_S`, and
+        `kcc_unread` states that limit."""
+        with mock.patch.object(collect, "KCC_READ_TIMEOUT_S", 70):
+            result = self.run_with(kcc_items=lambda argv, **kw: Run(argv, collect.TIMEOUT_RC, "", "", 60.0))
+        self.assertRegex(result["kcc_unread"], r"did not finish in (69|70)s")
+
+    def test_the_check_and_the_manifest_keys_read_the_same_objects(self):
+        """One read serves `kcc-object-wedged` and `kcc_unready`: a stalled
+        object is a candidate of the check and an entry of the key, from the
+        per-kind lists of `kcc_health.read_objects`."""
+        stalled = kcc_object("PubSubTopic", "fleet-events", ready="False", reason="UpdateFailed", message="Error 403")
+        result = self.run_with(kcc_items=[kcc_object("ComputeFirewall", "allow-ssh"), stalled])
+        wedged = [c for c in result["candidates"] if c["check"] == "kcc-object-wedged"]
+        self.assertEqual([c["object"] for c in wedged], ["PubSubTopic/fleet-events"])
+        self.assertEqual([r["name"] for r in result["kcc_unready"]], ["fleet-events"])
+        kind_reads = [argv for argv in self.issued if argv[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(len(kind_reads), 2)
 
     def test_a_cluster_without_config_connector_gets_neither_key(self):
         result = self.run_with()
@@ -8197,14 +8248,13 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertNotIn("kcc_unread", result)
 
     def test_the_gcp_read_gets_the_longer_timeout_and_the_others_do_not(self):
-        """A truthful `Undetermined` still leaves the check having never run on
-        the only cluster it can apply to, so the timeout is the other half of
-        the fix. Asserted per-read, because `run_and_gate` takes a default and
-        the whole defect was one read needing something other than it."""
-        seen = {}
+        """The Config Connector read is the one read here whose limit is not
+        `DEFAULT_TIMEOUT_S`: the whole read (a CRD list and one list per kind)
+        ends inside `KCC_READ_TIMEOUT_S`, and no step of it gets more."""
+        seen = []
 
         def record(argv, **kwargs):
-            seen["kcc"] = kwargs.get("timeout")
+            seen.append(kwargs.get("timeout"))
             return Run(argv, 0, json.dumps(dump_of(kcc_object("ComputeFirewall", "allow-ssh"))), "", 0.05)
 
         original = collect.run_and_gate
@@ -8216,14 +8266,15 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
         with patch.object(collect, "run_and_gate", spy):
             self.run_with(kcc_items=record)
-        self.assertEqual(seen["kcc"], collect.KCC_READ_TIMEOUT_S)
+        self.assertTrue(seen)
+        self.assertTrue(all(0 < t <= collect.KCC_READ_TIMEOUT_S for t in seen), seen)
         self.assertGreater(collect.KCC_READ_TIMEOUT_S, collect.DEFAULT_TIMEOUT_S)
-        others = [t for kind, t in observed if kind != collect.KCC_CATEGORY]
-        self.assertTrue(others, "the spy saw no other reads, so it proves nothing about them")
+        self.assertTrue(observed, "the spy saw no other reads, so it proves nothing about them")
         self.assertTrue(
-            all(t in (None, collect.DEFAULT_TIMEOUT_S) for t in others),
-            f"a read other than the `gcp` one took a custom timeout: {observed}",
+            all(t in (None, collect.DEFAULT_TIMEOUT_S) for _, t in observed),
+            f"a read other than the Config Connector one took a custom timeout: {observed}",
         )
+        self.assertFalse([kind for kind, _ in observed if kind in (collect.KCC_CATEGORY, "customresourcedefinitions", "--raw")])
 
     def test_an_unreadable_gcp_response_never_claims_config_connector_is_absent(self):
         """`run_and_gate` collapses five different failures into `None` -- a

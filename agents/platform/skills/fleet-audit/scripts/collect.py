@@ -8128,9 +8128,10 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "lb-world-open": ("services",),
 }
 
-# `kubectl get gcp` is the category Config Connector registers across every CRD
-# it installs, so one read returns every object it owns -- rather than the
-# ~200 `kubectl get <kind>` calls that enumerating the CRDs would cost.
+# The category Config Connector registers across every CRD it installs.
+# `kcc_health.read_objects` lists the CRDs in it and then each kind in
+# parallel, because `kubectl get gcp -A` lists the ~230 kinds one after
+# another, too slowly through the credential proxy.
 KCC_CATEGORY = "gcp"
 
 DEFAULT_SERVICE_ACCOUNT = "default"
@@ -8144,8 +8145,11 @@ AUTOPILOT_ALLOWLIST_KINDS = (
     "allowlistedv2workloads.auto.gke.io",
 )
 
-# The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because a
-# category read is not one list call. `kubectl` expands `gcp` to every CRD
+# The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because the
+# Config Connector read is not one list call: it is now the time limit of the
+# whole `kcc_health.read_objects` read (a CRD list and one list per kind, in
+# parallel), not of one `kubectl` process. The history below is of the
+# category read it replaced. `kubectl` expands `gcp` to every CRD
 # carrying the category -- 221 of them on this fleet's hub -- and issues a list
 # against each, so the cost scales with how much of Config Connector is
 # installed rather than with how many objects exist. Measured from the agent
@@ -8384,69 +8388,62 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # the absence of a CRD they are not supposed to have. Absence is reported
     # as an inapplicable check rather than as a clean one -- a cluster with no
     # Config Connector has not cleared anything.
-    kcc_argv = ["kubectl", "get", KCC_CATEGORY, "-A", "-o", "json"]
-    kcc_parsed, kcc_result = run_and_gate(kcc_argv, kubeconfig, run=run, timeout=KCC_READ_TIMEOUT_S)
-    context["kcc_objects"] = (kcc_parsed or {}).get("items") or []
+    # `kcc_health.read_objects`, the one Config Connector read the collectors
+    # share: a CRD list finds the Config Connector kinds, then one list request
+    # per kind runs in parallel. `kubectl get gcp -A` does the same requests one
+    # after another, and through the credential proxy its 230 requests took
+    # longer than `KCC_READ_TIMEOUT_S` on the hub. The whole read still ends
+    # inside that time.
+    kcc_started = time.monotonic()
+    kcc_read = kcc_health.read_objects(kubeconfig, run=run, deadline=kcc_started + KCC_READ_TIMEOUT_S)
+    context["kcc_objects"] = list(kcc_read.items)
     # The same read, as the manifest entry's `kcc_unready` or `kcc_unread`
     # key, so `finish` can say when a fix edits a declaration Config Connector
     # does not apply. No second read.
-    context["kcc_health"] = kcc_health.entry_fields(kcc_parsed, kcc_result.rc, kcc_result.stderr, KCC_READ_TIMEOUT_S)
+    context["kcc_health"] = kcc_health.read_fields(kcc_read)
     # An object with no project annotation takes its namespace's; the
     # namespaces are already in the context from the NetworkPolicy read.
     kcc_health.fill_namespace_projects(context["kcc_health"].get(kcc_health.UNREADY_FIELD) or [], context.get("namespaces") or [])
-    # `run_and_gate` returns `None` for four different things, and only one of
-    # them means "no Config Connector here". Collapsing them would publish
-    # "Config Connector is not installed on this cluster" as the audit's own
-    # claim about a cluster where the read timed out or came back truncated --
-    # a statement the collector cannot support, on the strength of a read that
-    # failed. Each gets the reason that is true of it.
+    # Each outcome of the read gets the reason that is true of it. Only "no
+    # Config Connector CRD here" means the check does not apply; a timeout, a
+    # refused list or an unreadable answer is a read that did not happen, and
+    # the cluster most likely to produce one is the hub the check exists for.
     kcc_reason = ""
-    if kcc_parsed is not None and not context["kcc_objects"]:
+    if kcc_read.status == kcc_health.READ_LISTED and not context["kcc_objects"]:
         kcc_reason = (
-            f"Config Connector is installed on this cluster -- `kubectl get "
-            f"{KCC_CATEGORY} -A` was served -- but it declares no GCP "
-            "resources, so there is nothing whose reconciliation could stall."
+            f"Config Connector is installed on this cluster -- its {kcc_read.kinds} kind(s) "
+            "were listed -- but it declares no GCP resources, so there is nothing whose "
+            "reconciliation could stall."
         )
-    elif kcc_result.rc == TIMEOUT_RC:
-        # Split out ahead of the `rc != 0` arm below, which is only entitled to
-        # read an exit code as the API server's answer when the API server is
-        # the one that produced it. A timeout is this collector giving up, and
-        # the cluster it is most likely to give up on is the one where the read
-        # has the most work to do -- which is the cluster that runs Config
-        # Connector, the exact opposite of what the arm below would have said.
+    elif kcc_read.status == kcc_health.READ_TIMED_OUT:
         kcc_reason = (
-            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` did not finish "
-            f"within {KCC_READ_TIMEOUT_S}s and was killed, so whether Config "
+            f"Undetermined: the Config Connector read did not finish within "
+            f"{KCC_READ_TIMEOUT_S}s ({kcc_read.detail}), so whether Config "
             "Connector is installed here -- and whether anything it owns is "
             "stalled -- was not established. This check cleared nothing on "
             "this cluster."
         )
-    elif kcc_result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in kcc_result.stderr:
+    elif kcc_read.status == kcc_health.READ_ABSENT:
         kcc_reason = (
-            f"Config Connector is not installed on this cluster: `kubectl get "
-            f"{KCC_CATEGORY} -A` answered that the server does not serve the "
-            "category. Nothing here declares a GCP resource. This fleet runs "
-            "one Config Connector, on the hub cluster."
+            "Config Connector is not installed on this cluster: it has no "
+            "CustomResourceDefinition in a Config Connector group with the "
+            f"`{KCC_CATEGORY}` category. Nothing here declares a GCP resource. "
+            "This fleet runs one Config Connector, on the hub cluster."
         )
-    elif kcc_result.rc != 0:
-        # Any other failure -- Forbidden, one CRD in the category refusing to
-        # list, an API server error -- is a read that failed, and the cluster
-        # most likely to produce one is the hub the check exists for.
-        stderr = kcc_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+    elif kcc_read.status == kcc_health.READ_FAILED:
         kcc_reason = (
-            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` exited "
-            f"{kcc_result.rc} without saying the category is unserved "
-            f"({stderr}), so whether Config Connector is installed here -- and "
-            "whether anything it owns is stalled -- was not established. This "
-            "check cleared nothing on this cluster."
+            f"Undetermined: the Config Connector read failed ({kcc_read.detail}), "
+            "so whether Config Connector is installed here -- and whether "
+            "anything it owns is stalled -- was not established. This check "
+            "cleared nothing on this cluster."
         )
-    elif kcc_parsed is None:
+    elif kcc_read.status == kcc_health.READ_UNREADABLE:
         kcc_reason = (
-            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` exited 0 but "
-            "returned output this collector could not read as a list of "
-            "objects, so whether Config Connector is installed here -- and "
-            "whether anything it owns is stalled -- was not established. This "
-            "check cleared nothing on this cluster."
+            f"Undetermined: the Config Connector read returned output this "
+            f"collector could not read as a list of objects ({kcc_read.detail}), "
+            "so whether Config Connector is installed here -- and whether "
+            "anything it owns is stalled -- was not established. This check "
+            "cleared nothing on this cluster."
         )
     if kcc_reason.startswith(UNDETERMINED_PREFIX):
         # Not `not_applicable`: that list leaves the coverage denominator, so
@@ -8456,9 +8453,13 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     elif kcc_reason:
         context.setdefault("not_applicable", {})["kcc-object-wedged"] = kcc_reason
     else:
-        commands["kcc-object-wedged"] = _record(
-            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_argv)}", kcc_result
+        kcc_command = (
+            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_health.crd_list_argv())}, then "
+            f"`kubectl get --raw /apis/<group>/<version>/<plural>` for each of its "
+            f"{kcc_read.kinds} Config Connector kind(s)"
         )
+        listed = Run(kcc_health.crd_list_argv(), 0, json.dumps(kcc_read.items, sort_keys=True), "", time.monotonic() - kcc_started)
+        commands["kcc-object-wedged"] = _record(kcc_command, listed)
 
     # Config Sync's sync objects, for §2.17. Ungated like the `gcp` read above
     # and for the same reason: most clusters do not run Config Sync, and an

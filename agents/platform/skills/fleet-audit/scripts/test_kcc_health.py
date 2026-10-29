@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -36,8 +38,43 @@ READY_POOL = kcc_object("ContainerNodePool", "pool-a", status="True", reason="Up
 UNREACHED = kcc_object("ComputeNetwork", "fresh")
 
 
+# The group every fake Config Connector kind is in, and the kind a cluster
+# that runs Config Connector lists when it holds no object.
+FAKE_GROUP = "test.cnrm.cloud.google.com"
+DEFAULT_KIND = "ComputeFirewall"
+
+
+def crd_line(kind, group=FAKE_GROUP, categories='["gcp"]'):
+    """One line of the CRD list, as `kcc_health.CRD_JSONPATH` prints it."""
+    return "\t".join((group, f"{kind.lower()}s", kind, categories, "v1beta1"))
+
+
+def serve_kcc(argv, answer):
+    """The Config Connector read of one cluster, from one `answer`.
+
+    `listing(*items)`: the cluster runs Config Connector and holds `items`,
+    and its CRDs are the kinds of `items` (`DEFAULT_KIND` when it holds
+    none). A Result that says the type is not served: no Config Connector
+    CRD. Any other Result: the answer to every kind's list request.
+    """
+    absent = answer.rc != 0 and kcc_health.RESOURCE_TYPE_ABSENT_MARKER in answer.stderr
+    items = json.loads(answer.stdout)["items"] if answer.rc == 0 and answer.stdout.startswith("{") else []
+    if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+        if absent:
+            return kcc_health.Result(0, "apps\tdeployments\tDeployment\t\tv1\n", "")
+        kinds = sorted({item["kind"] for item in items} or {DEFAULT_KIND})
+        return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
+    if argv[:3] == ["kubectl", "get", "--raw"]:
+        if answer.rc != 0 or not answer.stdout.startswith("{"):
+            return answer
+        plural = argv[3].rsplit("/", 1)[1]
+        return listing(*(item for item in items if f"{item['kind'].lower()}s" == plural))
+    raise AssertionError(f"unexpected Config Connector command {argv}")
+
+
 class FakeRun:
-    """Answers `get-credentials` and the `gcp` read per cluster, and records the calls."""
+    """Answers `get-credentials` and the Config Connector read per cluster
+    (`serve_kcc`), and records the calls."""
 
     def __init__(self, reads, credentials_rc=0, namespaces=None):
         # `namespaces`: the answer to `kubectl get namespaces`, else a failure.
@@ -59,7 +96,7 @@ class FakeRun:
         cluster = Path((env or {})["KUBECONFIG"]).name
         for key, answer in self.reads.items():
             if f"_{key}_" in cluster:
-                return answer
+                return serve_kcc(argv, answer)
         raise AssertionError(f"unexpected read with kubeconfig {cluster}")
 
 
@@ -144,28 +181,118 @@ class UnreadyObjectsTest(unittest.TestCase):
         self.assertEqual(bare[0]["why"], "no reason given")
 
 
-class EntryFieldsTest(unittest.TestCase):
-    def test_a_served_read_lists_the_unready_objects(self):
-        fields = kcc_health.entry_fields({"items": [STALLED_TOPIC, READY_POOL]}, 0, "")
-        self.assertEqual([r["name"] for r in fields["kcc_unready"]], ["fleet-events"])
+class ReadObjectsTest(unittest.TestCase):
+    """`read_objects`: a CRD list, then one list request per Config Connector
+    kind, in parallel."""
 
-    def test_a_served_read_with_nothing_unready_is_an_empty_list(self):
-        self.assertEqual(kcc_health.entry_fields({"items": [READY_POOL]}, 0, ""), {"kcc_unready": []})
+    def read(self, run, **kwargs):
+        return kcc_health.read_objects(Path("kubeconfig"), run=run, deadline=kwargs.pop("deadline", 1e9), clock=kwargs.pop("clock", lambda: 0.0), **kwargs)
 
-    def test_an_unserved_category_adds_nothing(self):
-        stderr = 'error: the server doesn\'t have a resource type "gcp"'
-        self.assertEqual(kcc_health.entry_fields(None, 1, stderr), {})
+    def test_the_kinds_come_from_the_crd_list_and_other_crds_are_ignored(self):
+        lines = "\n".join((
+            crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com"),
+            crd_line("ConfigConnectorContext", group="core.cnrm.cloud.google.com", categories=""),
+            crd_line("Widget", group="example.com"),
+            "\t".join(("compute.cnrm.cloud.google.com", "computeaddresses", "ComputeAddress", '["gcp","all"]', "v1beta1")),
+        ))
+        self.assertEqual(
+            kcc_health.kcc_kinds(lines),
+            [
+                kcc_health.KccKind("compute.cnrm.cloud.google.com", "v1beta1", "computeaddresses", "ComputeAddress"),
+                kcc_health.KccKind("pubsub.cnrm.cloud.google.com", "v1beta1", "pubsubtopics", "PubSubTopic"),
+            ],
+        )
+        self.assertEqual(
+            kcc_health.kind_argv(kcc_health.KccKind("pubsub.cnrm.cloud.google.com", "v1beta1", "pubsubtopics", "PubSubTopic")),
+            ["kubectl", "get", "--raw", "/apis/pubsub.cnrm.cloud.google.com/v1beta1/pubsubtopics"],
+        )
 
-    def test_a_failed_read_is_unknown_never_healthy(self):
-        for rc, stderr, parsed in (
-            (124, "killed", None),
-            (1, "Error from server (Forbidden)", None),
-            (0, "", None),
-            (0, "", {"kind": "List"}),
+    def test_the_lists_of_every_kind_are_merged(self):
+        calls = []
+
+        def run(argv, *, env=None, timeout=None):
+            calls.append(argv)
+            return serve_kcc(argv, listing(STALLED_TOPIC, BLOCKED_CLUSTER, READY_POOL))
+
+        read = self.read(run)
+        self.assertEqual(read.status, kcc_health.READ_LISTED)
+        self.assertEqual(read.kinds, 3)
+        self.assertEqual(sorted(item["metadata"]["name"] for item in read.items), ["fleet-events", "pool-a", "prod-usc1"])
+        self.assertEqual(len([argv for argv in calls if argv[:3] == ["kubectl", "get", "--raw"]]), 3)
+        self.assertFalse([argv for argv in calls if "gcp" in argv], "no category read: it lists the kinds one after another")
+        self.assertEqual([r["name"] for r in kcc_health.read_fields(read)["kcc_unready"]], ["prod-usc1", "fleet-events"])
+
+    def test_an_item_with_no_kind_takes_the_kind_of_its_crd(self):
+        bare = {key: value for key, value in STALLED_TOPIC.items() if key != "kind"}
+
+        def run(argv, *, env=None, timeout=None):
+            if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+                return kcc_health.Result(0, crd_line("PubSubTopic") + "\n", "")
+            return listing(bare)
+
+        self.assertEqual(self.read(run).items[0]["kind"], "PubSubTopic")
+
+    def test_the_kinds_are_listed_in_parallel_on_a_bounded_pool(self):
+        lock = threading.Lock()
+        running = [0, 0]
+        kinds = [f"Kind{n}" for n in range(3 * kcc_health.KIND_READ_WORKERS)]
+
+        def run(argv, *, env=None, timeout=None):
+            if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+                return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
+            with lock:
+                running[0] += 1
+                running[1] = max(running[1], running[0])
+            time.sleep(0.02)
+            with lock:
+                running[0] -= 1
+            return listing()
+
+        read = self.read(run)
+        self.assertEqual(read.status, kcc_health.READ_LISTED)
+        self.assertGreater(running[1], 1)
+        self.assertLessEqual(running[1], kcc_health.KIND_READ_WORKERS)
+
+    def test_one_kind_that_does_not_list_makes_the_read_unknown(self):
+        for answer, status, words in (
+            (kcc_health.Result(1, "", "Error from server (Forbidden): pubsubtopics is forbidden"), kcc_health.READ_FAILED, "Forbidden"),
+            (kcc_health.Result(kcc_health.TIMEOUT_RC, "", "killed"), kcc_health.READ_TIMED_OUT, "did not finish"),
+            (kcc_health.Result(0, '{"items": [{"kind": "Pub', ""), kcc_health.READ_UNREADABLE, "not a list"),
         ):
-            with self.subTest(rc=rc, stderr=stderr):
-                fields = kcc_health.entry_fields(parsed, rc, stderr)
+            with self.subTest(status=status):
+                def run(argv, *, env=None, timeout=None):
+                    if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+                        return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
+                    if argv[3].endswith("pubsubtopics"):
+                        return answer
+                    return listing(kcc_object("ComputeFirewall", "fw", status="False", reason="UpdateFailed"))
+
+                read = self.read(run)
+                self.assertEqual(read.status, status)
+                fields = kcc_health.read_fields(read)
                 self.assertEqual(list(fields), ["kcc_unread"])
+                self.assertIn("not known", fields["kcc_unread"])
+                self.assertIn(words, fields["kcc_unread"] if status != kcc_health.READ_TIMED_OUT else fields["kcc_unread"] + read.detail)
+
+    def test_a_kind_that_went_away_after_the_crd_list_is_skipped(self):
+        def run(argv, *, env=None, timeout=None):
+            if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]:
+                return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
+            if argv[3].endswith("pubsubtopics"):
+                return kcc_health.Result(1, "", "Error from server (NotFound): the server could not find the requested resource")
+            return listing(STALLED_TOPIC)
+
+        self.assertEqual(self.read(run).status, kcc_health.READ_LISTED)
+
+    def test_no_config_connector_crd_adds_nothing(self):
+        read = self.read(lambda argv, **kw: serve_kcc(argv, kcc_health.Result(1, "", "doesn't have a resource type")))
+        self.assertEqual(read.status, kcc_health.READ_ABSENT)
+        self.assertEqual(kcc_health.read_fields(read), {})
+
+    def test_a_failed_crd_list_is_unknown_never_absent(self):
+        for answer in (kcc_health.Result(1, "", "Forbidden"), kcc_health.Result(kcc_health.TIMEOUT_RC, "", "killed")):
+            with self.subTest(rc=answer.rc):
+                fields = kcc_health.read_fields(self.read(lambda argv, **kw: answer))
                 self.assertIn("not known", fields["kcc_unread"])
 
 
@@ -218,9 +345,9 @@ class AnnotateManifestTest(unittest.TestCase):
         self.assertIn("did not finish", slow["kcc_unread"])
         self.assertNotIn("kcc_unread", gone)
         self.assertEqual(read["kcc_unready"], [])
-        reads = [argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "gcp"]]
-        self.assertEqual(len(reads), 3)
-        self.assertTrue(all(argv == ["kubectl", "get", "gcp", "-A", "-o", "json"] for argv in reads))
+        crd_lists = [argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "customresourcedefinitions"]]
+        self.assertEqual(len(crd_lists), 3, "one CRD list per read cluster")
+        self.assertTrue(all(argv == kcc_health.crd_list_argv() for argv in crd_lists))
         for argv, kubeconfig in run.calls:
             self.assertTrue(kubeconfig.startswith(str(self.dir)), kubeconfig)
 
@@ -474,21 +601,28 @@ class DeadlineTest(unittest.TestCase):
             ]
         }
 
-    def slow_run(self, credentials_s, read_s):
-        """A reader that takes `credentials_s` or `read_s` of the fake clock
-        per call, or its whole timeout when that is shorter."""
+    def slow_run(self, credentials_s, crd_s, kind_s, kinds=(DEFAULT_KIND,), deadline=None):
+        """A reader that takes `credentials_s`, `crd_s` or `kind_s` of the fake
+        clock per call, or its whole timeout when that is shorter. It checks
+        that no step is given more time than is left before `deadline`."""
         timeouts = []
 
         def run(argv, *, env=None, timeout=None):
-            timeouts.append((argv[0], timeout))
-            seconds = read_s if argv[0] == "kubectl" else credentials_s
+            step = "gcloud" if argv[0] == "gcloud" else ("crd" if argv[2] == "customresourcedefinitions" else "kind")
+            timeouts.append((step, timeout))
+            if deadline is not None:
+                self.assertLessEqual(self.now + timeout, deadline, f"{step} was given more than the time left")
+            seconds = {"gcloud": credentials_s, "crd": crd_s, "kind": kind_s}[step]
             if timeout is not None and seconds >= timeout:
                 self.now += timeout
                 return kcc_health.Result(kcc_health.TIMEOUT_RC, "", "killed")
             self.now += seconds
-            if argv[0] != "kubectl":
+            if step == "gcloud":
                 Path(env["KUBECONFIG"]).write_text("apiVersion: v1\n")
-            return listing() if argv[0] == "kubectl" else kcc_health.Result(0, "", "")
+                return kcc_health.Result(0, "", "")
+            if step == "crd":
+                return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
+            return listing()
 
         return run, timeouts
 
@@ -496,36 +630,39 @@ class DeadlineTest(unittest.TestCase):
         # The sweep took seven minutes, so two minutes are left.
         self.now = 420.0
         deadline = kcc_health.run_deadline(0.0)
-        run, timeouts = self.slow_run(10, 105)
-        manifest = self.entries("a", "b", "c")
+        run, timeouts = self.slow_run(10, 5, 20, deadline=deadline)
+        manifest = self.entries("a", "b", "c", "d")
         kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, clock=self.clock)
         self.assertLessEqual(self.now, deadline)
         self.assertLessEqual(deadline, kcc_health.TERMINAL_TIMEOUT_S - kcc_health.PRINT_MARGIN_S)
-        a, b, c = manifest["clusters"]
-        # The read had the 110 s left, not its own 240 s.
-        self.assertEqual(timeouts, [("gcloud", kcc_health.CREDENTIALS_TIMEOUT_S), ("kubectl", 110)])
-        self.assertEqual(a["kcc_unready"], [])
-        for entry in (b, c):
-            self.assertIn("time budget", entry["kcc_unread"])
-            self.assertIn(str(kcc_health.RUN_DEADLINE_S), entry["kcc_unread"])
+        a, b, c, d = manifest["clusters"]
+        for entry in (a, b, c):
+            self.assertEqual(entry["kcc_unready"], [])
+        # c's steps were cut to the time left; d's credentials ended with less
+        # than a step left, so its read did not start.
+        self.assertEqual(timeouts[6:9], [("gcloud", 50), ("crd", 40), ("kind", 35)])
+        self.assertIn("time budget", d["kcc_unread"])
+        self.assertIn(str(kcc_health.RUN_DEADLINE_S), d["kcc_unread"])
 
-    def test_a_read_that_runs_out_the_time_left_ends_at_the_deadline(self):
-        self.now = 420.0
-        deadline = kcc_health.run_deadline(0.0)
-        run, timeouts = self.slow_run(59, 1000)
+    def test_many_kinds_end_inside_the_read_limit(self):
+        """A cluster with many kinds, listed one at a time here: the read stops
+        starting kinds when less than a step is left, and ends inside
+        `READ_TIMEOUT_S`."""
+        run, timeouts = self.slow_run(0, 1, 10, kinds=[f"Kind{n}" for n in range(50)], deadline=kcc_health.READ_TIMEOUT_S)
         manifest = self.entries("a")
-        kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, clock=self.clock)
-        self.assertEqual(timeouts, [("gcloud", 60), ("kubectl", 61)])
-        self.assertIn("did not finish in 61s", manifest["clusters"][0]["kcc_unread"])
-        self.assertLessEqual(self.now, deadline)
+        with mock.patch.object(kcc_health, "KIND_READ_WORKERS", 1):
+            kcc_health.annotate_manifest(manifest, deadline=kcc_health.run_deadline(0.0), run=run, clock=self.clock)
+        self.assertLessEqual(self.now, kcc_health.READ_TIMEOUT_S)
+        self.assertIn(f"did not finish in {kcc_health.READ_TIMEOUT_S}s", manifest["clusters"][0]["kcc_unread"])
+        self.assertLess(len([t for t in timeouts if t[0] == "kind"]), 50)
 
     def test_a_read_is_never_given_more_than_the_time_left(self):
         self.now = 500.0
         deadline = kcc_health.run_deadline(0.0)
-        run, timeouts = self.slow_run(1, 1)
+        run, timeouts = self.slow_run(1, 1, 1, deadline=deadline)
         manifest = self.entries("a")
         kcc_health.annotate_manifest(manifest, deadline=deadline, run=run, clock=self.clock)
-        self.assertEqual(timeouts, [("gcloud", 40), ("kubectl", 39)])
+        self.assertEqual(timeouts, [("gcloud", 40), ("crd", 39), ("kind", 38)])
         self.assertEqual(manifest["clusters"][0]["kcc_unready"], [])
 
     def test_a_failure_around_the_reads_keeps_the_manifest(self):
@@ -534,7 +671,7 @@ class DeadlineTest(unittest.TestCase):
 
         manifest = self.entries("a")
         kcc_health.annotate_manifest(
-            manifest, deadline=kcc_health.run_deadline(0.0), run=self.slow_run(1, 1)[0], mapper=mapper, clock=self.clock
+            manifest, deadline=kcc_health.run_deadline(0.0), run=self.slow_run(1, 1, 1)[0], mapper=mapper, clock=self.clock
         )
         self.assertIn("RuntimeError", manifest["clusters"][0]["kcc_unread"])
 

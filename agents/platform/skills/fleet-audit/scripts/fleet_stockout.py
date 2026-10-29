@@ -2685,7 +2685,8 @@ def main(argv: list[str] | None = None) -> int:
     # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command,
     # scheduled or on demand, passes it; a chat fleet question does not.
     if args.config_connector:
-        # After the sweep, in a new pool of the sweep's size: one `kubectl get gcp`
+        # After the sweep, in a new pool of the sweep's size: one Config Connector
+        # read (a CRD list and one list request per kind, `kcc_health.read_objects`)
         # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry,
         # with the kubeconfig the sweep fetched for that cluster
         # (`fetch_credentials`). The reads end inside the collector's time budget
