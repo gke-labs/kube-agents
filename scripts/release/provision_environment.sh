@@ -176,7 +176,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -376,6 +376,11 @@ fi
 # file as the durable answer.
 if [ -n "${ENABLE_DRIFT_DETECTOR:-}" ]; then
   INSTALL_ARGS+=(--enable-drift-detector="$(canonical_bool "${ENABLE_DRIFT_DETECTOR}")")
+fi
+
+# The same shape: unset omits the flag and install.sh's default (on) answers.
+if [ -n "${VERTEX_MANAGE_SERVING_PROJECT:-}" ]; then
+  INSTALL_ARGS+=(--vertex-manage-serving-project="$(canonical_bool "${VERTEX_MANAGE_SERVING_PROJECT}")")
 fi
 
 if [ -n "${MODEL_PROVIDER:-}" ]; then

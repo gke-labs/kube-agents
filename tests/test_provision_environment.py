@@ -765,6 +765,7 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
         "ENABLE_GVISOR": "--enable-gvisor",
         "HERMES_DASHBOARD_ENABLED": "--enable-hermes-dashboard",
         "WEB_CONSOLE_ENABLED": "--enable-web-console",
+        "VERTEX_MANAGE_SERVING_PROJECT": "--vertex-manage-serving-project",
     }
 
     def _install_call(self, tmp_dir):

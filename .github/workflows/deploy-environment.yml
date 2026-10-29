@@ -243,6 +243,7 @@ jobs:
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
           ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
+          VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
         run: ./scripts/release/validate_and_log_deploy_summary.sh
 
       - name: Authenticate to GCP via Workload Identity Federation (WIF)
