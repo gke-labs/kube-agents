@@ -18652,12 +18652,15 @@ class KccHealth(NamedTuple):
     in neither list, so an empty `stalled` is never "everything is applying".
     `hosts` counts the entries that ran Config Connector (that carry
     `kcc_unready`, also empty): with more than one, the same object name can
-    be ready on one host and not ready on another.
+    be ready on one host and not ready on another. `targets` holds the name
+    of every manifest entry, so a match can see two clusters of one name in
+    two projects.
     """
 
     stalled: list[KccStall]
     unread: list[str]
     hosts: int = 0
+    targets: tuple[str, ...] = ()
 
 
 def kcc_health(manifest: dict | None) -> KccHealth:
@@ -18665,10 +18668,12 @@ def kcc_health(manifest: dict | None) -> KccHealth:
     stalled: list[KccStall] = []
     unread: list[str] = []
     hosts = 0
+    targets: list[str] = []
     for entry in (manifest or {}).get("clusters") or []:
         if not isinstance(entry, dict):
             continue
         host = str(entry.get("name") or "")
+        targets.append(host)
         if entry.get(KCC_UNREAD_FIELD):
             unread.append(host)
         if isinstance(entry.get(KCC_UNREADY_FIELD), list):
@@ -18689,7 +18694,7 @@ def kcc_health(manifest: dict | None) -> KccHealth:
                     str(record.get("project") or ""),
                 )
             )
-    return KccHealth(stalled, unread, hosts)
+    return KccHealth(stalled, unread, hosts, tuple(targets))
 
 
 def _kcc_dependencies(stall: KccStall, stalled: list[KccStall]) -> list[KccStall]:
@@ -18758,13 +18763,17 @@ def _finding_project(finding: dict) -> str:
 
 
 def _project_certain(stall: KccStall, project: str, kcc_hosts: int) -> bool:
-    """Whether `stall` is certainly the object of `project`.
+    """Whether `stall` can be the object of `project`.
 
-    With one host that runs Config Connector, the name decides. With more,
-    the same name can be ready on one host and not ready on another, and the
-    list of unready objects cannot show that. Then only a known project that
-    agrees makes the match certain.
+    A recorded project that is known and differs from `project` is never a
+    match, on any number of hosts: one management cluster can hold an object
+    of the same name for each project. With more than one host that runs
+    Config Connector, the same name can also be ready on one host and not
+    ready on another, and the list of unready objects cannot show that. Then
+    only a known project that agrees makes the match certain.
     """
+    if stall.project and project and stall.project != project:
+        return False
     if kcc_hosts <= 1:
         return True
     return bool(stall.project) and stall.project == project
@@ -18781,11 +18790,11 @@ def _remediation_file_stalls(
     both name a `clusterRef`, the two must be equal. A match that is not
     certain names nothing: objects that fit on more than one host cluster
     (Config Controller puts every instance's objects in one namespace), or,
-    when the file sets no namespace, more than one object that fits. With
-    more than one host that runs Config Connector (`kcc_hosts`), the
-    recorded object's project must be known and agree with the file
-    object's project annotation, or with the finding's project when the
-    file has none (`_project_certain`).
+    when the file sets no namespace, more than one object that fits. A
+    recorded project that is known must agree with the file object's
+    project annotation, or with the finding's project when the file has
+    none; with more than one host that runs Config Connector (`kcc_hosts`),
+    it must also be known (`_project_certain`).
     """
     matched: list[KccStall] = []
     for (kind, _, cluster_ref, _), declaration in index.items():
@@ -18810,15 +18819,19 @@ def _remediation_file_stalls(
     return matched
 
 
-def _object_stalls(finding: dict, stalled: list[KccStall], kcc_hosts: int) -> list[KccStall]:
+def _object_stalls(
+    finding: dict, stalled: list[KccStall], kcc_hosts: int, targets: tuple[str, ...] = ()
+) -> list[KccStall]:
     """The unready objects that are `finding`'s own object: a `Cluster/` or
     `NodePool/` finding, matched on the name GKE reports (the object's
     `resourceID`, else its name) and, for a node pool, on its cluster.
     An object whose project is known must manage the finding's project, and
     with more than one host that runs Config Connector the project must be
-    known (`_project_certain`). Objects that fit on more than one host
-    cluster name nothing, as in `_remediation_file_stalls`: the match is not
-    certain."""
+    known (`_project_certain`). An object with no recorded project names
+    nothing when the manifest holds a cluster of the same name in another
+    project (`targets`): its name and `clusterRef` cannot tell the two
+    apart. Objects that fit on more than one host cluster name nothing, as
+    in `_remediation_file_stalls`: the match is not certain."""
     prefix, _, name = str(finding.get("object") or "").partition("/")
     kinds = _KCC_OBJECT_KINDS.get(prefix)
     if not kinds or not name:
@@ -18826,6 +18839,10 @@ def _object_stalls(finding: dict, stalled: list[KccStall], kcc_hosts: int) -> li
     cluster = str(finding.get("cluster") or "").rpartition("/")[2]
     project = _finding_project(finding)
     pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
+    namesakes = any(
+        len(parts) == CLUSTER_TARGET_SEGMENTS and parts[2] == cluster and parts[0] != project
+        for parts in (target.split("/") for target in targets)
+    )
     fits = [
         stall
         for stall in stalled
@@ -18834,6 +18851,7 @@ def _object_stalls(finding: dict, stalled: list[KccStall], kcc_hosts: int) -> li
         and (stall.kind not in pool_kinds or stall.cluster == cluster)
         and not (stall.project and stall.project != project)
         and _project_certain(stall, project, kcc_hosts)
+        and (stall.project or not namesakes)
     ]
     return fits if len({stall.host for stall in fits}) <= 1 else []
 
@@ -18956,7 +18974,7 @@ def disclose_stalled_kcc_remediations(
         in_file = _remediation_file_stalls(finding, index, stalled, health.hosts) if index else []
         is_manifest = isinstance(remediation, dict) and remediation.get("kind") == MANIFEST_REMEDIATION_KIND
         object_fallback = bool(stalled) and (bool(index) or not is_manifest)
-        matched = in_file or (_object_stalls(finding, stalled, health.hosts) if object_fallback else [])
+        matched = in_file or (_object_stalls(finding, stalled, health.hosts, health.targets) if object_fallback else [])
         if matched:
             finding[KCC_STALLED_FINDING_FIELD] = kcc_stalled_objects(matched, stalled)
         if in_file and isinstance(remediation, dict):

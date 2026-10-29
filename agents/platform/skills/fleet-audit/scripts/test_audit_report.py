@@ -22986,6 +22986,38 @@ metadata:
         self.disclose([own], kcc_manifest(dict(record, project="pa")))
         self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
 
+    def test_one_host_never_matches_an_object_of_another_project(self):
+        """One management cluster, one namespace per project, the same names.
+        The file leaves the namespace to Kustomize and names proj-a; the only
+        unready object is team-b's, which manages proj-b."""
+        self.write(
+            "teams/a/gke.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: gke\n"
+            "  annotations:\n    cnrm.cloud.google.com/project-id: proj-a\nspec:\n  location: us-central1\n",
+        )
+        finding = kcc_finding(path="teams/a/gke.yaml")
+        finding.update(cluster="proj-a/us-central1/gke", object="Cluster/gke")
+        record = {"kind": "ContainerCluster", "namespace": "team-b", "name": "gke", "why": "UpdateFailed", "project": "proj-b"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(record)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.disclose([finding], kcc_manifest(dict(record, namespace="team-a", project="proj-a")))
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+
+    def test_an_object_with_no_project_does_not_match_when_a_namesake_cluster_is_in_another_project(self):
+        """The finding's own `Cluster/gke` in proj-a; the manifest also holds a
+        `gke` in proj-b; the unready object records no project, so its name
+        and `clusterRef` cannot tell the two clusters apart."""
+        own = kcc_finding(note="x", kind="gcloud")
+        own.update(cluster="proj-a/us-central1/gke", object="Cluster/gke")
+        record = {"kind": "ContainerCluster", "namespace": "infra", "name": "gke", "why": "UpdateFailed"}
+        manifest = kcc_manifest(record)
+        manifest["clusters"].append({"name": "proj-b/us-central1/gke", "outcome": "collected", "commands": [], "candidates": []})
+        self.disclose([own], manifest)
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+        # Without the namesake, the one object of that name is the finding's.
+        self.disclose([own], kcc_manifest(record))
+        self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+
     def test_a_fix_to_a_file_with_no_config_connector_object_gets_no_config_connector_text(self):
         """The finding's node pool is unready, but the fix edits a
         `ComputeClass`: the merged fix did not change a Config Connector
