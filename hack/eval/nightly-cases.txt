@@ -914,6 +914,12 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# A card the AI model's rate limit blocked is not promised a retry: the wake
+# reply says it will not run again on its own and offers to try again (SOUL
+# §2 step 5, #3766). Plants its own card through card_wake.py; one front-door
+# turn, no card round trip, no fixture: +3 units at the 200s default.
+./tasks/chat-rate-limit-block-promises-no-retry/task.yaml
+
 # The front door routes "which namespaces exist in this cluster?" to the host
 # cluster's agent (or platform) without asking which cluster (#3286).
 # deployer: noop, read-only, one front-door turn plus the card round trip:

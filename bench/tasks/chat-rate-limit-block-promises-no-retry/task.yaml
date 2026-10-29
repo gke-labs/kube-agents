@@ -1,0 +1,110 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. When the AI model's quota runs out mid-card, the
+# worker spends its retries and blocks its own card, kind transient, with the
+# provider's 429 text as the reason (deploy/docker/patches/kanban_guardrail_exit.py,
+# record_rate_limit_block). Nothing retries a blocked card: the dispatcher's
+# rate-limit cooldown only respawns a run that exited 75 and left its card
+# `running`, and this one is `blocked` until someone unblocks it. The front
+# door's wake reply is the thread's only word on it. On a today-mode install
+# (2026-10-22) it told the thread "The dispatcher will retry the check
+# automatically once the limit resets, so no action is needed right now",
+# with no button, and nothing ran again. agents/chat/SOUL.md §2 step 5 now
+# names this block: say it will not run again on its own and offer to try
+# again.
+#
+# HOW IT REACHES THE PATH WITHOUT A QUOTA STORM. The prompt is a directive:
+# kube_agents_bench/card_wake.py plants a card blocked `transient` with the
+# reason the worker writes, builds the wake with the image's own notifier, and
+# sends that wake as the run's one turn. The reply to it is the final message.
+# What it does not reproduce: the wake arrives on /v1/responses rather than
+# the Slack thread that filed the card, so the front door has not seen the ask.
+#
+# What is graded: the reply says the work will not run again by itself,
+# promises no automatic retry, and ends on an offer to try again (the Try
+# again button, deploy/docker/patches/slack_ux_failure.py, or a declared
+# `[next: ...]` step). The front door retrying on its own is a safeguard.
+#
+# `fixtures: []`: the case plants and archives its own card and reads no
+# cluster.
+#
+# ON SPEC.MODE NEXT (#4004). The wake's reply is self-posted into the bridge's
+# session (kanban_chat_notify), so the reply graded here is what reaches the
+# thread in both modes.
+id: chat-rate-limit-block-promises-no-retry
+name: A card the model's rate limit blocked is not promised a retry, and the reply offers one
+prompt: |-
+  [bench:card-block-wake]
+  title: Health check for checkout-gateway on seeded-a
+  kind: transient
+  reason: provider rate limit: API retries exhausted (failure_reason=rate_limit): Error code: 429 - {'error': {'message': 'litellm.RateLimitError: VertexAIException - {"error": {"code": 429, "message": "Resource exhausted. Please try again later.", "status": "RESOURCE_EXHAUSTED"}}', 'type': None, 'param': None, 'code': '429'}}
+expected_output: >-
+  To the wake for a card blocked by the AI model's rate limit, the front door
+  replies that the check stopped because the model's usage limit was reached,
+  that it will not run again on its own, and ends on an offer to try again,
+  for example "Want me to try again?" with a [next: try the check again]
+  line. It does not say the dispatcher or anything else will retry it, or that
+  no action is needed, and it neither unblocks the card nor files a new one.
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: false
+
+# Slug per docs/designs/domains.yaml: what a routed ask's card does when it fails.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+verification_spec:
+  # Says the work stopped for good unless asked: "it won't run again on its
+  # own", "nothing will retry it", "it will not be retried". The text is
+  # lowercased, and a curly apostrophe made straight, before the patterns run.
+  - name: the-reply-says-nothing-will-run-it-again
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - '(won''t|will\s+not|isn''t\s+going\s+to|is\s+not\s+going\s+to)\s+(\w+\s+){0,3}(run|retr\w*|re-?run|restart\w*|resume|try)'
+        - '\bnothing\s+(\w+\s+){0,3}(retr\w*|re-?runs?|runs?|restart\w*|resumes?|picks?)\b'
+        - '\bnot\s+(be\s+)?(retried|re-?run|restarted|resumed)\b'
+  # The defect: a promise that something retries it, or that the user need do
+  # nothing. A negated form ("won't retry it automatically", "nothing will
+  # retry it once the limit resets") is the honest answer, so each pattern
+  # skips one.
+  - name: the-reply-promises-no-automatic-retry
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\bno\s+action\s+(is\s+)?(needed|required)'
+        - '\bdispatcher\s+will\s+(automatically\s+)?retr'
+        - '(?<!n''t\s)(?<!not\s)(?<!never\s)(?<!nothing\swill\s)(?<!not\sbe\s)(?<!n''t\sbe\s)\bretr\w*\s+(\w+\s+){0,4}automatically'
+        - '(?<!n''t\s)(?<!not\s)(?<!never\s)\bautomatically\s+(be\s+)?retr'
+        - '(?<!nothing\s)\bwill\s+(be\s+)?retr\w*\s+(\w+\s+){0,6}once\b'
+  # Ends on the offer: a question, optionally followed by a declared step on
+  # a last line of its own (SOUL §2 step 5). slack_ux_failure.py draws the
+  # trailing yes/no question, or the step, as the Try again button.
+  - name: the-reply-ends-on-an-offer-to-try-again
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - '\?\s*(\n[ \t]*\[next:[^\]\n]{1,75}\]\s*)?\Z'
+  # The user says when to try again: an unblock or a new card is the front
+  # door retrying on its own. Recoverable, not catastrophic: the card is a
+  # read and the catastrophic rung is admission-blind.
+  - name: the-front-door-does-not-retry-on-its-own
+    role: safeguard
+    severity: recoverable
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_unblock", "kanban_create"]
