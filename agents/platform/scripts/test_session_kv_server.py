@@ -1,6 +1,7 @@
 import copy
 import importlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -3320,14 +3321,11 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             entered.set()
             release.wait(5)
 
-        def start(session_id, name):
-            return session_kv_server._TriageStart(session_id, {**self.PAYLOAD, "name": name}, None, None, 0.0)
-
         with patch.dict(os.environ, {self.ENV: "true"}, clear=False), patch.object(
             session_kv_server, "_attempt_triage_start_unlocked", side_effect=turn
         ):
-            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
-            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
             first.start()
             self.assertTrue(entered.wait(5))
             second.start()
@@ -3374,8 +3372,15 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
 
     def test_an_unanswered_turn_holds_the_lock_until_its_card_is_on_the_board(self):
         # The board the first start's prompt saw: a live same-branch sibling
-        # filed by an earlier session.
-        self.make_board(self.card(self.SIBLING, "running", session_id="k8s-evt-0"))
+        # filed by an earlier session, and a settled pull-request card the
+        # first start's own session filed in an earlier turn (the watcher's
+        # `--mode=shared` sends every incident into one session), which is not
+        # this turn's card and must not end the hold.
+        before_the_turn = time.time() - 10.0
+        self.make_board(
+            self.card(self.SIBLING, "running", created_at=before_the_turn, session_id="k8s-evt-0"),
+            self.card("t_0a000000", "done", created_at=before_the_turn, session_id="k8s-evt-a"),
+        )
         turns, patches = self._unanswered_turn(10.0)
         with ExitStack() as stack:
             for item in patches:
@@ -3392,20 +3397,27 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self._assert_still_held(first, second, turns)
             # None of these is the turn's own card, so none ends the hold: the
             # sibling the prompt saw settling, a pull-request card for the
-            # branch filed by some other session, and a poll the board refused.
+            # branch filed by some other session, a card the same session filed
+            # during this turn for another branch (a shared session's
+            # concurrent turn), and a poll the board refused.
             self._board_write("UPDATE tasks SET status = 'done' WHERE id = ?", (self.SIBLING,))
             self._assert_still_held(first, second, turns)
             self._board_write(
                 "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                self.card("t_2b000002", "running", created_at=2.0, session_id="k8s-evt-z"),
+                self.card("t_2b000002", "running", created_at=time.time(), session_id="k8s-evt-z"),
+            )
+            self._assert_still_held(first, second, turns)
+            self._board_write(
+                "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                self.card("t_3c000003", "todo", branch=self.branch() + "-other", created_at=time.time(), session_id="k8s-evt-a"),
             )
             self._assert_still_held(first, second, turns)
             with patch.object(session_kv_server, "_read_kanban", side_effect=session_kv_server.HTTPException(503, "locked")):
                 self._assert_still_held(first, second, turns)
-            # The first start's own session files its Call 2 card.
+            # The first start's own turn files its Call 2 card.
             self._board_write(
                 "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                self.card("t_1a000001", "todo", created_at=3.0, session_id="k8s-evt-a"),
+                self.card("t_1a000001", "todo", created_at=time.time(), session_id="k8s-evt-a"),
             )
             first.join(5)
             second.join(5)
@@ -3455,39 +3467,54 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                 stack.enter_context(item)
             session_kv_server._attempt_triage_start(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"))
 
-    def test_the_own_card_read_answers_not_yet_until_the_session_files_its_pull_request_card(self):
+    def test_the_own_card_read_answers_not_yet_until_the_turn_files_its_pull_request_card(self):
         import sqlite3
 
-        # No board, no session: not yet.
-        self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a"), "")
-        self.assertEqual(session_kv_server._own_pull_request_card(""), "")
+        branch = self.branch()
+        turn_began = 1_700_000_000
+
+        def own_card(session_id="k8s-evt-a", since=turn_began):
+            return session_kv_server._own_pull_request_card(session_id, branch, since)
+
+        # No board, no session, no branch: not yet.
+        self.assertEqual(own_card(), "")
+        self.assertEqual(own_card(""), "")
+        self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a", "", turn_began), "")
         # The session's triage card alone is not the pull-request card; another
-        # session's pull-request card is not this session's.
+        # session's pull-request card is not this session's; and on a session
+        # that carries more than one turn (`--mode=shared`), a pull-request
+        # card the session filed before this turn began, or for another
+        # branch, is some other turn's.
         self.make_board(
-            self.card("t_aaaaaaaa", "running", title="Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1", session_id="k8s-evt-a"),
-            self.card("t_bbbbbbbb", "running", session_id="k8s-evt-z"),
+            self.card("t_aaaaaaaa", "running", title="Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1", created_at=turn_began, session_id="k8s-evt-a"),
+            self.card("t_bbbbbbbb", "running", created_at=turn_began, session_id="k8s-evt-z"),
+            self.card("t_cccccccc", "done", created_at=turn_began - 1, session_id="k8s-evt-a"),
+            self.card("t_dddddddd", "running", branch=branch + "-other", created_at=turn_began + 5, session_id="k8s-evt-a"),
         )
-        self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a"), "")
+        self.assertEqual(own_card(), "")
         # Once filed it counts in any status, settled included: the question is
-        # whether Call 2 landed, not whether the card is live.
+        # whether Call 2 landed, not whether the card is live. Hermes stamps
+        # whole seconds, so a card stamped with the floor's own second counts.
         for status in ("todo", "running", "blocked", "done", "archived"):
             with self.subTest(status=status):
                 self._board_write("DELETE FROM tasks WHERE id = 't_1a000001'")
                 self._board_write(
                     "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    self.card("t_1a000001", status, created_at=2.0, session_id="k8s-evt-a"),
+                    self.card("t_1a000001", status, created_at=turn_began, session_id="k8s-evt-a"),
                 )
-                self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a"), "t_1a000001")
+                self.assertEqual(own_card(), "t_1a000001")
+        # The same board read for a later turn of the same session: not yet.
+        self.assertEqual(own_card(since=turn_began + 1), "")
         # A board that cannot be read is "not yet" with a log line, never a raise.
         self.board.unlink()
         with sqlite3.connect(self.board) as conn:
             conn.execute("CREATE TABLE other (id TEXT)")
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
-            self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a"), "")
+            self.assertEqual(own_card(), "")
         self.assertTrue(any("INCIDENT_PR_OWN_CARD_LOOKUP_FAILED session=k8s-evt-a" in line for line in logs.output), logs.output)
         with patch.object(session_kv_server, "_kanban_db_path", side_effect=RuntimeError("no home")):
             with self.assertLogs(session_kv_server.logger, level="WARNING"):
-                self.assertEqual(session_kv_server._own_pull_request_card("k8s-evt-a"), "")
+                self.assertEqual(own_card(), "")
 
     def test_an_unreadable_board_fails_open_to_the_one_parent(self):
         import sqlite3
@@ -11870,15 +11897,22 @@ class TestTriageStartRetry(unittest.TestCase):
         `_attempt_triage_start` holds the stripe on that answer: a body that
         ended on a bare `return` would skip the hold and log no HELD line."""
         began = self.clock.now
+        wall_before = math.floor(time.time())
         own_card, logs = self._unanswered_chat_with_the_opt_in_on(["", "", "t_1a000001"], TimeoutError("timed out"))
         self.assertEqual(own_card.call_count, 3)
-        self.assertEqual(own_card.call_args_list[0].args, ("k8s-evt-1",))
+        # Keyed on this turn: the session, its branch, and the whole second the
+        # turn began in, so a card the session filed earlier does not count.
+        session_id, branch, turn_began = own_card.call_args_list[0].args
+        self.assertEqual(session_id, "k8s-evt-1")
+        self.assertEqual(branch, session_kv_server._incident_branch("k8s-evt-1", dict(self.INCIDENT)))
+        self.assertIsInstance(turn_began, int)
+        self.assertTrue(wall_before <= turn_began <= math.floor(time.time()), (wall_before, turn_began))
         self.assertIn("INCIDENT_START_HELD session=k8s-evt-1 until=card", logs)
         self.assertAlmostEqual(self.clock.now - began, 2 * session_kv_server.INCIDENT_START_UNKNOWN_POLL_S)
 
     def test_an_unanswered_chat_releases_the_branch_lock_once_the_hold_has_passed(self):
         began = self.clock.now
-        own_card, logs = self._unanswered_chat_with_the_opt_in_on(lambda session_id: "", _http_error(502))
+        own_card, logs = self._unanswered_chat_with_the_opt_in_on(lambda *turn: "", _http_error(502))
         self.assertIn("INCIDENT_START_HELD session=k8s-evt-1 until=timeout held=300s", logs)
         self.assertAlmostEqual(self.clock.now - began, session_kv_server.INCIDENT_START_UNKNOWN_HOLD_S)
         self.assertGreater(own_card.call_count, 1)

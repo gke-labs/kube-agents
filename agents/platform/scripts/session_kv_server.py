@@ -371,15 +371,23 @@ INCIDENT_PR_SIBLING_SQL = """
 # How the card body names its branch: `_triage_pr_task_body` writes
 # ``on the branch `<branch>` ``, and the sibling lookup matches that whole token.
 INCIDENT_PR_BRANCH_NEEDLE = "`{branch}`"
-# The pull-request card one session filed, whatever its status: Hermes stamps
+# The pull-request card one turn filed, whatever its status: Hermes stamps
 # the filing session on `tasks.session_id`, and the front door's Call 2 runs
 # in the session the triage start opened for the alert, so this is the card
-# the hold after an unanswered turn waits for.
+# the hold after an unanswered turn waits for. A session is not always one
+# turn (the watcher's `--mode=shared` sends every incident into one), so the
+# read is floored at the turn's start and narrowed to the body naming the
+# turn's branch: a card an earlier turn of the session filed, or one a
+# concurrent turn on another branch filed, is not this turn's. Hermes stamps
+# `created_at` in whole seconds, so the floor is the whole second the turn
+# began in (`_attempt_triage_start`).
 INCIDENT_PR_OWN_CARD_SQL = """
     SELECT t.id
       FROM tasks t
      WHERE t.session_id = ?
        AND substr(t.title, 1, ?) = ?
+       AND t.created_at >= ?
+       AND instr(COALESCE(t.body, ''), ?) > 0
      ORDER BY t.created_at DESC, t.id DESC
      LIMIT 1
 """
@@ -2941,22 +2949,33 @@ def _live_pull_request_sibling(branch: str) -> str:
     return sibling
 
 
-def _own_pull_request_card(session_id: str) -> str:
-    """The id of the `Open GitOps PR` card `session_id` filed, or "" while there is none.
+def _own_pull_request_card(session_id: str, branch: str, since: float) -> str:
+    """The id of the `Open GitOps PR` card for `branch` that `session_id` filed at or
+    after `since` (an epoch second), or "" while there is none.
 
     Read-only, any status: the question is whether the turn's Call 2 has landed,
-    not whether the card is live. A board that is missing or cannot be read
-    answers "" too, which to the one caller (`_hold_for_unanswered_turn`) means
-    "not yet": the hold goes on polling, bounded by INCIDENT_START_UNKNOWN_HOLD_S,
-    rather than releasing on a read it could not make.
+    not whether the card is live. The floor and the branch make the read about
+    this turn rather than about the session, which `--mode=shared` reuses for
+    every incident: a card the session filed before this turn began, or for
+    another branch, is some other turn's. A board that is missing or cannot be
+    read answers "" too, which to the one caller (`_hold_for_unanswered_turn`)
+    means "not yet": the hold goes on polling, bounded by
+    INCIDENT_START_UNKNOWN_HOLD_S, rather than releasing on a read it could not
+    make.
     """
-    if not session_id:
+    if not session_id or not branch:
         return ""
 
     def read(conn: sqlite3.Connection) -> str:
         row = conn.execute(
             INCIDENT_PR_OWN_CARD_SQL,
-            (session_id, len(INCIDENT_PR_CARD_TITLE_PREFIX), INCIDENT_PR_CARD_TITLE_PREFIX),
+            (
+                session_id,
+                len(INCIDENT_PR_CARD_TITLE_PREFIX),
+                INCIDENT_PR_CARD_TITLE_PREFIX,
+                since,
+                INCIDENT_PR_BRANCH_NEEDLE.format(branch=branch),
+            ),
         ).fetchone()
         return str(row["id"]) if row and row["id"] is not None else ""
 
@@ -3993,24 +4012,26 @@ def _incident_start_lock(payload: Dict[str, Any], session_id: str):
     return _INCIDENT_START_LOCKS[zlib.crc32(branch.encode("utf-8")) % INCIDENT_START_LOCK_STRIPES]
 
 
-def _hold_for_unanswered_turn(session_id: str) -> None:
+def _hold_for_unanswered_turn(session_id: str, branch: str, turn_began: float) -> None:
     """Keep the branch's start lock while a turn `/chat` did not answer may still be filing.
 
     `_attempt_triage_start_unlocked` treats START_UNKNOWN as started, since a
     second `/chat` would file a second pair of cards; but the turn's own cards
     may not be on the board yet, and the next same-branch start would run its
     sibling lookup before they are. So the stripe stays held until the
-    pull-request card this start's own session filed is on the board
-    (`_own_pull_request_card`: Hermes stamps the filing session on the card, so
-    the read is keyed on the one fact the hold needs, and neither another card
-    settling, nor a poll the board refused, nor a card of another session ends
-    it), or INCIDENT_START_UNKNOWN_HOLD_S has passed. Past that, a turn still
-    running is the window the lock does not cover, and the log line says which
-    way the hold ended.
+    pull-request card this turn filed is on the board
+    (`_own_pull_request_card`: this session's, for this branch, created at or
+    after `turn_began`, the whole second the turn began in, so the read is
+    keyed on the one fact the hold needs, and neither another card settling,
+    nor a poll the board refused, nor a card of another session, nor a card
+    this session filed in an earlier turn or for another branch ends it), or
+    INCIDENT_START_UNKNOWN_HOLD_S has passed. Past that, a turn still running
+    is the window the lock does not cover, and the log line says which way the
+    hold ended.
     """
     deadline = time.monotonic() + INCIDENT_START_UNKNOWN_HOLD_S
     while True:
-        if _own_pull_request_card(session_id):
+        if _own_pull_request_card(session_id, branch, turn_began):
             logger.info(f"INCIDENT_START_HELD session={session_id} until=card")
             return
         now = time.monotonic()
@@ -4030,9 +4051,12 @@ def _attempt_triage_start(start: _TriageStart) -> None:
         waited = time.monotonic() - began
         if waited >= INCIDENT_START_WAIT_LOG_S:
             logger.info(f"INCIDENT_START_SERIALIZED session={start.session_id} waited={waited:.0f}s")
+        # The hold's floor, taken before the turn so every card the turn files
+        # is at or after it: the whole second, as Hermes stamps `created_at`.
+        turn_began = math.floor(time.time())
         outcome = _attempt_triage_start_unlocked(start)
         if serialized and outcome == START_UNKNOWN:
-            _hold_for_unanswered_turn(start.session_id)
+            _hold_for_unanswered_turn(start.session_id, _incident_branch(start.session_id, start.payload), turn_began)
 
 
 def _attempt_triage_start_unlocked(start: _TriageStart) -> str:
