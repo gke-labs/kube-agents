@@ -601,7 +601,9 @@ class Runner:
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
         """The runs whose key is not in the data file yet, for the build the install runs now."""
-        done = {record["key"]: record.get("values", {}) for record in records.load(self.data_file)["records"]}
+        stored = records.load(self.data_file)["records"]
+        done = {record["key"]: record.get("values", {}) for record in stored}
+        phases = {record["key"]: record.get("phase", "") for record in stored}
         operations.wait_gateway_ready(self.install.context, self.install.namespace)
         image = self.install.image()
         commit = commit_of(image) or image.rsplit(":", 1)[-1] or "unknown"
@@ -611,6 +613,10 @@ class Runner:
             key = records.record_key(commit, mode, spec.factor, spec.level, spec.operation.name, spec.run)
             if key not in done or not self.same_point(done[key], spec):
                 pending.append(spec)
+            elif phases[key] != self.plan.phase:
+                # A key carries the operation's name, not the plan's phase: say when another phase's
+                # record stands for this run, so a reused name does not skip it unnoticed.
+                LOG.warning("%s is already recorded by %s; not running it again", key, phases[key])
         return pending
 
     def same_point(self, stored: dict[str, float], spec: RunSpec) -> bool:
@@ -880,13 +886,18 @@ def hold_lease(plan: Plan, note: str):
 
         acquired = lease("acquire", "--ttl", ttl, "--note", note)
         if acquired.returncode != 0:
-            raise SystemExit(f"the install's live-test lease is held elsewhere; not running:\n"
-                             f"{acquired.stdout}{acquired.stderr}")
+            # Held by another holder, or not resolvable at all (a checkout's install.env naming the same
+            # context, a kubectl failure): the script's own output says which.
+            raise SystemExit(f"could not take the install's live-test lease (exit {acquired.returncode}); "
+                             f"not running:\n{acquired.stdout}{acquired.stderr}")
         LOG.info("holding the live-test lease on %s for up to %s minutes", target["host_cluster"], ttl)
         try:
             yield
         finally:
-            lease("release")
+            released = lease("release")
+            if released.returncode != 0:
+                LOG.warning("could not release the live-test lease; it expires on its own after %s minutes: %s",
+                            ttl, released.stdout + released.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

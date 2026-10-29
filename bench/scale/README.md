@@ -21,6 +21,10 @@ console's Harness limits page reads `harness-limits.json`.
 - `phase3-proxy-raised.yaml`: Phase 3's two windows at 2 and 16 clusters with the credential proxy's
   limits raised, so its CPU peak shows what it needs; set the limits before the runs and remove them
   after.
+- `phase4.yaml`: the Phase 4 plan: an onboarded install's daily work (Stall Watch, one daily audit,
+  fan-out questions) from 40 clusters down. Its test clusters are created before the run, outside
+  the runner, each with its own subnet and small Pod and Service ranges, so the project's default
+  network does not cap their number.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.

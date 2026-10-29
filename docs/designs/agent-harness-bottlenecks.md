@@ -352,18 +352,20 @@ The Harness limits page's example fleets are sizes built from customer fleets, r
 | Clusters           | Agent CPU, memory | Proxy CPU | Shell CPU | Longest command wait | Stall Watch pass         | One daily audit     | Fan-out question |
 | ------------------ | ----------------- | --------- | --------- | -------------------- | ------------------------ | ------------------- | ---------------- |
 | 2                  | 0.36, 934 MiB     | 0.37      | 0.79      | under 0.1 s          | 2.0 min                  | 2.6 min             | —                |
-| 8                  | 0.55, 533 MiB     | 0.24      | 0.81      | under 0.1 s          | 7.0 min                  | 32 s (see below)    | —                |
-| 16                 | 0.43, 910 MiB     | 0.56      | 0.83      | under 0.1 s          | 13.6 min                 | 36 s (see below)    | —                |
+| 8                  | 0.55, 533 MiB     | 0.24      | 0.81      | under 0.1 s          | 7.0 min                  | 31 s (see below)    | —                |
+| 16                 | 0.43, 910 MiB     | 0.56      | 0.83      | under 0.1 s          | skipped (see below)      | 34 s (see below)    | —                |
 | 24                 | 1.07, 1,743 MiB   | 1.09      | 0.82      | 30–60 s (IAM outage) | 25 min, its whole budget | failed (IAM outage) | 239–291 s        |
 | 32                 | 0.64, 1,778 MiB   | 1.13      | 0.81      | 15–30 s              | —                        | 39 min              | 101–127 s        |
 | 40                 | 2.36, 3,146 MiB   | 2.45      | 1.58      | 2.5–5 s              | —                        | 34 min              | 129–375 s        |
 | 40 × 1,000 objects | 0.90, 1,766 MiB   | 2.33      | 1.48      | 2.5–5 s              | —                        | 45 min              | 137–157 s        |
 
+The fan-out question has no Phase 4 run at 2, 8 and 16 clusters: the plan named it `fan_out`, the same key as the earlier phases' fan-out runs at those sizes, so the runner counted those as recorded and skipped it. The plan now names it `daily_fan_out`, and the runner warns when another phase's record stands for a run.
+
 The data shows four things.
 
 - **One install holds 40 clusters of daily work.** Every container stayed inside its limit, no command was refused, and the shell peaked at 1.58 of its fixed 2 cores. The model's line for the shell, from the Phase 1 upgrade readiness runs (a report a user starts), reaches 2 cores at about 15 clusters, so that report is what loads the shell; at 40 clusters it would run slower, not fail.
-- **Stall Watch reads about 52 seconds per cluster,** one cluster at a time, within a 25-minute budget each half hour. It covers about 28 clusters per pass; at 40 clusters each cluster is read about once an hour.
-- **A full daily audit takes about 51 to 67 seconds per cluster** at 32 and 40 clusters. At 8 and 16 clusters the audit completed in about 30 seconds with almost no model tokens; the cron log shows no error, and whether it read every cluster is unknown, so those two times are not used.
+- **Stall Watch reads about 52 to 60 seconds per cluster** (the triggered passes that finished, at 2 and 8 clusters; at 16, 32 and 40 the trigger met a scheduled pass and was skipped), one cluster at a time, within a 25-minute budget each half hour. It covers about 25 to 28 clusters per pass; at 40 clusters each cluster is read about once an hour.
+- **A full daily audit takes about 51 to 72 seconds per cluster** at 32 and 40 clusters. At 8 and 16 clusters the audit completed in about 30 seconds with almost no model tokens; the cron log shows no error, and whether it read every cluster is unknown, so those two times are not used.
 - **Model tokens grow fastest.** One daily audit used 3.1 to 13.9 million input tokens at 32 and 40 clusters, about 0.1 to 0.35 million per cluster.
 
 For the XL fleet, with today's code:
@@ -373,7 +375,7 @@ For the XL fleet, with today's code:
 | 40                   | 63        | about 190 (760 vCPU)                   | about once an hour             | yes, at the top of it                |
 | 24 to 28             | 90 to 105 | about 270 to 320 (1,080 to 1,260 vCPU) | every 30 minutes               | yes                                  |
 
-Each install sets the agent to about 3 CPU and 4 GiB and the credential proxy to about 3.5 CPU and 1 GiB, the 40-cluster peaks plus the 30% margin; the other containers keep their defaults. The delays, per install: a fan-out question takes about 2 to 6 minutes, a brokered command waits up to 5 to 30 seconds, and one daily audit takes 34 to 45 minutes, so the six daily audits take about 3.5 to 4.5 hours of each day. Across the fleet, the daily audits alone use about 1.5 to 5 billion input tokens a day (6 audits × 2,500 clusters × 0.1 to 0.35 million), before questions and triage; that needs a model quota and budget of its own.
+Each install sets the agent to about 3 CPU and 4 GiB and the credential proxy to about 3.2 CPU and 1 GiB, the 40-cluster peaks plus the 30% margin; the other containers keep their defaults. The delays, per install: a fan-out question takes about 2 to 6 minutes, a brokered command waits up to 5 to 30 seconds, and one daily audit takes 34 to 45 minutes, so the six daily audits take about 3.5 to 4.5 hours of each day. Across the fleet, the daily audits alone use about 1.5 to 5 billion input tokens a day (6 audits × 2,500 clusters × 0.1 to 0.35 million), before questions and triage; that needs a model quota and budget of its own.
 
 The XL fleet is supportable this way, with three limits. Each install answers only for its own clusters: a question across all 2,500 clusters needs a layer above the installs that does not exist. The test clusters are small, and the XL fleet's are not, so per-cluster costs are a lower bound and the upper end of each range is the safer plan. The model's own lines, which take each input's largest increase across all operations, give about 15 clusters per install, or about 170 installs; the measured daily work says up to 40.
 

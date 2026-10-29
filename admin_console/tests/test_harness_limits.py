@@ -704,7 +704,7 @@ class CheckTest(unittest.TestCase):
         fan_out_chart = hl.metric_charts(records, "fan_out", hl.CLUSTERS, [], fleet)[0]
 
         self.assertEqual((check.status, check.prediction.value), (hl.PASS, 25.0))
-        self.assertEqual(check.name, "Response time (fan_out)")
+        self.assertEqual(check.name, "Response time (fan_out, daily_fan_out)")
         self.assertEqual(audit_chart.lines, ())
         self.assertEqual(fan_out_chart.lines, hl.RESPONSE_LINES)
 

@@ -398,7 +398,7 @@ CAPACITY_METRICS = MappingProxyType({PVC_USED: PVC_CAPACITY})
 # The response-time gates are for typical queries: the plan's fan-out question
 # and the metadata question asked during it. The other operations are long
 # reports, such as a fleet audit; their response time is charted without a gate.
-QUERY_OPERATIONS = ("fan_out",)
+QUERY_OPERATIONS = ("fan_out", "daily_fan_out")
 QUERY_METRICS = (RESPONSE,)
 
 # How far a capacity search looks: up to this multiple of the input's base value.

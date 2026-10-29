@@ -138,6 +138,9 @@ JOB_RUNNING = "running"
 JOB_CLAIMED = "claimed"
 JOB_ACTIVE = (JOB_CLAIMED, JOB_RUNNING)
 JOB_UNCLAIMED = "unclaimed"
+# A run line's fields after the job id (status, finished, started), and how Python prints a missing one.
+JOB_RUN_FIELDS = 3
+PYTHON_NONE = "None"
 # What a new install starts without: the agent's data and session metadata, the shell's data, the bus's data.
 RESET_CLAIMS = ("platform-agent-data", "system-metadata", "data-platform-agent-shell-0", "data-platform-agent-a2a-nats-0")
 RESET_STATEFUL_PODS = ("platform-agent-shell-0", "platform-agent-a2a-nats-0")
@@ -428,8 +431,8 @@ def job_seconds(context: str, namespace: str, home: str, jobs: tuple[str, ...], 
                        timeout=JOB_TIMEOUT_SECONDS)
     durations = {}
     for line in out.splitlines():
-        job, status, finished, started, *_ = line.split() + [""] * 3
-        if status == JOB_COMPLETED and finished not in ("", "None") and started not in ("", "None"):
+        job, status, finished, started, *_ = line.split() + [""] * JOB_RUN_FIELDS
+        if status == JOB_COMPLETED and finished not in ("", PYTHON_NONE) and started not in ("", PYTHON_NONE):
             durations[job] = (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
     return durations
 

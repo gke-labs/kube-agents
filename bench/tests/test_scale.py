@@ -1098,7 +1098,7 @@ def test_a_lease_held_elsewhere_refuses_the_run(monkeypatch):
         calls.append(args[2])
         return subprocess.CompletedProcess(args, 1, stdout="held by someone@host", stderr="")
     monkeypatch.setattr(runner.subprocess, "run", lease)
-    with pytest.raises(SystemExit, match="held elsewhere"):
+    with pytest.raises(SystemExit, match="could not take the install.s live-test lease"):
         with runner.hold_lease(plan, "test"):
             pytest.fail("the block ran without the lease")
     assert calls == ["acquire"]
@@ -1116,3 +1116,18 @@ def test_a_held_lease_is_released_when_the_block_ends(monkeypatch):
     with runner.hold_lease(plan, "test"):
         assert calls == ["acquire"]
     assert calls == ["acquire", "release"]
+
+
+def test_a_run_another_phase_recorded_is_skipped_with_a_warning(monkeypatch, tmp_path, caplog):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    spec = next(s for s in plan.matrix() if s.operation.kind == "prompt" and s.factor == "clusters")
+    records.merge(tmp_path / "data.json", [records.Record(
+        commit="e" * 40, mode="next", phase="phase3", factor=spec.factor, level=spec.level,
+        operation=spec.operation.name, run=spec.run, started="2026-10-27T00:00:00Z", ended="2026-10-27T00:05:00Z")])
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a: None)
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns", "image": lambda self: "img:" + "e" * 40,
+                                       "mode": lambda self: "next"})()
+    with caplog.at_level("WARNING"):
+        assert spec not in run.pending([spec])
+    assert "already recorded by phase3" in caplog.text

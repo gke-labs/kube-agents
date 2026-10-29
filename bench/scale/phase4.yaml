@@ -73,7 +73,9 @@ operations:
     window_seconds: 1500
     jobs_home: /opt/data/profiles/platform
     jobs: [compliance-audit]
-  fan_out:
+  # Named apart from the earlier phases' fan_out: a record key carries the operation, not the
+  # phase, so the same name would find their records and skip these runs.
+  daily_fan_out:
     kind: prompt
     factors: [clusters, combined]
     runs: 2
