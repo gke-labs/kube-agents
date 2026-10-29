@@ -6,6 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -187,5 +190,29 @@ func TestTurnStop_AShutdownEndsAStopInFlight(t *testing.T) {
 	}
 	if took := time.Since(started); took > 5*time.Second {
 		t.Fatalf("the stop held the shutdown for %s", took)
+	}
+}
+
+// The three waits nest: the API server's route answers inside the bridge's
+// request bound, and the card stop's wait for the session's turn outlasts
+// both, or a slow turn stop would end the card stop card-stop-unavailable.
+func TestTurnStop_TheWaitsNest(t *testing.T) {
+	src, err := os.ReadFile("../../deploy/docker/patches/api_session_stop.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^WAIT_SECONDS = ([0-9.]+)$`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("WAIT_SECONDS not found in api_session_stop.py")
+	}
+	route, err := strconv.ParseFloat(string(m[1]), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routeWait := time.Duration(route * float64(time.Second)); routeWait >= turnStopTimeout {
+		t.Fatalf("the route's wait %s is not under turnStopTimeout %s", routeWait, turnStopTimeout)
+	}
+	if turnStopTimeout >= cardStopTurnWait {
+		t.Fatalf("turnStopTimeout %s is not under cardStopTurnWait %s", turnStopTimeout, cardStopTurnWait)
 	}
 }

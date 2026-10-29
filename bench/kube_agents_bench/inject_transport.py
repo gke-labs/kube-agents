@@ -1503,7 +1503,7 @@ class InjectTask:
         task_id: str,
         *,
         deadline: float,
-        on_poll: Callable[[Fold], None] | None = None,
+        on_poll: Callable[[Fold], float | None] | None = None,
     ) -> Exchange:
         """Await the terminal of ``task_id``, folding what the relay posts.
 
@@ -1527,9 +1527,12 @@ class InjectTask:
             deadline: ``time.monotonic()`` instant after which the wait ends
                 on the read route's answer. The budget behind it clears the
                 floor (:func:`check_budget`).
-            on_poll: Called with the fold after each read that did not end
-                the wait: the harness's mid-turn stop sends from here
-                (:mod:`stop_hook`).
+            on_poll: Called with the fold before the first read and after
+                each read that did not end the wait; what it returns caps
+                how long the next read may block, in seconds (``None``: the
+                usual long poll). The harness's mid-turn stop sends from
+                here, and caps the reads so its delay is kept to a second or
+                so rather than a long poll's 30 (:mod:`stop_hook`).
 
         Raises:
             InjectUnavailable: The gateway could not be reached or was lost.
@@ -1537,13 +1540,14 @@ class InjectTask:
         fold = Fold(task_id)
         after = 0
         probe: Probe | None = None
+        poll_cap = on_poll(fold) if on_poll is not None else None
         while True:
             if fold.final:
                 return self._ended(fold, task_id, probe)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return self._classify(fold, task_id, after)
-            body = self._poll(task_id, after, remaining)
+            body = self._poll(task_id, after, remaining if poll_cap is None else min(remaining, poll_cap))
             after, fresh = self._absorb(fold, body, after)
             answered = Probe.from_body(body)
             adopted = False
@@ -1562,7 +1566,7 @@ class InjectTask:
                     if answered.executor_state == "" and answered.past_grace:
                         return self._never_started(fold, task_id, answered)
             if on_poll is not None:
-                on_poll(fold)
+                poll_cap = on_poll(fold)
             if fold.final and not adopted:
                 # The relay's terminal arrived in this read and its probe
                 # carried no trace to adopt: whatever trace the fold holds

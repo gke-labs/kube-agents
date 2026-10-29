@@ -3374,3 +3374,15 @@ def test_a_stream_terminal_ends_the_wait_with_or_without_a_poll_hook(
 
     assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
     assert time.monotonic() - started < 30.0
+
+
+def test_a_mid_turn_stop_caps_the_reads_until_it_goes(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long poll would hold the stop up to 30 s past its delay, so the
+    opening exchange's reads block at most a second until it has gone."""
+    run_mid_turn_ask(stub_gateway, monkeypatch)
+
+    opening = [p for p in stub_gateway.polls if p["probe"] and p["task"] == stub_gateway.task_id]
+    # The last read is the one after the stop, which finds the terminal.
+    assert len(opening) > 1 and all(p["wait"] <= 1 for p in opening[:-1])

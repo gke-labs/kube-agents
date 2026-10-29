@@ -289,6 +289,10 @@ _QUESTION_SECTION = "Question from delegated task {tid}:\n{text}"
 # Appended to the opening turn's message id for the stop a stopped ask sends
 # (stop_hook), so the door's dedupe never answers it with the opening task.
 _INJECT_STOP_SUFFIX = "/stop"
+# The longest a read of the opening exchange blocks while a mid-turn stop is
+# still to go (stop_hook.MID_TURN_DIRECTIVE), so the stop leaves within about
+# this much of its delay.
+_MID_TURN_POLL_SECONDS = 1.0
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -2258,7 +2262,7 @@ class KubeAgentsHarness(AgentHarness):
             budget: float,
             *,
             opening: bool,
-            on_poll: Callable[[inject.Fold], None] | None = None,
+            on_poll: Callable[[inject.Fold], float | None] | None = None,
         ) -> inject.Exchange:
             """One task to its terminal, through the transport retry.
 
@@ -2506,25 +2510,30 @@ class KubeAgentsHarness(AgentHarness):
 
         # A mid-turn stop goes from the opening exchange's own polls, once the
         # task has been working for the directive's delay; what it said (or
-        # the transport error it raised) is kept for the stop below.
+        # the transport error it raised) is kept for the stop below. Until it
+        # goes, each read is capped at a second, so the delay is not a long
+        # poll's 30 s.
         mid_turn_sent: list[tuple[bool, str, _TransportError | None]] = []
         working_since: list[float] = []
 
-        def _stop_mid_turn(fold: inject.Fold) -> None:
+        def _stop_mid_turn(fold: inject.Fold) -> float | None:
             if stop is None or stop.mid_turn_after is None or mid_turn_sent or fold.final:
-                return
+                return None
             if inject.STATE_WORKING not in fold.executor_states:
-                return
+                return _MID_TURN_POLL_SECONDS
             if not working_since:
                 working_since.append(time.monotonic())
             if time.monotonic() - working_since[0] < stop.mid_turn_after:
-                return
+                return _MID_TURN_POLL_SECONDS
             try:
                 sent, detail = _send_stop()
             except _TransportError as exc:
                 mid_turn_sent.append((False, str(exc), exc))
-                return
+                return None
+            _log.info("inject: mid-turn stop sent %.1fs after the task was first seen working",
+                      time.monotonic() - working_since[0])
             mid_turn_sent.append((sent, detail, None))
+            return None
 
         try:
             exchange = _exchange(task, timeout, opening=True, on_poll=_stop_mid_turn)

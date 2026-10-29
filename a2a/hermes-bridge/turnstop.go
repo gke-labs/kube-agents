@@ -72,6 +72,9 @@ func (b *Bridge) stopCanceledTurn(run *taskRun, sessionID string, err error) {
 		b.cfg.Logger.Warn("the canceled turn runs on in hermes: "+err.Error(), "task", taskID, "session", sessionID)
 	case err != nil:
 		b.cfg.Logger.Warn("the canceled turn could not be stopped in hermes", "task", taskID, "session", sessionID, "err", err)
+	case resp.Turns == 0:
+		b.cfg.Logger.Info("no turn found running in hermes for the canceled task; nothing to stop",
+			"task", taskID, "session", sessionID)
 	case !resp.Ended:
 		b.cfg.Logger.Warn("the canceled turn was still running in hermes when the stop answered",
 			"task", taskID, "session", sessionID, "turns", resp.Turns, "interrupted", resp.Interrupted)

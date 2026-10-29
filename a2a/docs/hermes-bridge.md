@@ -641,9 +641,10 @@ terminal. No Hermes turn runs. Instead the bridge:
    cancelled end first, and holds off the next bridge turn in the session while the cards are
    archived. The cancelled task holds the session's turn until its turn stop has answered, so
    the control looks for cards only once the Hermes turn has ended, and archives one it filed
-   before the interrupt reached it. A turn the stop could not end inside its wait, or a server
-   without the stop route, can still file a card later; session-kv's re-scan catches it only if
-   it lands within the call. Only bridge turns: a
+   before the interrupt reached it. A turn that outlasts the stop's wait still can't file one,
+   since its `kanban_create` is refused. A server without the stop route, or a turn the server
+   had not yet recorded when the stop arrived, can still file a card later; session-kv's
+   re-scan catches it only if it lands within the call. Only bridge turns: a
    wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
    stop doesn't wait. The wait is not first come, first served: a message sent right after
    `stop` can take the session first, and a turn that keeps it past 20 s ends the control
