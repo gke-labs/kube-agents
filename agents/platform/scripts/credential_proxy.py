@@ -2641,6 +2641,14 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
             handler.connection.settimeout(previous_timeout)
 
 
+# Top-level request-body keys the agent API reads a session id from. A value
+# here must be a string; any other type is refused.
+AGENT_API_SESSION_BODY_KEYS = ("id", "session_id", "sessionId", "gateway_session_key")
+# The longest session id the agent API accepts (Hermes' _MAX_SESSION_HEADER_LEN).
+# Longer top-level strings are message text, not ids, and aren't checked.
+AGENT_API_SESSION_ID_MAX_LEN = 256
+
+
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
@@ -2836,7 +2844,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
 
         `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
         through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
-        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        headers, request-body session ids, and `state.db`
         child continuations on the external proxy stops a holder of
         `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
         `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
@@ -2873,12 +2881,22 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     return True
             else:
                 if isinstance(parsed, dict):
-                    for key in ("session_id", "sessionId", "gateway_session_key"):
+                    for key in AGENT_API_SESSION_BODY_KEYS:
                         if key in parsed and parsed[key] is not None:
                             if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
                                 parsed[key], workspace_root
                             ):
                                 return True
+                    # Any other top-level string short enough to be a session id is
+                    # checked too, so a field the harness reads an id from doesn't
+                    # need to be named here first.
+                    for key, value in parsed.items():
+                        if key in AGENT_API_SESSION_BODY_KEYS or not isinstance(value, str):
+                            continue
+                        if len(value) <= AGENT_API_SESSION_ID_MAX_LEN and cls._is_bridge_session_id(
+                            value, workspace_root
+                        ):
+                            return True
         return False
 
     @staticmethod
