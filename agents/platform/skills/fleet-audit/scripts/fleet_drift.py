@@ -14,7 +14,7 @@ compares, the same shape `clusters describe` would (the SOP's own §1.3
 frames `describe` as each finding's `evidence.command`; this collector
 issues the cheaper per-project `list` instead and records that as the
 command it actually ran: the manifest publishes what happened, not what
-the SOP originally described). After the sweep, `main` fetches credentials
+the SOP originally described). After the sweep, with `--config-connector`, `main` fetches credentials
 for each collected cluster and makes one Config Connector read there
 (`kcc_health.py`), inside the collector's time budget; that read needs list
 access on the Config Connector objects, else the entry gets `kcc_unread`.

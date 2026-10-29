@@ -19,7 +19,7 @@ cached per distinct `(project, location)` pair, not re-issued per cluster --
 the SOP's own §2 instruction. The eleventh, `upgrade-blocked`, is the
 exception described below: it reads PodDisruptionBudgets through the
 fleet-upgrade-verification reporter, which fetches a kubeconfig per member.
-After the sweep, `main` also fetches credentials for each collected cluster
+After the sweep, with `--config-connector`, `main` also fetches credentials for each collected cluster
 and makes one Config Connector read there (`kcc_health.py`), inside the
 collector's time budget, as `kcc_unready` or `kcc_unread` on its entry.
 
@@ -2354,8 +2354,8 @@ def main(argv: list[str] | None = None) -> int:
     # The Config Connector reads below end inside a budget measured from here.
     started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command of
-    # the scheduled audit passes it, the chat route does not.
+    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command,
+    # scheduled or on demand, passes it; the chat route does not.
     if args.config_connector:
         # After the sweep, in a new pool of the sweep's size: a credential fetch
         # and one `kubectl get gcp` per collected cluster, as `kcc_unready` or
