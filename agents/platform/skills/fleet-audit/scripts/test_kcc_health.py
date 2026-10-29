@@ -374,6 +374,17 @@ class AnnotateManifestTest(unittest.TestCase):
         self.assertEqual({r["name"]: r.get("project") for r in manifest["clusters"][0]["kcc_unready"]}, {"events": "acme", "fleet-events": "acme"})
         self.assertEqual(len([argv for argv, _ in run.calls if argv[:3] == ["kubectl", "get", "namespaces"]]), 1)
 
+    def test_a_namespace_with_no_annotation_gives_its_name_as_the_project(self):
+        """Config Connector uses the namespace's name as the project ID when
+        neither the object nor its namespace names one. A namespace the read
+        did not return leaves the project unknown."""
+        bare = kcc_object("PubSubTopic", "events", namespace="proj-c", status="False", reason="UpdateFailed")
+        lost = kcc_object("PubSubTopic", "lost", namespace="gone", status="False", reason="UpdateFailed")
+        run = FakeRun({"hub": listing(bare, lost)}, namespaces=listing(self.namespace("proj-c")))
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        self.assertEqual({r["name"]: r.get("project") for r in manifest["clusters"][0]["kcc_unready"]}, {"events": "proj-c", "lost": None})
+
     def test_a_failed_namespaces_read_leaves_the_project_unknown(self):
         bare = kcc_object("PubSubTopic", "events", status="False", reason="UpdateFailed")
         run = FakeRun({"hub": listing(bare)})

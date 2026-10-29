@@ -18,13 +18,14 @@ the result on that cluster's manifest entry:
   applying or deleting the object), each as
   `{kind, namespace, name, why}`, plus `resource` (the object's
   `spec.resourceID`), `cluster` (a `ContainerNodePool`'s `clusterRef`),
-  `location` (the object's `spec.location`) and
-  `project` (the GCP project the object manages, from its
-  `cnrm.cloud.google.com/project-id` annotation, else from the same
-  annotation on its namespace) where they are set. When no object on a host
-  has the annotation, one `kubectl get namespaces` gives the namespaces'
-  annotations; when that read fails, the project stays unknown. An empty list means the cluster runs Config Connector and every
-  object it holds is ready or not yet reached.
+  `location` (the object's `spec.location`) and `project` (the GCP project
+  the object manages: its `cnrm.cloud.google.com/project-id` annotation,
+  else the same annotation on its namespace, else the namespace's name, as
+  Config Connector itself decides it) where they are set. When an unready
+  object has no project annotation, one `kubectl get namespaces` gives the
+  namespaces; when that read fails, the project stays unknown. An empty
+  list means the cluster runs Config Connector and every object it holds
+  is ready, not yet reached, or still updating or deleting.
 - `kcc_unread`: why the read did not give an answer (a timeout, a forbidden
   read, output that is not a list). This is "unknown", never "healthy".
 - Neither key on a `collected` entry: the API server does not serve the `gcp`
@@ -230,19 +231,22 @@ def unready_objects(items: list) -> list[dict]:
 
 
 def fill_namespace_projects(records: list[dict], namespaces: list) -> None:
-    """Give each record with no `project` its namespace's project annotation.
+    """Give each record with no `project` the project Config Connector uses.
 
-    Config Connector takes the project from the namespace when the object
-    does not name one. `namespaces` is a list of Namespace objects; a
-    namespace without the annotation leaves the project unknown.
+    Config Connector takes the project from the namespace's
+    `cnrm.cloud.google.com/project-id` annotation when the object does not
+    name one, and uses the namespace's name as the project ID when the
+    namespace has no annotation either. `namespaces` is the list of
+    Namespace objects from a read that succeeded; a record whose namespace
+    is not in it keeps its project unknown.
     """
     projects: dict[str, str] = {}
     for item in namespaces or []:
         meta = item.get("metadata") if isinstance(item, dict) and isinstance(item.get("metadata"), dict) else {}
         annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
-        project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
-        if project and meta.get("name"):
-            projects[str(meta["name"])] = project
+        name = str(meta.get("name") or "")
+        if name:
+            projects[name] = str(annotations.get(KCC_PROJECT_ANNOTATION) or "") or name
     for record in records:
         if not record.get("project") and projects.get(record.get("namespace", "")):
             record["project"] = projects[record["namespace"]]
