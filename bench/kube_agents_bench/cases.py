@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from devops_bench.tasks.schema import Task as DevopsBenchTask
 
 from kube_agents_bench import stop_hook
 
@@ -52,29 +53,35 @@ __all__ = [
     "load_case",
 ]
 
-# Every top-level key a task.yaml may carry: devops-bench's task fields and
-# the aliases its loader accepts (``task_id``, ``goal``, ``input``), then the
-# keys this package and the repository's case tooling read, then
-# ``task_version``, a case's own revision note that nothing reads. Neither
-# loader rejects a key it does not know -- devops-bench and load_case read the
-# keys they want and drop the rest -- so this is the grader's schema for the
-# top level: hack/ci-eval-pr.sh reds a pull request's case that carries a key
-# outside main's copy of it, and tests/test_cases.py holds every task in the
-# tree to it. A new case-level key is added here, in a pull request before
-# the presubmit case that uses it.
-DEVOPS_BENCH_CASE_KEYS = frozenset(
-    {
-        "id", "task_id", "name", "prompt", "goal", "input", "expected_output",
-        "retrieval_context", "chaos_spec", "verification_spec", "recoverable_safety",
-        "infrastructure", "documentation", "validated",
-    }
-)
-CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | frozenset(
+# Every top-level key a task.yaml may carry, which is this grader's schema for
+# the top level: neither loader rejects a key it does not know -- devops-bench
+# and load_case read the keys they want and drop the rest -- so
+# hack/ci-eval-pr.sh reds a pull request's case carrying a key outside main's
+# copy of this set ("land the grader change first"), and tests/test_cases.py
+# holds every task in the tree to it. Two halves:
+#
+# - devops-bench's: its task model's fields, read off the installed model so a
+#   bump that adds one is allowed without an edit here (``folder`` is set by
+#   the loader from the directory, never written), plus the three aliases its
+#   loader maps onto them (``Task.from_dict``: ``task_id`` for ``id``,
+#   ``goal`` and ``input`` for ``prompt``), which the model cannot list.
+# - this repository's: what this package and the case tooling read --
+#   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
+#   ``tool_calls_optional``, ``audit_streams`` -- and ``task_version``, a
+#   case's own revision note that nothing reads. A new one is added here, in a
+#   pull request before the presubmit case that uses it.
+_DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
+_DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
+DEVOPS_BENCH_CASE_KEYS = (
+    frozenset(DevopsBenchTask.model_fields) - _DEVOPS_BENCH_LOADER_FIELDS
+) | _DEVOPS_BENCH_ALIASES
+REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", "task_version",
     }
 )
+CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out

@@ -844,7 +844,10 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         out.write_text(text, encoding="utf-8")
     if args.json_out:
         doc = verdict.to_dict()
-        doc[GRADER_SHA_KEY] = args.grader_sha
+        # Only when known: a run that names no grader writes the document
+        # it always wrote (tests/test_store_unset_golden.py pins it).
+        if args.grader_sha:
+            doc[GRADER_SHA_KEY] = args.grader_sha
         if args.partial:
             doc["partial"] = True
             doc["partial_note"] = args.partial

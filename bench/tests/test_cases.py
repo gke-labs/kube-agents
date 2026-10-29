@@ -64,10 +64,12 @@ def test_every_shipped_task_keeps_to_the_case_keys(path):
     assert set(raw) <= CASE_KEYS, sorted(set(raw) - CASE_KEYS)
 
 
-def test_the_case_keys_cover_devops_benchs_task_fields():
-    """A field devops-bench adds to its task schema is a key a case may use;
-    a bump that adds one fails here until CASE_KEYS names it."""
-    assert set(Task.model_fields) - {"folder"} <= DEVOPS_BENCH_CASE_KEYS
+def test_the_case_keys_are_devops_benchs_fields_and_aliases_plus_ours():
+    """devops-bench's half is read off its model, so a field it adds is a key a
+    case may use; its loader-set ``folder`` is not one."""
+    assert DEVOPS_BENCH_CASE_KEYS == (set(Task.model_fields) - {"folder"}) | {"task_id", "goal", "input"}
+    assert "folder" not in CASE_KEYS
+    assert {"domain", "fixtures", "expected_fail"} <= CASE_KEYS
 
 
 def test_kanban_smoke_reads_as_the_shell_read_it(kanban_task):

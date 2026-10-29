@@ -735,7 +735,7 @@ def test_without_a_grader_sha_the_verdict_says_nothing_of_one(tmp_path):
     main(["suite", "--case-result", str(case_file(tmp_path, "a")),
           "--markdown-out", str(md), "--json-out", str(out)])
     assert "Graded by" not in md.read_text(encoding="utf-8")
-    assert json.loads(out.read_text(encoding="utf-8"))["grader_sha"] is None
+    assert "grader_sha" not in json.loads(out.read_text(encoding="utf-8"))
 
 
 def test_the_aggregate_margin_comes_from_the_environment(tmp_path, monkeypatch):
