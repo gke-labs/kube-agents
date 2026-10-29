@@ -249,6 +249,9 @@ IN_CLUSTER_HOST_ENV = "KUBERNETES_SERVICE_HOST"
 IN_CLUSTER_PORT_ENV = "KUBERNETES_SERVICE_PORT"
 IN_CLUSTER_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 IN_CLUSTER_CA_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# The summary keys the health bot reads them under (health.POOL_HELD_KEY).
+HELD_KEY = "held"
+HELD_ERROR_KEY = "held_error"
 HELD_KEY_OWNER = "owner"
 HELD_KEY_STATE = "state"
 HELD_KEY_SINCE = "since"
@@ -2547,8 +2550,8 @@ def measure(
     )
     # Which project each holder has, for the health bot's fixture rule;
     # None with the reason when the list could not be read.
-    summary["held"] = held.value if held.ok else None
-    summary["held_error"] = held.error
+    summary[HELD_KEY] = held.value if held.ok else None
+    summary[HELD_ERROR_KEY] = held.error
 
     # Written before the report is printed, and a write that fails is reported
     # rather than raised: the exit code is the verdict, and the tab still shows

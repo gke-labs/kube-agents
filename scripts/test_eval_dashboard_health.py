@@ -3490,7 +3490,7 @@ class OpenConditions(unittest.TestCase):
         self.assertEqual(after_blind["incident"]["projects"], [project(2), project(3)])
         self.assertIsNone(health.adjudicate(green, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=None)["fixture_holds"])
         # The two halves of the contract name the holder the same way.
-        self.assertEqual((pool_pressure.HELD_KEY_OWNER, health.POOL_HELD_KEY), (health.POOL_HELD_OWNER_KEY, "held"))
+        self.assertEqual((pool_pressure.HELD_KEY_OWNER, pool_pressure.HELD_KEY), (health.POOL_HELD_OWNER_KEY, health.POOL_HELD_KEY))
 
     def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
         green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))

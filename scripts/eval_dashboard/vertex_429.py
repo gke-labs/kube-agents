@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.client
 import json
 import pathlib
 import subprocess
@@ -47,12 +48,17 @@ RESPONSE_CODE_LABEL = "response_code"
 RATE_LIMITED_CODE = "429"
 # Ten-minute buckets over the last six hours: the storm rule's two-hour
 # window (health.STORM_WINDOW), the three hours of model calls a hit run
-# makes before it finishes (health.STORM_429_LOOKBACK), and an hour for the
-# tick's own clock gap (health.STORM_429_READ_SLACK: the rule's `now` is the
-# collect step's, this read comes later); the rule rejects a reading that
-# falls short of that, and a test pins the sum.
+# makes before it finishes (health.STORM_429_LOOKBACK), and the hour a
+# reading kept from an earlier blind tick may trail the runs' window by
+# (health.STORM_429_READ_SLACK); the rule rejects a reading that falls short
+# of that, and a test pins the sum. A fresh read ends at --now, the data's
+# clock, so it always covers.
 BUCKET_SECONDS = 600
 LOOKBACK = timedelta(hours=6)
+# A blind read keeps the previous reading only while the rule would still
+# judge on it (health.VERTEX_429_MAX_AGE, pinned by a test); past that the
+# blind document is written, so the published errors and read_at stay current.
+KEEP_MAX_AGE = timedelta(hours=3)
 # One Monitoring call per project, READ_WORKERS at a time; a whole-pool
 # read must fit the workflow step (40 projects, 20 s each, 8 abreast: 100 s
 # at worst).
@@ -117,7 +123,9 @@ def read_project(project: str, start: datetime, end: datetime, token: str, opene
             document = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return None, f"HTTP {exc.code}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
+        # HTTPException covers a body cut short of its length (IncompleteRead),
+        # which is not an OSError; one project's answer must not end the read.
         return None, f"{type(exc).__name__}: {exc}"
     if not isinstance(document, dict):
         return None, "not a JSON object"
@@ -196,13 +204,17 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def previous_reading_reached_a_project(path: pathlib.Path) -> bool:
-    """Whether the document at `path` is a reading with a non-empty `read`."""
+def previous_reading_is_usable(path: pathlib.Path, now: datetime) -> bool:
+    """Whether the document at `path` is a reading that reached a project and
+    is young enough (KEEP_MAX_AGE before `now`) for the rule to judge on."""
     try:
         previous = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(previous, dict) and bool(previous.get("read"))
+    if not isinstance(previous, dict) or not previous.get("read"):
+        return False
+    read_at = parse_iso(previous.get("read_at"))
+    return read_at is not None and now - read_at <= KEEP_MAX_AGE
 
 
 def main(argv=None, runner=subprocess.run, opener=urllib.request.urlopen) -> int:
@@ -215,13 +227,13 @@ def main(argv=None, runner=subprocess.run, opener=urllib.request.urlopen) -> int
     now = args.now or datetime.now(timezone.utc)
     document = read_pool(projects, now, access_token(args.token_command, runner), opener)
     log(f"vertex 429: read {len(document['read'])} of {document['projects']} projects, {len(document['buckets'])} buckets; {len(document['errors'])} error(s)")
-    if not document["read"] and previous_reading_reached_a_project(args.out):
+    if not document["read"] and previous_reading_is_usable(args.out, now):
         # A read that reached no project (no token, Monitoring down) does not
         # replace a previous reading that did, which the workflow fetched to
-        # --out: the rule ages and bounds that one itself, and a storm it
-        # denied stays denied rather than re-declared on a blind tick. A
-        # previous reading that was itself blind is replaced, so the
-        # published errors and read_at stay current until the grant lands.
+        # --out: the rule bounds that one itself, and a storm it denied stays
+        # denied rather than re-declared on a blind tick. A previous reading
+        # that was itself blind, or is older than the rule judges on, is
+        # replaced, so the published errors and read_at stay current.
         log(f"vertex 429: kept the previous reading at {args.out}")
         return 0
     args.out.parent.mkdir(parents=True, exist_ok=True)

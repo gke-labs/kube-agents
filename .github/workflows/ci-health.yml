@@ -623,6 +623,9 @@ jobs:
           gcloud storage cp --cache-control=no-cache work/health.json "$DASHBOARD_BUCKET/health.json"
 
       - name: Publish the Vertex 429 reading next to health.json
+        # Best-effort like the read: the adjudicator tolerates a missing
+        # reading, so a failed upload must not skip the post.
+        continue-on-error: true
         run: |
           if [ -f work/vertex-429.json ]; then
             gcloud storage cp --cache-control=no-cache work/vertex-429.json "$DASHBOARD_BUCKET/vertex-429.json"
