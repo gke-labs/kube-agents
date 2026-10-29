@@ -8151,9 +8151,29 @@ CARD_STOP_MAX_WRITES = 20
 CARD_WRITE_KIND_PULL_REQUEST = "pull_request"
 CARD_WRITE_VERBS = ("opened", "updated")
 CARD_WRITE_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+# A finished card's writes are named only when it belongs to the latest ask:
+# created no earlier than this long before the newest card the conversation's
+# turns filed themselves (not a fan-out child), or than its oldest open card.
+# One turn files its cards within minutes of each other; an earlier ask's
+# finished card, whose own report already named its pull request, is older.
+CARD_WRITES_ASK_WINDOW_S = 900.0
 CARD_WRITE_PR_URL_RE = re.compile(
     r"\Ahttps://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})\Z"
 )
+
+
+def _latest_ask(settled: Dict[str, Any], seen: Dict[str, Dict[str, Any]], unfinished: Sequence[str]) -> list:
+    """The finished cards whose writes the stop names: those of the latest ask
+    (CARD_WRITES_ASK_WINDOW_S). A card no collection described is left out."""
+    created = {i: card["created_at"] for i, card in seen.items()}
+    roots = [created[i] for i, card in seen.items() if card["via"] != "child"]
+    if not roots:
+        return []
+    since = max(roots) - CARD_WRITES_ASK_WINDOW_S
+    still_open = [created[i] for i in unfinished if i in created]
+    if still_open:
+        since = min(since, min(still_open))
+    return [i for i in settled if i in created and created[i] >= since]
 
 
 def _card_writes(board: str, card_ids: Sequence[str]) -> list:
@@ -8786,6 +8806,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pending: Dict[str, Dict[str, Any]] = {}
     attempts: Dict[str, int] = {}  # archives that raised, per card; each is retried once
     watch: Dict[str, str] = {}  # archived mid-claim with no worker pid yet: id -> title
+    seen: Dict[str, Dict[str, Any]] = {}  # every card a collection found: id -> its row
     # Every archive runs here, and the route never waits on this pool past the
     # deadline; `shutdown(wait=False)` below leaves a straggler to finish.
     pool = ThreadPoolExecutor(max_workers=CARD_STOP_PARALLEL)
@@ -8814,6 +8835,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     def stop(tree: _CardTree) -> bool:
         """Archive the tree's open cards in phases 1 and 2. True when any of them
         had not failed before, which is what earns another re-scan."""
+        seen.update(tree.cards)
         for task_id, card in tree.cards.items():
             if card["status"] == "done":
                 record(task_id, "settled", {"id": task_id, "title": card["title"], "status": "done"}, card)
@@ -8943,7 +8965,8 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     result["pending"] = list(pending.values())
     result["unresolved"] = [{"id": task_id, "title": title} for task_id, title in watch.items()]
     result["deadline"] = budget.hit
-    result["writes"] = _card_writes(board, [*stopped, *settled, *failed, *pending, *watch])
+    unfinished = [*stopped, *failed, *pending, *watch]
+    result["writes"] = _card_writes(board, [*unfinished, *_latest_ask(settled, seen, unfinished)])
     logger.info(
         "card stop for %s: stopped %d, settled %d, failed %d, pending %d, unresolved %d, %d re-scans%s%s",
         session_id,

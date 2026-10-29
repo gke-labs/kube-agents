@@ -9620,6 +9620,24 @@ class TestCardStop(unittest.TestCase):
             [(412, "opened", "t_done", "acme/gitops"), (413, "opened", "t_run", "acme/gitops")],
         )
 
+    def test_an_earlier_asks_finished_card_is_not_named(self):
+        now = time.time()
+        self.card("t_old", "done", session=self.SESSION, created=now - 3600)
+        self.card("t_new", "running", session=self.SESSION, created=now)
+        self.ledger("t_old", self.pr(400))
+        self.ledger("t_new", self.pr(401))
+        self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [401])
+
+    def test_the_latest_asks_finished_cards_are_named_with_nothing_open(self):
+        now = time.time()
+        self.card("t_old", "done", session=self.SESSION, created=now - 3600)
+        self.card("t_a", "done", session=self.SESSION, created=now - 30)
+        self.card("t_child", "done", session=self.SESSION, creator="t_a", created=now)
+        self.ledger("t_old", self.pr(400))
+        self.ledger("t_a", self.pr(402, at=1.0))
+        self.ledger("t_child", self.pr(403, at=2.0))
+        self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [402, 403])
+
     def test_one_entry_per_pull_request_and_opened_wins(self):
         self.card("t_a", "running", session=self.SESSION)
         self.card("t_b", "running", session=self.SESSION)

@@ -3317,6 +3317,33 @@ def test_the_stops_answer_is_recorded_and_earlier_posts_are_not(
     assert (reply["status"], reply["result"]) == ("completed", answer)
 
 
+def test_a_late_post_beside_the_placeholder_is_not_taken_for_the_answer(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card's report that lands after the stop, before the gateway edits its
+    placeholder, is not the answer: the edit is."""
+    answer = "🤷 nothing is running; already opened a pull request: [#412](https://github.com/acme/gitops/pull/412)"
+    real_submit = inject.InjectTask.submit
+
+    def submit_then_answer(self: Any) -> str:
+        started = real_submit(self)
+        if self.prompt == stop_hook.STOP_WORD:
+            stub_gateway.entries.append(entry(7, inject.ENTRY_POST, text="🛑 stopping this conversation's cards…", messageId="inj-stop"))
+            stub_gateway.entries.append(entry(8, inject.ENTRY_POST, text="late card report", messageId="inj-card"))
+            stub_gateway.entries.append(entry(9, inject.ENTRY_EDIT, text=answer, messageId="inj-stop"))
+        return started
+
+    def arrange(stub: _StubGatewayServer) -> None:
+        refuse_no_task(stub)
+        monkeypatch.setattr(inject.InjectTask, "submit", submit_then_answer)
+        monkeypatch.setattr(harness, "_STOP_REPLY_WAIT_SECONDS", 5.0)
+
+    result, _ = run_stopped_ask(stub_gateway, monkeypatch, arrange)
+
+    [reply] = [e for e in result.trajectory if e["name"] == stop_hook.STOP_REPLY_ENTRY]
+    assert reply["result"] == answer
+
+
 def test_no_answer_to_the_stop_records_an_error_entry(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

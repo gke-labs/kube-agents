@@ -648,7 +648,7 @@ terminal. No Hermes turn runs. Instead the bridge:
    `{"cardStop":{"v":1,"stopped":[{"id","title","priorStatus"}],"settled":[{"id","title"}],"failed":N,"pending":N,"unresolved":N,"truncated":bool,"deadline":bool,"listsCut":bool,"notStopped":[{"id","title"}],"writes":[{"kind","verb","url","repo","number"}]}}`.
    `notStopped` names the cards the three counts count, session-kv's failed, then pending, then
    unresolved ones, and is left out when every card stopped. `writes` is session-kv's list of
-   the pull requests those cards recorded, passed on as it came and cut at 20, and is left out
+   the pull requests the conversation's cards recorded, passed on as it came and cut at 20, and is left out
    when there are none.
    The text counts what session-kv answered, and says plainly what the stop could not promise:
    `unresolved` cards were stopped just after a worker was claimed for them, so a worker may

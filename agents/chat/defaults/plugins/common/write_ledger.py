@@ -54,8 +54,8 @@ PR_URL_RE = re.compile(r"\Ahttps://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9.
 KIND_PULL_REQUEST = "pull_request"
 VERB_OPENED = "opened"
 VERB_UPDATED = "updated"
-# The most entries one card's file holds; a card that writes more is cut
-# here and the record says so (a reader names the first ones only anyway).
+# The most entries one card's file holds; later writes are not recorded (a
+# reader names the first ones only anyway).
 MAX_ENTRIES_PER_CARD = 50
 LEDGER_FILE_MODE = 0o640
 LEDGER_DIR_MODE = 0o750

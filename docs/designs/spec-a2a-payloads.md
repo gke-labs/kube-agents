@@ -893,8 +893,9 @@ and title. An executor that sends none leaves it out, which reads as none named.
 stop, oldest first and at most 20, each `{"kind":"pull_request","verb":"opened"|"updated",
 "url","repo","number"}`: a card's worker records one when `submit-suggestion` prints its
 success line (`agents/chat/defaults/plugins/common/write_ledger.py`), and session-kv reads them
-back for the cards it stopped or found finished. It records what it saw, so an empty list never
-means nothing was written. A stop that failed carries no part and ends `failed` with
+back for every card the stop found open and for the finished cards of the latest ask (filed
+within 15 minutes of the newest card the turns filed themselves, or after the oldest open one).
+It records what it saw, so an empty list never means nothing was written. A stop that failed carries no part and ends `failed` with
 `reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
 bus refuses the result with the part, the text goes alone, so a `completed` control can
 arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.

@@ -1757,26 +1757,36 @@ def _stop_reply_cursor(exchange: Any) -> int:
 
 
 def _read_stop_reply(stopper: inject.InjectTask, after: int) -> dict[str, Any]:
-    """The gateway's answer to a stop it took: the last post or edit past
-    ``after`` that is not a placeholder, read for up to
-    :data:`_STOP_REPLY_WAIT_SECONDS`. A read that fails ends the wait with
+    """The gateway's answer to a stop it took, read past ``after`` for up to
+    :data:`_STOP_REPLY_WAIT_SECONDS`: the edit that replaces the stop's
+    placeholder, which is where the gateway puts it. Any other post (a card's
+    late report, say) is the answer only when no placeholder came and nothing
+    better did by the deadline, since the gateway posts the answer itself
+    when it has no placeholder to edit. A read that fails ends the wait with
     what it has."""
     deadline = time.monotonic() + _STOP_REPLY_WAIT_SECONDS
-    reply = ""
+    placeholders: set[str] = set()
+    reply, fallback = "", ""
     try:
-        while True:
+        while not reply:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
-            texts, after = stopper.read_texts(after, left)
-            answers = [t for t in texts if t.strip() and t.strip() not in _STOP_PLACEHOLDERS]
-            if answers:
-                reply = answers[-1]
-                break
-            # A door that answers an empty read at once is not spun on.
-            time.sleep(min(max(0.0, deadline - time.monotonic()), _STOP_REPLY_POLL_SECONDS))
+            posts, after = stopper.read_posts(after, left)
+            for post in posts:
+                text = post["text"].strip()
+                if text in _STOP_PLACEHOLDERS:
+                    placeholders.add(post["messageId"])
+                elif post["kind"] == inject.ENTRY_EDIT and post["messageId"] in placeholders:
+                    reply = post["text"]
+                elif text and not placeholders:
+                    fallback = post["text"]
+            if not posts:
+                # A door that answers an empty read at once is not spun on.
+                time.sleep(min(max(0.0, deadline - time.monotonic()), _STOP_REPLY_POLL_SECONDS))
     except inject.InjectUnavailable as exc:
         _log.warning("inject: reading the stop's answer failed: %s", exc)
+    reply = reply or fallback
     if not reply:
         return {"status": "error", "result": f"no answer to the stop within {_STOP_REPLY_WAIT_SECONDS:.0f}s"}
     return {"status": "completed", "result": reply}
@@ -2657,7 +2667,7 @@ class KubeAgentsHarness(AgentHarness):
                 # exchange (a card's report), so only the stop's answer is read.
                 cursor = _stop_reply_cursor(exchange)
                 try:
-                    _, cursor = stopper.read_texts(cursor, 0)
+                    _, cursor = stopper.read_posts(cursor, 0)
                 except inject.InjectUnavailable as exc:
                     _log.warning("inject: reading past the conversation before the stop failed: %s", exc)
                 failures = 0
