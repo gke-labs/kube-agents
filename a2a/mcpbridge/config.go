@@ -94,20 +94,20 @@ type DeploymentProfile struct {
 
 // ConversationEntry tracks a named console conversation token and its mode.
 type ConversationEntry struct {
-	Alias                   string    `json:"alias"`
-	Token                   string    `json:"token"`
-	SessionMode             bool      `json:"sessionMode"`
-	SessionTerminated       bool      `json:"sessionTerminated,omitempty"`
-	Description             string    `json:"description,omitempty"`
-	HostConversationID      string    `json:"hostConversationId,omitempty"`
-	ParentHostConversationID string   `json:"parentHostConversationId,omitempty"`
-	SubagentRole            string    `json:"subagentRole,omitempty"`
-	SessionWorkerID         string    `json:"sessionWorkerId,omitempty"`
-	AutoBound               bool      `json:"autoBound,omitempty"`
-	DebugMode               bool      `json:"debugMode,omitempty"`
-	Disconnected            bool      `json:"disconnected,omitempty"`
-	CreatedAt               time.Time `json:"createdAt"`
-	LastUsedAt              time.Time `json:"lastUsedAt"`
+	Alias                    string    `json:"alias"`
+	Token                    string    `json:"token"`
+	SessionMode              bool      `json:"sessionMode"`
+	SessionTerminated        bool      `json:"sessionTerminated,omitempty"`
+	Description              string    `json:"description,omitempty"`
+	HostConversationID       string    `json:"hostConversationId,omitempty"`
+	ParentHostConversationID string    `json:"parentHostConversationId,omitempty"`
+	SubagentRole             string    `json:"subagentRole,omitempty"`
+	SessionWorkerID          string    `json:"sessionWorkerId,omitempty"`
+	AutoBound                bool      `json:"autoBound,omitempty"`
+	DebugMode                bool      `json:"debugMode,omitempty"`
+	Disconnected             bool      `json:"disconnected,omitempty"`
+	CreatedAt                time.Time `json:"createdAt"`
+	LastUsedAt               time.Time `json:"lastUsedAt"`
 }
 
 // PushConfig configures optional host push notification routing.
