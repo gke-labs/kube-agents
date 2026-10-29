@@ -116,9 +116,10 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 objects on that cluster whose `Ready` condition is `False`; `kcc_unread` says why the read of that
 cluster gave no answer, which is unknown and never healthy. Each `kcc_unready` entry is
 `{kind, namespace, name, why}`, with `resource` (the object's `spec.resourceID`), `cluster` (a
-`ContainerNodePool`'s `clusterRef`) and `project` where they are set. `project` is the object's
-`cnrm.cloud.google.com/project-id` annotation, else the same annotation on its namespace, as Config
-Connector itself reads it. An empty list means the cluster runs Config Connector and nothing there
+`ContainerNodePool`'s `clusterRef`), `location` (the object's `spec.location`) and `project` where
+they are set. `project` is the object's `cnrm.cloud.google.com/project-id` annotation, else the same
+annotation on its namespace, else the namespace's name, as Config Connector itself decides it; the
+namespace name counts only when the namespaces read succeeded and returned that namespace. An empty list means the cluster runs Config Connector and nothing there
 is unready. An object with no `Ready` condition yet is left out, and so is one whose reason is
 `Updating` or `Deleting`: Config Connector sets those while it still applies the object.
 
@@ -126,7 +127,11 @@ The compliance collector writes the keys from its read for `kcc-object-wedged`
 ([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12), and
 takes the namespace annotations from its NetworkPolicy read. The drift, patch readiness and stockout
 collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool` declaration, read each
-collected cluster once after their sweep, in a new worker pool of the sweep's size. Drift and patch
+collected cluster once after their sweep, in a new worker pool of the sweep's size, but only with
+`--config-connector`: the scheduled SOP commands pass it, and the chat route, which runs the same
+collectors with no `finish`, does not. The drift and patch readiness collectors mark a cluster whose
+`clusters list` record shows the Config Connector add-on enabled with `config_connector_addon`, and
+those clusters are read first. Drift and patch
 readiness fetch credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
 unready object has no project annotation, one `kubectl get namespaces` on that cluster gives the
 namespace annotations; when it fails, the project stays unknown. These reads end

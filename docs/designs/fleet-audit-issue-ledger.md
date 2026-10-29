@@ -807,7 +807,9 @@ whose `Ready` condition is `False`
 leave out the transient reasons `Updating` and `Deleting`, which Config Connector sets while it
 still applies the object. `finish` parses the fix's file as the Config Connector index parses a
 clone, and matches each object it declares on kind, `metadata.name`, `metadata.namespace` when the
-file sets one, and `clusterRef` when the file object and the recorded object both set one.
+file sets one, and `clusterRef` when the file object and the recorded object both set one. A known
+`location` on the recorded object (its `spec.location`) must equal the file's `spec.location` or,
+for a cluster or a node pool, the location of the finding's cluster.
 
 When the file declares more than one Config Connector object, only the finding's own object counts:
 for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for `Cluster/<n>`, the
@@ -818,7 +820,8 @@ A match that is not certain gives no note. Two cases are by name: the same objec
 more than one host cluster and nothing tells them apart (Config Controller puts the objects of each
 instance in `config-control`), or the file sets no namespace and more than one object fits. The
 other cases are by project. The collector records the project each object manages as `project`: the
-object's `cnrm.cloud.google.com/project-id` annotation, else that annotation on its namespace. A
+object's `cnrm.cloud.google.com/project-id` annotation, else that annotation on its namespace, else
+the namespace's name, as Config Connector decides it. A
 known `project` must equal the file object's project annotation, or the finding's project when the
 file has none, also with one host, because one management cluster can hold an object of the same
 name for each project.
@@ -829,7 +832,9 @@ entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, in the manife
 that reads Config Connector, a cluster entry it never read (`unreachable` or `gate-failed`). An entry
 whose `cluster_status` says the cluster is not running is not a host: it cannot run the
 controllers. A `Cluster/` or `NodePool/` finding's own object with no recorded project does not
-match when the manifest holds a cluster of the same name in another project.
+match when the manifest holds a cluster of the same name in another project. The own object must
+also be in a namespace the file sets, when it sets one, and in the finding's cluster location when
+its location is known, so a `default-pool` of another cluster of the same name does not match.
 
 The note is the last paragraph of the remediation note, starts "**Config Connector is not applying
 this file.**", and names each matched object and the controller's reason in code spans. When the
