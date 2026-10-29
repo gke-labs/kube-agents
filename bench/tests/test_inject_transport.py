@@ -3306,6 +3306,8 @@ def test_a_stop_that_drops_once_in_transport_is_retried(
 # opening exchange's polls while the task is working, before its terminal.
 
 MID_TURN_ASK = f"{stop_hook.MID_TURN_DIRECTIVE} after=0.5 observe=60\nscale checkout-gateway to 4"
+# How many reads the stub had served when the last mid-turn stop went.
+polls_at_stop: list[int] = []
 
 
 def run_mid_turn_ask(
@@ -3321,10 +3323,12 @@ def run_mid_turn_ask(
         stub.entries = running_transcript(stub.task_id)
     real_submit = inject.InjectTask.submit
     running_at_stop: list[bool] = []
+    polls_at_stop.clear()
 
     def submit(self: Any) -> str:
         if self.prompt == stop_hook.STOP_WORD:
             running_at_stop.append(not any(e["kind"] == inject.ENTRY_TERMINAL for e in stub.entries))
+            polls_at_stop.append(len(stub.polls))
             refuse_no_task(stub)
             stub.entries = stub.entries + [
                 entry(len(stub.entries) + 1, inject.ENTRY_TERMINAL, taskId=stub.task_id, state="canceled",
@@ -3398,9 +3402,9 @@ def test_a_mid_turn_stop_caps_the_reads_until_it_goes(
     opening exchange's reads block at most a second until it has gone."""
     run_mid_turn_ask(stub_gateway, monkeypatch)
 
-    opening = [p for p in stub_gateway.polls if p["probe"] and p["task"] == stub_gateway.task_id]
-    # The last read is the one after the stop, which finds the terminal.
-    assert len(opening) > 1 and all(p["wait"] <= 1 for p in opening[:-1])
+    before = stub_gateway.polls[: polls_at_stop[-1]]
+    opening = [p for p in before if p["probe"] and p["task"] == stub_gateway.task_id]
+    assert opening and all(p["wait"] <= 1 for p in opening)
 
 # --- The front door's token usage. The executor publishes each turn's usage
 # artifact before its terminal, the door's probe carries the task's total
