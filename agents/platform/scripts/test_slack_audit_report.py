@@ -1358,6 +1358,29 @@ class SummaryCardTest(unittest.TestCase):
         report = f"{first}\n\nRe-run in this audit; counts are against the report above.\n{second}"
         self.assertIsNone(sar.summary_card(report))
 
+    def test_a_rerun_label_above_the_summary_is_dropped(self):
+        for label in (
+            "Re-run in this audit after an earlier finish published and stopped; counts are against what it published.",
+            "Re-run in this audit after an earlier finish published and stopped; counts cover the whole run.",
+        ):
+            with self.subTest(label=label[-30:]):
+                report = f"{label}\n{SUMMARY}"
+                self.assertEqual(sar.summary_card(report), sar.summary_card(SUMMARY))
+                self.assertEqual(sar.headline_from_summary(report), sar.headline_from_summary(SUMMARY))
+                self.assertEqual(sar.chat_from_summary(report)[0], sar.chat_from_summary(SUMMARY)[0])
+                self.assertNotIn(label, sar.blocks_from_summary(report)[1])
+
+    def test_a_rerun_label_alone_or_over_another_shape_posts_as_written(self):
+        label = "Re-run in this audit after an earlier finish published and stopped; counts cover the whole run."
+        for report in (label, f"{label}\nHere's the audit.\n{sar.NO_LEDGER_NOTES[0]}"):
+            with self.subTest(report=report[-20:]):
+                self.assertIsNone(sar.summary_card(report))
+
+    def test_a_namespaced_row_is_a_row(self):
+        summary = SUMMARY.replace("seeded-a: control plane is public", "seeded-a/payments: payments-api runs a privileged container")
+        card = sar.summary_card(summary)
+        self.assertEqual(card.rows[0], {"severity": "critical", "text": "seeded-a/payments: payments-api runs a privileged container"})
+
     def test_another_shape_posts_as_written(self):
         for report in ("", "Here's the audit.", "## What's wrong\nThe audit could not write its ledger.", REPORT):
             with self.subTest(report=report[:20]):

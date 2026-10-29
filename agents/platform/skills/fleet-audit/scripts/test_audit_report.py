@@ -31971,7 +31971,7 @@ class TestPlainChatLines(unittest.TestCase):
 
     def test_a_row_names_the_object_the_check_judged(self):
         finding = make_finding(check="privileged-container", cluster="proj/us-central1-a/seeded-a", obj="Deployment/payments-api")
-        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a: payments-api runs a privileged container")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a/payments: payments-api runs a privileged container")
 
     def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
         finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")
@@ -31980,6 +31980,28 @@ class TestPlainChatLines(unittest.TestCase):
     def test_a_kinded_object_named_like_its_cluster_is_still_the_object(self):
         finding = make_finding(fid="p", check="legacy-metadata", obj="NodePool/prod-us-east", namespace="")
         self.assertNotEqual(audit_report._object_name(finding), "")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` prod-us-east: legacy node metadata endpoints are on (prod-us-east)")
+        bare = make_finding(fid="p", check="legacy-metadata", obj="prod-us-east", namespace="")
+        self.assertEqual(audit_report._object_name(bare), "")
+
+    def test_a_row_names_the_namespace(self):
+        findings = [
+            make_finding(fid=ns, check="privileged-container", cluster="proj/us-central1-a/seeded-a", namespace=ns, obj="Deployment/api")
+            for ns in ("payments", "staging")
+        ]
+        self.assertEqual(
+            [audit_report.summary_row(finding) for finding in findings],
+            [
+                "`critical` seeded-a/payments: api runs a privileged container",
+                "`critical` seeded-a/staging: api runs a privileged container",
+            ],
+        )
+
+    def test_a_row_names_no_namespace_for_the_namespace_itself_or_its_placeholder(self):
+        for obj, namespace in (("Namespace/payments", "payments"), ("payments", "payments"), ("Deployment/api", "_")):
+            with self.subTest(obj=obj, namespace=namespace):
+                finding = make_finding(check="netpol-missing", cluster="seeded-a", namespace=namespace, obj=obj)
+                self.assertTrue(audit_report.summary_row(finding).startswith("`critical` seeded-a: "))
 
     def test_a_row_without_a_phrase_keeps_the_title(self):
         unknown = make_finding(check="not-a-check", title="Something  odd")

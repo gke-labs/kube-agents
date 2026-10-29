@@ -315,6 +315,11 @@ SUMMARY_HEADLINE = re.compile(
     r"\A[^\n:`]{1,200}: (?:\d{1,9} (?:critical|major|minor) findings?|no findings)\b[^\n]{0,300}\Z"
 )
 SUMMARY_ROW = re.compile(r"\A`(?P<severity>critical|major|minor)` (?P<text>[^\n]{1,1000})\Z")
+#: The label fleet-audit stores above a re-run's report when an earlier finish
+#: published and stopped (``audit_report.CHAT_REPORT_RERUN_LABEL`` and
+#: ``CHAT_REPORT_RERUN_RELATIVE_LABEL``). Above a summary, the card drops it,
+#: as the ledger card, which reads the report's last line, does.
+RERUN_LABEL = re.compile(r"\ARe-run in this audit after an earlier finish published and stopped; [^\n]{1,200}\Z")
 #: The summary's last line when the install has no GitOps repository at all
 #: (``audit_report.NO_FORGE_NOTE`` and ``NO_FORGE_UNSTORED_NOTE``), which the card
 #: shows whole. Any other note (a repository the broker cannot reach, several
@@ -828,6 +833,7 @@ def summary_card(report: str) -> Card | None:
     repository (:data:`SUMMARY_HEADLINE`): its headline, its finding rows,
     and its other lines under them (the rest counted by severity, the ids the
     collector still flags, the coverage gaps, why no ledger was written).
+    A re-run's label above the summary (:data:`RERUN_LABEL`) is dropped.
     None for a report that names an issue URL, which has a ledger; for one
     whose last line is not one of :data:`NO_LEDGER_NOTES`; for one with a line
     under the rows that the card would clip, or more of them than a chat
@@ -837,6 +843,8 @@ def summary_card(report: str) -> Card | None:
     if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
         return None
     lines = [line.strip() for line in report.strip().splitlines() if line.strip()]
+    if lines and RERUN_LABEL.match(lines[0]):
+        lines = lines[1:]
     if not lines or not SUMMARY_HEADLINE.match(lines[0]) or lines[-1] not in NO_LEDGER_NOTES:
         return None
     # A run that finished twice keeps both summaries, one under the other: the card

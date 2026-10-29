@@ -178,8 +178,10 @@ no GitOps repository (`slack_audit_report.summary_card`) gets the same card, bui
 the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
 the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
 summary's headline, its finding rows, its other lines under them, and "Look at the first
-one" with no link button. Where the card does not post, `headline_from_summary` goes out
-as text, and the fallbacks are those of the ledger card.
+one" with no link button. The label fleet-audit stores above a re-run's summary, when an
+earlier finish published and stopped, is dropped, as the ledger card drops it. Where the
+card does not post, `headline_from_summary` goes out as text, and the fallbacks are those
+of the ledger card.
 
 ## Why no agent turn runs over the report
 
