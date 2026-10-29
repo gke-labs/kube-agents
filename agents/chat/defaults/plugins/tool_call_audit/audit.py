@@ -9,7 +9,7 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
-from common import audit_sink, write_ledger  # noqa: E402
+from common import audit_sink  # noqa: E402
 from common.audit_schema import envelope  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
@@ -115,8 +115,6 @@ def log_post_tool_call(
         )
     except Exception as exc:
         logger.error("Error in tool_call_audit post_tool_call hook: %s", exc, exc_info=True)
-    # A kanban worker's writes, for the card stop's reply (common/write_ledger.py).
-    write_ledger.record(tool_name, result)
 
 
 def log_pre_approval_request(

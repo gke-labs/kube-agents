@@ -632,39 +632,42 @@ func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	return strings.Join(append([]string{head}, clauses...), "; ")
 }
 
-// cardStopWritePRURLRE is a github.com pull request URL in GitHub's own owner
-// and repository grammar, the only form the executor records
-// (agents/chat/defaults/plugins/common/write_ledger.py). Checked again here
-// because the reply links what it names.
-var cardStopWritePRURLRE = regexp.MustCompile(`\Ahttps://github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}/pull/([0-9]{1,9})\z`)
+// cardStopWritePRURLRE is a pull request (/pull/<n>) or GitLab merge
+// request (/-/merge_requests/<n>) url with nothing in it a chat surface could
+// read as markup, the form session-kv passes on. Checked again here because
+// the reply links what it names; the second group is the number.
+var cardStopWritePRURLRE = regexp.MustCompile(`\Ahttps://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9._~/-]{1,300}?/(pull|-/merge_requests)/([0-9]{1,9})\z`)
 
-// cardStopWrites splits a result's writes into the pull requests the
-// conversation's cards opened and those they updated, each in the
-// executor's order, dropping any entry that is not a well-formed github.com
-// pull request whose number matches its URL.
-func cardStopWrites(r *lib.CardStopResult) (opened, updated []lib.CardStopWrite) {
+// cardStopMRPath is the url segment that marks a GitLab merge request, which
+// is labelled !<number> rather than #<number>.
+const cardStopMRPath = "-/merge_requests"
+
+// cardStopWrites is the pull requests a result says the conversation's cards
+// opened, in the executor's order, dropping any entry that is not a
+// well-formed pull request or merge request url whose number matches.
+func cardStopWrites(r *lib.CardStopResult) []lib.CardStopWrite {
+	var opened []lib.CardStopWrite
 	for _, w := range r.Writes[:min(len(r.Writes), lib.CardStopWritesMax)] {
 		m := cardStopWritePRURLRE.FindStringSubmatch(w.URL)
-		if w.Kind != lib.CardStopWritePullRequest || m == nil || m[1] != strconv.Itoa(w.Number) {
+		if w.Kind != lib.CardStopWritePullRequest || w.Verb != lib.CardStopWriteOpened || m == nil || m[2] != strconv.Itoa(w.Number) {
 			continue
 		}
-		switch w.Verb {
-		case lib.CardStopWriteOpened:
-			opened = append(opened, w)
-		case lib.CardStopWriteUpdated:
-			updated = append(updated, w)
-		}
+		opened = append(opened, w)
 	}
-	return opened, updated
+	return opened
 }
 
-// cardStopPRLinks names pull requests as markdown links labelled #<number>,
-// which the chat adapters turn into their own link form: "#412", "#412 and
-// #413", "#412, #413 and #414".
+// cardStopPRLinks names pull requests as markdown links labelled #<number>
+// (!<number> for a merge request), which the chat adapters turn into their
+// own link form: "#412", "#412 and #413", "#412, #413 and !7".
 func cardStopPRLinks(ws []lib.CardStopWrite) string {
 	links := make([]string, len(ws))
 	for i, w := range ws {
-		links[i] = fmt.Sprintf("[#%d](%s)", w.Number, w.URL)
+		sigil := "#"
+		if cardStopWritePRURLRE.FindStringSubmatch(w.URL)[1] == cardStopMRPath {
+			sigil = "!"
+		}
+		links[i] = fmt.Sprintf("[%s%d](%s)", sigil, w.Number, w.URL)
 	}
 	if len(links) == 1 {
 		return links[0]
@@ -680,19 +683,15 @@ func cardStopPRNoun(ws []lib.CardStopWrite) string {
 	return "pull requests"
 }
 
-// cardStopWriteClauses are the typed stop's clauses for what the
-// conversation's cards had already written: "already opened a pull request:
-// #412", "already updated a pull request: #413".
+// cardStopWriteClauses is the typed stop's clause for the pull requests the
+// conversation's cards had already opened ("already opened a pull request:
+// #412"), or none.
 func cardStopWriteClauses(r *lib.CardStopResult) []string {
-	opened, updated := cardStopWrites(r)
-	var clauses []string
-	if len(opened) > 0 {
-		clauses = append(clauses, "already opened "+cardStopPRNoun(opened)+": "+cardStopPRLinks(opened))
+	opened := cardStopWrites(r)
+	if len(opened) == 0 {
+		return nil
 	}
-	if len(updated) > 0 {
-		clauses = append(clauses, "already updated "+cardStopPRNoun(updated)+": "+cardStopPRLinks(updated))
-	}
-	return clauses
+	return []string{"already opened " + cardStopPRNoun(opened) + ": " + cardStopPRLinks(opened)}
 }
 
 // cardTitles names the first cardStopNamed cards and counts the rest. cut

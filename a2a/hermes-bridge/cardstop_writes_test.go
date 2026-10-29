@@ -15,12 +15,12 @@ func TestCardStopResultCarriesTheWrites(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{
 		"stopped": [{"id": "t_1", "title": "scale checkout", "prior_status": "running"}],
 		"writes": [{"kind": "pull_request", "verb": "opened", "url": "https://github.com/acme/gitops/pull/412",
-			"repo": "acme/gitops", "number": 412, "card": "t_1", "at": 1.5}]
+			"number": 412, "card": "t_1", "at": 1.5}]
 	}`), &r); err != nil {
 		t.Fatal(err)
 	}
 	out := cardStopResult(&r)
-	want := lib.CardStopWrite{Kind: "pull_request", Verb: "opened", URL: "https://github.com/acme/gitops/pull/412", Repo: "acme/gitops", Number: 412}
+	want := lib.CardStopWrite{Kind: "pull_request", Verb: "opened", URL: "https://github.com/acme/gitops/pull/412", Number: 412}
 	if len(out.Writes) != 1 || out.Writes[0] != want {
 		t.Fatalf("writes = %+v, want [%+v]", out.Writes, want)
 	}
@@ -32,7 +32,7 @@ func TestCardStopResultWritesAreBoundedAndOptional(t *testing.T) {
 	}
 	var entries []string
 	for n := 1; n <= lib.CardStopWritesMax+5; n++ {
-		entries = append(entries, fmt.Sprintf(`{"kind":"pull_request","verb":"opened","url":"https://github.com/a/b/pull/%d","repo":"a/b","number":%d}`, n, n))
+		entries = append(entries, fmt.Sprintf(`{"kind":"pull_request","verb":"opened","url":"https://github.com/a/b/pull/%d","number":%d}`, n, n))
 	}
 	var r cardStopResponse
 	if err := json.Unmarshal([]byte(`{"writes":[`+strings.Join(entries, ",")+`]}`), &r); err != nil {

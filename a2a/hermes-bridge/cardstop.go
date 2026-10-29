@@ -127,7 +127,7 @@ type cardStopResponse struct {
 	Errors     []string          `json:"errors"`
 	Truncated  bool              `json:"truncated"`
 	Deadline   bool              `json:"deadline"`
-	// Writes is the pull requests the conversation's cards recorded
+	// Writes is the pull requests the conversation's cards opened
 	// (session-kv's `_card_writes`); a session-kv older than the field
 	// sends none.
 	Writes []lib.CardStopWrite `json:"writes"`

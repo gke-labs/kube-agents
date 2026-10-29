@@ -8137,28 +8137,22 @@ CARD_STOP_SQL_CHUNK = 500
 # Test hook, `None` in production: the state.db to read.
 CARD_STOP_STATE_DB_PATH: Optional[str] = None
 PROC_ROOT = "/proc"
-# The writes the conversation's cards made, as each card's worker recorded
-# them (agents/chat/defaults/plugins/common/write_ledger.py, whose
-# CARD_WRITES_DIR_NAME this is; test_session_kv_server holds the two
-# together): one JSON line per write in <board dir>/kanban-writes/<card>.jsonl.
-# The answer carries them as `writes`, so a stop can name a pull request that
-# landed before it. Only a well-formed github.com pull request is passed on,
-# since the gateway links what it names, and at most CARD_STOP_MAX_WRITES.
-CARD_WRITES_DIR_NAME = "kanban-writes"
-CARD_WRITES_SUFFIX = ".jsonl"
-CARD_WRITES_FILE_MAX_BYTES = 64 * 1024
+# The pull requests the conversation's cards opened, as the platform profile's
+# `pr_opened` plugin records them (agents/platform/plugins/pr_opened): a
+# `pr_opened` event on the card, written only once the forge has confirmed
+# the pull request is open, new, on a repository this install manages and
+# authored by the agent's own account. The answer carries them as `writes`, so
+# a stop can name a pull request that landed before it; at most
+# CARD_STOP_MAX_WRITES, and only a url the gateway can link safely.
+CARD_STOP_PR_OPENED_KIND = "pr_opened"
 CARD_STOP_MAX_WRITES = 20
 CARD_WRITE_KIND_PULL_REQUEST = "pull_request"
-CARD_WRITE_VERBS = ("opened", "updated")
-CARD_WRITE_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
-# A finished card's writes are named only when it belongs to the latest ask:
-# created no earlier than this long before the newest card the conversation's
-# turns filed themselves (not a fan-out child), or than its oldest open card.
-# One turn files its cards within minutes of each other; an earlier ask's
-# finished card, whose own report already named its pull request, is older.
+CARD_WRITE_VERB_OPENED = "opened"
 CARD_WRITES_ASK_WINDOW_S = 900.0
+# A pull request (`/pull/<n>`) or GitLab merge request (`/-/merge_requests/<n>`)
+# url with nothing a chat surface could read as markup in it.
 CARD_WRITE_PR_URL_RE = re.compile(
-    r"\Ahttps://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})\Z"
+    r"\Ahttps://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9._~/-]{1,300}?/(?:pull|-/merge_requests)/([0-9]{1,9})\Z"
 )
 
 
@@ -8177,50 +8171,43 @@ def _latest_ask(settled: Dict[str, Any], seen: Dict[str, Dict[str, Any]], unfini
 
 
 def _card_writes(board: str, card_ids: Sequence[str]) -> list:
-    """The pull requests the cards' workers recorded opening or updating, oldest
-    first, one per pull request ("opened" wins over "updated"), at most
-    CARD_STOP_MAX_WRITES. A missing file is a card that recorded none; an
-    unreadable file or line is skipped with a warning, since a stop never fails
-    over what it can only add to its answer."""
-    directory = os.path.join(os.path.dirname(board), CARD_WRITES_DIR_NAME)
+    """The pull requests the cards opened, oldest first, one per url, at most
+    CARD_STOP_MAX_WRITES, from their `pr_opened` events. A malformed event is
+    skipped; a board that cannot be read answers none with a warning, since a
+    stop never fails over what it can only add to its answer."""
+    ids = list(dict.fromkeys(card_ids))
+    if not ids:
+        return []
+    try:
+        with closing(_read_only(board)) as conn:
+            rows = _ids_where_in(
+                conn,
+                "SELECT task_id, payload, created_at FROM task_events WHERE kind = ? AND task_id IN ({marks})",
+                ids,
+                (CARD_STOP_PR_OPENED_KIND,),
+            )
+    except sqlite3.Error as exc:
+        logger.warning("card stop: the pull requests the cards opened could not be read: %s", exc)
+        return []
     by_url: Dict[str, Dict[str, Any]] = {}
-    for card_id in dict.fromkeys(card_ids):
-        if not CARD_WRITE_ID_RE.match(card_id):
-            continue
-        path = os.path.join(directory, card_id + CARD_WRITES_SUFFIX)
+    # Oldest first, so a pull request two cards name is the first one's.
+    for task_id, payload, created in sorted(rows, key=lambda r: (r[2] or 0, r[0])):
         try:
-            with open(path, encoding="utf-8") as ledger:
-                text = ledger.read(CARD_WRITES_FILE_MAX_BYTES)
-        except FileNotFoundError:
+            data = json.loads(payload) if isinstance(payload, str) else payload
+        except ValueError:
             continue
-        except OSError as exc:
-            logger.warning("card stop: the write ledger of %s is unreadable: %s", card_id, exc)
+        url = data.get("url") if isinstance(data, dict) else None
+        parsed = CARD_WRITE_PR_URL_RE.match(url) if isinstance(url, str) else None
+        if parsed is None or url in by_url:
             continue
-        for line in text.splitlines():
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(entry, dict) or entry.get("kind") != CARD_WRITE_KIND_PULL_REQUEST:
-                continue
-            url, verb, at = entry.get("url"), entry.get("verb"), entry.get("at")
-            parsed = CARD_WRITE_PR_URL_RE.match(url) if isinstance(url, str) else None
-            if parsed is None or verb not in CARD_WRITE_VERBS or not isinstance(at, (int, float)):
-                continue
-            write = {
-                "kind": CARD_WRITE_KIND_PULL_REQUEST,
-                "verb": verb,
-                "url": url,
-                "repo": f"{parsed.group(1)}/{parsed.group(2)}",
-                "number": int(parsed.group(3)),
-                "card": card_id,
-                "at": at,
-            }
-            held = by_url.get(url)
-            if held is None:
-                by_url[url] = write
-            elif verb == "opened" and held["verb"] != "opened":
-                by_url[url] = {**write, "at": min(at, held["at"])}
+        by_url[url] = {
+            "kind": CARD_WRITE_KIND_PULL_REQUEST,
+            "verb": CARD_WRITE_VERB_OPENED,
+            "url": url,
+            "number": int(parsed.group(1)),
+            "card": task_id,
+            "at": created or 0,
+        }
     return sorted(by_url.values(), key=lambda w: (w["at"], w["url"]))[:CARD_STOP_MAX_WRITES]
 
 
@@ -8761,8 +8748,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
     was larger than one pass, `deadline` when the budget ran out, and
-    `writes`, the pull requests those cards' workers recorded opening or
-    updating (`_card_writes`). Answers within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
+    `writes`, the pull requests those cards opened (`_card_writes`). Answers within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
     an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()

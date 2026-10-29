@@ -1777,6 +1777,7 @@ def _read_stop_reply(stopper: inject.InjectTask, after: int) -> dict[str, Any]:
                 text = post["text"].strip()
                 if text in _STOP_PLACEHOLDERS:
                     placeholders.add(post["messageId"])
+                    fallback = ""
                 elif post["kind"] == inject.ENTRY_EDIT and post["messageId"] in placeholders:
                     reply = post["text"]
                 elif text and not placeholders:

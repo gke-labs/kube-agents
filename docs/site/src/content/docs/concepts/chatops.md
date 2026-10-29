@@ -199,7 +199,7 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
   - `No tasks were running yet. I'm still answering your latest question.` when there was nothing to stop but a newer question of yours is running;
   - `I couldn't stop the work in this thread. Press Stop again.` when the stop could not be confirmed and another press can help, or `I couldn't stop the work in this thread.` when it can't.
 
-  If your latest request's cards had already opened a pull request through the agent's pull-request skill, the reply then names it, linked: `I'd already opened a pull request before you stopped me: #412.` (`updated` for one a card refreshed). A reply that names none is not a promise that nothing changed: only pull requests on github.com opened that way are recorded today.
+  A line like `I'd already opened a pull request before you stopped me: #412` then names, linked, any pull request your latest request's cards had already opened. A reply that names none is not a promise that nothing changed: only pull requests and merge requests the agent opened are recorded, not other changes.
 
   Pressing it again while a stop is still running adds nothing, unless you had asked something new since, which it stops too. Without `A2A_CARD_STOP`, and in a conversation whose tasks go to a session worker, the button does exactly what typing `stop` does.
 

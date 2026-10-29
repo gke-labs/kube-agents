@@ -9595,37 +9595,49 @@ class TestCardStop(unittest.TestCase):
         self.card("t_fanout", "ready", session=self.SESSION, creator="t_parent")
         self.card("t_grand", "todo", session=self.SESSION, parents=["t_fanout"])
 
-    # -- the writes ledger -------------------------------------------------
+    # -- the pull requests the cards opened ---------------------------------
 
-    def ledger(self, card_id, *entries, raw=""):
-        directory = self.root / session_kv_server.CARD_WRITES_DIR_NAME
-        directory.mkdir(exist_ok=True)
-        lines = [json.dumps(e) for e in entries]
-        (directory / f"{card_id}.jsonl").write_text("\n".join(lines) + "\n" + raw, encoding="utf-8")
+    def opened(self, card_id, number, at=1.0, url=None, raw=None):
+        """The `pr_opened` event agents/platform/plugins/pr_opened appends to a card."""
+        import sqlite3
 
-    @staticmethod
-    def pr(number, verb="opened", at=1.0, repo="acme/gitops"):
-        return {"kind": "pull_request", "verb": verb, "url": f"https://github.com/{repo}/pull/{number}", "at": at}
+        payload = raw if raw is not None else json.dumps(
+            {"url": url or f"https://github.com/acme/gitops/pull/{number}", "number": number, "title": "t"}
+        )
+        with sqlite3.connect(self.board) as conn:
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, ?)",
+                (card_id, payload, at),
+            )
 
-    def test_the_answer_names_the_pull_requests_its_cards_recorded(self):
+    def test_the_answer_names_the_pull_requests_its_cards_opened(self):
         self.card("t_run", "running", session=self.SESSION)
         self.card("t_done", "done", session=self.SESSION)
         self.card("t_other", "running", session="a2a-someone-else")
-        self.ledger("t_run", self.pr(413, at=2.0))
-        self.ledger("t_done", self.pr(412, at=1.0))
-        self.ledger("t_other", self.pr(999))
+        self.opened("t_run", 413, at=2.0)
+        self.opened("t_done", 412, at=1.0)
+        self.opened("t_other", 999)
         body = self.stop().json()
         self.assertEqual(
-            [(w["number"], w["verb"], w["card"], w["repo"]) for w in body["writes"]],
-            [(412, "opened", "t_done", "acme/gitops"), (413, "opened", "t_run", "acme/gitops")],
+            [(w["number"], w["verb"], w["card"], w["url"]) for w in body["writes"]],
+            [
+                (412, "opened", "t_done", "https://github.com/acme/gitops/pull/412"),
+                (413, "opened", "t_run", "https://github.com/acme/gitops/pull/413"),
+            ],
         )
+
+    def test_a_gitlab_merge_request_and_an_enterprise_host_are_named(self):
+        self.card("t_run", "running", session=self.SESSION)
+        self.opened("t_run", 7, at=1.0, url="https://gitlab.example.com/group/sub/proj/-/merge_requests/7")
+        self.opened("t_run", 8, at=2.0, url="https://ghe.example.com:8443/acme/gitops/pull/8")
+        self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [7, 8])
 
     def test_an_earlier_asks_finished_card_is_not_named(self):
         now = time.time()
         self.card("t_old", "done", session=self.SESSION, created=now - 3600)
         self.card("t_new", "running", session=self.SESSION, created=now)
-        self.ledger("t_old", self.pr(400))
-        self.ledger("t_new", self.pr(401))
+        self.opened("t_old", 400)
+        self.opened("t_new", 401)
         self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [401])
 
     def test_the_latest_asks_finished_cards_are_named_with_nothing_open(self):
@@ -9633,36 +9645,33 @@ class TestCardStop(unittest.TestCase):
         self.card("t_old", "done", session=self.SESSION, created=now - 3600)
         self.card("t_a", "done", session=self.SESSION, created=now - 30)
         self.card("t_child", "done", session=self.SESSION, creator="t_a", created=now)
-        self.ledger("t_old", self.pr(400))
-        self.ledger("t_a", self.pr(402, at=1.0))
-        self.ledger("t_child", self.pr(403, at=2.0))
+        self.opened("t_old", 400)
+        self.opened("t_a", 402, at=1.0)
+        self.opened("t_child", 403, at=2.0)
         self.assertEqual([w["number"] for w in self.stop().json()["writes"]], [402, 403])
 
-    def test_one_entry_per_pull_request_and_opened_wins(self):
+    def test_one_entry_per_pull_request(self):
         self.card("t_a", "running", session=self.SESSION)
         self.card("t_b", "running", session=self.SESSION)
-        self.ledger("t_a", self.pr(412, verb="updated", at=5.0))
-        self.ledger("t_b", self.pr(412, verb="opened", at=3.0), self.pr(412, verb="updated", at=4.0))
+        self.opened("t_a", 412, at=5.0)
+        self.opened("t_b", 412, at=3.0)
         [write] = self.stop().json()["writes"]
-        self.assertEqual((write["verb"], write["at"]), ("opened", 3.0))
+        self.assertEqual((write["number"], write["at"]), (412, 3.0))
 
-    def test_a_malformed_entry_is_skipped_and_the_stop_still_answers(self):
+    def test_a_malformed_event_is_skipped_and_the_stop_still_answers(self):
         self.card("t_run", "running", session=self.SESSION)
-        self.ledger(
-            "t_run",
-            {"kind": "pull_request", "verb": "opened", "url": "https://evil.example/a/b/pull/1", "at": 1.0},
-            {"kind": "pull_request", "verb": "merged", "url": "https://github.com/a/b/pull/2", "at": 1.0},
-            {"kind": "pull_request", "verb": "opened", "url": "https://github.com/a/b/pull/3<!here>", "at": 1.0},
-            {"kind": "branch", "verb": "opened", "url": "https://github.com/a/b/pull/4", "at": 1.0},
-            self.pr(5, repo="a/b"),
-            raw="not json\n",
-        )
+        self.opened("t_run", 1, url="https://evil.example/a/b/issues/1")
+        self.opened("t_run", 3, url="https://github.com/a/b/pull/3<!here>")
+        self.opened("t_run", 4, url="https://github.com/a/b/pull/4)[x](https://evil.example")
+        self.opened("t_run", 0, raw="not json")
+        self.opened("t_run", 0, raw=json.dumps(["x"]))
+        self.opened("t_run", 5, url="https://github.com/a/b/pull/5")
         response = self.stop()
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual([w["number"] for w in response.json()["writes"]], [5])
         self.assertEqual(self.status("t_run"), "archived")
 
-    def test_no_ledger_and_no_board_answer_no_writes(self):
+    def test_no_event_and_no_board_answer_no_writes(self):
         self.card("t_run", "running", session=self.SESSION)
         self.assertEqual(self.stop().json()["writes"], [])
         self.board.unlink()
@@ -9670,22 +9679,15 @@ class TestCardStop(unittest.TestCase):
 
     def test_the_writes_list_is_capped(self):
         self.card("t_run", "running", session=self.SESSION)
-        self.ledger("t_run", *(self.pr(n, at=float(n)) for n in range(1, 30)))
+        for n in range(1, 30):
+            self.opened("t_run", n, at=float(n))
         writes = self.stop().json()["writes"]
         self.assertEqual(len(writes), session_kv_server.CARD_STOP_MAX_WRITES)
         self.assertEqual(writes[0]["number"], 1)
 
-    def test_the_ledger_directory_matches_the_writer(self):
-        import importlib.util
-
-        path = Path(__file__).resolve().parents[3] / "agents/chat/defaults/plugins/common/write_ledger.py"
-        spec = importlib.util.spec_from_file_location("write_ledger_under_test", path)
-        write_ledger = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(write_ledger)
-
-        self.assertEqual(session_kv_server.CARD_WRITES_DIR_NAME, write_ledger.CARD_WRITES_DIR_NAME)
-        self.assertEqual(session_kv_server.CARD_WRITES_SUFFIX, write_ledger.CARD_WRITES_SUFFIX)
-        self.assertEqual(session_kv_server.CARD_WRITE_PR_URL_RE.pattern, write_ledger.PR_URL_RE.pattern)
+    def test_the_event_kind_is_the_plugins(self):
+        path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
+        self.assertIn(f'PR_OPENED_KIND = "{session_kv_server.CARD_STOP_PR_OPENED_KIND}"', path.read_text())
 
     # -- the tree ----------------------------------------------------------
 

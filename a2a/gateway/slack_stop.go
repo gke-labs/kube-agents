@@ -40,9 +40,9 @@ const (
 // The approved pull request line ("Stopped. I'd already opened a pull request
 // before you stopped me: #412.") is slackStopWritesFormat after any of them.
 const (
-	// slackStopWritesFormat takes "opened" or "updated", the noun ("a pull
-	// request", "pull requests") and the links (cardStopPRLinks).
-	slackStopWritesFormat = "I'd already %s %s before you stopped me: %s."
+	// slackStopWritesFormat takes the noun ("a pull request", "pull
+	// requests") and the links (cardStopPRLinks).
+	slackStopWritesFormat = "I'd already opened %s before you stopped me: %s."
 	slackStopStoppedReply = "Stopped."
 	// slackStopExceptReplyFormat takes the one card that did not stop.
 	slackStopExceptReplyFormat = "Stopped, except one task that didn't respond: %s."
@@ -149,19 +149,15 @@ func slackStopReply(r *lib.CardStopResult, turnCancelled, newerTurnRunning bool)
 }
 
 // slackStopWritesLine is the sentence that names the pull requests the
-// thread's cards recorded before the stop, or "" for none: "I'd already
+// thread's cards had opened before the stop, or "" for none: "I'd already
 // opened a pull request before you stopped me: #412." (the maintainer's
-// approved line), and the same with "updated" for one a card refreshed.
+// approved line).
 func slackStopWritesLine(r *lib.CardStopResult) string {
-	opened, updated := cardStopWrites(r)
-	var sentences []string
-	if len(opened) > 0 {
-		sentences = append(sentences, fmt.Sprintf(slackStopWritesFormat, lib.CardStopWriteOpened, cardStopPRNoun(opened), cardStopPRLinks(opened)))
+	opened := cardStopWrites(r)
+	if len(opened) == 0 {
+		return ""
 	}
-	if len(updated) > 0 {
-		sentences = append(sentences, fmt.Sprintf(slackStopWritesFormat, lib.CardStopWriteUpdated, cardStopPRNoun(updated), cardStopPRLinks(updated)))
-	}
-	return strings.Join(sentences, " ")
+	return fmt.Sprintf(slackStopWritesFormat, cardStopPRNoun(opened), cardStopPRLinks(opened))
 }
 
 // slackPresser is one cached workspace answer for a Stop presser.

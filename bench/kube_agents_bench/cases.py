@@ -183,7 +183,8 @@ class CaseSpec:
     """The entries in ``transport_blind_checks`` with any leaf that reads the
     delegated workers -- ``worker_commands``, ``worker_agents``,
     ``worker_budget``, or a ``tool_called`` in the ``workers`` or ``all`` scope -- or any
-    ``tool_called`` with a ``result`` pattern. Blind on every inject record,
+    ``tool_called`` with a ``result`` pattern, bar one over harness-written
+    entries only (:data:`HARNESS_WRITTEN_ENTRIES`). Blind on every inject record,
     trace or none: the trace carries no results, so no card id can be read
     from it and no result pattern can match. The delegation wait reads the
     workers from the pod when the turn ran under the bridge's api executor;

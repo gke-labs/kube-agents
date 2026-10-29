@@ -18,9 +18,9 @@
 #
 # Red on main: the card stop answers with what it stopped and what had
 # finished ("🤷 nothing is running; already finished: <card>"), and nothing
-# names the pull request. Green: the card's worker recorded the pull request
-# submit-suggestion opened (agents/chat/defaults/plugins/common/write_ledger.py),
-# the card stop's answer carries it, and the gateway names it
+# names the pull request. Green: the card stop reads the pull request the
+# card opened off its pr_opened event (agents/platform/plugins/pr_opened),
+# its answer carries it, and the gateway names it
 # ("already opened a pull request: [#N](<url>)").
 #
 # The pull request is the case's subject, so it writes one to the GitOps
