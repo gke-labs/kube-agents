@@ -3184,8 +3184,12 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(body.count("--force"), 1, body)
         self.assertIn("do not re-run it and never pass `--force`", body)
         self.assertIn("Complete this card with the refusal quoted in `result`", body)
-        self.assertIn("is removed by the next `prepare` for this branch, so a later card starts clean", body)
-        self.assertIn("one that arrives sooner meets the same refusal and completes the same way", body)
+        # The refusal stands: nothing here reaps the copy on the card's behalf
+        # (vcs_client spares the clone's own destination), so the text says who
+        # clears it and when the reaper does.
+        self.assertIn("Every later card for this branch meets the same refusal until a person clears the copy", body)
+        self.assertIn("until a `prepare` for another branch runs after the copy has gone untouched for the copy TTL", body)
+        self.assertNotIn("is removed by the next `prepare` for this branch", body)
         self.assertNotIn("reap_stale_copies", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
