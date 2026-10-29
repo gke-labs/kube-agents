@@ -35,14 +35,30 @@ To rotate the token, write a new value into the Secret. The server reads the mou
 
 ## The tools
 
-| Tool                | What it does                                                                                                                                                                                                                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `connection_status` | Reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the Platform Agent are consuming, and the agents registered on the directory. Answered from a cache at most once every five seconds. |
-| `read_topics`       | Reads the install's standing topics and agent cards: `list` shows every provisioned topic with its newest entry, `read` shows one topic, and `cards` shows the agent cards. Entries are shown as quoted data, capped per block.                                          |
-| `send_message`      | Sends one message to the install as a console user and waits for the answer, on a named conversation so that later turns continue it. A turn still running when the wait ends returns its task, to be read later with `task_control`.                                    |
-| `task_control`      | Reads a task's state and answer (`get`, optionally waiting for it to finish), or stops a conversation's running task (`stop`).                                                                                                                                           |
-| `inspect_pr`        | Reads one pull or merge request, with its comments and diff, from a repository the install manages, through the credential broker; the pod holds no forge credential. The operator wires the broker in whenever it renders the server, so the tool is always offered.    |
+| Tool                | What it does                                                                                                                                                                                                                                                                                       |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `connection_status` | Reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the Platform Agent are consuming, and the agents registered on the directory. Answered from a cache at most once every five seconds.                           |
+| `read_topics`       | Reads the install's standing topics and agent cards: `list` shows every provisioned topic with its newest entry, `read` shows one topic, and `cards` shows the agent cards. Entries are shown as quoted data, capped per block.                                                                    |
+| `send_message`      | Sends one message to the install as a console user and waits for the answer, on a named conversation so that later turns continue it. A turn still running when the wait ends returns its task, to be read later with `task_control`.                                                              |
+| `task_control`      | Reads a task's state and answer (`get`, optionally waiting for it to finish), or stops a conversation's running task (`stop`).                                                                                                                                                                     |
+| `inspect_pr`        | Reads one pull or merge request, with its comments and diff, from a repository the install manages, through the credential broker; the pod holds no forge credential. The operator wires the broker in whenever it renders the server, so the tool is always offered.                              |
+| `manage_session`    | Keeps the names of this server's conversations and sends the console's control turns: `list`, `new` and `delete` manage the names, and `session_on`, `session_off` and `help` send `/session`, `/session off` or `help` on a conversation and return the answer ([Conversations](#conversations)). |
 
 A message sent through `send_message` reaches the A2A gateway through its console door, the same path the A2A console's chat pane takes, so the Planning Agent answers it or files kanban cards as for any chat message ([Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next)). Everything `inspect_pr` returns that a pull request's authors wrote is shown as data: fenced, capped on line boundaries with a count of what was cut, and introduced by a line saying it is the authors' content.
+
+## Conversations
+
+Every turn tool names its conversation. `conversation` is a name, `default` when omitted, and turns with the same name continue the same conversation. `conversation_token` is the token an earlier answer reported, as `<token>` or `console:<token>`, and continues that conversation whether or not the server still holds a name for it. There is no server-wide active conversation.
+
+Names are the server's own memory, and every caller shares them, since all callers present the same bearer token. A restart forgets them, and past 1024 names the table drops the least recently used; a conversation resumes by its token either way. A name is at most 128 characters and holds nothing a listing could not show back as typed: no backticks, pipes, control or invisible characters, no leading, trailing or doubled spaces, and nothing spelled like a token.
+
+`manage_session` keeps the names and sends the console's control turns:
+
+- `list` shows the named conversations, most recently used first, with token, description and last use; up to 50 are listed and the rest counted.
+- `new` creates a name, with an optional description of at most 200 characters, and refuses a name already in use.
+- `delete` forgets a name, given as the name or as the conversation's token. The conversation's history stays on the bus, and a session pod for it idles out on its own; to end one now, stop its running task and send `session_off` first.
+- `session_on`, `session_off` and `help` send `/session`, `/session off` or `help` on the conversation, exactly as `send_message` would, and return the answer. The first two are the gateway's commands ([`/session`](/kube-agents/concepts/chatops/#session)); `help` is a message to the agent, so it waits for a running turn to end first.
+
+The original client's `switch`, `debug_on`, `debug_off`, `transcript`, `clear_killed` and `status` are not offered; a call to one is answered with an error that says why, and `task_control` `get` reads a task's progress meanwhile.
 
 [`a2a/mcp/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/mcp/README.md) is canonical for the server, the tool list included.
