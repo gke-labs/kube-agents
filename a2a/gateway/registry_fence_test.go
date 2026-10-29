@@ -345,6 +345,7 @@ func TestAnUnreadableMarkerNamesItselfAndARecordThatDoesNotParseIsReplaced(t *te
 	if _, err := kv.Put(ctx, termKey, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
+	reg.SetEpoch(1) // term 0 doesn't read the marker
 	err = reg.Put(ctx, &SessionRecord{Key: key, Addressee: "blocked"})
 	if err == nil || !strings.Contains(err.Error(), termKey) {
 		t.Fatalf("Put under an unreadable marker = %v, want an error naming %s", err, termKey)
@@ -361,5 +362,35 @@ func TestAReplicatedStreamsConflictIsARevisionConflict(t *testing.T) {
 	}
 	if isRevisionConflict(errors.New("timeout")) {
 		t.Fatal("an unrelated error is a revision conflict")
+	}
+}
+
+func TestTermZeroIsUnfencedSoAPreElectionBuildCanRollBack(t *testing.T) {
+	// A build without the election writes at term 0. Rolled back to after
+	// terms have started, its writes must still land.
+	ctx := context.Background()
+	r := startRig(t)
+	leader, rolledBack := NewRegistry(r.client), NewRegistry(r.client)
+	if _, err := leader.BeginTerm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := "slack:T1/C1/rollback"
+	if err := leader.Put(ctx, &SessionRecord{Key: key, Addressee: "term-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rolledBack.Put(ctx, &SessionRecord{Key: key, Addressee: "term-0"}); err != nil {
+		t.Fatalf("Put at term 0 after terms began: %v", err)
+	}
+	if err := rolledBack.Create(ctx, &SessionRecord{Key: "slack:T1/C1/rollback-new"}); err != nil {
+		t.Fatalf("Create at term 0 after terms began: %v", err)
+	}
+	if err := rolledBack.IndexTask(ctx, "task-rb", key); err != nil {
+		t.Fatalf("IndexTask at term 0: %v", err)
+	}
+	if err := rolledBack.DropTask(ctx, "task-rb"); err != nil {
+		t.Fatalf("DropTask at term 0: %v", err)
+	}
+	if err := rolledBack.DeleteSession(ctx, key); err != nil {
+		t.Fatalf("DeleteSession at term 0: %v", err)
 	}
 }

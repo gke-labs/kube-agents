@@ -718,7 +718,21 @@ func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error
 // between reading the marker and writing, for any record the new leader has
 // written. A record that doesn't parse carries no epoch to check, so the
 // conditional write goes ahead and replaces it, as an unfenced Put did.
+//
+// Term 0 is a gateway without the election, which fences nothing: it reads
+// only the revision. A build from before the election can then be rolled
+// back to after terms have started, and its writes still land.
 func fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string, mine uint64) (uint64, error) {
+	if mine == 0 {
+		entry, err := kv.Get(ctx, kvKey(sessionKey))
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return 0, nil
+		}
+		if err != nil {
+			return 0, fmt.Errorf("session %s: %w", sessionKey, err)
+		}
+		return entry.Revision(), nil
+	}
 	term, _, err := readTerm(ctx, kv)
 	if err != nil {
 		return 0, err
@@ -814,12 +828,14 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 		return err
 	}
 	mine := r.epoch.Load()
-	term, _, err := readTerm(ctx, kv)
-	if err != nil {
-		return err
-	}
-	if term > mine {
-		return fmt.Errorf("session %s: term %d: %w", rec.Key, term, ErrFenced)
+	if mine != 0 {
+		term, _, err := readTerm(ctx, kv)
+		if err != nil {
+			return err
+		}
+		if term > mine {
+			return fmt.Errorf("session %s: term %d: %w", rec.Key, term, ErrFenced)
+		}
 	}
 	rec.Epoch = mine
 	data, err := json.Marshal(rec)
