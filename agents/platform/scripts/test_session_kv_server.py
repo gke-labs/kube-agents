@@ -3210,9 +3210,11 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                     vcs_client._refuse_to_discard(dest, force=False)
         self.assertTrue(str(refused.exception).startswith(f"there is already a copy at {dest} with "))
         self.assertTrue(str(refused.exception).endswith("Publish it, or re-run with --force to replace it."))
-        self.assertIn("This card has one or two parents; `kanban_show` each", body)
-        self.assertIn("A second parent titled `Open GitOps PR for ...`", body)
-        self.assertIn("if its `result` names a Pull Request, that is the one you revise rather than opening a second", body)
+        self.assertIn("This card has one or more parents; `kanban_show` each", body)
+        self.assertIn("Every other parent, titled `Open GitOps PR for ...`", body)
+        self.assertIn("has already finished or been archived", body)
+        self.assertIn("if one of their `result`s names a Pull Request, that is the one you revise rather than opening a second", body)
+        self.assertNotIn("one or two parents", body)
         self.assertIn("If the triage parent has no report (`result` is empty or its `status` is not `done`)", body)
         self.assertIn("Never change the live cluster directly", body)
         self.assertIn("open nothing", body)
@@ -3220,8 +3222,8 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
     def test_without_a_live_sibling_call_2_has_the_one_parent(self):
         self.assertFalse(self.board.exists())
         self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
-        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
-        self.assertEqual(session_kv_server._live_pull_request_sibling(""), "")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
+        self.assertEqual(session_kv_server._live_pull_request_siblings(""), [])
 
     def test_a_live_sibling_on_the_branch_is_a_second_parent(self):
         # A pull-request card the dispatcher has not settled (`_parents_satisfied`
@@ -3232,13 +3234,14 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                 if self.board.exists():
                     self.board.unlink()
                 self.make_board(self.card(self.SIBLING, status))
-                self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), self.SIBLING)
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
                 query = self.query("true")
                 line = self.parents_line(query)
                 self.assertNotEqual(line, self.ONE_PARENT)
-                self.assertIn("a list of two card ids, in this order: the card id call 1 returned", line)
-                self.assertIn(f"and `{self.SIBLING}`, a card already opening a Pull Request on this incident's branch", line)
-                self.assertIn("starts only after that one has finished", line)
+                self.assertIn("a list of 2 card ids, in this order: the card id call 1 returned", line)
+                self.assertIn(f"then `{self.SIBLING}`, each a card already opening a Pull Request on this incident's branch", line)
+                self.assertIn("starts only after all of them have finished", line)
+                self.assertIn("Name every one of them: a card left out would run beside this one.", line)
                 # The two bodies between the markers are unchanged: only the routing line names the sibling.
                 pr = query.split("--- BEGIN PULL REQUEST TASK BODY (copy verbatim) ---\n", 1)[1]
                 pr = pr.split("\n--- END PULL REQUEST TASK BODY ---", 1)[0]
@@ -3259,19 +3262,51 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             # names its branch between backticks, and the needle carries them.
             self.card("t_77777777", "running", branch=self.branch() + "-x-r-9e8f7a6b"),
         )
-        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
         self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
-        self.assertEqual(session_kv_server._live_pull_request_sibling(other_branch), "t_33333333")
-        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch() + "-x-r-9e8f7a6b"), "t_77777777")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(other_branch), ["t_33333333"])
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch() + "-x-r-9e8f7a6b"), ["t_77777777"])
         self.assertIn(f"on the branch `{self.branch()}`", session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
 
-    def test_the_newest_live_sibling_is_the_parent(self):
+    def test_every_live_sibling_is_a_parent_oldest_first(self):
+        # All of them, in the order the dispatcher runs them, not the newest:
+        # the new card then waits for each, whichever of them settles first.
         self.make_board(
             self.card("t_aaaaaaaa", "running", created_at=10.0),
             self.card("t_bbbbbbbb", "todo", created_at=20.0),
             self.card("t_cccccccc", "done", created_at=30.0),
+            self.card("t_dddddddd", "blocked", created_at=15.0),
         )
-        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "t_bbbbbbbb")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_aaaaaaaa", "t_dddddddd", "t_bbbbbbbb"])
+        query = self.query("true")
+        line = self.parents_line(query)
+        self.assertIn("a list of 4 card ids, in this order: the card id call 1 returned", line)
+        self.assertIn("then `t_aaaaaaaa`, `t_dddddddd`, `t_bbbbbbbb`, each a card already opening a Pull Request", line)
+        self.assertNotIn("t_cccccccc", query)
+        for card_id in ("t_aaaaaaaa", "t_dddddddd", "t_bbbbbbbb"):
+            self.assertEqual(query.count(card_id), 1, card_id)
+
+    def test_archiving_a_middle_card_leaves_the_earlier_ones_gating(self):
+        # The finding this guards against: with A running, B parented on A and
+        # a new start C, a C parented on B alone is promoted the moment B is
+        # archived (`archived` settles a parent for Hermes' `_parents_satisfied`),
+        # and runs `prepare` on the branch A's worker holds. Parented on every
+        # live card, C still names A once B is gone.
+        self.make_board(
+            self.card("t_aaaaaaaa", "running", created_at=10.0),
+            self.card("t_bbbbbbbb", "todo", created_at=20.0),
+        )
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_aaaaaaaa", "t_bbbbbbbb"])
+        self._board_write("UPDATE tasks SET status = 'archived' WHERE id = 't_bbbbbbbb'")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_aaaaaaaa"])
+        line = self.parents_line(self.query("true"))
+        self.assertIn("a list of 2 card ids", line)
+        self.assertIn("then `t_aaaaaaaa`, each a card", line)
+        self.assertNotIn("t_bbbbbbbb", line)
+        # And the other way round: the running card finishing first leaves the queued one gating.
+        self._board_write("UPDATE tasks SET status = 'todo' WHERE id = 't_bbbbbbbb'")
+        self._board_write("UPDATE tasks SET status = 'done' WHERE id = 't_aaaaaaaa'")
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), ["t_bbbbbbbb"])
 
     def test_a_malformed_card_id_is_kept_out_of_the_prompt(self):
         for bad in (
@@ -3283,10 +3318,18 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
                     self.board.unlink()
                 self.make_board(self.card(bad, "running"))
                 with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
-                    self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+                    self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
                 self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
                 self.assertFalse(any(bad in line for line in logs.output), logs.output)
                 self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        # A malformed id beside a well-formed one drops only itself: the live
+        # card still gates the new one.
+        self.board.unlink()
+        self.make_board(self.card("t_0a43cf9c\n", "running", created_at=10.0), self.card(self.SIBLING, "todo", created_at=20.0))
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
+        self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
+        self.assertEqual(self.query("true").count(self.SIBLING), 1)
 
     def test_the_settled_statuses_are_the_card_stop_routes(self):
         self.assertEqual(session_kv_server.CARD_STOP_SETTLED_STATUSES, frozenset(session_kv_server.KANBAN_SETTLED_STATUSES))
@@ -3454,7 +3497,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         # the start reads no board at all.
         no_read = [
             patch.object(session_kv_server, "_own_pull_request_card", side_effect=AssertionError("read")),
-            patch.object(session_kv_server, "_live_pull_request_sibling", side_effect=AssertionError("read")),
+            patch.object(session_kv_server, "_live_pull_request_siblings", side_effect=AssertionError("read")),
             patch.object(session_kv_server, "_triage_sleep", side_effect=AssertionError("held")),
         ]
         with ExitStack() as stack:
@@ -3528,7 +3571,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         with sqlite3.connect(self.board) as conn:
             conn.execute("CREATE TABLE other (id TEXT)")
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
-            self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+            self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
         self.assertTrue(any("INCIDENT_PR_SIBLING_LOOKUP_FAILED" in line for line in logs.output), logs.output)
         self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
         # A locked board past the busy timeout.
@@ -3539,10 +3582,10 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         holder.execute("BEGIN EXCLUSIVE")
         with patch.object(session_kv_server, "FEED_DB_BUSY_TIMEOUT_SECONDS", 0.05):
             with self.assertLogs(session_kv_server.logger, level="WARNING"):
-                self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), "")
+                self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [])
             self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
         holder.execute("ROLLBACK")
-        self.assertEqual(session_kv_server._live_pull_request_sibling(self.branch()), self.SIBLING)
+        self.assertEqual(session_kv_server._live_pull_request_siblings(self.branch()), [self.SIBLING])
         # The board path itself cannot be resolved.
         with patch.object(session_kv_server, "_kanban_db_path", side_effect=RuntimeError("no home")):
             with self.assertLogs(session_kv_server.logger, level="WARNING"):
@@ -11889,7 +11932,7 @@ class TestTriageStartRetry(unittest.TestCase):
         own_card = MagicMock(side_effect=own_card_answers)
         with patch.dict(os.environ, {session_kv_server.INCIDENT_TRIAGE_OPEN_PR_ENV: "true"}, clear=False), \
                 patch.object(session_kv_server, "_own_pull_request_card", own_card), \
-                patch.object(session_kv_server, "_live_pull_request_sibling", side_effect=AssertionError("read")):
+                patch.object(session_kv_server, "_live_pull_request_siblings", side_effect=AssertionError("read")):
             urlopen, logs = self._run([_answered(), chat_answer], payload=dict(self.INCIDENT))
         self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
         self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
