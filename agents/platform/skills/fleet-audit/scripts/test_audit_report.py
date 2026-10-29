@@ -23226,6 +23226,22 @@ metadata:
                 self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
                 self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
 
+    def test_the_same_object_unready_on_two_hosts_with_a_known_project_gives_no_note(self):
+        """hub-a and hub-b both report ContainerCluster infra/prod, project
+        proj, at UpdateFailed. The project agrees with the fix, but nothing
+        tells the fix which host's object it declares, so no note."""
+        self.write(
+            "clusters/prod.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: prod\n"
+            "  namespace: infra\nspec:\n  location: us-central1\n",
+        )
+        finding = kcc_finding(path="clusters/prod.yaml")
+        finding.update(cluster="proj/us-central1/prod", object="Cluster/prod")
+        stall = {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "why": "UpdateFailed", "project": "proj"}
+        manifest = self.two_hosts(("proj/us-central1/hub-a", [stall]), ("proj/us-east1/hub-b", [stall]))
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""
