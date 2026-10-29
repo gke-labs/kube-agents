@@ -3331,6 +3331,59 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertTrue(any("INCIDENT_PR_SIBLING_IGNORED" in line for line in logs.output), logs.output)
         self.assertEqual(self.query("true").count(self.SIBLING), 1)
 
+    def test_a_card_a_dispatcher_worker_filed_is_neither_a_sibling_nor_the_turns_own_card(self):
+        """The children patch records every create a worker process makes in
+        `kanban_worker_children`, keyed on `HERMES_KANBAN_TASK` in the worker's
+        environment rather than on anything the model passes. A card with a row
+        there is not a sibling and not a turn's own card, whatever its title and
+        body say; a board without the table (the class's default board) takes the
+        query without the clause."""
+        import sqlite3
+
+        table = session_kv_server.KANBAN_WORKER_CHILDREN_TABLE
+        self.assertEqual(table, "kanban_worker_children")
+        self.assertEqual(session_kv_server.CARD_STOP_CHILDREN_TABLE, table)
+        turn_began = 1_700_000_000
+        branch = self.branch()
+
+        def siblings():
+            return session_kv_server._live_pull_request_siblings(branch)
+
+        def own_card(session_id="k8s-evt-a"):
+            return session_kv_server._own_pull_request_card(session_id, branch, turn_began)
+
+        # The class's board has no children table: today's query, the card found.
+        self.make_board(self.card(self.SIBLING, "running", created_at=turn_began + 1, session_id="k8s-evt-a"))
+        with sqlite3.connect(self.board) as conn:
+            self.assertFalse(session_kv_server._has_table(conn, table))
+            self.assertNotIn("NOT EXISTS", session_kv_server._pull_request_card_sql(conn, session_kv_server.INCIDENT_PR_SIBLING_SQL))
+        self.assertEqual(siblings(), [self.SIBLING])
+        self.assertEqual(own_card(), self.SIBLING)
+        # The patch's table, as its DDL creates it, with no row for the card: the same answers.
+        self._board_write(f"CREATE TABLE {table} (child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL, created_at INTEGER NOT NULL)")
+        self.assertEqual(siblings(), [self.SIBLING])
+        self.assertEqual(own_card(), self.SIBLING)
+        # A row for the card: a worker filed it. Not a sibling, so the new card
+        # is not gated on it; not the turn's own card, so the hold goes on.
+        self._board_write(f"INSERT INTO {table} (child_id, creator_id, created_at) VALUES (?, ?, ?)", (self.SIBLING, "t_00000001", turn_began + 1))
+        self.assertEqual(siblings(), [])
+        self.assertEqual(self.parents_line(self.query("true")), self.ONE_PARENT)
+        self.assertEqual(own_card(), "")
+        # A front door's card beside it (no row) is a sibling, alone, and the turn's own card.
+        self._board_write(
+            "INSERT INTO tasks (id, title, body, assignee, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            self.card("t_bbbbbbbb", "todo", created_at=turn_began + 2, session_id="k8s-evt-a"),
+        )
+        self.assertEqual(siblings(), ["t_bbbbbbbb"])
+        line = self.parents_line(self.query("true"))
+        self.assertIn("a list of 2 card ids", line)
+        self.assertIn("`t_bbbbbbbb`", line)
+        self.assertNotIn(self.SIBLING, line)
+        self.assertEqual(own_card(), "t_bbbbbbbb")
+        # The row gone (a board the patch stopped writing): both cards count again, oldest first.
+        self._board_write(f"DELETE FROM {table} WHERE child_id = ?", (self.SIBLING,))
+        self.assertEqual(siblings(), [self.SIBLING, "t_bbbbbbbb"])
+
     def test_the_settled_statuses_are_the_card_stop_routes(self):
         self.assertEqual(session_kv_server.CARD_STOP_SETTLED_STATUSES, frozenset(session_kv_server.KANBAN_SETTLED_STATUSES))
         self.assertEqual(session_kv_server.KANBAN_SETTLED_STATUSES, ("done", "archived"))

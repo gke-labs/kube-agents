@@ -326,6 +326,12 @@ INCIDENT_PR_CARD_TITLE_PREFIX = "Open GitOps PR for "
 # owns its branch's checkout, and a new card for that branch is parented on
 # every such card so the dispatcher runs it after all of them.
 KANBAN_SETTLED_STATUSES = ("done", "archived")
+# The children patch's table (`deploy/docker/patches/kanban_children_settled.py`):
+# one row per card a dispatcher-spawned worker filed, written from
+# `HERMES_KANBAN_TASK` on the worker's process and not from anything the
+# model passes. Read here behind `_has_table` by the sibling lookup, the
+# hold's own-card read and the card-stop route.
+KANBAN_WORKER_CHILDREN_TABLE = "kanban_worker_children"
 # The shape of a Hermes card id: `t_` and the hex digits Hermes mints (eight
 # today, from `secrets.token_hex`). An id read from the board that does not
 # match in full is not written into the front door's prompt.
@@ -387,8 +393,21 @@ INCIDENT_PR_SIBLING_SQL = """
      WHERE substr(t.title, 1, ?) = ?
        AND t.status NOT IN (?, ?)
        AND instr(COALESCE(t.body, ''), ?) > 0
+       {not_worker_filed}
      ORDER BY t.created_at ASC, t.id ASC
 """
+# A card a dispatcher-spawned worker filed is neither a sibling nor a turn's
+# own card. The title prefix and the branch in the body are text any
+# `kanban_create` caller can write, and every triage card hands a Cluster
+# Agent worker cluster output other teams control; a worker steered into
+# filing a card with both would otherwise gate the branch's next pull-request
+# card until it settled, and could end the hold after an unanswered turn.
+# The front door runs in a chat session with no `HERMES_KANBAN_TASK`, so its
+# own `Open GitOps PR` card has no row and is never dropped. Added to a read
+# only when the board has the table (`_pull_request_card_sql`), so a board
+# predating the patch takes the query without it rather than refusing every
+# read. A card filed from a chat session on a user's own ask is the user's.
+INCIDENT_PR_NOT_WORKER_FILED_SQL = "AND NOT EXISTS (SELECT 1 FROM {table} c WHERE c.child_id = t.id)"
 # How the card body names its branch: `_triage_pr_task_body` writes
 # ``on the branch `<branch>` ``, and the sibling lookup matches that whole token.
 INCIDENT_PR_BRANCH_NEEDLE = "`{branch}`"
@@ -412,6 +431,7 @@ INCIDENT_PR_OWN_CARD_SQL = """
        AND substr(t.title, 1, ?) = ?
        AND t.created_at >= ?
        AND instr(COALESCE(t.body, ''), ?) > 0
+       {not_worker_filed}
      ORDER BY t.created_at DESC, t.id DESC
      LIMIT 1
 """
@@ -2920,6 +2940,16 @@ def _incident_branch(session_id: str, payload: Dict[str, Any]) -> str:
     return f"{INCIDENT_PR_BRANCH_PREFIX}{slug}"
 
 
+def _pull_request_card_sql(conn: sqlite3.Connection, template: str) -> str:
+    """`template` (INCIDENT_PR_SIBLING_SQL or INCIDENT_PR_OWN_CARD_SQL) with the
+    worker-filed exclusion filled in when the board has the children patch's
+    table, and with nothing in its place when it does not."""
+    clause = ""
+    if _has_table(conn, KANBAN_WORKER_CHILDREN_TABLE):
+        clause = INCIDENT_PR_NOT_WORKER_FILED_SQL.format(table=KANBAN_WORKER_CHILDREN_TABLE)
+    return template.format(not_worker_filed=clause)
+
+
 def _live_pull_request_siblings(branch: str) -> list[str]:
     """The ids of the live `Open GitOps PR` cards for `branch`, oldest first; [] when none.
 
@@ -2938,6 +2968,10 @@ def _live_pull_request_siblings(branch: str) -> list[str]:
     runs would promote C beside A. Parented on A and B both, C waits for A
     whatever happens to B. The set is bounded by the un-folded same-branch
     starts whose cards are still live, one per front-door turn.
+
+    A card a dispatcher worker filed is not a sibling, whatever its title and
+    body say (INCIDENT_PR_NOT_WORKER_FILED_SQL, on a board that has the
+    children patch's table).
 
     Read-only, and it fails open, but not at the first refusal: no board yet
     gives [] and today's single-parent prompt at once (a fresh install has no
@@ -2974,7 +3008,7 @@ def _live_pull_request_siblings(branch: str) -> list[str]:
 
     def read(conn: sqlite3.Connection) -> list[str]:
         rows = conn.execute(
-            INCIDENT_PR_SIBLING_SQL,
+            _pull_request_card_sql(conn, INCIDENT_PR_SIBLING_SQL),
             (
                 len(INCIDENT_PR_CARD_TITLE_PREFIX),
                 INCIDENT_PR_CARD_TITLE_PREFIX,
@@ -3023,7 +3057,9 @@ def _own_pull_request_card(session_id: str, branch: str, since: float) -> str:
     caller's floor is the second after the one the turn began in, so the
     previous turn's card is below it even when that turn's `/chat` returned in
     the same second this one took the lock), or for another branch, is some
-    other turn's. A board that is missing or cannot be
+    other turn's, and a card a dispatcher worker filed is not this turn's
+    whatever it carries (INCIDENT_PR_NOT_WORKER_FILED_SQL, on a board that
+    has the children patch's table). A board that is missing or cannot be
     read answers "" too, which to the one caller (`_hold_for_unanswered_turn`)
     means "not yet": the hold goes on polling, bounded by
     INCIDENT_START_UNKNOWN_HOLD_S, rather than releasing on a read it could not
@@ -3034,7 +3070,7 @@ def _own_pull_request_card(session_id: str, branch: str, since: float) -> str:
 
     def read(conn: sqlite3.Connection) -> str:
         row = conn.execute(
-            INCIDENT_PR_OWN_CARD_SQL,
+            _pull_request_card_sql(conn, INCIDENT_PR_OWN_CARD_SQL),
             (
                 session_id,
                 len(INCIDENT_PR_CARD_TITLE_PREFIX),
@@ -8504,7 +8540,7 @@ CARD_STOP_WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
 # Both it and the `created` event's `creator_task_id` are read: the table is
 # created on its first write and holds only the fan-outs since, and the event
 # is Hermes' own record of every create that named a creator.
-CARD_STOP_CHILDREN_TABLE = "kanban_worker_children"
+CARD_STOP_CHILDREN_TABLE = KANBAN_WORKER_CHILDREN_TABLE
 # Hermes' session store, where a compressed session's continuation names the
 # session it continues (`parent_session_id`, with the parent ended
 # 'compression'); a card filed after a compression carries the continuation's
