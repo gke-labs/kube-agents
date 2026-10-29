@@ -568,9 +568,11 @@ type ConversationState struct {
 	Activity []json.RawMessage
 	Progress string
 	// Usage is the total of the task's usage artifact (lib.UsageTotal over
-	// its parts), read like Activity whenever the stream was read; nil when
-	// the stream was not read or the executor published no usage. The
-	// executor publishes a turn's usage before its terminal, so a read that
-	// shows the task final carries all of it.
+	// its parts), read like Activity whenever the stream was read and from
+	// the same stream: for a delegation chain's root, the link the read
+	// follows, not the chain's sum. Nil when the stream was not read or the
+	// executor published no usage. The executor publishes a turn's usage
+	// before its terminal, so a read that shows the task final carries all
+	// of it.
 	Usage *lib.Usage
 }

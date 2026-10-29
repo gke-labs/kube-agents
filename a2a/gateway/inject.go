@@ -478,7 +478,9 @@ type probeReport struct {
 	// the relay's rolling edit shows -- at the instant of the read.
 	Progress string `json:"progress,omitempty"`
 	// Usage is what the task's turns cost as its stream holds it at the
-	// read: the sum of its usage artifact's parts (ConversationState.Usage).
+	// read: the sum of its usage artifact's parts (ConversationState.Usage),
+	// from the stream the read follows, which for a delegation chain's root
+	// is its running or last link, as for Activity.
 	// Absent when the executor published none, when the stream was not
 	// read, and on a door older than the field. A read that shows the task
 	// final carries every turn's, since the executor publishes each before

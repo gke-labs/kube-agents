@@ -219,7 +219,8 @@ PROBE_PROGRESS_KEY = "progress"
 # artifact (``ConversationState.Usage``), absent when the executor published
 # none and on a door older than the field. The executor publishes each turn's
 # usage before its terminal, so a read that shows the task final carries all
-# of it. Hermes reports the prompt whole, cached reads included, with no
+# of it. On a delegation chain's root the door reads the running or last link,
+# so the counts are that link's, as the trace is. Hermes reports the prompt whole, cached reads included, with no
 # split, so the harness maps ``inputTokens`` and ``outputTokens`` alone.
 PROBE_USAGE_KEY = "usage"
 USAGE_INPUT_KEY = "inputTokens"
@@ -1600,7 +1601,9 @@ class InjectTask:
         carried the relay's terminal can hold a probe taken before the
         executor's terminal, and with it before the turn's usage. A read made
         now follows the terminal, and so the usage. Best effort: a read that
-        fails leaves the counts as the earlier reads had them.
+        fails leaves the counts as the earlier reads had them. It is made
+        whatever budget is left, so on the deadline and cancel paths it can
+        run past the budget by one probed read's timeout.
         """
         try:
             answered = Probe.from_body(self._poll(task_id, after, 0))

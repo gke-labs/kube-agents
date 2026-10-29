@@ -672,7 +672,7 @@ def test_the_record_carries_the_lifecycle_as_status_events(
     """Every executor state the read route showed, and the terminal, land in
     the trajectory as a2a.status-update entries -- the same name the bus
     transport uses, and the final one is what rung 3 accepts in place of a
-    token count. Tokens stay null; latency is the harness's."""
+    token count. Tokens stay null (the stub reports no usage); latency is the harness's."""
     stub_gateway.executor_states = ["submitted", "working"]
     # Let two reads see the task running before the terminal appears.
     stub_gateway.entries = running_transcript(stub_gateway.task_id)
