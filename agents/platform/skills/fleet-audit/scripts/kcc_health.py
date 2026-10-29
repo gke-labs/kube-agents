@@ -122,13 +122,15 @@ GLOBAL_LOCATION = "global"
 CLUSTER_STATUS_FIELD = "cluster_status"
 READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 # The flag that turns the read on. A collector reads Config Connector only
-# with it: only `finish` uses the result, and the SOP commands of the
-# scheduled audits pass it, while the chat route runs the same collectors
+# with it: only `finish` uses the result. The SOP command passes it whenever
+# the audit runs by its SOP, scheduled or on demand
+# (references/on-demand.md); a chat fleet question runs the same collectors
 # without it and pays nothing for a read that nothing uses.
 FLAG = "--config-connector"
 FLAG_HELP = (
     "after the sweep, read Config Connector on each collected cluster and record kcc_unready or "
-    "kcc_unread on its entry, for finish; the SOP commands of the scheduled audits pass it, chat runs do not"
+    "kcc_unread on its entry, for finish; the SOP command passes it, scheduled or on demand, and a "
+    "chat fleet question does not"
 )
 # The carried key a collector sets on a cluster whose `clusters list` record
 # shows the Config Connector add-on enabled

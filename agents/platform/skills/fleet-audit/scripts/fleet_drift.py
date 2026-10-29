@@ -2011,7 +2011,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
             # GKE's status, carried for the Config Connector read after the
             # sweep (`kcc_health.annotate_manifest`), which reads only a
             # running cluster: this entry is `collected` in every status.
-            "cluster_status": c.get("status") or "",
+            kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
             # Still `collected` when a cohort floored out. Nothing was
             # compared, but nothing the model can run by hand would compare it
             # either -- the peers do not exist -- and `gate-failed` asks for
@@ -2162,8 +2162,8 @@ def main(argv: list[str] | None = None) -> int:
     # The Config Connector reads below end inside a budget measured from here.
     started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command of
-    # the scheduled audit passes it, the chat route does not.
+    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command,
+    # scheduled or on demand, passes it; a chat fleet question does not.
     if args.config_connector:
         # After the sweep, in a new pool of the sweep's size: a credential fetch
         # and one `kubectl get gcp` per collected cluster, as `kcc_unready` or

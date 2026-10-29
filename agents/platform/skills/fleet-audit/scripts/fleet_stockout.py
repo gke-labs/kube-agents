@@ -620,7 +620,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
         # GKE's status, so `finish` does not count this cluster as one that
         # may run Config Connector (`audit_report.kcc_health`).
-        "cluster_status": c.get("status") or "",
+        kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
     }
 
 
@@ -2682,8 +2682,8 @@ def main(argv: list[str] | None = None) -> int:
     # The Config Connector reads below end inside a budget measured from here.
     started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command of
-    # the scheduled audit passes it, the chat route does not.
+    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command,
+    # scheduled or on demand, passes it; a chat fleet question does not.
     if args.config_connector:
         # After the sweep, in a new pool of the sweep's size: one `kubectl get gcp`
         # per collected cluster, as `kcc_unready` or `kcc_unread` on its entry,

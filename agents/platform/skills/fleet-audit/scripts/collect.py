@@ -649,7 +649,7 @@ def not_running_entry(c: dict, project: str) -> dict:
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
         # GKE's status, so `finish` does not count this cluster as one that
         # may run Config Connector (`audit_report.kcc_health`).
-        "cluster_status": c.get("status") or "",
+        kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
     }
 
 
