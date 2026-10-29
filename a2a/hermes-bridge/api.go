@@ -515,6 +515,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	defer resp.Body.Close()
@@ -528,6 +529,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	took := time.Since(connectedAt)
 	if err != nil && taskCtx.Err() != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	if err != nil {

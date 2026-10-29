@@ -45,6 +45,11 @@ type apiStub struct {
 	calls  []apiCall
 	srv    *httptest.Server
 	handle func(w http.ResponseWriter, r *http.Request, c apiCall)
+	// stops is every turn-stop request's path (turnstop.go), answered by
+	// stop, or 404 as an image without the route answers when stop is nil.
+	// Neither is a turn, so neither reaches calls or handle.
+	stops []string
+	stop  func(w http.ResponseWriter, r *http.Request)
 }
 
 func newAPIStub(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, c apiCall)) *apiStub {
@@ -57,6 +62,18 @@ func newAPIStub(t *testing.T, handle func(w http.ResponseWriter, r *http.Request
 
 // serve records the call and answers it with handle, or with an echo.
 func (s *apiStub) serve(w http.ResponseWriter, r *http.Request) {
+	if !strings.HasSuffix(r.URL.Path, apiChatCompletionsSuffix) {
+		s.mu.Lock()
+		s.stops = append(s.stops, r.URL.Path)
+		stop := s.stop
+		s.mu.Unlock()
+		if stop == nil {
+			http.NotFound(w, r)
+			return
+		}
+		stop(w, r)
+		return
+	}
 	var req apiChatRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	c := apiCall{
@@ -76,6 +93,12 @@ func (s *apiStub) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeCompletion(w, c.sessionID, "answer to "+c.prompt)
+}
+
+func (s *apiStub) stopsSeen() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.stops...)
 }
 
 func (s *apiStub) seen() []apiCall {
