@@ -41,6 +41,16 @@
 # rest on the success path: the pull request the run opened against the
 # declaration, the declaration, the object and the namespace.
 #
+# Inputs. Each variable in variables.tf can come from the environment as
+# TF_VAR_<name>: TF_VAR_project_id, TF_VAR_kcc_cluster_name,
+# TF_VAR_kcc_cluster_location, TF_VAR_gitops_repo, TF_VAR_gitops_token_file
+# and, in namespaced mode, TF_VAR_kcc_google_service_account; the task sets
+# kcc_namespace, seeded_slot and seeded_pool. This file gives them to
+# plant.py as KCC_EVAL_PROJECT, KCC_EVAL_CLUSTER, KCC_EVAL_LOCATION,
+# KCC_EVAL_NAMESPACE, KCC_EVAL_SLOT, KCC_EVAL_POOL, KCC_EVAL_GITOPS_REPO,
+# KCC_EVAL_GITOPS_TOKEN_FILE and KCC_EVAL_GOOGLE_SERVICE_ACCOUNT. With no
+# token file, plant.py reads the GitHub token from BENCH_GITHUB_TOKEN.
+#
 # Isolation class: one namespace on the Config Connector cluster, and one file
 # on the GitOps repository's default branch. Eligible tier: nightly.
 
