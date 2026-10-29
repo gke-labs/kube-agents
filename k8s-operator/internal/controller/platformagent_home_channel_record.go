@@ -31,8 +31,10 @@ const (
 	// a2aHomeChannelRecordSuffix names the ConfigMap after the agent.
 	a2aHomeChannelRecordSuffix = "-home-channel"
 
-	// The record's data keys the operator reads. The gateway also writes
-	// slack.setBy, slack.setAt and writer, for audit; nothing here reads them.
+	// The record's data keys the operator reads: the channel, the learn's
+	// timestamp that starts the admit delay, the refusal and the reader. The
+	// gateway also writes slack.setBy and writer, for audit; nothing here
+	// reads them.
 	homeChannelRecordSlackKey   = "slack"
 	homeChannelRecordSetAtKey   = "slack.setAt"
 	homeChannelRecordRefusedKey = "slack.refused"
@@ -108,10 +110,13 @@ const (
 	homeChannelUnsetPendingFormat          = " A learned channel %s is recorded and is applied to the agent at %s, %s after it was learned, so the conversation that learned it finishes before the agent restarts."
 	homeChannelUnsetStaleFormat            = " A learned channel %s was last confirmed by gateway image %s, not the %s this operator renders, so it is not used until that gateway confirms it;" + homeChannelUnsetStaleExit
 	homeChannelUnsetStaleNoReaderFormat    = " A learned channel %s is recorded with no confirming gateway image, so it is not used until the gateway confirms it;" + homeChannelUnsetStaleExit
-	// homeChannelUnsetStaleExit names the one way out of a stale record: the
-	// gateway checks and re-stamps the record when it starts, and nothing
-	// retries a boot check that could not be made or a re-stamp that failed.
-	homeChannelUnsetStaleExit = " the gateway checks the record when it starts (kubectl rollout restart deployment/%s -n %s)."
+	// homeChannelUnsetStaleExit names the way out of a stale record: the
+	// gateway checks and re-stamps the record when it starts. An operator
+	// upgrade is the usual cause (the gateway image follows the operator's)
+	// and starts its new gateway itself; a hand-edited reader, a boot check
+	// that could not be made or a re-stamp that failed waits for a restart
+	// that can check, because nothing retries them.
+	homeChannelUnsetStaleExit = " the gateway checks the record when it starts. During an operator upgrade the new gateway does that as it starts, and no action is needed; otherwise restart it (kubectl rollout restart deployment/%s -n %s)."
 )
 
 // homeChannelRefusedReasons maps the gateway's refusal vocabulary to the
