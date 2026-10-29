@@ -2609,7 +2609,8 @@ fi
 # A case main's grader cannot read -- a check type, check field or top-level
 # key it does not know, a stack it does not have -- stops the job red here, before the fan-out,
 # rather than running and losing the check to rung 2 (or a missing stack to
-# infrastructure). So a grader change lands on main before the case that
+# infrastructure). The check itself runs after the lane step ("main's grader
+# reads the cases as run"), over the task copies devops-bench is handed. So a grader change lands on main before the case that
 # needs it (decided 2026-10-28). A new case lands in the nightly, which grades
 # from HEAD, so only a change to a presubmit case is held to that order.
 #
@@ -2633,6 +2634,7 @@ fi
 # under it. Exits non-zero only when the check itself could not run.
 grader_unreadable_cases() { # <task file>... (relative to BENCH_DIR)
   (cd "${BENCH_DIR}" && uv run python -c '
+import os
 import sys
 from pathlib import Path
 
@@ -2656,8 +2658,15 @@ for path in sys.argv[1:]:
         for error in parse_entries(task.verification_spec)[1]:
             print(path + ": verification entry " + str(error.get("name")) + ": " + str(error.get("reason")))
         stack = (task.infrastructure or {}).get("stack")
-        if stack and not (Path("tf") / str(stack)).is_dir():
-            print(f"{path}: its stack tf/{stack} is not in this grader")
+        if stack:
+            # Resolved and contained: pathlib keeps "..", and an absolute
+            # value discards the root it is joined to, so either could reach
+            # a stack outside the tf/ of this grader, such as one shipped in
+            # the case folder of the change.
+            tf_root = Path(os.environ.get("BENCH_TF_ROOT") or "tf").resolve()
+            stack_dir = (tf_root / str(stack)).resolve()
+            if not (stack_dir != tf_root and stack_dir.is_relative_to(tf_root) and stack_dir.is_dir()):
+                print(f"{path}: its stack {stack} is not a directory under this grader tf/")
 ' "$@")
 }
 
@@ -2671,15 +2680,6 @@ if [ -n "${GRADER_BENCH_DIR}" ]; then
   # only on itself.
   if ! (cd "${BENCH_DIR}" && uv sync --quiet) && ! (cd "${BENCH_DIR}" && uv sync --quiet); then
     echo "ERROR: could not sync main's grader's venv in ${BENCH_DIR} (twice, above); the run does not start." >&2
-    exit 1
-  fi
-  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${TASKS[@]}")"; then
-    echo "ERROR: could not check that main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) reads this change's cases (above); the run does not start." >&2
-    exit 1
-  fi
-  if [ -n "${GRADER_UNREADABLE}" ]; then
-    echo "ERROR: main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) cannot read these cases: this case needs a grader change that is not on main yet; land the grader change first, then the case." >&2
-    sed 's/^/  /' <<< "${GRADER_UNREADABLE}" >&2
     exit 1
   fi
 fi
@@ -2805,6 +2805,27 @@ unit_task_path() { # <task-path> <task-name>
     echo "$1"
   fi
 }
+
+# ─── main's grader reads the cases as run (section 6) ────────────────────────
+# The read check of "Grade with the merge target's grader", run here, after
+# the lane step, over the file each unit hands devops-bench (unit_task_path):
+# the lane's copy carries the entries of inject-lane-safeguards.yaml, read
+# from the change, which main's parser has to read as well.
+if [ -n "${GRADER_BENCH_DIR}" ]; then
+  GRADER_CHECKED=()
+  for ENTRY in "${TASKS[@]}"; do
+    GRADER_CHECKED+=("$(unit_task_path "${ENTRY}" "$(basename "$(dirname "${ENTRY}")")")")
+  done
+  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${GRADER_CHECKED[@]}")"; then
+    echo "ERROR: could not check that main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) reads this change's cases (above); the run does not start." >&2
+    exit 1
+  fi
+  if [ -n "${GRADER_UNREADABLE}" ]; then
+    echo "ERROR: main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) cannot read these cases: this case needs a grader change that is not on main yet; land the grader change first, then the case." >&2
+    sed 's/^/  /' <<< "${GRADER_UNREADABLE}" >&2
+    exit 1
+  fi
+fi
 
 # ─── The nightly part ────────────────────────────────────────────────────────
 # EVAL_NIGHTLY_PART (validated at the tier switch) applied to TASKS: after

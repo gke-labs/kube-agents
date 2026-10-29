@@ -176,7 +176,11 @@ def mutated(tmp_path):
     this tree's tf/ so a stack the grader has resolves."""
     bench = tmp_path / "bench"
     (bench / "tasks").mkdir(parents=True)
-    (bench / "tf").symlink_to(BENCH / "tf")
+    # A real tf/ whose entries link to this tree's, so resolving a path
+    # against it stays inside this bench directory.
+    (bench / "tf").mkdir()
+    for entry in (BENCH / "tf").iterdir():
+        (bench / "tf" / entry.name).symlink_to(entry)
     shutil.copytree(BENCH / "tasks" / SMOKE, bench / "tasks" / SMOKE)
     path = bench / "tasks" / SMOKE / "task.yaml"
 
@@ -235,7 +239,23 @@ def test_a_stack_the_grader_does_not_have_is_reported(mutated):
 
     proc = mutated(stack)
     assert proc.returncode == 0, proc.stderr
-    assert "its stack tf/prebuilt/stack-not-on-main is not in this grader" in proc.stdout
+    assert "its stack prebuilt/stack-not-on-main is not a directory under this grader" in proc.stdout
+
+
+@pytest.mark.parametrize("escape", ["dotdot", "absolute"])
+def test_a_stack_outside_the_graders_tf_is_reported(mutated, tmp_path, escape):
+    """A stack shipped in the case folder of the change, reached by `..` or by
+    an absolute path, would run the change's own Terraform under the pin."""
+    outside = tmp_path / "bench" / "tasks" / SMOKE / "stack"
+    outside.mkdir(parents=True)
+    stack = f"../tasks/{SMOKE}/stack" if escape == "dotdot" else str(outside)
+
+    def point(spec):
+        spec["infrastructure"] = {"deployer": "tofu", "stack": stack}
+
+    proc = mutated(point)
+    assert proc.returncode == 0, proc.stderr
+    assert f"its stack {stack} is not a directory under this grader" in proc.stdout
 
 
 def test_a_case_bench_gate_refuses_is_reported(mutated):
@@ -317,7 +337,7 @@ def test_the_lease_scan_imports_fixture_drift_from_the_grader():
 # --------------------------------------------------------------------------
 
 
-def _step(repo: Path, grader_bench: str, *, unreadable: str = "", uv: str = "uv() { :; }",
+def _step(repo: Path, grader_bench: str, *, uv: str = "uv() { :; }",
           env: dict | None = None) -> subprocess.CompletedProcess:
     block = _lift(r"^# ─── Grade with the merge target's grader.*?^export EVAL_GRADER_SHA$")
     head, sep, tail = block.partition('\nEVAL_GRADER_SHA="$(git')
@@ -332,7 +352,6 @@ def _step(repo: Path, grader_bench: str, *, unreadable: str = "", uv: str = "uv(
             "TASKS=(./tasks/kept/task.yaml ./tasks/added/task.yaml)",
             uv,
             head,
-            f"grader_unreadable_cases() {{ printf '%s' {unreadable!r}; }}",
             sep.lstrip("\n") + tail,
             'echo "BENCH_DIR=${BENCH_DIR}"',
             'echo "EVAL_GRADER_SHA=${EVAL_GRADER_SHA}"',
@@ -358,13 +377,49 @@ def test_an_unpinned_run_names_head(change):
     assert _out(proc, "EVAL_GRADER_SHA") == _git(repo, "rev-parse", "HEAD")
 
 
-def test_a_case_main_cannot_read_reds_the_job(change, tmp_path):
-    repo, _ = change
+def _check(grader_bench: str, lane_dir: Path, unreadable: str = "") -> subprocess.CompletedProcess:
+    """The after-lane read check, with grader_unreadable_cases recording what
+    it was handed."""
+    block = _lift(r"^# ─── main's grader reads the cases as run.*?^fi$")
+    body = "\n".join(
+        [
+            _function("unit_task_path"),
+            f'GRADER_BENCH_DIR="{grader_bench}"',
+            f'INJECT_LANE_TASKS_DIR="{lane_dir}"',
+            "PULL_BASE_SHA=base0",
+            'EVAL_GRADER_TREE=bench',
+            "TASKS=(./tasks/kept/task.yaml ./tasks/added/task.yaml)",
+            f"grader_unreadable_cases() {{ printf 'HANDED %s\\n' \"$@\" >&2; printf '%s' {unreadable!r}; }}",
+            block,
+            "echo passed",
+        ]
+    )
+    return _run(body, {})
+
+
+def test_the_read_check_reads_the_lane_copies_devops_bench_is_handed(tmp_path):
+    lane = tmp_path / "lane"
+    _write(lane / "kept" / "task.yaml", "id: kept\n")
+    proc = _check(str(tmp_path), lane)
+    assert proc.returncode == 0, proc.stderr
+    # The lane's copy where it made one, the file under tasks/ otherwise.
+    assert f"HANDED {lane}/kept/task.yaml" in proc.stderr
+    assert "HANDED ./tasks/added/task.yaml" in proc.stderr
+    assert "HANDED ./tasks/kept/task.yaml" not in proc.stderr
+
+
+def test_a_case_main_cannot_read_reds_the_job(tmp_path):
     reason = "./tasks/added/task.yaml: verification entry x: unknown verifier type 'y'"
-    proc = _step(repo, str(tmp_path), unreadable=reason)
+    proc = _check(str(tmp_path), tmp_path / "lane", unreadable=reason)
     assert proc.returncode == 1
     assert MESSAGE in proc.stderr
     assert f"  {reason}" in proc.stderr
+
+
+def test_an_unpinned_run_checks_nothing(tmp_path):
+    proc = _check("", tmp_path / "lane", unreadable="x: y")
+    assert proc.returncode == 0, proc.stderr
+    assert "HANDED" not in proc.stderr
 
 
 def test_one_failed_venv_sync_is_retried(change, tmp_path):
