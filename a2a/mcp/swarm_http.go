@@ -95,20 +95,20 @@ func swarmCapRunes(s string, n int) string {
 // the client's own, passed back as it sent it, since the bridge replaces its
 // entry with the one returned whenever they differ.
 type swarmConversationEntry struct {
-	Alias                   string    `json:"alias"`
-	Token                   string    `json:"token"`
-	SessionMode             bool      `json:"sessionMode"`
-	SessionTerminated       bool      `json:"sessionTerminated,omitempty"`
-	Description             string    `json:"description,omitempty"`
-	AGYConversationID       string    `json:"agyConversationId,omitempty"`
-	ParentAGYConversationID string    `json:"parentAgyConversationId,omitempty"`
-	SubagentRole            string    `json:"subagentRole,omitempty"`
-	SessionWorkerID         string    `json:"sessionWorkerId,omitempty"`
-	AutoBound               bool      `json:"autoBound,omitempty"`
-	DebugMode               bool      `json:"debugMode,omitempty"`
-	Disconnected            bool      `json:"disconnected,omitempty"`
-	CreatedAt               time.Time `json:"createdAt"`
-	LastUsedAt              time.Time `json:"lastUsedAt"`
+	Alias                    string    `json:"alias"`
+	Token                    string    `json:"token"`
+	SessionMode              bool      `json:"sessionMode"`
+	SessionTerminated        bool      `json:"sessionTerminated,omitempty"`
+	Description              string    `json:"description,omitempty"`
+	HostConversationID       string    `json:"hostConversationId,omitempty"`
+	ParentHostConversationID string    `json:"parentHostConversationId,omitempty"`
+	SubagentRole             string    `json:"subagentRole,omitempty"`
+	SessionWorkerID          string    `json:"sessionWorkerId,omitempty"`
+	AutoBound                bool      `json:"autoBound,omitempty"`
+	DebugMode                bool      `json:"debugMode,omitempty"`
+	Disconnected             bool      `json:"disconnected,omitempty"`
+	CreatedAt                time.Time `json:"createdAt"`
+	LastUsedAt               time.Time `json:"lastUsedAt"`
 }
 
 // swarmLineage is one subagent's lineage (#3689:
@@ -363,11 +363,11 @@ func cappedClientEntry(e swarmConversationEntry) swarmConversationEntry {
 	if len(e.Description) > swarmScanBytes {
 		e.Description = ""
 	}
-	if !validSwarmConversationID(e.AGYConversationID) {
-		e.AGYConversationID = ""
+	if !validSwarmConversationID(e.HostConversationID) {
+		e.HostConversationID = ""
 	}
-	if !validSwarmConversationID(e.ParentAGYConversationID) {
-		e.ParentAGYConversationID = ""
+	if !validSwarmConversationID(e.ParentHostConversationID) {
+		e.ParentHostConversationID = ""
 	}
 	if len(e.SubagentRole) > maxSwarmHandleBytes {
 		e.SubagentRole = ""
@@ -383,21 +383,21 @@ func cappedClientEntry(e swarmConversationEntry) swarmConversationEntry {
 // alias of the entry whose Antigravity id is this entry's parent id, or, when
 // that names none, the one the subagent lineage gives as its parent.
 func swarmConversations(entries []swarmConversationEntry, subagents map[string]swarmLineage) []SwarmConversation {
-	aliasOfAGY := make(map[string]string, len(entries))
+	aliasOfHost := make(map[string]string, len(entries))
 	for _, e := range entries {
-		if e.AGYConversationID == "" {
+		if e.HostConversationID == "" {
 			continue
 		}
-		if have, dup := aliasOfAGY[e.AGYConversationID]; !dup || e.Alias < have {
-			aliasOfAGY[e.AGYConversationID] = e.Alias
+		if have, dup := aliasOfHost[e.HostConversationID]; !dup || e.Alias < have {
+			aliasOfHost[e.HostConversationID] = e.Alias
 		}
 	}
 	out := make([]SwarmConversation, 0, len(entries))
 	for _, e := range entries {
-		parent := aliasOfAGY[e.ParentAGYConversationID]
-		if parent == "" && e.AGYConversationID != "" {
-			if l, ok := subagents[e.AGYConversationID]; ok && validSwarmConversationID(l.ParentConversationID) {
-				parent = aliasOfAGY[l.ParentConversationID]
+		parent := aliasOfHost[e.ParentHostConversationID]
+		if parent == "" && e.HostConversationID != "" {
+			if l, ok := subagents[e.HostConversationID]; ok && validSwarmConversationID(l.ParentConversationID) {
+				parent = aliasOfHost[l.ParentConversationID]
 			}
 		}
 		if parent == e.Alias {
@@ -406,7 +406,7 @@ func swarmConversations(entries []swarmConversationEntry, subagents map[string]s
 		out = append(out, SwarmConversation{
 			Alias: e.Alias, Token: e.Token, Description: e.Description, Parent: parent, LastUsed: e.LastUsedAt,
 			// The projection validates it again before a member carries it.
-			AGYConversationID: e.AGYConversationID,
+			AGYConversationID: e.HostConversationID,
 		})
 	}
 	return out
