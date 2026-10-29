@@ -19,6 +19,9 @@ cached per distinct `(project, location)` pair, not re-issued per cluster --
 the SOP's own §2 instruction. The eleventh, `upgrade-blocked`, is the
 exception described below: it reads PodDisruptionBudgets through the
 fleet-upgrade-verification reporter, which fetches a kubeconfig per member.
+After the sweep, `main` also fetches credentials for each collected cluster
+and makes one Config Connector read there (`kcc_health.py`), inside the
+collector's time budget, as `kcc_unready` or `kcc_unread` on its entry.
 
 Two GCP surfaces, so two manifest failure shapes:
 

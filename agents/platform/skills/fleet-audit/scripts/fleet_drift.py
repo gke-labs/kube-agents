@@ -17,7 +17,7 @@ command it actually ran: the manifest publishes what happened, not what
 the SOP originally described). After the sweep, `main` fetches credentials
 for each collected cluster and makes one Config Connector read there
 (`kcc_health.py`), inside the collector's time budget; that read needs list
-access on the Config Connector CRDs, else the entry gets `kcc_unread`.
+access on the Config Connector objects, else the entry gets `kcc_unread`.
 
 **What is procedural here and what stays judgment.** Normalizing a raw
 field to one comparable token per facet (§4), computing the majority and
