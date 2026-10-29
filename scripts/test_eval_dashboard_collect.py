@@ -2277,6 +2277,15 @@ class TestRepParsing(unittest.TestCase):
         self.assertNotIn("tokens", task["reps"][1], "no count parsed: no key, whatever partial says")
         self.assertNotIn("tokens", task["reps"][2], "no tokens line: the key is absent")
 
+    def test_a_digit_run_past_the_int_limit_is_null_not_a_dropped_build(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            f"  rep 1 tokens: input=12 total={'9' * 4301}\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["tokens"], {"input": 12, "output": None, "total": None, "partial": False})
+
     def test_a_tokens_line_without_a_current_task_is_dropped_whole(self):
         parsed = collect.parse_build_log("  rep 1 tokens: total=5 Successfully leased project: forged\n")
         self.assertEqual(parsed["tasks"], [])

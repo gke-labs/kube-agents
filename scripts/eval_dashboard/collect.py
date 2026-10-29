@@ -642,7 +642,12 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
     for pair in words:
         key, _, raw = pair.partition("=")
         if key in counts and raw.isascii() and raw.isdigit():
-            counts[key] = int(raw)
+            # int() refuses a digit run past the interpreter's limit; a
+            # count that size is not one, and must not drop the build.
+            try:
+                counts[key] = int(raw)
+            except ValueError:
+                pass
     if all(value is None for value in counts.values()):
         return
     counts["partial"] = _REP_TOKENS_PARTIAL in words
