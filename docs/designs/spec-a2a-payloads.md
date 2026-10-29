@@ -888,7 +888,13 @@ the stop, for which a worker may still start. `truncated` says more cards were o
 stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
 cut to fit the part. An optional list rides beside them for the Slack Stop button's reply
 (spec-chatops-gateway, the Slack adapter): `notStopped`, the cards the three counts count, by id
-and title. An executor that sends none leaves it out, which reads as none named. A stop that failed carries no part and ends `failed` with
+and title. An executor that sends none leaves it out, which reads as none named. So does
+`writes`, the pull requests the conversation's cards recorded opening or updating before the
+stop, oldest first and at most 20, each `{"kind":"pull_request","verb":"opened"|"updated",
+"url","repo","number"}`: a card's worker records one when `submit-suggestion` prints its
+success line (`agents/chat/defaults/plugins/common/write_ledger.py`), and session-kv reads them
+back for the cards it stopped or found finished. It records what it saw, so an empty list never
+means nothing was written. A stop that failed carries no part and ends `failed` with
 `reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
 bus refuses the result with the part, the text goes alone, so a `completed` control can
 arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.

@@ -8137,6 +8137,71 @@ CARD_STOP_SQL_CHUNK = 500
 # Test hook, `None` in production: the state.db to read.
 CARD_STOP_STATE_DB_PATH: Optional[str] = None
 PROC_ROOT = "/proc"
+# The writes the conversation's cards made, as each card's worker recorded
+# them (agents/chat/defaults/plugins/common/write_ledger.py, whose
+# CARD_WRITES_DIR_NAME this is; test_session_kv_server holds the two
+# together): one JSON line per write in <board dir>/kanban-writes/<card>.jsonl.
+# The answer carries them as `writes`, so a stop can name a pull request that
+# landed before it. Only a well-formed github.com pull request is passed on,
+# since the gateway links what it names, and at most CARD_STOP_MAX_WRITES.
+CARD_WRITES_DIR_NAME = "kanban-writes"
+CARD_WRITES_SUFFIX = ".jsonl"
+CARD_WRITES_FILE_MAX_BYTES = 64 * 1024
+CARD_STOP_MAX_WRITES = 20
+CARD_WRITE_KIND_PULL_REQUEST = "pull_request"
+CARD_WRITE_VERBS = ("opened", "updated")
+CARD_WRITE_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+CARD_WRITE_PR_URL_RE = re.compile(
+    r"\Ahttps://github\.com/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,9})\Z"
+)
+
+
+def _card_writes(board: str, card_ids: Sequence[str]) -> list:
+    """The pull requests the cards' workers recorded opening or updating, oldest
+    first, one per pull request ("opened" wins over "updated"), at most
+    CARD_STOP_MAX_WRITES. A missing file is a card that recorded none; an
+    unreadable file or line is skipped with a warning, since a stop never fails
+    over what it can only add to its answer."""
+    directory = os.path.join(os.path.dirname(board), CARD_WRITES_DIR_NAME)
+    by_url: Dict[str, Dict[str, Any]] = {}
+    for card_id in dict.fromkeys(card_ids):
+        if not CARD_WRITE_ID_RE.match(card_id):
+            continue
+        path = os.path.join(directory, card_id + CARD_WRITES_SUFFIX)
+        try:
+            with open(path, encoding="utf-8") as ledger:
+                text = ledger.read(CARD_WRITES_FILE_MAX_BYTES)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("card stop: the write ledger of %s is unreadable: %s", card_id, exc)
+            continue
+        for line in text.splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("kind") != CARD_WRITE_KIND_PULL_REQUEST:
+                continue
+            url, verb, at = entry.get("url"), entry.get("verb"), entry.get("at")
+            parsed = CARD_WRITE_PR_URL_RE.match(url) if isinstance(url, str) else None
+            if parsed is None or verb not in CARD_WRITE_VERBS or not isinstance(at, (int, float)):
+                continue
+            write = {
+                "kind": CARD_WRITE_KIND_PULL_REQUEST,
+                "verb": verb,
+                "url": url,
+                "repo": f"{parsed.group(1)}/{parsed.group(2)}",
+                "number": int(parsed.group(3)),
+                "card": card_id,
+                "at": at,
+            }
+            held = by_url.get(url)
+            if held is None:
+                by_url[url] = write
+            elif verb == "opened" and held["verb"] != "opened":
+                by_url[url] = {**write, "at": min(at, held["at"])}
+    return sorted(by_url.values(), key=lambda w: (w["at"], w["url"]))[:CARD_STOP_MAX_WRITES]
 
 
 def _card_stop_sleep(seconds: float) -> None:
@@ -8675,8 +8740,9 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     at the deadline, `unresolved` for a card archived mid-claim whose worker
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
-    was larger than one pass, and `deadline` when the budget ran out. Answers
-    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
+    was larger than one pass, `deadline` when the budget ran out, and
+    `writes`, the pull requests those cards' workers recorded opening or
+    updating (`_card_writes`). Answers within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
     an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()
@@ -8703,6 +8769,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         "rounds": 0,
         "truncated": False,
         "deadline": False,
+        "writes": [],
     }
     board = _kanban_db_path()
     if not os.path.isfile(board):
@@ -8876,6 +8943,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     result["pending"] = list(pending.values())
     result["unresolved"] = [{"id": task_id, "title": title} for task_id, title in watch.items()]
     result["deadline"] = budget.hit
+    result["writes"] = _card_writes(board, [*stopped, *settled, *failed, *pending, *watch])
     logger.info(
         "card stop for %s: stopped %d, settled %d, failed %d, pending %d, unresolved %d, %d re-scans%s%s",
         session_id,

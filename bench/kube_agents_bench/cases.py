@@ -89,8 +89,11 @@ WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worke
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
 # Entries the harness writes on the trajectory itself (``stop_hook.py``), not
 # calls read off the door's trace, so a lossy trace says nothing about them:
-# a ``tool_called`` leaf naming only these is graded on every record.
-HARNESS_WRITTEN_ENTRIES = frozenset({stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY})
+# a ``tool_called`` leaf naming only these is graded on every record, a
+# ``result`` pattern included, since the harness writes the result too.
+HARNESS_WRITTEN_ENTRIES = frozenset(
+    {stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY, stop_hook.STOP_REPLY_ENTRY}
+)
 _TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
@@ -214,11 +217,10 @@ def _leaves(node: Any) -> list[dict[str, Any]]:
 
 def _harness_written(leaf: dict[str, Any]) -> bool:
     """Whether a leaf is a ``tool_called`` over harness-written entries
-    only, which no transport blinds."""
+    only, which no transport blinds, whatever its ``result`` pattern."""
     names = leaf.get(_TOOL_CALLED_NAMES_KEY) or []
     return (
         str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
-        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
         and bool(names)
         and set(names) <= HARNESS_WRITTEN_ENTRIES
     )

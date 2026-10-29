@@ -64,10 +64,13 @@ does not send, so a case that grades either stays in `hack/eval/inject-lane-excl
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
-([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
-only over the inject transport, so the case needs an entry in
-`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
-`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
+([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py));
+`after=done`, bounded by `wait=<seconds>`, stops it once every filed card has ended instead. It
+runs only over the inject transport, so the case needs an entry in
+`hack/eval/api-lane-exclusions.txt`. The harness writes three entries for such a case,
+`harness_stop_sent`, `harness_cards_stopped` and `harness_stop_reply` (the gateway's answer to
+the stop, as its result), and the case's `tool_called` objectives name them, with a `result`
+pattern for the answer.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that

@@ -3173,6 +3173,8 @@ def run_stopped_ask(
     Returns the result and what send_stop answered."""
     stub.entries = completed_transcript(stub.task_id, "filed a card")
     answers: list[Any] = []
+    # No test here waits out the read for the stop's answer unless it posts one.
+    monkeypatch.setattr(harness, "_STOP_REPLY_WAIT_SECONDS", 0.0)
 
     def seam(self: Any, result: Any, session_id: str, stop: Any, *, send_stop: Any, poll_interval: float) -> None:
         if arrange is not None:
@@ -3285,3 +3287,40 @@ def test_a_stop_that_drops_once_in_transport_is_retried(
 
     assert drops == [1]
     assert answers[0][0] is True
+
+
+def test_the_stops_answer_is_recorded_and_earlier_posts_are_not(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card's report posted between the opening turn and the stop is read
+    past; the stop's placeholder is skipped; its edit is the answer."""
+    answer = "🤷 nothing is running; already finished: scale checkout; already opened a pull request: [#412](https://github.com/acme/gitops/pull/412)"
+    real_submit = inject.InjectTask.submit
+
+    def submit_then_answer(self: Any) -> str:
+        started = real_submit(self)
+        if self.prompt == stop_hook.STOP_WORD:
+            stub_gateway.entries.append(entry(8, inject.ENTRY_POST, text="🛑 stopping this conversation's cards…", messageId="inj-stop"))
+            stub_gateway.entries.append(entry(9, inject.ENTRY_EDIT, text=answer, messageId="inj-stop"))
+        return started
+
+    def arrange(stub: _StubGatewayServer) -> None:
+        refuse_no_task(stub)
+        stub.entries.append(entry(7, inject.ENTRY_POST, text="I opened a pull request: #412", messageId="inj-card"))
+        monkeypatch.setattr(inject.InjectTask, "submit", submit_then_answer)
+        monkeypatch.setattr(harness, "_STOP_REPLY_WAIT_SECONDS", 5.0)
+
+    result, answers = run_stopped_ask(stub_gateway, monkeypatch, arrange)
+
+    assert answers[0][0] is True
+    [reply] = [e for e in result.trajectory if e["name"] == stop_hook.STOP_REPLY_ENTRY]
+    assert (reply["status"], reply["result"]) == ("completed", answer)
+
+
+def test_no_answer_to_the_stop_records_an_error_entry(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = run_stopped_ask(stub_gateway, monkeypatch, refuse_no_task)
+
+    [reply] = [e for e in result.trajectory if e["name"] == stop_hook.STOP_REPLY_ENTRY]
+    assert reply["status"] == "error"

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -577,7 +579,10 @@ func (g *Gateway) abandonCardStop(ctx context.Context, rec *SessionRecord, autho
 // anything that could ping or lay out (cardStopTitle), and says plainly what
 // the stop could not promise. A stop that found nothing open says nothing is
 // running, which is now true: the executor looked. It looked at cards only,
-// so with a newer turn running (turnRunning) it says no card was open.
+// so with a newer turn running (turnRunning) it says no card was open. Last
+// come the pull requests the conversation's cards recorded opening or
+// updating before the stop (cardStopWriteClauses); none named is not a claim
+// that nothing was written.
 func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	var clauses []string
 	if n := r.Unresolved; n > 0 && len(r.Stopped) > 0 {
@@ -623,7 +628,71 @@ func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	default:
 		head = nothingRunningNotice
 	}
+	clauses = append(clauses, cardStopWriteClauses(r)...)
 	return strings.Join(append([]string{head}, clauses...), "; ")
+}
+
+// cardStopWritePRURLRE is a github.com pull request URL in GitHub's own owner
+// and repository grammar, the only form the executor records
+// (agents/chat/defaults/plugins/common/write_ledger.py). Checked again here
+// because the reply links what it names.
+var cardStopWritePRURLRE = regexp.MustCompile(`\Ahttps://github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}/pull/([0-9]{1,9})\z`)
+
+// cardStopWrites splits a result's writes into the pull requests the
+// conversation's cards opened and those they updated, each in the
+// executor's order, dropping any entry that is not a well-formed github.com
+// pull request whose number matches its URL.
+func cardStopWrites(r *lib.CardStopResult) (opened, updated []lib.CardStopWrite) {
+	for _, w := range r.Writes[:min(len(r.Writes), lib.CardStopWritesMax)] {
+		m := cardStopWritePRURLRE.FindStringSubmatch(w.URL)
+		if w.Kind != lib.CardStopWritePullRequest || m == nil || m[1] != strconv.Itoa(w.Number) {
+			continue
+		}
+		switch w.Verb {
+		case lib.CardStopWriteOpened:
+			opened = append(opened, w)
+		case lib.CardStopWriteUpdated:
+			updated = append(updated, w)
+		}
+	}
+	return opened, updated
+}
+
+// cardStopPRLinks names pull requests as markdown links labelled #<number>,
+// which the chat adapters turn into their own link form: "#412", "#412 and
+// #413", "#412, #413 and #414".
+func cardStopPRLinks(ws []lib.CardStopWrite) string {
+	links := make([]string, len(ws))
+	for i, w := range ws {
+		links[i] = fmt.Sprintf("[#%d](%s)", w.Number, w.URL)
+	}
+	if len(links) == 1 {
+		return links[0]
+	}
+	return strings.Join(links[:len(links)-1], ", ") + " and " + links[len(links)-1]
+}
+
+// cardStopPRNoun is "a pull request" for one and "pull requests" for more.
+func cardStopPRNoun(ws []lib.CardStopWrite) string {
+	if len(ws) == 1 {
+		return "a pull request"
+	}
+	return "pull requests"
+}
+
+// cardStopWriteClauses are the typed stop's clauses for what the
+// conversation's cards had already written: "already opened a pull request:
+// #412", "already updated a pull request: #413".
+func cardStopWriteClauses(r *lib.CardStopResult) []string {
+	opened, updated := cardStopWrites(r)
+	var clauses []string
+	if len(opened) > 0 {
+		clauses = append(clauses, "already opened "+cardStopPRNoun(opened)+": "+cardStopPRLinks(opened))
+	}
+	if len(updated) > 0 {
+		clauses = append(clauses, "already updated "+cardStopPRNoun(updated)+": "+cardStopPRLinks(updated))
+	}
+	return clauses
 }
 
 // cardTitles names the first cardStopNamed cards and counts the rest. cut

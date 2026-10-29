@@ -31,3 +31,9 @@ chat-stop-halts-delegated-remediation
 # job runs a nightly case today; the entry keeps one from grading it on that
 # wait. Leaves this list when the api lane's wait reads a paused card's block.
 chat-question-asked-to-choose-pauses
+
+# #4061: chat-stop-halts-delegated-remediation's stop, sent once the card has
+# ended, with the gateway's answer to it read off the inject conversation.
+# Leaves this list when the api lane can send a second message on the same
+# conversation.
+chat-stop-names-pull-request-already-opened
