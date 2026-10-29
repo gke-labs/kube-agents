@@ -5223,9 +5223,10 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 
 	// The bus's servers. On a multi-server bus the StatefulSet counts toward
 	// Ready once a quorum serves (a2aNATSServingReplicas), so a server stuck
-	// Pending under the hostname spread or failing its image pull leaves the
-	// bus serving and the CR Ready with nothing saying it is one server short
-	// of HA. Scanned, its pod's reason reaches the status instead.
+	// Pending under the hostname spread or failing its image pull can leave
+	// the CR Ready; updateStatusReady's message names it then
+	// (a2aNATSShortNote). While the CR is not Ready, this scan carries the
+	// pod's reason to the status.
 	if a2aStackRendering(agent) {
 		selectors = append(selectors, map[string]string{"app": a2aNATSName(agent)})
 	}

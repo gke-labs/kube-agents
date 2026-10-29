@@ -3970,6 +3970,14 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			// bus that lost one, not a two-server bus, which never existed.
 			running = 3
 		}
+		if running == 1 && agent.Status.BusReplicas == 3 {
+			// A cluster whose StatefulSet went before server 1 had its
+			// claim (OrderedReady creates them in turn) leaves the same
+			// lone claim as a single server; only the recorded count tells
+			// them apart. A flip to today clears it, so a bus coming back
+			// from today reads its claims.
+			running = 3
+		}
 	default:
 		return false, err
 	}
@@ -5713,25 +5721,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
 	}
 
-	// The routes Service and the disruption budget belong to a multi-server
-	// bus. On a single server they are deleted rather than left, so lowering
-	// busReplicas does not leave a budget that blocks the last server's
-	// drain or a Service that points routes at nothing.
-	for _, obj := range []client.Object{buildA2ANATSRoutesService(agent), buildA2ANATSPDB(agent)} {
-		if a2aNATSReplicas(agent) > 1 {
-			if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-				return state, err
-			}
-			if err := r.applyManaged(ctx, agent, obj); err != nil {
-				return state, fmt.Errorf("failed to apply A2A NATS %T: %w", obj, err)
-			}
-			// Owned objects only (#3871), as the teardown list removes these
-			// same two: a budget or Service an admin made under one of these
-			// names is skipped and logged, not deleted, and does not fail the
-			// pass.
-		} else if err := r.deleteA2AObjectIfOwned(ctx, agent, obj, r.Client, nil); err != nil {
-			return state, fmt.Errorf("failed to delete A2A NATS %T for a single-server bus: %w", obj, err)
-		}
+	if err := r.reconcileA2ANATSClusterObjects(ctx, agent); err != nil {
+		return state, err
 	}
 
 	// The auth callout, before the fence and before anything that dials the
@@ -7146,4 +7137,39 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
+}
+
+// reconcileA2ANATSClusterObjects applies the routes Service and the disruption
+// budget, which belong to a multi-server bus. On a single server they are
+// deleted rather than left, so lowering busReplicas does not leave a budget
+// that blocks the last server's drain or a Service that points routes at
+// nothing.
+func (r *PlatformAgentReconciler) reconcileA2ANATSClusterObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for _, obj := range []client.Object{buildA2ANATSRoutesService(agent), buildA2ANATSPDB(agent)} {
+		if a2aNATSReplicas(agent) > 1 {
+			if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+				return err
+			}
+			// A minAvailable another manager set on the live budget would
+			// merge with the rendered maxUnavailable and the apply would be
+			// refused, failing everything after this step in reconcileA2A
+			// on every pass; the clear is the callout's and verifier's, for
+			// the same reason.
+			if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+				if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+					return err
+				}
+			}
+			if err := r.applyManaged(ctx, agent, obj); err != nil {
+				return fmt.Errorf("failed to apply A2A NATS %T: %w", obj, err)
+			}
+			// Owned objects only (#3871), as the teardown list removes these
+			// same two: a budget or Service an admin made under one of these
+			// names is skipped and logged, not deleted, and does not fail the
+			// pass.
+		} else if err := r.deleteA2AObjectIfOwned(ctx, agent, obj, r.Client, nil); err != nil {
+			return fmt.Errorf("failed to delete A2A NATS %T for a single-server bus: %w", obj, err)
+		}
+	}
+	return nil
 }

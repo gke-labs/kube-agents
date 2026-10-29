@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -341,10 +342,6 @@ func TestEveryProvisionedStreamTakesTheConfiguredReplicaCount(t *testing.T) {
 		t.Fatal("the provision script adds no stream or bucket; the check below would be vacuous")
 	}
 	for _, loc := range adds {
-		end := strings.Index(script[loc[0]:], "\n\n")
-		if end < 0 {
-			end = len(script) - loc[0]
-		}
 		// A stream add continues over backslashed lines; read to the end
 		// of the command.
 		cmd := script[loc[0]:]
@@ -1104,5 +1101,56 @@ func TestThePrunedBusReplicasRecordIsReprobedAndForgotten(t *testing.T) {
 	r.forgetUsageStatus(agent)
 	if r.busReplicasStatusPruned(agent) {
 		t.Error("the pruned busReplicas record outlived forgetUsageStatus")
+	}
+}
+
+// A minAvailable another manager set on the live bus budget. A forced apply
+// cannot remove a field it never owned, so without clearForeignPDBBudgetField
+// the apply merges to both fields and is refused, and the bus step sits ahead
+// of the callout, the fences and the provision Job in reconcileA2A.
+func TestTheBusBudgetRecoversFromAForeignBudgetField(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	want := buildA2ANATSPDB(agent)
+	live := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: want.Name, Namespace: agent.Namespace},
+		Spec:       policyv1.PodDisruptionBudgetSpec{MinAvailable: ptr.To(intstr.FromInt32(2)), Selector: want.Spec.Selector},
+	}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, live).WithInterceptorFuncs(pdbSSAInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	if err := r.reconcileA2ANATSClusterObjects(ctx, agent); err != nil {
+		t.Fatalf("reconcileA2ANATSClusterObjects: %v", err)
+	}
+	got := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(want), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.MinAvailable != nil || got.Spec.MaxUnavailable == nil || got.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("bus budget = maxUnavailable %v / minAvailable %v, want 1 / unset", got.Spec.MaxUnavailable, got.Spec.MinAvailable)
+	}
+}
+
+// OrderedReady creates server 1 and its claim only once server 0 is Ready, so
+// a new cluster's StatefulSet deleted before then leaves only claim 0, as a
+// single server does. The recorded count tells them apart; with nothing
+// recorded (a bus back from today) the lone claim reads as one server.
+func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
+	for _, tc := range []struct {
+		recorded, want int32
+	}{{3, 3}, {1, 1}, {0, 1}} {
+		agent := a2aTestAgent()
+		agent.Status.BusReplicas = tc.recorded
+		claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace,
+			Labels: buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels,
+		}}
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, claim).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+		converting, err := r.resolveA2ABusReplicas(context.Background(), agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if agent.Status.BusReplicas != tc.want || converting {
+			t.Errorf("recorded %d, lone claim 0: status.busReplicas = %d converting = %v, want %d and no conversion", tc.recorded, agent.Status.BusReplicas, converting, tc.want)
+		}
 	}
 }
