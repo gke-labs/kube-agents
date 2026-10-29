@@ -201,5 +201,3 @@ Metric names:
   reports them; `run_tokens_input` is the non-cached part of the prompt, so the run's share of the
   window is `run_tokens_input + run_tokens_cached` against `tokens_input`);
 - the fixtures: `churn_achieved_per_minute`.
-- the jobs a triggered window started, read after the drain: `job_seconds` (the slowest completed job's run
-  time) and `jobs_completed`.

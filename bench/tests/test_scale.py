@@ -1017,15 +1017,6 @@ def test_a_pod_unread_at_the_start_adds_no_growth():
     assert collect._growth(collect.Snapshot(), after, "proxy", "kubeagents_tool_execution_duration_seconds_count") == 500.0
 
 
-def test_job_seconds_are_read_for_completed_runs_only(monkeypatch):
-    out = ("compliance-audit completed 2026-10-28T20:30:32.450605+00:00 2026-10-28T20:10:28.731243+00:00\n"
-           "stall-watch running None 2026-10-28T20:30:28.731243+00:00\n"
-           "obtainability-audit unclaimed None None\n")
-    monkeypatch.setattr(operations, "_gateway_pod", lambda *a: "pod")
-    monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: out)
-    durations = operations.job_seconds("ctx", "ns", "/home", ("compliance-audit", "stall-watch"), "2026-10-28T20:00:00Z")
-    assert durations == {"compliance-audit": pytest.approx(1203.72, abs=0.01)}
-
 
 def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     seen = {}

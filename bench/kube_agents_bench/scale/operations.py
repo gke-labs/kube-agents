@@ -18,7 +18,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -122,14 +121,14 @@ JOB_TRIGGER_SCRIPT = (
     "missed = [job for job in sys.argv[1:] if not trigger_job(job)]\n"
     "if missed:\n    sys.exit('not marked: ' + ' '.join(missed))\n"
 )
-# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished started".
+# Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished".
 JOB_RUNS_SCRIPT = (
     "import os, sqlite3, sys\n"
     "db = sqlite3.connect(os.path.join(os.environ['HERMES_HOME'], 'cron', 'executions.db'))\n"
     "for job in sys.argv[2:]:\n"
-    "    row = db.execute('select status, finished_at, started_at from executions where job_id = ? and claimed_at >= ? '\n"
+    "    row = db.execute('select status, finished_at from executions where job_id = ? and claimed_at >= ? '\n"
     "                     'order by claimed_at desc limit 1', (job, sys.argv[1])).fetchone()\n"
-    "    print(job, *(row or ('unclaimed', None, None)))\n"
+    "    print(job, *(row or ('unclaimed', None)))\n"
 )
 JOB_TIMEOUT_SECONDS = 120
 JOB_COMPLETED = "completed"
@@ -416,22 +415,6 @@ def job_statuses(context: str, namespace: str, home: str, jobs: tuple[str, ...],
         job, status, *_ = line.split() + [""]
         statuses[job] = status or JOB_UNCLAIMED
     return statuses
-
-
-def job_seconds(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> dict[str, float]:
-    """How long each job's run since ``since`` took, from its start to its end, for the runs that completed."""
-    pod = _gateway_pod(context, namespace)
-    if not pod:
-        raise kube.CommandError("no gateway pod to read the job runs in")
-    out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", AGENT_CONTAINER, "--", "env",
-                       f"HERMES_HOME={home}", JOB_PYTHON, "-c", JOB_RUNS_SCRIPT, since.replace("Z", ""), *jobs,
-                       timeout=JOB_TIMEOUT_SECONDS)
-    durations = {}
-    for line in out.splitlines():
-        job, status, finished, started, *_ = line.split() + [""] * 3
-        if status == JOB_COMPLETED and finished not in ("", "None") and started not in ("", "None"):
-            durations[job] = (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
-    return durations
 
 
 def unfinished_jobs(context: str, namespace: str, home: str, jobs: tuple[str, ...], since: str) -> list[str]:
