@@ -56,6 +56,9 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 # its rule rather than a second one.
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
+# The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
+SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
+SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
@@ -167,16 +170,6 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
-    # Has its fixture (its own stack) and its eval record (#3467: red on main,
-    # three greens on the fix, on a dev install), and belongs in the nightly.
-    # The pool runners hold no role that creates a Cloud Monitoring alert
-    # policy, so every apply of its stack would fail with 403; #3632 grants
-    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
-    # hack/eval/nightly-cases.txt.
-    "monitoring-alert-policy-read": (
-        "#3632: stack case held out of the nightly until the pool runners can "
-        "create a Cloud Monitoring alert policy"
-    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -291,6 +284,22 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "cluster-agent-scaled-zero-gateway-silence": (
+        "#4098: needs bench/tf/fleet's scaled-zero-gateway role on every pool project "
+        "(the postsubmit reconcile) and stall_report.py's scale-to-zero rule for Gateways "
+        "and HTTPRoutes; without the rule the case is red every run"
+    ),
+    # Needs Config Sync's RootSync CRD and one root-sync object reporting
+    # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
+    # API, so Config Sync is installed nowhere, and the seeded fleet plants no
+    # custom resource. The CRD alone is enough (no operator): apply the
+    # upstream CRD, create the object, write its status with
+    # `kubectl patch --subresource=status`. #2580's "Fixture & Eval" section
+    # specifies the object.
+    "compliance-configsync-stalled": (
+        "#2580: needs the Config Sync RootSync CRD and a Stalled root-sync object "
+        "on a seeded cluster; no pool project runs Config Sync"
+    ),
     # Needs a GitOps repository that declares the namespace under a path a
     # reconciler syncs; no pool project's repository has one. Run by hand on
     # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
@@ -312,6 +321,9 @@ FIXTURE_NOT_READY = {
     "terraform-node-pool-autoscaling-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    "terraform-new-cluster-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
@@ -322,11 +334,6 @@ FIXTURE_NOT_READY = {
         "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
         "re-apply); no pool project has a backend service draining longer than the 600 s "
         "GKE waits per node"
-    ),
-    "scope-excluded-cluster-not-listed": (
-        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
-        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
-        "cluster exclusion and the case cannot patch the CR for a run"
     ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
@@ -443,6 +450,13 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513 / #3576: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in "
+        "spec.deployment.env and a GitOps repository declaring eval-open-pr-workload alongside "
+        "provisioning files; every CI eval install leaves INCIDENT_TRIAGE_OPEN_PULL_REQUEST off "
+        "(which the nightly AutoOps triage cases require) and no pool *-infra repository carries "
+        "both paths, so no CI tier can run it; run it by hand against such an install"
+    ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
         "version the cluster's next minor stops serving, which no standing fleet "
@@ -463,6 +477,15 @@ FIXTURE_NOT_READY = {
         "and an accelerator pool costs by the hour on every pool project), so "
         "the surge-capacity rule's two surge halves are covered by unit tests on "
         "a recorded cluster record and node list until the fixture lands"
+    ),
+    "upgrades-readiness-rollout-sequence-precheck": (
+        "#3798: needs gkehub.googleapis.com enabled, roles/gkehub.viewer bound for "
+        "the agent's service account, a fleet, and the standing RolloutSequence "
+        "`seeded-train` on every pool project, so a worker's `gcloud container fleet "
+        "rolloutsequences list` on the eval project answers `existing 1; plan "
+        "blocked`, the line the case pins; no pool project has them today, so the "
+        "read fails for a reason that is not the case's, and the blocked path is "
+        "graded by the rule's unit tests on a recorded list"
     ),
 }
 
@@ -530,13 +553,14 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
     # Likewise: "the run wrote to the GitOps repository since it started" is
-    # the assertion, and every field narrows it. The inject lane appends it
-    # to every case it runs (hack/eval/inject-lane-safeguards.yaml); a case
+    # the assertion, and every field narrows it. Both lanes append it to
+    # every case they run (hack/eval/inject-lane-safeguards.yaml); a case
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
@@ -591,6 +615,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
     "audit_chat_report_posted": (),
+    # This repository, agent-pod- and cluster-reading: the namespace names the
+    # burst whose admitted alerts must each have started a triage turn.
+    "triage_starts": ("namespace",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -696,6 +723,15 @@ def audit_streams_reader() -> Any:
     spec = importlib.util.spec_from_file_location(AUDIT_STREAMS_MODULE_NAME, AUDIT_STREAMS_FILE)
     if spec is None or spec.loader is None:
         raise CaseError(f"{AUDIT_STREAMS_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scope_exclude_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(SCOPE_EXCLUDE_MODULE_NAME, SCOPE_EXCLUDE_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{SCOPE_EXCLUDE_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -1166,6 +1202,28 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     f"'audit_streams:' names {', '.join(unknown)}, which "
                     f"{PLATFORM_JOBS_FILE.relative_to(REPO_ROOT)} does not define"
                 )
+
+    # The seeded slots a case excludes from the install's scope. The runner
+    # resolves each to its cluster through the fleet's .fleet-context; a slot
+    # the catalogue does not declare resolves to nothing, so every repetition
+    # would be recorded as infrastructure, and a case that excludes every slot
+    # has no seeded cluster left to ask about.
+    if "scope_exclude" in spec:
+        reader = scope_exclude_reader()
+        try:
+            slots = reader.declared_slots(path)
+        except reader.ScopeExcludeError as exc:
+            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...]}}: {exc}")
+        else:
+            catalog = _catalog_slots()
+            unknown = sorted(set(slots) - catalog)
+            if unknown:
+                problems.append(
+                    f"'scope_exclude:' names slot(s) {', '.join(unknown)}, which "
+                    f"{ROLE_CATALOG.relative_to(REPO_ROOT)} does not declare"
+                )
+            elif set(slots) >= catalog:
+                problems.append("'scope_exclude:' excludes every seeded slot; leave at least one in scope")
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

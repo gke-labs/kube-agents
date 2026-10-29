@@ -45,6 +45,27 @@ Two tiers. The issue is the only always-on object.
 One open GitHub issue per audit stream, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
+- The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
+  label. When the list has more than one issue, the highest number is the ledger. An empty list is
+  not always "no ledger": GitHub's label-filtered list can omit an open, labelled issue for a short
+  time, usually just after a label write. `start`, `finish` and `remediate` look up the ledger, and
+  each one ensures the labels just before the lookup. The forge writes a label only when its colour
+  or description changed, or, on GitHub, when the case of its name changed. If the list is empty,
+  the harness reads directly each issue that the stream's report store
+  ([`fleet-audit-report-store.md`](fleet-audit-report-store.md)) names for this repository, highest
+  number first, as the full list does. The first issue that is open and still carries the
+  `audit:<audit-id>` label is the ledger, and the run logs a warning that the list omitted it. A
+  closed issue stays closed. A failed read stops the search and gives "no ledger", because a lower
+  number is not the ledger while a higher one can still be. The store names an issue in each
+  envelope of `latest.json` and the ring: the `issue_number`, and the `open_issue_number` that a
+  clean run writes when it holds the ledger open with no trusted memory (that run stores no
+  `issue_number`, so the next run's memory stays lost). An envelope that a diverted run marked never
+  names the ledger. The store names no open ledger when it is absent or unreadable, when it was
+  written for another repository, or when every run that it keeps closed the ledger, ran with no
+  forge, or diverted. An open, labelled issue that no envelope names, for example one opened by
+  hand, stays unseen until the list shows it again. Read as "no ledger", an omitted ledger makes
+  `finish` open a second ledger with no memory and lose the state of the first one (held rows,
+  carried findings).
 - The run-over-run delta mechanism is carried over unchanged: the hidden
   `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
   `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of
@@ -69,14 +90,17 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   the open-ledger search lists open issues only.
 - `[SILENT]` has one rule and `finish` computes it, returning the answer as `silent_ok` (§7.5). It
   is true only when the run moved nothing an operator needs to hear about: `new == 0`,
-  `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, and no
+  `resolved == 0`, no new or changed coverage gap, no held close, no remediation PR opened or closed, on a
+  scheduled run the same published ids as the last scheduled run (§7.5), and no
   collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md)). If any of those fails
   the agent reports the ledger issue URL and a one-line summary — a run that resolved five findings
   and found nothing new is _news_, the audit reporting that the fleet got better. And a run that
   finds a new or changed coverage gap is never silent even when both counters are zero, because "I
   found nothing" and "I could not look" are different statements and only one of them is
   reassuring (§7.4). A gap that is the same as on the stored previous run does not make the run
-  speak again (§7.4 says why). `silent_ok` is the _scheduled_ verdict; an operator-dispatched run reports regardless.
+  speak again (§7.4 says why); for a scheduled run, the previous run is the last stored scheduled
+  run. `silent_ok` is the _scheduled_ verdict: only a run that passes
+  `--scheduled` can get `true`, so an operator-dispatched run always reports (§7.5).
 
 ### Tier 2 — remediation pull requests
 
@@ -587,7 +611,7 @@ the repository, so a scheduled run with nothing new is silent.
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.
 
-### `finish --audit <id> --findings-file <path> [--dry-run] [--manifest-file <path> | --no-collector-manifest <why>]`
+### `finish --audit <id> --findings-file <path> [--dry-run] [--scheduled] [--manifest-file <path> | --no-collector-manifest <why>]`
 
 The two collector flags are the subject of
 [`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md), which says why a stream
@@ -624,7 +648,8 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
    useful to a commenter without write access.
 
 6. Otherwise → render and create-or-edit the ledger issue, apply the severity label, post the delta
-   comment when the delta is non-empty.
+   comment when the delta is non-empty. Over a gap, the body keeps each previous finding on a target
+   that this run did not check, under _Not re-checked this run_ (§7.4).
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
@@ -671,6 +696,9 @@ When `--manifest-file` was given, `unpublished_candidates`, `wholly_unpublished_
 `uncorroborated_findings` join the line; they are absent on every other run
 ([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.6).
 
+The last example, `silent_ok: true`, is possible only on a run that passed `--scheduled` (§7.5).
+Without the flag, `silent_ok` is false on every line.
+
 `publish_s`, `inspect_s` and `collect_s` are timing data in seconds, and nothing decides on them.
 `publish_s` is the time `finish` used to publish. `inspect_s` is the time from `start` to `finish`,
 read from the in-flight note that `start` wrote, and is absent when that note gives no start time.
@@ -694,19 +722,6 @@ One asymmetry with the real run is deliberate: a dry run **warns** about a `reme
 is missing or fails containment, and does not rewrite the finding to `manual` the way `finish` does.
 Degrading a document it is only previewing would show the reader a body the real run never produces.
 
-### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
-
-The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
-the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
-is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
-
-**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
-`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
-subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
-make `remediate --finding one-id` open up to six pull requests, five of them for findings the
-operator never mentioned and cannot tell apart from the one they did, on the command whose entire
-purpose is to act on a specific request.
-
 Manifest files must already exist under the workspace, but **a missing one is no longer a hard
 error**. That finding degrades to `kind: manual`, keeps its evidence and recommendation, says in the
 ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
@@ -727,6 +742,70 @@ Refusing once was not enough: a worker re-ran `finish` unchanged and the fix rea
 it writes instead: a declared `no-pdb` finding gets the SOP's PodDisruptionBudget from the
 collector's `pod_selector`, in a new file beside the declaration; a decline of that budget stands
 only when its reason carries the URL of the pull request already carrying it. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
+
+After these passes, `finish` adds to each `manual` remediation a note that tells the reader where
+the fix belongs. The note comes only from the collector's candidate for the same finding id. There
+is one location note at most: the `declaration` file, or else the `release_declaration` file with
+the fact that the next sync or upgrade of the release can revert a patch to the live object, or else
+the `namespace_directory` where a new object belongs, with the `resources:` entry that an `overlay`
+source needs or the `metadata.namespace` that a `cluster` source needs. A `reconciler` adds a second
+note: its next sync or upgrade can revert a change made by hand. A plain `helm install` release
+reverts a field that the chart sets only at the next `helm upgrade`, so the notes say "can revert",
+not "is reverted".
+The paths come from file names in the repository and the reconciler from annotations on the live
+object, so a note shows only letters, digits and `_./-` from them. A path with another character
+gets no location note. A reconciler that is not exactly one of the phrases the collector writes is
+shown as "a controller whose name the audit does not show". A value that the redaction of the
+stored document changes, such as a `sk-` inside `task-` with 32 characters after it, is not shown
+either, because the stored note would show a value that is not in the repository. So a value cannot
+add a link or a mention to the ledger, and the next pass can find and remove each whole note. The
+pass also removes a note whose value an older run let the redaction change. A path or a
+reconciler longer than 512 characters is not shown either (`ROUTE_PATH_MAX_CHARS`,
+`ROUTE_RECONCILER_MAX_CHARS`), so the route notes always leave room for the start of the worker's
+note and its ` …(truncated)` mark.
+The notes go in a paragraph of their own after the worker's note, and a code fence that the
+worker's note leaves open is closed first. A note whose path the worker's note already names as a
+whole path is not written, unless the cut below removes that mention. A candidate without these
+fields gets no note, because a missing `declaration` is not a claim that no file declares the
+object. A route note copied from an earlier ledger is removed before the notes are written again,
+also from a fix that gets no route note, from a remediation of every kind (a fix that `finish`
+wrote and a worker's `manifest` fix too), and on a run without a manifest. A fix that `finish` wrote, that the worker
+declined, or that an open pull request carries gets no route note, because the row already gives
+the answer. A pull request carries the fix when its delta block names the finding, or, for a
+degraded fix, when it is on the branch that the promised path names. Only an open pull request
+counts: when a merged fix still reproduces (`pr-merged-persists`) or a person closed the pull
+request (`refused`), the reader must make the change by hand, so the row gets the route notes.
+The ledger that a forge with no issue tracker keeps in the report store gets the same notes, with
+the same rules. When that run cannot list the pull requests, no fix counts as carried, and each
+`manual` fix gets its notes.
+The notes give the location; a worker clause that contradicts them stays, and the note beside it is the correction. The worker's note is
+cut first when the total is longer than the note cap, measured after redaction and the escape of a
+comment opener as the renderer measures it, so the route notes stay in the rendered row, and the cut
+is never inside a code block: a note with a fence loses its first code block and all text after
+it, and the text before the block is cut. When the route notes still do not fit with the truncation
+mark, the location note is left out; the reconciler note always fits, because of the caps above, so
+a reconciled object is never published without it. The cut is in the worker's part of the note:
+the text that the degrade of an unwritten file adds at the end stays whole, unless the reconciler
+note leaves no room for it. The text that the Kustomize degrade writes at the start, with its copy
+of the worker's file, is never cut, because that copy is the only published copy of the fix. When
+the route notes do not fit with it, the location note is left out first, and then the copy is made
+shorter by whole lines, with its fences closed, to make room for the reconciler note. The stored document keeps the note from before the cut in the
+remediation's `uncut_note`, and the carry of an unchanged finding puts that note back, so the cut
+does not stay on a later run that has room. The dry run can leave out notes the real run adds, because it reads no
+pull request and no `--decline-fix`, and so skips every fix the refusal would list.
+
+### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
+
+The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
+the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
+is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
+
+**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
+`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
+subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
+make `remediate --finding one-id` open up to six pull requests, five of them for findings the
+operator never mentioned and cannot tell apart from the one they did, on the command whose entire
+purpose is to act on a specific request.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
@@ -778,18 +857,18 @@ lose and anything present is debris from a run that did not finish.
 
 ## 7. Rendering
 
-| Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation (`manifest` links fill the `fileUrl` template from the forge's `capabilities` response at the repository commit when the forge supplies one and the file exists at that commit, and keep the bare path for a newly written file or when `fileUrl` is absent), PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered plus the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1). |
-| Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                |
-| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                                                                                                                                                                                                                                                                        |
-| Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                                                                                                                                                                                                                                                                            |
-| Clean-close comment   | Date and the targets covered (counted by kind: clusters, subnets, projects), then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| Remediation PR title  | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), the risk note, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus `<!-- audit-id-scheme -->` stamp. For a group, one section per member.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Stale-close comment   | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation (`manifest` links fill the `fileUrl` template from the forge's `capabilities` response at the repository commit when the forge supplies one and the file exists at that commit, and keep the bare path for a newly written file or when `fileUrl` is absent), PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered, the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)) and the ids under _Not re-checked this run_ (§7.4), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1). |
+| Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                                                               |
+| Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. On a findings run over a gap, with or without a manifest: rows under _Not re-checked this run_ (§7.4). Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                                                                                                                                                                                                                |
+| Size budget           | 60,000 characters, against GitHub's hard limit of 65,536. See §7.1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Delta comment         | Two lists — new (severity-first) and resolved (by id) — plus a truncation note when the body could not carry everything, and a coverage paragraph for the collector-manifest waiver, the one caller-appended hold a delta comment can carry ([collector design §4](fleet-audit-collector-manifest.md)). Reuses `render_delta_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Clean-close comment   | Date and the targets covered (counted by kind: clusters, subnets, projects), then either "closing as completed" or the coverage gaps that keep the ledger open. Reuses `render_clean_comment`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Remediation PR title  | `fix(<audit-id>): <finding title>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Remediation PR body   | `Part of #<issue>`, the single finding's evidence, impact, **Why this fix** (the recommendation), the risk note, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus `<!-- audit-id-scheme -->` stamp. For a group, one section per member.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Stale-close comment   | Date, each finding the pull request was opened for, the `audit:stale-closed` label, and an accurate reopen note. Not the evidence — see §3.3.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ### 7.1 Size budget
 
@@ -813,7 +892,8 @@ headroom for the trailing marker and for anything a later section appends.
 - **Order of measurement.** Header, scope, and footer (the complete-list block excepted, see below) are rendered and measured first; whatever
   remains of the 60,000 is the findings budget. The collector-held section, when there is one, is
   measured after the findings and before the evidence appendix, degrading to identity lines and then
-  to a note rather than displacing a finding (collector design §3.3). Findings are selected **severity-first**, so
+  to a note rather than displacing a finding (collector design §3.3). It also carries the
+  _Not re-checked this run_ rows (§7.4). Findings are selected **severity-first**, so
   truncation only ever eats the least-severe end and criticals are structurally safe — a fleet with
   five criticals and three hundred minors publishes all five criticals no matter what. In a
   severity band, selection takes one finding for each target in turn while the band has space: no
@@ -842,7 +922,7 @@ headroom for the trailing marker and for anything a later section appends.
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
   body names, in full or on one line (see the bullet on the one-line tier above), not the full finding set — and, after them, the collector-held ids the body carries
-  under their own heading (collector design §3.3). Otherwise the next run would see a truncated finding
+  under their own heading (collector design §3.3) and the ids under _Not re-checked this run_ (§7.4). Otherwise the next run would see a truncated finding
   absent from the previous marker, or present in it and absent from the body, and report a finding
   that is very much still reproducing as _resolved_. The marker is itself a size term and was
   unbounded: 1,250 finding ids render 80,526 characters of marker alone, over the limit before a
@@ -866,7 +946,8 @@ headroom for the trailing marker and for anything a later section appends.
   machine-readable record that a cut finding was filed at all, so a grader or a script reading the
   ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
   omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
-  with every current id and the collector-held ids. Nothing joins against it: the delta keeps
+  with every current id, the collector-held ids and the ids under _Not re-checked this run_ (§7.4).
+  Nothing joins against it: the delta keeps
   reading the marker, for the reason the bullets above give, and, when the report store holds the last run's
   document, `new` also leaves out any finding the last
   run filed (its stored document), so an omitted finding that gains room is not announced as new. Findings are selected once without the
@@ -1137,20 +1218,30 @@ coverage, and nothing else:
 - A run with a new or changed gap is never `[SILENT]`: `finish` returns `silent_ok: false` (§7.5).
   "I found nothing" and "I could not look" must not arrive in chat as the same silence. A gap is new
   or changed when no trusted stored record exists, when the record does not list its gaps, or when
-  the set of gaps differs from the record's `coverage_gaps`. A gap that did not change does not make
+  the set of gaps differs from the record's gaps (for a scheduled run, the gaps of the last
+  scheduled run, as below). A gap that did not change does not make
   the run speak again, unless a finding id that the stored run listed is not in this run's published
-  set (its findings, the postures it withheld, and the held ids). A gap holds `resolved` at 0, so
+  set (its findings, the postures it withheld, the collector-held ids, and the ids under
+  _Not re-checked this run_). A gap holds `resolved` at 0, so
   that finding would leave the ledger with nothing said. The run then speaks, and the JSON line lists
   those ids under `unreported_under_gap`. Each id is reported once: the stored record keeps, under
   `reported_under_gap`, the ids that a run already reported and that are still not published, and
-  the next run does not report them again. A record without that key subtracts nothing, so a run
+  the next run does not report them again. A run with full coverage clears the list: it did not find
+  those ids, so it resolved them. A record without that key subtracts nothing, so a run
   that held the ledger open without reporting an id (an unreadable conversation, an unaccounted
-  finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. `finish`
-  cannot tell a scheduled run from an on-demand one (§7.5), so it compares with the last stored run
-  of either kind: a gap first seen on an on-demand run reached the person who asked, but not the
-  channel, and the next scheduled run with the same gaps does not report it. The first-install
-  audits count as scheduled runs: the `oobe` job marks each one due, and it stores its record like
-  any other. The comparison uses each gap's sentence as written. The sentence comes from the run's
+  finding) does not hide one. Over a scheme bump the list is withheld, as `resolved` is. A
+  scheduled run (`--scheduled`, §7.5) compares its gaps with the last stored _scheduled_ run, not
+  with the last stored run: a gap first seen on an on-demand run reached the person who asked, but
+  not the channel, so the next scheduled run with the same gaps still reports it. For this, each
+  stored record says whether its run was scheduled (`scheduled`) and carries the gaps of the last
+  scheduled run (`scheduled_coverage_gaps`): a scheduled run writes its own gaps there, and an
+  on-demand run copies the value from the record before it. A record written before `finish` knew
+  the run kind has neither key, and its `coverage_gaps` are read as a scheduled run's, which was
+  the rule when it was written. The partial all-clear comment goes on the issue, which every run
+  writes to, so for the comment every run compares with the last stored run of either kind: the
+  scheduled run after an on-demand run with the same gaps speaks, but it does not comment again.
+  The first-install audits count as scheduled runs: the `oobe` job marks each one due, the run
+  takes the cron prompt, and it stores its record like any other. The comparison uses each gap's sentence as written. The sentence comes from the run's
   findings document: the reason the worker writes for a cluster it could not read
   (`scope.skipped`) or read only in part (`limitations`), plus the checks that did not run, which
   `finish` adds. Some reasons carry an error message, for example the first line of a failed
@@ -1171,6 +1262,59 @@ every day has a cost.
 What a gap does **not** do is suppress the report. Findings from the clusters that _were_ read are
 published normally, and new fixes are still proposed for them. A partial audit is a partial audit,
 not a failed one.
+
+A findings run over a gap writes the body again from its own document, so a previous finding on a
+target that this run did not check would go off the ledger and out of the hidden marker. The next
+complete run would then call it new if it is still there, and would never call it resolved if
+somebody fixed it during the gap. So `finish` keeps each such finding as a held row under _Not
+re-checked this run_, in the held span below the collector-held rows, with the reason on the row
+(`unread_held_entries`). It does this only when a ledger is open and the report store holds a
+trusted record of it, because the candidates and their places come from that record; with no
+trusted record the delta is withheld anyway ([report store design §4](fleet-audit-report-store.md#4-finishs-own-memory)). A target was not checked when it is in `scope.skipped`; when the finding's
+check is on its roster and in neither `checks_run` nor `checks_not_applicable` on it, which includes
+a check the collector lists in `checks_unevaluated`; when the check is a derived one and a roster
+check that applies there did not run; when no entry names it and its project target is in
+`scope.skipped`; or when the run listed no target of its kind. The candidates are the ids in the
+previous marker and the findings of the stored document that the previous body renders, which adds
+the findings the body budget cut. A finding that the document lists under `resolved_because` is not a
+candidate, because the run says it is gone. The place of each finding comes from its row on the previous
+body (a full block, or a one-line row under _Listed without detail_), from that stored document, or
+from `not_rechecked` on the stored record: the title and place
+of each finding the previous run kept this way. The note and id-only tiers of the held span ([collector design §3.3](fleet-audit-collector-manifest.md#33-resolution--still_flagged_ids-collector_held_entries))
+write no row, so without that key the next gap run could not place the id and the finding would
+come back as new on the next complete run. The one-line rows of a body that overflows (§7.1) fill
+most of the room that the findings leave, so the held span often falls to one of these two tiers.
+Every tier writes the ids of these findings in a second renderer-owned list inside the held span,
+`<!-- audit-not-rechecked-ids: [...] -->`. No run reads that list back. It lets a reader of the
+body tell these ids from findings that the body cut for space. An id with no known place is not kept, and the run log
+names it, because a row held by id alone would never get a place back and would stay for as long as
+any gap stands. On the findings run the rows share `MAX_HELD_IDS` with the collector-held rows, and the body says how
+many it did not show, in every tier except the id-only one. An id past the cap leaves the body and the marker, but
+the run still did not check its target: its pull request stays open in the stale-close pass, a `/remediate` on it is
+deferred, and the run log names it. A kept id stays in the marker, so the next complete run
+joins against it, and it is not in `resolved` and not stale for the stale-close pass. It is not in
+the held-id list that a run without a manifest carries (collector design §3.3), so the row goes away
+on the first run that checks its target. A finding on a target that the run read and checked is not
+kept: the document reports it, or it is gone. A target with a `limitations` note that ran the check
+counts as checked, because the note does not say which findings it could not see. The rule that any
+gap keeps `resolved` at `0` does not change. A finding kept this way counts as published, so it is
+not listed under `unreported_under_gap`.
+
+On the run that rewrites the body, a `/remediate` on an id under _Not re-checked this run_ is
+deferred until a run checks its target, as on the clean run below; this covers the ids inside the
+cap, and an id past the cap is answered as not in the current report, because the ledger stops
+tracking it.
+
+The clean run over a gap renders no rows, because it comments and leaves the body as it was, and it
+keeps the stored `not_rechecked` places. It still uses the ids, all of them with no cap, because the
+body it keeps carries each one: a `/remediate` on one is deferred,
+not answered as "no longer reproduces", and the shield's close counts them as current, so it does not
+retire a pull request whose other finding was not re-checked. A run on an install with no forge
+keeps the same findings in the `current_ids` of its stored record, with their places, when the store
+holds a trusted record of the previous such run.
+A run that keeps its ledger in the report store (`STORE_LEDGER`, [version-control design §8](version-control-support.md#the-ledger-without-issues))
+does all of this on the body it stores, when the store holds a trusted stored ledger. There is no
+ledger thread on that path, so no `/remediate` comment is read or deferred.
 
 `partial` is `true` if and only if `coverage_gaps` is non-empty, on both `finish` branches. The
 tempting generalisation — also raising it when the body budget (§7.1) dropped findings from the
@@ -1201,22 +1345,91 @@ collector candidate the document dropped ([collector design §3.5](fleet-audit-c
 — and it is computed from the numbers `finish` is
 about to _report_,
 not the ones it privately knows. A partial run reports `resolved: 0`; a report store with no record of
-the open ledger makes the delta unknowable and reports `new: 0`. `silent_ok` follows what was published, so the flag
+the open ledger makes the delta unknowable and reports `new: 0`. On a scheduled run, one more
+term applies: the published ids are the ids the last scheduled run published (below).
+`silent_ok` follows what was published, so the flag
 and the report can never disagree. The PR counters are in the conjunction because opening a fix is
 news even on a run that found nothing new: the ids were already in the ledger, so `new` is zero,
 while a pull request now exists that did not before.
 
-`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and it has no way
-to know a person is waiting: `finish` sees a findings document, not the provenance of the run. So
-the second half of the rule lives with the agent and cannot be moved into the harness — **an
-on-demand run is never silent.** A run a person asked for — a kanban card naming the stream, or a
-request straight from chat — reports its outcome and its ledger URL whatever `silent_ok` says, and
-every SOP's close section says so. The Platform Agent's `AGENTS.md` adds the one case the rule
-cannot reach: "run the `<x>` cron job now" is answered with `hermes cron run <job-id>`, which marks
-the job due for the next `profile-cron-tick` instead of re-enacting the audit in the session that
-fielded the request. That run takes the same execute → save → deliver → mark path as a scheduled
-one and has no way to know a person asked, so `silent_ok` judges it like any other scheduled run;
-the session that triggered it says only that the job is queued and leaves the report to the run.
+`silent_ok` is the **scheduled** verdict. It answers "would a channel want this?", and only a run
+that passes `--scheduled` can get `true`. **An on-demand run is never silent:** a run a person asked
+for — a kanban card naming the stream, or a request straight from chat — does not pass the flag, so
+its `silent_ok` is always false, and it reports its outcome and its ledger URL. Every SOP's close
+section says so. The one limit: an on-demand run that goes through `hermes cron run` (below) uses
+the cron prompt, so it counts as a scheduled run and can be silent.
+
+The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
+`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`. The SOPs do
+not, because a scheduled run and an on-demand run read the same SOP, and an SOP that passed the
+flag would make every on-demand run of its stream able to go silent. A scheduled worker that
+forgets the flag reports a run that could have been silent. That is noise in the channel, and it
+costs less than an answer that a person never gets.
+
+Why the harness and not the SOP: the SOP rule alone does not hold. A worker that reads
+`silent_ok: true` on an on-demand rerun that moved nothing can follow the flag over the SOP and
+answer `[SILENT]`, and then the person who asked gets no answer and no ledger URL. A rule that the
+agent applies correctly most of the time is a rule the harness should apply. The harness cannot
+know that a person is waiting, but the cron prompt knows that no person is. So the default is
+vocal, and the scheduled run is the one that says what it is: an on-demand path that forgets a
+flag then reports, and does not go silent.
+
+The channel hears only scheduled runs, so a scheduled run measures "did anything move" against
+the last _scheduled_ run, not against the last run. Each stored record carries the ids that the
+last scheduled run published (`scheduled_published_ids`: with a ledger, its findings, the postures
+it withheld, the held ids and the ids under _Not re-checked this run_, or for a clean run that left
+the body untouched, the ids that body still lists; with the ledger in the report store, the same ids
+as with a ledger, and no value when it held a ledger it could not read; with no forge, its findings,
+the held ids and the not-re-checked ids, which are the ids it stores as `current_ids`) and its gaps (`scheduled_coverage_gaps`, §7.4). A scheduled run writes its own
+values there, and an on-demand run copies them from the record before it. A scheduled run whose
+published ids differ from `scheduled_published_ids` is not silent, also when its delta against
+the last run is zero: a finding that an on-demand run saw first, new or resolved, still reaches
+the channel. An id that a scheduled run already reported under a gap (`scheduled_reported_under_gap`)
+is not a difference. Its `new` and `resolved` then can be 0, so the JSON line also carries
+`since_last_scheduled`, the ids new and resolved since the last scheduled run, and the text chat
+report says them on a line of its own ("Changed since the last scheduled run: 1 resolved (…)."), with
+no count of zero. A Slack card built from the ledger issue (`KAGE_SLACK_UX` on) replaces the text and
+does not show this line. The card of a run with no ledger issue is built from its summary, which puts
+the line under the finding rows, so that card shows it. When no record shows
+the ids, or the record was written under another finding id scheme, the value is `null` and the
+line says that the change is not known. The key is absent when the last stored run was a scheduled
+run on the open ledger, because `new` and `resolved` then say the change. An id that left under a
+gap, on this run or an earlier one (`reported_under_gap`), is not counted as resolved, and when
+every id that moved left under a gap the key is absent: "0 new, 0 resolved" is not why the run
+speaks. An id that an on-demand run resolved with full coverage is counted as resolved, also on a
+scheduled run with a gap. A run with full coverage clears `reported_under_gap`, with a ledger, with
+the ledger in the report store, and with no forge, so an id that it resolved is not counted as one that left under a gap.
+`new` and `resolved` keep their meaning: they count against the last stored run. In the same way, a scheduled run subtracts from `unreported_under_gap` only the ids
+that a scheduled run reported (`scheduled_reported_under_gap`). An id that the last scheduled run
+published and that an on-demand run dropped since then is in `unreported_under_gap` only when it
+left under a gap (the on-demand run then put it in `reported_under_gap`). An id that an on-demand
+run resolved with full coverage is not.
+
+When no record shows the ids of the last scheduled run, the scheduled run speaks. This is the case
+for a record written before `finish` stored the key, for a record that an on-demand run wrote
+with no value to copy, and for the record that `finish` seeds from the ledger's hidden block when
+the store holds none ([report store](fleet-audit-report-store.md) §4). The delta against the last run cannot replace the baseline, because the last
+run can be the on-demand run that saw the change first. So every stream speaks once after the
+upgrade that adds the key, or after the report store is rebuilt from the ledger. A store that holds no run of the stream is not "unknown": no scheduled
+run published anything, so the baseline is empty.
+
+The stored memory belongs to the open ledger. With no open ledger, a scheduled run reads the
+baseline from the newest record that the stream stored for the repository, which is the record of
+the ledger that a run closed. A marked envelope from a run that could not reach the repository is
+not read, because that run published nothing there ([report store](fleet-audit-report-store.md)
+§2). When the store holds only marked envelopes, no baseline is known and the run speaks. So a
+scheduled run after an on-demand run that closed the ledger
+speaks once, and the channel hears that the stream is clean. When a person closed the ledger, the
+newest record is the record of its last run, and it still lists that run's ids. A scheduled run
+with a gap does not call those ids resolved, because no run checked them. It lists them under
+`unreported_under_gap`.
+
+The Platform Agent's `AGENTS.md` adds one more case: "run the `<x>` cron job now" is answered with
+`hermes cron run <job-id>`, which marks the job due for the next `profile-cron-tick` instead of
+re-enacting the audit in the session that fielded the request. That run takes the same execute →
+save → deliver → mark path and the same cron prompt as a scheduled one, so it passes `--scheduled`
+and `silent_ok` judges it like any other scheduled run; the session that triggered it says only
+that the job is queued and leaves the report to the run.
 
 On a scheduled run the Platform Agent has no channel of its own: a scheduled audit is a cron run on the Platform Agent's own roster
 (`agents/platform/cron/jobs.json`, ticked by `profile-cron-tick`), executed in a process of its own
@@ -1507,10 +1720,12 @@ findings ledger's body alone; a clean close changes the title and adds the banne
 makes no edit when the close fails, adds no second banner, and keeps the old body when the edit
 fails.
 
-**Silence cases** (§7.5): `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
+**Silence cases** (§7.5): on a run that passed `--scheduled`, `silent_ok` is `true` on a quiet clean run and a quiet `UPDATED` run, and
 `false` whenever the run reported a new finding, a resolved finding, a new or changed coverage gap, or a
 remediation PR opened or closed, and `true` again over a gap that did not change — asserted on both `finish` branches, since each prints its own
-JSON. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
+JSON. The same quiet runs without `--scheduled` give `false`, on both branches and with no
+forge, and a scheduled run after an on-demand run that first saw a gap still reports the gap.
+Every fleet-audit cron prompt tells the worker to pass `--scheduled`, and no SOP does. Four prose tests pin the handover the flag cannot cover on its own: the `AGENTS.md`
 governance-job bullet names the Platform Agent's own roster
 (`/opt/data/profiles/platform/cron/jobs.json`) and `profile-cron-tick`, the on-demand bullet names
 `hermes cron run` and `cronjob(action='run')` so that "run it now" stays a trigger rather than a

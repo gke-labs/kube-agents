@@ -124,6 +124,9 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		{"keys Secret", func() error {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-callout-keys", Namespace: "test-ns"}, &corev1.Secret{})
 		}},
+		{"task-signing key Secret", func() error {
+			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-task-signing-key", Namespace: "test-ns"}, &corev1.Secret{})
+		}},
 		{"identity map", func() error {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, &corev1.ConfigMap{})
 		}},
@@ -172,7 +175,7 @@ var rbacBindingKinds = map[string]bool{
 // scope: they take the subject as an argument and have their own coverage.)
 func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T) {
 	agent := a2aTestAgent()
-	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.ServiceAccountName
+	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.ServiceAccountName
 	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.ServiceAccountName
 
 	cases := []struct {
@@ -287,6 +290,9 @@ func nothingA2ALabelledSurvivesAFlipToToday(t *testing.T, mcpOn bool) {
 		for name, obj := range map[string]client.Object{
 			a2aMCPName(agent):       &appsv1.Deployment{},
 			a2aMCPAccessName(agent): &corev1.Secret{},
+			// The broker identity: the pod's own ServiceAccount, which
+			// must go with the rest of the MCP server on the flip.
+			a2aMCPServiceAccountName(agent): &corev1.ServiceAccount{},
 		} {
 			if err := cl.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, obj); err != nil {
 				t.Fatalf("the MCP server's %s was not rendered under its flag, so sweeping it proves nothing: %v", name, err)

@@ -31,6 +31,7 @@ import (
 
 	"google.golang.org/api/option"
 	"google.golang.org/api/pubsub/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
@@ -1153,4 +1154,119 @@ func (c *clockedSource) Pull(ctx context.Context, maxMessages int64) ([]received
 		}
 	}
 	return batch, err
+}
+
+// One hung cluster in a fleet must not spend the batch budget the healthy
+// clusters' records share. Before the bench, every record naming the hung
+// cluster paid the full per-request timeout, so three of them exhausted this
+// budget and the healthy records behind them came out failed.
+func TestProcessBatchSlowClusterDoesNotStarveTheFleet(t *testing.T) {
+	const (
+		slowName = "prod-1"
+		budget   = 500 * time.Millisecond
+	)
+	blocked := make(chan struct{})
+	defer close(blocked)
+
+	entryFor := func(cluster string) []byte {
+		return []byte(strings.Replace(humanPatchEntry, `"cluster_name": "prod-1"`, `"cluster_name": "`+cluster+`"`, 1))
+	}
+	identity := func(cluster string) clusterIdentity {
+		return clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: cluster}
+	}
+	slow := &stubGetter{block: blocked}
+	clusters := map[clusterIdentity]objectGetter{
+		identity(slowName): slow,
+		identity("prod-2"): &stubGetter{obj: &unstructured.Unstructured{}},
+		identity("prod-3"): &stubGetter{obj: &unstructured.Unstructured{}},
+	}
+	var forwarded []DriftEvent
+	join := newJoiner(clusters, nil, nil, nil, func(_ context.Context, e DriftEvent) { forwarded = append(forwarded, e) })
+	join.timeout = 200 * time.Millisecond
+	join.slowLookup = 100 * time.Millisecond
+
+	var batch []receivedMessage
+	for i, cluster := range []string{slowName, "prod-2", slowName, "prod-3", slowName, "prod-2", slowName, "prod-3"} {
+		batch = append(batch, receivedMessage{AckID: fmt.Sprintf("ack-%d", i), Data: entryFor(cluster)})
+	}
+
+	source := &fakeSource{}
+	filter := newDriftFilter(NewClassifier("", ""), join.Handle, false)
+	sub := newSubscriber(source, filter.Handle, defaultMaxMessages, budget)
+
+	start := time.Now()
+	sub.processBatch(context.Background(), batch)
+	elapsed := time.Since(start)
+
+	if len(forwarded) != len(batch) {
+		t.Fatalf("forwarded %d events, want %d: no record may be dropped", len(forwarded), len(batch))
+	}
+	for i, e := range forwarded {
+		switch {
+		case e.Record.Cluster != slowName:
+			if e.Outcome != joinEnriched {
+				t.Errorf("forwarded[%d] (%s) = %q %v, want enriched", i, e.Record.Cluster, e.Outcome, e.LookupError)
+			}
+		case e.Outcome != joinFailed || e.LookupError == nil:
+			t.Errorf("forwarded[%d] (slow) = %q %v, want failed with a reason", i, e.Outcome, e.LookupError)
+		}
+	}
+	if len(slow.refs) != 1 {
+		t.Errorf("slow cluster saw %d lookups, want 1", len(slow.refs))
+	}
+	if elapsed >= budget {
+		t.Errorf("batch took %s, want under the %s budget", elapsed, budget)
+	}
+	if len(source.acked) != len(batch) {
+		t.Errorf("acked %d, want %d", len(source.acked), len(batch))
+	}
+}
+
+// The same starvation from a cluster that answers, slowly: four answers of
+// 150ms spend a 500ms budget, and before slow answers benched, the healthy
+// clusters' records after them came out failed. The second slow answer in a
+// row benches, so the slow cluster is asked twice and both answers are kept.
+func TestProcessBatchSlowAnswersDoNotStarveTheFleet(t *testing.T) {
+	const budget = 500 * time.Millisecond
+	entryFor := func(cluster string) []byte {
+		return []byte(strings.Replace(humanPatchEntry, `"cluster_name": "prod-1"`, `"cluster_name": "`+cluster+`"`, 1))
+	}
+	identity := func(cluster string) clusterIdentity {
+		return clusterIdentity{Project: "example-project", Location: "us-central1", Cluster: cluster}
+	}
+	slow := &slowAnswerGetter{delay: 150 * time.Millisecond}
+	clusters := map[clusterIdentity]objectGetter{
+		identity("prod-1"): slow,
+		identity("prod-2"): &stubGetter{obj: &unstructured.Unstructured{}},
+		identity("prod-3"): &stubGetter{obj: &unstructured.Unstructured{}},
+	}
+	var forwarded []DriftEvent
+	join := newJoiner(clusters, nil, nil, nil, func(_ context.Context, e DriftEvent) { forwarded = append(forwarded, e) })
+	join.timeout = time.Second
+	join.slowLookup = 100 * time.Millisecond
+
+	var batch []receivedMessage
+	for i, cluster := range []string{"prod-1", "prod-1", "prod-1", "prod-1", "prod-2", "prod-3"} {
+		batch = append(batch, receivedMessage{AckID: fmt.Sprintf("ack-%d", i), Data: entryFor(cluster)})
+	}
+	filter := newDriftFilter(NewClassifier("", ""), join.Handle, false)
+	sub := newSubscriber(&fakeSource{}, filter.Handle, defaultMaxMessages, budget)
+	sub.processBatch(context.Background(), batch)
+
+	if len(forwarded) != len(batch) {
+		t.Fatalf("forwarded %d events, want %d", len(forwarded), len(batch))
+	}
+	for _, e := range forwarded[:2] {
+		if e.Outcome != joinEnriched {
+			t.Errorf("slow answer's own record = %q, want enriched", e.Outcome)
+		}
+	}
+	if slow.calls != slowAnswerStrikes {
+		t.Errorf("slow cluster saw %d lookups, want %d", slow.calls, slowAnswerStrikes)
+	}
+	for _, e := range forwarded[4:] {
+		if e.Outcome != joinEnriched {
+			t.Errorf("%s record = %q %v, want enriched", e.Record.Cluster, e.Outcome, e.LookupError)
+		}
+	}
 }

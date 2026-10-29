@@ -29,8 +29,9 @@ check yet and is stated here:
   reading of the path, not a proof of the upgrade's safety.
 
 After those four, `evaluate_extra_rules` runs every module registered in `EXTRA_RULES`, one
-per entry of docs/designs/upgrade-failure-catalogue.md under `readiness_rules/`, whose
-package docstring is the contract a module meets. The fold stamps each finding with its
+per entry of docs/designs/upgrade-failure-catalogue.md under `readiness_rules/`, then the
+plan-level rules, which have no entry (`ENTRY` is None) and grade the upgrade plan rather
+than a catalogue scenario; the package docstring is the contract a module meets. The fold stamps each finding with its
 rule; a rule's `blocking` joins the `blocked` verdict, an `unknown` from a rule that can block
 joins `unknown`, its `risks` the member's risks list, which the table and the report print
 under "risks", and its `notes` the note column. A rule that raises, `SystemExit` included, is
@@ -65,6 +66,7 @@ from readiness_rules import (
     removed_api_callers,
     removed_node_label,
     retired_registry,
+    rollout_sequence_precheck,
     target_patch_valid,
     zonal_control_plane,
 )
@@ -437,6 +439,7 @@ EXTRA_RULES = [
     cluster_status_age,  # entry 24: a cluster held by an operation that has not ended
     target_patch_valid,  # entry 25: the target and the running patch against the channel's valid versions
     known_issues_matrix,  # entry 26: the add-on inventory against the published known issues per patch
+    rollout_sequence_precheck,  # plan-level: no catalogue entry, registered last
 ]
 RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own

@@ -86,7 +86,7 @@ To manually verify the Token Minter integration, you can execute a debug pod run
 kubectl run debug-box --rm -it \
   --image=curlimages/curl \
   --namespace=kubeagents-system \
-  --labels="app=platform-agent" \
+  --labels="kubeagents.x-k8s.io/has-credential-proxy=true" \
   --overrides='
   {
     "spec": {

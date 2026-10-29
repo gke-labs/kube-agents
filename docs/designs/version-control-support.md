@@ -669,6 +669,12 @@ and nothing that needs to be co-resident.
 the same sandbox, and a route that demanded nothing would be the one gap in a
 table whose point is that every route names what it requires.
 
+It admits one other caller: the A2A MCP server's pod, under the `mcp` role,
+which `ROLE_VCS_VERBS` holds to `proposal-view`, a read, with that verb's
+managed-repository check still applying. `CREDENTIAL_PROXY_MCP_CALLERS` binds
+the role to the MCP pod's own ServiceAccount.
+[`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) owns that caller.
+
 ### No shallow clones
 
 There is no `depth`. This is a property of the transport rather than an
@@ -2101,6 +2107,15 @@ shared table, living in the forge package. GitLab is the first to populate it,
 for its own readings of 401 and 400, so by the time Bitbucket arrives the
 mechanism has a user and a test rather than being a speculative hook.
 
+Self-managed Gitea checks a second axis of the same contract: a forge with no
+canonical SaaS host, an optional non-default `port`, and an optional
+`scheme: http` restricted to in-cluster `.svc` / `.svc.cluster.local` Services.
+Its differences — `WIP:` draft title prefixes, label name-to-numeric-ID
+resolution, issue endpoints that return pull requests alongside issues, and
+`Authorization: token <t>` on `StaticFileCredential` — stay inside its own
+package, while `Forge.scheme` and `BrokerForge.{Scheme,Port}` carry the origin
+metadata across `VCS_FORGES_CONFIG`.
+
 ### Not every provider is a forge
 
 The Bitbucket row above says "no issue tracker" is absorbed by `verbs`
@@ -2163,10 +2178,12 @@ the first three forges and not a property of the domain.**
 ## 6. The declarative surface
 
 `IntegrationSpec` declares two lists. `forges` names each forge the install talks to: a `name`
-the rest of the spec refers to it by, a `provider`, an optional `host`, an optional default
-`namespace`, and an optional `credentialsRef`. `repositories` names each repository the operator
-registers: the `forge` it lives on, the `repository` itself, an optional `namespace` of its own
-for a repository given as a bare name, a `role`, and an optional `baseBranch`.
+the rest of the spec refers to it by, a `provider`, an optional `host`, an optional `port`
+(`1`–`65535`) and `scheme` (`https` default, or `http` for an in-cluster self-managed service),
+an optional default `namespace`, and an optional `credentialsRef`. `repositories` names each
+repository the operator registers: the `forge` it lives on, the `repository` itself, an optional
+`namespace` of its own for a repository given as a bare name, a `role`, and an optional
+`baseBranch`.
 (`PlatformAgentIntegrationSpec` embeds it alongside `GoogleChat` and `Slack`, so version control
 is one integration among several.)
 
@@ -3310,6 +3327,11 @@ claim about what else the sandbox can reach —
 [`../credential-isolation-design.md`](../credential-isolation-design.md) owns
 that question.
 
+The MCP pod is the second caller, and its requests come from outside the
+cluster, through the pod. What bounds it is narrower than the `shell` role:
+`ROLE_VCS_VERBS` holds the `mcp` role to `proposal-view`, which writes nothing,
+and only on a repository the install manages.
+
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it
 cheaper.
@@ -3325,7 +3347,7 @@ been added to it, so until they are, an install approaching its token quota is
 visible in the broker's logs and, by status code alone, as `429`s under
 `endpoint="/v1/vcs"` in `kubeagents_credential_proxy_requests_total`, the route
 family every forge verb travels (`/v1/forge` reaches only the credential
-refresh, which spends no quota). The per-verb `kubeagents_vcs_requests_total{verb,status}` names the failing verb, not the cause: a `429` lands as `status="error"` under its verb. The refusal is also thinner than it could
+refresh, which spends no quota). The per-verb `kubeagents_vcs_requests_total{verb,status,provider}` names the failing verb and forge, not the cause: a `429` lands as `status="error"` under its verb. The refusal is also thinner than it could
 be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
 telling it when, and the `Retry-After` and `RateLimit-*` values both forges
 return are read to classify the failure and then dropped rather than carried

@@ -1795,6 +1795,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: platformagent-gateway-agent
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:

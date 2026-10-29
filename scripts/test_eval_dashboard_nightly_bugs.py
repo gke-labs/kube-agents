@@ -27,6 +27,7 @@ from eval_dashboard import nightly_bugs
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 JOB = "ci-kube-agents-eval-nightly"
 WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
+MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 REPO = "gke-labs/kube-agents"
 ISSUES = f"repos/{REPO}/issues"
 FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: required phrases absent"
@@ -409,14 +410,14 @@ class DedupeTest(Harness):
         pr = {"number": 3990, "title": "t", "body": "", "pull_request": {"url": "https://api.github.com/pulls/3990"}}
         hidden = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
         filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, FakeGh(open_issues=[pr, hidden])), self.root)
-        self.assertEqual(filer.listing_doubt([pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
-        self.assertIsNone(filer.listing_doubt([pr, hidden], [], None))
+        self.assertEqual(nightly_bugs.listing_doubt(filer.gh, [pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
+        self.assertIsNone(nightly_bugs.listing_doubt(filer.gh, [pr, hidden], [], None))
 
     def test_a_listing_short_of_graphqls_total_beyond_its_first_page_is_untrusted(self):
         listed = [{"number": n, "title": "t", "body": ""} for n in range(1, 101)]
         fake = FakeGh(open_issues=listed + [{"number": 101, "title": "t", "body": ""}])
         filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, fake), self.root)
-        self.assertIsNotNone(filer.listing_doubt(listed, [], None))
+        self.assertIsNotNone(nightly_bugs.listing_doubt(filer.gh, listed, [], None))
 
     def test_a_bug_closed_after_the_newest_red_night_is_not_filed_again(self):
         marker = nightly_bugs.MARKER.format(case="case-red")
@@ -427,8 +428,11 @@ class DedupeTest(Harness):
         self.assertIn("tracked: case-red by #3996 (closed, still tracking)", out)
         reads = [p for m, p, _ in gh.calls if m == "GET" and "state=closed" in p]
         self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&since=2026-10-15T00:00:30Z&per_page=100"])
-        # A newer failing night after the close files again.
+        # One newer failing night is not a streak after the close; three are.
         later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
+        gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
+        self.assertEqual(self.filed(gh), [])
+        later = data(*(night(d, [red(), green()]) for d in range(15, 21)))
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh)), 1)
 
@@ -452,12 +456,23 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[old]))
         self.assertEqual(len(self.filed(gh)), 1)
 
-    def test_a_bug_closed_while_the_newest_red_night_ran_is_filed_again(self):
-        # Closed at 00:30 on the 17th, between that night's start (00:00:30)
-        # and its finish (00:59): the close did not see the night's verdict.
-        closed = {"number": 3996, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z"}
-        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
-        self.assertEqual(len(self.filed(gh)), 1)
+    def test_a_bug_closed_while_the_newest_red_night_ran_counts_only_nights_started_after(self):
+        # #4041: a fix merged and closed the bug at 00:30 on the 17th, while
+        # that night's run (started 00:00:30, from code before the fix) was
+        # still going. Its red verdict and the older ones do not re-file.
+        closed = {"number": 3863, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z",
+                  "state_reason": "completed"}
+        gh, out, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("tracked: case-red by #3863 (closed, still tracking)", out)
+        # Failing on three nights that started after the close: the fix did
+        # not hold, and a fresh issue lists only those nights.
+        after = data(*(night(d, [red(), green()]) for d in range(15, 21)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[closed]))
+        [issue] = self.filed(gh)
+        for day in (18, 19, 20):
+            self.assertIn(f"2026-10-{day}: 0/3 passed", issue["body"])
+        self.assertNotIn("2026-10-17", issue["body"])
 
     def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
         other = {"number": 3995, "title": "Nightly: case-maint fails every run", "body": nightly_bugs.MARKER.format(case="case-maint") + "\nreason: see case-red too"}
@@ -807,6 +822,23 @@ class InfraCaseTest(Harness):
         self.assertIn("`3 of 3 repetitions infrastructure: agent run failed: http 429 RESOURCE_EXHAUSTED`", body)
         self.assertIn("eval_case-red_rep1.log", body)
 
+    def test_a_drifted_fixture_files_no_domain_bug_and_one_infra_issue_naming_the_role(self):
+        # hack/ci-eval-pr.sh recorded every repetition without running it:
+        # the lease-time scan saw version-laggard drifted on each night.
+        reason = (
+            "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade "
+            "(fixture-drift:version-laggard: cluster currentMasterVersion minor_behind_channel_default: observed the default)"
+        )
+
+        def drifted():
+            return {"name": "case-red", "result": "infra", "reps": [rep(i + 1, "infra", reason) for i in range(3)]}
+
+        gh, _, _ = self.run_once(data(*(night(d, [drifted()]) for d in (15, 16, 17))))
+        self.assertEqual(self.filed(gh), [], "never a nightly-red bug against the case")
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("3 of 3 repetitions infrastructure: ", issue["body"])
+        self.assertIn("fixture-drift:version-laggard", issue["body"])
+
     def test_a_case_with_no_line_on_clean_nights_files(self):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
         [issue] = self.filed(gh, infra=True)
@@ -982,13 +1014,31 @@ class InfraCaseTest(Harness):
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
         self.assertEqual(self.filed(gh, infra=True), [])
-        # Closed as completed (fixed), the next kept night files again.
-        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[dict(closed, state_reason="completed")]))
+        # Closed as completed (fixed) on the 16th while the streak's nights
+        # (15th-17th) include ones that started before the close: still
+        # tracked, as for domain bugs (#4041).
+        fixed = dict(closed, state_reason="completed")
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[fixed]))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # Three kept nights that all started after the close: filed again.
+        after = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17, 18, 19)))
+        gh, _, _ = self.run_once(after, FakeGh(closed_issues=[fixed]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
         # Graded after the close, then kept again: a new problem, filed.
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [green("case-red")]),
                    *(night(d, [infra_task("case-red")]) for d in (18, 19, 20)))
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+
+    def test_a_handed_off_lost_job_issue_clears_on_a_clean_night_inside_the_window(self):
+        # Lost on the 15th, clean on the 16th, lost on the 17th; the job's
+        # issue was handed off (not planned) on the 15th after that night
+        # started. The clean 16th finished after the close, so the hand-off
+        # has cleared and the 17th's loss files fresh.
+        lost = data(night(15, [], lost=True), night(16, [green()]), night(17, [], lost=True))
+        handed_off = {"number": 3716, "title": "t", "closed_at": "2026-10-15T12:00:00Z", "state_reason": "not_planned",
+                      "body": nightly_bugs.BOT_MARKER.format(kind=nightly_bugs.KIND_LOST, field=nightly_bugs.KEY_JOB, key=JOB)}
+        gh, _, _ = self.run_once(lost, FakeGh(closed_issues=[handed_off]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
     def test_a_case_that_changed_parts_is_read_from_the_part_that_ran_it(self):
@@ -1021,6 +1071,17 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*runs, night(18, [green("case-red")])), FakeGh(open_issues=[issue]))
         [(_, comment)] = self.comments(gh)
         self.assertIn("`case-red` was graded on the 2026-10-18 nightly", comment)
+
+    def test_an_open_issue_naming_the_main_b_job_is_read_on_the_main_b_part(self):
+        # As above, but main-b ran the case: the note cites main-b's build.
+        issue = {"number": 3976, "title": "t", "body": f"<!-- kube-agents-bot:nightly-infra case=case-red --> (`{MAIN_B_JOB}`)", "created_at": "2026-10-04T12:00:00Z"}
+        main = [night(d, []) for d in range(1, 18)]
+        main_b = [night(1, [green("case-red")], job=MAIN_B_JOB, hour="09")] + [night(d, [], job=MAIN_B_JOB, hour="09") for d in range(2, 18)]
+        gh, _, _ = self.run_once(data(*sorted(main + main_b, key=lambda r: r["build_id"])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly", comment)
+        self.assertIn("the main-b part ran to its verdict", comment)
+        self.assertIn(f"/logs/{MAIN_B_JOB}/30000000000000170902)", comment)
 
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the

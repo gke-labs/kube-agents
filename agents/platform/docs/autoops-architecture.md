@@ -150,7 +150,7 @@ sends **no prompt** — it sends facts. Noise control lives here too: namespace 
 flapping guard, a two-minute settle period for the crash-loop family (a back-off that clears sooner
 is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
 is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
-watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread.
+watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread and on its triage card (the card alone on an install without chat).
 
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
@@ -325,7 +325,9 @@ written to the live cluster directly.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
-  precisely enough to act on from the report alone. This is the safety property of the whole
+  precisely enough to act on from the report alone. It asks for each change against the live object
+  (kind, name, field, value, or the object to create), because the triaging Cluster Agent has no GitOps
+  repository and the agent opening the PR finds the file. This is the safety property of the whole
   architecture, and it is stated in the prompt.
 
 A domain also registers a **skill** ([Plugging in a new domain](#plugging-in-a-new-domain) says where), which supplies the

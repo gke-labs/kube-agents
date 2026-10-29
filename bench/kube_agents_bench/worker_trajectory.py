@@ -14,7 +14,8 @@ back, one ``kubectl exec`` per run, after the delegated work settles and
 before :func:`harness._purge_card_state` and the per-run Cluster Agent profile
 are gone.
 
-How a card is mapped to its sessions, in this order, all inside the pod:
+How a card is mapped to its sessions, in this order, all inside the pod and
+through the shared reader's functions (the feed maps a card the same way):
 
 1. ``task_runs.metadata.worker_session_id`` -- hermes' own stamp, when the
    worker ran with ``HERMES_SESSION_ID`` set. The image's pinned hermes does
@@ -39,18 +40,29 @@ Each tool call becomes one devops-bench trajectory entry in the same shape
 ``task`` (the card it was working), ``session`` and ``at`` (epoch seconds).
 Results and arguments are scrubbed and clipped inside the pod, in that order,
 so nothing credential-shaped leaves it and a chatty worker cannot make the exec
-output unbounded. The scrubber is the install's own ``AuditRedactor`` (the one
-the audit log and the LiteLLM gateway run every message through), loaded by
-path from the image (:data:`REDACTOR_PATH`), plus a supplement for what it does
-not cover: a JSON ``data`` object in text that names no Secret or that is cut
-short, and URL userinfo for images whose redactor predates its URL rule (the
-pattern matches the redactor's, so the two agree). Blanking is by shape, not by ``kind``: a ConfigMap's
-``data:`` is blanked as a Secret's is, the call the redactor documents as the
-safe direction to err in. A pod whose redactor cannot be loaded withholds every
-result and argument rather than sending them unscrubbed; the call names, tags
-and statuses still come back. The tags are also how ``tool_called`` keeps its
-default router-only contract: ``scope: router`` skips every entry carrying
-``agent`` and ``scope: workers`` counts only those.
+output unbounded. The rules are the shared transcript reader's
+(``agents/platform/scripts/worker_transcript.py``, loaded by path from the
+image at :data:`SUPPLEMENT_PATH`), applied in the session-kv feed's order: the
+install's own ``AuditRedactor`` (the one the audit log and the LiteLLM gateway
+run every message through, loaded from :data:`REDACTOR_PATH`) first, then the
+supplement for what it leaves -- block scalars under ``data:``/``stringData:``,
+a ``data``/``stringData`` object in JSON text or in a parsed manifest, URL
+userinfo, ``NAME: value`` lines, the CLI credential flags, the bearer-scheme
+pair, and the secret-read detector under which the result of a call that
+prints a secret's value is recorded as :data:`WITHHELD_READ_RESULT`, a
+redacted result rather than an unread one. One copy, so a shape the feed masks is masked here
+too; a new shape lands in that module and nowhere else. A manifest's ``data`` mapping
+is blanked by shape, not by ``kind``, in YAML and JSON alike: a ConfigMap's is
+blanked as a Secret's, the call the redactor documents as the safe direction
+to err in, and a Secret kubectl's key-sorted JSON cut short before its
+``kind`` is blanked as text. An API response's ``data`` is not a manifest's.
+A pod whose redactor or rules module cannot be loaded withholds every result
+and argument rather than sending them unscrubbed; the call names, tags and
+statuses still come back when the redactor is the one missing; when the rules
+module is missing nothing is read, since the card-to-session mapping is its too.
+The tags are also how ``tool_called`` keeps its default router-only contract:
+``scope: router`` skips every entry carrying ``agent`` and ``scope: workers``
+counts only those.
 
 The same read collects each worker session's token counts (#1870). A session's
 usage is aggregated on its ``sessions`` row in the same five columns the
@@ -85,6 +97,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -92,7 +105,7 @@ from typing import Any
 
 from kube_agents_bench.parsing import _call_args
 
-__all__ = ["WorkerCapture", "capture"]
+__all__ = ["WorkerCapture", "capture", "TOOL_CALL_WRAPPER", "wrapped_tool_names"]
 
 _log = logging.getLogger("kube_agents_bench.worker_trajectory")
 
@@ -100,6 +113,27 @@ _log = logging.getLogger("kube_agents_bench.worker_trajectory")
 # script never ran to completion (no kubectl, no python, an unreachable pod),
 # which is a capture failure rather than an empty capture.
 CAPTURE_PRESENT = "__WORKER_TRAJECTORY__"
+
+# Dispatch wrapper name Hermes uses when recording MCP tool calls
+TOOL_CALL_WRAPPER = "tool_call"
+
+
+def wrapped_tool_names(entry: dict[str, Any]) -> set[str]:
+    """Tool names a ``tool_call`` wrapper entry invoked; empty for any other."""
+    if entry.get("name") != TOOL_CALL_WRAPPER:
+        return set()
+    args = entry.get("args")
+    if not isinstance(args, dict):
+        return set()
+    names: set[str] = set()
+    if args.get("name"):
+        names.add(str(args["name"]))
+    calls = args.get("calls")
+    if isinstance(calls, list):
+        for c in calls:
+            if isinstance(c, dict) and c.get("name"):
+                names.add(str(c["name"]))
+    return names
 
 # The hermes data volume, the root ``harness._ATTACHMENTS_DIR`` and
 # ``harness._LOGS_DIR`` hang off: ``kanban.db`` and the ``default`` profile's
@@ -122,6 +156,15 @@ FALLBACK_PYTHON = "python3"
 # repository's file.
 REDACTOR_PATH = "/opt/defaults/plugins/common/redactor.py"
 
+# The shared transcript rules: ``agents/platform/scripts/worker_transcript.py``,
+# which the image copies to ``/opt/defaults/scripts`` beside the session-kv
+# server that imports it. Loaded by path inside the pod, so the record is
+# scrubbed by the same supplement, in the same order, as the feed's worker
+# steps, and mapped to its sessions by the same prompt and store layout.
+# Passed to the in-pod script as an argument, right after the redactor, so the
+# tests can point it at the repository's file.
+SUPPLEMENT_PATH = "/opt/defaults/scripts/worker_transcript.py"
+
 # Bounds applied inside the pod, so the exec output stays bounded however much
 # a worker talked. A run's workers make tens to a few hundred calls; the call
 # cap is a runaway guard, and the per-field caps keep a ``kubectl logs`` dump or
@@ -141,16 +184,24 @@ TRUNCATED_GAP = "the read stopped at %d cards; later cards were not read" % MAX_
 CALL_CAP_GAP = "the read stopped at %d tool calls; later calls were not read" % MAX_CALLS
 CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
 # What the in-pod script puts in place of every result and argument when the
-# redactor will not load. Named here too so a verifier can tell a withheld
-# result from a real one; a test holds the two spellings together.
+# redactor will not load (a store without the shared rules module reads no
+# session at all). Named here too so a verifier can tell an unreadable capture
+# from a real one; a test holds the two spellings together.
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
+# What it puts in place of the one result of a call the shared rules'
+# secret-read detector matches, the arguments and every other result readable.
+# It starts with `[REDACTED_` so the verifiers read it as a recorded call whose
+# output is redacted (as they read a `[REDACTED_SECRET]` in any output), never
+# as the whole capture being unread; a test holds the two spellings together.
+WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
 
 # Runs inside the agent container under hermes' own interpreter. Plain
-# ``python3`` and ``sqlite3``, plus the redactor loaded from the image: nothing
-# from hermes is imported, so a hermes release that moves a module cannot break
-# the read, only a schema change can -- and that lands in ``errors`` rather
-# than in an exception. A redactor that fails to load lands there too, and
-# withholds content rather than leaking it.
+# ``python3`` and ``sqlite3``, plus the redactor and the shared transcript
+# rules loaded from the image: nothing from hermes is imported, so a hermes
+# release that moves a module cannot break the read, only a schema change can
+# -- and that lands in ``errors`` rather than in an exception. A redactor or
+# rules module that fails to load lands there too, and withholds content
+# rather than leaking it.
 #
 # Kept as one string rather than a file the harness would have to ship into
 # the pod: ``_agent_shell`` runs ``sh -c``, and a quoted ``python3 -c``
@@ -158,11 +209,11 @@ WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
 # harness side also knows -- the data root, the sentinel, the caps -- and then
 # the card ids, so no literal is spelled twice.
 _IN_POD_SCRIPT = r"""
-import importlib.util, json, os, re, sqlite3, sys
+import importlib.util, json, os, sqlite3, sys
 
-ROOT, SENTINEL, REDACTOR = sys.argv[1:4]
-MAX_CARDS, MAX_CALLS, MAX_RESULT, MAX_ARGS = [int(a) for a in sys.argv[4:8]]
-roots = [a for a in sys.argv[8:] if a]
+ROOT, SENTINEL, REDACTOR, SUPPLEMENT = sys.argv[1:5]
+MAX_CARDS, MAX_CALLS, MAX_RESULT, MAX_ARGS = [int(a) for a in sys.argv[5:9]]
+roots = [a for a in sys.argv[9:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
@@ -191,10 +242,8 @@ def unread(problem):
     out["unread"].append(problem)
 
 JSON_PREFIX = "\x00json:"
-PROMPT = "work kanban task "
-# The redactor's own marker, so a reader grepping artifacts finds one marker.
-REDACTED = "[REDACTED_SECRET]"
 WITHHELD = "[WITHHELD: redactor unavailable in the pod]"
+WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
 TOOL_ERROR_PREFIX = "Error executing tool"
 # hermes' usage columns, on the ``sessions`` row as aggregates and, in a
 # hermes that attributes usage per model, on ``session_model_usage`` rows.
@@ -206,135 +255,56 @@ TOKEN_COLUMNS = (
     "reasoning_tokens",
 )
 
-# What AuditRedactor leaves behind in the text a worker reads. In a Secret
-# payload: the continuation lines of a block scalar under data:/stringData:
-# (its line scan blanks key: value pairs only), and the JSON form,
-# "data": {...}, in text that names no Secret or cut short. In free text:
-# userinfo in a URL, for images whose redactor predates its URL rule (same
-# character classes, so the password runs to the last `@`), and a
-# `NAME: value` / `NAME=value` line whose name its key-based walk would blank
-# in a mapping but its text pattern does not (`DB_CREDENTIALS:` in a
-# `kubectl describe pod`), plus the `*-key-data` / `*-certificate-data` names
-# neither blanks (`client-key-data:` in a kubeconfig), which KEY_DATA_WORDS
-# adds.
-YAML_BLOCK_RE = re.compile(r"^(\s*)(data|stringData)\s*:\s*$")
-YAML_PAIR_RE = re.compile(r"^(\s*)([^\s:]+)\s*:\s*(.*)$")
-JSON_BLOCK_RE = re.compile(r'("(?:data|stringData)"\s*:\s*\{)([^{}]*)(\}|\Z)')
-JSON_PAIR_RE = re.compile(r'("(?:[^"\\]|\\.)*"\s*:\s*")((?:[^"\\]|\\.)*)("|\Z)')
-URL_USERINFO_RE = re.compile(r"(://[^\s:/?#@\[\]\"'<>{}\\|^`,;]*:)[^\s/?#\[\]\"'<>{}\\|^`,;]+(?=@)")
-# The separator stays on the line, so `Environment:` above an indented env
-# line does not swallow it; the value is the rest of the line, the safe side.
-TEXT_KV_RE = re.compile(r"(?m)(?<![\w.\-/\"])([\w.\-]+)([ \t]*[:=][ \t]*)([^\n]+)")
-KEY_DATA_WORDS = ({"key", "data"}, {"certificate", "data"})
+# The step kinds the shared rules tell apart: a call's arguments carry the
+# shell line the continuation fold and the CLI flag rules read, a result the
+# inline-object rule.
+CALL_KIND = "tool_call"
+RESULT_KIND = "tool_result"
+# The names the two files are registered under in sys.modules.
+REDACTOR_MODULE_NAME = "kube_agents_audit_redactor"
+SUPPLEMENT_MODULE_NAME = "kube_agents_worker_transcript"
 
 
-def load_redactor():
-    name = "kube_agents_audit_redactor"
-    spec = importlib.util.spec_from_file_location(name, REDACTOR)
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise ImportError("no loader for " + REDACTOR)
+        raise ImportError("no loader for " + path)
     module = importlib.util.module_from_spec(spec)
     # Registered before the exec: the file's dataclass resolves its string
     # annotations through sys.modules (credential_patterns in
     # scripts/validate_bench_cases.py explains the failure otherwise).
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module.AuditRedactor
+    return module
 
 
 try:
-    redactor = load_redactor()
+    redactor = load_module(REDACTOR_MODULE_NAME, REDACTOR).AuditRedactor
 except Exception as exc:
     out["errors"].append(
         "redactor %s: %s; results and arguments withheld" % (REDACTOR, exc)
     )
     redactor = None
 
-
-def scrub_blocks(text):
-    if "data" not in text:
-        return text
-    lines = text.split("\n")
-    block = None
-    for i, line in enumerate(lines):
-        opener = YAML_BLOCK_RE.match(line)
-        if opener:
-            block = len(opener.group(1))
-            continue
-        if block is None or not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip())
-        if indent <= block:
-            block = None
-            continue
-        pair = YAML_PAIR_RE.match(line)
-        if pair is None:
-            lines[i] = " " * indent + REDACTED
-        elif pair.group(3):
-            lines[i] = "%s%s: %s" % (pair.group(1), pair.group(2), REDACTED)
-    text = "\n".join(lines)
-    return JSON_BLOCK_RE.sub(
-        lambda m: m.group(1)
-        + JSON_PAIR_RE.sub(lambda p: p.group(1) + REDACTED + p.group(3), m.group(2))
-        + m.group(3),
-        text,
-    )
+# The shared transcript reader: the supplement rules and the card-to-session
+# mapping. An image without it is an image whose rules this read cannot run.
+try:
+    wt = load_module(SUPPLEMENT_MODULE_NAME, SUPPLEMENT)
+except Exception as exc:
+    out["errors"].append("transcript rules %s: %s; no session read" % (SUPPLEMENT, exc))
+    wt = None
 
 
-def named_value_is_sensitive(name):
-    words = redactor._get_key_words(name)
-    return bool(words & redactor.SENSITIVE_KEYS) or any(w <= words for w in KEY_DATA_WORDS)
-
-
-def blank_named_values(text):
-    return TEXT_KV_RE.sub(
-        lambda m: m.group(1) + m.group(2) + REDACTED
-        if named_value_is_sensitive(m.group(1))
-        else m.group(0),
-        text,
-    )
-
-
-def as_json(text):
-    # A string that is itself a JSON document: a `terminal` result of
-    # `kubectl get -o json`, a Secret's last-applied-configuration annotation,
-    # the arguments hermes stores as a JSON string. Walked as a value, so
-    # what is escaped inside it is seen unescaped, then re-serialised.
-    if text.lstrip()[:1] not in "{[":
+def scrub(value, kind):
+    # The feed's rules in the feed's order: AuditRedactor.redact, then the
+    # supplement, on the text as hermes stored it (a structured result is
+    # serialised first and walked as JSON inside).
+    if value is None:
         return None
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        return None
-    return parsed if isinstance(parsed, (dict, list)) else None
-
-
-def supplement(value, key=None):
-    # The shapes the redactor lacks, applied where the strings sit so YAML
-    # inside a JSON string field is seen with its newlines rather than as
-    # escaped text; a data/stringData mapping is blanked wholesale, as the
-    # text shapes are. AuditRedactor.redact then does the rest of the walk:
-    # its patterns on every string, and its key-based blanking of anything
-    # under a password/token/secret/credentials-named key.
-    if isinstance(value, str):
-        parsed = as_json(value)
-        if parsed is not None:
-            return json.dumps(scrub(parsed))
-        text = URL_USERINFO_RE.sub(lambda m: m.group(1) + REDACTED, value)
-        return blank_named_values(scrub_blocks(text))
-    if isinstance(value, dict):
-        if key in ("data", "stringData"):
-            return {k: REDACTED if isinstance(v, str) else supplement(v) for k, v in value.items()}
-        return {k: supplement(v, k) for k, v in value.items()}
-    if isinstance(value, list):
-        return [supplement(v) for v in value]
-    return value
-
-
-def scrub(value):
     if redactor is None:
         return WITHHELD
-    return redactor.redact(supplement(value))
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return wt.scrub_step_text(redactor, kind, text, WITHHELD)
 
 
 def failed(result):
@@ -392,9 +362,7 @@ def ro(path):
 
 
 def state_db(profile):
-    if not profile or profile == "default":
-        return ROOT + "/state.db"
-    return ROOT + "/profiles/" + profile + "/state.db"
+    return str(wt.profile_state_db_path(ROOT, profile))
 
 
 def like_escape(value):
@@ -475,7 +443,7 @@ def read_session(conn, card, profile, sid):
                 arguments = fn.get("arguments")
                 entry = {
                     "name": str(fn.get("name") or ""),
-                    "args": clip(scrub(arguments), MAX_ARGS) if arguments is not None else None,
+                    "args": clip(scrub(arguments, CALL_KIND), MAX_ARGS) if arguments is not None else None,
                     "result": None,
                     "failed": None,
                     "agent": profile,
@@ -483,6 +451,11 @@ def read_session(conn, card, profile, sid):
                     "session": sid,
                     "at": row["timestamp"],
                     "_id": tc.get("id") or tc.get("call_id"),
+                    # A call that reads a secret's value has its result
+                    # withheld, as the feed withholds it; the verdict is
+                    # still taken on the raw result. (`sessions_for` reads no
+                    # session without the rules module, so `wt` is loaded here.)
+                    "_withhold": wt.is_secret_read_tool_call(arguments),
                 }
                 pending.append(entry)
                 out["calls"].append(entry)
@@ -507,7 +480,12 @@ def read_session(conn, card, profile, sid):
             pending.remove(target)
             result = decode(row["content"])
             target["failed"] = failed(result)
-            target["result"] = clip(scrub(result), MAX_RESULT)
+            # Without a redactor nothing is readable; the read placeholder
+            # would say this one result was recorded in a capture that is not.
+            if target["_withhold"] and result is not None and redactor is not None:
+                target["result"] = WITHHELD_READ_RESULT
+            else:
+                target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
     if orphans:
         out["errors"].append(
             "session %s of %s: %d tool result(s) matched no call" % (sid, profile, orphans)
@@ -516,15 +494,12 @@ def read_session(conn, card, profile, sid):
 
 
 def sessions_for(card, assignee, runs):
-    found = []
-    for run in runs:
-        try:
-            md = json.loads(run["metadata"] or "{}")
-        except ValueError:
-            md = {}
-        sid = md.get("worker_session_id") if isinstance(md, dict) else None
-        if isinstance(sid, str) and sid and sid not in [f[0] for f in found]:
-            found.append((sid, run["profile"] or assignee, "run_metadata"))
+    if wt is None:
+        # The mapping is the shared module's; without it no store is opened.
+        unread("card %s: transcript rules unavailable; sessions not read" % card)
+        return []
+    stamped, _ = wt.stamped_worker_sessions(runs, assignee)
+    found = [(sid, profile, "run_metadata") for sid, profile in stamped]
     dispatched = [r["profile"] or assignee for r in runs]
     profiles = list(dict.fromkeys(dispatched + [assignee]))
     for profile in profiles:
@@ -542,15 +517,15 @@ def sessions_for(card, assignee, runs):
             rows = conn.execute(
                 "SELECT session_id, content FROM messages WHERE role = 'user' "
                 "AND content LIKE ? ESCAPE '\\' ORDER BY id",
-                ("%" + PROMPT + like_escape(card) + "%",),
+                ("%" + wt.WORKER_PROMPT_PREFIX + like_escape(card) + "%",),
             ).fetchall()
             conn.close()
         except sqlite3.Error as exc:
             unread("session store for %s: %s" % (profile, exc))
             continue
         # LIKE's trailing wildcard would also take a card whose id merely
-        # starts with this one; the id has to end where the prompt's does.
-        exact = re.compile(re.escape(PROMPT + card) + r"(?![\w-])")
+        # starts with this one; the shared pattern ends the id where the prompt's does.
+        exact = wt.worker_prompt_exact_re(card)
         for row in rows:
             sid = row["session_id"]
             if exact.search(row["content"] or "") and sid not in [f[0] for f in found]:
@@ -582,7 +557,7 @@ while kb is not None and queue:
             cards[tid] = None
             continue
         runs = kb.execute(
-            "SELECT id, profile, status, started_at, ended_at, metadata "
+            "SELECT id, profile, status, started_at, ended_at, metadata, outcome, error "
             "FROM task_runs WHERE task_id = ? ORDER BY id",
             (tid,),
         ).fetchall()
@@ -617,6 +592,14 @@ while kb is not None and queue:
         "assignee": row["assignee"],
         "status": row["status"],
         "runs": len(runs),
+        # How each attempt ended, as the dispatcher recorded it: a worker out
+        # of its turn budget closes its run ``timed_out`` with the budget in
+        # ``error`` (``Iteration budget exhausted (N/M)``), which is the one
+        # place the cap a worker actually ran under can be read back.
+        "run_outcomes": [
+            {"profile": r["profile"], "status": r["status"], "outcome": r["outcome"], "error": r["error"]}
+            for r in runs
+        ],
         "children": list(dict.fromkeys(children)),
         "fanned_out": list(dict.fromkeys(fanned_out)),
         "sessions": [],
@@ -641,12 +624,15 @@ while kb is not None and queue:
         card["sessions"].append(
             {"id": sid, "agent": profile, "match": match, "calls": calls, "tokens": tokens}
         )
-    if not card["sessions"] and runs:
+    # Without the rules module `sessions_for` has already said no store was
+    # opened; "no session found" would send a reader to the store.
+    if not card["sessions"] and runs and wt is not None:
         unread("no session found for card %s" % tid)
 
 out["cards"] = [c for c in cards.values() if c is not None]
 for entry in out["calls"]:
     entry.pop("_id", None)
+    entry.pop("_withhold", None)
 print(SENTINEL)
 reply = json.dumps(out, default=str) + "\n"
 for start in range(0, len(reply), WRITE_CHUNK):
@@ -728,6 +714,26 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
     return found
 
 
+def runs(summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Every attempt of every captured card, in board order, with its card id.
+
+    ``None`` when the read did not run. Each row is the card's ``run_outcomes``
+    entry (``profile``, ``status``, ``outcome``, ``error``) plus ``task``; a
+    summary without card records yields an empty list. ``worker_budget`` reads the rows for the
+    turn budget a worker ran out of.
+    """
+    if not isinstance(summary, dict):
+        return None
+    rows: list[dict[str, Any]] = []
+    for card in summary.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        for run in card.get("run_outcomes") or []:
+            if isinstance(run, dict):
+                rows.append({"task": str(card.get("task") or ""), **run})
+    return rows
+
+
 
 def _entry(call: dict[str, Any]) -> dict[str, Any]:
     """One trajectory entry in ``parsing.parse_response``'s shape, plus the tags.
@@ -769,6 +775,7 @@ def command(task_ids: list[str]) -> str:
             DATA_ROOT,
             CAPTURE_PRESENT,
             REDACTOR_PATH,
+            SUPPLEMENT_PATH,
             str(MAX_CARDS),
             str(MAX_CALLS),
             str(MAX_RESULT_CHARS),

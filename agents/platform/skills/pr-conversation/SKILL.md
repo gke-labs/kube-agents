@@ -38,6 +38,11 @@ at. Use the card's words in your reply — a user of a forge that calls them mer
 requests should not be answered in GitHub's vocabulary. If the card says
 nothing, it is a GitHub pull request.
 
+Pass `--repo` as the card names the repository: `<owner>/<repo>` on GitHub, or
+`<host>/<owner>/<repo>` on another declared forge (such as GitLab or Gitea) so
+installs that serve more than one forge do not have to guess which host a bare
+slug belongs to.
+
 ## Procedure
 
 ### Step 1: Re-read the conversation

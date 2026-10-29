@@ -50,7 +50,7 @@ readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.
 readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
 readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
 readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
-readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list"
+readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -361,6 +361,7 @@ gcloud services enable \
   logging.googleapis.com \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
+  gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
@@ -486,8 +487,8 @@ for role in \
 done
 
 # A custom role, not roles/compute.networkAdmin: that role holds almost a
-# thousand permissions, and the sweep needs twelve. `update` on a re-run keeps the
-# role's permissions equal to the list above. On a project already registered,
+# thousand permissions, and the sweep needs only COMPUTE_SWEEP_PERMISSIONS.
+# `update` on a re-run keeps the role's permissions equal to the list above. On a project already registered,
 # run the commands in docs/ci-pool-projects.md section 5.7 by hand rather than
 # the script (section 8).
 echo "Granting the Compute plant sweeper its custom role on ${PROJECT_ID}..."
@@ -788,6 +789,12 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     # the nightly's, and to the CI health bot, so this apply also grants each of
     # them impersonation on seeded-fleet-reader. Do not pass it with -var; variables.tf says why
     # every apply has to carry the same value.
+    # Two applies: the scaled-zero gateway fixture's kubernetes_manifest
+    # resources read the Gateway API CRDs at plan time, and those exist only
+    # once GKE has created seeded-a with gateway_api_config. The first apply
+    # creates that cluster on its own; on a project that has it, it changes
+    # nothing.
+    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else

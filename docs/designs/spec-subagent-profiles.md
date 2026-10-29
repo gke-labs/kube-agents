@@ -299,12 +299,18 @@ running.
 
 What the operator renders per profile, as built (amended 10/6):
 
-- The ServiceAccount: `agentprofile-<profile>`, owned by the CR, token automount off, no
-  RoleBinding anywhere. A profile that names its own in `identity.serviceAccountName` gets
-  none created. A profile may not name a ServiceAccount the operator already uses for
-  something else (the agent's, the session pods', the callout's, and so on) or `default`.
+- The ServiceAccounts: one per allowed tier, `agentprofile-<profile>-<tier>`, in the
+  profile namespace, token automount off, no RoleBinding anywhere (amended 10/23). They
+  carry the profile's name and UID instead of an owner reference, which can't cross
+  namespaces. A profile that names its own in `identity.serviceAccountName` gets none
+  created, and may then allow only one tier. A profile may not name a ServiceAccount name
+  the operator uses for the agent (the agent's, the session pods', the callout's, and so on)
+  or `default`.
   Those are refused with a condition, and the profile renders nothing.
-- The callout identity: one entry per profile in the PlatformAgent's identity map. A static
+- The callout identity: one entry per profile and tier in the PlatformAgent's identity map,
+  user `profile-<profile>-<tier>`. A tier's entry adds the dispatch subjects for its own pod
+  (`a2a.dispatch.<profile>.<tier>.<pod>`, plus `.accept` and `.lease` to publish) and no KV
+  grant: the dispatcher is the only writer of `PROFILE_LEASES`. A static
   entry cannot work here. Every pod of a profile publishes as the profile, but two of them
   running at once need their own consumers and inboxes, and a shared consumer name or a
   wildcard one is worse than either. So the entry narrows on `profile`. It carries the
@@ -312,14 +318,37 @@ What the operator renders per profile, as built (amended 10/6):
   from the profile and the consumer names and inbox from the attested pod name, the same way
   it already does for session pods. A refused profile is left out of the map rather than
   failing it for everyone.
+- Per-task credentials (#3889), staged. A worker gets two connections. Its pod connection,
+  which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and
+  its topics. After it accepts a task it opens a task connection with the token as the
+  connection token and a task credential as the password. The dispatcher signs the
+  credential (`a2a/taskcred`), and the callout refuses it unless its pod name and UID are
+  the pod the token is bound to, and its profile and tier are the entry's. The task
+  connection gets that one task's `.events` publish and its three consumers, filtered
+  exactly on the task. They and its inbox are named for the task, not the pod
+  (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a consumer's
+  info, pull and delete subjects carry only its name, and a pod-named consumer would be
+  reachable from the pod's next task. A credential may run to the callout's maximum task
+  lifetime, measured both from now and from its issue time. That is 6h until #4121's
+  operator renders it from the profile deadline cap, and it can exceed the grant TTL. A setting the callout can't use refuses every task credential, never
+  falling back to 6h, and the callout keeps serving everything else. The connection's JWT
+  still expires at the earlier of the credential and the grant TTL, and the worker
+  reconnects with the same credential. The password carries the credential because the
+  server copies CONNECT's `jwt` field into its `$SYS` advisories and `connz`, and a refused
+  connection would publish it. The operator generates the task-signing key beside the
+  callout's keys, in a Secret only the dispatcher will mount (nothing mounts it yet), and
+  renders the public half into the callout's environment. The narrowing lands in steps: the
+  first PR adds the task connection, and the pod connection keeps its profile-wide task
+  reach. The worker PR moves the worker onto the task connection and removes that reach, and
+  it has to land before #3659's tiers stronger than Read go live.
 - The card: the operator is a bus principal for this and nothing else. Its entry publishes on
   `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
   from a current one. The grant is a wildcard over the profile token because callout grants are
   fixed for the life of a connection, and a profile created later still has to be publishable.
 
-Two limits of what is built. Credentials are per profile, as decided 8/24, so two pods of one
-profile can reach each other's task subjects; per-task credentials stay with the authority
-work. And a profile deleted while its agent is on `today` releases its finalizer with no
+Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
+task connection) land, a worker's pod connection still reaches every task of its profile, so
+two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
 tombstone, because there is no bus to publish one on. The directory survives a flip to
 `today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
 Nothing sweeps directory entries that have no profile. Fixing that means either holding
@@ -517,7 +546,7 @@ spec:
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
     model: model-default
-    maxTurns: 250 # today's value, set for fleet-audit remediation loops
+    maxTurns: 250 # the fleet audits' per-entry value today; the profile itself carries 150
   bus:
     publishTopics:
       - agent.platform.upgrade-readiness
@@ -687,6 +716,9 @@ Three small items to fold back into the payload spec rather than fork here (fold
   attenuation machinery exists (`Attenuate`, the hop chain) but has no production
   caller, and bus credentials are still per-principal. It is a named tightening
   against built machinery now rather than against a plan, which is a better position
-  to be in, but it is not done.
+  to be in, but it is not done. **Amended 10/28 (#3889):** staged. Its first PR adds a
+  worker's task connection, granted one task's subjects on a task credential the
+  dispatcher signs; the worker PR moves the worker onto it and removes the pod
+  connection's profile-wide task reach, before #3659's tiers stronger than Read go live.
 - ~~**Worker session naming.**~~ Decided 8/24: the animals stay - `<profile>-<animal>`
   per run, with `from.profile` carrying the structure.

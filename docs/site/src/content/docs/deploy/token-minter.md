@@ -164,12 +164,12 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 kubectl run debug-box --rm -it \
   --image=curlimages/curl \
   --namespace=kubeagents-system \
-  --serviceaccount=kubeagents-platform-agent \
-  --labels="app=platform-agent" \
+  --overrides='{"spec":{"serviceAccountName":"kubeagents-platform-agent"}}' \
+  --labels="kubeagents.x-k8s.io/has-credential-proxy=true" \
   -- sh
 ```
 
-The `app=platform-agent` label is required: Minty's `NetworkPolicy` only accepts ingress from pods carrying it.
+The `kubeagents.x-k8s.io/has-credential-proxy=true` label is required: Minty's `NetworkPolicy` only accepts ingress from pods carrying it, the label the operator puts on the credential proxy pod, Minty's one caller.
 
 From inside the pod (the OIDC `audience` must match the Minty service URL, and the token is passed in the `X-OIDC-Token` header — not `Authorization`):
 

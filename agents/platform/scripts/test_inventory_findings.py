@@ -406,6 +406,14 @@ class SelectItemsTests(unittest.TestCase):
         self.assertEqual(refs(shown), [["f001"], ["f002"], ["f003"]])
         self.assertEqual(deferred, 3)
 
+    def test_a_limit_past_the_row_cap_lists_the_cap_and_defers_the_rest(self):
+        # The report is one chat card: a limit above its rows lists the rows, and the
+        # rest are deferred, so the shown file never names an item the card cannot show.
+        cap = inv.FIRST_REPORT_ROWS_MAX
+        specs = [(CRITICAL, {"check": f"check-{i}", "object": f"obj-{i:02d}"}) for i in range(cap + 2)]
+        shown, deferred, others = self.select(specs, limit=cap + 5)
+        self.assertEqual((len(shown), deferred, others), (cap, 2, 0))
+
     def test_a_gathered_line_is_one_item_of_its_most_severe_rows_class(self):
         # One check on one cluster: a major scoring 120 and a floored critical
         # scoring 90 are one critical item, at the major's place, ahead of a

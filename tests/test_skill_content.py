@@ -39,6 +39,53 @@ class ClusterWorkloadSecuritySkillTest(unittest.TestCase):
             self.assertIn(text, content)
 
 
+class TerraformNewClusterDefaultsTest(unittest.TestCase):
+    """#3691's lane runs: a new cluster on a Terraform repository came out with
+    deletion_protection = false in 4 of 5 runs, and 3 of 4 re-declared the
+    sibling's project-wide google_gke_hub_feature (#3727). Step 3 gives a new
+    cluster its siblings' protection, or true, and only per-cluster resources."""
+
+    def _step3(self):
+        # Whitespace collapsed, so a rewrap of the prose does not fail the test.
+        content = TERRAFORM_SKILL.read_text(encoding="utf-8")
+        step3 = content[content.index("### Step 3: Write the change"):content.index("### Step 4")]
+        return " ".join(step3.split())
+
+    def test_a_new_clusters_deletion_protection_is_on(self):
+        step3 = self._step3()
+        self.assertIn("**A new cluster's deletion protection** is on", step3)
+        self.assertIn("it is `deletion_protection = true`", step3)
+        self.assertIn("A sibling that has it `false` is not copied", step3)
+        self.assertIn("Never `false`, for a test, an evaluation or an easier teardown", step3)
+
+    def test_a_new_cluster_declares_only_per_cluster_resources(self):
+        step3 = self._step3()
+        self.assertIn("Shape, not contents", step3)
+        self.assertIn("never declared a second time", step3)
+        self.assertIn("`google_gke_hub_feature`", step3)
+        self.assertIn("copied with this cluster's own state prefix", step3)
+
+    def test_the_pr_body_says_which_deletion_protection_rule_applied(self):
+        content = TERRAFORM_SKILL.read_text(encoding="utf-8")
+        self.assertIn("new cluster: `true`, the provider default", content)
+        self.assertIn("has `false` and was not copied", content)
+
+    def test_the_reference_lists_the_shared_resources(self):
+        reference = (TERRAFORM_SKILL.parent / "references" / "container.md").read_text(encoding="utf-8")
+        self.assertIn("## Shared resources beside a cluster", reference)
+        # The reference agrees with Step 3: a sibling's false is never copied.
+        flat = " ".join(reference.split())
+        self.assertNotIn("the existing clusters' value", flat)
+        self.assertIn("a sibling's `false` is not copied", flat)
+        for resource in ("google_gke_hub_feature", "google_gke_hub_fleet", "google_project_service"):
+            self.assertIn(f"`{resource}`", reference)
+
+    def test_gke_basics_no_longer_turns_deletion_protection_off(self):
+        """gke-basics' Terraform example set it false "for testing" (#3727)."""
+        example = (REPO_ROOT / "agents/platform/skills/gke-basics/references/iac-usage.md").read_text(encoding="utf-8")
+        self.assertNotRegex(example, r'deletion_protection\s*=\s*"?false')
+
+
 class RoutedSkillsExistTest(unittest.TestCase):
     def test_config_connector_skill_exists(self):
         self.assertTrue(CONFIG_CONNECTOR_SKILL.is_file())
@@ -142,6 +189,16 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         self.assertIn("authoring skill's rules here too (Step 2's table)", step5)
         self.assertIn("`tofu fmt` after any `.tf` edit", step5)
         self.assertIn("submit do not apply: stay on `<source>` in this copy", step5)
+
+    def test_step_two_scopes_multi_option_reports_to_chosen_option_only(self):
+        content = (REPO_ROOT / "agents/platform/skills/submit-suggestion/SKILL.md").read_text(encoding="utf-8")
+        step2 = content[content.index("### Step 2: Make the Changes"):content.index("### Deleting a resource")]
+        flat = " ".join(step2.split())
+        self.assertIn("**Implement only the chosen option.**", flat)
+        self.assertIn("edit only the file(s) that option calls for", flat)
+        self.assertIn("edit only the synced workload manifest(s)", flat)
+        self.assertIn("Never bundle unchosen options or optional hardening into the same pull request", flat)
+        self.assertIn("never touch unrelated manifests or infrastructure definitions", flat)
 
 if __name__ == "__main__":
     unittest.main()

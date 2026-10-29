@@ -1419,7 +1419,9 @@ class ScopeTest(HomesMixin):
                 stall.hold()
             return True if cluster != "c" else False
 
-        listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
+        # No cluster on the list, so all three are described: a listed one would skip its
+        # describe (#3703) and leave only one completing describe beside the stall.
+        listings = {self.MGMT: []}
         with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
                 mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
@@ -3053,6 +3055,80 @@ class ScopeTest(HomesMixin):
         self.assertIn("1 scope selector(s) (folder, organisation, Shared VPC host or Metrics Scope) could not be resolved", text)
         self.assertIn(f"`{self.SCOPE}` (denied, 1 project(s))", text)
 
+
+
+    # #3703: a cluster its project's own list named this run is not described again. The
+    # list is proof of existence and never proof of absence: a cluster missing from it is
+    # still described, and only that describe's NotFound deletes its profile.
+
+    def _describes(self, answers):
+        """An `_cluster_exists` stub that records which profiles it was asked about."""
+        asked: list[str] = []
+
+        def exists(project, cluster, location, timeout=None):
+            asked.append(cluster)
+            return answers[cluster]
+        return asked, exists
+
+    def _profiles(self, *clusters, project=None):
+        project = project or self.MGMT
+        names = [f"cluster-{c}" for c in clusters]
+        return names, {f"cluster-{c}": _identity(project=project, cluster=c) for c in clusters}
+
+    def test_a_cluster_on_its_projects_list_is_kept_without_a_describe(self):
+        profiles, identities = self._profiles("a", "b")
+        asked, exists = self._describes({})
+        report, _, deleted = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1"),
+                                                          (self.MGMT, "b", "us-central1")]},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(asked, [])
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
+
+    def test_a_cluster_missing_from_the_list_is_described_and_pruned_only_on_notfound(self):
+        profiles, identities = self._profiles("a", "gone", "unsure")
+        asked, exists = self._describes({"gone": False, "unsure": None})
+        report, _, deleted = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1")]},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(sorted(asked), ["gone", "unsure"])
+        self.assertEqual(deleted, ["cluster-gone"])
+        self.assertEqual(report["skipped_error"], ["cluster-unsure"])
+        self.assertEqual(report["kept"], ["cluster-a"])
+
+    def test_a_partial_list_cannot_delete_a_live_cluster(self):
+        # The safety property: the list leaves out a cluster that exists (filtered, cut short,
+        # or simply wrong). Absence from it is not a NotFound, so the describe decides, and a
+        # live answer keeps the profile.
+        profiles, identities = self._profiles("a", "omitted")
+        asked, exists = self._describes({"omitted": True})
+        report, _, deleted = self._run(None, {self.MGMT: [(self.MGMT, "a", "us-central1")]},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(asked, ["omitted"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-omitted"])
+
+    def test_a_failed_list_describes_every_profile_in_the_project(self):
+        profiles, identities = self._profiles("a", "b")
+        asked, exists = self._describes({"a": True, "b": None})
+        report, _, deleted = self._run(None, {self.MGMT: (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=profiles, identities=identities, exists=exists)
+        self.assertEqual(sorted(asked), ["a", "b"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertEqual(report["skipped_error"], ["cluster-b"])
+
+    def test_an_asset_inventory_member_is_still_described(self):
+        # The index lags, and a member's describe is the one call that sees an IAM deny on
+        # its project, so index rows are not evidence here.
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        profiles, identities = self._profiles("prod", project="team-a")
+        asked, exists = self._describes({"prod": True})
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=profiles, identities=identities, exists=exists,
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(asked, ["prod"])
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-prod"])
 
 
 class ProjectSourceTest(unittest.TestCase):

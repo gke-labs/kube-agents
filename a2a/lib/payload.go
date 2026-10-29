@@ -460,7 +460,7 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 // them (the executor's log names each card). truncated says the
 // conversation had more open cards than one stop takes, so some may still
 // be open; deadline that the stop ran out of time. listsCut says only that
-// the executor cut stopped or settled to fit the part, each at
+// the executor cut stopped, settled or notStopped to fit the part, each at
 // CardStopListMax, so the list that was cut is one at that length: the
 // cards themselves are as the counts say. A stop that found nothing open answers empty lists.
 // A stop that failed answers no part: its terminal is failed, and the
@@ -486,6 +486,10 @@ type CardStopResult struct {
 	Truncated  bool           `json:"truncated"`
 	Deadline   bool           `json:"deadline"`
 	ListsCut   bool           `json:"listsCut"`
+	// NotStopped names the cards Failed, Pending and Unresolved count, in that
+	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
+	// older executor's result, which reads as none named.
+	NotStopped []CardStopCard `json:"notStopped,omitempty"`
 }
 
 // CardStopCard is one card a result names. PriorStatus is set on a stopped

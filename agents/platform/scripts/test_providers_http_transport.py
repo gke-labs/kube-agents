@@ -482,6 +482,32 @@ class BrokerBuildsItTest(unittest.TestCase):
             built.api("GET", "user")
         self.assertEqual([3.0, 1.0], opener.timeouts)
 
+    def test_a_scheme_http_forge_passes_allow_http_to_transport_and_git_runner(self):
+        opener = Opener({})
+        recorded = []
+
+        def recording_git_runner(argv, cwd, check=True, config=(), **kwargs):
+            recorded.append((argv, cwd, check, config, kwargs))
+            return None
+
+        broker = vcs_broker.VcsBroker(
+            self.root, git_runner=recording_git_runner, http_opener=opener
+        )
+        http_forge = _HttpForge(api_url="http://gitea.gitea.svc.cluster.local:3000/api/v1")
+        http_forge.scheme = "http"
+        built = broker._transport(http_forge, "acme/infra")
+        self.assertIsInstance(built, HttpTransport)
+        built.api("GET", "user")
+
+        https_forge = _HttpForge(api_url="http://gitea.gitea.svc.cluster.local:3000/api/v1")
+        with self.assertRaisesRegex(ValueError, "https"):
+            broker._transport(https_forge, "acme/infra")
+
+        broker._git_for(http_forge, "acme/infra")(self.root, "status")
+        broker._git_for( _HttpForge(), "acme/infra")(self.root, "status")
+        self.assertEqual({"allow_http": True}, recorded[0][4])
+        self.assertEqual({}, recorded[1][4])
+
     def test_the_reach_question_goes_through_the_forges_own_transport(self):
         # Review round 3: the one line joining the startup diagnostic to the
         # forge was replaced by a Mock in every test that reached it.

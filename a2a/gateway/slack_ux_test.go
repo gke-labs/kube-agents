@@ -115,6 +115,28 @@ func clickPayload(t *testing.T, user, team, channel, thread, actionID, label, va
 	return raw
 }
 
+// A choice click in the shape Slack documents for block_actions carries its
+// action_ts inside the action; it is still a turn, keyed by that timestamp.
+func TestSlackClickInTheDocumentedPayloadShapeIsATurn(t *testing.T) {
+	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
+	raw, err := json.Marshal(map[string]any{
+		"type":    "block_actions",
+		"user":    map[string]any{"id": "U1", "team_id": "T1"},
+		"team":    map[string]any{"id": "T1"},
+		"channel": map[string]any{"id": "C1"},
+		"message": map[string]any{"ts": "50.0", "thread_ts": "40.0", "text": "Which one?", "blocks": json.RawMessage(uxQuestionBlocks)},
+		"actions": []any{map[string]any{"type": "button", "action_id": "kage.choice.0", "value": "Option A: restart",
+			"text": map[string]any{"text": "Option A"}, "action_ts": "62.0"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, ok := a.interactive(raw)
+	if !ok || msg.MessageID != "62.0" || msg.Text != "Option A: restart" {
+		t.Fatalf("turn = %+v, %v; want the click as a turn keyed by the action's action_ts", msg, ok)
+	}
+}
+
 func TestSlackClickIsATurnFromTheClicker(t *testing.T) {
 	api := &fakeSlackAPI{}
 	a, _ := newUXSlackAdapter(api)
@@ -196,6 +218,48 @@ func TestSlackClickThatIsNotOursIsNoTurn(t *testing.T) {
 	}
 	if _, ok := a.interactive(json.RawMessage(`{"type":"view_submission"}`)); ok {
 		t.Error("a view submission is not a click")
+	}
+}
+
+func TestSlackClickFromAListedGuestIsATurn(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetAllowedGuests([]string{"T2:U9"})
+	msg, ok := a.interactive(clickPayload(t, "U9", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "65.0"))
+	if !ok || msg.AuthorID != "T2:U9" {
+		t.Fatalf("a listed guest's click = (%+v, %v), want a turn authored T2:U9", msg, ok)
+	}
+	if _, ok := a.interactive(clickPayload(t, "U8", "T2", "C1", "41.0", "kage.choice.0", "Option A", "x", "66.0")); ok {
+		t.Error("an unlisted member of the same workspace clicked through")
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "`T2:U8`") {
+		t.Errorf("posts = %+v, want one notice naming the entry T2:U8", api.posted)
+	}
+}
+
+func TestSlackClickGuestWorkspaceFields(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetAllowedGuests([]string{"T2:U9"})
+	withTeams := func(raw json.RawMessage, userTeam, team string) json.RawMessage {
+		var p map[string]any
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		p["user"].(map[string]any)["team_id"] = userTeam
+		p["team"].(map[string]any)["id"] = team
+		out, _ := json.Marshal(p)
+		return out
+	}
+	// Only the click's team names the workspace: matched by it.
+	teamOnly := withTeams(clickPayload(t, "U9", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "67.0"), "", "T2")
+	if msg, ok := a.interactive(teamOnly); !ok || msg.AuthorID != "T2:U9" {
+		t.Errorf("a listed guest named only by team.id = (%+v, %v), want T2:U9", msg, ok)
+	}
+	// The two fields disagree: no entry matches.
+	disagree := withTeams(clickPayload(t, "U9", "T2", "C1", "41.0", "kage.choice.0", "Option A", "x", "68.0"), "T2", "T3")
+	if _, ok := a.interactive(disagree); ok {
+		t.Error("a click whose two workspace fields disagree was admitted")
 	}
 }
 

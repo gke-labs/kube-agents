@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-This is the core. It answers one tool, `connection_status`; the tools that send turns, steer tasks and read topics come in later changes.
+It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `send_message` and `task_control`, and `manage_session`, and serves the workstation bridge's swarm view. Further tools come in later changes.
 
 ## Turn it on
 
@@ -11,6 +11,8 @@ The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
 - `<agent>-a2a-mcp-token`: the bearer token callers present, minted once by the operator.
+
+The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and its token Secret, `<agent>-a2a-mcp-token`. If either name is already taken by an object the operator does not control, the server is not rendered and the PlatformAgent carries the `A2AMCPServer` condition ([conditions](../../docs/site/src/content/docs/operator/platformagent-crd.md)).
 
 Unset the flag and all of it is removed, the token included.
 
@@ -32,8 +34,48 @@ Point an MCP client at `http://localhost:8089/mcp` with the header `Authorizatio
 
 A request that names an MCP revision this server doesn't speak (the `MCP-Protocol-Version` header) is refused with 400; a request without the header is served.
 
-To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute.
+To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute. A value that is blank, or holds a byte no request header could carry (a line break or another control character other than a tab), is replaced: the operator mints a new token over it.
 
 ## What it reads
 
+`inspect_pr` reads one pull or merge request, with its comments and diff, from a repository the install manages. It asks the credential broker's `proposal-view` with the pod's own projected token, so it works on GitHub and GitLab and the pod holds no forge credential; the broker refuses any repository outside the install's managed list, and the token's role reaches that one read and nothing else. The tool is offered only when the operator has wired the broker in (`A2A_MCP_BROKER_URL`). Everything the pull request's authors wrote, its title, description, comments and diff, is shown as data: fenced, capped on line boundaries with a count of what was cut, control and bidi characters shown as `<U+XXXX>`, and introduced by a line saying it is the authors' content.
+
 `connection_status` reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the platform agent are consuming, and the agents registered on `DIRECTORY`. It reads all of it through the console's grants, at most once every five seconds whatever the call rate. Agent names and descriptions are shown as code, as published, shortened.
+
+`read_topics` reads the install's standing topics and agent cards, through the same grants. `list` shows every topic provisioned on `TOPICS-STATE` and `TOPICS-JOURNAL` with its newest entry, or that it has none yet (up to 256 per stream; past that the list says so). `read` shows one topic: a state topic's latest entry, or a journal topic's newest 16 entries from the last 1024 messages of its stream, or its latest entry alone if none falls in that window. `cards` shows the agent cards on `DIRECTORY`. A topic is named by its name, `shared.<name>` or `agent.<agent>.<name>`, or its subject; a bare name that several topics share is refused as ambiguous. A name that is not dot-separated subject tokens is refused before the bus is asked, and one that names no provisioned topic is refused before any consumer is opened. A repeated call within five seconds is answered from the last read. Entries are written by agents and shown as quoted data: one line each in the list, fenced and capped at 2 KiB per summary and per data block in a read. Every caller reads every topic the console can.
+
+## The swarm view
+
+`POST /mcp/swarm` serves the workstation bridge's swarm view (gke-labs/kube-agents#3689): the bridge posts its conversation table, its subagent lineage and the board ledger it kept from the last call, and gets back the members, new board posts and view it writes into Antigravity's Swarm UI. It sits behind the same `Origin` refusal and bearer token as `/mcp`, takes JSON of at most 1 MiB (413 past it), and answers 400 to a body that isn't a swarm request or that names more than 512 conversations or more than 512 subagents.
+
+It projects only the conversations the request names. This server's own conversation names only resolve them: where the server holds a request entry's name, the conversation is the server's, since that is where the name's turns went, so the server's token is used and returned; the entry keeps the bridge's name and every other field the bridge sent. An entry whose name or token isn't valid is dropped, and `notes` says how many were. The server's other names are neither shown nor returned.
+
+It reads, bounded:
+
+- the newest 4096 messages on `TASKS`, keeping those from the last hour, in one drain within a bus read's 4 MiB budget. When the hour holds more messages than that, the oldest are the ones not read. When the messages hold more bytes than the budget, the drain, which reads oldest first, stops before the newest, so the newest tasks and states may be missing. Either way `notes` says so. A read cut short (by the budget, its deadline or its caller), or skipped because the server's bus readers are busy, is still answered with a line in `notes`, and isn't kept for the next call;
+- the agent cards, from the same cached read `connection_status` uses.
+
+A call holds at most one bus reader, and concurrent calls share a complete read: one `TASKS` read answers every call for three seconds. A read cut short (by the budget, its deadline or its caller) isn't shared, so on an install past the budget every call reads again, and the swarm view can take readers the turn tools need (tracked in #4219).
+
+It keeps only the tasks of those conversations, and the tasks delegated from them. A task submitted before the hour that took a follow-up message inside it is still shown, since it is live, but without a prompt: the follow-up isn't its submission. A task whose submission is older than the read's start (the hour, or the newest 4096 messages) isn't shown even while it runs, since the conversation it belongs to is only on its submission.
+
+It never reads the request's `deployment`: the server takes no endpoint or credential from a client, and always answers for the install it runs in (`deploymentIgnored: true`). Pending push events aren't served yet (`pendingEventsServed: false`, `pendingEvents: []`).
+
+## Conversations
+
+Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). A token given where a name goes, in either form, names that conversation too, whether or not this server still holds a name for it. There is no server-wide active conversation.
+
+Names are this server's memory only, and they're shared:
+
+- A restart forgets them, and so does the table itself past 1024 names, starting with the least recently used. A conversation resumes by its token either way.
+- Every caller holds the same bearer token, so every caller sees and can use every name.
+- A name is at most 128 characters, and holds nothing `list` couldn't show back as typed: no backticks, pipes, control or invisible characters, spaces at either end, doubled or other than the plain space, and nothing spelled like a token (`mcp` and 24 lower-case hex digits).
+
+`manage_session` handles the names and the console's control turns:
+
+- `list`: the named conversations, most recently used first, with token, description and last use;
+- `new`: create a name, with an optional description of at most 200 characters; an existing name is refused;
+- `delete`: forget a name, given as the name or as the conversation's token. The conversation's history stays on the bus, and a `/session` worker for it idles out by itself. To end one now, stop its running task and send `session_off` first;
+- `session_on`, `session_off`, `help`: send `/session`, `/session off` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `help` is a message to the agent, sent like any other: while the conversation's turn is still running it waits for it to end, as a second `send_message` does.
+
+The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered, and neither is `status` yet: sent as a message, it would wait out a running turn rather than report its progress, so it comes back once it can (read a task's progress with `task_control get` meanwhile). A call to one is answered with an error that says why.

@@ -312,6 +312,11 @@ func TestSlackNotifyRefusesInteractiveBlocks(t *testing.T) {
 		"accessory":     `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"button","text":{"type":"plain_text","text":"Go"},"action_id":"b"}}]`,
 		"select":        `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"static_select","action_id":"c","options":[]}}]`,
 		"input":         `[{"type":"input","label":{"type":"plain_text","text":"y"},"element":{"type":"plain_text_input","action_id":"d"}}]`,
+		// A rating block a sender wrote would rate under a task id it chose.
+		// The element alone, under a block that is otherwise allowed.
+		"rating element": `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"feedback_buttons","action_id":"kage.feedback","positive_button":{"text":{"type":"plain_text","text":"Good"},"value":"up"},"negative_button":{"text":{"type":"plain_text","text":"Bad"},"value":"down"}}}]`,
+		"icon button":    `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"icon_button","action_id":"kage.feedback","icon":"trash","text":{"type":"plain_text","text":"x"}}}]`,
+		"rating block":   `[{"type":"context_actions","block_id":"kage.feedback.t-1","elements":[{"type":"feedback_buttons","action_id":"kage.feedback","positive_button":{"text":{"type":"plain_text","text":"Good"},"value":"up"},"negative_button":{"text":{"type":"plain_text","text":"Bad"},"value":"down"}}]}]`,
 	} {
 		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); !strings.Contains(got.Error, "interactive") {
 			t.Errorf("%s: reply = %+v, want an interactive refusal", name, got)
@@ -363,3 +368,29 @@ func TestSlackNotifyTextPostsDoNotUnfurl(t *testing.T) {
 
 var _ notifyPoster = (*SlackAdapter)(nil)
 var _ notifyBlocksPoster = (*SlackAdapter)(nil)
+
+func TestSlackNotifySetHomeArmsHomePosts(t *testing.T) {
+	home := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(home, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != notifyNoHome {
+		t.Fatalf("home post before SetHome = %+v, want %q", got, notifyNoHome)
+	}
+	if err := n.SetHome("D0DM"); err == nil {
+		t.Error("a DM was accepted as the home channel")
+	}
+	if err := n.SetHome(testSlackHome); err != nil {
+		t.Fatal(err)
+	}
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "drift"}); got.Error != "" {
+		t.Fatalf("home post after SetHome = %+v", got)
+	}
+	if posts := home.all(); len(posts) != 1 || posts[0].space != testSlackHome {
+		t.Errorf("posts = %+v, want one in %s", posts, testSlackHome)
+	}
+	if !n.slackThreadOK(testSlackHome + "/1.2") {
+		t.Error("a thread of the learned home was refused")
+	}
+}

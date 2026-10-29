@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -179,10 +180,17 @@ type Gateway struct {
 	usage usageSource
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
+	// feedback is the answer-feedback recorder, set by Run once the
+	// feedback bucket is found (startFeedback); nil leaves answers unmarked.
+	feedback atomic.Pointer[feedbackDesk]
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
 	consoleResults consoleResultStash
+	// consoleCardsPending marks a console chain end whose task handed work
+	// to kanban cards (lib.ArtifactHandoff), from the relay's terminal to
+	// the frame (consoleFrame); the value is unused.
+	consoleCardsPending consoleResultStash
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -534,6 +542,11 @@ func New(o Options) (*Gateway, error) {
 			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
 		}, busBoardReader(o.Client))
 	}
+	// The board-health card's Retry and Drop, over the same route
+	// (slack_board.go); the adapter admits the presser by the Home tab's rule.
+	if sink, ok := o.Adapter.(BoardActSink); ok {
+		sink.SetBoardActor(busBoardActor(o.Client))
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
@@ -570,6 +583,9 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
+	// Its first try before the relay starts, so on an install with the
+	// bucket every answer the relay posts is marked alike.
+	g.startFeedback(ctx)
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
@@ -815,7 +831,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// Nor for a shortcut: the conversation is a thread under someone
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
-		notified := msg.Unaddressed || msg.Shortcut
+		//
+		// Nor for a press of Slack's Stop button: it asked the bot for
+		// nothing, and the notice would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
@@ -998,6 +1017,14 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
+	case stopping && isSlackStop(msg, backend) &&
+		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
+		// Only the people who asked for work in a Slack thread may press
+		// its Stop button (stopgate.go). Anyone else's press cancels
+		// nothing and posts nothing. A typed `stop` keeps the rule below.
+		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
+	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
+		g.slackStop(ctx, rec, authority, backend)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -1276,6 +1303,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
+		// A console client is told the task handed work to cards, as the
+		// relay tells it (relayTerminal): the fold read here carries the
+		// handoff too, so a heal-found end is not the one path without it.
+		if isConsoleConversation(rec.Key) && handedOff(task.State, foldHandedOff(task)) {
+			root, _ := rec.observedAs(active.TaskID)
+			g.consoleCardsPending.put(root, "")
+		}
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
 		// root's end comes from the wake below or, with no wake, from
@@ -1356,11 +1390,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
 		// that ran the heal then routes against the wake as its active task.
+		// As the relay does: a task, a human turn or a child, that handed
+		// the ask to cards leaves the answer, and its rating, to the card's
+		// report (AnswerFeedbackTarget rates only such a chain).
+		toCards := healedTask != nil &&
+			(cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask)))
+		if toCards {
+			rec.markCardsAnswer(active.TaskID)
+		}
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1676,6 +1718,13 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
+	if chainUsageAsked(ctx) {
+		readTask := task
+		if terr != nil {
+			readTask = nil
+		}
+		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
+	}
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -1699,6 +1748,69 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 	}
 	return state, nil
+}
+
+// chainUsage is what taskID's turns cost, from the usage artifact's parts
+// summed (lib.UsageTotal) per tier. front is the front door's own turns:
+// taskID's stream and, when taskID is a delegation chain's root, every wake
+// that continued it. children is the chain's child tasks, the addressees the
+// front door delegated to (the platform router that files the cards among
+// them). Either is nil when none of its turns published usage. partial
+// reports that a link's stream could not be read, so the sums leave out
+// whatever that link cost. The stream the probe already folded (read,
+// readTask; nil when it found no events) is not read twice.
+func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) (front, children *lib.Usage, partial bool) {
+	links := []TaskRef{{ID: taskID}}
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		links[0] = ref
+		if ref.Role != taskRoleChild && ref.rootID() == taskID {
+			for _, other := range rec.Tasks {
+				if other.ID != taskID && other.rootID() == taskID {
+					links = append(links, other)
+				}
+			}
+		}
+	}
+	var frontTurns, childTurns []lib.Usage
+	for i, link := range links {
+		folded := readTask
+		if link.ID != read {
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			switch {
+			case err == nil:
+				folded = t
+			case isTaskNotFound(err):
+				folded = nil
+			default:
+				partial = true
+				continue
+			}
+		}
+		if folded == nil {
+			continue
+		}
+		for _, p := range artifactParts(folded, lib.ArtifactUsage) {
+			u, ok := lib.UsageOf(p)
+			if !ok {
+				continue
+			}
+			if i > 0 && link.Role == taskRoleChild {
+				childTurns = append(childTurns, u)
+			} else {
+				frontTurns = append(frontTurns, u)
+			}
+		}
+	}
+	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// usageSum is turns folded by lib.UsageTotal, or nil when there are none.
+func usageSum(turns []lib.Usage) *lib.Usage {
+	if len(turns) == 0 {
+		return nil
+	}
+	total := lib.UsageTotal(turns)
+	return &total
 }
 
 // retireIncarnation deletes the record's lingering session pod before a
@@ -2018,6 +2130,7 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 		return
 	}
 	delivered, ok := g.consoleResults.take(taskID)
+	_, cardsPending := g.consoleCardsPending.take(taskID)
 	text := terminalNotice(state, reason)
 	// An end the gateway declared itself carries no executor reason; its
 	// frame says what the page's notice says rather than the bare line.
@@ -2044,6 +2157,7 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 	// without a mark; only a frame that failed to go out is logged.
 	if err := poster.PostTerminal(rec.Key, ConsoleTerminal{
 		TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
+		CardsPending: cardsPending && state == lib.StateCompleted,
 	}); err != nil && !errors.Is(err, errNoTerminalFrames) {
 		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
@@ -2686,6 +2800,14 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // terminal event for a task it doesn't supervise; it just stops letting that
 // task serialize new ones. It reports whether the cancel reached the bus.
 func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority Authority) bool {
+	return g.cancelTaskVoiced(ctx, rec, authority, false)
+}
+
+// cancelTaskVoiced is cancelTask, and quiet posts neither of its lines: the
+// Slack Stop button's path (slack_stop.go) answers with one reply of its own,
+// and marks the task so the relay posts no "canceled" for it either
+// (TaskRef.QuietCancel).
+func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, authority Authority, quiet bool) bool {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
 		lib.WithTo(lib.Party{Session: rec.Addressee}),
@@ -2696,7 +2818,9 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("cancel publish failed", "taskId", active.TaskID, "err", err)
-		g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+		if !quiet {
+			g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+		}
 		return false
 	}
 	active.Detached = true
@@ -2709,10 +2833,14 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 	// residue; replaying the in subject for the cancel envelope is the
 	// close if it ever bites.
 	rec.MarkCanceled(active.TaskID)
-	// The post before the signal: a waiter woken by the signal snapshots the
-	// conversation's entries, and the line saying the cancel went belongs in
-	// what it reads.
-	g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	if quiet {
+		rec.markQuietCancel(active.TaskID)
+	} else {
+		// The post before the signal: a waiter woken by the signal snapshots
+		// the conversation's entries, and the line saying the cancel went
+		// belongs in what it reads.
+		g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+	}
 	g.observeCancel(rec, active.TaskID)
 	return true
 }

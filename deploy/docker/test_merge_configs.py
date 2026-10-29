@@ -149,7 +149,7 @@ class RealConfigTest(unittest.TestCase):
         # `agent:` is set by both files -- the base for environment_probe, the
         # overlay for max_turns. A replace-rather-than-merge would lose one.
         self.assertIs(False, self.merged["agent"]["environment_probe"])
-        self.assertEqual(250, self.merged["agent"]["max_turns"])
+        self.assertEqual(150, self.merged["agent"]["max_turns"])
 
     def test_no_agent_common_toolset_survives_the_merge(self):
         # Both copies had to be deleted; this is the assertion that says so.

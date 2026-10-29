@@ -48,10 +48,11 @@ for a new cluster whose workload states no requirement it cannot meet.
     them) as the configuration the pull request will carry.
 6.  **Propose**: Write the configuration as a pull request in the format the
     GitOps repository's `provisioning/` path already holds: Config Connector
-    YAML through the `gcp-config-connector` skill. A Terraform repository, an
-    empty `provisioning/` path, or no usable repository is a stated stop
-    (`SOUL.md` §3, items 6 and 7). Never create the cluster directly: the
-    `gke` MCP server offers no create tool, and the broker refuses
+    YAML through the `gcp-config-connector` skill, Terraform HCL through the
+    `gcp-terraform` skill. An empty `provisioning/` path or no usable
+    repository is a stated stop (`SOUL.md` §3, items 6 and 7). Never
+    create the cluster directly: the `gke` MCP server offers no create
+    tool, and the broker refuses
     `gcloud container clusters create`.
 7.  **Track**: Once the pull request merges and the reconciler starts the
     create, use `get_operation` to monitor its progress.

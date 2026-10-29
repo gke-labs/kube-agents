@@ -11,63 +11,69 @@
 # against the target. A runtime below the floor is a risk only on a pool the
 # target moves to cgroup v2. The seeded fleet's pools were created at 1.26 or
 # later, so they already run cgroup v2, and the rule reports the JDK 8u302
-# image in its note: already on cgroup v2, not an upgrade risk. The declared
-# line therefore reads `blocks the upgrade: no`, and the case grades that the
-# agent names the Deployment from the report and does not call it a blocker.
-# The risk path, a cgroup v1 pool the target migrates, is covered by the
-# rule's unit tests; this fleet cannot show it.
+# image in its note: already on cgroup v2, not an upgrade risk. The case
+# grades that the agent found the rule's note for the Deployment in the report
+# and copied it as printed. The risk path, a cgroup v1 pool the target
+# migrates, is covered by the rule's unit tests; this fleet cannot show it.
 #
 # What the deterministic checks read, and what they leave to the judge. The
-# prompt asks for one fixed-form line per seeded cluster, "<cluster>:
-# cgroup-v2-runtime: <object kind namespace/name|none>; blocks the upgrade:
-# <yes|no|none>; cell: <the rule's text for that cluster|none>", the shape the
-# per-cluster readiness cases use (upgrades-readiness-surge-capacity), and the
-# checks read those lines and nothing else; the prose, the reason the rule
-# gives, and the recommended remedy are the judge's, against
-# `expected_output`. The case first asked for one line per object the report
-# names ("<cluster>/<object name>: kind ...; blocks the upgrade: ...; cell:
-# ..."), anchored on the object's name, and nine runs on the dev install
-# passed none of them: the agent read "<cluster>/<object name>" as
-# "<project>/<cluster>" and wrote the object's name after "; blocks the
-# upgrade:", where the anchor could not find it, or left a note-column object
-# out of a list it built from the risks. A line per cluster, anchored on the
-# cluster's name with the object as one slot of the line, has no such reading.
-# Slot a's line must name the planted Deployment and read `blocks the upgrade:
-# no`, and its cell slot must carry the rule's own text, wording only the rule
-# produces (`cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm
-# container <name> runs docker.io/library/eclipse-temurin:8u302-b08-jre (JDK
-# 8u302, below 8u372) on pool <pool>`), which the skill paraphrases and a hand
-# kubectl survey cannot supply; a report whose rule is missing prints no such
-# entry, so the slot reads `none` or another rule's text and the line fails
-# there whatever the verdict says. The rule prints one entry per pool the
-# template can land on, so slot a's note column may carry one per pool; the
-# cell slot needs one of them, whole or with the others around it. The other
-# three slots read `none` in every slot: the fleet's only Java or .NET image
-# is cgroup-blind-jvm's (bench/tf/fleet/defects-*.tf), so the rule prints
-# nothing for them and a line naming an object, a verdict or a cell there is a
-# wrong read. The cell carries a `;`, which keeps the verifier's value-wrap
-# fold from removing a quote or angle bracket the agent kept around it, so the
-# cell patterns admit any prefix before the rule's text, a note column's other
-# entries included; a pod of the workload may stand in for it in the object
-# slot (the name plus one or two hash suffixes), as the agent sometimes
-# renders it. Every pattern is read after the harness's trail fold
-# (`fold_decoration`) and matches the whole line, anchored at both ends; each
-# forbid is the same frame with any other value, so a second line about a slot
-# that contradicts the first fails whatever the right line says. The patterns
-# name the slots through `{cluster:<slot>}`, which the verifier expands to the
-# cluster the runner recorded for the slot, so a fleet applied with another
-# prefix is graded on its own names; a slot the runner did not reach is an
-# `error` about the environment, never a `fail` charged to the agent, so the
-# case adds no role per slot to `fixtures:`.
+# prompt asks for one declared line per seeded cluster in the rule's own cell
+# form, "<cluster>: cgroup-v2-runtime: <the rule's entry for that cluster,
+# copied as printed|none>", the form the readiness cases of #3575 use
+# (upgrades-readiness-lb-drain-timeout, upgrades-readiness-orphan-node), and
+# the checks read those lines and nothing else; the prose, the reason the rule
+# gives, and the recommended remedy are the judge's, against `expected_output`.
+# The rule prints one note per pool the template can land on, and
+# cgroup-blind-jvm names no pool, so slot a's note column carries one per pool
+# of the cluster (default-pool, idle-batch-pool and pinned-inference-pool),
+# each reading `cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm
+# container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre (JDK
+# 8u302, below 8u372) on pool <pool>, already on cgroup v2; not an upgrade
+# risk` (NOTE_ALREADY in cgroup_v2_runtime.py). Slot a's line is one or more
+# of those notes, each whole with its pool open, separated by `; ` as the note
+# column joins them: wording only the rule produces, which the skill
+# paraphrases and a hand kubectl survey cannot supply; a report whose rule is
+# missing prints no such entry, so the line reads `none` or a composed one and
+# fails, and so does a line that merges the pools into one note. The other
+# three slots read `none`: the fleet's only Java or .NET image is
+# cgroup-blind-jvm's (bench/tf/fleet/defects-*.tf), so the rule prints nothing
+# for them and any entry there is a wrong read, the planted note copied onto
+# another cluster included. The table's `cgroup-v2-runtime: ` prefix is
+# optional on each note (the JSON carries the prefixed string in `notes[]`);
+# one opener before the text (a quote or angle bracket the agent kept) is
+# admitted, since the `;` inside the note keeps the verifier's value-wrap fold
+# from removing it; the whole line is lower-cased. Every pattern is read after
+# the harness's trail fold (`fold_decoration`) and matches the whole line,
+# anchored at both ends; each forbid is the same frame, with the rule id on the line, with any other value,
+# so a second line about a slot that contradicts the first fails whatever the
+# right line says. The patterns name the slots through `{cluster:<slot>}`,
+# which the verifier expands to the cluster the runner recorded for the slot,
+# so a fleet applied with another prefix is graded on its own names.
+#
+# Why this form (ported 2026-10-23, #3722). The case first asked for
+# "<cluster>: cgroup-v2-runtime: <object kind namespace/name|none>; blocks the
+# upgrade: <yes|no|none>; cell: <text|none>", whose object and verdict slots
+# graded the agent's reading of the rule's entry rather than the entry. The
+# sibling upgrades-fleet-readiness-node-local-state, in the same form, went
+# red on `main` ed906222c (2026-10-22 19:02Z, dev install) with the right
+# report in hand: the worker's one `jq` over `.members[].readiness` indexed
+# `.rule` and `.text` on `readiness.notes[]`, which are strings of the form
+# `<rule id>: <text>` (RULE_PREFIX_FORMAT in upgrade_readiness.py) while
+# `rule_blocking[]`, `risks[]` and `unknown[]` are objects, failed with
+# `Cannot index string with string`, and the worker answered `none` in every
+# slot. The line is now the rule's cell as printed, and the prompt says where
+# in the JSON it is and what shape each list has.
 #
 # Planted defect required: on slot a, the Deployment cgroup-blind-jvm in
 # seeded-shapes, one replica, running eclipse-temurin 8u302 under a memory
 # limit (role `cgroup-blind-runtime` in bench/tf/fleet/fixtures.json). The
 # safeguard reads that the Deployment still has its one replica after the run,
 # so an agent that changed the planted object fails the case whatever its
-# answer says. No `worker_commands` objective: it reads delegated workers'
-# terminals only and errors on a run the router answered itself, so the
-# report's own output is graded through the cell slot instead, as
+# answer says. The four roles beside it, one per slot, are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have. No `worker_commands` objective: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead, as
 # upgrades-readiness-zonal-control-plane does.
 #
 # Isolation class: read-only (chat prompt; the readiness script reads with
@@ -80,33 +86,37 @@ prompt: >-
   release channel's default version. For each cluster, report what blocks the
   upgrade and what is at risk. Read only: do not change, upgrade or remove
   anything. End your answer with one line per seeded cluster in exactly this
-  form, no other words on the line: "<cluster>: cgroup-v2-runtime: <object
-  kind namespace/name|none>; blocks the upgrade: <yes|no|none>; cell: <the
-  rule's text for that cluster copied as printed|none>". The cell is the
-  cgroup-v2-runtime rule's text for that cluster, copied from the readiness
-  report's note column (or, for a risk or a blocker, its risks or other
-  blockers column) or from the member's row in the report's JSON
-  (readiness.notes, readiness.risks), as printed and not paraphrased; a
-  cluster the rule prints nothing for reads none in every slot. Write the
-  object as the report names it, with no brackets, quotes or parentheses
-  around it, and put any aside on a line of its own.
+  form, no other words on the line: "<cluster>: cgroup-v2-runtime: <the
+  cgroup-v2-runtime rule's entry for that cluster, copied as printed|none>".
+  The entry is the rule's own text for that cluster as the readiness report
+  prints it: in the readiness table, the text behind `cgroup-v2-runtime: ` in
+  the note column (or, for a risk or a blocker, in the risks or other blockers
+  column); in the report's JSON, the member's `readiness.notes[]` entry that
+  starts with `cgroup-v2-runtime: `, or the `readiness.risks[]` or
+  `readiness.rule_blocking[]` object whose `rule` is `cgroup-v2-runtime` (the
+  notes are strings, each prefixed with its rule's id; those two lists, like
+  `readiness.unknown[]`, hold objects with `rule` and `text`). Copy the text,
+  not a paraphrase and not values you composed from kubectl; when the rule
+  prints several entries for one cluster, keep one line and copy them in the
+  order printed, separated by "; "; a cluster the rule prints nothing for
+  reads none.
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-a it names
   the Deployment cgroup-blind-jvm in seeded-shapes: its image
   docker.io/library/eclipse-temurin:8u302-b08-jre is a JDK below 8u372, the
-  first update that reads cgroup v2. It says the pool already runs cgroup v2,
+  first update that reads cgroup v2. It says the pools already run cgroup v2,
   so the upgrade changes nothing for the JVM; the report carries it in its
-  note column, not as a risk or a blocker. It recommends a JDK at 8u372 or
-  later, or explicit heap flags. Other clusters' blockers and risks come from
-  the same run. It ends with one declared line per seeded cluster: for
-  seeded-a "seeded-a: cgroup-v2-runtime: Deployment
-  seeded-shapes/cgroup-blind-jvm; blocks the upgrade: no; cell:
-  cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm
-  runs docker.io/library/eclipse-temurin:8u302-b08-jre (JDK 8u302, below
-  8u372) on pool default-pool, already on cgroup v2; not an upgrade risk", the
-  cell copied from the report's note column, and for seeded-b, seeded-c and
-  seeded-d "cgroup-v2-runtime: none; blocks the upgrade: none; cell: none". It
-  cites no CVE identifiers and changes nothing.
+  note column, one note per pool the Deployment can land on, not as a risk or
+  a blocker. It recommends a JDK at 8u372 or later, or explicit heap flags.
+  Other clusters' blockers and risks come from the same run. It ends with one
+  declared line per seeded cluster: for seeded-a "seeded-a: cgroup-v2-runtime:
+  Deployment seeded-shapes/cgroup-blind-jvm container jvm runs
+  docker.io/library/eclipse-temurin:8u302-b08-jre (JDK 8u302, below 8u372) on
+  pool default-pool, already on cgroup v2; not an upgrade risk", followed on
+  the same line, after "; ", by the same note for idle-batch-pool and
+  pinned-inference-pool as the report prints them, and for seeded-b, seeded-c
+  and seeded-d "cgroup-v2-runtime: none". It cites no CVE identifiers and
+  changes nothing.
 infrastructure:
   deployer: noop
 validated: false
@@ -118,16 +128,22 @@ domain: upgrades
 owner: haoxuw
 
 # Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
-# docs/designs/bench-fleet-catalog.md is the rule.
+# docs/designs/bench-fleet-catalog.md is the rule. The planted role first,
+# then one role per slot, which is how the declared-line objectives tell a
+# cluster the agent missed from a cluster the project does not have.
 fixtures:
   - cgroup-blind-runtime
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
 
 verification_spec:
   # One line per seeded cluster, fixed vocabulary, the cluster named at the
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -138,15 +154,23 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - cgroup-blind-runtime
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?[^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?[^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?[^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?[^\n]+$)'
 
-  # The verdict this case exists for: slot a's line names cgroup-blind-jvm and
-  # reads no; the forbid is the same frame with any other object or verdict,
-  # so a line that promotes it, leaves it out or reads none fails here
-  # whatever the prose says. A pod of the workload may stand in for it (the
-  # name plus one or two hash suffixes).
-  - name: the-planted-object-is-named-and-does-not-block
+  # The entry this case exists for: slot a's line is the rule's note for
+  # cgroup-blind-jvm in the rule's words, one note per pool, each whole with
+  # the pool's name open, joined by `; `. A report whose rule is missing
+  # prints no such entry, so the line reads `none` or something the agent
+  # composed and fails here; so does a note cut short, a paraphrase, the pools
+  # merged into one note, or the Deployment promoted to a risk in words of the
+  # agent's. The table's `cgroup-v2-runtime: ` prefix is optional on each
+  # note; one opener before the text is admitted; the forbid is the same frame
+  # with any other value.
+  - name: the-planted-clusters-line-quotes-the-rules-note
     role: objective
     mode: assert
     check:
@@ -154,39 +178,18 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - cgroup-blind-runtime
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: deployment seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!deployment seeded-shapes/cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: )[^\n]*$'
-
-  # The report's own wording: the entry the note column carries for the object
-  # is the rule's text, which the skill paraphrases and a cluster listing
-  # cannot supply. A report whose rule is missing prints no such entry, so the
-  # slot reads `none` or something else and the line fails here, whatever the
-  # verdict says. Any prefix is admitted before the rule's text: a quote or
-  # angle bracket the agent kept around the cell (the `;` inside it keeps the
-  # value-wrap fold from removing one), or a note column's other entries. The
-  # required text stops at the pool's name, so a fleet whose pool is on cgroup
-  # v1 (a risk) or whose pool record carries no mode (an unknown, in the note)
-  # is still graded on the rule's own text.
-  - name: the-planted-objects-line-quotes-the-reports-cell
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      fold_decoration: true
-      fixture_roles:
-        - cgroup-blind-runtime
-      # The `cgroup-v2-runtime: ` prefix is the table's; report.json carries the bare text, so it is optional.
-      any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+[^\n]*$'
-      forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$)[^\n]*$'
 
   # The fleet's only Java or .NET image is cgroup-blind-jvm's, so the rule
-  # prints nothing for slots b, c and d and each reads none in every slot; a
-  # line naming an object, a verdict or a cell there is a wrong read, the
-  # planted finding copied onto another cluster included.
+  # prints nothing for slots b, c and d and each reads none; any entry there
+  # is a wrong read, the planted note copied onto another cluster included.
   - name: the-other-clusters-read-none
     role: objective
     mode: assert
@@ -195,10 +198,15 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - cgroup-blind-runtime
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: none; blocks the upgrade: none; cell: none$)'
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!none; blocks the upgrade: none; cell: none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

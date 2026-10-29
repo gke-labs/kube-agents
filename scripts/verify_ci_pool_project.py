@@ -336,6 +336,10 @@ REQUIRED_APIS = {
     # The observability nightly case reads the install's traces through the
     # broker's relay; the composition enables this for the same reason.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences through the GKE Hub API; the composition
+    # enables it for the same reason.
+    "gkehub.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
 }
@@ -540,8 +544,8 @@ DUPLICATE_DECLARATION_PREFIX = "more than one file declares it ("
 # cleanly: the remedy is the sibling, not a replace of the seed.
 SIBLING_RAISE_PREFIX = "a file beside it under the tree makes the index raise ("
 # The cases that fail on a project whose repository lacks the declaration:
-# the nightly case (#3120 gates its roster return on this seed) and the #2228
-# case parked on this fixture. (The other
+# pdb-remediation-pr (back on the roster since 2026-10-26 on this seed,
+# #3120) and the #2228 case parked on this fixture. (The other
 # #2228 case, obtainability-refusal-direct-mutation, is nightly and only
 # loses its pull-request arm: its inline-proposal arm passes without the file.)
 GITOPS_WORKLOAD_MANIFEST_CASES = (
@@ -696,10 +700,11 @@ PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserv
 
 # The Compute plant sweep (hack/ci_sweep_compute_plants.py, the periodic
 # ci-kube-agents-compute-sweep on main) lists and deletes the plant networks,
-# subnets and addresses that a killed run left in a free project. It holds one
-# project-level custom role with exactly COMPUTE_SWEEP_PERMISSIONS, and nothing
-# else on the project. roles/compute.networkAdmin also covers the sweep, but it
-# holds almost a thousand permissions. A project without the grant fails every
+# subnets, addresses and alert policies that a killed run left in a free
+# project. It holds one project-level custom role with exactly
+# COMPUTE_SWEEP_PERMISSIONS, and nothing else on the project.
+# roles/compute.networkAdmin also covers the sweep, but it holds almost a
+# thousand permissions. A project without the grant fails every
 # sweep there, so the check names the commands that add it -- the provisioning
 # script must not be re-run on a registered project (docs/ci-pool-projects.md
 # sections 5.7 and 8). Kept equal to scripts/provision_ci_pool_project.sh and
@@ -736,6 +741,13 @@ COMPUTE_SWEEP_PERMISSIONS = frozenset({
     # gcloud waits on each delete operation until it is done.
     "compute.globalOperations.get",
     "compute.regionOperations.get",
+    # `gcloud monitoring policies list`, and `policies delete` for a policy the
+    # alert-policy stack labelled managed-by=kube-agents-bench (#3797). A
+    # project whose role predates these fails the sweep at the policy list,
+    # after its Compute sweep: `gcloud iam roles update` with the current
+    # list repairs it (docs/ci-pool-projects.md section 5.7).
+    "monitoring.alertPolicies.list",
+    "monitoring.alertPolicies.delete",
 })
 
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
@@ -893,6 +905,7 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -1720,7 +1733,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     details, findings, FINDING_COMPUTE_SWEEPER_MISSING,
                     f"The Compute plant sweeper ({COMPUTE_SWEEP_MEMBER.split(':', 1)[1]}) lacks "
                     f"{compute_sweep_role} on {project_id}, so the periodic Compute plant sweep fails "
-                    "here and leftover plant networks stay. Grant it without re-running the provisioning "
+                    "here and leftover plant networks and alert policies stay. Grant it without re-running the provisioning "
                     "script (docs/ci-pool-projects.md section 5.7); if the role exists, run "
                     "`gcloud iam roles update` with the same flags in place of `create`",
                     _compute_sweep_repair(project_id),

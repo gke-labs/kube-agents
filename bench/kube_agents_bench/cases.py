@@ -38,8 +38,13 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from devops_bench.tasks.schema import Task as DevopsBenchTask
+
+from kube_agents_bench import scope_exclude, stop_hook
 
 __all__ = [
+    "CASE_KEYS",
+    "HARNESS_WRITTEN_ENTRIES",
     "TRACE_GRADABLE_CHECK_TYPES",
     "TRANSPORT_BLIND_CHECK_TYPES",
     "WORKER_BLIND_CHECK_TYPES",
@@ -47,6 +52,38 @@ __all__ = [
     "CaseSpecError",
     "load_case",
 ]
+
+# Every top-level key a task.yaml may carry, which is this grader's schema for
+# the top level: neither loader rejects a key it does not know -- devops-bench
+# and load_case read the keys they want and drop the rest -- so
+# hack/ci-eval-pr.sh reds a pull request's case carrying a key outside main's
+# copy of this set ("land the grader change first"), and tests/test_cases.py
+# holds every task in the tree to it. Two halves:
+#
+# - devops-bench's: its task model's fields, read off the installed model so a
+#   bump that adds one is allowed without an edit here (``folder`` is set by
+#   the loader from the directory, never written), plus the three aliases its
+#   loader maps onto them (``Task.from_dict``: ``task_id`` for ``id``,
+#   ``goal`` and ``input`` for ``prompt``), which the model cannot list.
+# - this repository's: what this package and the case tooling read --
+#   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
+#   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
+#   ``scope_exclude.py``) -- and ``task_version``, a
+#   case's own revision note that nothing reads. A new one is added here, in a
+#   pull request before any case a pull-request job grades uses it (the
+#   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
+_DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
+_DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
+DEVOPS_BENCH_CASE_KEYS = (
+    frozenset(DevopsBenchTask.model_fields) - _DEVOPS_BENCH_LOADER_FIELDS
+) | _DEVOPS_BENCH_ALIASES
+REPOSITORY_CASE_KEYS = frozenset(
+    {
+        "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
+        "audit_streams", scope_exclude.KEY, "task_version",
+    }
+)
+CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out
@@ -58,7 +95,8 @@ NOOP_DEPLOYER = "noop"
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
 # ``worker_commands`` the delegated cards' worker logs (and, with
 # ``after_result_pattern``, the workers' trajectory entries as typed), ``worker_agents`` the
-# ``agent`` tags the harness puts on the workers' trajectory entries. On the
+# ``agent`` tags the harness puts on the workers' trajectory entries,
+# ``worker_budget`` the cards' run rows the same read collects. On the
 # inject transport they are blind in two different ways, and the scorer
 # sets each aside under its own condition (``scoring.py``, the inject lane).
 # ``tool_called`` in its default ``router`` scope reads the delegating
@@ -81,8 +119,13 @@ TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
 # the trajectory, the workers' included, to tell a time the agent read from
 # one it guessed; the inject trace carries calls without their tool
 # outputs, so it is blind the same way.
-WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "report_times_in_window"})
+WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
+# Entries the harness writes on the trajectory itself (``stop_hook.py``), not
+# calls read off the door's trace, so a lossy trace says nothing about them:
+# a ``tool_called`` leaf naming only these is graded on every record.
+HARNESS_WRITTEN_ENTRIES = frozenset({stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY})
+_TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
@@ -169,8 +212,8 @@ class CaseSpec:
 
     worker_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` with any leaf that reads the
-    delegated workers -- ``worker_commands``, ``worker_agents``, or a
-    ``tool_called`` in the ``workers`` or ``all`` scope -- or any
+    delegated workers -- ``worker_commands``, ``worker_agents``,
+    ``worker_budget``, or a ``tool_called`` in the ``workers`` or ``all`` scope -- or any
     ``tool_called`` with a ``result`` pattern. Blind on every inject record,
     trace or none: the trace carries no results, so no card id can be read
     from it and no result pattern can match. The delegation wait reads the
@@ -201,6 +244,18 @@ def _leaves(node: Any) -> list[dict[str, Any]]:
     if isinstance(node, list):
         return [leaf for item in node for leaf in _leaves(item)]
     return [{}]
+
+
+def _harness_written(leaf: dict[str, Any]) -> bool:
+    """Whether a leaf is a ``tool_called`` over harness-written entries
+    only, which no transport blinds."""
+    names = leaf.get(_TOOL_CALLED_NAMES_KEY) or []
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+        and bool(names)
+        and set(names) <= HARNESS_WRITTEN_ENTRIES
+    )
 
 
 def _reads_the_workers(leaf: dict[str, Any]) -> bool:
@@ -261,7 +316,8 @@ def _transport_blind_checks(
         check = entry.get("check")
         leaves = _leaves(check)
         if not leaves or not all(
-            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves
+            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES and not _harness_written(leaf)
+            for leaf in leaves
         ):
             continue
         name = str(entry["name"])

@@ -220,7 +220,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 1, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
-		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
+		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
@@ -230,7 +230,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 }
 
 // a2aProvisionLikeTheScript seeds a test bus with what the provision Job
-// creates: the streams above and three KV buckets.
+// creates: the streams above and four KV buckets.
 func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	t.Helper()
 	_, js := a2aConnectAs(t, url, "seed", seedPassword)
@@ -248,6 +248,12 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 		if err != nil {
 			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
 		}
+	}
+	// `nats kv add feedback --ttl=720h`: the one bucket with a max age.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "feedback", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864, TTL: 720 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket feedback as seed: %v", err)
 	}
 }
 
@@ -465,6 +471,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		// WRITE the blackboard, which is the half an agent would notice.
 		{"a2a.topics.shared.blueprint", `{"kind":"topic-entry"}`},
 		{"a2a.topics.agent.platform.upgrade-readiness", `{"kind":"topic-entry"}`},
+		{"a2a.topics.agent.platform.topology-skew", `{"kind":"topic-entry"}`},
 		{"$JS.API.INFO", ""},
 		{"$JS.API.STREAM.NAMES", ""},
 		{"$JS.API.STREAM.LIST", ""},

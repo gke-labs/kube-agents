@@ -526,6 +526,21 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
+# 2b, continued: the onboarding plugin is image-owned too, and must come from the same image
+# as the delivery script above: its pre_llm_call hook holds the first report behind the greeting
+# and its post_llm_call hook releases it. A stale plugin beside a new bootstrap_delivery.py
+# writes no hold, so the report races the greeting as before the hold existed.
+#
+# Reported, not fatal: `$TARGET_DIR/plugins` is root-owned on a volume where the kubelet
+# created it as the parent of a plugin mounted beneath it, and `set -e` would otherwise end
+# the container on the mkdir. The scripts block above guards only its `cp`: step 2's bulk
+# copy has already created `scripts/`, so its bare `mkdir -p` meets an existing directory.
+if [ -d "/opt/defaults/plugins/bootstrap_onboarding" ]; then
+    { mkdir -p "$TARGET_DIR/plugins/bootstrap_onboarding" \
+        && cp -rf /opt/defaults/plugins/bootstrap_onboarding/. "$TARGET_DIR/plugins/bootstrap_onboarding/"; } \
+        || echo "WARN: could not refresh $TARGET_DIR/plugins/bootstrap_onboarding from the image; the first report may post before the greeting" >&2
+fi
+
 # 2c. Invalidate locally-hosted MCP server schemas from each profile's on-disk cache.
 #
 # Why: Hermes caches tool definitions from `mcp_servers` in `<profile>/cache/mcp_schema_cache.json`

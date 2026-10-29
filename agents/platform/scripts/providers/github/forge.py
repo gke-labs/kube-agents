@@ -79,6 +79,21 @@ GITHUB_OWNED_DOMAINS = (
 )
 
 
+def _label_unchanged(existing: Any, body: Mapping[str, Any]) -> bool:
+    """Whether the label GitHub holds already is what `body` would PATCH it to.
+
+    GitHub answers the colour in lower case without `#`, and a label with no
+    description as null or "". A field `body` leaves out is not changed.
+    """
+    if not isinstance(existing, dict) or existing.get("name") != body["name"]:
+        return False
+    color = body.get("color")
+    if color is not None and str(existing.get("color") or "").lower() != str(color).lower():
+        return False
+    description = body.get("description")
+    return description is None or (existing.get("description") or "") == description
+
+
 def _bare_host(host: str) -> str:
     """``host`` without a ``:<port>`` suffix, for the checks that judge the name only."""
     name, sep, port = host.rpartition(":")
@@ -181,6 +196,15 @@ class GitHubForge(Forge):
             if not host:
                 raise ValueError(f"a {cls.name} forge entry names no host")
             for entry in mine:
+                if entry.get("port") not in (None, "", 0):
+                    raise ValueError(
+                        f"port is not supported for {cls.name}: the broker reaches "
+                        f"{host} on its standard HTTPS port only"
+                    )
+                if entry.get("scheme") not in (None, "", "https"):
+                    raise ValueError(
+                        f"scheme {entry.get('scheme')!r} is not supported for {cls.name}"
+                    )
                 # Refused rather than ignored: the same key narrows a forge
                 # whose credential reaches a whole host, and accepted here it
                 # would read as narrowing this one. The App installation's
@@ -796,11 +820,18 @@ class GitHubForge(Forge):
             body["description"] = description
         quoted = quote(name, safe="")
         try:
-            api("GET", f"repos/{repo}/labels/{quoted}")
+            existing = api("GET", f"repos/{repo}/labels/{quoted}")
         except WorkspaceError as exc:
             if exc.status != 404:
                 raise
             node = api("POST", f"repos/{repo}/labels", body=body)
         else:
-            node = api("PATCH", f"repos/{repo}/labels/{quoted}", body=body)
+            # Write only a change. A caller ensures the same labels on every
+            # run, and a PATCH that changes nothing is still a label write,
+            # after which GitHub's label-filtered issue list can leave out an
+            # issue that carries the label for a short time.
+            if _label_unchanged(existing, body):
+                node = existing
+            else:
+                node = api("PATCH", f"repos/{repo}/labels/{quoted}", body=body)
         return {"label": translate.label(node)}

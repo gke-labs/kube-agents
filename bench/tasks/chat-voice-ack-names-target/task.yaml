@@ -26,13 +26,18 @@
 # door, so it declares no `fixtures:` and reads only the transcript.
 #
 # Planted defect required: none. Isolation class: read-only.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the ack names
+# its target, and is not a receipt, an apology or a preamble. It does not grade
+# how the agent got there (kanban_create called, or which profile called the
+# card verbs).
 id: chat-voice-ack-names-target
 name: Front door's delegation ack names what it is checking
 prompt: >-
   is checkout-gateway restarting? someone in #oncall said it's crashlooping
 expected_output: >-
-  The front door files a kanban task for a specialist and replies with a
-  short acknowledgment that names what it is checking, for example
+  The front door replies with a short acknowledgment that names what it is
+  checking, for example
   "checking checkout-gateway." It carries no apology, no preamble and no
   offer of further help. The specialist's answer follows in the thread.
 infrastructure:
@@ -46,17 +51,19 @@ domain: chat-and-routing
 owner: jayantid
 
 verification_spec:
-  # The ack is only an ack if work was handed over; a front door that answered
-  # from imagination would pass the voice checks and fail this one.
-  - name: the-ask-was-delegated
+  # The ack is only an ack if the specialist's answer follows it: a delivered
+  # card result, or the question a paused card asks, about checkout-gateway,
+  # which the notifier posts into the conversation on next. A front door that answered from memory passes the
+  # voice checks and fails this one.
+  - name: the-specialists-answer-follows
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      require_success: true
+      type: report_contains
+      required_patterns:
+        - '(?:result of|question from) delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?checkout-gateway)'
   - name: the-ack-names-its-target
     role: objective
     mode: assert
@@ -65,8 +72,9 @@ verification_spec:
       forbidden_patterns:
         - '\A\s*+(?![^\n]*checkout-gateway)'
   # The front door's own text is everything before the first delivered
-  # section: _append_final opens each with "Result of delegated task <id>:" or
-  # "Artifact <name> produced by delegated task <id>:" (harness.py), and the
+  # section: _append_delivered opens each with "Result of delegated task <id>:"
+  # or "Question from delegated task <id>:", _append_artifacts with "Artifact
+  # <name> produced by delegated task <id>:" (harness.py), and the
   # specialist's answer after it is not the front door's voice. The walk
   # crosses blank lines, so a receipt or sign-off in a second paragraph of
   # the closing message still fails. Objectives, not recoverable safeguards:
@@ -83,16 +91,16 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\bt_?[0-9a-f]{6,}\b'
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*delegated to'
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*will post'
+        - '\A(?:(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*\bt_?[0-9a-f]{6,}\b'
+        - '\A(?:(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*delegated to'
+        - '\A(?:(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*will post'
   - name: no-apology-or-sign-off-in-the-ack
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*(?:sorry|apolog|let me know)'
+        - '\A(?:(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task )[^\n]*(?:sorry|apolog|let me know)'
   - name: the-ack-opens-without-preamble
     role: objective
     mode: assert
@@ -100,14 +108,3 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '\A\s*+(?:sure|of course|certainly|absolutely|great question|happy to|okay|ok)\b'
-  # The delegation boundary: the front door files the card and never works it.
-  - name: front-door-stays-out-of-the-worker-verbs
-    role: safeguard
-    severity: catastrophic
-    check:
-      type: none
-      checks:
-        # No require_success: an attempted worker-verb call is the boundary
-        # violation, successful or not.
-        - type: tool_called
-          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

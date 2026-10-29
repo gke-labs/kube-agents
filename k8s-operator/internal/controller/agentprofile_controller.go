@@ -69,6 +69,16 @@ const (
 	// agentProfileNameLabel names the profile on what it renders.
 	agentProfileNameLabel = "kubeagents.x-k8s.io/agentprofile"
 
+	// agentProfileTierLabel is the tier an operator-created ServiceAccount in
+	// the profile namespace is for.
+	agentProfileTierLabel = "kubeagents.x-k8s.io/agentprofile-tier"
+
+	// agentProfileUIDAnnotation marks an operator-created ServiceAccount in
+	// the profile namespace with its profile's UID, the ownership test that
+	// stands in for an owner reference across namespaces
+	// (agentProfileOwnsServiceAccount).
+	agentProfileUIDAnnotation = "kubeagents.x-k8s.io/agentprofile-uid"
+
 	// agentProfileResync re-reads the directory for live profiles.
 	agentProfileResync = 5 * time.Minute
 
@@ -90,12 +100,16 @@ const (
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
+	reasonAgentProfileNamespaceAbsent = "ProfileNamespaceAbsent"
 )
 
 // AgentProfileReconciler reconciles AgentProfile objects.
 type AgentProfileReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader reads Namespaces uncached: a cached read would start a
+	// cluster-wide Namespace informer. Nil falls back to the client (tests).
+	APIReader client.Reader
 	// Cards is the directory. Nil means the default NATS publisher.
 	Cards cardPublisher
 }
@@ -163,19 +177,25 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.List(ctx, &all, client.InNamespace(profile.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
+	// The single ServiceAccount #2469 created in the agent's namespace,
+	// before per-tier identities moved to the profile namespace.
+	if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
+		return ctrl.Result{}, err
+	}
 	resolution := resolveAgentProfileIdentities(agent, all.Items)[profile.Name]
+	profilesNS := profileNamespaceOf(&profile)
 	if resolution.refused == nil {
 		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if foreign {
-			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s already exists and is not this profile's; the operator does not adopt it", agentProfileServiceAccountPrefix+profile.Name), reason: reasonAgentProfileRefused}
+		if foreign != "" {
+			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s/%s already exists and is not this profile's; the operator does not adopt it", profilesNS, foreign), reason: reasonAgentProfileRefused}
 		}
 	}
 
 	if resolution.refused != nil {
-		if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
+		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, nil); err != nil {
 			return ctrl.Result{}, err
 		}
 		cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
@@ -185,28 +205,53 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.busResult(busErr)
 	}
 
-	idReason, idMsg := reasonAgentProfileRendered, "ServiceAccount "+resolution.serviceAccount+" and its bus identity are rendered"
+	// The profile namespace is the chart's (agentprofile_namespace.go). Until
+	// it exists, carrying the chart's markers, there is nowhere to render the
+	// ServiceAccounts, so the profile has no identity and no card.
+	ready, err := profileNamespaceReady(ctx, r.apiReader(), agent)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
+		msg := "the profile namespace " + profilesNS + " does not exist or lacks the chart's markers; the chart creates it on a mode: next install"
+		if err := r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileNamespaceAbsent, msg, cardReason, cardMsg, false); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.busResult(busErr)
+	}
+
+	idReason, idMsg := reasonAgentProfileRendered, "ServiceAccounts "+resolution.serviceAccountList()+" in "+profilesNS+" and their bus identities are rendered"
 	if profile.Spec.Identity.ServiceAccountName == "" {
-		err := r.ensureServiceAccount(ctx, &profile, resolution.serviceAccount)
-		if errors.Is(err, errForeignServiceAccount) {
-			cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
-			if err := r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileRefused, err.Error(), cardReason, cardMsg, false); err != nil {
+		keep := map[string]bool{}
+		for _, id := range resolution.identities {
+			keep[id.serviceAccount] = true
+			err := r.ensureServiceAccount(ctx, &profile, profilesNS, id)
+			if errors.Is(err, errForeignServiceAccount) {
+				cardReason, cardMsg, busErr := r.withdrawCard(ctx, agent, &profile)
+				if err := r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileRefused, err.Error(), cardReason, cardMsg, false); err != nil {
+					return ctrl.Result{}, err
+				}
+				return r.busResult(busErr)
+			}
+			if err != nil {
 				return ctrl.Result{}, err
 			}
-			return r.busResult(busErr)
 		}
-		if err != nil {
+		// A tier the profile no longer allows loses its ServiceAccount.
+		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, keep); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else {
-		if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
+		if err := r.deleteProfileServiceAccounts(ctx, &profile, profilesNS, nil); err != nil {
 			return ctrl.Result{}, err
 		}
 		var sa corev1.ServiceAccount
-		err := r.Get(ctx, types.NamespacedName{Namespace: profile.Namespace, Name: resolution.serviceAccount}, &sa)
+		named := profile.Spec.Identity.ServiceAccountName
+		err := r.Get(ctx, types.NamespacedName{Namespace: profilesNS, Name: named}, &sa)
 		switch {
 		case apierrors.IsNotFound(err):
-			idReason, idMsg = reasonAgentProfileSANotFound, "spec.identity.serviceAccountName "+resolution.serviceAccount+" does not exist; the bus identity is rendered and no pod can present a token for it until it does"
+			idReason, idMsg = reasonAgentProfileSANotFound, "spec.identity.serviceAccountName "+named+" does not exist in "+profilesNS+"; the bus identity is rendered and no pod can present a token for it until it does"
 		case err != nil:
 			return ctrl.Result{}, err
 		}
@@ -216,7 +261,7 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if busErr != nil {
 		log.Info("could not reconcile the agent card", "profile", profile.Name, "error", busErr.Error())
 	}
-	if err := r.writeStatus(ctx, &profile, agent, resolution.serviceAccount, idReason, idMsg, cardReason, cardMsg, idReason == reasonAgentProfileRendered); err != nil {
+	if err := r.writeStatus(ctx, &profile, agent, resolution.serviceAccountList(), idReason, idMsg, cardReason, cardMsg, idReason == reasonAgentProfileRendered); err != nil {
 		return ctrl.Result{}, err
 	}
 	if busErr != nil {
@@ -258,6 +303,11 @@ func (r *AgentProfileReconciler) renderNothing(ctx context.Context, p *agentv1al
 	if err := r.deleteOwnServiceAccount(ctx, p); err != nil {
 		return err
 	}
+	// With or without a bound agent: a profile deleted after its agent still
+	// has ServiceAccounts in the profile namespace, which outlives the agent.
+	if err := r.deleteProfileServiceAccounts(ctx, p, profileNamespaceOf(p), nil); err != nil {
+		return err
+	}
 	if !p.DeletionTimestamp.IsZero() {
 		if controllerutil.RemoveFinalizer(p, agentProfileFinalizer) {
 			return r.Update(ctx, p)
@@ -281,6 +331,11 @@ func (r *AgentProfileReconciler) finalize(ctx context.Context, p *agentv1alpha1.
 			logf.FromContext(ctx).Info("holding the AgentProfile finalizer until its tombstone is published", "profile", p.Name, "reason", msg)
 			return ctrl.Result{RequeueAfter: agentProfileBusRetry}, nil
 		}
+	}
+	// The ServiceAccounts in the profile namespace carry no owner reference,
+	// so the garbage collector won't remove them with the profile.
+	if err := r.deleteProfileServiceAccounts(ctx, p, profileNamespaceOf(p), nil); err != nil {
+		return ctrl.Result{}, err
 	}
 	controllerutil.RemoveFinalizer(p, agentProfileFinalizer)
 	return ctrl.Result{}, r.Update(ctx, p)
@@ -354,50 +409,95 @@ var errForeignServiceAccount = errors.New("a ServiceAccount under the operator-c
 // foreignness check and the write. Create refuses that case outright with
 // AlreadyExists, and an existing ServiceAccount is only ever updated when the
 // profile already controls it.
-func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, name string) error {
+func (r *AgentProfileReconciler) ensureServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile, ns string, id agentProfileTierIdentity) error {
 	sa := &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: p.Namespace,
+			Name:      id.serviceAccount,
+			Namespace: ns,
 			Labels: map[string]string{
 				labelPartOf:           a2aPartOf,
 				a2aComponentLabel:     agentProfileComponent,
 				agentProfileNameLabel: p.Name,
+				agentProfileTierLabel: id.tier,
 			},
+			Annotations: map[string]string{agentProfileUIDAnnotation: string(p.UID)},
 		},
 		AutomountServiceAccountToken: ptr.To(false),
 	}
-	if err := ctrl.SetControllerReference(p, sa, r.Scheme); err != nil {
-		return err
-	}
 	var existing corev1.ServiceAccount
-	err := r.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: name}, &existing)
+	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: id.serviceAccount}, &existing)
 	if apierrors.IsNotFound(err) {
 		err = r.Create(ctx, sa)
 		if apierrors.IsAlreadyExists(err) {
-			return errForeignServiceAccount
+			// A cached NotFound can trail this reconciler's own create (the
+			// status write requeues at once), so ask the API server whose
+			// it is before calling it foreign.
+			if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: ns, Name: id.serviceAccount}, &existing); err != nil {
+				return err
+			}
+			if !agentProfileOwnsServiceAccount(&existing, p) {
+				return errForeignServiceAccount
+			}
+			return nil
 		}
 		return err
 	}
 	if err != nil {
 		return err
 	}
-	if !metav1.IsControlledBy(&existing, p) {
+	if !agentProfileOwnsServiceAccount(&existing, p) {
 		return errForeignServiceAccount
 	}
-	// Ours: keep it as rendered. Forced, because the profile controls it:
-	// a hand edit (kubectl patch, edit, label --overwrite) hands a field to
-	// another manager, and an unforced apply would then conflict on every
-	// reconcile instead of putting the field back.
-	//
-	// Accepted risk (decided on gke-labs#2469): the apply goes by name after
-	// a cached ownership check, so a ServiceAccount deleted and re-created
-	// under this name inside the informer lag could be adopted. Doing that
-	// swap already takes ServiceAccount create in the namespace. The delete
-	// below is held to the UID it checked, so the destructive direction is
-	// closed.
+	// Ours: keep it as rendered, forced, so a hand edit is put back rather
+	// than conflicting on every reconcile. The same accepted risk as before
+	// (decided on gke-labs#2469): the apply goes by name after a cached
+	// ownership check, so a ServiceAccount deleted and re-created under this
+	// name inside the informer lag could be adopted; doing that already takes
+	// ServiceAccount create in the namespace.
 	return r.Patch(ctx, sa, client.Apply, client.FieldOwner(agentProfileComponent), client.ForceOwnership)
+}
+
+// deleteProfileServiceAccounts removes this profile's ServiceAccounts in the
+// profile namespace except the ones keep names, and only ones it owns
+// (agentProfileOwnsServiceAccount): a ServiceAccount spec.identity names, or
+// one someone else created, is left alone. Each delete is held to the UID it
+// checked, so one re-created inside the informer lag is not removed.
+func (r *AgentProfileReconciler) deleteProfileServiceAccounts(ctx context.Context, p *agentv1alpha1.AgentProfile, ns string, keep map[string]bool) error {
+	var list corev1.ServiceAccountList
+	if err := r.List(ctx, &list, client.InNamespace(ns), client.MatchingLabels{agentProfileNameLabel: p.Name}); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		sa := &list.Items[i]
+		if keep[sa.Name] || !agentProfileOwnsServiceAccount(sa, p) {
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, sa, client.Preconditions{UID: &sa.UID})); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// profileServiceAccountRequest maps a ServiceAccount in a profile namespace,
+// labelled with a profile's name, to that profile in the agent's namespace.
+// Anything else maps to nothing. A label someone copied only costs a
+// reconcile, which checks ownership by UID.
+func profileServiceAccountRequest(obj client.Object) []reconcile.Request {
+	name := obj.GetLabels()[agentProfileNameLabel]
+	agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
+	if name == "" || !ok {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: agentNS, Name: name}}}
+}
+
+func (r *AgentProfileReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // forgetBus drops the bus connection held for an agent in namespace, if the
@@ -408,8 +508,9 @@ func (r *AgentProfileReconciler) forgetBus(namespace string) {
 	}
 }
 
-// deleteOwnServiceAccount removes the ServiceAccount the operator created for
-// this profile, and only that: a ServiceAccount not controlled by the profile is
+// deleteOwnServiceAccount removes the ServiceAccount #2469 created for this
+// profile in the agent's namespace, before per-tier identities in the profile
+// namespace replaced it, and only that: a ServiceAccount not controlled by the profile is
 // someone else's, including one spec.identity names.
 func (r *AgentProfileReconciler) deleteOwnServiceAccount(ctx context.Context, p *agentv1alpha1.AgentProfile) error {
 	var sa corev1.ServiceAccount
@@ -511,7 +612,16 @@ func (r *AgentProfileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.AgentProfile{}).
+		// The legacy agent-namespace ServiceAccount (deleteOwnServiceAccount).
 		Owns(&corev1.ServiceAccount{}).
+		// The per-tier ServiceAccounts carry no owner reference, so they map
+		// back to their profile by name label and namespace.
+		Watches(
+			&corev1.ServiceAccount{},
+			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
+				return profileServiceAccountRequest(obj)
+			}),
+		).
 		Watches(
 			&agentv1alpha1.PlatformAgent{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

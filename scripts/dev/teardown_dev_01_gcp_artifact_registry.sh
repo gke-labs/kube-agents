@@ -18,6 +18,7 @@ VARS_FILE="${INSTALLER_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 source "${INSTALLER_DIR}/common.sh" "$@"
+check_prereqs "gcloud"
 
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state
@@ -30,13 +31,21 @@ confirm_action "This will permanently delete Artifact Registry repository '$GCP_
   "Region:$REGION" \
   "Artifact Repo:$GCP_ARTIFACT_REGISTRY_REPO_NAME"
 
-gcloud config set project "$PROJECT_ID" --quiet
-
 # ─── Step 1: Delete Artifact Registry Repository ──────────────────────────────
 echo -e "\n${C_BOLD}=== Tearing Down Artifact Registry Repo ===${C_RESET}"
 REPO_EXISTS=""
 if [ "${DRY_RUN:-0}" -ne 1 ]; then
-  REPO_EXISTS=$(gcloud artifacts repositories describe "$GCP_ARTIFACT_REGISTRY_REPO_NAME" --location="$REGION" --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+  # Only a NOT_FOUND answer means the repository is gone. A missing login, a
+  # missing role or a broken gcloud fails the probe too, and must not read as
+  # "already deleted".
+  if describe_output=$(gcloud artifacts repositories describe "$GCP_ARTIFACT_REGISTRY_REPO_NAME" --location="$REGION" --project="$PROJECT_ID" --format="value(name)" 2>&1); then
+    REPO_EXISTS="$describe_output"
+  elif [[ "$describe_output" == *NOT_FOUND* ]]; then
+    REPO_EXISTS=""
+  else
+    print_error "Could not check Artifact Registry repository '$GCP_ARTIFACT_REGISTRY_REPO_NAME': ${describe_output}"
+    exit 1
+  fi
 fi
 
 if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$REPO_EXISTS" ]; then
@@ -44,7 +53,10 @@ if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$REPO_EXISTS" ]; then
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     echo -e "  ${C_GREEN}[DRY-RUN] Would delete Artifact Registry repository '$GCP_ARTIFACT_REGISTRY_REPO_NAME'.${C_RESET}"
   else
-    gcloud artifacts repositories delete "$GCP_ARTIFACT_REGISTRY_REPO_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet || true
+    gcloud artifacts repositories delete "$GCP_ARTIFACT_REGISTRY_REPO_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet || {
+      print_error "Could not delete Artifact Registry repository '$GCP_ARTIFACT_REGISTRY_REPO_NAME'; DEV_ARTIFACT_REGISTRY_CREATED in scripts/installer/vars.sh is unchanged."
+      exit 1
+    }
     echo -e "  ${C_GREEN}✓ Artifact Registry repository '$GCP_ARTIFACT_REGISTRY_REPO_NAME' successfully deleted.${C_RESET}"
   fi
 else

@@ -48,6 +48,7 @@ helper = _load_helper()
 
 SELF = "kube-agents-bot"
 REPO = "acme/toolkit"
+
 #: A second managed repository, deliberately on another host. Identity is a
 #: property of a forge, so a two-repository test on one forge would not notice a
 #: sweep that asked once and reused the answer.
@@ -1533,7 +1534,6 @@ class RepoValidationTest(_Harness):
         self.assertIn("not in the managed repositories list", payload["value"])
 
 
-
 class ForgeNeutralRepositoryTest(unittest.TestCase):
     def test_a_managed_nested_gitlab_project_is_a_valid_repository(self):
         import gitops_workspace
@@ -1545,6 +1545,46 @@ class ForgeNeutralRepositoryTest(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             helper.validate_repo("https://gitlab.com/acme/infra")
         self.assertIn("<host>/<path>", str(caught.exception))
+
+
+class GiteaRepoTest(unittest.TestCase):
+    """`--repo` takes a managed repository on another forge as the card names it."""
+
+    GITEA = "gitea.lab/acme/live"
+    ENTRIES = [REPO, GITEA]
+
+    def patched(self):
+        return mock.patch("gitops_workspace.get_managed_repos", mock.Mock(return_value=self.ENTRIES))
+
+    def test_a_managed_gitea_repo_is_accepted(self):
+        with self.patched():
+            self.assertEqual(helper.validate_repo(self.GITEA), self.GITEA)
+
+    def test_an_unmanaged_host_qualified_repo_is_refused(self):
+        with self.patched():
+            with self.assertRaises(ValueError):
+                helper.validate_repo("gitea.lab/acme/other")
+            with self.assertRaises(ValueError):
+                helper.validate_repo("evil.example/acme/live")
+
+    def test_poll_without_repo_reads_the_gitea_entry(self):
+        gitea_pr = make_pr(number=3, head_repo="acme/live")
+
+        class OnlyGitea(FakeProvider):
+            def list_open_prs(self, repo):
+                return [gitea_pr] if repo == GiteaRepoTest.GITEA else []
+
+            def list_comments(self, repo, pr):
+                return [make_comment("IC_3", f"@{SELF} please fix")]
+
+        buf = StringIO()
+        with self.patched(), \
+             mock.patch.object(forge, "provider_for", return_value=OnlyGitea()), \
+             redirect_stdout(buf):
+            helper.main(["poll"])
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual([conv["repo"] for conv in payload["conversations"]], [self.GITEA])
 
 
 if __name__ == "__main__":

@@ -207,7 +207,7 @@ def infra_reason(task: dict) -> str:
     reps = sum(counts.values())
     reason = classify.first_reason(task)[:REASON_MAX_CHARS] or NO_REASON
     ceiling = CEILING_NOTE.format(ceiling=counts["ceiling"]) if counts["ceiling"] else ""
-    return INFRA_REASON.format(infra=counts["infra"] + counts["ceiling"], reps=reps, ceiling=ceiling, reason=reason)
+    return INFRA_REASON.format(infra=counts["infra"] + counts["ceiling"] + counts["fixture"], reps=reps, ceiling=ceiling, reason=reason)
 
 
 def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[str, str] | None = None) -> dict[str, list[dict]]:

@@ -646,6 +646,7 @@ class Workspace:
     # its own -- a managed repository on the ambient credential, or a public
     # one on none -- and never anything a response reports.
     credential: object | None = None
+    allow_http: bool = False
     # Who opened it, as the caller labelled itself, and when it was opened and
     # last resolved through `get`, on the store's clock. These are what the
     # reclaim reads and what the log names when the store is full.
@@ -946,21 +947,24 @@ class ContentWorkspaceStore:
         *,
         check: bool = True,
         config: tuple[tuple[str, str], ...] = (),
+        allow_http: bool = False,
     ):
         cwd = (
             workspace_or_dir.tree
             if isinstance(workspace_or_dir, Workspace)
             else Path(workspace_or_dir)
         )
-        # `config` is handed on only when there is something in it. The three
-        # verbs that talk to the remote are the only ones that ever have any,
+        # `config` and `allow_http` are handed on only when set. The three
+        # verbs that talk to the remote are the only ones that ever have either,
         # and a runner that takes `(argv, cwd)` -- every recorded one in the
-        # tests, and the executor before it learned the argument -- keeps
+        # tests, and the executor before it learned the arguments -- keeps
         # working for the rest.
+        kwargs: dict[str, object] = {"cwd": cwd}
         if config:
-            result = self._runner(["git", *argv], cwd=cwd, config=config)
-        else:
-            result = self._runner(["git", *argv], cwd=cwd)
+            kwargs["config"] = config
+        if allow_http:
+            kwargs["allow_http"] = True
+        result = self._runner(["git", *argv], **kwargs)
         exit_code = getattr(result, "exit_code", 1)
         if check and exit_code != 0:
             refusal = self._tls_refusal(getattr(result, "stderr", ""))
@@ -1172,6 +1176,7 @@ class ContentWorkspaceStore:
             # and to no other git this store runs; everything else is local.
             credential = self._credential(repo)
             remote_config = tuple(credential.git_config(repo)) if credential else ()
+            allow_http = url.startswith("http://")
             # The URL was composed by `_where` -- from a validated `owner/name`,
             # or by the forge that owns the repository -- and never taken from
             # the caller: a caller-supplied URL is `url.<host>.insteadOf` by
@@ -1198,6 +1203,7 @@ class ContentWorkspaceStore:
                         ],
                         check=False,
                         config=remote_config,
+                        allow_http=allow_http,
                     )
                     if getattr(probe, "exit_code", 1) == LS_REMOTE_NO_MATCH_EXIT_CODE:
                         raise _base_branch_missing(repo, pinned)
@@ -1207,7 +1213,7 @@ class ContentWorkspaceStore:
                     if base is not None:
                         argv += ["--branch", base]
                 argv += [url, str(tree / "repo")]
-                self._git(tree, argv, config=remote_config)
+                self._git(tree, argv, config=remote_config, allow_http=allow_http)
                 # Measured after the clone, and the tree goes if it is over.
                 # A repository the broker cannot afford to hold is not one it
                 # should hold *badly*, half-cloned and still on the disk.
@@ -1225,6 +1231,7 @@ class ContentWorkspaceStore:
                     base_sha="",
                     shallow=depth is not None,
                     credential=credential,
+                    allow_http=allow_http,
                     caller=caller,
                 )
                 workspace.default_branch = self._default_branch(workspace)
@@ -1660,6 +1667,7 @@ class ContentWorkspaceStore:
                 workspace,
                 ["fetch", "--quiet", "--prune", "origin"],
                 config=self._remote_config(workspace),
+                allow_http=workspace.allow_http,
             )
             current_base_sha = self._sha(workspace, f"origin/{workspace.base}")
             if expected_base_sha and expected_base_sha != current_base_sha:
@@ -1857,6 +1865,7 @@ class ContentWorkspaceStore:
                 ["push", "--force-with-lease", "origin", branch],
                 check=False,
                 config=self._push_config(workspace),
+                allow_http=workspace.allow_http,
             )
             if getattr(result, "exit_code", 1) != 0:
                 # Read as `_git` reads a checked failure: a certificate is

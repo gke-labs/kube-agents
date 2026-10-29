@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -50,6 +51,9 @@ const (
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
+	// answerFeedbackName counts the ratings chat users gave answers, by
+	// platform and rating (feedback.go): the dashboard's 👍/👎 series.
+	answerFeedbackName = "answer_feedback_total"
 	// sessionsName counts the conversations the gateway minted a session
 	// record for, by platform: the next-mode chat half of status.usage's
 	// sessionsTotal, beside the watcher's triage sessions and the
@@ -71,6 +75,7 @@ const (
 	labelSource   = "source"
 	labelOutcome  = "outcome"
 	labelPlatform = "platform"
+	labelRating   = "rating"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -145,6 +150,7 @@ var (
 	metricsGchatOutcomes   = []string{gchatPullEvents, gchatPullEmpty, gchatPullFailed}
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
+	metricsRatings         = []string{FeedbackUp, FeedbackDown}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
 	metricsBackendPlatforms = map[string]string{
@@ -169,6 +175,7 @@ type Metrics struct {
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
+	answerFeedback      *prometheus.CounterVec
 	sessions            *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
@@ -215,6 +222,12 @@ func NewMetrics() *Metrics {
 			Name:      messagesInboundName,
 			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
+		answerFeedback: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      answerFeedbackName,
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other) and rating (up, down, other); a rating changed is counted again.",
+		}, []string{labelPlatform, labelRating}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -227,7 +240,7 @@ func NewMetrics() *Metrics {
 		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.sessions, m.processStart)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.processStart)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -242,6 +255,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
+	}
+	for _, rating := range metricsRatings {
+		m.answerFeedback.WithLabelValues(platformSlack, rating)
 	}
 	return m
 }
@@ -420,4 +436,19 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 		_ = srv.Shutdown(shutdownCtx)
 		return nil
 	}
+}
+
+// answerRated counts one rating. Both labels come from closed lists: a
+// platform or rating outside them is counted as other.
+func (m *Metrics) answerRated(platform, rating string) {
+	if m == nil {
+		return
+	}
+	if !slices.Contains(metricsPlatforms, platform) {
+		platform = metricsLabelOther
+	}
+	if !slices.Contains(metricsRatings, rating) {
+		rating = metricsLabelOther
+	}
+	m.answerFeedback.WithLabelValues(platform, rating).Inc()
 }

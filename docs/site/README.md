@@ -58,7 +58,7 @@ both exit 0. Nothing mechanical flags that conflict, so revisit this entry on ev
 Two GitHub Actions workflows:
 
 - **[`.github/workflows/docs-build.yml`](../../.github/workflows/docs-build.yml)** — starts on every PR and builds the site when `docs/site/**` or the workflow itself changed, to catch broken links / bad frontmatter. Doesn't publish.
-- **[`.github/workflows/docs-deploy.yml`](../../.github/workflows/docs-deploy.yml)** — publishes to GitHub Pages on push to `main` (and via `workflow_dispatch`). See below.
+- **[`.github/workflows/docs-deploy.yml`](../../.github/workflows/docs-deploy.yml)** — publishes to GitHub Pages on push to `main` touching `docs/site/**` or `.github/workflows/docs-deploy.yml`, and via `workflow_dispatch` (including automatic post-release dispatch from `.github/workflows/release-publish.yml`; see [`scripts/release/README.md`](../../scripts/release/README.md)). During the build, it stages `install.sh`, `uninstall.sh`, and `upgrade.sh` from the numerically highest published `X.Y.Z` GA GitHub Release (falling back to upstream releases on forks that publish none of their own) and verifies `BAKED_RELEASE_VERSION="<X.Y.Z>"` in `dist/`. See below.
 
 ## Publish from your fork
 
@@ -73,7 +73,8 @@ The `astro.config.mjs` sets `base: '/kube-agents'`, matching the default Pages U
 ## Published site
 
 The upstream site is live at **<https://gke-labs.github.io/kube-agents/>**, published by
-`docs-deploy.yml` on every push to `main` that touches `docs/site/**`.
+`docs-deploy.yml` on pushes to `main` touching `docs/site/**` or `.github/workflows/docs-deploy.yml`,
+and on manual or post-release `workflow_dispatch`.
 
 ## Prettier
 

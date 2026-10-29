@@ -146,13 +146,15 @@ def _autopilot_describe_stub(version="1.31.5-gke.1023000"):
     """A `clusters describe` stub for an Autopilot cluster.
 
     The generator asks twice on this path — autopilot.enabled first, then
-    currentMasterVersion for the gVisor floor — so the stub answers on the
-    --format it is given. An empty `version` stands for a version that
-    could not be read.
+    currentMasterVersion for the gVisor floor (plus the NetworkPolicy probe
+    when WEB_CONSOLE_ENABLED and ACCEPT_NO_NETWORK_POLICY are both set) — so
+    the stub answers on the --format it is given. An empty `version` stands
+    for a version that could not be read.
     """
     return (
         'case "$*" in\n'
         f"  *currentMasterVersion*) printf '{version}\\n' ;;\n"
+        '  *datapathProvider*) printf "RUNNING,ADVANCED_DATAPATH,False\\n" ;;\n'
         "  *) printf 'True\\n' ;;\n"
         "esac\n"
         "exit 0"
@@ -256,6 +258,8 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    "WEB_CONSOLE_ENABLED": "",
+                    "ACCEPT_NO_NETWORK_POLICY": "",
                     # And the data volume size, refused when malformed.
                     "PLATFORM_AGENT_STORAGE_SIZE": "",
                     **(env or {}),
@@ -541,6 +545,115 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_drift_pubsub   = true", content)
             self.assertIn("enable_drift_detector = true", content)
             self.assertNotIn("exported-project", content)
+
+    # ── the web console switch ───────────────────────────────────────────────
+
+    def test_tfvars_carries_the_web_console_switch(self):
+        # Off unless asked for, and on when install.env or the flag says so;
+        # main.tf maps web_console_enabled to the chart's webConsole.enabled.
+        for exported, want in ((None, "false"), ("true", "true"), ("false", "false")):
+            with self.subTest(WEB_CONSOLE_ENABLED=exported), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                env = {"API_SERVER_KEY": "k"}
+                if exported is not None:
+                    env["WEB_CONSOLE_ENABLED"] = exported
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env=env,
+                    describe_stub=_autopilot_describe_stub(),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f"web_console_enabled      = {want}", dest.read_text())
+
+    def test_tfvars_refuses_web_console_when_accept_no_network_policy_is_set(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) printf "RUNNING,,False\\n" ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn(
+                "WEB_CONSOLE_ENABLED=true cannot be combined with ACCEPT_NO_NETWORK_POLICY=true",
+                proc.stdout + proc.stderr,
+            )
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_reports_unreadable_cluster_when_probing_web_console_network_policy(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) exit 1 ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn(
+                "Could not query NetworkPolicy configuration for existing cluster",
+                proc.stdout + proc.stderr,
+            )
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_allows_web_console_when_adopted_standard_cluster_now_enforces_network_policy(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "WEB_CONSOLE_ENABLED": "true",
+                    "ACCEPT_NO_NETWORK_POLICY": "true",
+                },
+                describe_stub=(
+                    'case "$*" in\n'
+                    '  *datapathProvider*) printf "RUNNING,ADVANCED_DATAPATH,False\\n" ;;\n'
+                    '  *) printf "False\\n" ;;\n'
+                    'esac\n'
+                    'exit 0'
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("web_console_enabled      = true", dest.read_text())
+
+    def test_tfvars_allows_web_console_with_stale_accept_on_autopilot_or_created_cluster(self):
+        for label, describe_stub in (
+            ("adopted_autopilot", _autopilot_describe_stub()),
+            ("created_cluster", 'echo "NOT_FOUND" >&2; exit 1'),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env={
+                        "API_SERVER_KEY": "k",
+                        "WEB_CONSOLE_ENABLED": "true",
+                        "ACCEPT_NO_NETWORK_POLICY": "true",
+                    },
+                    describe_stub=describe_stub,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn("web_console_enabled      = true", dest.read_text())
 
     # ── the cert-manager probe: a Deployment alone cannot say whose it is ────
 
@@ -3113,9 +3226,9 @@ class InstallDefaultsFileTest(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "autopilot")
 
     def test_the_chart_carries_the_same_per_provider_models(self):
-        """charts/kube-agents/templates/litellm.yaml keeps its own copy of the
-        per-provider default models for a hand-driven Helm install, because a
-        chart cannot source this file. The copy is allowed only while it is
+        """charts/kube-agents/templates/_helpers.tpl (kube-agents.litellmModel)
+        keeps its own copy of the per-provider default models for a
+        hand-driven Helm install, because a chart cannot source this file. The copy is allowed only while it is
         equal, and this is what makes that true."""
         proc = subprocess.run(
             ["bash", "-c",
@@ -3126,9 +3239,9 @@ class InstallDefaultsFileTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         defaults = dict(line.split("=", 1) for line in proc.stdout.split())
-        chart = (_REPO_ROOT / "charts" / "kube-agents" / "templates" / "litellm.yaml").read_text()
+        chart = (_REPO_ROOT / "charts" / "kube-agents" / "templates" / "_helpers.tpl").read_text()
         table = re.search(r'\$defaultModels := dict (.*?) \}\}', chart)
-        self.assertIsNotNone(table, "litellm.yaml no longer declares $defaultModels")
+        self.assertIsNotNone(table, "_helpers.tpl no longer declares $defaultModels")
         chart_models = dict(re.findall(r'"(\w+)" "([^"]+)"', table.group(1)))
         self.assertEqual(chart_models, defaults)
 
@@ -5580,7 +5693,7 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
         gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
         operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+                              "slackChannelID", "home", "a2aSlackMinChannelIDLen")
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")

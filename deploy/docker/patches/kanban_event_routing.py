@@ -75,6 +75,19 @@ DEFAULT_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 #: look for a better address; a row naming a real chat platform is left alone.
 NON_CHAT_ORIGINS = frozenset({"api_server", "k8s-watcher"})
 
+#: The console door's platform name on a conversation route
+#: (lib.NotifyPlatformConsole). The gateway serves its chat.notify route
+#: whenever the console runs, so a console route is accepted whatever
+#: NOTIFY_CONVERSATIONS_ENV names. Kanban-era, like the rest of this patch:
+#: it goes when kanban does.
+CONSOLE_PLATFORM = "console"
+#: Joins a console card's conversation key and the gateway task of the turn
+#: that filed it in the subscription's thread_id, snapshotted at creation so
+#: the card's report names the turn it answers (kanban_chat_notify sends it as
+#: --reply-to). '#' cannot occur in a console conversation's token, which is
+#: one DNS-1123 label.
+CONSOLE_THREAD_TASK_SEP = "#"
+
 #: How long to wait for the routing database. The caller is holding a board
 #: transaction open, so this is deliberately short: losing the thread is better
 #: than stalling the create.
@@ -139,6 +152,9 @@ def _conversation_route(session_id: str, metadata: Optional[dict[str, Any]]) -> 
     conversation = str(route.get("conversation") or "")
     if not platform or not conversation or not route.get("context_id"):
         return None
+    task_id = str(route.get("task_id") or "")
+    if platform == CONSOLE_PLATFORM and task_id and CONSOLE_THREAD_TASK_SEP not in task_id:
+        conversation += CONSOLE_THREAD_TASK_SEP + task_id
     return platform, session_id, conversation
 
 
@@ -256,7 +272,7 @@ def resolve_chat_route(
     conversation = _conversation_route(holder, metadata)
     if conversation:
         served = os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
-        if conversation[0] == served:
+        if conversation[0] in (served, CONSOLE_PLATFORM):
             return conversation
         _log_undeliverable(
             chat_id,

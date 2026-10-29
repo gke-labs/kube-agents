@@ -3,10 +3,12 @@ readiness_rules — the per-entry rules `upgrade_readiness.EXTRA_RULES` runs aft
 maintenance and skew rules of `fleet_upgrade_report.py --readiness`.
 
 One or more modules per entry of docs/designs/upgrade-failure-catalogue.md (entry 10 has two,
-the version side and the add-on matrix). Each module exposes:
+the version side and the add-on matrix), and after them the plan-level rules, which grade the
+upgrade plan rather than a catalogue scenario (the rollout-sequence precheck). Each module exposes:
 
 - `RULE_ID`, the slug the report keys the rule's counts under and stamps on its findings;
-  `ENTRY`, the catalogue entry number; `CAN_BLOCK`, whether a finding of the rule can ever
+  `ENTRY`, the catalogue entry number, or None for a plan-level rule, which `EXTRA_RULES`
+  registers after every numbered one; `CAN_BLOCK`, whether a finding of the rule can ever
   block the upgrade. A rule with `CAN_BLOCK = False` files risks and notes; an `unknown` it
   files is reported in the note and never moves the member's verdict, since the finding it
   could not make would not have blocked either, and a blocker it files is demoted to a risk
@@ -171,6 +173,7 @@ CONTEXT_MASTER = "master"
 CONTEXT_AUTOPILOT = "autopilot"
 CONTEXT_PROJECT_READS = "project_reads"
 CONTEXT_ADDONS = "addons"  # the member's add-on inventory (known_issues_matrix.inventory), built once by the report
+CONTEXT_GRADED = "graded"  # the cluster records the run grades (every listed one on a full run; the named ones under --cluster), so a once-per-host read lands on a graded member
 CONTEXT_KEYS = (
     CONTEXT_PROJECT,
     CONTEXT_LOCATION,
@@ -186,6 +189,7 @@ CONTEXT_KEYS = (
     CONTEXT_AUTOPILOT,
     CONTEXT_PROJECT_READS,
     CONTEXT_ADDONS,
+    CONTEXT_GRADED,
 )
 # The reads under `project_reads`, named once for the report that makes them and the rules
 # that ask for them: three per project (`gcloud compute backend-services list`, `gcloud

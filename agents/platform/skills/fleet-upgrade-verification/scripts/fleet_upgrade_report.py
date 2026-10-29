@@ -1213,7 +1213,7 @@ def _read_error_notes(read_errors: dict) -> list[str]:
     return [NOTE_READ_FAILED.format(kinds=readiness.LIST_SEPARATOR.join(kinds), error=_error_excerpt(error)) for error, kinds in kinds_by_error.items()]
 
 
-def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = None, pools: list[dict] | None = None, master=None, autopilot: bool = False, project_reads: dict | None = None, addons: list[dict] | None = None) -> dict:
+def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = None, pools: list[dict] | None = None, master=None, autopilot: bool = False, project_reads: dict | None = None, graded: list[dict] | None = None, addons: list[dict] | None = None) -> dict:
     """The per-member read context the per-entry rules share (readiness_rules documents the
     keys): the member's project, location and name for a log filter, this module's runner
     with its per-call cap, the instant, a cache a rule fills so another reads it once, every
@@ -1235,10 +1235,11 @@ def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = 
         readiness_rules.CONTEXT_AUTOPILOT: autopilot,
         readiness_rules.CONTEXT_PROJECT_READS: dict(project_reads) if project_reads else {},
         readiness_rules.CONTEXT_ADDONS: list(addons) if addons is not None else None,
+        readiness_rules.CONTEXT_GRADED: list(graded) if graded is not None else None,
     }
 
 
-def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, fleet: list[dict] | None = None, project_reads: dict | None = None) -> dict:
+def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, fleet: list[dict] | None = None, project_reads: dict | None = None, graded: list[dict] | None = None) -> dict:
     """The member's `readiness` object: the PDB, maintenance, skew and webhook rules, then
     EXTRA_RULES, against the row's target. `fleet` is every cluster record in the run, for the
     rules that compare peers; `project_reads` the project and location reads the rules take
@@ -1254,7 +1255,7 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
     addons = known_issues_matrix.inventory(read)  # once per member: the rule reads it from the context, the JSON carries it
-    context = readiness_context(member, at, fleet if fleet is not None else [cluster], pools, master, autopilot, project_reads, addons)
+    context = readiness_context(member, at, fleet if fleet is not None else [cluster], pools, master, autopilot, project_reads, graded, addons)
     rules = readiness.evaluate_extra_rules(cluster, member, read, target, context)
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None, rules)
 
@@ -1419,7 +1420,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 if message != read["error"]:
                     row[ERROR_READ_KEY] = WEBHOOK_READ
                 errors.append(row)
-            member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"], fleet, project_reads.for_member(project, member["location"]))
+            member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"], fleet, project_reads.for_member(project, member["location"]), graded=[c for _, c in found])
             for which, log in (member["readiness"].get("audit_log") or {}).items():
                 if log.get("error"):
                     audit_log_failures.append({"project": project, "location": member["location"], "cluster": member["cluster"], "read": which, "message": log["error"]})

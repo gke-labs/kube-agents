@@ -1,0 +1,30 @@
+[
+  {
+    "name": "projects/acme-fleet-host/locations/global/rolloutSequences/prod-train",
+    "displayName": "prod-train",
+    "uid": "3f9c1b2a-7d4e-4a61-9c0e-5b8d2f6a1e47",
+    "createTime": "2026-09-30T14:02:11.482913Z",
+    "updateTime": "2026-10-20T09:15:40.113204Z",
+    "etag": "W/\"a1b2c3d4e5f6\"",
+    "labels": {
+      "managed-by": "platform-team"
+    },
+    "stages": [
+      {
+        "fleetProjects": ["projects/acme-fleet-host"],
+        "clusterSelector": {
+          "labelSelector": "resource.labels.env=='canary'"
+        },
+        "soakDuration": "604800s"
+      },
+      {
+        "fleetProjects": ["projects/acme-fleet-host"]
+      }
+    ],
+    "computedReleaseChannel": "REGULAR",
+    "targetControlPlaneVersion": "1.34.1-gke.1829001",
+    "targetNodeVersion": "1.34.1-gke.1829001",
+    "lastQualifiedControlPlaneVersion": "1.33.5-gke.1080000",
+    "lastQualifiedNodeVersion": "1.33.5-gke.1080000"
+  }
+]

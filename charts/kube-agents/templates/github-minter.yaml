@@ -18,10 +18,10 @@ the module README, which links the upstream guide for doing it by hand).
   declares no forge at all still renders the minter, which is what every
   existing values file relies on.
 
-  A GitLab-only declaration is the case this fires for: GitLab's credential
-  is an access token an administrator stores in the Secret its
-  credentialsRef names, which the operator mounts into the credential broker,
-  and nothing about it involves the minter -- see
+  A GitLab- or Gitea-only declaration is the case this fires for: their
+  credential is an access token an administrator stores in the Secret the
+  forge's credentialsRef names, which the operator mounts into the credential
+  broker, and nothing about it involves the minter -- see
   docs/designs/version-control-support.md §7.
 */}}
 {{- $providers := include "kube-agents.forgeProviders" . }}

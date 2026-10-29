@@ -320,7 +320,14 @@ risks, reasons it could not decide, and notes, and declares whether it can block
 blocker joins the verdict, a risk never does, and the table prints them under `other blockers`
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
 note column does. The rules, one per catalogue entry or incident scenario, with their reads and
-actions: [`references/readiness-rules.md`](references/readiness-rules.md).
+actions: [`references/readiness-rules.md`](references/readiness-rules.md). After them runs one plan-level rule, `rollout-sequence-precheck`
+(no catalogue entry, never a blocker): for a fleet member it lists the fleet host project's
+RolloutSequences once per run, with
+`gcloud container fleet rolloutsequences list --project <host> --format=json`, filed on the host's
+first member in the listing (the host's other members carry a note saying where, a non-member a
+note that no sequence can carry it), and an existing sequence is
+a risk naming its stages, since the platform allows one sequence per host project and refuses a
+plan that creates a second; the clause after the cell's last `; ` is the one action.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read
@@ -329,10 +336,8 @@ rule said so); `ready` only when every rule was evaluated and none blocks. A ris
 verdict, and neither does an unknown from a rule that declares it can never block, which is
 reported in the note. In the JSON each member carries `readiness.rules` (per rule id: its entry,
 whether it can block, and a count of its blocking, risk, unknown and note entries),
-`rule_blocking`, `risks` and `unknown` (the findings across rules, once, each with its `rule`,
-`entry` and the `text` the cell or the note prints; an unknown entry with its `reason` and
-`can_block`), `notes`, `addons` (the add-on inventory rows), `read_errors` (per kind) and `audit_log` (per read); the top-level
-`readiness` block counts the members with risks (`members_with_risks`). A failed
+`rule_blocking`, `risks` and `unknown` (the findings across rules, once: `rule`, `entry`, `text`; an unknown adds `reason` and `can_block`), `notes`, `addons` (the add-on inventory rows), `read_errors` (per kind) and `audit_log` (per read); the top-level
+`readiness` block counts the members with risks (`members_with_risks`). `notes[]` are strings prefixed `<rule id>: <text>`; `rule_blocking[]`, `risks[]` and `unknown[]` are objects with `rule` and `text`. A per-rule question is answered from the JSON per member by [the recipe](references/readiness-rules.md#a-per-rule-answer): a note is an entry unless the question is for a risk or blocker (its finding-only form); `none` where `readiness.rules.<id>` counts nothing. A failed
 `get-credentials`, PDB read or webhook read is listed under the table as a read failure for that
 member and sets exit code 1, like a failed gcloud read. A failed `get-credentials` or PDB read
 leaves the PDB rule and every per-entry rule that needs an object ungraded (the webhook read is

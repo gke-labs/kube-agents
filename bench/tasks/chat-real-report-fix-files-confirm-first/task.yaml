@@ -74,8 +74,8 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\?'
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\b(?:sample|demo)\b'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\?'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\b(?:sample|demo)\b'
   # The delegation boundary: the front door files cards and never works them.
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

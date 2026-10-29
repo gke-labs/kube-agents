@@ -289,7 +289,16 @@ func TestAPI_SharedCredentialDoorsDoNotRecordUserRoute(t *testing.T) {
 			if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; strings.Contains(got, routeLostNote) {
 				t.Fatalf("answer = %q carries the route-lost note for %s door", got, tc.name)
 			}
-			if puts := store.seen(); len(puts) != 0 {
+			puts := store.seen()
+			if tc.backend == "console" {
+				// The console door posts back, so it records a route, but
+				// never the shared credential's principal.
+				if len(puts) != 1 || puts[0].body.Platform != "console" || puts[0].body.UserID != "" {
+					t.Fatalf("route PUTs = %+v, want one console route with no user_id", puts)
+				}
+				return
+			}
+			if len(puts) != 0 {
 				t.Fatalf("route PUTs = %+v, want none", puts)
 			}
 		})
@@ -396,5 +405,52 @@ func TestAPI_NoRouteIsRecordedForAConversationWithoutOne(t *testing.T) {
 	}
 	if puts := store.seen(); len(puts) != 0 {
 		t.Fatalf("route PUTs = %+v, want none", puts)
+	}
+}
+
+// A console conversation's route carries the turn's task, which a card the
+// turn files snapshots so its report names the turn; a chat conversation's
+// does not, so its route stays the same from turn to turn and repeat PUTs
+// are skipped.
+func TestRouteFor_OnlyAConsoleRouteCarriesItsTask(t *testing.T) {
+	for _, tc := range []struct {
+		conversation, platform, task string
+	}{
+		{"console:tab-1", lib.NotifyPlatformConsole, "task-7"},
+		{"gchat:spaces/A/threads/B", lib.NotifyPlatformGchat, ""},
+	} {
+		env := &lib.Envelope{TaskID: "task-7", ContextID: "ctx-1",
+			Authority: json.RawMessage(`{"audience":{"conversation":"` + tc.conversation + `"}}`)}
+		got, err := routeFor(env)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.conversation, err)
+		}
+		want := conversationRoute{Platform: tc.platform, Conversation: tc.conversation, ContextID: "ctx-1", TaskID: tc.task}
+		if got != want {
+			t.Errorf("%s: route = %+v, want %+v", tc.conversation, got, want)
+		}
+	}
+}
+
+// A console route's task is what its card's report names: when the PUT for
+// a later turn fails, the earlier turn's record would make that turn's card
+// report under the wrong task, so the route is lost (the answer says so)
+// rather than standing. The same turn again still stands.
+func TestRecordRoute_AConsoleRouteForAnotherTurnIsNotTheSame(t *testing.T) {
+	store := newRouteStore(t, http.StatusOK)
+	b := &Bridge{cfg: Config{RouteURL: store.srv.URL, RouteKey: "kv-key", Logger: discardLogger()}, routeClient: http.DefaultClient}
+	turn1 := routeEnvelope(t, "ctx-c", "console:tab-1")
+	turn1.TaskID = "task-1"
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn1); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	store.setStatus(http.StatusInternalServerError)
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn1); err != nil {
+		t.Fatalf("a failed PUT for the same turn = %v, want nil: the earlier record stands", err)
+	}
+	turn2 := routeEnvelope(t, "ctx-c", "console:tab-1")
+	turn2.TaskID = "task-2"
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn2); err == nil {
+		t.Fatal("a failed PUT for another turn = nil, want the error: its card would report under task-1")
 	}
 }

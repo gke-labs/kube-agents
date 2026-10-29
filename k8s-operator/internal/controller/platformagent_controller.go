@@ -170,7 +170,12 @@ const (
 
 	// readyConditionType and degradedPhase are the condition and the phase
 	// getDeploymentStatusDetails reads back off the CR when a pod read failed.
+	// The three phases this controller writes are these constants and never
+	// a literal: usagePhases (usage_gauges.go) exports them, and a test holds
+	// the package to it.
 	readyConditionType = "Ready"
+	provisioningPhase  = "Provisioning"
+	readyPhase         = "Ready"
 	degradedPhase      = "Degraded"
 	// podScanMessagePrefixContainer and podScanMessagePrefixPod open every
 	// message getDeploymentStatusDetails writes, and nothing else that writes
@@ -415,6 +420,21 @@ type PlatformAgentReconciler struct {
 	// next event. Keyed by ObjectKey, value time.Time; cleared by any write
 	// whose echo carries the field, and when the CR is deleted.
 	prunedUsageStatus sync.Map
+	// prunedNewerFields records, per CR (usagePollKey) and per newer
+	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
+	// lastHumanActiveTime, and each counter after the first schema by its
+	// name -- the last poll in which the usage counters poller wrote the field
+	// and it came back absent: a served CRD at a previous schema, which has
+	// the first-schema counters and not every later field. A record per field
+	// because each suppresses the writes it covers for the interval and the
+	// fields such a CRD does serve should keep landing. The poller writes and
+	// reads the records (newerFieldPruned, noteNewerFieldEcho); the usage
+	// gauges' publish reads them on every reconcile, at any age, to hold the
+	// pruned fields' samples back (heldUsageFields). Cleared per field by an
+	// echo that carries it, per CR by the poller's sweep of departed CRs and
+	// when the CR is deleted. Under prunedNewerFieldsMu.
+	prunedNewerFieldsMu sync.Mutex
+	prunedNewerFields   map[string]map[string]time.Time
 
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
@@ -648,9 +668,18 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// plugins pointing at an agent that does not exist. Tell them so, rather
 			// than leaving a mistyped agentRef silently statusless forever.
 			r.markOrphanedPlugins(ctx, req.Namespace, req.Name)
+			usageMetrics.forget(req.Namespace, req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// The gauges carry the CR as read, on every reconcile: an operator restart
+	// serves the fleet on its first pass, and a status write by any writer is
+	// published on the reconcile it re-enqueues, so no writer publishes itself.
+	// While the served CRD prunes a status.usage field the zero read back
+	// means unknown, not idle, so that field's sample is held back, the whole
+	// block or field by field as the writers recorded it (heldUsageFields).
+	usageMetrics.publishPhase(instance)
+	usageMetrics.publishUsageExcept(instance, r.heldUsageFields(instance))
 
 	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
 
@@ -845,7 +874,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// operator can delete permanently — and with nothing selecting the agent Pod,
 	// NetworkPolicy permits all egress. Read 11e for why; both refusals here are
 	// the same hazard and take the same rescue.
-	if msg := validateExtraVolumeMounts(instance); msg != "" {
+	if msg := validateExtraVolumeMounts(instance, agentPlugins...); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, workloadNotRendered); statusErr != nil {
@@ -914,7 +943,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 11. Reconcile the credential proxy: its own Deployment, its Service and the
 	// NetworkPolicy narrowing who may reach it.
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins); err != nil {
+	// Whether the broker may admit the MCP pod's ServiceAccount: read here
+	// because the broker renders before the A2A stack that would otherwise
+	// answer it (a2aMCPIdentityOwned).
+	mcpIdentityOwned, err := r.a2aMCPIdentityOwned(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, mcpIdentityOwned); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1781,18 +1817,31 @@ func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
 			return false
 		}
 	}
+	host := provider.DefaultHost
+	if provider.SelfManaged {
+		seededParsed, err := provider.ParseRepoRef(seeded.URL)
+		if err != nil || seededParsed.Host == "" {
+			return false
+		}
+		host = seededParsed.Host
+	}
 	parsed, err := provider.ParseRepoRef(existing.URL)
 	if err != nil {
 		return false
 	}
-	if parsed.Host != "" && parsed.Host != provider.DefaultHost {
+	// A bare owner/name names no host. The agent reads it for GitHub only on
+	// github.com; on a GitHub Enterprise Server install it skips it.
+	if parsed.Host == "" && (provider.Name != agentv1alpha1.GitProviderGitHub || host != provider.DefaultHost) {
 		return false
 	}
-	existingRef, err := provider.Resolve("", existing.URL, "")
+	if parsed.Host != "" && parsed.Host != host {
+		return false
+	}
+	existingRef, err := provider.Resolve(host, existing.URL, "")
 	if err != nil {
 		return false
 	}
-	seededRef, err := provider.Resolve("", seeded.URL, "")
+	seededRef, err := provider.Resolve(host, seeded.URL, "")
 	if err != nil {
 		return false
 	}
@@ -2525,6 +2574,12 @@ func (r *PlatformAgentReconciler) heldEnabledProfiles(ctx context.Context, agent
 // Service and the NetworkPolicy, so what the failure blocked was
 // updateStatusReady: the CR's status silently stopped tracking reality while
 // an admin followed the documented deletion path straight onto the error path.
+//
+// The guard itself no longer fails the reconcile either: an object under one
+// of the two names that this PlatformAgent does not control is skipped and
+// logged, as the A2A removals skip theirs (#3871). It is not ours to delete,
+// and this runs on every reconcile in both modes, so refusing would stop
+// everything after it until a person deleted the object.
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
@@ -2538,7 +2593,9 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 			continue
 		}
 		if !metav1.IsControlledBy(resource, agent) {
-			return fmt.Errorf("refusing to delete unowned legacy %T %s/%s", resource, resource.GetNamespace(), resource.GetName())
+			logf.FromContext(ctx).V(1).Info("skipping unowned legacy object under a reserved name",
+				"kind", fmt.Sprintf("%T", resource), "namespace", resource.GetNamespace(), "name", resource.GetName())
+			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, resource)); err != nil {
 			return err
@@ -2932,7 +2989,7 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // and the sandbox's wrapped CLIs both dial the Service, and neither has any
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
-func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) error {
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, an override under the
@@ -2977,7 +3034,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// reaching a container that never restarts. (On a Slack-armed next install
 	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
 	// stamps.)
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins)
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -3094,18 +3151,6 @@ func (r *PlatformAgentReconciler) reconcileCredentialBrokerTokenReviewRBAC(ctx c
 		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
 	}
 	return nil
-}
-
-// deleteIfOwned removes a namespaced object this controller created, refusing
-// to touch one it does not own.
-func (r *PlatformAgentReconciler) deleteIfOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent, object client.Object) error {
-	if err := r.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !metav1.IsControlledBy(object, agent) {
-		return fmt.Errorf("refusing to delete unowned %T %s/%s", object, object.GetNamespace(), object.GetName())
-	}
-	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
 // deleteIfManaged removes a cluster-scoped object this controller created.
@@ -3926,6 +3971,37 @@ func a2aGatewayConditionStands(agent *agentv1alpha1.PlatformAgent) bool {
 		(existing.Reason == a2aGatewayLegacyDarkReason || existing.Reason == a2aGatewayWakingReason)
 }
 
+// a2aMCPIdentityConditionCurrent and setA2AMCPIdentityCondition carry the
+// MCP server condition (a2aMCPIdentityConditionType): present, True, with
+// the reason a2aProvisionState.mcpNotRendered names, while the door is on
+// and an unowned object holds one of the server's reserved names; absent
+// otherwise. Same shape as the gateway's, and written by both status
+// writers (updateStatusReady and syncA2AConditions), so the ordinary Ready
+// pass and a Degraded park both carry it.
+func a2aMCPIdentityConditionCurrent(agent *agentv1alpha1.PlatformAgent, reason string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aMCPIdentityConditionType)
+	if reason == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == reason && existing.Message == a2aMCPNotRenderedMessage(agent, reason)
+}
+
+func setA2AMCPIdentityCondition(agent *agentv1alpha1.PlatformAgent, reason string, now metav1.Time) {
+	if reason == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aMCPIdentityConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aMCPIdentityConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            a2aMCPNotRenderedMessage(agent, reason),
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
 // setA2AGatewayCondition writes the A2AGateway condition on the EventWatcher
 // pattern: present while the state holds, removed the pass it stops holding.
 // The only state is the way back on an upgraded install (a gateway an older
@@ -4083,13 +4159,15 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	homeMsg := homeChannelUnsetMessage(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
-		homeChannelUnsetConditionCurrent(agent, homeMsg) {
+		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live))
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
 	}) {
 		return nil
 	}
@@ -4098,6 +4176,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
+	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4219,13 +4298,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	// Determine Phase and Condition
-	newPhase := "Provisioning"
+	newPhase := provisioningPhase
 	condStatus := metav1.ConditionFalse
 	condReason := "Provisioning"
 	condMsg := "Waiting for deployment replicas to be ready"
 	switch {
 	case errWorkload == nil && newDeploymentStatusReadyReplicas > 0 && len(notReady) == 0:
-		newPhase = "Ready"
+		newPhase = readyPhase
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
@@ -4284,7 +4363,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// The Degraded message is the Ready one unless a branch says otherwise.
 	degradedMsg := ""
 	if gitRepoErr != nil {
-		newPhase = "Degraded"
+		newPhase = degradedPhase
 		condStatus = metav1.ConditionFalse
 		// The reason string stays InvalidGitRepoURL: it is on the status of
 		// running resources and in tests, and renaming it would be a second,
@@ -4311,7 +4390,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded%s. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr), withheld)
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
-		newPhase = "Degraded"
+		newPhase = degradedPhase
 		condStatus = metav1.ConditionFalse
 		condReason = conditionReasonCorruptManagedRepos
 		degradedReason = conditionReasonCorruptManagedRepos
@@ -4409,6 +4488,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// reason.
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
+	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4457,7 +4537,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4535,6 +4615,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
+	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	if err := r.Status().Update(ctx, agent); err != nil {
@@ -4542,6 +4623,32 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	return newPhase, nil
+}
+
+// heldUsageFields is the usage gauges' view of the served-CRD skew for one
+// CR: nil when nothing is held; every exported field when the whole block is
+// pruned (prunedUsageStatus, at any age) or the block reads entirely empty,
+// which is a pruned status before this process records it; else the fields
+// whose own record is held (prunedNewerFields, at any age), which a CRD at an
+// intermediate schema prunes while it serves the rest. Age is the writers'
+// reprobe gate, not this one: a sample must not lapse into zero with it.
+func (r *PlatformAgentReconciler) heldUsageFields(agent *agentv1alpha1.PlatformAgent) map[string]bool {
+	if _, pruned := r.prunedUsageStatus.Load(client.ObjectKeyFromObject(agent)); pruned || usageBlockEmpty(&agent.Status.Usage) {
+		return usageExportFieldSet(nil)
+	}
+	r.prunedNewerFieldsMu.Lock()
+	defer r.prunedNewerFieldsMu.Unlock()
+	records := r.prunedNewerFields[usagePollKey(agent)]
+	if len(records) == 0 {
+		return nil
+	}
+	held := map[string]bool{}
+	for record := range records {
+		for _, field := range usageExportFieldsOfRecord(record) {
+			held[field] = true
+		}
+	}
+	return held
 }
 
 // usageStatusPruned reports whether the served CRD has been seen to drop
@@ -4598,6 +4705,9 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 // map does not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedNewerFieldsMu.Lock()
+	delete(r.prunedNewerFields, usagePollKey(agent))
+	r.prunedNewerFieldsMu.Unlock()
 }
 
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
@@ -4976,7 +5086,7 @@ func podScanWroteMessage(message string) bool {
 // after it -- because the Job is reaped and re-rendered while the bucket it
 // made stays put.
 func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, capBucketProvisioned bool) (phase string, reason string, message string) {
-	phase = "Provisioning"
+	phase = provisioningPhase
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
 
@@ -5159,7 +5269,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 			}
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" &&
 				cs.State.Waiting.Reason != reasonContainerCreating && cs.State.Waiting.Reason != reasonPodInitializing {
-				phase = "Degraded"
+				phase = degradedPhase
 				reason = cs.State.Waiting.Reason
 				message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - %s", cs.Name, pod.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
 				if isPluginStagingContainer(cs.Name) {
@@ -5175,7 +5285,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 				return phase, reason, message
 			}
 			if isPluginStagingContainer(cs.Name) && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
-				phase = "Degraded"
+				phase = degradedPhase
 				reason = cs.State.Terminated.Reason
 				if reason == "" {
 					reason = reasonContainerError
@@ -5191,7 +5301,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		// 2. Check pod scheduling conditions (Unschedulable due to node selector/affinity/gVisor)
 		for _, cond := range pod.Status.Conditions {
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse && cond.Reason == "Unschedulable" {
-				phase = "Degraded"
+				phase = degradedPhase
 				reason = "PodUnschedulable"
 				if requested := requestedRuntimeClasses(agent); len(requested) > 0 {
 					// Plural only when the CR really does name two, which takes
@@ -5419,7 +5529,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		return nil
 	}
 
-	agent.Status.Phase = "Degraded"
+	agent.Status.Phase = degradedPhase
 	agent.Status.ObservedGeneration = agent.Generation
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -5578,13 +5688,18 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its
-				// operator-created ServiceAccount (a foreign one under that
-				// name keeps it out: agentProfileServiceAccountIsForeign),
-				// and that ServiceAccount is the profile's, not the agent's,
-				// so Owns() above never fires for it.
+				// operator-created ServiceAccounts (a foreign one under
+				// such a name keeps it out: agentProfileServiceAccountIsForeign),
+				// and those are the profile's, not the agent's, so Owns()
+				// above never fires for them. They live in the profile
+				// namespace, which maps to the agent beside it.
 				&corev1.ServiceAccount{},
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+					agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
+					if !ok {
+						return nil
+					}
+					return enqueueAgentsInNamespace(ctx, agentNS)
 				}),
 				builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)
@@ -6184,7 +6299,7 @@ func (r *PlatformAgentReconciler) markOrphanedPlugins(ctx context.Context, names
 		patch := client.MergeFrom(original)
 		plugin.Status.ObservedGeneration = plugin.Generation
 		plugin.Status.TargetAgents = nil
-		plugin.Status.Phase = "Degraded"
+		plugin.Status.Phase = degradedPhase
 		condition := metav1.Condition{
 			Type:               "Ready",
 			Status:             metav1.ConditionFalse,

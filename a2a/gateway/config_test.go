@@ -990,6 +990,26 @@ func TestAMalformedPodNamespaceIsAGatewayBootFailure(t *testing.T) {
 	}
 }
 
+// TestAProfileTierIsNotAGatewayCeiling: read and unattended are tiers a grant
+// carries only with its profile, and the gateway's install-wide mint sets no
+// profile. Entry.Validate refuses a profile tier with no profile, so a gateway
+// configured with A2A_AUTHORITY_TIER=read or unattended fails boot instead of
+// minting profile-less roots whose first hop could pick any profile (#3659).
+func TestAProfileTierIsNotAGatewayCeiling(t *testing.T) {
+	for _, tier := range []capability.Tier{capability.TierRead, capability.TierUnattended} {
+		c := &Config{Namespace: "kubeagents-system", AuthorityTier: tier}
+		c.defaultCapabilityCeiling()
+		if err := c.validateCapabilityCeiling(); err == nil || !strings.Contains(err.Error(), "names no profile") {
+			t.Errorf("A2A_AUTHORITY_TIER=%s: validateCapabilityCeiling = %v, want a boot failure naming the missing profile", tier, err)
+		}
+	}
+	c := &Config{Namespace: "kubeagents-system", AuthorityTier: capability.TierDeveloperTeam}
+	c.defaultCapabilityCeiling()
+	if err := c.validateCapabilityCeiling(); err != nil {
+		t.Fatalf("the default tier should still boot: %v", err)
+	}
+}
+
 // TestDelegationDepthMaxFromEnv: unset means 3; a value below 1 or a
 // non-integer refuses the boot, the way A2A_MAX_SESSIONS does, rather than
 // quietly clamping a typo into a different bound.
@@ -1109,5 +1129,33 @@ func TestNewDefaultsAConsoleOnlyGatewayToTheConsole(t *testing.T) {
 	}
 	if g.backend != consoleBackend {
 		t.Fatalf("a console-only gateway attributes to %q, want %q", g.backend, consoleBackend)
+	}
+}
+
+func TestConfigHomeLearnArmed(t *testing.T) {
+	armed := Config{SlackBotToken: "xoxb-x", HomeChannelRecord: "platform-agent-home-channel", HomeChannelLearn: true}
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want bool
+	}{
+		{"all gates hold", func(*Config) {}, true},
+		{"policy absent is auto", func(c *Config) { c.SlackHomePolicy = "" }, true},
+		{"CR home set", func(c *Config) { c.SlackHomeChannel = "C0HOME" }, false},
+		{"CR home set but malformed", func(c *Config) { c.SlackHomeChannel = "general" }, false},
+		{"policy manual", func(c *Config) { c.SlackHomePolicy = slackHomePolicyManual }, false},
+		{"no record named", func(c *Config) { c.HomeChannelRecord = "" }, false},
+		{"learn not armed by the operator", func(c *Config) { c.HomeChannelLearn = false }, false},
+		{"Chat holds the gateway", func(c *Config) { c.GchatRelayURL = "https://relay" }, false},
+		{"no backend", func(c *Config) { c.SlackBotToken = "" }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := armed
+			tc.mut(&c)
+			if got := c.HomeLearnArmed(); got != tc.want {
+				t.Errorf("HomeLearnArmed = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

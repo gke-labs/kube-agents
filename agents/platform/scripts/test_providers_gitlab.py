@@ -600,6 +600,19 @@ class LabelTest(unittest.TestCase):
         forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04"})
         self.assertEqual("#fbca04", api.calls[1][3]["color"])
 
+    def test_an_unchanged_label_is_not_written(self):
+        held = {"name": "x", "color": "#FBCA04", "description": "d"}
+        api = Api(held)
+        answer = forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04", "description": "d"})
+        self.assertEqual(["GET"], [call[0] for call in api.calls])
+        self.assertEqual("FBCA04", answer["label"]["color"])
+
+    def test_only_a_changed_field_is_written(self):
+        api = Api({"name": "x", "color": "#fbca04", "description": "old"}, {"name": "x"})
+        forge().label_ensure(api, "acme/infra", {"name": "x", "color": "fbca04", "description": "new"})
+        self.assertEqual(["GET", "PUT"], [call[0] for call in api.calls])
+        self.assertEqual({"description": "new"}, api.calls[1][3])
+
     def test_a_label_name_is_encoded_in_its_path(self):
         api = Api({"name": "status:in progress", "color": "#000000"})
         forge().label_ensure(api, "acme/infra", {"name": "status:in progress"})

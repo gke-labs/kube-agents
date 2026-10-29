@@ -483,6 +483,7 @@ class VcsBroker:
                 outer_deadline=self._request_deadline,
                 ca_file=forge.ca_file,
                 ca_source=forge.ca_source,
+                allow_http=(forge.scheme == "http"),
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
@@ -508,8 +509,12 @@ class VcsBroker:
         # Read per invocation, not at bind time: a minted credential holds no
         # token until the verb's `ensure` has run, and a token minted later
         # than the bind is the one git must present.
+        allow_http = forge.scheme == "http"
+
         def run(cwd: Path, *args: str, check: bool = True):
             config = tuple(forge.credential.git_config(repo))
+            if allow_http:
+                return self._git_runner(["git", *args], cwd, check, config, allow_http=True)
             return self._git_runner(["git", *args], cwd, check, config)
 
         return run

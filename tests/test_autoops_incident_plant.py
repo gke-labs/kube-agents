@@ -97,6 +97,7 @@ _INTERPOLATIONS = {
     # The OOM shape and the incident wait: what the incumbent case plants.
     "var.crash_seconds": "0",
     "var.wait_for": "incident",
+    "var.start_settle_seconds": "0",
 }
 
 #: The label step 1 writes, and the value step 0b requires before it will
@@ -143,17 +144,19 @@ exit 0
 
 #: The plant polls on 10-second sleeps and its timeouts are minutes long.
 #: `STUB_SLEEP` buys back a little real time for the signal test, which needs
-#: the script still running when it sends SIGTERM.
-_SLEEP_STUB = '#!/bin/bash\nexec /bin/sleep "${STUB_SLEEP:-0}"\n'
+#: the script still running when it sends SIGTERM. Every invocation is recorded
+#: to $CALLS so tests can assert settle sleeps and ordering after the poll.
+_SLEEP_STUB = '#!/bin/bash\necho "sleep $*" >> "$CALLS"\nexec /bin/sleep "${STUB_SLEEP:-0}"\n'
 
 #: Bounds for the signal test's two waits -- for the plant to reach the watcher
 #: poll, and for it to finish once signalled. Generous, because blowing either
 #: is a hang rather than a red.
 _SIGNAL_TIMEOUT_SECONDS = 60
 _SIGNAL_POLL_SECONDS = 0.05
+_TF_BIN = shutil.which("tofu") or shutil.which("terraform")
 
 
-def _render_plant() -> str:
+def _render_plant(overrides: "dict[str, str] | None" = None) -> str:
     """Render the create-time provisioner the way Terraform would.
 
     `<<-EOT` strips the indentation common to every line -- which matters, since
@@ -169,14 +172,17 @@ def _render_plant() -> str:
     sentinel = "\x00"
     body = body.replace("$${", sentinel)
 
+    interpolations = dict(_INTERPOLATIONS)
+    if overrides:
+        interpolations.update(overrides)
     unresolved = []
 
     def substitute(match: "re.Match[str]") -> str:
         expression = match.group(1).strip()
-        if expression not in _INTERPOLATIONS:
+        if expression not in interpolations:
             unresolved.append(expression)
             return match.group(0)
-        return _INTERPOLATIONS[expression]
+        return interpolations[expression]
 
     body = re.sub(r"\$\{([^}]*)\}", substitute, body)
     body = body.replace(sentinel, "${")
@@ -458,6 +464,122 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
         completed, _ = self._run(NS_EXISTS_RC=0, NS_DELETE_RC=1)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("could not clear the leftover", completed.stderr)
+
+    def test_start_settle_seconds_waits_after_watcher_poll_only_when_positive(self):
+        # At the default 0, single-card cases pay no extra sleep after `fire`.
+        completed, calls = self._run()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("Waiting ", completed.stdout)
+        logs_calls = self._indices(calls, "logs ")
+        self.assertTrue(logs_calls, f"no watcher poll ran:\n{chr(10).join(calls)}")
+        self.assertEqual(
+            [i for i in self._indices(calls, "sleep ") if i > max(logs_calls)],
+            [],
+            f"the default 0s plant slept after the watcher poll:\n{chr(10).join(calls)}",
+        )
+
+        # With a positive settle duration, the plant prints its settle line and
+        # sleeps strictly after `k8s-event-watcher` handles the pod.
+        self._calls.unlink(missing_ok=True)
+        settled = _render_plant({"var.start_settle_seconds": "7"})
+        self.assertNotEqual(settled, self._plant)
+        self._script.write_text(settled)
+        completed, calls = self._run()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        handled_msg = "k8s-event-watcher handled a pod"
+        waiting_msg = "Waiting 7s for the incident cards to settle before the board read."
+        self.assertIn(handled_msg, completed.stdout)
+        self.assertIn(waiting_msg, completed.stdout)
+        self.assertLess(
+            completed.stdout.index(handled_msg),
+            completed.stdout.index(waiting_msg),
+        )
+        logs_calls = self._indices(calls, "logs ")
+        settle_sleeps = self._indices(calls, "sleep 7")
+        self.assertTrue(logs_calls, f"no watcher poll ran:\n{chr(10).join(calls)}")
+        self.assertTrue(
+            settle_sleeps, f"no `sleep 7` settle ran:\n{chr(10).join(calls)}"
+        )
+        self.assertLess(
+            max(logs_calls),
+            settle_sleeps[0],
+            f"`sleep 7` ran before the watcher poll finished:\n{chr(10).join(calls)}",
+        )
+
+    def test_start_settle_seconds_declares_whole_number_validation(self):
+        # main.tf gates the settle with `[ "${var.start_settle_seconds}" != "0" ]`
+        # (avoiding bash's 64-bit integer `-gt` grammar) and variables.tf bounds
+        # `start_settle_seconds` to whole numbers in `0..86400`. Pin the exact
+        # validation condition text so CI environments without `tofu` or
+        # `terraform` still fail on any edit that weakens or appends to the rule.
+        block = re.search(
+            r'variable "start_settle_seconds"\s*\{(.*?)\n\}',
+            _VARIABLES.read_text(),
+            re.S,
+        )
+        self.assertIsNotNone(
+            block, f"start_settle_seconds variable block not found in {_VARIABLES}"
+        )
+        condition = re.search(
+            r"validation\s*\{[^}]*?\bcondition\s*=\s*([^\n]+)",
+            block.group(1),
+            re.S,
+        )
+        self.assertIsNotNone(
+            condition,
+            f"validation condition not found on start_settle_seconds in {_VARIABLES}",
+        )
+        self.assertEqual(
+            condition.group(1).strip(),
+            "var.start_settle_seconds >= 0 && var.start_settle_seconds <= 86400 && floor(var.start_settle_seconds) == var.start_settle_seconds",
+        )
+
+    @unittest.skipUnless(_TF_BIN, "needs a tofu or terraform binary")
+    def test_start_settle_seconds_validation_evaluated_by_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy2(_VARIABLES, pathlib.Path(tmp) / "variables.tf")
+            init = subprocess.run(
+                [_TF_BIN, f"-chdir={tmp}", "init", "-input=false", "-no-color"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(init.returncode, 0, init.stderr)
+
+            def plan(val: str) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    [
+                        _TF_BIN,
+                        f"-chdir={tmp}",
+                        "plan",
+                        "-input=false",
+                        "-no-color",
+                        "-var",
+                        "host_cluster_name=platform-agent-host",
+                        "-var",
+                        "host_cluster_location=us-central1",
+                        "-var",
+                        f"start_settle_seconds={val}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+
+            for accepted in ("0", "180", "86400"):
+                with self.subTest(accepted=accepted):
+                    res = plan(accepted)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+            for refused in ("2.5", "-1", "86401", "10000000000000000000"):
+                with self.subTest(refused=refused):
+                    res = plan(refused)
+                    self.assertNotEqual(res.returncode, 0, res.stdout)
+                    self.assertIn(
+                        "start_settle_seconds must be a whole number of seconds between 0 and 86400",
+                        res.stderr,
+                    )
 
 
 if __name__ == "__main__":

@@ -190,12 +190,19 @@ object it cannot apply. helm template alone has no cluster to ask: pass
 render, or --validate to ask the cluster the kubeconfig points at.
 */}}
 {{- define "kube-agents.platformAgentPodMonitoring" -}}
-{{- $explicit := .Values.platformAgent.podMonitoring -}}
-{{- if kindIs "invalid" $explicit -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" .Values.platformAgent.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end }}
+
+{{/*
+The tri-state behind every PodMonitoring knob: null follows the cluster, true
+and false decide. Takes a dict with "explicit" (the value) and "Capabilities".
+*/}}
+{{- define "kube-agents.podMonitoringTriState" -}}
+{{- if kindIs "invalid" .explicit -}}
 {{- if .Capabilities.APIVersions.Has "monitoring.googleapis.com/v1/PodMonitoring" -}}
 true
 {{- end -}}
-{{- else if $explicit -}}
+{{- else if .explicit -}}
 true
 {{- end -}}
 {{- end }}
@@ -704,6 +711,38 @@ Takes a dict of field name to value.
 {{- end }}
 
 {{/*
+The model LiteLLM serves as model-default: litellm.modelDefaultName, or the
+provider's default when that is empty. litellm.yaml renders it into the gateway
+config and web-console.yaml shows it in the console banner, so the two cannot
+name different models. Fails on a provider the table does not know.
+
+Takes the root context.
+*/}}
+{{- define "kube-agents.litellmModel" -}}
+{{- $provider := .Values.litellm.modelProvider }}
+{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
+       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
+{{- /*
+  openai_compatible has no default model, so it is allowed beside the table
+  rather than in it. Any other value is taken as a LiteLLM provider slug
+  (azure, bedrock, databricks, ...) whose credentials arrive through
+  envFromSecret: the chart knows no default model for it, so modelDefaultName
+  is required, and the slug's shape is checked here so a typo fails the render
+  rather than the first model call.
+*/}}
+{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
+{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
+{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
+{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
+{{- end }}
+{{- .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
+{{- end }}
+
+{{/*
 The LiteLLM gateway config, mirroring
 k8s-operator/config/integrations/litellm/base/config.yaml and its provider
 overlays.
@@ -719,7 +758,10 @@ in-place updates, so the running pod would have kept the old file indefinitely.
 Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
-neither key), which only openai_compatible passes.
+neither key), which only openai_compatible passes, and the optional
+dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds
+and numRetries. Every optional input renders nothing when unset, so the default
+render is unchanged.
 callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
@@ -727,15 +769,21 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   max_tokens on every alias when .maxTokens is above zero, and no key at all
   otherwise, so the default render adds no key the kustomize base
   (k8s-operator/config/integrations/litellm/base/config.yaml) lacks beyond the
-  Gemini thinking key below; the base carries no max_tokens on purpose. One value for all three aliases: they are one
+  Gemini thinking key below; the base carries no max_tokens on purpose. One
+  value for every rendered alias (three by default, four with fallback): they are one
   upstream model, and the budget is the backend's property, not the alias's.
   LiteLLM's router spreads litellm_params underneath the request's own
   arguments, so this is what a request that names no max_tokens gets, not a
   ceiling on one that does; values.yaml says what that means for the agent.
+
+  The fallback alias, when asked for, is one more entry for the same upstream
+  model at its own reasoning_effort, and router_settings.fallbacks sends each
+  primary alias to it once the primary's retries are spent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
 {{- /*
-  reasoning_effort on every alias when .reasoningEffort is set, and no key at
+  reasoning_effort on every primary alias when .reasoningEffort is set (the
+  fallback alias carries its own), and no key at
   all otherwise, for the same reason as max_tokens above: the default render
   and its checksum stay what they were. LiteLLM translates the OpenAI-style
   value per provider (thinkingLevel on Gemini 3.x through gemini or vertex_ai,
@@ -747,7 +795,7 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   deploy/shared/defaults/config.yaml).
 */}}
 {{- /*
-  thinking: {type: enabled} on every alias for a Gemini model that thinks, so
+  thinking: {type: enabled} on every primary alias for a Gemini model that thinks, so
   its thoughts come back as thought parts (reasoning_content) rather than not
   at all. Gemini thinks by default but returns its thoughts only when the
   request sets thinkingConfig.includeThoughts. With that off, Gemini 3.x has
@@ -810,8 +858,55 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   api_key line: the key arrives as HOSTED_VLLM_API_KEY (litellm.yaml).
 */}}
 {{- $litellmProvider := ternary "hosted_vllm" .provider (eq .provider "openai_compatible") -}}
+{{- $fallback := .fallback | default dict -}}
+{{- $fallbackEffort := $fallback.reasoningEffort | default "" -}}
+{{- if and $fallback.modelName (not (regexMatch `^[A-Za-z0-9][A-Za-z0-9_.@\-]*$` $fallback.modelName)) -}}
+{{- fail (printf "litellm.fallback.modelName %q must start with a letter or digit and use only letters, digits, _ . @ -" $fallback.modelName) -}}
+{{- end -}}
+{{- $fallbackName := "" -}}
+{{- if and $fallback.modelName (not $fallbackEffort) -}}
+{{- fail (printf "litellm.fallback.modelName %q is set without litellm.fallback.reasoningEffort, which is what renders the fallback alias" $fallback.modelName) -}}
+{{- end -}}
+{{- if $fallbackEffort -}}
+{{- $fallbackName = $fallback.modelName | default (printf "%s-%s" .model $fallbackEffort) -}}
+{{- end -}}
+{{- $timeout := int (.timeoutSeconds | default 0) -}}
+{{- $numRetries := int (.numRetries | default 0) -}}
+{{- $primaries := list "model-default" "hermes-agent" .model -}}
+{{- if and $fallbackName (has $fallbackName $primaries) -}}
+{{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
+{{- end -}}
 model_list:
-  - model_name: model-default
+{{- range $primaries }}
+  - model_name: {{ . }}
+    litellm_params:
+      model: {{ printf "%s/%s" $litellmProvider $.model }}
+      {{- with $.apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with $.sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
+      {{- if gt $maxTokens 0 }}
+      max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- with $.reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
+      {{- if $claudeDrop }}
+      additional_drop_params: ["temperature", "top_p", "top_k"]
+      {{- end }}
+{{- end }}
+{{- /*
+  The fallback alias carries its own reasoning_effort, so it never takes the
+  Gemini thinking key: the two on one deployment fail every Gemini 3.x request
+  (see $geminiThoughts above).
+*/}}
+{{- if $fallbackName }}
+  - model_name: {{ $fallbackName | quote }}
     litellm_params:
       model: {{ printf "%s/%s" $litellmProvider .model }}
       {{- with .apiBase }}
@@ -823,58 +918,15 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- with .reasoningEffort }}
-      reasoning_effort: {{ . | quote }}
-      {{- end }}
-      {{- if $geminiThoughts }}
-      thinking: {"type": "enabled"}
-      {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
-  - model_name: hermes-agent
-    litellm_params:
-      model: {{ printf "%s/%s" $litellmProvider .model }}
-      {{- with .apiBase }}
-      api_base: {{ . | quote }}
-      {{- end }}
-      {{- with .sslVerify }}
-      ssl_verify: {{ . | quote }}
-      {{- end }}
-      {{- if gt $maxTokens 0 }}
-      max_tokens: {{ $maxTokens }}
-      {{- end }}
-      {{- with .reasoningEffort }}
-      reasoning_effort: {{ . | quote }}
-      {{- end }}
-      {{- if $geminiThoughts }}
-      thinking: {"type": "enabled"}
-      {{- end }}
-      {{- if $claudeDrop }}
-      additional_drop_params: ["temperature", "top_p", "top_k"]
-      {{- end }}
-  - model_name: {{ .model }}
-    litellm_params:
-      model: {{ printf "%s/%s" $litellmProvider .model }}
-      {{- with .apiBase }}
-      api_base: {{ . | quote }}
-      {{- end }}
-      {{- with .sslVerify }}
-      ssl_verify: {{ . | quote }}
-      {{- end }}
-      {{- if gt $maxTokens 0 }}
-      max_tokens: {{ $maxTokens }}
-      {{- end }}
-      {{- with .reasoningEffort }}
-      reasoning_effort: {{ . | quote }}
-      {{- end }}
-      {{- if $geminiThoughts }}
-      thinking: {"type": "enabled"}
-      {{- end }}
-      {{- if $claudeDrop }}
-      additional_drop_params: ["temperature", "top_p", "top_k"]
-      {{- end }}
+      reasoning_effort: {{ $fallbackEffort | quote }}
+{{- end }}
 litellm_settings:
+  {{- if or .dropParams $fallbackEffort }}
+  drop_params: true
+  {{- end }}
   callbacks: {{ .callbacks }}
 {{- /*
   Prompt caching, for Anthropic-family models only: the $claude gate, which
@@ -887,8 +939,21 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if $claude }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) }}
 router_settings:
+  {{- if $fallbackName }}
+  fallbacks:
+    {{- range $primaries }}
+    - {{ . }}: [{{ $fallbackName | quote }}]
+    {{- end }}
+  {{- end }}
+  {{- if gt $timeout 0 }}
+  timeout: {{ $timeout }}
+  {{- end }}
+  {{- if gt $numRetries 0 }}
+  num_retries: {{ $numRetries }}
+  {{- end }}
+  {{- if $claude }}
   default_litellm_params:
     cache_control_injection_points:
       - location: message
@@ -900,6 +965,7 @@ router_settings:
         index: -3
       - location: message
         index: -1
+  {{- end }}
 {{- end }}
 {{- end }}
 
@@ -910,6 +976,27 @@ selectors are immutable once the Deployment exists.
 {{- define "kube-agents.operatorSelectorLabels" -}}
 app.kubernetes.io/name: {{ .Chart.Name }}-operator
 app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Whether the operator's PodMonitoring renders: the same tri-state as
+platformAgent.podMonitoring (null follows the cluster, true and false decide),
+and only while the manager serves metrics at all.
+*/}}
+{{- define "kube-agents.operatorPodMonitoring" -}}
+{{- $metrics := .Values.operator.metrics | default dict -}}
+{{- if $metrics.enabled -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" $metrics.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The manager's metrics port: the bind flag, the containerPort, the
+PodMonitoring endpoint and the NetworkPolicy rule read it here;
+tests/test_chart_operator_monitoring.py holds them together.
+*/}}
+{{- define "kube-agents.operatorMetricsPort" -}}
+8080
 {{- end }}
 
 {{/*
@@ -987,12 +1074,17 @@ are unique, a provider must be registered, a GitHub forge's host must be github.
 Enterprise Server hostname and its namespace a GitHub organisation or user name, an install has
 one GitHub host and one host is one forge's, a GitLab forge needs a
 credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
-is a GitLab group path, and a repository must name a
+is a GitLab group path, a self-managed forge (gitea) must
+name its host and credentialsRef, only a self-managed forge may declare a port or plain http, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
 refusal would name `github.org` or `github.gitRepo`, keys the values file never
 set.
+
+A self-managed forge has no fixed host list: the host it serves is the one its
+declaration names, so the "host and no repository" test below compares a
+repository against that host rather than against GitHub's spellings.
 
 Renders the empty string when no forge is declared at all, which is a valid
 install: repositories can be registered in the gitops-state ConfigMap later.
@@ -1001,13 +1093,17 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider, the host list
-mirrors githubHosts, and the GitLab namespace pattern mirrors
-gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider, the
+self-managed list mirrors the providers with SelfManaged set, the host list
+mirrors githubHosts, and the GitLab and Gitea namespace patterns mirror
+gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" "gitlab" -}}
+{{- $registered := list "github" "gitlab" "gitea" -}}
+{{- $selfManaged := list "gitea" -}}
+{{- $defaultScheme := "https" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
+{{- $reservedHosted := list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
 {{- $repos := $integ.repositories | default list -}}
@@ -1020,7 +1116,8 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $names := list -}}
 {{- $providers := list -}}
 {{- $namespaces := dict -}}
-{{- $gitlabHosts := dict -}}
+{{- $credentialHosts := dict -}}
+{{- $forgeHosts := dict -}}
 {{- $hostProviders := dict -}}
 {{- $ghHost := "" -}}
 {{- $ghCA := "" -}}
@@ -1055,13 +1152,15 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- fail (printf "platformAgent.integration.forges[%d].host: this install's GitHub host is already %s; an install serves one GitHub host, github.com or one GitHub Enterprise Server" $i $ghHost) -}}
 {{- end -}}
 {{- $ghHost = $canon -}}
-{{- else -}}
+{{- else if eq $provider "gitlab" -}}
 {{- if or (not $canon) (eq $canon "www.gitlab.com") }}{{ $canon = "gitlab.com" }}{{ end -}}
 {{- end -}}
-{{- if and (hasKey $hostProviders $canon) (ne (get $hostProviders $canon) $provider) -}}
+{{- if and $canon (hasKey $hostProviders $canon) (ne (get $hostProviders $canon) $provider) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host: %s is already the host of a %s forge; one host is one forge's" $i $canon (get $hostProviders $canon)) -}}
 {{- end -}}
+{{- if $canon -}}
 {{- $_ := set $hostProviders $canon $provider -}}
+{{- end -}}
 {{- /* On every provider: the CRD's schema refuses the name wherever it is written, so the chart does too, naming the values key. */ -}}
 {{- $secret := ($f.credentialsRef | default dict).name | default "" -}}
 {{- if and $secret (or (gt (len $secret) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $secret))) -}}
@@ -1074,8 +1173,11 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- if $caMap -}}
 {{- /* gitlab.com and github.com present certificates the public CAs sign: a private CA must never vouch for them. */ -}}
-{{- if or (not $host) (has (lower $host) (concat (list "gitlab.com" "www.gitlab.com") $githubHosts)) -}}
+{{- if and (has $provider (list "github" "gitlab")) (or (not $host) (has (lower $host) (concat (list "gitlab.com" "www.gitlab.com") $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com and github.com use the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
+{{- end -}}
+{{- if eq ($f.scheme | default $defaultScheme) "http" -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef cannot be set when scheme is http" $i) -}}
 {{- end -}}
 {{- if or (gt (len $caMap) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $caMap)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef.name is %q, which is not a Secret name (a lowercase DNS subdomain of at most 253 characters)" $i $caMap) -}}
@@ -1093,6 +1195,13 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $ghCA = $thisCA -}}
 {{- end -}}
 {{- end -}}
+{{- $isSelfManaged := has $provider $selfManaged -}}
+{{- if and $f.port (not $isSelfManaged) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].port is set, but provider %s does not accept a port; only %s does" $i $provider (join ", " $selfManaged)) -}}
+{{- end -}}
+{{- if and $f.scheme (ne $f.scheme $defaultScheme) (not $isSelfManaged) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].scheme is %q, but provider %s is %s only" $i $f.scheme $provider $defaultScheme) -}}
+{{- end -}}
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
 {{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
@@ -1105,10 +1214,35 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- /* One credential per host in the broker: www.gitlab.com is gitlab.com. */ -}}
 {{- $glHost := lower ($host | default "gitlab.com") -}}
 {{- if eq $glHost "www.gitlab.com" }}{{ $glHost = "gitlab.com" }}{{ end -}}
-{{- if hasKey $gitlabHosts $glHost -}}
-{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one gitlab forge there" $i $glHost (get $gitlabHosts $glHost)) -}}
+{{- if hasKey $credentialHosts $glHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one %s forge there" $i $glHost (get $credentialHosts $glHost) $provider) -}}
 {{- end -}}
-{{- $_ := set $gitlabHosts $glHost (toString $i) -}}
+{{- $_ := set $credentialHosts $glHost (toString $i) -}}
+{{- $_ := set $forgeHosts $f.name (ternary (list "gitlab.com" "www.gitlab.com") (list $glHost) (eq $glHost "gitlab.com")) -}}
+{{- else if $isSelfManaged -}}
+{{- if not $host -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is required: provider %s is self-managed and has no default host" $i $provider) -}}
+{{- end -}}
+{{- if or (has (lower $host) $reservedHosted) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is a hosted SaaS domain and cannot be targeted by self-managed provider %s" $i $f.host $provider) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a multi-label DNS hostname" $i $f.host) -}}
+{{- end -}}
+{{- if and (eq ($f.scheme | default $defaultScheme) "http") (not (or (hasSuffix ".svc" (lower $host)) (hasSuffix ".svc.cluster.local" (lower $host)))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].scheme is \"http\", which is only supported for in-cluster Kubernetes Services (*.svc or *.svc.cluster.local); got host %q" $i $f.host) -}}
+{{- end -}}
+{{- if not $secret -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is required: provider %s is self-managed and requires an API token Secret" $i $provider) -}}
+{{- end -}}
+{{- $canonHost := lower $host -}}
+{{- if hasKey $credentialHosts $canonHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one %s forge there" $i $canonHost (get $credentialHosts $canonHost) $provider) -}}
+{{- end -}}
+{{- $_ := set $credentialHosts $canonHost (toString $i) -}}
+{{- $_ := set $forgeHosts $f.name (list $canonHost) -}}
+{{- else -}}
+{{- $_ := set $forgeHosts $f.name (ternary $githubHosts (list $ghHost) (eq $ghHost "github.com")) -}}
 {{- end -}}
 {{- $namespace := $f.namespace | default "" -}}
 {{- if and (eq $provider "github") $namespace (not (regexMatch "^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$" $namespace)) -}}
@@ -1130,6 +1264,15 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if or (has $first (list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com")) (eq $first (lower ($host | default "gitlab.com"))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which starts with the forge host %q; name the group alone" $i $namespace $first) -}}
 {{- end -}}
+{{- end -}}
+{{- if and (eq $provider "gitea") (gt (len $namespace) 40) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 40 characters" $i) -}}
+{{- end -}}
+{{- if and (eq $provider "gitea") $namespace (not (regexMatch "^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a Gitea user or organisation name" $i $namespace) -}}
+{{- end -}}
+{{- if and (eq $provider "gitea") $namespace (or (has (lower $namespace) $reservedHosted) (eq (lower $namespace) (lower $host))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is the forge host; name the owner or organisation alone" $i $namespace) -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}
@@ -1159,8 +1302,8 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if and $name (not (hasSuffix "/" $name)) -}}
 {{- $trimmed = trimAll "/" $name -}}
 {{- end -}}
-{{- /* A GitHub host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
-{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) $githubHosts) -}}
+{{- /* A forge's own host followed only by `/` names no repository, which a namespace would not fix; the operator refuses it against this entry. */ -}}
+{{- $hostOnly := and (hasSuffix "/" $repository) (regexMatch "^[A-Za-z0-9./-]+$" $repository) (has (lower (trimAll "/" $repository)) (get $forgeHosts $r.forge)) -}}
 {{- if and (not (contains "/" $trimmed)) (not (contains ":" $repository)) (not $hostOnly) (not $r.namespace) (not (get $namespaces $r.forge)) -}}
 {{- fail (printf "platformAgent.integration.repositories[%d].repository is %q, a bare name, but neither the entry nor forge %q declares a namespace to qualify it" $i $repository $r.forge) -}}
 {{- end -}}
@@ -1973,6 +2116,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- end -}}
 {{- if .Values.githubMinter.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
 {{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall

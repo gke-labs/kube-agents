@@ -13,7 +13,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 | ------------------------------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Fastest path with a hosted frontier model                          | **LiteLLM → Gemini** (default)                                    | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                                                                                       |
 | Provider redundancy or A/B                                         | **LiteLLM → Gemini + Anthropic + OpenAI**                         | LiteLLM handles the router config; agent config is unchanged.                                                                                                                                                  |
-| Inference billed to your own GCP project                           | **LiteLLM → Vertex AI / Model Garden**                            | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                                                                                        |
+| Inference billed to your own GCP project                           | **LiteLLM → Vertex AI / Model Garden**                            | Workload Identity by default instead of an API key (or a SA key Secret); Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                                                        |
 | Free local prototyping with a consumer subscription                | **LiteLLM → ChatGPT subscription** (OAuth device flow)            | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).                                                                       |
 | Model traffic kept off hosted model providers                      | **LiteLLM → your OpenAI-compatible server** (`openai_compatible`) | vLLM, TGI or an internal gateway, in the cluster or on your network. Google APIs stay required. See [below](#openai-compatible-endpoints-self-hosted-or-private).                                              |
 | Model traffic through your SAP tenant, or another LiteLLM provider | **LiteLLM → SAP AI Core** (`sap`), or the provider's slug         | Credentials in a Secret you create, named with `--litellm-env-secret`; an OpenAI-compatible gateway behind OAuth2 client credentials uses the same Secret. See [below](#a-credentials-secret-for-the-gateway). |
@@ -50,7 +50,7 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 | `gemini` (default)     | `gemini-3.5-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
 | `anthropic`            | `claude-opus-5`                | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
 | `openai`               | `gpt-5.4`                      | Uses `OPENAI_API_KEY`.                                                                                                                |
-| `vertex_ai`            | `gemini-3.5-flash`             | No API key — Workload Identity. See below.                                                                                            |
+| `vertex_ai`            | `gemini-3.5-flash`             | Workload Identity by default (or a SA key Secret). See below.                                                                         |
 | `openai_compatible`    | none; required                 | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
 | `sap`                  | `anthropic--claude-4.5-sonnet` | OAuth2 client credentials from a Secret you create. See [below](#sap-ai-core).                                                        |
 | any other LiteLLM slug | none; required                 | `azure`, `bedrock`, `databricks`, ...; credentials from the same Secret. See [below](#other-litellm-providers).                       |
@@ -86,6 +86,43 @@ The chart is the only path that renders it: the kustomize dev copy above (`make 
 At the default of `0` nothing is rendered and the gateway config is what it was. The hosted providers above need no value: the agent's requests carry their own `max_tokens`, and a provider with its own output limit answers a value above it with an error rather than a truncated reply. A self-hosted backend such as vLLM, SGLang, TGI or llama.cpp admits a request only if the prompt and `max_tokens` together fit its served window, so a request that asks for more output than the window holds is refused before the model runs. Set the value below that window, leaving the prompt the room it needs.
 
 The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.9.14`) does not send `max_tokens` on agent turns, so this value is the one the agent's requests get, the same as a direct call to the gateway's `/v1/chat/completions` that omits the field. Images built on `v2026.8.19` and earlier sent their own `max_tokens` on every request; on those the client's value won for agent turns and only a request that omitted the field took the configured one.
+
+On non-adaptive Anthropic Claude models, LiteLLM maps `fallback.reasoningEffort` (`low`, `medium`, `high`) to `thinking.budget_tokens` (`1024`, `2048`, `4096`), and Anthropic requires `max_tokens > thinking.budget_tokens`. When setting `litellm.maxTokens` alongside `fallback.reasoningEffort` on a Claude model, set `maxTokens` strictly above that effort budget (for example, `> 4096` for `high`).
+
+### Fallback alias and parameter dropping
+
+Two chart blocks, both off by default, add a fallback alias and router retry limits when a primary call fails. At their defaults nothing is rendered, so the gateway config and its rollout checksum are what they were.
+
+`litellm.fallback.reasoningEffort` (`low`, `medium` or `high`) adds a fallback alias for the same model at its own reasoning effort, named `litellm.fallback.modelName` or `<model>-<effort>` by default. `"minimal"` is omitted because Vertex AI Gemini 3.x Flash rejects `thinkingLevel: "minimal"` with HTTP 400 and Claude maps it to a 1024-token thinking budget. It also renders a `router_settings.fallbacks` entry that routes each primary alias (`model-default`, `hermes-agent` and the model name) to the fallback once primary retries are spent.
+
+`litellm.fallback.timeoutSeconds` and `numRetries` render `router_settings.timeout` and `num_retries` (both default to `0`, omitting the keys). On Vertex `gemini-3.5-flash`, a `600`-second request cap covers `99.96%` of streams while `300` seconds covers `99.57%`. The render fails if `litellm.fallback.modelName` is set without `litellm.fallback.reasoningEffort` or matches a primary alias name. With `fallback.reasoningEffort: low` and `gemini-3.8-flash` on Vertex AI the result reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: vertex_ai/gemini-3.8-flash
+      thinking: { "type": "enabled" }
+  # hermes-agent and gemini-3.8-flash: the same
+  - model_name: "gemini-3.8-flash-low"
+    litellm_params:
+      model: vertex_ai/gemini-3.8-flash
+      reasoning_effort: "low"
+litellm_settings:
+  drop_params: true
+  callbacks:
+    ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"]
+router_settings:
+  fallbacks:
+    - model-default: ["gemini-3.8-flash-low"]
+    # one entry per primary alias
+```
+
+The primary aliases keep the `thinking` key that a Gemini 2.5 or 3.x model gets ([Gemini's thoughts](#geminis-thoughts)). The fallback alias never gets it: it carries its own `reasoning_effort`, and the two on one alias fail every Gemini 3.x request.
+
+`litellm.dropParams: true` (or setting `litellm.fallback.reasoningEffort`) renders `drop_params: true`, which tells LiteLLM to drop a parameter the provider does not accept rather than fail the request (for example, `temperature != 1.0` when Anthropic Claude thinking is enabled). It drops silently. LiteLLM decides whether a model takes `reasoning_effort` from its model cost map, so on a model the map does not list, the effort can vanish from every request with no error. Check the model is in the map before you rely on the two together.
+
+A fallback is not silent. The gateway's reply carries `x-litellm-attempted-fallbacks` (how many fallbacks it tried), `x-litellm-model-group` (the alias that answered) and `x-litellm-attempted-retries`. With LiteLLM's log level at `INFO` the pod also logs `Falling back to model_group = <alias>` and `Successful fallback b/w models.`; the chart does not raise the level.
 
 ### Setting the reasoning effort
 
@@ -220,11 +257,11 @@ To bound disk consumption on the gateway pod's `/tmp` `emptyDir`, the logger rot
 
 ### Vertex AI and Model Garden
 
-`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster. That boundary is a project, not a geography: the default location is the global endpoint, which makes no promise about the region a request is processed in — see the location bullet below.
+`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and by default (when using Workload Identity rather than `litellm.vertex.credentialsSecretRef`) no model API key or static GCP key exists in the cluster. That boundary is a project, not a geography: the default location is the global endpoint, which makes no promise about the region a request is processed in — see the location bullet below.
 
 Two things differ from the API-key providers:
 
-- **Authentication is Workload Identity.** The gateway gets its own service-account pair rather than an API key — see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity). There is no entry in `platform-agent-secrets` for Vertex.
+- **Authentication is Workload Identity by default.** The gateway gets its own service-account pair rather than an API key — see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity). Unless a chart install opts into `litellm.vertex.credentialsSecretRef` (below), there is no entry in `platform-agent-secrets` for Vertex.
 - **The endpoint is a project and a location.** `VERTEX_PROJECT_ID` and `VERTEX_LOCATION` become `VERTEXAI_PROJECT` and `VERTEXAI_LOCATION` on the gateway pod. The project defaults to the install's. The location defaults to `global` in `install.sh`, Terraform, and the chart — not the cluster's region, which need not serve the model you asked for and on a zonal cluster is not a valid Vertex location at all. (The kustomize dev path substitutes `VERTEX_LOCATION` with no fallback, so export it there.) Set `VERTEX_LOCATION` to a region when you have a data-residency requirement, when org policy blocks the global endpoint, or when the model is a Model Garden partner model served only from specific regions. Google's [locations page](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations) lists which locations serve which model, and its [data-residency page](https://docs.cloud.google.com/gemini-enterprise-agent-platform/resources/data-residency) covers what the global endpoint does not guarantee.
 - **A serving project you cannot administer.** With `VERTEX_PROJECT_ID` pointing at another project, the install enables `aiplatform.googleapis.com` there and grants the gateway's service account `roles/aiplatform.user` on it, which needs IAM rights on that project. Set `VERTEX_MANAGE_SERVING_PROJECT=false` (`--vertex-manage-serving-project=false`) when you do not have them: the install still creates the service account and its Workload Identity binding in your project, and you enable the API and make the grant by hand. Choose it at the first install; flipping it later on an install that already manages the two revokes the grant unless you remove them from Terraform state first (the [composition's README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) has the command). [Security and IAM](../reference/security-and-iam.md) covers what that does to the identity's lifecycle.
 
@@ -239,6 +276,10 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ```
 
 A re-run against an existing install reconciles the switch in one `terraform apply` — the gateway's IAM pair, its KSA, and the rolled ConfigMap land together.
+
+Where Workload Identity is not available, the chart can read a service-account key and the project from a Secret instead. `litellm.vertex.credentialsSecretRef: {name, key}` mounts that key read-only at `/var/run/secrets/vertex/sa.json` and sets `GOOGLE_APPLICATION_CREDENTIALS` to it, which Google's client libraries prefer over the KSA's Workload Identity binding. `litellm.vertex.projectSecretRef: {name, key}` sets `VERTEXAI_PROJECT` from the Secret so the project id does not appear in the pod spec, standing in for `projectId`.
+
+Both fields are chart-only and read only with `modelProvider: vertex_ai`; the render fails if either is set for another provider or omits `name` or `key`. Mint the key for a dedicated service account holding only `roles/aiplatform.user` on the serving project (see [Security & IAM](/kube-agents/reference/security-and-iam/#the-vertex-ai-gateway-is-a-separate-identity)), rotate it in the Secret, and prefer Workload Identity wherever the cluster supports it. Changing either Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it so the process reloads `VERTEXAI_PROJECT` and the key file.
 
 ### A credentials Secret for the gateway
 

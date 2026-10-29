@@ -35,6 +35,12 @@ const (
 
 	// VerbFleetRead is a read that spans clusters.
 	VerbFleetRead Verb = "fleet.read"
+
+	// VerbProfileRun is the dispatcher starting a profile task: does this
+	// grant permit running profile P at tier T for this target. It is the
+	// one verb whose request carries a profile and a tier, and it is
+	// answered by PermitsProfile, not Permits alone (#3659).
+	VerbProfileRun Verb = "profile.run"
 )
 
 // tierVerbs is each tier's verb set: the tier permits exactly these verbs and
@@ -57,6 +63,14 @@ var tierVerbs = map[Tier]verbSet{
 	TierPlatform: newVerbSet(
 		VerbTaskExecute, VerbTaskDelegate, VerbTopicPublishShared, VerbClusterMutate, VerbFleetRead,
 	),
+	// The profile tiers. Read runs interactive profile tasks; Unattended
+	// is a trigger's principal and only ever starts profile tasks, so it
+	// holds neither task.execute nor task.delegate. Neither holds a write
+	// verb: in this round a profile proposes changes, it does not make
+	// them. profile.run is in neither of the original three sets, so
+	// their nesting is untouched.
+	TierRead:       newVerbSet(VerbTaskExecute, VerbProfileRun),
+	TierUnattended: newVerbSet(VerbProfileRun),
 }
 
 // verbSet is a tier's verbs. A map rather than a slice so membership is one
@@ -118,6 +132,34 @@ func Permits(e Entry, v Verb, r Scope) error {
 	}
 	if !e.Scope.Contains(r) {
 		return refuse("resource is outside the capability's scope")
+	}
+	return nil
+}
+
+// PermitsProfile answers profile.run: does grant e permit running profile at
+// tier for target r. On top of Permits (the verb is in the tier's set and the
+// target is in scope), the request's tier must be the grant's own tier and the
+// request's profile the one the grant was minted for. The dispatcher never
+// reads either out of the grant; it states what it means to run, and the
+// verifier says yes or no.
+func PermitsProfile(e Entry, profile string, tier Tier, r Scope) error {
+	if err := Permits(e, VerbProfileRun, r); err != nil {
+		return err
+	}
+	if _, ok := tierVerbs[tier]; !ok {
+		return refuse("the request names a tier that is not a known tier")
+	}
+	if tier != e.Tier {
+		return refuse("the request's tier is not the grant's tier")
+	}
+	if !validProfileName(profile) {
+		return refuse("the request's profile is not a DNS label")
+	}
+	if e.Profile == "" {
+		return refuse("the grant was not minted for a profile")
+	}
+	if profile != e.Profile {
+		return refuse("the grant was minted for another profile")
 	}
 	return nil
 }

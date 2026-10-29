@@ -561,6 +561,34 @@ func TestAnArmedGatewayCarriesTheSlackAllowlist(t *testing.T) {
 	}
 }
 
+// TestAnswerFeedbackOffIsTheOnlyRenderedState: slack.answerFeedback=false
+// reaches the gateway as its off switch, and unset or true renders nothing,
+// so an install that never set the field keeps its gateway pod as it was.
+func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	off, on := false, true
+	for _, tc := range []struct {
+		name    string
+		setting *bool
+		want    string
+		present bool
+	}{
+		{"unset", nil, "", false},
+		{"true", &on, "", false},
+		{"false", &off, "false", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", true)
+			agent.Spec.Integration.Slack.AnswerFeedback = tc.setting
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aSlackAnswerFeedbackEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aSlackAnswerFeedbackEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+}
+
 // TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
 // to "is every Slack member allowed", whichever consumer the mode renders.
 func TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {

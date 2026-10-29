@@ -113,6 +113,7 @@ const (
 	a2aTopicsJournalStream = "TOPICS-JOURNAL"
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aSessionStateBucket  = "session-state"
+	a2aFeedbackBucket      = "feedback"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth
@@ -581,6 +582,9 @@ const (
 	// The Slack home channel the same route posts to on a Slack-armed
 	// gateway, from slack.homeChannel.
 	a2aSlackHomeChannelEnvVar = "A2A_SLACK_HOME_CHANNEL"
+	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
+	// envSlackAnswerFeedback): no rating buttons, nothing kept.
+	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
@@ -667,6 +671,15 @@ const (
 	a2aProvisionReportTasksSubjectCapKey = "tasks_subject_cap"
 	a2aProvisionReportLiveKey            = "live"
 	a2aProvisionReportWantKey            = "want"
+	// The second finding the closing block reports: an existing TOPICS-STATE
+	// stream whose subject list predates the topology-skew topic. The report
+	// carries only a marker (`missing: 1`); the subject the Event names is
+	// this binary's a2aTopologySkewSubject, on the same rule as the TASKS
+	// remedy -- a report that could steer the remedy could steer it to any
+	// subject.
+	a2aProvisionReportTopicsStateSubjectKey = "topics_state_subject"
+	a2aProvisionReportMissingKey            = "missing"
+	a2aTopologySkewSubject                  = "a2a.topics.agent.platform.topology-skew"
 	// a2aProvisionContainerName is the Job pod's one container, named because
 	// the report reader looks its termination state up by name.
 	a2aProvisionContainerName = "provision"
@@ -706,6 +719,17 @@ const (
 		"this render creates it at %d and provisioning does not edit an existing stream, so one task's events can still evict another session's history. " +
 		"Applying the limit evicts oldest-first on every subject already over it: nats stream edit TASKS --max-msgs-per-subject=%d"
 	tasksSubjectCapRenderedDiffers = " (the Job's own script named %d as the rendered cap; the numbers above are this render's)"
+	// reasonTopicsStateSubjectMissing is the Warning Event's reason when the
+	// live TOPICS-STATE stream, created by an earlier render, does not carry
+	// the topology-skew subject; topicsStateSubjectEventMessage is its
+	// message. Format arguments: Job name, subject, subject. The current
+	// subject list is not quoted from the pod: the operator reads it with
+	// `nats stream info TOPICS-STATE` and appends to it, and the Event says so.
+	reasonTopicsStateSubjectMissing = "TopicsStateSubjectMissing"
+	topicsStateSubjectEventMessage  = "provision Job %s found the TOPICS-STATE stream without subject %s; " +
+		"this render creates the stream with it and provisioning does not edit an existing stream, so nothing can publish to that topic " +
+		"until an operator appends it to the stream's current subject list (read it with nats stream info TOPICS-STATE): " +
+		"nats stream edit TOPICS-STATE --subjects=\"<current subjects>,%s\""
 
 	// The condition that reports the verifier, and the reason it is a
 	// condition rather than a Ready row.
@@ -1301,7 +1325,15 @@ func a2aSlackHomeChannel(agent *agentv1alpha1.PlatformAgent) string {
 	if !slackEnabled(agent) {
 		return ""
 	}
-	home := strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel)
+	return slackChannelID(agent.Spec.Integration.Slack.HomeChannel)
+}
+
+// slackChannelID is s trimmed when it is a public ("C...") or private
+// ("G...") Slack channel id, and "" otherwise. The same rule reads the CR
+// field, and a gateway that learns a channel will read it too
+// (platformagent_home_channel_record.go).
+func slackChannelID(s string) string {
+	home := strings.TrimSpace(s)
 	if len(home) < a2aSlackMinChannelIDLen || (home[0] != 'C' && home[0] != 'G') {
 		return ""
 	}
@@ -1594,7 +1626,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // still connects with it. Nothing yet binds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
-	"KV_runtime-state", "KV_session-state", "KV_cap",
+	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -1853,6 +1885,12 @@ func a2aAgentJetStreamGrants() []string {
 //     Create, Put and Delete are publishes on $KV.session-state.>, granted
 //     beside this list.
 //
+//   - KV_feedback, the kept 👍 and 👎 ratings (a2a/gateway/feedback.go): the same
+//     four verbs for the same calls -- STREAM.INFO to bind it and read its
+//     max age at start, DIRECT.GET for a rating's note and the export's
+//     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
+//     export's key list. Put and Delete are publishes on $KV.feedback.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -1933,6 +1971,7 @@ func a2aAgentJetStreamGrants() []string {
 // by grant.
 func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
+	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -1942,6 +1981,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvSessionState + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*",
+		"$JS.API.STREAM.INFO." + kvFeedback,
+		"$JS.API.DIRECT.GET." + kvFeedback + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*",
 	}
 }
 
@@ -1985,11 +2028,19 @@ func (r *PlatformAgentReconciler) a2aReader() client.Reader {
 // it is inert data, and re-enabling `next` must not re-roll credentials the
 // gateway image may have cached in a still-running pod. The one thing it
 // changes on an existing Secret is a missing or empty key, which it fills.
+// An existing Secret at the name that this PlatformAgent doesn't control is
+// refused rather than adopted or repaired.
 func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*corev1.Secret, error) {
 	name := types.NamespacedName{Name: a2aCredsSecretName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
+		// Only a Secret this PlatformAgent controls is read or repaired, as
+		// for the callout keys and the door's token: one created by anything
+		// else is neither trusted for its passwords nor overwritten.
+		if !metav1.IsControlledBy(existing, agent) {
+			return nil, fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A NATS credentials; delete it and the operator creates a fresh one (a controller reference is not a remedy: it would adopt passwords of unknown origin as they are)", name.Namespace, name.Name)
+		}
 		repaired := false
 		if existing.Data == nil {
 			existing.Data = map[string][]byte{}
@@ -2762,8 +2813,8 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the four streams, three KV
-// buckets, and three starter topics from the deployment spec, created
+// a2aProvisionScript is the provisioning payload: the four streams, four KV
+// buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
@@ -3017,7 +3068,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
-# State-class topics (provisioned registry): upgrade-readiness, blueprint, probe.
+# State-class topics (provisioned registry): upgrade-readiness, topology-skew, blueprint, probe.
 #
 # The probe subject is the one here with NO writer, deliberately, and it is the
 # single exception to the rule that a topic's subject list and its writer's
@@ -3033,7 +3084,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
 # hold" is the assumption the web user already broke once. A writerless
 # subject makes the failure mode land nowhere.
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
-  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
+  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
@@ -3064,6 +3115,15 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+
+# feedback: the 👍 and 👎 ratings chat users gave the gateway's answers, each with
+# the exchange it rated (a2a/gateway/feedback.go). User content, so the max
+# age is the retention: NATS drops a rating 30 days after it was given, and
+# the gateway refuses to keep ratings in a bucket without one. Only the
+# gateway's user reads or writes its records (provision and seed can list its keys). 64MiB holds about three thousand ratings
+# at their caps (ask, answer and note, about 22KB) and more at a typical
+# size; past it the write is refused, and the rating is counted but not kept.
+$NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
 
 # TASKS older than this render: the limits the create above could not apply.
 #
@@ -3118,10 +3178,11 @@ fi
 # to the container's termination message below: the pod log goes with the
 # Job's TTL, and the reconcile reads this off the pod and records it as an
 # Event on the PlatformAgent (reportA2AProvisionFindings). An empty object
-# says the check ran and found nothing.
-report='{}'
+# says the checks ran and found nothing. Each check appends its own finding;
+# the object is closed once every check has run.
+report_findings=''
 if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
-  report="{\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}}"
+  report_findings="\"` + a2aProvisionReportTasksSubjectCapKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_subject_cap},\"` + a2aProvisionReportWantKey + `\":` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `}"
   echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at ` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `." >&2
   echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
   echo "  an operator applies it one task's events can still evict another session's history." >&2
@@ -3137,6 +3198,30 @@ elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
 fi
+# TOPICS-STATE older than this render: check that the topology-skew subject is
+# in its subject list. Provisioning is create-only convergence, so an existing
+# stream keeps the subject list it was created with, and a publisher of the
+# new topic gets "no stream matches subject" until an operator appends it.
+# Same stance as the TASKS extractor above: an answer with no readable
+# subject list FAILS rather than passing as "nothing to report" (a mirror or
+# sourced stream has an empty list and is not a shape this render creates).
+# The finding goes to stderr for the pod log and into the report for the
+# Event, like the cap gap; the subject list is quoted on stderr only, where
+# an operator can copy it, and not in the report, which never steers an Event.
+topics_state_json="$($NATS stream info TOPICS-STATE --json | tr -d ' \t\r\n')"
+topics_state_subjects="$(printf '%s' "${topics_state_json}" \
+  | grep -o '"subjects":\[[^]]*\]' | head -n1 | sed 's/^"subjects":\[//;s/\]$//;s/"//g' || true)"
+if [ -z "${topics_state_subjects}" ]; then
+  echo "could not read subjects off the TOPICS-STATE stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+if ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|platform\.(>|\*|topology-skew)))"'; then
+  report_findings="${report_findings}${report_findings:+,}\"` + a2aProvisionReportTopicsStateSubjectKey + `\":{\"` + a2aProvisionReportMissingKey + `\":1}"
+  echo "NOTE: TOPICS-STATE does not carry subject ` + a2aTopologySkewSubject + `." >&2
+  echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
+  echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},` + a2aTopologySkewSubject + `\"" >&2
+fi
+report="{${report_findings}}"
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
 # provisioned bus. Nor is a write that fails (a full or faulting disk under
@@ -3460,12 +3545,19 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 		// reports the gap again while it stands.
 		log.Info("the A2A provision Job's succeeded pod is gone, and its termination message with it; nothing from this Job run reaches the PlatformAgent's Events")
 		outcome = a2aProvisionReportOutcomeUnreadable
-	} else if finding, err := parseA2AProvisionReport(message); err != nil {
+	} else if findings, err := parseA2AProvisionReport(message); err != nil {
 		log.Error(err, "the A2A provision pod's termination message is not a report; nothing from this Job run reaches the PlatformAgent's Events")
 		outcome = a2aProvisionReportOutcomeUnreadable
-	} else if finding != nil {
-		r.recordEvent(agent, corev1.EventTypeWarning, reasonTasksSubjectCapMissing, finding.eventMessage(job.Name))
-		outcome = a2aProvisionReportOutcomeReported
+	} else {
+		if findings.tasksSubjectCap != nil {
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonTasksSubjectCapMissing, findings.tasksSubjectCap.eventMessage(job.Name))
+			outcome = a2aProvisionReportOutcomeReported
+		}
+		if findings.topicsStateSubjectMissing {
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonTopicsStateSubjectMissing,
+				fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
+			outcome = a2aProvisionReportOutcomeReported
+		}
 	}
 	patch := client.MergeFrom(job.DeepCopy())
 	if job.Annotations == nil {
@@ -3505,46 +3597,62 @@ func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 	return message
 }
 
+// a2aProvisionFindings is what parseA2AProvisionReport read out of one
+// report: each finding the reader knows, absent when the script did not
+// write it. Both nil/false is the clean report, {}.
+type a2aProvisionFindings struct {
+	tasksSubjectCap           *tasksSubjectCapFinding
+	topicsStateSubjectMissing bool
+}
+
 // parseA2AProvisionReport reads the termination message and returns the
-// per-subject-cap finding in it, nil when the report is clean, and an error
-// when the message is not a report the reader can act on. An empty message
-// is an error rather than an empty report: the script writes {} when it
-// found nothing, so nothing at all means the script never got to write, and
-// the caller should say so rather than call the install clean. A finding
-// with no live cap, or a live cap other than the two the script writes under
-// this key (0 and -1, the two spellings of no limit; anything positive is a
-// bound, not the gap, and any other negative is nothing nats reports), is an
-// error too, with the message quoted: the reader does not fill in a field
-// the pod left out, because the field it would fill in steers the remedy,
-// and it does not quote a number the script has no way to have written. A
-// bare JSON null is an error and not a clean report: it decodes to no
-// object at all, and the script's clean report is {}.
-func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
+// findings in it, none when the report is clean, and an error when the
+// message is not a report the reader can act on. An empty message is an
+// error rather than an empty report: the script writes {} when it found
+// nothing, so nothing at all means the script never got to write, and the
+// caller should say so rather than call the install clean. A per-subject-cap
+// finding with no live cap, or a live cap other than the two the script
+// writes under this key (0 and -1, the two spellings of no limit; anything
+// positive is a bound, not the gap, and any other negative is nothing nats
+// reports), is an error too, with the message quoted: the reader does not
+// fill in a field the pod left out, because the field it would fill in
+// steers the remedy, and it does not quote a number the script has no way
+// to have written. The TOPICS-STATE finding is a marker and nothing else
+// (`missing: 1`); any other value under its key is not a report the script
+// writes. A bare JSON null is an error and not a clean report: it decodes to
+// no object at all, and the script's clean report is {}.
+func parseA2AProvisionReport(message string) (a2aProvisionFindings, error) {
+	var findings a2aProvisionFindings
 	if strings.TrimSpace(message) == "" {
-		return nil, fmt.Errorf("empty termination message; the provision script wrote no report")
+		return findings, fmt.Errorf("empty termination message; the provision script wrote no report")
 	}
 	report := a2aProvisionReport{}
 	if err := json.Unmarshal([]byte(message), &report); err != nil {
-		return nil, fmt.Errorf("parsing the provision pod's termination message %q: %w", message, err)
+		return findings, fmt.Errorf("parsing the provision pod's termination message %q: %w", message, err)
 	}
-	fields, present := report[a2aProvisionReportTasksSubjectCapKey]
-	if !present {
-		if report == nil {
-			// json.Unmarshal reads a bare null into a nil map, which a key
-			// lookup cannot tell from {} on its own.
-			return nil, fmt.Errorf("the provision pod's termination message is JSON null, not a report the script writes")
+	if report == nil {
+		// json.Unmarshal reads a bare null into a nil map, which a key
+		// lookup cannot tell from {} on its own.
+		return findings, fmt.Errorf("the provision pod's termination message is JSON null, not a report the script writes")
+	}
+	if fields, present := report[a2aProvisionReportTasksSubjectCapKey]; present {
+		live, ok := fields[a2aProvisionReportLiveKey]
+		if !ok {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding with no %q field; not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey)
 		}
-		return nil, nil
+		if live != 0 && live != -1 {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding with %s=%d, not the gap the key names (0 or -1); not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey, live)
+		}
+		want, hasWant := fields[a2aProvisionReportWantKey]
+		findings.tasksSubjectCap = &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}
 	}
-	live, ok := fields[a2aProvisionReportLiveKey]
-	if !ok {
-		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with no %q field; not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey)
+	if fields, present := report[a2aProvisionReportTopicsStateSubjectKey]; present {
+		if missing, ok := fields[a2aProvisionReportMissingKey]; !ok || missing != 1 {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding without %s=1; not a report the script writes", message, a2aProvisionReportTopicsStateSubjectKey, a2aProvisionReportMissingKey)
+		}
+		findings.topicsStateSubjectMissing = true
 	}
-	if live != 0 && live != -1 {
-		return nil, fmt.Errorf("the provision pod's termination message %q carries a %s finding with %s=%d, not the gap the key names (0 or -1); not a report the script writes", message, a2aProvisionReportTasksSubjectCapKey, a2aProvisionReportLiveKey, live)
-	}
-	want, hasWant := fields[a2aProvisionReportWantKey]
-	return &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}, nil
+	return findings, nil
 }
 
 // a2aProvisionPodVanished says whether a Complete Job whose succeeded
@@ -4096,7 +4204,8 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
 // pinned by name. The gateway creates and reaps one pod per delegated task in
-// its own namespace; it reads no Secret, no ConfigMap and no other namespace.
+// its own namespace; it reads no Secret, no ConfigMap but the one home-channel record it
+// may patch, and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
@@ -4145,6 +4254,16 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				Resources:     []string{"platformagents"},
 				ResourceNames: []string{agent.Name},
 				Verbs:         []string{"get"},
+			},
+			// The home-channel record, one named ConfigMap: the gateway's
+			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
+			// once an A2A_HOME_CHANNEL_LEARN this operator does not yet render
+			// arms it (platformagent_home_channel_record.go).
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"configmaps"},
+				ResourceNames: []string{a2aHomeChannelRecordName(agent)},
+				Verbs:         []string{"get", "patch"},
 			},
 		},
 	}
@@ -4239,10 +4358,8 @@ func (r *PlatformAgentReconciler) ensureA2AInjectTokenSecret(ctx context.Context
 		if !metav1.IsControlledBy(existing, agent) {
 			// Not ours, not adopted. The token is the door's only access
 			// control, so a Secret somebody else wrote under the rendered name
-			// would hand the door to whoever wrote it; and the flag-off
-			// removal refuses to delete an unowned object, so a render built
-			// on one would wedge later. Refused here, before the Service and
-			// the gateway's env reference the name.
+			// would hand the door to whoever wrote it. Refused here, before
+			// the Service and the gateway's env reference the name.
 			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the A2A inject door's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
 		}
 		if len(existing.Data[a2aInjectTokenKey]) > 0 {
@@ -4680,6 +4797,25 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if home := strings.TrimSpace(slack.HomeChannel); home != "" {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackHomeChannelEnvVar, Value: home})
 		}
+		// Answer feedback is on unless the install turns it off; only the
+		// off is rendered, so an install that never set the field keeps the
+		// gateway's env, and its pod, as they were.
+		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
+		// The learned-home contract (platformagent_home_channel_record.go),
+		// for a gateway that learns a home channel from the first admitted
+		// mention: whether it may, the record it would write, and its own
+		// image for the record's writer and reader keys. The gateway reads
+		// them, and learns only once A2A_HOME_CHANNEL_LEARN is rendered true,
+		// which this release does not. The gateway's home env above stays the
+		// CR's: a learned value reaches the gateway through the record, not a
+		// re-render.
+		backendEnv = append(backendEnv,
+			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
+			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
+			corev1.EnvVar{Name: a2aGatewaySelfImageEnvVar, Value: a2aGatewayImage()},
+		)
 	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
@@ -4950,6 +5086,13 @@ type a2aProvisionState struct {
 	// pass because no auth callout replica is ready yet (the gate at the
 	// create site). It shares the requeue with !done, which it implies.
 	jobHeld bool
+	// mcpNotRendered is the reason the MCP server was removed rather than
+	// rendered this pass with its door on: a2aMCPIdentityUnownedReason for
+	// a ServiceAccount under the MCP pod's name that is not this
+	// PlatformAgent's (reconcileA2AMCPBrokerIdentity),
+	// a2aMCPTokenUnownedReason for its token Secret (ensureA2AMCPToken), ""
+	// otherwise. The status writers carry it as a2aMCPIdentityConditionType.
+	mcpNotRendered string
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5094,6 +5237,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
 	}
 
+	// Before the callout, which is rendered with its public half. The seed
+	// is the dispatcher's, and nothing mounts it until a dispatcher does.
+	taskSigningKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure the A2A task-signing key: %w", err)
+	}
+
 	// Before the config and every client: the server mounts the serving pair
 	// and each client mounts the bundle, and a pod started against a Secret
 	// or ConfigMap that does not exist yet waits in ContainerCreating.
@@ -5111,6 +5261,23 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		var err error
 		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
 			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
+		}
+	}
+	// A profile's identities are ServiceAccounts in the profile namespace,
+	// so without that namespace (marked as the chart's) there are none to
+	// render: whoever made a namespace of that name must not get them. A
+	// failed read returns, as a failed list does above, and leaves the
+	// applied map as it is. Dropping the entries instead would revoke every
+	// profile's identity on an API-server blip, and the map lives in the
+	// agent's namespace, so the profile-namespace rule (skip and carry on)
+	// doesn't apply to it.
+	if len(profiles) > 0 {
+		ready, err := r.profileNamespaceExists(ctx, agent)
+		if err != nil {
+			return state, fmt.Errorf("failed to read the profile namespace for the identity map: %w", err)
+		}
+		if !ready {
+			profiles = nil
 		}
 	}
 	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
@@ -5154,7 +5321,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent)
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public)
 	if err != nil {
 		return state, err
 	}
@@ -5194,9 +5361,27 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	// The MCP server, the other console client, under its flag and for the
-	// same reasons: after the fences, ahead of the gateway's hold.
-	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	// same reasons: after the fences, ahead of the gateway's hold. Its
+	// broker identity first, so the ServiceAccount exists before the pod
+	// that names it.
+	mcpIdentityOwned, err := r.reconcileA2AMCPBrokerIdentity(ctx, agent)
+	if err != nil {
 		return state, err
+	}
+	if mcpIdentityOwned {
+		reason, err := r.reconcileA2AMCP(ctx, agent)
+		if err != nil {
+			return state, err
+		}
+		state.mcpNotRendered = reason
+	} else {
+		// Not rendered over an identity that is not ours; a server rendered
+		// on an earlier pass goes too, so no MCP pod runs as that account.
+		// The fence stays, for the reason reconcileA2AMCP gives.
+		if err := r.removeA2AMCPServer(ctx, agent); err != nil {
+			return state, err
+		}
+		state.mcpNotRendered = a2aMCPIdentityUnownedReason
 	}
 
 	// The session-pod quota, the enforcement half of the bound whose
@@ -5386,10 +5571,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 
 	// Identity before workload: the gateway pod must not start before the
 	// ServiceAccount its pod spec names exists.
+	// The home-channel record rides with them: the Role above names it, and
+	// the teardown list, which every rendered pass must cover, lists it
+	// whatever chat backend the stack holds (platformagent_home_channel_record.go).
 	for _, obj := range []client.Object{
 		buildA2AGatewayServiceAccount(agent),
 		buildA2AGatewayRole(agent),
 		buildA2AGatewayRoleBinding(agent),
+		buildHomeChannelRecord(agent),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return state, err
@@ -5582,10 +5771,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 // selecting it. Counters only, and
 // the same async-reap gap a2aBusTeardown's session-fence comment names;
 // closing it would mean holding the removal until no gateway pod remains.
-// One cached read: NetworkPolicy is an Owns() kind.
+// One cached read: NetworkPolicy is an Owns() kind. A policy under the name
+// that this PlatformAgent does not own is skipped, as the doors' removals
+// skip theirs (removeA2AInjectBackend): this runs on every held pass, and
+// the render that follows the hold applies the fence over it.
 func (r *PlatformAgentReconciler) removeA2AGatewayFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}
-	if err := r.deleteOwnedA2AObject(ctx, agent, np, r.Client); err != nil {
+	if err := r.deleteA2AObjectIfOwned(ctx, agent, np, r.Client, nil); err != nil {
 		return fmt.Errorf("failed to remove the A2A gateway's NetworkPolicy: %w", err)
 	}
 	return nil
@@ -5651,12 +5843,20 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 //
 // A teardown entry exists for all four as well, for the flip to `today`
 // where neither this function nor the render runs at all.
+//
+// This runs on every next reconcile while the flag is off, so an object
+// under the door's name, in any of its four kinds, that this PlatformAgent
+// does not own (a copy made by hand, or the previous CR's while the garbage
+// collector runs after a delete and re-create) is skipped and logged, not
+// refused: refusing stopped the rest of the reconcile and the status write
+// behind it until a person deleted it (#3871). The flag's own path still
+// refuses to adopt one (ensureA2AInjectTokenSecret).
 func (r *PlatformAgentReconciler) removeA2AInjectBackend(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if a2aInjectBackendEnabled() {
 		return nil
 	}
 	for _, entry := range r.a2aInjectObjects(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return fmt.Errorf("failed to remove the A2A inject backend's %T: %w", entry.obj, err)
 		}
 	}
@@ -5708,14 +5908,15 @@ func (r *PlatformAgentReconciler) applyA2AAgentDoor(ctx context.Context, agent *
 }
 
 // removeA2AAgentDoor takes the A2A door away when its flag is not set. See
-// removeA2AInjectBackend for why the removal exists and why the Secret is
-// read uncached.
+// removeA2AInjectBackend for why the removal exists, why the Secret is read
+// uncached, and why an unowned object is skipped (the flag's own refusal is
+// ensureA2ADoorTokenSecret's).
 func (r *PlatformAgentReconciler) removeA2AAgentDoor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if a2aAgentDoorEnabled() {
 		return nil
 	}
 	for _, entry := range r.a2aDoorObjects(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return fmt.Errorf("failed to remove the A2A door's %T: %w", entry.obj, err)
 		}
 	}
@@ -5733,21 +5934,6 @@ func (r *PlatformAgentReconciler) a2aDoorObjects(agent *agentv1alpha1.PlatformAg
 		{&networkingv1.NetworkPolicy{ObjectMeta: meta}, r.Client},
 		{&corev1.Secret{ObjectMeta: meta}, r.a2aReader()},
 	}
-}
-
-// deleteOwnedA2AObject removes one object this agent owns, tolerating its
-// absence. The ownership check is cleanupA2A's, for the same reason: an
-// object somebody else created under a name we render is not ours to delete.
-// reader is the client that may read this kind -- the cache for kinds the
-// manager watches, a2aReader for a Secret (see removeA2AInjectBackend).
-func (r *PlatformAgentReconciler) deleteOwnedA2AObject(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, reader client.Reader) error {
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !metav1.IsControlledBy(obj, agent) {
-		return fmt.Errorf("refusing to delete unowned A2A %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
-	}
-	return client.IgnoreNotFound(r.Delete(ctx, obj))
 }
 
 // a2aCalloutCanServeANewGateway reports whether at least one replica of the
@@ -5947,6 +6133,7 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find
@@ -5974,6 +6161,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// Its broker identity (reconcileA2AMCPBrokerIdentity), after the
+		// Deployment that names it.
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
@@ -6017,6 +6207,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// cleanup pass dies on the map delete, the keys Secret is still standing
 		// to prevent the next pass from early-exiting.
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The task-signing key, before the keys Secret for the same reason
+		// as the map: the keys Secret is the sentinel.
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
@@ -6117,7 +6310,8 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // are the gateway's, not the operator's: every spawned pod carries an
 // ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
 // deleting the gateway here hands any stragglers to Kubernetes GC, with no
-// operator exception to the IsControlledBy refusal below.
+// operator exception to the ownership rule below: the walk deletes only
+// what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
@@ -6187,11 +6381,13 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
 	// object under a reserved name is not residue of this CR and is left to
-	// its owner or to the garbage collector. The walk below refuses to delete
-	// anything this CR does not own, so a present-but-unowned sentinel that
-	// counted would send every reconcile of a today install into that refusal
-	// -- the shape a next CR deleted and re-created under the same name in
-	// today mode takes, while its old fences still carry the old UID.
+	// its owner or to the garbage collector. The walk below leaves anything
+	// this CR does not own alone (deleteA2AObjectIfOwned), so a flip with an
+	// unowned object under a reserved name completes around it (#3871); a
+	// present-but-unowned sentinel that counted would only send every
+	// reconcile of a today install through the walk for nothing -- the shape
+	// a next CR deleted and re-created under the same name in today mode
+	// takes, while its old fences still carry the old UID.
 	// Ownership is read off the fetched object, so the exit stays at eleven
 	// Gets, plus one for the profile namespace's fence below, which carries
 	// no owner reference and is tested by this agent's labels instead.
@@ -6261,7 +6457,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// Deleted first so the services built on top of the bus are initiated and stopped
 	// before the bus itself.
 	for _, entry := range r.a2aPreBusTeardown(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return err
 		}
 	}
@@ -6310,7 +6506,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// 4. The NATS bus namespaced objects (Service, NetworkPolicy fences,
 	// config Secret, ResourceQuota).
 	for _, entry := range r.a2aBusTeardown(agent) {
-		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
 			return err
 		}
 	}
@@ -6344,7 +6540,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 // dying anywhere earlier leaves the StatefulSet standing to resume cleanup (#2216).
 func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
-	return r.deleteOwnedA2AObject(ctx, agent, sts, r.Client)
+	return r.deleteA2AObjectIfOwned(ctx, agent, sts, r.Client, nil)
 }
 
 // deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label

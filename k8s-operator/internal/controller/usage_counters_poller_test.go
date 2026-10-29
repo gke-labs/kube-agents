@@ -294,10 +294,10 @@ func gaugeValue(v *int64) int64 {
 // expireNewerFieldsRecordForTest ages every newer-field pruning record of the
 // CR past the reprobe interval, as the clock would.
 func (p *UsageCounterPoller) expireNewerFieldsRecordForTest(agent *agentv1alpha1.PlatformAgent) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for field := range p.prunedNewerFields[usagePollKey(agent)] {
-		p.prunedNewerFields[usagePollKey(agent)][field] = p.now().Add(-2 * usageStatusReprobeInterval)
+	p.r.prunedNewerFieldsMu.Lock()
+	defer p.r.prunedNewerFieldsMu.Unlock()
+	for field := range p.r.prunedNewerFields[usagePollKey(agent)] {
+		p.r.prunedNewerFields[usagePollKey(agent)][field] = p.now().Add(-2 * usageStatusReprobeInterval)
 	}
 }
 

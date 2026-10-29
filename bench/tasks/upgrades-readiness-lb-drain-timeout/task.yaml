@@ -2,8 +2,8 @@
 #
 # Unlike its siblings this case reads a planted fixture: the
 # readiness-lb-drain-timeout role on slot b, a backend service on the default
-# pool's instance group with a 3600-second connection draining timeout, six
-# times GKE's 600-second per-node deregistration wait, behind a TCP health
+# pool's instance group with a 720-second connection draining timeout, a
+# fifth over GKE's 600-second per-node deregistration wait, behind a TCP health
 # check and no forwarding rule. It grades the rule's own entry for every
 # seeded cluster, copied into a declared line: the blocker the rule files for
 # slot b, and its "no finding" note for the three slots without the fixture;
@@ -85,14 +85,14 @@ prompt: >-
 expected_output: >-
   The version table and the readiness table read during this run, with the
   slot-b cluster blocked by the lb-connection-draining rule: its backend
-  service drain-timeout-<prefix>-b drains for 3600 s on pool(s) default-pool,
+  service drain-timeout-<prefix>-b drains for 720 s on pool(s) default-pool,
   GKE waits 600 s per node during an upgrade, so each surge node's drain times
   out, and the fix is `gcloud compute backend-services update <name> --global
   --connection-draining-timeout=600`. The other seeded clusters carry no such
   backend service. It ends with the declared lines, each carrying the rule's
   entry copied from the report: the slot-b cluster's reading
   "lb-connection-draining: BackendService drain-timeout-<prefix>-b drains for
-  3600 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade,
+  720 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade,
   so each surge node's drain times out; set the timeout at or under the wait:
   `gcloud compute backend-services update drain-timeout-<prefix>-b --global
   --connection-draining-timeout=600`" and the others "lb-connection-draining:
@@ -141,7 +141,7 @@ verification_spec:
         - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: lb-connection-draining: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: lb-connection-draining: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: lb-connection-draining: [^\n]+$)'
   # Slot b carries the fixture, and its line is the rule's blocker in the
   # rule's words: the backend service by name (the fleet's prefix varies per
-  # project), its 3600-second timeout on pool(s) default-pool, the 600-second
+  # project), its 720-second timeout on pool(s) default-pool, the 600-second
   # wait and why it matters, and the fix command. `drains for ... on pool(s)
   # ...; GKE waits 600 s per node during an upgrade, so each surge node's
   # drain times out; set the timeout at or under the wait:` is what no gcloud
@@ -168,9 +168,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: ["''“‘<]?(?:lb-connection-draining: )?backendservice drain-timeout-[a-z0-9-]+ drains for 3600 s on pool\(s\) default-pool; gke waits 600 s per node during an upgrade, so each surge node''s drain times out; set the timeout at or under the wait: gcloud compute backend-services update drain-timeout-[a-z0-9-]+ --global --connection-draining-timeout=600$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: ["''“‘<]?(?:lb-connection-draining: )?backendservice drain-timeout-[a-z0-9-]+ drains for 720 s on pool\(s\) default-pool; gke waits 600 s per node during an upgrade, so each surge node''s drain times out; set the timeout at or under the wait: gcloud compute backend-services update drain-timeout-[a-z0-9-]+ --global --connection-draining-timeout=600$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: (?!["''“‘<]?(?:lb-connection-draining: )?backendservice drain-timeout-[a-z0-9-]+ drains for 3600 s on pool\(s\) default-pool; gke waits 600 s per node during an upgrade, so each surge node''s drain times out; set the timeout at or under the wait: gcloud compute backend-services update drain-timeout-[a-z0-9-]+ --global --connection-draining-timeout=600$)[^\n]*$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: (?!["''“‘<]?(?:lb-connection-draining: )?backendservice drain-timeout-[a-z0-9-]+ drains for 720 s on pool\(s\) default-pool; gke waits 600 s per node during an upgrade, so each surge node''s drain times out; set the timeout at or under the wait: gcloud compute backend-services update drain-timeout-[a-z0-9-]+ --global --connection-draining-timeout=600$)[^\n]*$'
   # The three other clusters' lines are the rule's note in the rule's words:
   # no backend service on the cluster's pools or NEGs drains for more than the
   # wait, with the count of the project's backend services that have a

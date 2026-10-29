@@ -1,11 +1,12 @@
-# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-10-17,
-# demoted from the blocking roster on #3120 (it collapsed on unrelated pull
-# requests: the worker declines to open a pull request into a pool -infra
-# repository that holds no manifest for checkout-gateway); `remediation` is
-# on the coverage allowlist in docs/designs/domains.yaml until it returns,
-# after #3145 (which seeds that manifest into every pool -infra repository)
-# merges and its record holds. Still in hack/eval/gitlab-cases.txt, held out
-# there.
+# PRESUBMIT-ACTIVE, ON THE ROSTER again since 2026-10-26, after #3145 seeded
+# checkout-gateway's manifest into every pool -infra repository: 21/21 on the
+# writers nightlies since the claude-opus-5-5 agent model of 2026-10-19, 9/9
+# on the three since #3145, all three under spec.mode next (docs/eval-gate-roster.md
+# has the entry). Nightly-only 2026-10-17 to 2026-10-26, demoted on #3120 (it
+# collapsed on unrelated pull requests: the worker declined to open a pull
+# request into a pool -infra repository that held no manifest for
+# checkout-gateway). Also in hack/eval/gitlab-cases.txt, where it arms rung 4
+# again.
 # Admitted 2026-10-14 (#2016 step 4) on the record since #2263 landed on 2026-10-03:
 # 3/3 on the three writers nightlies 10-12 to 10-14 (the three clean days), the store's
 # newest-20 window at 19/21 (`would-admit`), and 1,882 of 2,086 graded presubmit repetitions
@@ -99,7 +100,7 @@
 # accepted on the same terms: the *-infra repos are throwaway fixtures nobody
 # reads. Eligible tier: presubmit; nightly 2026-09-15 until the seat,
 # which opened 2026-09-28; held out until the roster line of 2026-10-14 (#2016);
-# nightly again since 2026-10-17 (#3120).
+# nightly 2026-10-17 to 2026-10-26 (#3120); on the roster again since.
 #
 # Expected cost bracket: unmeasured. Bounded below by
 # obtainability-remediation-proposal (124-130s measured — same fixture,

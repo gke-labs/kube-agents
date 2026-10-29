@@ -98,8 +98,8 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 # The agent gateway the daemon starts each triage turn on, on the same loopback
 # (session_kv_server.py's PLATFORM_API_URL default). The watcher waits for it to
 # answer before it watches events: the daemon accepts an inject before it starts
-# the turn, so an event offered while the gateway boots would be recorded as
-# delivered with no triage behind it.
+# the turn, so an event offered while the gateway boots would rest on the
+# daemon's retries, which give up after a bounded wait.
 readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
 
 # How long to wait for that daemon to start listening before launching the
@@ -248,10 +248,26 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # delivers the signal and not the shutdown.
 #
 # Fifteen seconds because the detector budgets ten to settle its in-flight
-# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go) and
-# the pod takes Kubernetes' default thirty-second grace period, so this leaves
-# half of it unspent for the credential runtime and Envoy. The poll is whole
-# seconds: the drain is bounded by the settle, not by how often it is checked.
+# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go).
+# A cut drain loses those settles: unsettled records go to the next instance,
+# which can post one duplicate drift record to Session KV per non-graceful
+# restart. The credential runtime is not waited on; it is killed once the
+# supervisors are gone.
+#
+# With the current operator, the only pod that runs this drain is the gateway
+# pod, where this script runs in the agent-api-auth native sidecar. That pod's
+# grace period is gatewayTerminationGracePeriodSeconds (60s,
+# k8s-operator/internal/controller/platformagent_manifests.go), not the 30s
+# default. Native sidecars are signalled after the app containers exit and share
+# that budget. Today the operator runs the gateway at one replica
+# (supportedGatewayReplicas), where Hermes' stop path may spend 40s, so this
+# drain gets about 20s. If multi-replica gateways return (#3016), leader_elect.py
+# may spend up to 56s (50s drain plus lease release calls), leaving this drain
+# about 4s; resizing it is tracked in #3407. An older operator's `combined`
+# sidecar keeps the 30s default, which 15s fits. The standalone broker pod
+# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so terminate()
+# has nothing to drain there. The poll is whole seconds: the drain is bounded by
+# the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 

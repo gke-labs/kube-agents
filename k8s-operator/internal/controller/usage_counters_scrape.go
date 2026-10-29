@@ -69,9 +69,10 @@ const (
 	toolInvocationsSeries  = "kubeagents_tool_invocations_total"
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
 	processStartTimeSeries = "process_start_time_seconds"
-	// vcsRequestsSeries is the broker's version-control counter, by verb and
-	// status; remediationsProposedTotal sums it under vcsProposalCreateVerb
-	// and vcsStatusSuccess alone: a proposal the forge accepted is a proposal.
+	// vcsRequestsSeries is the broker's version-control counter, by verb,
+	// status and provider; remediationsProposedTotal sums it under
+	// vcsProposalCreateVerb and vcsStatusSuccess alone, over every provider:
+	// a proposal the forge accepted is a proposal.
 	vcsRequestsSeries     = "kubeagents_vcs_requests_total"
 	vcsVerbLabel          = "verb"
 	vcsProposalCreateVerb = "proposal-create"
@@ -84,7 +85,8 @@ const (
 	// gateway accepted, by platform; summed over every platform.
 	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
 	// brokerFailuresSeries is the broker's failure counter, summed over its
-	// kind label into brokerFailuresTotal; the kinds stay in Prometheus.
+	// kind and tool labels into brokerFailuresTotal; the kinds, and the tool a
+	// timed-out command ran, stay in Prometheus.
 	brokerFailuresSeries = "kubeagents_broker_execution_failures_total"
 	// chatTurnsErroredSeries is the chat plugin's count of synchronous turns
 	// the Hermes gateway failed to complete, summed over its platform label

@@ -119,8 +119,8 @@ _DECIMAL_SI_HARD_BYTES = 1000000000
 _LITELLM_REPLICAS = 2
 _LITELLM_CPU_LIMIT_MILLIS = 500 * _LITELLM_REPLICAS
 _LITELLM_CPU_REQUEST_MILLIS = 100 * _LITELLM_REPLICAS
-# An ephemeral-storage request no chart workload sets by default, so the totals move by
-# exactly this much when one does.
+# An ephemeral-storage request set on LiteLLM in place of its 1280Mi default, so the
+# totals move by the difference, per replica.
 _EPHEMERAL_SET_GIB = 3
 # What the shell StatefulSet leaves behind: persistentVolumeClaimRetentionPolicy is
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
@@ -893,6 +893,14 @@ class PreflightDecisionTest(unittest.TestCase):
             with_hindsight["requestsStorage"],
             base["requestsStorage"] + _HINDSIGHT_STORAGE_BYTES,
         )
+
+    def test_web_console_adds_its_pod_and_resources_to_the_totals(self) -> None:
+        """Enabling webConsole adds its one replica and resource requests."""
+        base = self._requirements()
+        with_console = self._requirements(["webConsole.enabled=true"])
+        self.assertEqual(with_console["pods"], base["pods"] + 1)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
 
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.

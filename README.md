@@ -115,6 +115,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Upgrade & Patch Readiness Audit | Weekly, Monday 07:20 | [`security_patch_orchestrator_sop.md`](agents/platform/governance/security_patch_orchestrator_sop.md) |
 | Fleet Waste Audit | Weekly, Monday 07:50 | [`fleet_wide_cost_analysis_sop.md`](agents/platform/governance/fleet_wide_cost_analysis_sop.md) |
 | Fleet Consistency Drift Audit | Weekly, Monday 08:20 | [`fleet_consistency_drift_sop.md`](agents/platform/governance/fleet_consistency_drift_sop.md) |
+| Upgrade Retrospective | Weekly, Sunday 18:00 | [`upgrade_retrospective_sop.md`](agents/platform/governance/upgrade_retrospective_sop.md) |
 
 ### Skills by area
 
@@ -127,10 +128,10 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Networking and storage | `gcp-networking-fabric-audit`, `gke-networking`, `gke-service-networking`, `gke-storage` |
 | AI and inference | `gke-ai-troubleshooting-handle-disruption-gpu-tpu`, `gke-ai-troubleshooting-jobset-interruption`, `gke-ai-troubleshooting-tpu-vbar-oom`, `gke-golden-path`, `gke-inference`, `gke-tpu-dynamic-slices-monitoring`, `gke-tpu-metrics-monitoring` |
 | Observability | `gke-alert-configuration`, `gke-basics`, `gke-observability`, `kube-agents-observability` |
-| Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades`, `upgrade-readiness-brief` |
+| Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades`, `topology-drift`, `upgrade-readiness-brief` |
 | Manifests and remediation | `gcp-config-connector`, `gcp-terraform`, `gitops-helm-chart`, `gke-manifest-generation`, `submit-suggestion` |
 | Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
-| Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting` |
+| Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `topology-drift` |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: capabilities -->

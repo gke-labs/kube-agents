@@ -496,6 +496,22 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// observeEnded below and by the read route).
 	g.settleHandOff(rec, taskID, evidence)
 
+	// The terminal's chat message is its mark alone, with no fallback; a
+	// terminal without one takes the default (applyTerminalMark), drawn below
+	// after the answer, so the ask's reaction comes off once the answer is
+	// posted. Read here because it also says whether the turn left cards
+	// running (cardsPending), whose report, not this result, answers the ask.
+	var terminal chatmsg.Reading
+	if s.Status.Message != nil {
+		terminal = g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts)
+	}
+	// A task that handed the ask to cards, a delegated child's included,
+	// leaves the answer to a card's report for the whole chain.
+	toCards := cardsPending(s.Status.State, terminal) || handedOff(s.Status.State, rs.handoff)
+	if toCards {
+		rec.markCardsAnswer(taskID)
+	}
+
 	switch s.Status.State {
 	case lib.StateCompleted:
 		// Whole, to the adapter whose caller is a program, before the chunked
@@ -513,6 +529,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		} else if !isConsoleConversation(rec.Key) {
 			answerChat = g.resultChat(rec.Key, taskID, rs, replayedResult)
 			answer.Chat = layoutOf(answerChat)
+			// The chain's final answer, and only that, can be rated: not a
+			// turn that handed the ask to cards, whose result is the hand-off
+			// acknowledgement (the card's report is rated instead,
+			// Notifier.postConversation).
+			if !toCards {
+				answer.Feedback = g.feedbackTarget(rec, taskID)
+			}
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
@@ -535,7 +558,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		// A Slack Stop answers with its own one reply (slack_stop.go).
+		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
+			g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		}
 	case lib.StateRejected:
 		// Same shape as failed above, and for the same reason. Both
 		// executors put the cause in the terminal message -- a capability
@@ -552,13 +578,6 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	}
 	g.postSteerShortfall(rec, rs, taskID)
 	g.flushNotices(rec.Key, rs)
-	// The terminal's chat message is its mark alone, with no fallback; a
-	// terminal without one takes the default (applyTerminalMark). After the
-	// answer, so the ask's reaction comes off once the answer is posted.
-	var terminal chatmsg.Reading
-	if s.Status.Message != nil {
-		terminal = g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts)
-	}
 	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
@@ -646,6 +665,16 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
 	if !ref.TerminalObserved {
+		// A console client is told the turn handed work to cards, so it
+		// waits for their reports (notify frames) only when there are some.
+		// Any task in the chain may file them (a delegated child usually
+		// does), so the mark goes on the chain's root whichever task this
+		// is, and the chain's end (the wake, or the child's own end when no
+		// wake runs) takes it in consoleFrame.
+		if isConsoleConversation(rec.Key) && handedOff(s.Status.State, rs.handoff) {
+			root, _ := rec.observedAs(taskID)
+			g.consoleCardsPending.put(root, "")
+		}
 		g.observeEnded(rec, taskID, s.Status.State, source, reason)
 	}
 
@@ -657,7 +686,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if turnsUnread {
 			wakeResult, wakeReason = withTurnsUnread(result), withTurnsUnread(reason)
 		}
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, cardsPending(s.Status.State, terminal) || handedOff(s.Status.State, rs.handoff)); !woken {
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, toCards); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}

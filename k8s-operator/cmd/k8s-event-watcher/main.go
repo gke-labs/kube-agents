@@ -87,9 +87,13 @@ const (
 	// the watcher knows, and no more.
 	followupMessage = "no new events for this object since the last sighting"
 	// The outcomes of k8s_event_watcher_followups_total: the daemon accepted
-	// the line for the session's thread (it posts after answering, so a chat
-	// failure past that point is invisible here, as for the alert), it had
-	// no thread to post into, or the inject failed.
+	// the line (for a session with a thread it posts after answering, so a
+	// chat failure past that point is invisible here, as for the alert; for
+	// one with a card but no thread the card line was already written), it
+	// had neither a thread nor a card it could find within the hour to post
+	// into, or the inject failed,
+	// which includes the daemon's 503 for a card still to come, retried each
+	// sweep for an hour.
 	followupOutcomeSent     = "sent"
 	followupOutcomeUnrouted = "unrouted"
 	followupOutcomeError    = "error"
@@ -167,7 +171,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
 	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
-	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread. Silence is read off the events alone; no object is read back. 0 = off.")
+	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
 	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
 	// Kubernetes client.
@@ -921,7 +925,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // the gate's suppression rate the counter gives. An incident whose alert
 // went out and whose object has been unsighted for quietAfter gets one
 // k8s-event-followup inject on its own session, which the daemon posts into
-// the alert's thread (session_kv_server, _inject_followup). What the watcher
+// the alert's thread and onto its card, the card alone where no thread is
+// routed (session_kv_server, _inject_followup). What the watcher
 // knows is silence, and the payload says so: the object was not read back,
 // since the broker's watcher route serves no pods, and a deleted pod and a
 // recovered one both go quiet. One per incident, held on the dedup entry so
@@ -991,8 +996,9 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 		}
 		outcome := followupOutcomeSent
 		if answer.Status == injectStatusUnrouted {
-			// The daemon had no thread for the session (the alert never
-			// reached chat), so it posted nothing; there is nothing to retry.
+			// The daemon had neither a thread nor a card it could find within
+			// its hour for the session (the alert never reached chat, and its
+			// card never came), so it posted nothing; there is nothing to retry.
 			outcome = followupOutcomeUnrouted
 		}
 		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, outcome).Inc()

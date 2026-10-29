@@ -71,6 +71,14 @@ const (
 	heldMarkerValue = "v1"
 )
 
+// ErrHeldBindRefused marks a bind SubscribeHeld refused on what it read from
+// the durable's stored config: the wrong filter, an ack policy that is not
+// explicit, no MaxAckPending cap, no AckWait, or no EnsureHeldConsumer
+// marker. The verdict is the server's own record of the consumer, so waiting
+// cannot change it, and the first bind returns it at once instead of retrying
+// it for the bind window the way a missing durable is. errors.Is against it.
+var ErrHeldBindRefused = errors.New("held durable refused")
+
 // HeldConsumerConfig is a held durable as the operator creates it.
 type HeldConsumerConfig struct {
 	Stream  string
@@ -190,9 +198,13 @@ type HeldSubscription interface {
 // hands each delivery to handler on its own goroutine, with a context that is
 // cancelled by Stop or Close. It never creates, updates or deletes the
 // consumer: a missing durable, or one that isn't an explicit-ack consumer
-// filtering cfg.Subject with a real MaxAckPending, is an error (a missing
-// one is retried for the bind window first, in case the operator has not
-// created it yet). The heartbeat is paced from the durable's own AckWait.
+// filtering cfg.Subject with a real MaxAckPending, is an error. The two are
+// told apart by what waiting can do: a missing durable (and any other lookup
+// error) is retried for the bind window first, in case the operator has not
+// created it yet, while a durable that exists and fails the checks is refused
+// on the first attempt, wrapped in ErrHeldBindRefused, because its stored
+// config is the verdict and a retry would read the same one. The heartbeat
+// is paced from the durable's own AckWait.
 // The intake is one profile's, `a2a.tasks.<profile>.*.in`, the shape
 // ParseTaskSubject and the publisher know, so envelope-subject agreement and
 // the session filter apply as in SubscribeDurable; cfg.Session must be that
@@ -260,18 +272,20 @@ func (h *heldState) bind(ctx context.Context, js jetstream.JetStream, cfg Subscr
 	if err != nil {
 		return nil, fmt.Errorf("bind held durable %s on %s (the operator creates it): %w", cfg.Durable, cfg.Stream, err)
 	}
+	// Each refusal below is read from the consumer's stored config, so it
+	// wraps ErrHeldBindRefused and startWithRetry returns it without a retry.
 	cc := cons.CachedInfo().Config
 	switch {
 	case len(cc.FilterSubjects) > 0 || cc.FilterSubject != cfg.Subject:
-		return nil, fmt.Errorf("held durable %s filters %q%v, not %q; refusing to bind", cfg.Durable, cc.FilterSubject, cc.FilterSubjects, cfg.Subject)
+		return nil, fmt.Errorf("%w: held durable %s filters %q%v, not %q; refusing to bind", ErrHeldBindRefused, cfg.Durable, cc.FilterSubject, cc.FilterSubjects, cfg.Subject)
 	case cc.AckPolicy != jetstream.AckExplicitPolicy:
-		return nil, fmt.Errorf("held durable %s is not explicit-ack; refusing to bind", cfg.Durable)
+		return nil, fmt.Errorf("%w: held durable %s is not explicit-ack; refusing to bind", ErrHeldBindRefused, cfg.Durable)
 	case cc.MaxAckPending < 1:
-		return nil, fmt.Errorf("held durable %s has no MaxAckPending cap (%d); refusing to bind", cfg.Durable, cc.MaxAckPending)
+		return nil, fmt.Errorf("%w: held durable %s has no MaxAckPending cap (%d); refusing to bind", ErrHeldBindRefused, cfg.Durable, cc.MaxAckPending)
 	case cc.AckWait <= 0:
-		return nil, fmt.Errorf("held durable %s has no AckWait; refusing to bind", cfg.Durable)
+		return nil, fmt.Errorf("%w: held durable %s has no AckWait; refusing to bind", ErrHeldBindRefused, cfg.Durable)
 	case cc.Metadata[heldMarkerKey] != heldMarkerValue:
-		return nil, fmt.Errorf("held durable %s was not made by EnsureHeldConsumer (no %s metadata); refusing to bind", cfg.Durable, heldMarkerKey)
+		return nil, fmt.Errorf("%w: held durable %s was not made by EnsureHeldConsumer (no %s metadata); refusing to bind", ErrHeldBindRefused, cfg.Durable, heldMarkerKey)
 	}
 	h.mu.Lock()
 	h.ackWait = cc.AckWait

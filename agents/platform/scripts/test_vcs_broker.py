@@ -70,13 +70,14 @@ def git(cwd: Path | str, *args: str, check: bool = True):
     )
 
 
-def git_runner(argv, cwd, check=True, config=()):
+def git_runner(argv, cwd, check=True, config=(), *, allow_http=False):
     """The shape the broker's git runner presents.
 
     `config` is what the forge's credential asked for on this invocation. The
     executor turns it into a `GIT_CONFIG_COUNT` layer; here it becomes `-c`
     flags, which is the same precedence and is visible to an assertion.
     """
+    del allow_http
     flags = [flag for key, value in config for flag in ("-c", f"{key}={value}")]
     return subprocess.run(
         [argv[0], *flags, *argv[1:]],
@@ -3019,6 +3020,35 @@ class CollaborationTest(unittest.TestCase):
         broker, recorder = self.broker({"name": "x"}, {"name": "x", "color": "000000"})
         broker.label_ensure({"repository": "acme/infra", "name": "x", "color": "000000"})
         self.assertEqual([c[3] for c in recorder.calls], ["GET", "PATCH"])
+
+    def test_label_ensure_writes_nothing_when_the_label_is_unchanged(self):
+        # GitHub answers the colour in lower case and an empty description as
+        # null; neither is a change, so no PATCH follows the read.
+        held = {"name": "audit:x", "color": "1d76db", "description": None}
+        broker, recorder = self.broker(held)
+        answer = broker.label_ensure(
+            {"repository": "acme/infra", "name": "audit:x", "color": "#1D76DB", "description": ""}
+        )
+        self.assertEqual([c[3] for c in recorder.calls], ["GET"])
+        self.assertEqual(answer["label"], {"name": "audit:x", "color": "1d76db", "description": ""})
+        held = {"name": "audit:x", "color": "1d76db", "description": "Findings"}
+        broker, recorder = self.broker(held)
+        broker.label_ensure(
+            {"repository": "acme/infra", "name": "audit:x", "color": "1d76db", "description": "Findings"}
+        )
+        self.assertEqual([c[3] for c in recorder.calls], ["GET"])
+
+    def test_label_ensure_patches_a_changed_description_or_name(self):
+        for held in (
+            {"name": "audit:x", "color": "1d76db", "description": "Old"},
+            {"name": "Audit:X", "color": "1d76db", "description": "Findings"},
+        ):
+            with self.subTest(held=held):
+                broker, recorder = self.broker(held, held)
+                broker.label_ensure(
+                    {"repository": "acme/infra", "name": "audit:x", "color": "1d76db", "description": "Findings"}
+                )
+                self.assertEqual([c[3] for c in recorder.calls], ["GET", "PATCH"])
 
     def test_identity_reads_the_login_from_the_cli_and_the_permission_from_the_api(self):
         status = subprocess.CompletedProcess(

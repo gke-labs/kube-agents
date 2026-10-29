@@ -85,6 +85,35 @@ func viewText(t *testing.T, v slack.HomeTabViewRequest) string {
 	return strings.Join(lines, "\n")
 }
 
+func TestSlackHomeCountsTheWeeksRatingsWhenFeedbackIsOn(t *testing.T) {
+	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	if got := viewText(t, api.views[0].view); strings.Contains(got, "This week") {
+		t.Errorf("feedback off: the tab drew a ratings line:\n%s", got)
+	}
+	rec := &fakeRecorder{up: 4, down: 1}
+	a.SetFeedbackRecorder(rec)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[1].view)
+	if !strings.HasSuffix(got, "divider:\ncontext: This week: 4 👍, 1 👎") {
+		t.Errorf("the tab must end with the week's ratings:\n%s", got)
+	}
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	if rec.tallies != 1 {
+		t.Errorf("tally read %d times for two opens inside its freshness, want 1", rec.tallies)
+	}
+}
+
+func TestSlackHomeLeavesOutATallyItCouldNotRead(t *testing.T) {
+	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
+	a.SetFeedbackRecorder(&fakeRecorder{tallyErr: errors.New("bucket gone")})
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[0].view)
+	if strings.Contains(got, "This week") || !strings.Contains(got, "header: Fleet") {
+		t.Errorf("a failed tally must leave the line out and the rest of the tab drawn:\n%s", got)
+	}
+}
+
 func TestSlackHomeDrawsTheDashboardForAnAllowedMember(t *testing.T) {
 	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
 	a.noteAsker("slack:C1/40.0", "U1")
@@ -155,6 +184,47 @@ func TestSlackHomeShowsNoFleetToAMemberTheGatewayWouldNotAnswer(t *testing.T) {
 				t.Errorf("board read %d times for a member who sees none of it", *reads)
 			}
 		})
+	}
+}
+
+// A Slack Connect guest the list names as T…:U… is drawn the dashboard, as their
+// mentions are turns; the same member id from a workspace the entry does not
+// name is not.
+func TestSlackHomeDrawsTheDashboardForAListedGuest(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{
+		"UG": {ID: "UG", TeamID: "T7"}, "UH": {ID: "UH", TeamID: "T8"}}}
+	a, _ := newUXSlackAdapter(api)
+	a.workspaceURL = "https://acme.slack.com/"
+	a.SetAllowedGuests([]string{"T7:UG", "T7:UH"})
+	a.SetHome(func(m string) (bool, bool) { return m == "U1" || m == "T7:UG" || m == "T7:UH", false },
+		func(context.Context) (*lib.Board, error) { return homeBoardFixture(), nil })
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "UG", Tab: "home"})
+	if len(api.views) != 1 || !strings.Contains(viewText(t, api.views[0].view), "header: Fleet") {
+		t.Fatalf("a listed guest was not drawn the dashboard: %+v", api.views)
+	}
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "UH", Tab: "home"})
+	if len(api.views) != 2 || viewText(t, api.views[1].view) != "section: "+slackHomeDenied {
+		t.Errorf("a member of a workspace the entry does not name was drawn the dashboard: %+v", api.views)
+	}
+}
+
+// With guest entries on the list, a guest listed only by their bare member id
+// is shown no fleet, as their messages are refused; an entry naming the
+// install's own workspace admits nobody; our own listed member is still drawn.
+func TestSlackHomeWithGuestEntriesChecksEveryMembersWorkspace(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{
+		"UQ": {ID: "UQ", TeamID: "T7"}, "UO": {ID: "UO", TeamID: "T1"}, "U1": {ID: "U1", TeamID: "T1"}}}
+	a, _ := newUXSlackAdapter(api) // our own workspace is T1
+	a.workspaceURL = "https://acme.slack.com/"
+	a.SetAllowedGuests([]string{"T7:UG", "T1:UO"})
+	a.SetHome(func(m string) (bool, bool) { return m == "U1" || m == "UQ" || m == "T1:UO", false },
+		func(context.Context) (*lib.Board, error) { return homeBoardFixture(), nil })
+	for member, want := range map[string]bool{"UQ": false, "UO": false, "U1": true} {
+		a.homeOpened(&slackevents.AppHomeOpenedEvent{User: member, Tab: "home"})
+		got := strings.Contains(viewText(t, api.views[len(api.views)-1].view), "header: Fleet")
+		if got != want {
+			t.Errorf("member %s drawn the dashboard = %v, want %v", member, got, want)
+		}
 	}
 }
 

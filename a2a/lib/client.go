@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -621,6 +622,13 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // and serving and giving up would leave it silently deaf, while here a
 // consumer config the server will never accept must still fail the process
 // rather than hang it. Every attempt is logged, so the delay is never silent.
+//
+// One error is not retried at all: a held bind refused on the durable's
+// stored config (ErrHeldBindRefused). That verdict was read from the
+// consumer the server already holds, so a retry reads the same one, and
+// retrying it for the window would hand the caller whichever error the last
+// attempt happened to end on (the context's, when a caller's deadline fires
+// mid-retry) in place of the refusal. A missing durable keeps the window.
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
 	for attempt := 1; ; attempt++ {
@@ -630,6 +638,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				s.c.log.Info("durable bound after retry", "durable", s.cfg.Durable, "attempts", attempt)
 			}
 			return nil
+		}
+		if errors.Is(err, ErrHeldBindRefused) {
+			return err
 		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
 			return err

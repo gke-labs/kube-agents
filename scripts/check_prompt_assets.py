@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Six checks, all offline and standard library only:
+Seven checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -34,6 +34,9 @@ Six checks, all offline and standard library only:
 ``cron-risk``
     Every cron job declares a risk tier (``low`` or ``high``) the runtime
     approval gate can key its command policy off.
+``cron-max-turns``
+    Every model-run cron job declares a positive integer ``max_turns``, and
+    no ``no_agent`` job carries one.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
@@ -319,6 +322,13 @@ FRONTMATTER_DESCRIPTION = re.compile(
 
 # The valid risk tiers a cron job can declare (SKILL-002).
 ALLOWED_CRON_RISK = frozenset({"low", "high"})
+# The smallest iteration budget a model-run cron job may declare. Hermes'
+# `resolve_turn_limit` reads 0, a negative number, a bool and a non-numeric
+# string as unlimited; the image's scheduler patch ignores such a roster value
+# and runs the job at the profile's budget instead, so a roster that carried
+# one would say one thing and run another. A numeric string would parse, and
+# is refused here only to keep the roster one type.
+CRON_MAX_TURNS_MIN = 1
 
 
 @dataclass(frozen=True)
@@ -959,6 +969,56 @@ def check_cron_risk() -> list[Finding]:
     return findings
 
 
+def check_cron_max_turns() -> list[Finding]:
+    """Every model-run cron job declares its own iteration budget (#1947).
+
+    The image's scheduler reads a roster entry's ``max_turns`` ahead of the
+    profile's ``agent.max_turns`` (deploy/docker/patches/apply_cron_job_max_turns.py),
+    so the fleet audits can carry the budget they need while the profile default
+    bounds the kanban workers. An entry without one silently runs under the
+    worker budget; one with 0, a negative number, a bool or a non-numeric string
+    is a value Hermes would read as unlimited and the image's patch therefore
+    ignores, so the entry would run at the profile's budget while saying
+    otherwise; a numeric string is refused only to keep the roster one type. A ``no_agent`` job runs no model turn and must not carry one,
+    or the roster reads as if the key bounded the script.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            declared = "max_turns" in job
+            value = job.get("max_turns")
+            if job.get("no_agent"):
+                if declared:
+                    findings.append(
+                        Finding(
+                            "cron-max-turns",
+                            str(rel),
+                            f"job {job['id']!r} is no_agent and carries max_turns={value!r}; "
+                            "a script job runs no model turn, so the key bounds nothing",
+                        )
+                    )
+                continue
+            valid = (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= CRON_MAX_TURNS_MIN
+            )
+            if not valid:
+                findings.append(
+                    Finding(
+                        "cron-max-turns",
+                        str(rel),
+                        f"job {job['id']!r} has max_turns={value!r}; a model-run job must "
+                        f"declare an integer of at least {CRON_MAX_TURNS_MIN} — an absent key "
+                        "runs the job under the profile's worker budget, and 0, a negative "
+                        "number, a bool or a non-numeric string is ignored by the scheduler "
+                        "patch and runs it there too, while reading as something else",
+                    )
+                )
+    return findings
+
+
 def _nearest(name: str, owned: dict[str, Path]) -> str | None:
     """The closest real skill name, for the common single-character slips."""
     matches = difflib.get_close_matches(name, sorted(owned), n=1, cutoff=0.85)
@@ -1015,6 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_cron_assets()
         + check_cron_delivery()
         + check_cron_risk()
+        + check_cron_max_turns()
     )
     if findings:
         print(

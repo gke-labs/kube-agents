@@ -1,0 +1,1296 @@
+{
+  "after_reset": false,
+  "after_upgrade": false,
+  "budget_spent": false,
+  "deferred": [],
+  "deferred_rechecks": 0,
+  "dry_run": false,
+  "failed_reads": [],
+  "families": [
+    {
+      "canaries": [],
+      "family": "seeded-held",
+      "members": [
+        "{{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}"
+      ],
+      "verdict": null,
+      "waiting": [
+        "{{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}"
+      ]
+    },
+    {
+      "canaries": [
+        {
+          "cluster": "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+          "reasons": [
+            "1 container(s) past the log-volume thresholds"
+          ],
+          "verdict": "risk"
+        }
+      ],
+      "family": "seeded-regular",
+      "members": [
+        "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+        "{{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}",
+        "{{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}"
+      ],
+      "verdict": "hold",
+      "waiting": [
+        "{{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}",
+        "{{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}"
+      ]
+    }
+  ],
+  "fleet": [
+    "{{PROJECT}}"
+  ],
+  "gates_reread": [],
+  "generated_at": "2026-01-02T03:04:05Z",
+  "guards": [],
+  "held_clusters": {},
+  "not_running": {},
+  "operation_guards": {
+    "cleared": [],
+    "held": [],
+    "refreshed": [],
+    "unlisted": []
+  },
+  "operations_unread": [],
+  "outside_fleet": [],
+  "projects": [
+    "{{PROJECT}}"
+  ],
+  "rechecks": [],
+  "removed_clusters": [],
+  "reset_archive": null,
+  "reset_at": null,
+  "reviews": [
+    {
+      "answered": [
+        "pods",
+        "nodes",
+        "events",
+        "pdbs",
+        "owners",
+        "workloads",
+        "storage",
+        "webhooks",
+        "endpointslices"
+      ],
+      "baseline": {
+        "budgets": 2,
+        "first_run": false,
+        "first_seen": 0,
+        "guards": [],
+        "pods": 14,
+        "shape_reads_failed": [],
+        "shapes": 0,
+        "symptom_count": 0,
+        "versions": {
+          "control_plane": "1.33.5-gke.1080000",
+          "node_pools": {
+            "default-pool": "1.33.5-gke.1080000"
+          }
+        }
+      },
+      "budgets_at_zero": [],
+      "cluster": "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+      "commands": [],
+      "family": "seeded-regular",
+      "gate": {
+        "after_complete": true,
+        "after_complete_at": "2026-10-18T03:31:00Z",
+        "first_start": "2026-10-10T03:27:00Z",
+        "last_end": "2026-10-11T03:31:00Z",
+        "log_volume": {
+          "after_complete": true,
+          "after_end": "2026-10-18T03:31:00Z",
+          "after_total": 3279221338,
+          "before_start": "2026-10-03T03:27:00Z",
+          "before_total": 425311607,
+          "error": null,
+          "first_start": "2026-10-10T03:27:00Z",
+          "last_end": "2026-10-11T03:31:00Z",
+          "requests": [
+            {
+              "aggregation.alignmentPeriod": "604800s",
+              "aggregation.crossSeriesReducer": "REDUCE_SUM",
+              "aggregation.groupByFields": [
+                "resource.labels.namespace_name",
+                "resource.labels.container_name"
+              ],
+              "aggregation.perSeriesAligner": "ALIGN_SUM",
+              "filter": "metric.type=\"logging.googleapis.com/byte_count\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"{{CLUSTER_A}}\" AND resource.labels.location=\"{{LOCATION_A}}\"",
+              "interval.endTime": "2026-10-10T03:27:00Z",
+              "interval.startTime": "2026-10-03T03:27:00Z",
+              "pageSize": "2000"
+            },
+            {
+              "aggregation.alignmentPeriod": "604800s",
+              "aggregation.crossSeriesReducer": "REDUCE_SUM",
+              "aggregation.groupByFields": [
+                "resource.labels.namespace_name",
+                "resource.labels.container_name"
+              ],
+              "aggregation.perSeriesAligner": "ALIGN_SUM",
+              "filter": "metric.type=\"logging.googleapis.com/byte_count\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"{{CLUSTER_A}}\" AND resource.labels.location=\"{{LOCATION_A}}\"",
+              "interval.endTime": "2026-10-18T03:31:00Z",
+              "interval.startTime": "2026-10-11T03:31:00Z",
+              "pageSize": "2000"
+            }
+          ],
+          "rows": [
+            {
+              "after_bytes": 3161419710,
+              "before_bytes": 312447534,
+              "breach": true,
+              "container": "konnectivity-agent",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/konnectivity-agent",
+              "ratio": 10.12
+            },
+            {
+              "after_bytes": 1096135,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "fluentbit",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/fluentbit",
+              "ratio": null
+            },
+            {
+              "after_bytes": 19095818,
+              "before_bytes": 18096175,
+              "breach": false,
+              "container": "gke-metadata-server",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/gke-metadata-server",
+              "ratio": 1.06
+            },
+            {
+              "after_bytes": 16400841,
+              "before_bytes": 15782477,
+              "breach": false,
+              "container": "prometheus",
+              "namespace": "gmp-system",
+              "object": "gmp-system/Container/prometheus",
+              "ratio": 1.04
+            },
+            {
+              "after_bytes": 31573119,
+              "before_bytes": 31172130,
+              "breach": false,
+              "container": "netd",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/netd",
+              "ratio": 1.01
+            },
+            {
+              "after_bytes": 375552,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "operator",
+              "namespace": "gmp-system",
+              "object": "gmp-system/Container/operator",
+              "ratio": null
+            },
+            {
+              "after_bytes": 365774,
+              "before_bytes": 610,
+              "breach": false,
+              "container": "node-cache",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/node-cache",
+              "ratio": 599.63
+            },
+            {
+              "after_bytes": 519946,
+              "before_bytes": 213904,
+              "breach": false,
+              "container": "core-metrics-exporter",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/core-metrics-exporter",
+              "ratio": 2.43
+            },
+            {
+              "after_bytes": 795385,
+              "before_bytes": 536981,
+              "breach": false,
+              "container": "gke-metrics-agent",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/gke-metrics-agent",
+              "ratio": 1.48
+            },
+            {
+              "after_bytes": 151846,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "kube-state-metrics",
+              "namespace": "gke-managed-cim",
+              "object": "gke-managed-cim/Container/kube-state-metrics",
+              "ratio": null
+            },
+            {
+              "after_bytes": 149195,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "install-cni",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/install-cni",
+              "ratio": null
+            },
+            {
+              "after_bytes": 1934906,
+              "before_bytes": 1822363,
+              "breach": false,
+              "container": "kubedns",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/kubedns",
+              "ratio": 1.06
+            },
+            {
+              "after_bytes": 68281,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "autoscaler",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/autoscaler",
+              "ratio": null
+            },
+            {
+              "after_bytes": 65565,
+              "before_bytes": 2131,
+              "breach": false,
+              "container": "fluentbit-gke",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/fluentbit-gke",
+              "ratio": 30.77
+            },
+            {
+              "after_bytes": 39719,
+              "before_bytes": 758,
+              "breach": false,
+              "container": "metrics-server",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/metrics-server",
+              "ratio": 52.4
+            },
+            {
+              "after_bytes": 32415,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "csi-driver-registrar",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/csi-driver-registrar",
+              "ratio": null
+            },
+            {
+              "after_bytes": 26284,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "event-exporter",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/event-exporter",
+              "ratio": null
+            },
+            {
+              "after_bytes": 21232,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "sidecar",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/sidecar",
+              "ratio": null
+            },
+            {
+              "after_bytes": 20231,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "config-reloader",
+              "namespace": "gmp-system",
+              "object": "gmp-system/Container/config-reloader",
+              "ratio": null
+            },
+            {
+              "after_bytes": 2259279,
+              "before_bytes": 2240542,
+              "breach": false,
+              "container": "pdcsi-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/pdcsi-metrics-collector",
+              "ratio": 1.01
+            },
+            {
+              "after_bytes": 6476,
+              "before_bytes": 1636,
+              "breach": false,
+              "container": "prometheus-to-sd-exporter",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/prometheus-to-sd-exporter",
+              "ratio": 3.96
+            },
+            {
+              "after_bytes": 7187891,
+              "before_bytes": 7184791,
+              "breach": false,
+              "container": "dnsmasq",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/dnsmasq",
+              "ratio": 1.0
+            },
+            {
+              "after_bytes": 3919065,
+              "before_bytes": 3916834,
+              "breach": false,
+              "container": "kubectl",
+              "namespace": "seeded-shapes",
+              "object": "seeded-shapes/Container/kubectl",
+              "ratio": 1.0
+            },
+            {
+              "after_bytes": 2162,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "jvm",
+              "namespace": "seeded-shapes",
+              "object": "seeded-shapes/Container/jvm",
+              "ratio": null
+            },
+            {
+              "after_bytes": 30295212,
+              "before_bytes": 30293446,
+              "breach": false,
+              "container": "gce-pd-driver",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/gce-pd-driver",
+              "ratio": 1.0
+            },
+            {
+              "after_bytes": 1492,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "agent",
+              "namespace": "seeded-shapes",
+              "object": "seeded-shapes/Container/agent",
+              "ratio": null
+            },
+            {
+              "after_bytes": 1440,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "gateway",
+              "namespace": "seeded-reliability",
+              "object": "seeded-reliability/Container/gateway",
+              "ratio": null
+            },
+            {
+              "after_bytes": 1437,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "relay",
+              "namespace": "seeded-intent",
+              "object": "seeded-intent/Container/relay",
+              "ratio": null
+            },
+            {
+              "after_bytes": 727,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "worker",
+              "namespace": "seeded-defaults",
+              "object": "seeded-defaults/Container/worker",
+              "ratio": null
+            },
+            {
+              "after_bytes": 725,
+              "before_bytes": 0,
+              "breach": false,
+              "container": "pause",
+              "namespace": "seeded-shapes",
+              "object": "seeded-shapes/Container/pause",
+              "ratio": null
+            },
+            {
+              "after_bytes": 115772,
+              "before_bytes": 115755,
+              "breach": false,
+              "container": "default-http-backend",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/default-http-backend",
+              "ratio": 1.0
+            },
+            {
+              "after_bytes": 7555,
+              "before_bytes": 8420,
+              "breach": false,
+              "container": "ksm-metrics-collector",
+              "namespace": "gke-managed-cim",
+              "object": "gke-managed-cim/Container/ksm-metrics-collector",
+              "ratio": 0.9
+            },
+            {
+              "after_bytes": 1069794,
+              "before_bytes": 1071440,
+              "breach": false,
+              "container": "writer",
+              "namespace": "seeded-deprecation",
+              "object": "seeded-deprecation/Container/writer",
+              "ratio": 1.0
+            },
+            {
+              "after_bytes": 10847,
+              "before_bytes": 18227,
+              "breach": false,
+              "container": "kubedns-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/kubedns-metrics-collector",
+              "ratio": 0.6
+            },
+            {
+              "after_bytes": 21537,
+              "before_bytes": 36200,
+              "breach": false,
+              "container": "konnectivity-agent-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/konnectivity-agent-metrics-collector",
+              "ratio": 0.59
+            },
+            {
+              "after_bytes": 10944,
+              "before_bytes": 40424,
+              "breach": false,
+              "container": "netd-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/netd-metrics-collector",
+              "ratio": 0.27
+            },
+            {
+              "after_bytes": 133131,
+              "before_bytes": 175133,
+              "breach": false,
+              "container": "prometheus-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/prometheus-metrics-collector",
+              "ratio": 0.76
+            },
+            {
+              "after_bytes": 12309,
+              "before_bytes": 63382,
+              "breach": false,
+              "container": "fluentbit-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/fluentbit-metrics-collector",
+              "ratio": 0.19
+            },
+            {
+              "after_bytes": 11589,
+              "before_bytes": 70314,
+              "breach": false,
+              "container": "nodelocaldns-metrics-collector",
+              "namespace": "kube-system",
+              "object": "kube-system/Container/nodelocaldns-metrics-collector",
+              "ratio": 0.16
+            }
+          ]
+        },
+        "reasons": [
+          "1 container(s) past the log-volume thresholds"
+        ],
+        "verdict": "risk"
+      },
+      "gated": [],
+      "guards": [],
+      "location": "{{LOCATION_A}}",
+      "managed_agents": 0,
+      "mitigations": [],
+      "name": "{{CLUSTER_A}}",
+      "next_upgrade": {
+        "below_target": false,
+        "channel": "REGULAR",
+        "current": "1.33.5-gke.1080000",
+        "exclusions": [],
+        "next_opens": "2026-10-20T03:00:00Z",
+        "target": "1.33.5-gke.1080000",
+        "window": "daily 03:00Z for 4h"
+      },
+      "partial": [],
+      "project": "{{PROJECT}}",
+      "read_errors": [],
+      "reviewed": true,
+      "shapes": [],
+      "skew_notes": [],
+      "starting": [],
+      "symptom_baseline": [],
+      "terminating": [],
+      "unavailable_workloads": [],
+      "what_failed": [],
+      "what_happened": {
+        "channel": "REGULAR",
+        "cluster_status": "RUNNING",
+        "operations": [
+          {
+            "duration_s": 480,
+            "end": "2026-10-10T03:35:00Z",
+            "error": null,
+            "name": "operation-1760066820000-aaaaaaaa",
+            "start": "2026-10-10T03:27:00Z",
+            "status": "DONE",
+            "target": "control plane",
+            "type": "UPGRADE_MASTER"
+          },
+          {
+            "duration_s": 300,
+            "end": "2026-10-11T03:31:00Z",
+            "error": null,
+            "name": "operation-1760153160000-bbbbbbbb",
+            "start": "2026-10-11T03:26:00Z",
+            "status": "DONE",
+            "target": "default-pool",
+            "type": "UPGRADE_NODES"
+          }
+        ],
+        "reasons": [
+          "control plane moved",
+          "pool default-pool moved"
+        ],
+        "status": "upgraded",
+        "symptom_window_start": "2026-10-10T03:27:00Z",
+        "versions_after": {
+          "control_plane": "1.33.5-gke.1080000",
+          "node_pools": {
+            "default-pool": "1.33.5-gke.1080000"
+          }
+        },
+        "versions_before": {
+          "control_plane": "1.33.4-gke.1134000",
+          "node_pools": {
+            "default-pool": "1.33.4-gke.1134000"
+          }
+        },
+        "window_start": "2026-09-28T18:00:00Z"
+      }
+    }
+  ],
+  "scope_note": null,
+  "scope_reason": "",
+  "scope_unread": [],
+  "scope_unresolved": null,
+  "scoped": false,
+  "sections": {
+    "errors": [],
+    "info": {
+      "clean": [
+        {
+          "baseline": {
+            "budgets": 2,
+            "first_run": false,
+            "first_seen": 0,
+            "guards": [],
+            "pods": 14,
+            "shape_reads_failed": [],
+            "shapes": 0,
+            "symptom_count": 0,
+            "versions": {
+              "control_plane": "1.33.5-gke.1080000",
+              "node_pools": {
+                "default-pool": "1.33.5-gke.1080000"
+              }
+            }
+          },
+          "cluster": "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+          "family": "seeded-regular",
+          "gate": {
+            "after_complete": true,
+            "after_complete_at": "2026-10-18T03:31:00Z",
+            "first_start": "2026-10-10T03:27:00Z",
+            "last_end": "2026-10-11T03:31:00Z",
+            "log_volume": {
+              "after_complete": true,
+              "after_end": "2026-10-18T03:31:00Z",
+              "after_total": 3279221338,
+              "before_start": "2026-10-03T03:27:00Z",
+              "before_total": 425311607,
+              "error": null,
+              "first_start": "2026-10-10T03:27:00Z",
+              "last_end": "2026-10-11T03:31:00Z",
+              "requests": [
+                {
+                  "aggregation.alignmentPeriod": "604800s",
+                  "aggregation.crossSeriesReducer": "REDUCE_SUM",
+                  "aggregation.groupByFields": [
+                    "resource.labels.namespace_name",
+                    "resource.labels.container_name"
+                  ],
+                  "aggregation.perSeriesAligner": "ALIGN_SUM",
+                  "filter": "metric.type=\"logging.googleapis.com/byte_count\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"{{CLUSTER_A}}\" AND resource.labels.location=\"{{LOCATION_A}}\"",
+                  "interval.endTime": "2026-10-10T03:27:00Z",
+                  "interval.startTime": "2026-10-03T03:27:00Z",
+                  "pageSize": "2000"
+                },
+                {
+                  "aggregation.alignmentPeriod": "604800s",
+                  "aggregation.crossSeriesReducer": "REDUCE_SUM",
+                  "aggregation.groupByFields": [
+                    "resource.labels.namespace_name",
+                    "resource.labels.container_name"
+                  ],
+                  "aggregation.perSeriesAligner": "ALIGN_SUM",
+                  "filter": "metric.type=\"logging.googleapis.com/byte_count\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"{{CLUSTER_A}}\" AND resource.labels.location=\"{{LOCATION_A}}\"",
+                  "interval.endTime": "2026-10-18T03:31:00Z",
+                  "interval.startTime": "2026-10-11T03:31:00Z",
+                  "pageSize": "2000"
+                }
+              ],
+              "rows": [
+                {
+                  "after_bytes": 3161419710,
+                  "before_bytes": 312447534,
+                  "breach": true,
+                  "container": "konnectivity-agent",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/konnectivity-agent",
+                  "ratio": 10.12
+                },
+                {
+                  "after_bytes": 1096135,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "fluentbit",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/fluentbit",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 19095818,
+                  "before_bytes": 18096175,
+                  "breach": false,
+                  "container": "gke-metadata-server",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/gke-metadata-server",
+                  "ratio": 1.06
+                },
+                {
+                  "after_bytes": 16400841,
+                  "before_bytes": 15782477,
+                  "breach": false,
+                  "container": "prometheus",
+                  "namespace": "gmp-system",
+                  "object": "gmp-system/Container/prometheus",
+                  "ratio": 1.04
+                },
+                {
+                  "after_bytes": 31573119,
+                  "before_bytes": 31172130,
+                  "breach": false,
+                  "container": "netd",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/netd",
+                  "ratio": 1.01
+                },
+                {
+                  "after_bytes": 375552,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "operator",
+                  "namespace": "gmp-system",
+                  "object": "gmp-system/Container/operator",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 365774,
+                  "before_bytes": 610,
+                  "breach": false,
+                  "container": "node-cache",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/node-cache",
+                  "ratio": 599.63
+                },
+                {
+                  "after_bytes": 519946,
+                  "before_bytes": 213904,
+                  "breach": false,
+                  "container": "core-metrics-exporter",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/core-metrics-exporter",
+                  "ratio": 2.43
+                },
+                {
+                  "after_bytes": 795385,
+                  "before_bytes": 536981,
+                  "breach": false,
+                  "container": "gke-metrics-agent",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/gke-metrics-agent",
+                  "ratio": 1.48
+                },
+                {
+                  "after_bytes": 151846,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "kube-state-metrics",
+                  "namespace": "gke-managed-cim",
+                  "object": "gke-managed-cim/Container/kube-state-metrics",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 149195,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "install-cni",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/install-cni",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 1934906,
+                  "before_bytes": 1822363,
+                  "breach": false,
+                  "container": "kubedns",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/kubedns",
+                  "ratio": 1.06
+                },
+                {
+                  "after_bytes": 68281,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "autoscaler",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/autoscaler",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 65565,
+                  "before_bytes": 2131,
+                  "breach": false,
+                  "container": "fluentbit-gke",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/fluentbit-gke",
+                  "ratio": 30.77
+                },
+                {
+                  "after_bytes": 39719,
+                  "before_bytes": 758,
+                  "breach": false,
+                  "container": "metrics-server",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/metrics-server",
+                  "ratio": 52.4
+                },
+                {
+                  "after_bytes": 32415,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "csi-driver-registrar",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/csi-driver-registrar",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 26284,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "event-exporter",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/event-exporter",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 21232,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "sidecar",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/sidecar",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 20231,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "config-reloader",
+                  "namespace": "gmp-system",
+                  "object": "gmp-system/Container/config-reloader",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 2259279,
+                  "before_bytes": 2240542,
+                  "breach": false,
+                  "container": "pdcsi-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/pdcsi-metrics-collector",
+                  "ratio": 1.01
+                },
+                {
+                  "after_bytes": 6476,
+                  "before_bytes": 1636,
+                  "breach": false,
+                  "container": "prometheus-to-sd-exporter",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/prometheus-to-sd-exporter",
+                  "ratio": 3.96
+                },
+                {
+                  "after_bytes": 7187891,
+                  "before_bytes": 7184791,
+                  "breach": false,
+                  "container": "dnsmasq",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/dnsmasq",
+                  "ratio": 1.0
+                },
+                {
+                  "after_bytes": 3919065,
+                  "before_bytes": 3916834,
+                  "breach": false,
+                  "container": "kubectl",
+                  "namespace": "seeded-shapes",
+                  "object": "seeded-shapes/Container/kubectl",
+                  "ratio": 1.0
+                },
+                {
+                  "after_bytes": 2162,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "jvm",
+                  "namespace": "seeded-shapes",
+                  "object": "seeded-shapes/Container/jvm",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 30295212,
+                  "before_bytes": 30293446,
+                  "breach": false,
+                  "container": "gce-pd-driver",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/gce-pd-driver",
+                  "ratio": 1.0
+                },
+                {
+                  "after_bytes": 1492,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "agent",
+                  "namespace": "seeded-shapes",
+                  "object": "seeded-shapes/Container/agent",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 1440,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "gateway",
+                  "namespace": "seeded-reliability",
+                  "object": "seeded-reliability/Container/gateway",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 1437,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "relay",
+                  "namespace": "seeded-intent",
+                  "object": "seeded-intent/Container/relay",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 727,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "worker",
+                  "namespace": "seeded-defaults",
+                  "object": "seeded-defaults/Container/worker",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 725,
+                  "before_bytes": 0,
+                  "breach": false,
+                  "container": "pause",
+                  "namespace": "seeded-shapes",
+                  "object": "seeded-shapes/Container/pause",
+                  "ratio": null
+                },
+                {
+                  "after_bytes": 115772,
+                  "before_bytes": 115755,
+                  "breach": false,
+                  "container": "default-http-backend",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/default-http-backend",
+                  "ratio": 1.0
+                },
+                {
+                  "after_bytes": 7555,
+                  "before_bytes": 8420,
+                  "breach": false,
+                  "container": "ksm-metrics-collector",
+                  "namespace": "gke-managed-cim",
+                  "object": "gke-managed-cim/Container/ksm-metrics-collector",
+                  "ratio": 0.9
+                },
+                {
+                  "after_bytes": 1069794,
+                  "before_bytes": 1071440,
+                  "breach": false,
+                  "container": "writer",
+                  "namespace": "seeded-deprecation",
+                  "object": "seeded-deprecation/Container/writer",
+                  "ratio": 1.0
+                },
+                {
+                  "after_bytes": 10847,
+                  "before_bytes": 18227,
+                  "breach": false,
+                  "container": "kubedns-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/kubedns-metrics-collector",
+                  "ratio": 0.6
+                },
+                {
+                  "after_bytes": 21537,
+                  "before_bytes": 36200,
+                  "breach": false,
+                  "container": "konnectivity-agent-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/konnectivity-agent-metrics-collector",
+                  "ratio": 0.59
+                },
+                {
+                  "after_bytes": 10944,
+                  "before_bytes": 40424,
+                  "breach": false,
+                  "container": "netd-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/netd-metrics-collector",
+                  "ratio": 0.27
+                },
+                {
+                  "after_bytes": 133131,
+                  "before_bytes": 175133,
+                  "breach": false,
+                  "container": "prometheus-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/prometheus-metrics-collector",
+                  "ratio": 0.76
+                },
+                {
+                  "after_bytes": 12309,
+                  "before_bytes": 63382,
+                  "breach": false,
+                  "container": "fluentbit-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/fluentbit-metrics-collector",
+                  "ratio": 0.19
+                },
+                {
+                  "after_bytes": 11589,
+                  "before_bytes": 70314,
+                  "breach": false,
+                  "container": "nodelocaldns-metrics-collector",
+                  "namespace": "kube-system",
+                  "object": "kube-system/Container/nodelocaldns-metrics-collector",
+                  "ratio": 0.16
+                }
+              ]
+            },
+            "reasons": [
+              "1 container(s) past the log-volume thresholds"
+            ],
+            "verdict": "risk"
+          },
+          "gated": [],
+          "incidents": 1,
+          "managed_agents": 0,
+          "next_upgrade": {
+            "below_target": false,
+            "channel": "REGULAR",
+            "current": "1.33.5-gke.1080000",
+            "exclusions": [],
+            "next_opens": "2026-10-20T03:00:00Z",
+            "target": "1.33.5-gke.1080000",
+            "window": "daily 03:00Z for 4h"
+          },
+          "outside_fleet": false,
+          "partial": [],
+          "shapes": [],
+          "skew_notes": [],
+          "starting": [],
+          "terminating": [],
+          "what_happened": {
+            "channel": "REGULAR",
+            "cluster_status": "RUNNING",
+            "operations": [
+              {
+                "duration_s": 480,
+                "end": "2026-10-10T03:35:00Z",
+                "error": null,
+                "name": "operation-1760066820000-aaaaaaaa",
+                "start": "2026-10-10T03:27:00Z",
+                "status": "DONE",
+                "target": "control plane",
+                "type": "UPGRADE_MASTER"
+              },
+              {
+                "duration_s": 300,
+                "end": "2026-10-11T03:31:00Z",
+                "error": null,
+                "name": "operation-1760153160000-bbbbbbbb",
+                "start": "2026-10-11T03:26:00Z",
+                "status": "DONE",
+                "target": "default-pool",
+                "type": "UPGRADE_NODES"
+              }
+            ],
+            "reasons": [
+              "control plane moved",
+              "pool default-pool moved"
+            ],
+            "status": "upgraded",
+            "symptom_window_start": "2026-10-10T03:27:00Z",
+            "versions_after": {
+              "control_plane": "1.33.5-gke.1080000",
+              "node_pools": {
+                "default-pool": "1.33.5-gke.1080000"
+              }
+            },
+            "versions_before": {
+              "control_plane": "1.33.4-gke.1134000",
+              "node_pools": {
+                "default-pool": "1.33.4-gke.1134000"
+              }
+            },
+            "window_start": "2026-09-28T18:00:00Z"
+          }
+        }
+      ],
+      "failed_reads": [],
+      "families": [
+        {
+          "canaries": [],
+          "family": "seeded-held",
+          "members": [
+            "{{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}"
+          ],
+          "verdict": null,
+          "waiting": [
+            "{{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}"
+          ]
+        },
+        {
+          "canaries": [
+            {
+              "cluster": "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+              "reasons": [
+                "1 container(s) past the log-volume thresholds"
+              ],
+              "verdict": "risk"
+            }
+          ],
+          "family": "seeded-regular",
+          "members": [
+            "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+            "{{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}",
+            "{{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}"
+          ],
+          "verdict": "hold",
+          "waiting": [
+            "{{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}",
+            "{{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}"
+          ]
+        }
+      ],
+      "gates_reread": [],
+      "operation_guards": {
+        "cleared": [],
+        "held": [],
+        "refreshed": [],
+        "unlisted": []
+      },
+      "rechecked": [],
+      "removed": [],
+      "scoped": "",
+      "unchanged": [
+        {
+          "checks_unevaluated": [],
+          "cluster": "{{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}",
+          "commands": [],
+          "control_plane": "1.32.9-gke.1185000",
+          "last_operation": null,
+          "last_run": "2026-10-12T18:00:00Z",
+          "next_upgrade": {
+            "below_target": true,
+            "channel": "REGULAR",
+            "current": "1.32.9-gke.1185000",
+            "exclusions": [],
+            "next_opens": "2026-10-20T03:00:00Z",
+            "target": "1.33.5-gke.1080000",
+            "window": "daily 03:00Z for 4h"
+          }
+        },
+        {
+          "checks_unevaluated": [],
+          "cluster": "{{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}",
+          "commands": [],
+          "control_plane": "1.33.4-gke.1134000",
+          "last_operation": null,
+          "last_run": "2026-10-12T18:00:00Z",
+          "next_upgrade": {
+            "below_target": true,
+            "channel": "REGULAR",
+            "current": "1.33.4-gke.1134000",
+            "exclusions": [],
+            "next_opens": "2026-10-20T03:00:00Z",
+            "target": "1.33.5-gke.1080000",
+            "window": "daily 03:00Z for 4h"
+          }
+        },
+        {
+          "checks_unevaluated": [],
+          "cluster": "{{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}",
+          "commands": [],
+          "control_plane": "1.33.4-gke.1134000",
+          "last_operation": null,
+          "last_run": "2026-10-12T18:00:00Z",
+          "next_upgrade": {
+            "below_target": true,
+            "channel": "REGULAR",
+            "current": "1.33.4-gke.1134000",
+            "exclusions": [],
+            "next_opens": "2026-10-20T03:00:00Z",
+            "target": "1.33.5-gke.1080000",
+            "window": "daily 03:00Z for 4h"
+          }
+        }
+      ],
+      "upgrading": []
+    },
+    "warnings": [
+      {
+        "check": "upgrade-log-volume-rose",
+        "cluster": "{{PROJECT}}/{{LOCATION_A}}/{{CLUSTER_A}}",
+        "entries": "log volume",
+        "guards": [],
+        "kind": "log-volume",
+        "log_volume": {
+          "after_bytes": 3161419710,
+          "before_bytes": 312447534,
+          "breach": true,
+          "container": "konnectivity-agent",
+          "namespace": "kube-system",
+          "object": "kube-system/Container/konnectivity-agent",
+          "ratio": 10.12
+        },
+        "mitigations": [],
+        "object": "kube-system/Container/konnectivity-agent",
+        "outside_fleet": false,
+        "predates_upgrade": false,
+        "severity": "warning",
+        "symptoms": [],
+        "system": false,
+        "what_happened": {
+          "channel": "REGULAR",
+          "cluster_status": "RUNNING",
+          "operations": [
+            {
+              "duration_s": 480,
+              "end": "2026-10-10T03:35:00Z",
+              "error": null,
+              "name": "operation-1760066820000-aaaaaaaa",
+              "start": "2026-10-10T03:27:00Z",
+              "status": "DONE",
+              "target": "control plane",
+              "type": "UPGRADE_MASTER"
+            },
+            {
+              "duration_s": 300,
+              "end": "2026-10-11T03:31:00Z",
+              "error": null,
+              "name": "operation-1760153160000-bbbbbbbb",
+              "start": "2026-10-11T03:26:00Z",
+              "status": "DONE",
+              "target": "default-pool",
+              "type": "UPGRADE_NODES"
+            }
+          ],
+          "reasons": [
+            "control plane moved",
+            "pool default-pool moved"
+          ],
+          "status": "upgraded",
+          "symptom_window_start": "2026-10-10T03:27:00Z",
+          "versions_after": {
+            "control_plane": "1.33.5-gke.1080000",
+            "node_pools": {
+              "default-pool": "1.33.5-gke.1080000"
+            }
+          },
+          "versions_before": {
+            "control_plane": "1.33.4-gke.1134000",
+            "node_pools": {
+              "default-pool": "1.33.4-gke.1134000"
+            }
+          },
+          "window_start": "2026-09-28T18:00:00Z"
+        }
+      }
+    ]
+  },
+  "since": "2026-09-28T18:00:00Z",
+  "unchanged": [
+    {
+      "checks_unevaluated": [],
+      "cluster": "{{PROJECT}}/{{LOCATION_B}}/{{CLUSTER_B}}",
+      "commands": [],
+      "control_plane": "1.32.9-gke.1185000",
+      "last_operation": null,
+      "last_run": "2026-10-12T18:00:00Z",
+      "next_upgrade": {
+        "below_target": true,
+        "channel": "REGULAR",
+        "current": "1.32.9-gke.1185000",
+        "exclusions": [],
+        "next_opens": "2026-10-20T03:00:00Z",
+        "target": "1.33.5-gke.1080000",
+        "window": "daily 03:00Z for 4h"
+      }
+    },
+    {
+      "checks_unevaluated": [],
+      "cluster": "{{PROJECT}}/{{LOCATION_C}}/{{CLUSTER_C}}",
+      "commands": [],
+      "control_plane": "1.33.4-gke.1134000",
+      "last_operation": null,
+      "last_run": "2026-10-12T18:00:00Z",
+      "next_upgrade": {
+        "below_target": true,
+        "channel": "REGULAR",
+        "current": "1.33.4-gke.1134000",
+        "exclusions": [],
+        "next_opens": "2026-10-20T03:00:00Z",
+        "target": "1.33.5-gke.1080000",
+        "window": "daily 03:00Z for 4h"
+      }
+    },
+    {
+      "checks_unevaluated": [],
+      "cluster": "{{PROJECT}}/{{LOCATION_D}}/{{CLUSTER_D}}",
+      "commands": [],
+      "control_plane": "1.33.4-gke.1134000",
+      "last_operation": null,
+      "last_run": "2026-10-12T18:00:00Z",
+      "next_upgrade": {
+        "below_target": true,
+        "channel": "REGULAR",
+        "current": "1.33.4-gke.1134000",
+        "exclusions": [],
+        "next_opens": "2026-10-20T03:00:00Z",
+        "target": "1.33.5-gke.1080000",
+        "window": "daily 03:00Z for 4h"
+      }
+    }
+  ],
+  "unread_clusters": {},
+  "upgrading": []
+}

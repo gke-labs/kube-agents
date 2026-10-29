@@ -310,6 +310,9 @@ type SlackSpec struct {
 	AppTokenSecretRef *corev1.SecretKeySelector `json:"appTokenSecretRef,omitempty"`
 
 	// AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
+	// A plain ID (U...) is a member of the install's own workspace. Under mode next, an entry
+	// T...:U... (a workspace ID, a colon, a member ID) admits that member of another workspace
+	// in a Slack Connect channel; nothing else admits one, an absent list included.
 	// +listType=set
 	// +optional
 	AllowedUsers []string `json:"allowedUsers,omitempty"`
@@ -321,6 +324,25 @@ type SlackSpec struct {
 	// HomeChannelName is the human-readable name for the home channel.
 	// +optional
 	HomeChannelName string `json:"homeChannelName,omitempty"`
+
+	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
+	// each final answer under spec.mode next, and keeps each rating with
+	// its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
+	// False hides the buttons and keeps nothing.
+	// +kubebuilder:default=true
+	// +optional
+	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
+
+	// HomeChannelPolicy ("auto", also absent, or "manual") is accepted and
+	// recorded in this release but has no effect yet: the A2A gateway does not
+	// learn a home channel, so HomeChannel alone decides. It is rendered to
+	// the gateway as A2A_SLACK_HOME_POLICY for a gateway that learns the
+	// channel of the first admitted mention under "auto". No schema default:
+	// the API server would apply one to every stored object it reads, so
+	// absent is read as "auto" by the operator instead.
+	// +kubebuilder:validation:Enum=auto;manual
+	// +optional
+	HomeChannelPolicy string `json:"homeChannelPolicy,omitempty"`
 }
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.

@@ -307,10 +307,28 @@ func (m *MultiAdapter) SetHome(admits HomeAdmits, board BoardReader) {
 	}
 }
 
+func (m *MultiAdapter) SetBoardActor(actor BoardActor) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(BoardActSink); ok {
+			sink.SetBoardActor(actor)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {
 			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
+}
+
+// SetFeedbackRecorder hands the answer-feedback recorder to every backend
+// that draws rating controls (FeedbackSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetFeedbackRecorder(r FeedbackRecorder) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(FeedbackSink); ok {
+			sink.SetFeedbackRecorder(r)
 		}
 	}
 }

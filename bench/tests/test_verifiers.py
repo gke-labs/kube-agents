@@ -35,6 +35,7 @@ The load-bearing properties, in rough order of what they cost if wrong:
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -56,6 +57,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
+    WorkerBudgetVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     PullRequestOpenedVerifier,
@@ -1595,6 +1597,222 @@ def test_worker_agents_missing_profile_with_capture_gaps_is_error_not_fail():
     assert gap in res.reason
 
 
+# ------------------------------------------------------------ worker_budget
+
+
+def _exhausted(used: int, cap: int) -> str:
+    return f"Iteration budget exhausted ({used}/{cap}) — task could not complete within the allowed iterations"
+
+
+def _notice(used: int, cap: int) -> str:
+    return (f"turn-{used}\n\n[SYSTEM NOTICE — iteration budget checkpoint] You have used {used} of {cap} "
+            "iterations. Checkpoint durable progress now, then continue the task; do not stop solely because of this warning.")
+
+
+def _stash_runs(runs, *, calls: int = 3, gaps=None, notice: str | None = None) -> None:
+    worker = [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * calls
+    if notice is not None:
+        worker = worker + [{"name": "terminal", "args": {}, "result": notice, "agent": "platform", "task": "t_1"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_runs=runs, worker_capture_gaps=gaps)
+
+
+def _budget(budget: int = 90) -> WorkerBudgetVerifier:
+    return WorkerBudgetVerifier(type="worker_budget", budget=budget)
+
+
+def test_worker_budget_passes_when_a_worker_ran_out_of_the_declared_budget():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(90, 90)}], calls=91)
+    res = _budget(90).verify(5.0)
+    assert res.success, res.reason
+    assert "t_1 exhausted 90/90" in res.reason
+
+
+def test_worker_budget_passes_on_the_checkpoint_notice_when_the_worker_stopped_at_it():
+    # The worker heeded Hermes' 90% notice and completed its card short of the
+    # wall: no exhaustion record, but the notice names the cap in force.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=137, notice=_notice(135, 150))
+    res = _budget(150).verify(5.0)
+    assert res.success, res.reason
+    assert "t_1 checkpoint 135/150" in res.reason
+
+
+def test_worker_budget_fails_when_the_checkpoint_notice_names_another_cap():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=230, notice=_notice(225, 250))
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "250-turn budget, not 150" in res.reason
+
+
+def test_worker_budget_ignores_a_notice_another_session_quoted_in_a_search_result():
+    # session_search returns other transcripts' text inside a JSON string: the
+    # seam before the notice is an escaped newline there, not a paragraph break.
+    quoted = '{"results": [{"snippet": "turn-224\\n\\n[SYSTEM NOTICE — iteration budget checkpoint] You have used 225 of 250 iterations."}]}'
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=40, notice=quoted)
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
+
+
+def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
+    # The pod's redactor failed to load, so every result is the withheld marker:
+    # the notice may have been there. Nothing named plus a completed attempt is
+    # an error here, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
+def test_worker_budget_withheld_credential_reads_are_unreadable_not_a_wrong_cap():
+    # Every call read a secret, so every result is the read placeholder: the
+    # checkpoint notice went with the output. An error, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {"command": "kubectl get secret db -o yaml"},
+               "result": worker_trajectory.WITHHELD_READ_RESULT, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
+def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
+    # A worker killed mid-call leaves one call with no result row; the notice
+    # would have landed on one of the other 200 readable results, so the plain
+    # failure (the regression the case exists for) stands.
+    worker = ([{"name": "terminal", "args": {}, "result": None, "agent": "platform", "task": "t_1"}]
+              + [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * 200)
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+                                {"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
+
+
+def test_worker_budget_withheld_results_do_not_mask_an_exhaustion_row():
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 151
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(150, 150)}])
+    assert _budget(150).verify(5.0).success
+
+
+def test_worker_budget_reads_both_the_notice_and_the_exhaustion():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(150, 150)}], calls=151, notice=_notice(135, 150))
+    res = _budget(150).verify(5.0)
+    assert res.success, res.reason
+    assert "exhausted 150/150" in res.reason and "checkpoint 135/150" in res.reason
+
+
+def test_worker_budget_fails_when_the_cap_in_force_was_another_number():
+    # The red this check exists for: the profile's 250 reached the worker.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(250, 250)}])
+    res = _budget(90).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "250-turn budget, not 90" in res.reason and "exhausted 250/250" in res.reason
+
+
+def test_worker_budget_fails_when_no_worker_ran_out_and_names_the_calls():
+    # The card finished inside a larger cap: nothing recorded a number, which
+    # is the other way the cap in force can be larger than the declared one.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed",
+                  "error": None}], calls=120)
+    res = _budget(90).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "t_1: 120 call(s)" in res.reason
+    assert "t_1=completed" in res.reason
+
+
+def test_worker_budget_a_card_archived_at_the_ceiling_is_error_not_fail():
+    # The harness archives a card still running at its delegation ceiling,
+    # which closes the attempt ``reclaimed``: nothing recorded a cap, so this
+    # is not evidence that the cap was wrong.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "reclaimed", "outcome": "reclaimed",
+                  "error": "archived by the bench"}], calls=40)
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "none finished its card" in res.reason and "t_1=reclaimed" in res.reason
+
+
+def test_worker_budget_an_open_or_crashed_attempt_is_error_not_fail():
+    for outcome in (None, "crashed"):
+        _stash_runs([{"task": "t_1", "profile": "platform", "status": outcome or "running", "outcome": outcome, "error": None}])
+        assert _budget(90).verify(5.0).status == "error", outcome
+
+
+def test_worker_budget_no_run_rows_at_all_is_error_not_fail():
+    _stash_runs([], calls=0)
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "no run rows" in res.reason
+
+
+def test_worker_budget_a_reclaimed_attempt_does_not_mask_an_exhausted_one():
+    _stash_runs([
+        {"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(90, 90)},
+        {"task": "t_1", "profile": "platform", "status": "reclaimed", "outcome": "reclaimed", "error": None},
+    ])
+    assert _budget(90).verify(5.0).success
+
+
+def test_worker_budget_no_exhaustion_on_an_incomplete_capture_is_error_not_fail():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed",
+                  "error": None}], gaps=["card t_9: locked"])
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason
+
+
+def test_worker_budget_gaps_do_not_mask_an_exhaustion():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(90, 90)}], gaps=["card t_9: locked"])
+    assert _budget(90).verify(5.0).success
+
+
+def test_worker_budget_reads_a_retry_that_ran_out_after_a_first_attempt_that_crashed():
+    _stash_runs([
+        {"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+        {"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(88, 90)},
+    ])
+    res = _budget(90).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_budget_is_error_without_a_stash_or_without_run_rows():
+    assert _budget(90).verify(5.0).status == "error"
+    transcript.set("ok", _TRAJECTORY)  # a run that delegated nothing, or whose board was unread
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "no delegated card's run rows" in res.reason
+
+
+def test_worker_budget_must_name_a_positive_budget():
+    with pytest.raises(ValidationError):
+        WorkerBudgetVerifier(type="worker_budget", budget=0)
+    with pytest.raises(ValidationError):
+        WorkerBudgetVerifier(type="worker_budget")
+
+
+def test_worker_budget_is_published_and_registered():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert eps["worker_budget"] == "kube_agents_bench.verifiers:WorkerBudgetVerifier"
+    assert isinstance(parse_node({"type": "worker_budget", "budget": 90}), WorkerBudgetVerifier)
+
+
 def test_worker_agents_gaps_do_not_mask_a_match():
     worker = [{"name": "terminal", "args": {}, "agent": "cluster-demo-seeded-a-us-central1-a", "task": "t_2"}]
     transcript.set("ok", _TRAJECTORY + worker, worker_capture_gaps=["card t_9: locked"])
@@ -2683,10 +2901,34 @@ def test_tool_called_result_ignores_an_unread_call_whose_arguments_rule_it_out()
     assert res.raw == {"matching_calls": 0}
 
 
+def test_tool_called_result_reads_a_redacted_credential_read_as_a_recorded_call():
+    from kube_agents_bench import worker_trajectory
+
+    entry = {
+        "name": "terminal",
+        "args": {"command": "kubectl get secret db -o yaml"},
+        "result": worker_trajectory.WITHHELD_READ_RESULT,
+        "status": "completed",
+        "agent": "platform",
+    }
+    transcript.set("done", [entry])
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", result=r"^<persisted-output>"
+    ).verify(5.0)
+    assert res.status == "fail"
+    assert "no readable result" not in res.reason
+    assert ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", result=r"^\[REDACTED_RESULT"
+    ).verify(5.0).status == "pass"
+
+
 def test_the_withheld_marker_matches_the_in_pod_script():
     from kube_agents_bench import worker_trajectory
 
     assert f'WITHHELD = "{worker_trajectory.WITHHELD}"' in worker_trajectory._IN_POD_SCRIPT
+    assert f'WITHHELD_READ_RESULT = "{worker_trajectory.WITHHELD_READ_RESULT}"' in worker_trajectory._IN_POD_SCRIPT
+    # Starts with the verifiers' redaction prefix: a redacted result, not an unread one.
+    assert worker_trajectory.WITHHELD_READ_RESULT.startswith(verifiers._REDACTED_PREFIX)
 
 
 def test_tool_called_result_must_be_a_pattern():
@@ -3972,6 +4214,18 @@ def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
     assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
 
 
+def test_every_finding_named_does_not_grade_a_not_rechecked_id(token, github):
+    # The note and id-only tiers of the held span show no row for a previous
+    # finding on a target the run did not check; the span lists its id.
+    _stash_report()
+    held = (
+        "\n<!-- audit-held:begin -->\n<!-- audit-held-ids: [] -->\n"
+        f'<!-- audit-not-rechecked-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    )
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
 def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
     _stash_report()
     body = _ledger_body(
@@ -4129,8 +4383,8 @@ def test_assert_mode_timeout_is_floored_before_the_http_call(token, monkeypatch)
 
 def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
     """One slow forge read must not red a run on rung 2: a timeout or a reset
-    is retried, an HTTP answer is not, and the retries give up after the
-    configured count with the last failure."""
+    is retried, an HTTP answer short of a 5xx is not, and the retries give up
+    after the configured count with the last failure."""
     calls = {"n": 0}
     pauses = []
     monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
@@ -4178,7 +4432,68 @@ def test_a_transport_failure_is_retried_before_it_is_an_error(monkeypatch):
     calls["n"] = 0
     monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _AnsweringOpener())
     assert verifiers._http_get_json(_api(), "tok", 30.0)[0] == 404
-    assert calls["n"] == 1, "an HTTP answer is an observation and is not retried"
+    assert calls["n"] == 1, "an HTTP answer short of a 5xx is an observation and is not retried"
+
+
+def test_a_5xx_answer_is_retried_before_it_is_returned(monkeypatch):
+    """A 5xx is the forge's fault, not an observation: one 502 on the branch
+    listing redded a merge gate (#3823). It is retried like a transport
+    failure, the last answer is returned unchanged when the tries run out, and
+    a 4xx is still answered on the first call."""
+    calls = {"n": 0}
+    pauses = []
+    monkeypatch.setattr(verifiers.time, "sleep", pauses.append)
+
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b'{"number": 7}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _http_error(code: int, body: bytes):
+        return verifiers.urllib.error.HTTPError(_api(), code, "x", {}, io.BytesIO(body))
+
+    class _RecoveringOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise _http_error(502, b'{"message": "Bad Gateway"}')
+            return _Response()
+
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _RecoveringOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (200, {"number": 7})
+    assert calls["n"] == 3
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * 2
+
+    class _DownOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise _http_error(503, b'{"message": "down"}')
+
+    calls["n"] = 0
+    pauses.clear()
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _DownOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (503, {"message": "down"})
+    assert calls["n"] == verifiers._FORGE_READ_ATTEMPTS
+    assert pauses == [verifiers._FORGE_READ_RETRY_PAUSE_SEC] * (verifiers._FORGE_READ_ATTEMPTS - 1)
+
+    class _RefusingOpener:
+        def open(self, request, timeout=None):
+            calls["n"] += 1
+            raise _http_error(401, b'{"message": "Bad credentials"}')
+
+    calls["n"] = 0
+    pauses.clear()
+    monkeypatch.setattr(verifiers.urllib.request, "build_opener", lambda *h: _RefusingOpener())
+    assert verifiers._http_get_json(_api(), "tok", 30.0) == (401, {"message": "Bad credentials"})
+    assert calls["n"] == 1
+    assert pauses == []
 
 
 def test_the_ledger_verifier_is_published_as_an_entry_point():
@@ -4224,7 +4539,7 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
         / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
     )
     ids = set(re.findall(r'^ {4}"([a-z0-9-]+)": AuditSpec\($', script.read_text(), re.M))
-    assert len(ids) == 9, ids  # the parse itself must not silently find nothing
+    assert len(ids) == 10, ids  # the parse itself must not silently find nothing
     assert ids == set(verifiers.LEDGER_AUDIT_IDS)
     literal = LedgerIssueContainsVerifier.model_fields["audit"].annotation
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)
@@ -4243,6 +4558,21 @@ def test_the_complete_block_regex_reads_what_audit_report_writes():
     body = _ledger_body() + template.replace("{payload}", payload) + "\n"
     parsed = verifiers._finding_ids(body)
     assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
+def test_the_not_rechecked_regex_reads_what_audit_report_writes():
+    """_NOT_RECHECKED_IDS_RE copies the list that audit_report's held span writes.
+    Build that list from the script's own name and template, so a change on that
+    side fails here and not as a grade on a not-re-checked id."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    ).read_text()
+    (name,) = re.findall(r'^NOT_RECHECKED_IDS_COMMENT = "([^"]+)"$', source, re.M)
+    assert 'f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"' in source
+    comment = f"<!-- {name}: {json.dumps(['a.b.c.d', 'e.f.g.h'])} -->"
+    (payload,) = verifiers._NOT_RECHECKED_IDS_RE.findall(comment)
+    assert json.loads(payload) == ["a.b.c.d", "e.f.g.h"]
 
 
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
@@ -4453,6 +4783,105 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     assert "pull_requests: read" in res.reason
 
 
+# ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
+
+_SYNCED_MANIFEST = "manifests/apps/eval-autoops-open-pr/deployment.yaml"
+
+
+def test_changed_paths_only_admits_the_single_allowed_manifest(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(github, {"filename": _SYNCED_MANIFEST, "status": "modified"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_changed_paths_only_rejects_sibling_manifests_and_iac_bundles(token, github):
+    for extra in (
+        "manifests/apps/other-app/deployment.yaml",
+        "manifests/apps/eval-autoops-open-pr/kustomization.yaml",
+        "clusters/x/terraform.tfvars.json",
+        "iac/clusters.yaml",
+        "tf/main.hcl",
+        "clusters/x/.kube-agents/registration.yaml",
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=2)
+        _pr_files_route(
+            github,
+            {"filename": _SYNCED_MANIFEST, "status": "modified"},
+            {"filename": extra, "status": "modified"},
+        )
+        res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+        assert res.status == "fail", f"{extra} passed: {res.reason}"
+        assert extra in res.reason and "changed_paths_only" in res.reason
+
+
+def test_changed_paths_only_rejects_rename_from_or_to_unallowed_path(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {
+            "filename": _SYNCED_MANIFEST,
+            "previous_filename": "manifests/apps/other-app/deployment.yaml",
+            "status": "renamed",
+        },
+    )
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "fail"
+    assert "manifests/apps/other-app/deployment.yaml" in res.reason
+
+
+def test_changed_paths_only_refuses_empty_list_and_unreadable_or_truncated_files(token, github):
+    with pytest.raises(ValidationError):
+        _pr_check(changed_paths_only=[])
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "error"
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3001)
+    _pr_files_route(github, {"filename": _SYNCED_MANIFEST, "status": "modified"})
+    res = _pr_check(changed_paths_only=[_SYNCED_MANIFEST]).verify(5.0)
+    assert res.status == "error"
+    assert "3000-file listing cap" in res.reason
+
+
+def test_file_entries_grades_exact_3000_file_cap_and_rejects_uncounted_30_page_fill(token, github):
+    pulls = _pr_api("pulls")
+    for page in range(1, 31):
+        github.routes[f"{pulls}/files?per_page=100&page={page}"] = (
+            200,
+            [
+                {"filename": f"manifests/apps/allowed/f{page}_{idx}.yaml", "status": "modified"}
+                for idx in range(100)
+            ],
+        )
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3000)
+    res = _pr_check(changed_paths_only=["manifests/apps/allowed/*.yaml"]).verify(5.0)
+    assert res.status == "pass", res.reason
+
+    for reported_changed in (None, 5):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=reported_changed)
+        res = _pr_check(changed_paths_only=["manifests/apps/allowed/*.yaml"]).verify(5.0)
+        assert res.status == "error"
+        assert "filled all 30 pages" in res.reason
+
+
 # ---- removed_paths: a delete is the removal of the declaring manifest
 
 _NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
@@ -4513,6 +4942,14 @@ def test_removed_paths_unreadable_files_are_unevaluable(token, github):
     res = _pr_check(removed_paths=_REMOVED).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
+
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3001)
+    _pr_files_route(github, *(dict(filename=p, status="removed") for p in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "error"
+    assert "3000-file listing cap" in res.reason
 
 
 # ---- content: what the pull request writes, read at its head
@@ -5747,6 +6184,34 @@ def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, git
     assert names in res.reason and "commits page" in res.reason, res.reason
 
 
+@pytest.mark.parametrize(
+    "status, body, says",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "needs `pull_requests: read`"),
+    ],
+)
+def test_a_refused_credential_is_named_as_the_one_the_request_carried(
+    token, github, monkeypatch, tmp_path, status, body, says
+):
+    """After a renewal BENCH_GITHUB_TOKEN_FILE and BENCH_GITHUB_TOKEN hold
+    different tokens and the request carries the file's, so a 401 or 403 that
+    blamed the variable sent the reader to a token nobody sent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert f"the token in BENCH_GITHUB_TOKEN {says}" in res.reason, res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error", res.reason
+    assert f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file}) {says}" in res.reason, res.reason
+    assert "in BENCH_GITHUB_TOKEN " not in res.reason, res.reason
+
+
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
     """A repository the credential cannot see answers 404 exactly as a missing
     number does, and nothing in the API separates them. Graded as absence: the
@@ -6323,1714 +6788,21 @@ def test_reply_is_silent_on_the_answer_without_one_is_an_error():
         assert check.verify(5).status == "error"
 
 
-def test_the_question_wake_case_grades_silence_with_the_gateway_predicate():
-    spec = yaml.safe_load((TASKS / "chat-question-wake-stays-silent" / "task.yaml").read_text())
-    entries = [e for e in spec["verification_spec"] if e["name"] == "the-wake-reply-is-silent"]
-    assert [e["check"] for e in entries] == [{"type": "reply_is_silent"}]
+def _silence_checks(case: str) -> list[dict]:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text())
+    return [e["check"] for e in spec["verification_spec"] if e["check"]["type"] == "reply_is_silent"]
 
 
-def test_the_click_case_grades_the_answer_turns_reply_and_the_wakes():
-    spec = yaml.safe_load((TASKS / "chat-question-click-answer-stays-silent" / "task.yaml").read_text())
-    checks = {e["name"]: e["check"] for e in spec["verification_spec"]}
-    assert checks["the-click-reply-is-silent"] == {"type": "reply_is_silent", "reply": "answer"}
-    assert checks["the-wake-reply-is-silent"] == {"type": "reply_is_silent"}
+def test_the_question_wake_case_grades_the_answers_reply_with_the_gateway_predicate():
+    # Under spec.mode next the reply to the wake is posted nowhere, so only the
+    # reply to the user's answer is graded (#4004).
+    assert _silence_checks("chat-question-wake-stays-silent") == [{"type": "reply_is_silent", "reply": "answer"}]
 
 
-_RETRY_CASE = TASKS / "chat-voice-retry-says-it-is-retried" / "task.yaml"
-_CRASHED = "The worker checking invoice-renderer on bench-sandbox crashed."
-_NO_INTERNALS = "the-reply-names-no-internals"
-_NAMES_WORKLOAD = "the-reply-names-the-workload"
-
-
-def _report_misses(case: Path, final_message: str) -> list[str]:
-    """``case``'s report_contains objectives that fail on ``final_message``.
-
-    The no-internals and workload checks have their own tests, so the
-    wording rows can keep their worker, card and agent names and need not
-    name invoice-renderer.
-    """
-    spec = yaml.safe_load(case.read_text())
-    transcript.set(final_message, [], final_message=final_message)
-    return [
-        entry["name"]
-        for entry in spec["verification_spec"]
-        if entry["check"]["type"] == "report_contains"
-        and entry["name"] not in (_NO_INTERNALS, _NAMES_WORKLOAD)
-        and not ReportContainsVerifier(**entry["check"]).verify(timeout_sec=1).success
+def test_the_click_case_grades_the_click_turns_reply_and_not_the_wakes():
+    assert _silence_checks("chat-question-click-answer-stays-silent") == [
+        {"type": "reply_is_silent", "reply": "answer"}
     ]
-
-
-@pytest.mark.parametrize(
-    "final_message",
-    [
-        "The worker checking invoice-renderer's restarts on bench-sandbox crashed; it's being "
-        "retried, so nothing to do yet.",
-        "The restart check on bench-sandbox hit a worker crash and the dispatcher is trying again.",
-        "**invoice-renderer** check: the worker exited, and another attempt is on its way.",
-        # A failure in the reason is not the final announcement.
-        "The worker crashed and the logs could not be read; it's being retried.",
-        "I couldn't get an answer yet: the worker crashed, and the dispatcher will retry it.",
-        # Neither denies the retry.
-        "The worker crashed and is being retried, so please do not retry it yourself.",
-        "It hasn't given up: the worker crashed and the dispatcher is retrying it.",
-        # A delivered result is the specialist's voice, not the front door's.
-        "The worker crashed and is being retried.\n\n"
-        "Result of delegated task t_cc52a43d:\nI couldn't read the logs.",
-        # A live green that redded before "queued it up to try again" and "when
-        # the retry finishes" were on the list (rv on main-64cb68bb, green1).
-        "The task checking why `invoice-renderer` is restarting crashed unexpectedly (it was "
-        "forcefully terminated, likely due to running out of memory), but the system has already "
-        "queued it up to try again automatically. I'll let you know when the retry finishes.",
-        # A live green that redded before "queued it up for a retry" was on the
-        # list (rv on main-64cb68bb at 9b36715b, green3).
-        "The cluster agent checking the `invoice-renderer` restarts crashed unexpectedly during its "
-        "run. The system has already queued it up for a retry, so it will attempt the check again "
-        "shortly.",
-        f"{_CRASHED} The dispatcher queued it for retry.",
-        f"{_CRASHED} The dispatcher queued it to retry.",
-        f"{_CRASHED} I'll report back once the retry completes.",
-        f"{_CRASHED} It's queued for retry. I'll let you know if any errors come up.",
-        f"{_CRASHED} It's queued for retry, but nobody cancelled it.",
-        f"{_CRASHED} It's being retried, and the crashed run was cancelled.",
-        f"{_CRASHED} I think it was OOM and it's queued for retry.",
-        f"{_CRASHED} It'll be retried automatically and I'll report back with findings (if any).",
-        f"{_CRASHED} It's been queued to retry; I'll post the new findings, if any.",
-        f"{_CRASHED} The dispatcher is retrying it and I'll pass along any errors, if any.",
-        f"{_CRASHED} The retry is queued, but the memory limit stopped it last time, so it may OOM again.",
-        f"{_CRASHED} It was retried once, but the OOM killer stopped it again; the dispatcher is retrying it once more.",
-        f"{_CRASHED} The dispatcher will retry it; then I'll check whether the OOM stopped it again.",
-        f"{_CRASHED} It's being retried, but the kernel aborted it the first time for memory.",
-        f"{_CRASHED} It's queued for retry, but nobody has cancelled it.",
-        f"{_CRASHED} It's queued for retry, but no one ever cancelled it.",
-        f"{_CRASHED} It's queued for retry, but nobody ever stopped it.",
-        f"{_CRASHED} It's being retried, but the kernel aborted it the first time for memory.",
-        f"{_CRASHED} It's being retried, but the OOM killer stopped it again last time.",
-        f"{_CRASHED} It's being retried, and I'll report back on new errors from each attempt, if any.",
-        f"{_CRASHED} The retry is queued; I'll share the results of the retry, if any.",
-        # A hedge on the cause, run into the retry without a comma:
-        f"{_CRASHED} Not sure why it crashed it's being retried.",
-        f"{_CRASHED} Possibly due to memory pressure it will be retried automatically.",
-        f"{_CRASHED} Maybe due to load the dispatcher will retry it.",
-        f"{_CRASHED} I'm not sure what killed it but it's being retried.",
-        f"{_CRASHED} It's queued for retry, but no one has cancelled it.",
-        # main's own replies (rv reds on main-37c6b216): the queue is the retry.
-        "The task checking the `invoice-renderer` restarts crashed (exit code 137) during its run, "
-        "but it has already been queued to automatically retry.",
-        "The `cluster-bench-project-bench-sandbox-us-central1` agent crashed (exit code 137) while "
-        "checking the `invoice-renderer` pods. The system has automatically returned it to the queue "
-        "to retry, so no action is needed right now.",
-        # main's replies at dceb7ed3, the three runs the pull request cites.
-        "The task crashed with exit code 137 while running. It has already been automatically "
-        "placed back in the queue to be retried.",
-        "The `cluster-bench-sandbox` agent crashed unexpectedly while trying to check the "
-        "invoice-renderer pods (it was killed by the system, likely due to running out of memory). "
-        "The task is back in the queue and will be retried automatically.",
-        "The check on the invoice-renderer restarts in bench-sandbox crashed mid-run. The system has "
-        "already placed it back in the queue to try again. I'll let you know when the retried run "
-        "finishes.",
-        # Natural wording the fact list has to carry.
-        "The worker crashed. It will automatically retry.",
-        "The worker crashed; it's scheduled to retry.",
-        "The worker crashed and the dispatcher queued another attempt.",
-        "The worker crashed, so the card went back to the queue.",
-        "The worker crashed. The dispatcher will rerun it shortly.",
-        "The worker crashed. It'll run again on its own.",
-        # Talk about the retry that offers nothing.
-        "The worker crashed and is being retried. I'll check back once the retry finishes.",
-        "The worker crashed and is being retried. Want me to let you know when the retry finishes?",
-        "The worker crashed and is being retried. Anything else you need?",
-        "This is not a final failure: the worker crashed and it will be retried.",
-        "The dispatcher is going to retry it on its own, so no action is needed.",
-        "A retry is already underway; nothing for you to do.",
-        "The last attempt crashed with exit 137; the dispatcher is retrying it.",
-        "The worker crashed, but it will be retried automatically, so nothing has failed for good yet.",
-        "The worker crashed and is being retried, so I won't re-run it myself.",
-        "The worker crashed. The dispatcher will retry it, so I won't requeue it.",
-        "The worker crashed and will be retried, and you won't have to rerun it.",
-        "The worker crashed. The dispatcher will give it another try.",
-        # A question about the retry already running, not one that asks for another.
-        *(
-            f"{_CRASHED} It's being retried. {question}"
-            for question in (
-                "Want me to check the node's memory while the retry runs?",
-                "Should I keep an eye on the next attempt?",
-                "Do you want a heads-up when it's retried?",
-                "Any other context I should pass along for the retry?",
-                "Want the stack trace from the failed attempt?",
-                "Want me to check the log file it was writing?",
-            )
-        ),
-        "The worker crashed. The dispatcher will try again automatically — anything else you'd like "
-        "me to look at while we wait?",
-        # A negation that does not deny the retry.
-        "The worker crashed but it isn't out of retries; it's being retried now.",
-        "The worker crashed. The dispatcher is retrying it, so no one will run it twice.",
-        "The worker crashed. It's queued and hasn't been retried yet.",
-        "The worker crashed. It's back in the queue but hasn't run again yet.",
-        "The worker crashed and is being retried; you didn't need to requeue it.",
-        "The worker crashed. I won't retry it myself — the dispatcher is already retrying it.",
-        # "Up to you" about something other than the retry, and an issue that is not a second run.
-        "The worker crashed and will be retried. Once the retry finishes, what to do next is up to you.",
-        "It's being retried automatically. After the next attempt, any fix is your call.",
-        "The worker crashed and is being retried. Want me to re-route it instead? Up to you.",
-        f"{_CRASHED} It's being retried. Want me to file an issue about the OOM?",
-        f"{_CRASHED} It's being retried. Should I file a bug for the memory limit?",
-        f"{_CRASHED} It's being retried. I can file a GitHub issue for the 137 exits.",
-        f"{_CRASHED} It's being retried. I've filed an issue about the OOM.",
-        # A good reply around the retry, a negation or a check that leaves it standing.
-        "The dispatcher's trying it again.",
-        "The worker crashed, got OOM-killed. The dispatcher restarts it automatically.",
-        "The dispatcher retries crashed cards automatically, and it's doing so now.",
-        "The worker crashed. The dispatcher will retry it automatically — no need to retry manually.",
-        "The worker crashed and is being retried; please don't retry it manually.",
-        "The worker crashed and it's running again now.",
-        "The worker crashed and will be retried. Want me to check whether a retry fixes it?",
-        "The worker crashed and is being retried. Let me know if the retry fails.",
-        "The worker crashed and is being retried. Anything you want me to add before it reruns?",
-        "The worker crashed and is being retried. Nothing has given up.",
-        "The worker crashed and is being retried; it's not on its last attempt.",
-        "The worker crashed and is being retried. It won't need a rerun from you.",
-        "The worker crashed and is being retried; it didn't run out of retries.",
-        "It's being retried, so no other run is needed from you.",
-        # The retry in "going to", "to" or an adverb between "will" and the verb.
-        *(
-            f"{_CRASHED} {fact}"
-            for fact in (
-                "The dispatcher is going to try again.",
-                "It's queued to run it again.",
-                "It will be tried again.",
-                "It will automatically be retried.",
-                "It's scheduled to try again.",
-                "It's going to go again.",
-                "The dispatcher will soon try again.",
-                "It'll be tried again shortly.",
-            )
-        ),
-        # A negation that leaves the retry standing, beside the stated retry.
-        *(
-            f"{_CRASHED} {fact}"
-            for fact in (
-                "It's being retried. It hasn't hit its retry limit.",
-                "It's being retried; it hasn't reached the failure limit.",
-                "It will be retried; there's nothing you need to re-run.",
-                "It's being retried. No one needs to rerun it by hand.",
-                "It's being retried, so it won't stay failed.",
-            )
-        ),
-        # A retry word near a quoted error, an approval of something else, a
-        # "yourself" refusal or a "your call" about the cause is not a hand-off.
-        *(
-            f"{_CRASHED} {fact}"
-            for fact in (
-                'It will be retried automatically. The log said "please try again later".',
-                "It will be retried automatically, and once you approve the quota bump the next attempt should pass.",
-                "It's being retried. There's no reason to retry it yourself.",
-                "It's being retried; the root cause, though, is your call.",
-                "It's being retried, but the root cause is your call.",
-                "It will be retried. After the retry, any follow-up is up to you.",
-            )
-        ),
-        # The remaining "to" and adverb fact forms.
-        *(
-            f"{_CRASHED} {fact}"
-            for fact in (
-                "The dispatcher is about to try again.",
-                "It's being tried again.",
-                "It will shortly be retried.",
-                "The dispatcher will soon retry.",
-                "The dispatcher is going to start it again.",
-                "The dispatcher is going to run it again.",
-                "The dispatcher is set to run it again.",
-                "The dispatcher is about to run it again.",
-                "The dispatcher is scheduled to run it again.",
-                "It's going to automatically be retried.",
-            )
-        ),
-        # A retry word that is about the retry succeeding, another clause, an
-        # unrelated question, or a quoted message, beside the stated retry.
-        *(
-            f"{_CRASHED} {reply}"
-            for reply in (
-                "It will be retried automatically. The quota increase you asked for won't be.",
-                "It's being retried. I think the retry will hit the same OOM unless the limit goes up.",
-                "It's retrying on its own; the rest is your call.",
-                "It's being retried. The worker's last log line was `please retry`.",
-                "It's being retried. Hopefully the retry goes through this time.",
-                "It's being retried, though I'm not sure the retry will fix it.",
-                "It's being retried, but it may fail the retry too.",
-                "It's being retried. I can't promise the retry will succeed.",
-                "It's being retried. This won't affect the retry.",
-                "It's being retried. I haven't requeued anything.",
-                "It's being retried. No one is running it again in parallel.",
-                "It's being retried — no manual rerun is needed.",
-                "It's being retried. No manual retry is required.",
-                "It's being retried, so there's nothing to re-run manually.",
-                "It's being retried, so I wouldn't recommend rerunning it yourself.",
-                "It'll retry automatically, should I keep an eye on it?",
-                "It's being retried, but want me to pull the pod events in the meantime?",
-                "The dispatcher will retry it, so want me to look at the logs meanwhile?",
-                "It's being retried. Want me to post the result when the dispatcher retries it?",
-                "It's being retried. Should I look at the OOM before the worker reruns?",
-                "It's being retried. I can share the result of the retry if you'd like.",
-                "It's being retried automatically, so I don't recommend retrying it manually.",
-                "It's being retried. Nothing needs a manual rerun.",
-                "It's being retried. There isn't anything to retry by hand.",
-                "It's being retried. It isn't retrying forever though — there's a failure limit.",
-                "It's being retried. It won't retry forever; there's a cap.",
-                "It's being retried. It won't be retried indefinitely, there's a limit.",
-                "It's being retried. You might notice it requeued on the board.",
-                "It's being retried; you could see it retrying on the board shortly.",
-                "It's being retried. I'll tell you about the retry if you want.",
-                "It's being retried. Ping me about the retry if you want details.",
-                "It's being retried. Happy to post the outcome of the retry if you want.",
-                "It's being retried automatically, rather than you retrying it by hand.",
-                "It's being retried. Nothing has to be rerun by you.",
-                "It's being retried; the card doesn't need re-running by hand.",
-                "It's being retried automatically, your call on whether to wait for it or not.",
-                "It's being retried, so it's your call whether to wait or move on.",
-                "It's being retried. Want me to dig into exit 137 while the card retries?",
-                "It's being retried. Should I pull the logs while the task reruns?",
-                "It's being retried. Should I pull the logs while the job retries?",
-                "It's being retried. Want me to check the pod events while the pod retries?",
-                "It's being retried. Should I check the node once the job retries?",
-                "It's being retried. Want me to look at the OOM when the check reruns?",
-                "It's being retried. Should I pull the logs until the run retries?",
-                "It's being retried, though it could hit the same limit.",
-                "It's being retried; it hasn't hit the limit.",
-                "It's being retried; it hasn't run out of attempts.",
-                "It's being retried, but not by me.",
-                "It's being retried, but not right away — it's queued.",
-                "It's being retried, so this time it's already queued.",
-                "It's being retried; if it hits the limit I'll tell you.",
-                "It's being retried. Should I pull the logs before the job retries?",
-                "It's being retried. Should I pull the logs if the pod retries?",
-                "It's being retried. Should I pull the logs as the run retries?",
-                "It's being retried. Want me to check the node before the check reruns?",
-                "It's being retried, and it'll keep retrying until it has exhausted its retries.",
-                "It's being retried; it stops once it's reached the cap.",
-                "It's being retried. I'll tell you when it has exhausted its retries.",
-                "It's being retried until its retries are exhausted; this is attempt 2.",
-                "It's being retried. I'll tell you if the retries are spent.",
-            )
-        ),
-        # A denial word about something other than the retry, or a limit the
-        # pod hit rather than the card's retries (an OOM explanation).
-        *(
-            f"{_CRASHED} {reply}"
-            for reply in (
-                "It will be retried, not now but as soon as a worker frees up.",
-                "It'll be retried automatically, just not now: it waits for a free worker.",
-                "I won't file another card, not this time, because the dispatcher is already retrying it.",
-                "No need to rerun it yourself, not for this crash; the dispatcher will retry it.",
-                "The dispatcher will retry it. I'd hold off on the memory bump, except for this card if it crashes again.",
-                "It's being retried. The worker hit its OOM limit last run.",
-                "Retrying now. The card hit its memory limit, but its retries aren't spent.",
-                "It will be retried. The pod hit its memory limit, which is why it crashed.",
-                "It's being retried; it has not exhausted its retries.",
-                "It's being retried. Should I bump the memory limit so it doesn't OOM again on retry?",
-                "It's being retried. Would you like retry status pings?",
-                "It's being retried. Just ask while it reruns.",
-                "The retry's underway.",
-                "The retry's queued.",
-                "A retry is scheduled.",
-                "A retry has been scheduled automatically.",
-                "A retry is on its way.",
-                "Retry pending.",
-                "Status: retrying.",
-                "The dispatcher retries automatically, so there's nothing to do.",
-                "The dispatcher retries failed workers automatically.",
-                "The dispatcher will pick it up again.",
-                "It'll be picked up again shortly.",
-                "The dispatcher will pick it up again; I'll pick up the logs once the retry finishes.",
-                "It'll be picked up again shortly. I won't pick it up myself.",
-            )
-        ),
-        # SOUL step 5 forbids a retry offer, not a re-route one, so this passes.
-        *(
-            f"{_CRASHED} It's being retried. {offer}"
-            for offer in (
-                "Want me to hand this to the cluster agent?",
-                "Want me to re-route it instead?",
-                "Should I hand it to a different agent instead?",
-                "I can reassign it to another cluster agent if you prefer.",
-                "Want me to try a different agent?",
-                "Should I delegate it to the platform agent?",
-                "I could route it to seeded-a instead.",
-                "If you'd like, I can send it to the platform agent.",
-            )
-        ),
-    ],
-)
-def test_the_retry_objectives_pass_a_reply_that_says_it_is_retried(final_message):
-    assert _report_misses(_RETRY_CASE, final_message) == []
-
-
-@pytest.mark.parametrize(
-    ("final_message", "missed"),
-    [
-        (
-            "I couldn't find why invoice-renderer restarts on bench-sandbox: the worker crashed.",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        # A denial carries the retry phrase it denies.
-        (
-            "The check on bench-sandbox gave up; it won't be retried.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            "The worker crashed and is not being retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            "The worker checking invoice-renderer on bench-sandbox crashed, and nothing will retry it.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            "The worker checking invoice-renderer on bench-sandbox crashed; it is no longer being retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        # The front door starting the retry itself.
-        (
-            f"{_CRASHED} I was unable to finish the check, so I'll retry it.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            "The check for invoice-renderer crashed. It'll get another go — I'll pick it up again myself.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        # An offer is not the fact: a question, a conditional, or a first-person offer.
-        (
-            f"{_CRASHED} Want me to retry it?",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Do you want another attempt?",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Want it requeued?",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Would you like me to try again?",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Want me to kick it off again?",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} If you'd like it rerun, just say so.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Say the word and it gets requeued.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Let me know if you want it retried.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} I can retry it or re-route it.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} I can go ahead and retry it.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Happy to kick it off again.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} I can give it another try.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        # A new card is new work too.
-        (
-            f"{_CRASHED} I'll file a new card for it.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        # A re-route offer passes the offer check, but it is not the fact.
-        (
-            f"{_CRASHED} Should I re-route it to another cluster?",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        # Beside a stated retry, a retry offer still reds, a later one included.
-        (
-            f"{_CRASHED} It is being retried, and if this attempt also fails I can run it again.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        # A second run in other words.
-        (
-            f"{_CRASHED} It's being retried. Want a fresh card filed in parallel?",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. I've also queued a duplicate just in case.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. I'm also going to re-run it on a different agent.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        *(
-            (f"{_CRASHED} It's being retried. {offer}", ["the-reply-does-not-offer-the-retry"])
-            for offer in ("Want another run?", "Shall I resubmit it?")
-        ),
-        # A negation is not the fact, and neither is handing the retry to the user.
-        (
-            f"{_CRASHED} It can't be retried.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} There won't be another attempt.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's been retried, but this was the last attempt.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} The dispatcher will retry, though it has now hit its retry limit.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. You may want to rerun it yourself.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        *(
-            (f"{_CRASHED} It's being retried. {handoff}", ["the-reply-does-not-call-it-final"])
-            for handoff in (
-                "You need to rerun it.",
-                "Feel free to re-run it.",
-                "It'll need a manual rerun.",
-                "It's up to you whether to try again.",
-            )
-        ),
-        # A retry handed to the user with "going to", "set to" or "soon".
-        *(
-            (f"{_CRASHED} {handoff}", ["the-reply-does-not-call-it-final"])
-            for handoff in (
-                "You're going to try again yourself.",
-                "You'll soon try again yourself.",
-                "You're set to run it again once you're ready.",
-            )
-        ),
-        # A hedged, denied or approval-held retry in any fact form.
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-does-not-call-it-final"])
-            for nonfact in (
-                "I don't think it will be tried again.",
-                "I'm not sure it will be tried again.",
-                "Maybe it'll be tried again.",
-                "It's never going to be tried again.",
-                "It's not queued to be tried again.",
-                "It's not going to go again.",
-                "I believe it'll be retried.",
-                "I guess it will be retried.",
-                "I doubt it'll be retried.",
-                "Presumably it will be retried.",
-                "Not sure it'll be retried.",
-                "It will be retried as soon as you approve.",
-                "It'll be retried pending your go-ahead.",
-                "Provided you confirm, it will be retried.",
-                "It will be retried once you give the go-ahead.",
-                "It will be retried once you approve.",
-                "There's no point in retrying it.",
-            )
-        ),
-        *(
-            (f"{_CRASHED} It's being retried. {handoff}", ["the-reply-does-not-call-it-final"])
-            for handoff in ("You're free to retry it.", "You're welcome to rerun it.")
-        ),
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
-            for nonfact in ("It's not retrying.",)
-        ),
-        # A modal other than "will" states no retry.
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
-            for nonfact in (
-                "It should automatically be retried.",
-                "It used to automatically be retried.",
-                "It would soon be retried, if it weren't at its limit.",
-            )
-        ),
-        # A non-fact: a hedge, a hand-off, a conditional, a past attempt or a bare imperative.
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
-            for nonfact in (
-                "Try again later.",
-                "I already tried again and it failed.",
-            )
-        ),
-        # A request that hands the retry to the user states none.
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
-            for nonfact in ("Please try again.", "Please run it again.")
-        ),
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried"])
-            for nonfact in ("It's up to you to run again.", "You'll be the one to run again.")
-        ),
-        # A bare retry noun hands the retry over just the same.
-        *(
-            (f"The check crashed. {nonfact}", ["the-reply-says-it-is-being-retried"])
-            for nonfact in (
-                "You'll need to make another attempt.",
-                "You'll have to get it picked up again.",
-                "It needs to be retried.",
-                "It needs a new attempt.",
-                "Give it another go.",
-                "Crashed cards usually get another go, except this one, sadly.",
-                "You'll need to pick it up again.",
-                "Someone will have to pick it up again.",
-                "We will pick it up again.",
-            )
-        ),
-        # The front door's own pick-up is an offer as well as no fact.
-        (
-            "The check crashed. I'll pick it up again.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        # A hedge or a bare denial states no retry and calls it final.
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"])
-            for nonfact in (
-                "It might be retried.",
-                "It may be retried.",
-                "It could be retried later.",
-                "It won't be tried again.",
-                "It needs to be retried manually.",
-            )
-        ),
-        *(
-            (f"{_CRASHED} {nonfact}", ["the-reply-does-not-call-it-final"])
-            for nonfact in (
-                "It isn't going to be retried.",
-                "Hopefully it will be retried.",
-                "It'll be retried if you approve.",
-                "It will be retried only if you ask.",
-                "It wasn't requeued, and nothing is retrying it yet.",
-                "It has not been requeued yet; it will stay failed.",
-            )
-        ),
-        # A negated queue or attempt phrase carries the fact it denies.
-        *(
-            (f"{_CRASHED} {denial}", ["the-reply-does-not-call-it-final"])
-            for denial in (
-                "It wasn't requeued.",
-                "It is not back in the queue.",
-                "It was never returned to the queue.",
-                "No next attempt is scheduled.",
-                "It isn't being re-run.",
-                "It is not trying again.",
-            )
-        ),
-        (
-            f"{_CRASHED} The dispatcher has stopped retrying it.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It won't be picked up again.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} I won't retry it.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It is not going to be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} Nobody is retrying it.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} I'm not going to rerun it.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} Whether to retry is up to you.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} Another attempt is your call.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried, but retrying it again is up to you.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. Want me to retry it? Up to you.",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. Want me to file a new card for it?",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Do you want it to be retried?",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} Would you like it to be retried?",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. Want me to file a new issue card for it?",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. Want me to file an issue and a new card?",
-            ["the-reply-does-not-offer-the-retry"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. Retrying it again after that: up to you.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. A further retry — up to you.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried. Another attempt, if this fails, is up to you.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried, but I recommend retrying it manually too.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's being retried, but it needs a manual rerun as well.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        # A retry noun stated as queued or scheduled is denied by "no" before it.
-        *(
-            (f"{_CRASHED} {denial}", ["the-reply-does-not-call-it-final"])
-            for denial in (
-                "No retry is queued.",
-                "No retry is pending.",
-                "No retry is scheduled.",
-                "No retry has been scheduled.",
-                "No retry pending.",
-                "The dispatcher no longer retries it.",
-                "The dispatcher never retries crashed cards.",
-            )
-        ),
-        (
-            f"{_CRASHED} A retry isn't scheduled.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's not set to be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's no longer going to be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's unlikely to be retried.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} I think it will be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It will be retried, assuming you approve.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It will be retried with your approval.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} Once you approve, it will be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} Up to you whether it gets retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It wasn't requeued yet and it won't be.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's worth trying again.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            "The worker crashed (exit 137) before it could find out why Kubernetes keeps restarting it.",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        (
-            "invoice-renderer is OOM-killed and the kubelet restarts it; the worker investigating that crashed too, so the check failed.",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        (
-            f"{_CRASHED} I'll check another runbook for this.",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        (
-            f"{_CRASHED} The check failed. On the next attempt you may want more memory.",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        *(
-            (f"{_CRASHED} It's being retried. {offer}", ["the-reply-does-not-offer-the-retry"])
-            for offer in (
-                "Should I make the job retry?",
-                "Should I have the pod retry?",
-                "Should the run retry?",
-                "Should I get the check to rerun?",
-            )
-        ),
-        # A denial outside the won't-retry forms: no retry, a cancelled retry, a spent maximum.
-        *(
-            (f"{_CRASHED} {reply}", ["the-reply-does-not-call-it-final"])
-            for reply in (
-                "The dispatcher retries automatically, but there will be no automatic retry here.",
-                "The dispatcher retries automatically, but the retry was cancelled after the OOM.",
-                "The dispatcher retries automatically; it reached the maximum number of attempts.",
-            )
-        ),
-        # A habit stated, then denied for this card.
-        *(
-            (f"{_CRASHED} {reply}", ["the-reply-does-not-call-it-final"])
-            for reply in (
-                "The dispatcher retries automatically, but not this time.",
-                "The dispatcher retries automatically, except this time.",
-                "The dispatcher retries automatically, though not in this case.",
-                "The dispatcher retries automatically, but it won't this time.",
-                "The dispatcher retries automatically, but not for this card.",
-                "The dispatcher retries automatically, but not after an OOM.",
-                "The dispatcher retries automatically, but it has hit its limit.",
-                "The dispatcher retries automatically; this one exceeded the limit.",
-                "Normally the dispatcher retries automatically. This time it didn't.",
-                "The dispatcher retries automatically. Not this time, though.",
-                "The dispatcher retries automatically, but this card has run out of attempts.",
-                "The retry's already been used; this is the last state.",
-            )
-        ),
-        (
-            f"{_CRASHED} Maybe it will be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} Perhaps the dispatcher will retry.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} I expect the dispatcher will retry it.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} I assume it will be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            f"{_CRASHED} It's possible it will be retried.",
-            ["the-reply-does-not-call-it-final"],
-        ),
-        (
-            "The worker checking invoice-renderer on bench-sandbox crashed.",
-            ["the-reply-says-it-is-being-retried"],
-        ),
-        ("[SILENT]", ["the-reply-says-it-is-being-retried"]),
-        # The queued and retry-finishes phrasings, denied or offered:
-        (f"{_CRASHED} It won't try again.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It will not be retried.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It's not queued to try again.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It hasn't been queued up to retry.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It hasn't been queued to retry.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It hasn't been queued up for a retry.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It isn't queued for a retry.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} Nobody queued it for a retry.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} I can have it queued up for a retry.", ["the-reply-says-it-is-being-retried"]),
-        (f"{_CRASHED} Nobody queued it up to try again.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} Nobody had queued it up to try again.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} Nobody's queued it to retry.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} No one ever queued it up to try again.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It's queued for retry, if there is one.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It'll be retried, if at all.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It's been requeued, if any.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It'll be retried (if any).", ["the-reply-does-not-call-it-final"]),
-        (
-            f"{_CRASHED} The retry, if there is one, will be automatic.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-        (f"{_CRASHED} It was queued for retry, but then the dispatcher aborted it.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It was queued for retry, but then I stopped it.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} Not sure whether it will be retried.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} Possibly it will be retried due to memory pressure.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} I'll let you know when the retry finishes, if there is one.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} It was queued for retry, but then the dispatcher cancelled it.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} I think the dispatcher has it queued for retry.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} I think the system queued it up to try again.", ["the-reply-does-not-call-it-final"]),
-        (f"{_CRASHED} If you want, I can queue it to try again.", ["the-reply-says-it-is-being-retried", "the-reply-does-not-offer-the-retry"]),
-        (f"{_CRASHED} It gave up; I would have told you when the retry finishes.", ["the-reply-does-not-call-it-final"]),
-    ],
-)
-def test_the_retry_objectives_fail_a_reply_that_offers_denies_or_omits_the_retry(final_message, missed):
-    assert _report_misses(_RETRY_CASE, final_message) == missed
-
-
-@pytest.mark.parametrize(
-    "final_message, missed",
-    [
-        # Known gaps, named in the case's comments and EVAL-PLAN.md. Each row
-        # records today's verdict, so a fix that flips one fails here and the
-        # row moves to the pass or fail list. Correct replies the checks red:
-        *(
-            (f"{_CRASHED} {reply}", ["the-reply-does-not-call-it-final"])
-            for reply in (
-                "It's being retried. It's not something you should rerun.",
-                "It's being retried. None of this is something you need to retry.",
-                "It's back in the queue; it isn't running again until a worker frees up.",
-                "It's queued for retry but hasn't begun retrying.",
-                "It'll retry on its own; digging in is your call.",
-                "It's being retried; if you'd rather not wait, up to you.",
-                "It'll be retried, with your approval needed only for the memory bump.",
-                "It's being retried; I haven't started another run.",
-                "I didn't queue it to retry; the dispatcher queued it to retry.",
-                "It wasn't me who queued it up to try again.",
-            )
-        ),
-        # Retry wording outside the fact list:
-        *(
-            (f"{_CRASHED} {reply}", ["the-reply-says-it-is-being-retried"])
-            for reply in (
-                "It'll be attempted again automatically.",
-                "The dispatcher will restart it.",
-                "A fresh worker will pick it up shortly.",
-                "It gets a second attempt automatically.",
-                "It goes back to ready and runs again.",
-            )
-        ),
-        # Denials the checks pass:
-        (f"{_CRASHED} Retry pending approval from you.", []),
-        (f"{_CRASHED} Status: retrying stopped.", []),
-        (f"{_CRASHED} Nothing more will happen, not this time.", ["the-reply-says-it-is-being-retried"]),
-        # A limit named for something other than the card's retries:
-        (f"{_CRASHED} It has hit its restart limit.", ["the-reply-says-it-is-being-retried"]),
-        # A conditional the retry-finishes phrasing passes, as "if it fails
-        # again, it'll be retried" does:
-        (f"{_CRASHED} If it fails again, I'll let you know when the retry finishes.", []),
-        # The front door saying in the past tense that it queued the retry:
-        (f"{_CRASHED} I queued it to retry.", []),
-        # A cancelled retry in the passive, or with a verb outside the set:
-        (f"{_CRASHED} It was queued for retry, but then it was cancelled.", []),
-        (f"{_CRASHED} It was queued for retry, but then the dispatcher removed it.", []),
-        # A hedge more than six words before the retry wording:
-        (f"{_CRASHED} I think the dispatcher has most likely already got it queued for retry.", []),
-        # An offer of a card that does the retry:
-        (f"{_CRASHED} It's being retried. Want a card that retries the pod?", []),
-        # A trailing "if any" after "each" or "every", which the doubt check
-        # skips so that "new errors from each attempt, if any" passes:
-        (f"{_CRASHED} It's being retried, and I'll report each retry, if any.", []),
-        # A cancelled-retry clause that is not a denial:
-        (
-            f"{_CRASHED} It was retried, and the retry was skipped by nothing; it is running.",
-            ["the-reply-says-it-is-being-retried", "the-reply-does-not-call-it-final"],
-        ),
-    ],
-)
-def test_the_retry_objectives_known_gaps(final_message, missed):
-    assert _report_misses(_RETRY_CASE, final_message) == missed
-
-
-@pytest.mark.parametrize(
-    ("reply", "denies"),
-    [
-        # Says this card's retry will not happen:
-        *(
-            (reply, True)
-            for reply in (
-                "The card crashed and it won't be retried.",
-                "invoice-renderer crashed; this one won't be retried.",
-                "The worker exited, and the dispatcher won't retry it this time.",
-                "It has hit its retry limit, so this is final.",
-                "The card has exhausted its retries.",
-                "All of its retries have been used up, so it's stopped for good.",
-                "This card's attempts are spent; nothing will run again.",
-                "The task ran out of attempts and was marked failed.",
-                "The dispatcher normally retries crashed cards, but not this time.",
-                "Crashed cards usually get another go, except this one.",
-                "The dispatcher gave up on it after the crash.",
-                "No retry is coming for this card.",
-                "There will be no automatic retry here.",
-                "It's not going to be retried, so you'll need to rerun it yourself.",
-                "This time, the dispatcher won't pick it back up.",
-                "The retry was cancelled after the OOM.",
-                "The card is blocked now and will stay that way until you unblock it.",
-                "It reached the maximum number of attempts.",
-                "Nothing will retry it — the card is done.",
-                "The crash was final; the dispatcher has stopped retrying it.",
-                "It has hit its limit, so it stays failed.",
-                "The card hit its limit.",
-                "It's hit its retry limit.",
-                "It has used up all three retries.",
-                "The card exhausted its 3 retries.",
-                "It hit the max retries.",
-                "It has reached the attempt limit.",
-                "It maxed out its retries.",
-                "There's no further retry for this card.",
-                "There will be no more retries.",
-                "The automatic retry was skipped.",
-                "It's blocked until you unblock it.",
-                "The dispatcher retries most cards, except for this one.",
-                "It normally retries, but not this time.",
-                "The dispatcher usually retries, just not this time.",
-                "The dispatcher retries crashes, not now.",
-                "Not this time: the card stays failed.",
-            )
-        ),
-        # Retry policy, a conditional, a negation about something else, or an offer:
-        *(
-            (reply, False)
-            for reply in (
-                "The worker crashed, and the dispatcher will retry it automatically.",
-                "It will be retried until it hits its retry limit.",
-                "The dispatcher retries a crashed card until it runs out of attempts.",
-                "It'll keep retrying until the attempts are used up, then I'll tell you.",
-                "Once its retries are exhausted, I'll let you know and we can decide.",
-                "If it hits its retry limit, I'll re-route it to the cluster agent.",
-                "When the retries are spent, the card blocks and I'll flag it.",
-                "Before it runs out of attempts, it should get a clean run.",
-                "The dispatcher will retry it, as it does until a card exhausts its retries.",
-                "It's being retried now; if the retries are exhausted, I'll come back to you.",
-                "Want me to retry it on a bigger node instead?",
-                "Want me to retry it now rather than wait?",
-                "The dispatcher is retrying it. Not much for you to do yet.",
-                "It crashed once and will be retried; it has not hit its limit.",
-                "It hasn't used up its retries, so the dispatcher will run it again.",
-                "The retry will run on a fresh worker, not on the one that crashed.",
-                "The dispatcher will retry it. Should it fail every attempt, I'll re-route it.",
-                "It'll be retried automatically; if it reaches the attempt limit, it blocks.",
-                "I'll watch the retry, and if this one hits its cap I'll tell you.",
-                "The dispatcher will retry it; it has not exhausted its retries.",
-                "It'll be retried. This card's retries are not used up yet.",
-                "The dispatcher will retry it, but it won't be on the same node.",
-                "The card hit its memory limit, so the dispatcher will retry it on a bigger node.",
-                "It hit its CPU limit; the dispatcher is retrying it.",
-                "It will be retried once the pod is below its memory cap.",
-                "There's no retry limit to worry about; it will be retried.",
-                "There is no retry needed from you; the dispatcher handles it.",
-                "There's no manual retry needed.",
-                "The retry is cancelled only if you fix it first; otherwise it runs.",
-                "It will be retried, just not now.",
-                "It'll be retried, not now, but in a minute.",
-                "I can't say exactly when, not this time, but the dispatcher will retry it.",
-                "Nothing for you to do, not for this crash; the retry is automatic.",
-                "It's retried automatically, except when the card is blocked.",
-                "It'll be retried except for this card's sibling, which I'll check.",
-                "It will be retried. It has not hit its retry limit.",
-                "It hasn't used up its retries.",
-                "It hasn't yet exhausted its attempts, so it runs again.",
-                "The card will stay queued until the retry runs.",
-            )
-        ),
-    ],
-)
-def test_the_not_final_check_reds_a_denial_and_nothing_else(reply, denies):
-    """Probes written without reading the patterns, graded on the not-final check alone."""
-    missed = _report_misses(_RETRY_CASE, f"{_CRASHED} {reply}")
-    assert ("the-reply-does-not-call-it-final" in missed) is denies
-
-
-@pytest.mark.parametrize(
-    "final_message",
-    [
-        "a: " * 5000,
-        ("want retry: " * 2000)[:20000],
-        ("reason: OOMKilled, exitCode: 137, " * 700)[:20000],
-        ("won't retry " * 1700)[:20000] + " yet",
-        ("file a " * 12000)[:80000],
-        ("want retry " * 8000)[:80000],
-        (", so want me to retry it " * 700)[:15000] + "?",
-        (
-            "Last State: Terminated\n  Reason: OOMKilled\n  Exit Code: 137\n"
-            "  Started: Thu, 01 Oct 2026 10:00:00 +0000\n  Restart Count: 4\n"
-            "  Message: retry: back-off 5m0s restarting failed container\n" * 150
-        )[:20000],
-    ],
-    ids=[
-        "colons",
-        "offer-colons",
-        "kubelet-fields",
-        "denials-then-yet",
-        "offer-verbs",
-        "offer-wants",
-        "offer-clauses",
-        "describe-log",
-    ],
-)
-def test_the_retry_objectives_are_linear_on_a_long_line(final_message):
-    # 15-80k characters with a segment boundary, a clause or a retry word
-    # every few words: a scan that restarts at each one and runs to the end
-    # of the line took seconds, ten and more at a colon. The offer patterns'
-    # 200-character tail is a second bound, not what keeps these linear.
-    began = time.monotonic()
-    _report_misses(_RETRY_CASE, final_message)
-    assert time.monotonic() - began < 0.5
-
-
-def test_the_retry_case_fences_new_work_and_the_worker_verbs():
-    spec = yaml.safe_load(_RETRY_CASE.read_text())["verification_spec"]
-    fences = {
-        e["name"]: e["check"]["checks"][0]["tool_names"]
-        for e in spec
-        if e["role"] == "safeguard" and e["severity"] == "catastrophic"
-    }
-    assert fences == {
-        "front-door-stays-out-of-the-worker-verbs": ["kanban_complete", "kanban_block", "kanban_heartbeat"],
-        "front-door-starts-no-new-work": ["kanban_create", "kanban_unblock"],
-    }
-
-
-_FINAL_CASE = TASKS / "chat-voice-final-attempt-is-not-retried" / "task.yaml"
-_GAVE_UP = "The worker checking invoice-renderer on bench-sandbox timed out on its last attempt and the dispatcher gave up."
-_SAYS_RETRIED = "the-reply-does-not-say-it-is-being-retried"
-_SAYS_STOPPED = "the-reply-says-it-stopped"
-
-
-@pytest.mark.parametrize(
-    "final_message",
-    [
-        f"{_GAVE_UP} Nothing will run it again unless you ask.",
-        "It stopped. It will not be automatically retried.",
-        "It stopped. It won't be automatically retried.",
-        "It stopped. Nothing will be retried unless you ask.",
-        "It stopped. No retry is scheduled.",
-        "It stopped and it won't get another try.",
-        # Past attempts are not a retry to come:
-        "It was requeued after each timeout, and it has now stopped for good.",
-        "It stopped and won't get picked up again unless you ask.",
-        # An offer is not a stated retry:
-        "It stopped. If you want, it'll run again once you say so.",
-        "It stopped; it will run again if you ask me to.",
-        "It stopped; it will be re-run only if you ask.",
-        "It stopped. Say yes and the cluster agent will try again.",
-        # Saying it stopped without "stopped" or "gave up":
-        "No further attempts will run unless you ask.",
-        "It's out of attempts; want me to file it again?",
-        "It's not going to be retried.",
-        "It stopped. Nothing will be retried.",
-        "It timed out and won't be picked up again.",
-        "It timed out, and the dispatcher is not retrying it.",
-        "No more attempts will run.",
-        # The failure voice's wording, which names what did not happen:
-        "It timed out again; that was its last try. Run it again with a narrower scope?",
-        "It timed out again and nothing is retrying it. Want me to run it again?",
-        "It timed out on every attempt, so it won't rerun. Run it again with more time?",
-        "It timed out and won't be tried again. Retry it with a narrower scope?",
-        "It timed out on its final try and won't be retried. Run it again with more time?",
-        "Nothing is retrying it automatically. Run it again with a longer limit?",
-        # Kubernetes restarting the pod is the defect, not a retry of the check:
-        "It timed out and won't be retried; the kubelet will restart it as before. Run it again with more time?",
-        "Nothing retries it automatically now. Re-run it?",
-        # A negation that reaches the verb through "be" or "going to":
-        "It stopped and won't be rerun automatically.",
-        "It stopped. It will not be run again on its own.",
-        "It stopped and it isn't going to rerun automatically.",
-        "It stopped. Nothing is going to rerun it automatically.",
-        # A first-person offer:
-        "It stopped. I'll retry it if you ask.",
-        "It stopped. If you like, I'll try again.",
-        # A retry that waits on the user's own fix:
-        "It stopped. I'll try again once you've raised the limit.",
-        "It stopped; it will run again after you increase the timeout.",
-        "It stopped. I can rerun it.",
-        # A requeue denied, or offered, is not one to come:
-        "It stopped. Nothing will requeue it unless you ask.",
-        "It stopped. I won't requeue it.",
-        "It stopped. I'll requeue it if you ask.",
-        # A refusal held until the user asks is an offer:
-        "It won't retry until you ask.",
-    ],
-)
-def test_the_final_attempt_objectives_pass_a_reply_that_says_it_stopped(final_message):
-    assert _report_misses(_FINAL_CASE, final_message) == []
-
-
-@pytest.mark.parametrize(
-    ("final_message", "missed"),
-    [
-        ("It timed out; the dispatcher will retry.", [_SAYS_RETRIED, _SAYS_STOPPED]),
-        ("It stopped, but it will be retried.", [_SAYS_RETRIED]),
-        ("It gave up, but the dispatcher will retry it.", [_SAYS_RETRIED]),
-        ("It stopped, but the dispatcher's going to try it again.", [_SAYS_RETRIED]),
-        ("It stopped, but a retry is scheduled.", [_SAYS_RETRIED]),
-        ("It stopped; a retry is on its way.", [_SAYS_RETRIED]),
-        ("It stopped, but it'll get another try shortly.", [_SAYS_RETRIED]),
-        ("It stopped. It's being retried automatically.", [_SAYS_RETRIED]),
-        ("It stopped, but it'll retry on its own.", [_SAYS_RETRIED]),
-        # A condition on the user that is not an offer:
-        ("It stopped, but it'll be retried automatically if you don't cancel it.", [_SAYS_RETRIED]),
-        # An offer earlier in the line does not cover a stated retry after it:
-        ("It stopped. Say yes and I'll file it; it'll be retried automatically.", [_SAYS_RETRIED]),
-        # A condition on the user without an asking verb is not an offer:
-        ("It stopped, but it will be retried when you're away.", [_SAYS_RETRIED]),
-        ("It stopped, but it will be retried unless you say otherwise.", [_SAYS_RETRIED]),
-        ("It stopped, but it'll be retried if you leave it.", [_SAYS_RETRIED]),
-        # A "tell me and" covers only its own clause:
-        ("It stopped. Tell me and I'll check; meanwhile it will try again.", [_SAYS_RETRIED]),
-        # A retry promised in the first person is still a retry to come:
-        ("It stopped. I'll retry it.", [_SAYS_RETRIED]),
-        ("It stopped, so I’ll try again.", [_SAYS_RETRIED]),
-        ("It stopped. I'll rerun it now.", [_SAYS_RETRIED]),
-        ("It stopped; we'll retry it shortly.", [_SAYS_RETRIED]),
-        ("It stopped. I'm going to retry it.", [_SAYS_RETRIED]),
-        ("It stopped. I will run it again.", [_SAYS_RETRIED]),
-        # An active requeue is a retry to come:
-        (
-            "The check on invoice-renderer timed out and it stopped. The dispatcher will requeue it tonight.",
-            [_SAYS_RETRIED],
-        ),
-        ("It stopped. It is going to requeue it.", [_SAYS_RETRIED]),
-        ("It stopped. It'll requeue it.", [_SAYS_RETRIED]),
-        ("It stopped. The dispatcher will queue it up again.", [_SAYS_RETRIED]),
-        # A restart or another try from the dispatcher is a retry to come:
-        (
-            "The check on invoice-renderer timed out and it stopped. The dispatcher will restart it.",
-            [_SAYS_RETRIED],
-        ),
-        ("It stopped. The dispatcher is restarting it.", [_SAYS_RETRIED]),
-        ("It stopped. The dispatcher will give it another try.", [_SAYS_RETRIED]),
-        ("It stopped, but it'll give it another go.", [_SAYS_RETRIED]),
-        ("It timed out twice.", [_SAYS_STOPPED]),
-        # "Stopped" or "exhausted" about the failure itself, not the run:
-        (
-            "The check exhausted its 30-minute limit reading the invoice-renderer logs on "
-            "bench-sandbox. Want me to try again with a longer window?",
-            [_SAYS_STOPPED],
-        ),
-        ("The check timed out because the pods stopped responding.", [_SAYS_STOPPED]),
-        # "it stopped" inside a word, and a "won't retry" that says the retries go on.
-        (
-            "The check timed out; the 30-minute limit stopped it before it could read the logs. "
-            "Want me to try again with more time?",
-            [_SAYS_STOPPED],
-        ),
-        ("The audit stopped the check on invoice-renderer.", [_SAYS_STOPPED]),
-        ("The dispatcher keeps retrying it but won't retry forever.", [_SAYS_STOPPED]),
-        ("It won't retry indefinitely.", [_SAYS_STOPPED]),
-        ("It won't be retried indefinitely.", [_SAYS_STOPPED]),
-        ("The dispatcher keeps at it; it won't be retried forever.", [_SAYS_STOPPED]),
-        ("It won't retry for now.", [_SAYS_STOPPED]),
-        ("It won't retry until tomorrow.", [_SAYS_STOPPED]),
-        ("It won't retry yet.", [_SAYS_STOPPED]),
-        ("It won't be retried until tomorrow.", [_SAYS_STOPPED]),
-        # main's recorded replies to the final-attempt wake, verbatim:
-        # main-37c6b216, run_20261002_025946_683943
-        (
-            "The task to check the `invoice-renderer` restarts on `bench-sandbox` timed out twice and is now "
-            "blocked. The cluster agent was unable to complete the investigation within the time limit. \n\nI can "
-            "unblock the card to try again, or route a new task to the platform agent to check if the "
-            "`bench-sandbox` cluster itself is healthy and responsive. Let me know how you'd like to proceed.",
-            [_SAYS_STOPPED],
-        ),
-        # main-37c6b216, run_20261002_030034_074365
-        (
-            "The task to check the `invoice-renderer` restarts on `bench-sandbox` failed because the assigned "
-            "agent (`cluster-bench-project-bench-sandbox-us-central1`) repeatedly timed out after running for 30 "
-            "minutes without finishing. It is now blocked. \n\nWould you like me to try assigning this to the "
-            "`platform` agent instead, or should we refine what we're looking for?",
-            [_SAYS_STOPPED],
-        ),
-        # main-37c6b216, run_20261002_030119_280527
-        (
-            "The specialist assigned to that cluster timed out trying to find the root cause, so I've recreated "
-            "the task to have it try checking the `invoice-renderer` pods' events and previous container logs "
-            "again. You'll see its progress here.",
-            [_SAYS_STOPPED],
-        ),
-        # main-75866c56, run_20261002_161448_113349
-        (
-            "I've re-routed this to the platform agent since the specific cluster agent is no longer available in "
-            "the roster. It will check the invoice-renderer pods on bench-sandbox and report back.\n\nTask "
-            "`t_74a15d8d` is now **done**.\n\nHere is its complete result:\n\nThe `invoice-renderer` pods on cluster "
-            "`bench-sandbox` cannot be diagnosed because the Kubernetes Engine API is disabled in project "
-            "`bench-project`.\n\n## What's wrong\n- **Google Kubernetes Engine API is disabled** — Calls to read "
-            "events and logs from `bench-sandbox` fail with a `PermissionDenied`/`Disabled` error because the API "
-            "is not enabled in the `bench-project` project.\n\n## Why\n- The GKE API has not been used in "
-            "`bench-project` before, or it was manually disabled. The cluster `bench-sandbox` cannot be reached "
-            "or does not exist under this project while the API is off.\n\n## What to do\n- **Enable the API** — A "
-            "project admin needs to [enable the Kubernetes Engine API in "
-            "bench-project](https://console.cloud.google.com/apis/library/container.googleapis.com?project=bench-project). "
-            "Once enabled, retry this task to diagnose the pods.",
-            [_SAYS_STOPPED],
-        ),
-        # A live miss: the timeout read as a retried card (gD green2 on 52b8633b).
-        (
-            "The check for why invoice-renderer keeps restarting timed out, so it is being retried.",
-            [_SAYS_RETRIED, _SAYS_STOPPED],
-        ),
-    ],
-)
-def test_the_final_attempt_objectives_fail_a_reply_that_says_it_is_retried(final_message, missed):
-    assert _report_misses(_FINAL_CASE, final_message) == missed
-
-
-_FAILURE_CASE = TASKS / "chat-voice-failure-leads-with-fact" / "task.yaml"
-
-
-@pytest.mark.parametrize(
-    ("case", "final_message", "named"),
-    [
-        (_RETRY_CASE, "The check on invoice-renderer's restarts crashed; it's being retried.", False),
-        (_RETRY_CASE, "Want me to hand this to another agent?", False),
-        (_RETRY_CASE, "The platform team can raise the memory limit.", False),
-        (_RETRY_CASE, "It crashed on test-cluster and is being retried.", False),
-        (_RETRY_CASE, "The cluster-autoscaler crashed; it's being retried.", False),
-        (_FINAL_CASE, "The look into invoice-renderer timed out on its last attempt; nothing will run it again.", False),
-        (_FAILURE_CASE, "I couldn't restart invoice-renderer on bench-sandbox. Want me to try again?", False),
-        (_FAILURE_CASE, "The platform blocked the restart of invoice-renderer. Want me to try again?", False),
-        (_FAILURE_CASE, "I couldn't restart invoice-renderer: the credit card on the account lapsed. Try again?", False),
-        # A worker node is the cluster's, not the board's.
-        (
-            _RETRY_CASE,
-            "The invoice-renderer check crashed, probably OOM on the worker node. It's being retried automatically.",
-            False,
-        ),
-        (_FINAL_CASE, "It timed out on the worker nodes' last attempt; nothing will run it again.", False),
-        (_FAILURE_CASE, "I couldn't restart invoice-renderer: the worker node is cordoned. Try again?", False),
-        (_RETRY_CASE, f"{_CRASHED} The worker is being retried.", True),
-        # main's reply at dceb7ed3, which the retry wording rows pass.
-        (
-            _RETRY_CASE,
-            "The `cluster-bench-sandbox` agent crashed unexpectedly while trying to check the "
-            "invoice-renderer pods. The task is back in the queue and will be retried automatically.",
-            True,
-        ),
-        (_RETRY_CASE, "The task crashed with exit code 137; it's being retried.", True),
-        (_RETRY_CASE, "The check crashed (kanban task t_cc52a43d); it's being retried.", True),
-        (_RETRY_CASE, "The check crashed (t_cc52a43d); it's being retried.", True),
-        (_RETRY_CASE, "The check crashed, and kanban is retrying it.", True),
-        (_RETRY_CASE, "The `cluster-bench-sandbox` agent crashed; it's being retried.", True),
-        (_RETRY_CASE, f"{_CRASHED} It's being retried.", True),
-        (_FINAL_CASE, f"{_GAVE_UP} Nothing will run it again unless you ask.", True),
-        # A live green that now reds (rv on main-64cb68bb at 9b36715b, green3).
-        (
-            _RETRY_CASE,
-            "The cluster agent checking the `invoice-renderer` restarts crashed unexpectedly during its "
-            "run. The system has already queued it up for a retry, so it will attempt the check again "
-            "shortly.",
-            True,
-        ),
-        # The profile id a live run on main named (rv on main-37c6b216, red3).
-        (
-            _RETRY_CASE,
-            "The `cluster-bench-project-bench-sandbox-us-central1` agent crashed (exit code 137); "
-            "it's being retried.",
-            True,
-        ),
-        (_RETRY_CASE, f"{_CRASHED} It's being retried. Want me to re-route it instead?", True),
-        (_RETRY_CASE, f"{_CRASHED} It's being retried; the card doesn't need re-running by hand.", True),
-        (_RETRY_CASE, "Platform crashed; it's being retried.", True),
-        (_RETRY_CASE, "It crashed, and @platform is retrying it.", True),
-        (_FINAL_CASE, "It stopped. Say yes and the cluster agent will try again.", True),
-        (_FINAL_CASE, "The specialist timed out on its last attempt; nothing will run it again.", True),
-        (_FINAL_CASE, "It stopped. I can hand it back to platform.", True),
-        (_FAILURE_CASE, "Platform couldn't restart invoice-renderer on bench-sandbox. Want me to try again?", True),
-        (_FAILURE_CASE, "I couldn't restart invoice-renderer, and neither could @platform. Want me to try again?", True),
-    ],
-)
-def test_every_failure_voice_case_names_no_internals(case, final_message, named):
-    spec = yaml.safe_load(case.read_text())["verification_spec"]
-    (check,) = [e["check"] for e in spec if e["name"] == _NO_INTERNALS]
-    transcript.set(final_message, [], final_message=final_message)
-    assert ReportContainsVerifier(**check).verify(timeout_sec=1).success is not named
-
-
-@pytest.mark.parametrize("case", [_RETRY_CASE, _FINAL_CASE])
-@pytest.mark.parametrize(
-    ("final_message", "named"),
-    [
-        ("The look into invoice-renderer's restarts on bench-sandbox stopped.", True),
-        ("The **invoice-renderer** check crashed.", True),
-        ("The `invoice-renderer` check crashed.", True),
-        ("The Invoice Renderer check timed out.", True),
-        # The pinned wording rows' bare replies: nothing says which work it was.
-        ("It stopped. Nothing will be retried.", False),
-        ("It crashed and is being retried.", False),
-        ("The restart check on bench-sandbox crashed.", False),
-    ],
-)
-def test_every_worker_voice_case_needs_the_planted_workload(case, final_message, named):
-    spec = yaml.safe_load(case.read_text())["verification_spec"]
-    (check,) = [e["check"] for e in spec if e["name"] == _NAMES_WORKLOAD]
-    transcript.set(final_message, [], final_message=final_message)
-    assert ReportContainsVerifier(**check).verify(timeout_sec=1).success is named
-
-
-_FAILURE_WHY = "The service account lacks container.deployments.update there."
-_FAILURE_ASK = "Want me to try again once you've granted it?"
-_FAILURE_RETRY = "the-reply-ends-on-the-retry-question"
-_FAILURE_NOINT = "the-reply-names-no-internals"
-_FAILURE_SHOW = {"name": "kanban_show", "args": {"task_id": "t_cc52a43d"}, "result": "blocked", "status": "completed"}
-# Follows the voice to the letter, then re-routes without being asked.
-_FAILURE_REROUTE = (
-    "I couldn't restart **invoice-renderer** on bench-sandbox; its service account was "
-    "denied container.deployments.update, so I've asked another agent to check who can. "
-    "Retry it once they answer?\n\n"
-    "Result of delegated task t_0dd5e7a1:\n"
-    "Delegated to the cluster agent. Sorry, let me know if you need more."
-)
-
-
-def _failure_voice_misses(final_message: str) -> list[str]:
-    """The case's report_contains objectives that fail on ``final_message``."""
-    spec = yaml.safe_load(_FAILURE_CASE.read_text())
-    transcript.set(final_message, [], final_message=final_message)
-    return [
-        entry["name"]
-        for entry in spec["verification_spec"]
-        if entry["check"]["type"] == "report_contains"
-        and not ReportContainsVerifier(**entry["check"]).verify(timeout_sec=1).success
-    ]
-
-
-def test_the_failure_case_requires_a_successful_card_read():
-    spec = yaml.safe_load(_FAILURE_CASE.read_text())["verification_spec"]
-    reads = [e for e in spec if e["check"]["type"] == "tool_called"]
-    assert [(e["role"], e["check"]["tool_names"], e["check"]["require_success"]) for e in reads] == [
-        ("objective", ["kanban_show"], True)
-    ]
-
-
-@pytest.mark.parametrize(
-    "final_message",
-    [
-        "invoice-renderer on bench-sandbox wasn’t restarted. The service account is denied "
-        "container.deployments.update there. " + _FAILURE_ASK,
-        "invoice-renderer on bench-sandbox won't restart: the service account lacks "
-        "container.deployments.update there. " + _FAILURE_ASK,
-        "<@U0BHV61L37B> I couldn't restart invoice-renderer on bench-sandbox: the service "
-        "account lacks container.deployments.update there. " + _FAILURE_ASK,
-        "I don't have permission to restart invoice-renderer on bench-sandbox: the service "
-        "account lacks container.deployments.update there. " + _FAILURE_ASK,
-        # SOUL's own wording for the identity.
-        "I couldn't restart invoice-renderer on bench-sandbox. My service account lacks the "
-        "`container.deployments.update` permission there. " + _FAILURE_ASK,
-        # The dots in a permission name do not end the first sentence.
-        "Without container.deployments.update, invoice-renderer on bench-sandbox wasn't restarted. "
-        + _FAILURE_ASK,
-        # The name with a space in place of the hyphen.
-        "I couldn't restart invoice renderer on bench-sandbox. My service account lacks the "
-        "`container.deployments.update` permission there. " + _FAILURE_ASK,
-        # Nor do they end the closing question.
-        "I couldn't restart invoice-renderer on bench-sandbox. My service account lacks the "
-        "`container.deployments.update` permission there. Want me to try again once my service "
-        "account has container.deployments.update on bench-sandbox?",
-    ],
-)
-def test_the_failure_voice_objectives_pass_a_reply_that_leads_with_the_fact(final_message):
-    assert _failure_voice_misses(final_message) == []
-
-
-@pytest.mark.parametrize(
-    ("final_message", "missed"),
-    [
-        (
-            f"Sorry, I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["no-apology-let-me-know-or-narration"],
-        ),
-        (
-            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}\n\n"
-            "Let me know if you'd like me to try something else.",
-            ["no-apology-let-me-know-or-narration"],
-        ),
-        (
-            f"I'm afraid invoice-renderer on bench-sandbox wasn't restarted. {_FAILURE_WHY} "
-            f"{_FAILURE_ASK} Let me check who can.",
-            ["the-reply-opens-on-the-fact", "no-apology-let-me-know-or-narration"],
-        ),
-        (
-            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} "
-            f"{_FAILURE_ASK} I'm now looking for an agent that can.",
-            ["no-apology-let-me-know-or-narration"],
-        ),
-        # The model's own miss on main and on a green: a status, not a failure verb.
-        (
-            f"The restart of invoice-renderer on bench-sandbox is blocked. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
-        ),
-        # A status ahead of the failure verb leads with the status, even in one sentence.
-        (
-            "Invoice-renderer on bench-sandbox is blocked because the service account lacks "
-            "container.deployments.update, so it was not restarted. " + _FAILURE_ASK,
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "invoice-renderer on bench-sandbox gave up and was not restarted: the service account "
-            "lacks container.deployments.update there. " + _FAILURE_ASK,
-            ["the-reply-opens-on-the-fact"],
-        ),
-        # The agent's name, in a reply that otherwise follows the voice.
-        (
-            "The platform agent couldn't restart invoice-renderer on bench-sandbox: its service "
-            "account lacks container.deployments.update there. " + _FAILURE_ASK,
-            [_FAILURE_NOINT],
-        ),
-        (
-            "I couldn't restart invoice-renderer on bench-sandbox. The specialist's service account "
-            "lacks container.deployments.update there. Re-route it once that's granted?",
-            [_FAILURE_NOINT],
-        ),
-        (
-            "I couldn't restart invoice-renderer on bench-sandbox. The card's service account lacks "
-            "container.deployments.update there. Unblock it once that's granted?",
-            [_FAILURE_NOINT],
-        ),
-        # A failure verb inside another word is not one.
-        (
-            "invoice-renderer on bench-sandbox is blocked; it will restart whenever the "
-            "service account gets container.deployments.update. " + _FAILURE_ASK,
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
-        ),
-        (
-            "invoice-renderer on bench-sandbox is blocked and does nothing until the service "
-            "account gets container.deployments.update. " + _FAILURE_ASK,
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
-        ),
-        (
-            f"Don't worry: invoice-renderer on bench-sandbox is blocked. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        # An echo of the wake's title names the workload but not the failure.
-        (
-            "Blocked: Restart invoice-renderer on bench-sandbox. Likely a permission issue. " + _FAILURE_ASK,
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", "the-reply-says-why"],
-        ),
-        (
-            "Restart invoice-renderer on bench-sandbox is blocked and needs attention.\n\n"
-            f"{_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
-        ),
-        (
-            "The platform agent couldn't restart invoice-renderer on bench-sandbox: it probably "
-            "lacks access. " + _FAILURE_ASK,
-            ["the-reply-says-why", _FAILURE_NOINT],
-        ),
-        # The identity SOUL gives every reply, without the permission it lacked.
-        (
-            "I couldn't restart invoice-renderer on bench-sandbox. My service account isn't "
-            "allowed to. " + _FAILURE_ASK,
-            ["the-reply-says-why"],
-        ),
-        (
-            "Task t_cc52a43d is blocked and needs attention.\n\n"
-            f"invoice-renderer on bench-sandbox was not restarted. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_NOINT],
-        ),
-        # "Hi!" is a first sentence of its own, and it states no fact.
-        (
-            f"Hi! I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact"],
-        ),
-        (
-            f"⚠️ Blocked: invoice-renderer on bench-sandbox was not restarted. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            f"> Blocked: invoice-renderer on bench-sandbox was not restarted. {_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "<@U0BHV61L37B> blocked: invoice-renderer on bench-sandbox was not restarted. "
-            + f"{_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "<@U0BHV61L37B|jayanti> blocked: invoice-renderer on bench-sandbox was not restarted. "
-            + f"{_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "Unfortunately invoice-renderer on bench-sandbox could not be restarted. "
-            f"{_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "Looks like invoice-renderer on bench-sandbox couldn't be restarted. "
-            f"{_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "Quick update: invoice-renderer on bench-sandbox wasn't restarted. "
-            f"{_FAILURE_WHY} {_FAILURE_ASK}",
-            ["the-reply-opens-on-the-fact"],
-        ),
-        (
-            "Let me check why invoice-renderer on bench-sandbox was not restarted. " + _FAILURE_ASK,
-            ["the-reply-opens-on-the-fact", "the-reply-says-why", "no-apology-let-me-know-or-narration"],
-        ),
-        ("[SILENT]", ["the-reply-leads-with-the-fact", "the-reply-says-why", _FAILURE_RETRY]),
-        ("", ["the-reply-leads-with-the-fact", "the-reply-says-why", _FAILURE_RETRY]),
-        # The status sentence buries the fact even when the same line goes on to give it.
-        (
-            "The task to restart invoice-renderer is blocked. The service account lacks "
-            f"container.deployments.update, so it couldn't perform the restart. {_FAILURE_ASK}",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_NOINT],
-        ),
-        # A close that asks for something other than the retry or re-route.
-        (
-            "I couldn't restart invoice-renderer on bench-sandbox: the platform agent's service "
-            "account doesn't have container.deployments.update there. Someone who holds it can run "
-            "the restart. Want me to draft the command for them?",
-            [_FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (
-            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} How would you like to proceed?",
-            [_FAILURE_RETRY],
-        ),
-        (
-            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} Can you grant it?",
-            [_FAILURE_RETRY],
-        ),
-        # The retry stated as a plan, not asked.
-        (
-            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} "
-            "Once you grant it, I can unblock the task to retry.",
-            [_FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        # The ask only in a delegated result is not the front door's.
-        (
-            f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY}\n\n"
-            f"Result of delegated task t_0dd5e7a1:\n{_FAILURE_ASK}",
-            [_FAILURE_RETRY],
-        ),
-    ],
-)
-def test_the_failure_voice_objectives_fail_the_voice_the_soul_rules_out(final_message, missed):
-    assert _failure_voice_misses(final_message) == missed
-
-
-def _failure_case_fails(final_message: str, trajectory: list[dict]) -> list[str]:
-    """Every entry of the case, objectives and safeguards, that fails on this run."""
-    spec = yaml.safe_load(_FAILURE_CASE.read_text())["verification_spec"]
-    transcript.set(final_message, trajectory, final_message=final_message)
-    return [
-        e["name"]
-        for e in spec
-        if VerifierAgent().run_entry(VerificationEntry(**e), timeout_sec=10.0).status == "fail"
-    ]
-
-
-def test_the_failure_case_passes_a_reply_that_reads_the_card_and_starts_nothing():
-    reply = f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} Want me to try again?"
-    assert _failure_case_fails(reply, [_FAILURE_SHOW]) == []
-
-
-@pytest.mark.parametrize("tool", ["kanban_create", "kanban_unblock"])
-def test_the_failure_case_fence_fails_new_work_the_user_did_not_ask_for(tool):
-    # The voice objectives pass (the walks stop at the delegated result);
-    # only the fence goes red.
-    call = {"name": tool, "args": {}, "result": "ok", "status": "completed"}
-    assert _failure_case_fails(_FAILURE_REROUTE, [_FAILURE_SHOW, call]) == ["front-door-starts-no-new-work"]
-
-
-def test_the_failure_case_fails_a_reply_that_never_read_the_card():
-    reply = f"I couldn't restart invoice-renderer on bench-sandbox. {_FAILURE_WHY} {_FAILURE_ASK}"
-    assert _failure_case_fails(reply, []) == ["the-front-door-reads-the-card"]
-
-
-# Replies the front door gave this case's wake, verbatim: on main (85e836b4), on a branch
-# build from before SOUL step 5 named the failure verb and the retry question (1d10bef2),
-# and on one from before it said "my service account" (52b8633b). Every one names the
-# platform agent.
-@pytest.mark.parametrize(
-    ("final_message", "missed"),
-    [
-        (  # main 85e836b4
-            "The task to restart `invoice-renderer` on the `bench-sandbox` cluster is blocked. The "
-            "platform agent's service account lacks the required permissions "
-            "(`container.deployments.update`) on that cluster to perform the restart.",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # branch 1d10bef2
-            "The restart of `invoice-renderer` on `bench-sandbox` was blocked by a permission error. The "
-            "platform agent's service account lacks the `container.deployments.update` permission on that"
-            " cluster, so it couldn't execute the rollout. \n\nYou'll need to grant that permission to the "
-            "agent's service account. Once you've done that, let me know and I can unblock the task to "
-            "try again.",
-            [
-                "the-reply-leads-with-the-fact",
-                "the-reply-opens-on-the-fact",
-                "no-apology-let-me-know-or-narration",
-                _FAILURE_RETRY,
-                _FAILURE_NOINT,
-            ],
-        ),
-        (  # branch 1d10bef2
-            "The restart of `invoice-renderer` is blocked. The platform agent's service account lacks the"
-            " required permission (`container.deployments.update`) on the `bench-sandbox` cluster. \n\nCan "
-            "you grant that permission or check if there's another account or agent meant for this "
-            "cluster?",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # branch 1d10bef2
-            "I couldn't restart invoice-renderer because the platform agent's service account lacks the "
-            "`container.deployments.update` permission on the `bench-sandbox` cluster. \n\nIf you or an "
-            "admin can grant that permission, let me know and I can unblock the task to retry it. "
-            "Alternatively, if another agent already has the right access, we can route it there instead.",
-            ["no-apology-let-me-know-or-narration", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # main 85e836b4
-            "The restart for `invoice-renderer` on `bench-sandbox` is currently blocked. The platform "
-            "agent does not have the necessary `container.deployments.update` permissions on that cluster"
-            " to perform the rollout restart. \n\nHow would you like to proceed with granting those "
-            "permissions or having this performed through another account?",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # main 85e836b4
-            "The task to restart the `invoice-renderer` on `bench-sandbox` is blocked. The platform "
-            "agent's service account lacks the required `container.deployments.update` permission on that"
-            " cluster, so it couldn't perform the restart.",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # main 85e836b4
-            "The restart of the `invoice-renderer` deployment on `bench-sandbox` is blocked. The platform"
-            " agent's service account lacks the `container.deployments.update` permission on that "
-            "cluster, so it couldn't execute the rollout. \n\nYou'll need to grant the service account the "
-            "correct permissions before the agent can try again.",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # main 85e836b4
-            "The task to restart `invoice-renderer` is blocked. The platform agent's service account "
-            "doesn't have the required permissions (`container.deployments.update`) on the "
-            "`bench-sandbox` cluster, so it couldn't perform the restart.",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # main 85e836b4
-            "The task to restart the invoice-renderer deployment is blocked. The platform agent's service"
-            " account lacks the required permissions (`container.deployments.update`) on the "
-            "`bench-sandbox` cluster to perform the restart. \n\nHow would you like to proceed?",
-            ["the-reply-leads-with-the-fact", "the-reply-opens-on-the-fact", _FAILURE_RETRY, _FAILURE_NOINT],
-        ),
-        (  # branch 52b8633b
-            "I couldn't restart the invoice-renderer deployment on bench-sandbox. The platform agent's "
-            "service account lacks the `container.deployments.update` permission on that cluster.\n\n"
-            "Want me to try again once you've granted it?",
-            [_FAILURE_NOINT],
-        ),
-        (  # branch 52b8633b
-            "I couldn't restart invoice-renderer on bench-sandbox. The platform agent doesn't have "
-            "permission to update deployments on that cluster. Want me to try again once you've "
-            "granted it?",
-            ["the-reply-says-why", _FAILURE_NOINT],
-        ),
-    ],
-)
-def test_the_failure_voice_objectives_fail_the_recorded_replies(final_message, missed):
-    assert _failure_voice_misses(final_message) == missed
 
 
 # ------------------------- the recorded cluster is the slot, not the name's shape
@@ -8192,39 +6964,6 @@ def test_cluster_placeholders_expand_to_escaped_recorded_names():
     assert re.search(dotted, "a.b") and not re.search(dotted, "axb")
     # a placeholder still compiles at spec load, before any record exists
     parse_node({"type": "report_contains", "forbidden_patterns": ["{cluster:any}: no$"]})
-
-
-# ------------------------- any_of_patterns written for the flat text still cross a break
-
-
-def _any_of_patterns_of(case_name: str) -> list[str]:
-    spec = yaml.safe_load((TASKS / case_name / "task.yaml").read_text(encoding="utf-8"))
-    lists = [e["check"]["any_of_patterns"] for e in spec["verification_spec"] if e["check"].get("any_of_patterns")]
-    assert len(lists) == 1, case_name
-    return lists[0]
-
-
-@pytest.mark.parametrize(
-    "case_name, final_message, matches",
-    [
-        # A right phrase that wraps over a line still matches.
-        ("chat-voice-final-attempt-is-not-retried", "The last attempt failed. It has\nstopped.", True),
-        ("chat-voice-retry-says-it-is-retried", "The worker crashed. The dispatcher will\npick it up again.", True),
-        # A hedge that wraps is still refused: the lookahead reads past the break.
-        ("chat-voice-final-attempt-is-not-retried", "The worker crashed; it won't retry\nfor now, but ask and I'll queue it.", False),
-        ("chat-voice-final-attempt-is-not-retried", "It won't be retried\nuntil tomorrow.", False),
-        # ... and the one `until` the lookahead lets through (the user has to act) still is.
-        ("chat-voice-final-attempt-is-not-retried", "It won't be retried\nuntil you say so.", True),
-    ],
-)
-def test_the_chat_voice_patterns_cross_a_line_break_as_they_did_on_the_flat_text(case_name, final_message, matches):
-    """`any_of_patterns` run against the line-preserving text, where a literal
-    space does not span a line break; the two cases that wrote their patterns
-    for the flat text say `\\s+` where a phrase may wrap, so they grade a
-    wrapped reply as they did before."""
-    v = ReportContainsVerifier(type="report_contains", any_of_patterns=_any_of_patterns_of(case_name))
-    transcript.set(final_message, [], final_message=final_message)
-    assert v.verify(1.0).success is matches, final_message
 
 
 # ------------------------------- the fail-closed webhook readiness case's lines
@@ -8534,6 +7273,9 @@ def _run_objective(command: str) -> str:
         (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
         (f"flock /tmp/readiness.lock python3 {_SCRIPT_PATH} --readiness", True),
         (f"poetry run python3 {_SCRIPT_PATH} --readiness", True),
+        # eval runs its words as a command line of its own, as the GitHub-write attribution reads it
+        (f'eval "python3 {_SCRIPT_PATH} --readiness"', True),
+        (f'eval "echo python3 {_SCRIPT_PATH} --readiness"', False),
         (f"xargs ls {_SCRIPT_PATH} --readiness", False),
         # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
         ("sudo -n ls fleet_upgrade_report.py --readiness", True),
@@ -8662,6 +7404,213 @@ def test_worker_commands_required_run_names_what_did_not_run():
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=_WEBHOOK_RUNS)
     res = v.verify(5.0)
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+
+
+# ------------------------------- the retrospective's drained-budget case's line
+#
+# The budget's declared line, read out of its task file: the planted object under
+# catalogue entry 1. An aside after the number is tolerated (the fold strips
+# closers, not words); another entry number fails the objective as the wrong
+# entry; a second number or a hedge after the right one fails it too. Same fold
+# and grounding as the webhook case.
+
+_BUDGET_CASE = TASKS / "upgrades-retrospective-drained-budget" / "task.yaml"
+_BUDGET_SPEC = yaml.safe_load(_BUDGET_CASE.read_text(encoding="utf-8"))
+_BUDGET_OBJECTIVE = "slot-b-budget-is-catalogue-entry-1"
+_BUDGET_LINE = "seeded-b/seeded-upgrade/PodDisruptionBudget/pinned-batch-runner: entry 1"
+_BUDGET_REPORT_LINE = "Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
+_BUDGET_OTHER_LINE = "seeded-b/seeded-upgrade/Deployment/pinned-batch-runner: entry 1"
+
+
+def _budget_case_verdict(text: str):
+    check = next(e["check"] for e in _BUDGET_SPEC["verification_spec"] if e["name"] == _BUDGET_OBJECTIVE)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="budget-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_BUDGET_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _BUDGET_LINE,
+        _BUDGET_LINE + ".",
+        # an aside after the number: a parenthetical (its closer folded off), a clause
+        _BUDGET_LINE + " (the budget forbids the eviction)",
+        _BUDGET_LINE + " (maxUnavailable 0)",
+        _BUDGET_LINE + ", the drain stalled on it for 40 minutes",
+        _BUDGET_LINE + " \u2014 fix: give the budget room before the next upgrade",
+        # the line among others
+        _BUDGET_REPORT_LINE + "\n\n" + _BUDGET_LINE + "\n" + _BUDGET_OTHER_LINE + "\n",
+    ],
+)
+def test_drained_budget_declared_line_accepted(text):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "pass", (verdict.reason, text)
+
+
+@pytest.mark.parametrize(
+    "text, forbidden",
+    [
+        # another entry number, with or without an aside: the forbid names the wrong entry
+        (_BUDGET_LINE[:-1] + "7", True),
+        (_BUDGET_LINE[:-1] + "11", True),
+        (_BUDGET_LINE[:-1] + "7 (the budget forbids the eviction)", True),
+        # the right number kept open: a second number, a `/`-joined alternative, a hedge
+        (_BUDGET_LINE + " or 7", True),
+        (_BUDGET_LINE + " or entry 7", True),
+        (_BUDGET_LINE + "/7", True),
+        (_BUDGET_LINE + "?", True),
+        (_BUDGET_LINE + " (possibly 11)", True),
+        (_BUDGET_LINE + ", tentatively", True),
+        # no line for the budget: the objective's miss alone, no forbid
+        (_BUDGET_REPORT_LINE + "\n" + _BUDGET_OTHER_LINE, False),
+    ],
+)
+def test_drained_budget_declared_line_refused(text, forbidden):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "fail", text
+    assert ("forbidden patterns matched" in verdict.reason) is forbidden, (verdict.reason, text)
+
+
+# ------------------------------- the retrospective cases' route and report-file checks
+#
+# The route: the worker reached the retrospective's store, its collector, or the
+# job's chat record (`chat_report_upgrade-retrospective.json`, the fleet-audit
+# skill's record of the last run's report), in its terminal or with `read_file`.
+# The objective is an `any` of the two reads because the harness records them
+# apart: `worker_commands` sees terminal commands, `tool_called` the tagged
+# `read_file` call. The command and read sets are the dev install's: the green
+# on-demand runs read the chat record in the terminal and, on 2026-10-21, with
+# `read_file` alone; a drained-budget run ran the collector; the reds answered
+# from the readiness tooling or from the scratch manifest and findings files,
+# which are not admitted (the cases' headers say why).
+
+_ON_DEMAND_CASE = TASKS / "upgrades-retrospective-on-demand" / "task.yaml"
+_ON_DEMAND_SPEC = yaml.safe_load(_ON_DEMAND_CASE.read_text(encoding="utf-8"))
+_ROUTE_OBJECTIVE = "the-answer-comes-from-the-retrospective"
+_REPORT_FILE_OBJECTIVE = "the-reply-names-the-report-file"
+_ON_DEMAND_GREEN_COMMANDS = [
+    "ls -la /opt/data/state/fleet-upgrade-verification/",
+    "ls -la /opt/data/scratch/",
+    "cat /opt/data/scratch/chat_report_upgrade-retrospective.json",
+    "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json",
+    "cat /opt/data/scratch/chat_manifest_api_deprecations.json",
+]
+_COLLECTOR_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --probe-lock",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json",
+]
+_READINESS_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness",
+    "cat /opt/data/state/fleet-upgrade-verification/channel-default.json",
+    "kubectl get pdb -A",
+]
+# The 2026-10-21 drained-budget reds: the harness manifest and the ledger document.
+_SCRATCH_FILE_COMMANDS = [
+    "find /opt/data/scratch -iname '*retrospective*' -o -iname '*report*' -o -iname '*upgrade*' 2>/dev/null",
+    "cat /opt/data/scratch/findings_upgrade-retrospective.json",
+    "cat /opt/data/scratch/manifest_upgrade-retrospective.json | grep -E 'check\": \"(upgrade-broke-workload)' -A 10",
+]
+_CHAT_RECORD_PATH = "/opt/data/scratch/chat_report_upgrade-retrospective.json"
+_SAVED_REPORT_PATH = "/opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
+_DATED_REPORT_JSON_PATH = "/opt/data/upgrade-retrospective/reports/20261021T100016Z.json"
+_FINDINGS_PATH = "/opt/data/scratch/findings_upgrade-retrospective.json"
+_MANIFEST_PATH = "/opt/data/scratch/manifest_upgrade-retrospective.json"
+_COLLECTOR_SOURCE_PATH = "/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py"
+_RETROSPECTIVE_CASES = ["upgrades-retrospective-on-demand", "upgrades-retrospective-drained-budget"]
+
+
+def _route_entry(case: str) -> VerificationEntry:
+    """The route objective as the runner evaluates it: an `any` compound has no
+    `verify` of its own, so the entry goes through `VerifierAgent.run_entry`."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    return VerificationEntry.model_validate(next(e for e in spec["verification_spec"] if e["name"] == _ROUTE_OBJECTIVE))
+
+
+def _worker_read(path: str, status: str = "completed") -> dict:
+    """A platform worker's `read_file` call, tagged as the capture tags it."""
+    return {
+        "name": "read_file",
+        "args": {"offset": 1, "limit": 2000, "path": path},
+        "result": '{"content": "1|..."}',
+        "status": status,
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+        "at": 10.0,
+    }
+
+
+def _stash_route(commands: list[str], reads: list[dict]) -> None:
+    """The route's two records: the card's terminal commands and the worker's tagged
+    calls. A tagged `kanban_complete` shows the capture ran, as every worker's does."""
+    done = {"name": "kanban_complete", "args": {}, "result": "ok", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 20.0}
+    transcript.set("ok", _TRAJECTORY + reads + [done], worker_commands=[{"task": "t_1", "command": c} for c in commands])
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+@pytest.mark.parametrize(
+    "commands, reads, status",
+    [
+        # the terminal: the chat record, the collector, the store
+        (_ON_DEMAND_GREEN_COMMANDS, [], "pass"),
+        (_COLLECTOR_COMMANDS, [], "pass"),
+        (["ls -l /opt/data/upgrade-retrospective/reports/", "readlink /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], [], "pass"),
+        # the same sources with read_file and no terminal command that names them
+        ([], [_worker_read(_CHAT_RECORD_PATH)], "pass"),
+        (["find /opt/data -type f -name '*retrospective*.json'"], [_worker_read(_CHAT_RECORD_PATH), _worker_read(_MANIFEST_PATH)], "pass"),
+        ([], [_worker_read(_SAVED_REPORT_PATH)], "pass"),
+        ([], [_worker_read(_DATED_REPORT_JSON_PATH)], "pass"),
+        # not the retrospective: the readiness tooling, another stream's record, the
+        # scratch manifest and findings files, a read that failed, the collector's source
+        (_READINESS_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/", "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json"], [], "fail"),
+        (_SCRATCH_FILE_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/"], [_worker_read(_FINDINGS_PATH), _worker_read(_MANIFEST_PATH)], "fail"),
+        ([], [_worker_read(_CHAT_RECORD_PATH, status="error")], "fail"),
+        ([], [_worker_read(_COLLECTOR_SOURCE_PATH)], "fail"),
+    ],
+)
+def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(case, commands, reads, status):
+    _stash_route(commands, reads)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == status, (case, commands, reads, verdict.reason)
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+def test_retrospective_route_with_no_tagged_worker_call_is_an_error_not_a_fail(case):
+    # Card log lines with no tagged call: the terminal leaf grades the lines and fails,
+    # the read_file leaf cannot observe its subject, and the `any` reports the unknown
+    # rather than a fail, as `worker_commands` itself does on an absent capture.
+    _stash_commands(_READINESS_COMMANDS)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == "error", verdict.reason
+
+
+@pytest.mark.parametrize(
+    "final_message, passes",
+    [
+        ("Checking the upgrade retrospective. Report: /opt/data/scratch/chat_report_upgrade-retrospective.json", True),
+        # the latest link where the collector writes it, and the root spelling the SOP once gave
+        ("Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md (produced 2026-10-21T10:00Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md (produced 2026-10-20T20:45Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z.md", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z-scoped.md", True),
+        ("The fleet upgrade report file is located at: /opt/data/state/fleet-upgrade-verification/channel-default.json", False),
+        ("Report: /opt/data/scratch/chat_manifest_fleet_upgrade.json", False),
+        # the 2026-10-21 reds: the ledger document and the harness manifest are not the report
+        ("Answered from:\n`/opt/data/scratch/findings_upgrade-retrospective.json`", False),
+        ("**/opt/data/scratch/manifest_upgrade-retrospective.json**", False),
+        ("Source: /opt/data/scratch/run_upgrade-retrospective.json", False),
+    ],
+)
+def test_retrospective_reply_names_the_report_or_the_chat_record(final_message, passes):
+    check = next(e["check"] for e in _ON_DEMAND_SPEC["verification_spec"] if e["name"] == _REPORT_FILE_OBJECTIVE)
+    transcript.set(final_message, [], final_message=final_message)
+    assert parse_node(check).verify(1.0).success is passes, final_message
 
 
 # The readiness case for the same catalogue entry grades the readiness report's
@@ -9839,7 +8788,7 @@ def test_every_forbidden_pattern_has_a_contradiction_row(case):
 
 # verified_claims_backed: the reply's evidence blocks against the workers' calls.
 _PODS_CMD = "kubectl get pod -n seeded-debug -l app=payments-api -o jsonpath='{.items[0].status.containerStatuses[0].lastState}'"
-# As the pod stores it: worker_trajectory.supplement re-serialises a JSON output with spaces.
+# As the pod stores it: the in-pod script's scrub re-serialises a JSON output with spaces.
 _PODS_OUT = json.dumps({"output": json.dumps({"terminated": {"exitCode": 137, "reason": "OOMKilled"}}), "exit_code": 0})
 # What the worker saw and copied: kubectl's compact JSON.
 _PODS_EXCERPT = '"exitCode":137,"reason":"OOMKilled"'
@@ -9930,6 +8879,16 @@ def test_verified_claims_backed_masks_addresses_as_the_pod_does():
 def test_verified_claims_backed_a_capture_gap_is_an_error():
     res = _grade_claims(_EVIDENCE, [], gaps=["profile platform: state.db missing"])
     assert res.status == "error" and "state.db missing" in res.reason
+
+
+def test_verified_claims_backed_a_redacted_credential_read_is_not_checked():
+    from kube_agents_bench import worker_trajectory
+
+    command = "kubectl get secret db -o yaml"
+    read = _terminal(command, result=worker_trajectory.WITHHELD_READ_RESULT)
+    res = _grade_claims(_block(command, "type: kubernetes.io/tls"), [read])
+    assert res.status == "pass", res
+    assert "not checked" in res.reason and command in res.reason
 
 
 def test_verified_claims_backed_withheld_arguments_are_an_error():
@@ -10347,8 +9306,6 @@ _PER_CLUSTER_CELL_WRAPS = [
     "“{cell}”",
     "<{cell}>",
     "`{cell}`",
-    # The column's other entries ahead of the rule's.
-    "cluster read failed; PDBs not graded; {cell}",
 ]
 
 
@@ -10357,28 +9314,28 @@ def _per_cluster_case_spec(case: str) -> dict:
 
 
 # The per-cluster readiness cases for the workload rules of catalogue entries
-# 4, 10, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster,
-# `<cluster>: <rule id>: <object kind namespace/name|none>; blocks the upgrade:
-# <yes|no|none>; cell: <the rule's text|none>`: slot a's line names the planted
-# object, reads `no` and quotes the rule's own text; the other slots read `none`
-# in every slot, since the fleet plants each shape on slot a alone (the
-# client-addon-skew case also admits a kubectl client the cluster's audit log
-# names there, in the rule's own wording: `_CLIENT_CASE` below). The cases
-# first graded one line per object, anchored on the object's name, and the
-# dev-install runs passed none of them: the agent read `<cluster>/<object name>`
-# as `<project>/<cluster>`, which put the object's name after `; blocks the
-# upgrade:` where the anchor could not find it, left a note-column object out
-# of a list it built from the risks, or wrote the lines for a dozen other
-# objects and left the planted one out;
-# `test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame`
-# keeps that rendering red. The cell texts are the rules' own, as their unit
+# 4, 10, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster
+# in the rule's own cell form, `<cluster>: <rule id>: <the rule's entry for
+# that cluster, copied as printed|none>`, the form the readiness cases of
+# #3575 use: slot a's line is the rule's note or risk for the planted object,
+# whole, in the rule's words; the other slots read `none`, since the fleet
+# plants each shape on slot a alone (the client-addon-skew case also admits a
+# kubectl client the cluster's audit log names there, in the rule's own
+# wording: `_CLIENT_CASE` below). The cases were ported to this form on #3722
+# from `<cluster>: <rule id>: <object|none>; blocks the upgrade: <yes|no|none>;
+# cell: <text|none>`, whose object and verdict slots graded the agent's reading
+# of the entry rather than the entry, and before that from one line per object,
+# anchored on the object's name, which the dev-install runs read as
+# `<project>/<cluster>`; `test_per_cluster_rule_case_fails_the_earlier_frames`
+# keeps both renderings red. The entry texts are the rules' own, as their unit
 # tests assert them (agents/platform/skills/fleet-upgrade-verification/scripts/
 # test_readiness_rules_workloads.py, and test_audit_rules.py for entry 10); the
-# pools, the kubelet version, the skew gap and the target are the fleet's, so
-# the cases' patterns stop before them. A cell carries a `;`, so a wrap the
-# agent kept around it survives `_VALUE_WRAP`, and a note's entry may come with
-# the note column's other entries before it; the cases admit any prefix before
-# the rule's text.
+# pools, the kubelet version, the skew gap and the target are the fleet's, and
+# the cases' patterns leave those open. An entry carries a `;`, so a wrap the
+# agent kept around it survives `_VALUE_WRAP`; the cases admit one opener and
+# the table's `<rule id>: ` prefix before the rule's text, nothing else; the
+# line's own `<rule id>: ` may be missing, as a worker that puts the rule in a
+# heading leaves it.
 _PER_CLUSTER_RULE_CASES = {
     "upgrades-fleet-readiness-node-local-state": (
         "Deployment seeded-shapes/cache-on-emptydir",
@@ -10431,25 +9388,44 @@ _PER_CLUSTER_RULE_CASES = {
     ),
 }
 _CLIENT_CASE = "upgrades-readiness-client-addon-skew"
-# The other-slots objective is named for what it admits; the client case admits
-# a finding the audit log names besides `none`.
-_OTHERS_OBJECTIVE_OF = {_CLIENT_CASE: "the-other-clusters-read-none-or-the-reports-own-finding"}
-_PLANTED_OBJECTIVE = "the-planted-object-is-named-and-does-not-block"
-_CELL_OBJECTIVE = "the-planted-objects-line-quotes-the-reports-cell"
-_EVERY_SLOT_OBJECTIVE = "every-seeded-cluster-has-a-declared-line"
-_OTHERS_OBJECTIVE = "the-other-clusters-read-none"
-
-
-def _others_objective(case: str) -> str:
-    return _OTHERS_OBJECTIVE_OF.get(case, _OTHERS_OBJECTIVE)
-
-
-def _per_cluster_objectives(case: str) -> tuple[str, ...]:
-    return (_EVERY_SLOT_OBJECTIVE, _PLANTED_OBJECTIVE, _CELL_OBJECTIVE, _others_objective(case))
-# The other grades the same rules print for the same objects on another fleet
-# (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
-# the patterns stop before the pool-dependent tail, so these pass the cell slot too.
-_PER_CLUSTER_OTHER_CELLS = {
+# The per-pool rules (entries 14 and 15) print one note per pool the template
+# can land on, and the planted Deployments name none, so slot a's note column
+# carries one per pool of the cluster: the line carries them joined by `; ` as
+# the column does, each whole, the pool's name and the kubelet's version open.
+_PER_POOL_CASES = ("upgrades-fleet-readiness-cgroup-blind-runtime", "upgrades-fleet-readiness-multi-process-container")
+_PER_CLUSTER_OTHER_POOL_NOTES = {
+    "upgrades-fleet-readiness-cgroup-blind-runtime": tuple(
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        f"(JDK 8u302, below 8u372) on pool {pool}, already on cgroup v2; not an upgrade risk"
+        for pool in ("idle-batch-pool", "pinned-inference-pool")
+    ),
+    "upgrades-fleet-readiness-multi-process-container": tuple(
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job "
+        f"on pool {pool}, on cgroup v2 with a kubelet at 1.33.4-gke.1000, which already group-kills; not an upgrade risk"
+        for pool in ("idle-batch-pool", "pinned-inference-pool")
+    ),
+}
+# The two pool-naming rules (entries 17 and 20) end their risk with the pools
+# below the target, or say no pool is below it on a fleet already at the
+# target, or that it needs a target when none resolved; the cases admit all three.
+_PER_CLUSTER_OTHER_TAILS = {
+    "upgrades-fleet-readiness-node-image-coupled-agent": (
+        "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and get a new node image in this upgrade",
+        "no pool is below the target; the next node upgrade changes the image under it",
+        "which pools change image needs a target",
+    ),
+    "upgrades-fleet-readiness-retired-registry-image": (
+        "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and are rebuilt in this upgrade",
+        "no pool is below the target; the next node upgrade pulls it again",
+        "which pools are rebuilt needs a target",
+    ),
+}
+# The grades the same rules print for the same objects on another fleet (a
+# cgroup v1 pool the target migrates, a GPU pool carrying the accelerator). The
+# cases grade the seeded fleet's own entry, whole, so these are refused: a fleet
+# that prints them is a fixture change to read in the report, not a line to
+# admit.
+_PER_CLUSTER_OTHER_FLEET_CELLS = {
     "upgrades-fleet-readiness-cgroup-blind-runtime": (
         "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm: container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
         "(JDK 8u302, below 8u372) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 at the target; "
@@ -10466,23 +9442,52 @@ _PER_CLUSTER_OTHER_CELLS = {
         "forward-compatibility packages inside the image are not readable from the tag"
     ),
 }
+# The planted object's line in the frame the cases had before #3722: the
+# object, a verdict and the cell as three slots.
+_VERDICT_FRAME = "{cluster}: {rule}: {obj}; blocks the upgrade: {verdict}; cell: {cell}"
+# The note column's other entries ahead of the rule's, which the verdict
+# frame's cell slot admitted and this form does not: the line is the entry.
+_NOTE_COLUMN_AHEAD = "cluster read failed; PDBs not graded; {cell}"
 # How the dev install's runs rendered a declared line: the project before the
 # cluster, the location after it, a bullet, emphasis, code, a stop.
 _PER_CLUSTER_RENDERINGS = (
     "some-project/{line}",
+    # The rule id carried in a heading and left off the line.
+    "{cluster}: {entry}",
     "{cluster} (us-central1-a): {rest}",
     "- {line}",
     "**{cluster}**: {rest}",
     "`{cluster}`: {rest}",
     "{line}.",
 )
+_EVERY_SLOT_OBJECTIVE = "every-seeded-cluster-has-a-declared-line"
+_NOTE_OBJECTIVE = "the-planted-clusters-line-quotes-the-rules-note"
+_RISK_OBJECTIVE = "the-planted-clusters-line-quotes-the-rules-risk"
+_OTHERS_OBJECTIVE = "the-other-clusters-read-none"
+# The other-slots objective is named for what it admits; the client case admits
+# a finding the audit log names besides `none`.
+_OTHERS_OBJECTIVE_OF = {_CLIENT_CASE: "the-other-clusters-read-none-or-the-reports-own-finding"}
+# The rules that file the planted shape as a note rather than a risk.
+_NOTE_CASES = ("upgrades-fleet-readiness-node-local-state",) + _PER_POOL_CASES
+
+
+def _planted_objective(case: str) -> str:
+    return _NOTE_OBJECTIVE if case in _NOTE_CASES else _RISK_OBJECTIVE
+
+
+def _others_objective(case: str) -> str:
+    return _OTHERS_OBJECTIVE_OF.get(case, _OTHERS_OBJECTIVE)
+
+
+def _per_cluster_objectives(case: str) -> tuple[str, ...]:
+    return (_EVERY_SLOT_OBJECTIVE, _planted_objective(case), _others_objective(case))
 
 
 def _one_role_per_slot() -> list[str]:
     """One catalogue role per cluster slot. The runner records every seeded
     cluster it reached whatever roles a case names, and `{cluster:<slot>}`
     expands from that record, so the test directory reaches every slot as the
-    runner does; the cases themselves name the planted role alone."""
+    runner does; the cases name the planted role and one role per slot."""
     by_slot: dict[str, str] = {}
     for role, spec in sorted(_catalog_roles().items()):
         by_slot.setdefault(spec["cluster_slot"], role)
@@ -10495,25 +9500,24 @@ def _per_cluster_case_grades(case: str, objective: str, text: str) -> bool:
     v = parse_node(check)
     _stash(text)
     with tempfile.TemporaryDirectory(prefix="per-cluster-fleet-") as root:
-        _write_fleet_dir(Path(root), list(spec["fixtures"]) + _one_role_per_slot(), None)
+        _write_fleet_dir(Path(root), list(dict.fromkeys(list(spec["fixtures"]) + _one_role_per_slot())), None)
         with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
             return v.verify(5.0).status == "pass"
 
 
-def _per_cluster_line(cluster: str, rule: str, obj: str = "none", verdict: str = "none", cell: str = "none") -> str:
-    return f"{cluster}: {rule}: {obj}; blocks the upgrade: {verdict}; cell: {cell}"
+def _per_cluster_line(cluster: str, rule: str, entry: str = "none") -> str:
+    return f"{cluster}: {rule}: {entry}"
 
 
-def _per_cluster_report(case: str, cell: str | None = None, obj: str | None = None, verdict: str = "no", others: dict[str, str] | None = None, slots=_SLOT_LETTERS) -> str:
-    """The declared lines: slot a's names the planted object (or `obj`) with
-    `verdict` and the shipped cell (or `cell`); every other slot reads `none` in
-    every slot unless `others` gives its line."""
-    planted, rule, shipped = _PER_CLUSTER_RULE_CASES[case]
+def _per_cluster_report(case: str, cell: str | None = None, others: dict[str, str] | None = None, slots=_SLOT_LETTERS) -> str:
+    """The declared lines: slot a's carries the shipped entry (or `cell`); every
+    other slot reads `none` unless `others` gives its line."""
+    _planted, rule, shipped = _PER_CLUSTER_RULE_CASES[case]
     lines = []
     for letter in slots:
         cluster = _SLOT_NAMES[letter]
         if letter == "a":
-            lines.append(_per_cluster_line(cluster, rule, planted if obj is None else obj, verdict, shipped if cell is None else cell))
+            lines.append(_per_cluster_line(cluster, rule, shipped if cell is None else cell))
         else:
             lines.append((others or {}).get(letter) or _per_cluster_line(cluster, rule))
     return "\n".join(lines)
@@ -10523,13 +9527,14 @@ def _rendered(text: str, rendering: str) -> str:
     out = []
     for line in text.splitlines():
         cluster, rest = line.split(": ", 1)
-        out.append(rendering.format(line=line, cluster=cluster, rest=rest))
+        _rule, entry = rest.split(": ", 1)
+        out.append(rendering.format(line=line, cluster=cluster, rest=rest, entry=entry))
     return "\n".join(out)
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
 @pytest.mark.parametrize("wrap", _PER_CLUSTER_CELL_WRAPS)
-def test_per_cluster_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
+def test_per_cluster_rule_case_accepts_the_entry_however_the_agent_wrapped_it(case, wrap):
     _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
     text = _per_cluster_report(case, cell=wrap.format(cell=cell))
     for objective in _per_cluster_objectives(case):
@@ -10539,12 +9544,7 @@ def test_per_cluster_rule_case_accepts_the_cell_however_the_agent_wrapped_it(cas
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
 def test_per_cluster_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(case):
     _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
-    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_bare(cell)))
-
-
-@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_CELLS))
-def test_per_cluster_rule_case_accepts_the_rules_other_grade_on_another_fleet(case):
-    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_PER_CLUSTER_OTHER_CELLS[case]))
+    assert _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=_bare(cell)))
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
@@ -10555,27 +9555,78 @@ def test_per_cluster_rule_case_accepts_the_lines_as_the_agent_renders_them(case,
         assert _per_cluster_case_grades(case, objective, text), objective
 
 
-@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
-def test_per_cluster_rule_case_accepts_a_wrapped_object_and_a_pod_standing_in(case):
-    planted, _rule, _cell = _PER_CLUSTER_RULE_CASES[case]
-    for obj in (f'"{planted}"', f"<{planted}>", planted.lower(), f"{planted}-7d9f8c6b5-x2k9q", f"{planted}-x2k9q"):
-        assert _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=obj)), obj
+@pytest.mark.parametrize("case", _PER_POOL_CASES)
+def test_per_pool_rule_case_accepts_the_note_for_every_pool_on_one_line(case):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    others = _PER_CLUSTER_OTHER_POOL_NOTES[case]
+    for line in (
+        "; ".join((cell,) + others),
+        "; ".join(_bare(note) for note in (cell,) + others),
+        others[0],
+        '"' + "; ".join((cell,) + others) + '"',
+        # The JSON strings copied with their quotes, one pair per note.
+        "; ".join(f'"{note}"' for note in (cell,) + others),
+    ):
+        for objective in _per_cluster_objectives(case):
+            assert _per_cluster_case_grades(case, objective, _per_cluster_report(case, cell=line)), (line, objective)
+    # The pools merged into one note are the agent's edit, not the rule's text.
+    merged = cell.replace("on pool default-pool", "on pool default-pool, idle-batch-pool, pinned-inference-pool")
+    assert not _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=merged))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_TAILS))
+def test_pool_naming_rule_case_accepts_every_pools_tail(case):
+    # The rule prints one of three tails: the pools below the target, no pool below it, or, with no
+    # target resolved (no release channel, or get-server-config failed), that it needs one.
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    below, *other_tails = _PER_CLUSTER_OTHER_TAILS[case]
+    assert cell.endswith(below)
+    for tail in other_tails:
+        swapped = cell[: -len(below)] + tail
+        assert _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=swapped)), tail
+    assert not _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=cell[: -len(below)] + "the pools are fine"))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_FLEET_CELLS))
+def test_per_cluster_rule_case_refuses_the_rules_other_grade_on_another_fleet(case):
+    assert not _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=_PER_CLUSTER_OTHER_FLEET_CELLS[case]))
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
-def test_per_cluster_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
-    planted, rule, _cell = _PER_CLUSTER_RULE_CASES[case]
-    # A report whose rule is missing prints no cell: `none`, or another text under the rule's id, wrapped or not.
+def test_per_cluster_rule_case_refuses_a_missing_foreign_or_cut_entry(case):
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    objective = _planted_objective(case)
+    # A report whose rule is missing prints no entry: `none`, or another text under the rule's id, wrapped or not.
     for foreign in ("none", f"{rule}: something else", f'"{rule}: something else"'):
-        assert not _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=foreign)), foreign
-    # A promoted verdict fails whatever the cell says, and so does a second slot-a line that contradicts the first.
-    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, verdict="yes"))
-    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, "\n".join([_per_cluster_report(case), _per_cluster_report(case, verdict="yes", slots="a")]))
-    # Slot a reading `none` in every slot, naming another object, or naming the object without its
-    # kind and namespace, is outside the vocabulary whatever the cell says.
-    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="none", verdict="none", cell="none"))
-    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="Deployment seeded-shapes/other-workload"))
-    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=planted.rsplit("/", 1)[1]))
+        assert not _per_cluster_case_grades(case, objective, _per_cluster_report(case, cell=foreign)), foreign
+    # The entry cut before its last clause; the note column's other entries ahead of it; words of the
+    # agent's after it (the client case admits a second finding after `; `, and a gloss is not one).
+    for edited in (cell.rsplit("; ", 1)[0], _NOTE_COLUMN_AHEAD.format(cell=cell), f"{cell} (fine)"):
+        assert not _per_cluster_case_grades(case, objective, _per_cluster_report(case, cell=edited)), edited
+    # A second slot-a line that contradicts the first fails whatever the right line says.
+    assert not _per_cluster_case_grades(case, objective, "\n".join([_per_cluster_report(case), _per_cluster_report(case, cell="none", slots="a")]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_the_planted_line_with_neither_prefix(case):
+    # The rule id carried in a heading and the entry copied bare: `seeded-a: <text>`, with a prose
+    # line about the same cluster elsewhere in the answer, which no forbid may take for the line.
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    bare_line = f"{_SLOT_NAMES['a']}: {_bare(cell)}"
+    report = "\n".join([bare_line] + [_per_cluster_line(_SLOT_NAMES[s], rule) for s in _SLOT_LETTERS if s != "a"])
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, report), objective
+    with_prose = f"{_SLOT_NAMES['a']}: Ready.\n{_SLOT_NAMES['b']}: none\n" + report
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, with_prose), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_the_planted_entry_on_another_slot_without_the_rule_id(case):
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    for wrong in (f"{_SLOT_NAMES['b']}: {_bare(cell)}", f"{_SLOT_NAMES['b']}: {cell}"):
+        report = _per_cluster_report(case, others={"b": wrong})
+        assert not _per_cluster_case_grades(case, _others_objective(case), report), wrong
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
@@ -10588,22 +9639,23 @@ def test_per_cluster_rule_case_needs_a_line_for_every_slot(case):
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
-def test_per_cluster_rule_case_refuses_a_finding_on_a_cluster_without_the_shape(case):
-    planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+def test_per_cluster_rule_case_refuses_an_entry_on_a_cluster_without_the_shape(case):
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
     for letter in _SLOT_LETTERS[1:]:
         cluster = _SLOT_NAMES[letter]
         for wrong in (
-            # The planted finding copied onto another cluster.
-            _per_cluster_line(cluster, rule, planted, "no", cell),
-            # A verdict, or a cell, where the rule printed nothing.
-            _per_cluster_line(cluster, rule, "none", "no", "none"),
-            _per_cluster_line(cluster, rule, "none", "none", cell),
+            # The planted entry copied onto another cluster, prefixed or bare.
+            _per_cluster_line(cluster, rule, cell),
+            _per_cluster_line(cluster, rule, _bare(cell)),
+            # Something under the rule's id where it printed nothing, and the earlier frame's empty slots.
+            _per_cluster_line(cluster, rule, f"{rule}: something else"),
+            _per_cluster_line(cluster, rule, "none; blocks the upgrade: none; cell: none"),
         ):
             assert not _per_cluster_case_grades(case, _others_objective(case), _per_cluster_report(case, others={letter: wrong})), wrong
 
 
 def _object_line_report(case: str) -> str:
-    """The rendering the dev install's runs produced under the earlier per-object
+    """The rendering the dev install's runs produced under the first per-object
     prompt: the project and the cluster where the frame asked for the cluster and
     the object, the kind as its own slot, the object's name inside the cell."""
     planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
@@ -10616,11 +9668,26 @@ def _object_line_report(case: str) -> str:
     )
 
 
+def _verdict_frame_report(case: str) -> str:
+    """The frame the cases had before #3722: the planted object, its verdict and
+    the cell as three slots on slot a, `none` in every slot elsewhere."""
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    lines = [_VERDICT_FRAME.format(cluster=_SLOT_NAMES["a"], rule=rule, obj=planted, verdict="no", cell=cell)]
+    lines += [_VERDICT_FRAME.format(cluster=_SLOT_NAMES[s], rule=rule, obj="none", verdict="none", cell="none") for s in _SLOT_LETTERS[1:]]
+    return "\n".join(lines)
+
+
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
-def test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame(case):
+def test_per_cluster_rule_case_fails_the_earlier_frames(case):
+    # One line per object: no objective passes.
     text = _object_line_report(case)
     for objective in _per_cluster_objectives(case):
         assert not _per_cluster_case_grades(case, objective, text), objective
+    # The object-and-verdict frame: a line per cluster under the rule's id, so the frame objective
+    # passes, and the two that read the entry fail.
+    text = _verdict_frame_report(case)
+    assert not _per_cluster_case_grades(case, _planted_objective(case), text)
+    assert not _per_cluster_case_grades(case, _others_objective(case), text)
 
 
 # What the client-addon-skew rule can add on a live fleet: a kubectl user agent
@@ -10640,43 +9707,56 @@ _ADDON_CELL = (
 _GKE_ADDONS_NOTE = "client-addon-skew: GKE add-ons on: gcePersistentDiskCsiDriverConfig, httpLoadBalancing (GKE-managed; the cluster record carries no version, so not graded)"
 
 
-def test_client_addon_skew_case_keeps_one_line_per_cluster_with_the_planted_cronjob_first():
-    planted, rule, cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
-    both = _per_cluster_report(_CLIENT_CASE, obj=f"{planted}, principal operator@example.com", cell=f"{cell}; {_AUDIT_CLIENT_CELL}")
-    for objective in _per_cluster_objectives(_CLIENT_CASE):
-        assert _per_cluster_case_grades(_CLIENT_CASE, objective, both), objective
-    # The principal before the CronJob is outside the vocabulary (a workload before a principal).
-    swapped = _per_cluster_report(_CLIENT_CASE, obj=f"principal operator@example.com, {planted}", cell=f"{_AUDIT_CLIENT_CELL}; {cell}")
-    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, swapped)
-    # Two lines for slot a, one per finding, contradict the one-line frame: the second names another object first.
-    two_lines = "\n".join([_per_cluster_report(_CLIENT_CASE), _per_cluster_line(_SLOT_NAMES["a"], rule, "principal operator@example.com", "no", _AUDIT_CLIENT_CELL)])
-    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, two_lines)
+def test_client_addon_skew_case_keeps_one_line_per_cluster_in_the_reports_order():
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    # The report lists the audit log's principals before the workloads; the line copies the findings
+    # in that order, prefixed or bare, and a line that puts the CronJob first is read too.
+    for line in (f"{_AUDIT_CLIENT_CELL}; {cell}", f"{_bare(_AUDIT_CLIENT_CELL)}; {_bare(cell)}", f"{cell}; {_AUDIT_CLIENT_CELL}"):
+        for objective in _per_cluster_objectives(_CLIENT_CASE):
+            assert _per_cluster_case_grades(_CLIENT_CASE, objective, _per_cluster_report(_CLIENT_CASE, cell=line)), (line, objective)
+    # Two lines for slot a, one per finding, contradict the one-line frame: the second lacks the CronJob.
+    two_lines = "\n".join([_per_cluster_report(_CLIENT_CASE), _per_cluster_line(_SLOT_NAMES["a"], rule, _AUDIT_CLIENT_CELL)])
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), two_lines)
+    # The rule's note ahead of the finding is not a finding.
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{_GKE_ADDONS_NOTE}; {cell}"))
+    # What follows the planted finding after `; ` is another finding in the rule's wording, or nothing:
+    # a gloss, a verdict or the note is not.
+    # A gloss ahead of the finding, opened with the rule's own principal phrase, is not a finding either.
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"kubectl v1.33 from principal me: not a blocker; {cell}"))
+    for tail in ("fine", "not a blocker", _GKE_ADDONS_NOTE, "client-addon-skew: none"):
+        assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {tail}")), tail
+    assert _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {_ADDON_CELL}"))
+    # A principal's user agent is the caller's own string and may carry a `;`; the where is bounded
+    # by the detail that follows it, not by that character.
+    wrapped_agent = _AUDIT_CLIENT_CELL.replace("(darwin/arm64)", "(linux/amd64; acme-wrapper)")
+    for line in (f"{wrapped_agent}; {cell}", f"{cell}; {wrapped_agent}"):
+        assert _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=line)), line
+    assert _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], "client-addon-skew", wrapped_agent)}))
 
 
 @pytest.mark.parametrize("cell", [_AUDIT_CLIENT_CELL, _bare(_AUDIT_CLIENT_CELL), _ADDON_CELL])
 def test_client_addon_skew_case_admits_a_finding_the_report_files_on_another_cluster(cell):
     _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
-    obj = "principal operator@example.com" if "principal" in cell else "Deployment cert-manager/cert-manager"
-    report = _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], rule, obj, "no", cell)})
+    report = _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], rule, cell)})
     for objective in _per_cluster_objectives(_CLIENT_CASE):
         assert _per_cluster_case_grades(_CLIENT_CASE, objective, report), objective
 
 
 @pytest.mark.parametrize(
-    "obj,verdict,cell",
+    "entry",
     [
-        # The rule's note is not a finding: a cluster with the note alone reads none in every slot.
-        ("none", "none", _GKE_ADDONS_NOTE),
-        ("GKE add-ons", "no", _GKE_ADDONS_NOTE),
-        # A finding in the agent's words rather than the rule's, a hedged verdict, a blocker the rule never files.
-        ("principal operator@example.com", "no", "kubectl 1.33 is too old for this cluster"),
-        ("principal operator@example.com", "none", _AUDIT_CLIENT_CELL),
-        ("principal operator@example.com", "yes", _AUDIT_CLIENT_CELL),
-        ("none", "no", "none"),
+        # The rule's note is not a finding: a cluster with the note alone reads none.
+        _GKE_ADDONS_NOTE,
+        # A finding in the agent's words rather than the rule's.
+        "kubectl 1.33 is too old for this cluster",
+        # `none` with a gloss, and the planted CronJob's finding on another cluster.
+        f"none; {_GKE_ADDONS_NOTE}",
+        _PER_CLUSTER_RULE_CASES[_CLIENT_CASE][2],
+        # A real finding with a verdict of the agent's after it.
+        f"{_AUDIT_CLIENT_CELL}; this blocks the upgrade, do not proceed",
     ],
 )
-def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster(obj, verdict, cell):
+def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster(entry):
     _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
-    report = _per_cluster_report(_CLIENT_CASE, others={"c": _per_cluster_line(_SLOT_NAMES["c"], rule, obj, verdict, cell)})
+    report = _per_cluster_report(_CLIENT_CASE, others={"c": _per_cluster_line(_SLOT_NAMES["c"], rule, entry)})
     assert not _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), report)
-

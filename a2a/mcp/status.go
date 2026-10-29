@@ -78,7 +78,14 @@ func ConnectionStatusTool(bus Bus) Tool {
 			InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		Call: func(ctx context.Context, _ json.RawMessage) (string, error) {
-			return FormatBusStatusMarkdown(bus.Status(ctx)), nil
+			st := bus.Status(ctx)
+			// A request that ended before the read did (the server stopping,
+			// or the caller's own deadline) gets an error, never a status
+			// that would read as a disconnected bus.
+			if err := ctx.Err(); err != nil {
+				return "", fmt.Errorf("the request ended before the status read finished: %w", err)
+			}
+			return FormatBusStatusMarkdown(st), nil
 		},
 	}
 }

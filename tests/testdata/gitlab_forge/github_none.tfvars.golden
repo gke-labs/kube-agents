@@ -111,6 +111,7 @@ enable_gke_backup_plan = false
 # The CRD defaults dashboardEnabled to true; the installer has always
 # defaulted it to false and asks. Memory settings mirror --memory.
 hermes_dashboard_enabled = false
+web_console_enabled      = false
 memory_enabled           = false
 memory_provider          = "multiuser_memory"
 user_profile_enabled     = false

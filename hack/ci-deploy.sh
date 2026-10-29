@@ -258,9 +258,9 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # What the flag has to do, and where:
 #   - section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the jobs
-#     named below (a mis-set variable on the nightly or another postsubmit would
-#     otherwise run that job in next mode, so today's window and dashboard
-#     would silently miss it), and refuses a
+#     named below (a mis-set variable on any other periodic or postsubmit
+#     would otherwise run that job in next mode, so its today-mode record
+#     would silently go missing), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout, worker and console
@@ -310,31 +310,30 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
-# merge-blocking presubmit in a Tide batch (it grades next since next became
+# merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the today lane's
 # six-hourly periodic on main, which deploys next and rolls it back to today
-# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's two parts on
-# main, which grade the full catalog under next (the nightly the dashboard and
-# the digest read; ci-kube-agents-eval-nightly-today, the today-mode nightly
-# kept as the rollback check, is not listed and so is refused the flag); the
-# GitLab lane's nightly under next (EVAL_FORGE=gitlab,
+# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
+# main (the main part's two halves, main-a and main-b, and the writers part),
+# which grade the full catalog under next (the nightly the dashboard and
+# the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
-# is optional, so Tide never batches it, and a pull request's run of it
+# is optional, so Tide never batched it, and a pull request's run of it
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
-# one by the first on a Tide batch, the periodic, the nightlies and the RC
+# one by the first on a batch Tide ran, the periodic, the nightlies and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
-# the flag leaking into the today nightly's or another postsubmit's environment
+# the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. Admitting a job here never lets it write today's window:
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -385,6 +384,12 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
+# The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
+# `stop` sent through the inject door stops the conversation's kanban cards,
+# which chat-stop-halts-delegated-remediation grades. The operator renders
+# it onto the gateway from its own environment; only an exact "true" arms it.
+readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
+readonly A2A_CARD_STOP_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -977,15 +982,15 @@ fi
 # The mode flip exists for the runs that grade next or roll it back: a pull
 # request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
 # lane's periodic and the main and GitLab nightlies on main, the blocking presubmit
-# in a Tide batch, and the release-candidate eval).
+# in a batch Tide ran, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
 # keeps the today lane out of the recorder, and bench-gate separately refuses
 # a pull request's sample, bench/baselines/README.md), so what the flag
-# mis-set on a job that is not the lane's -- the today nightly, another
-# postsubmit -- would do is run that job in next mode and leave today's
-# window and dashboard silently missing it, its verdict measuring the wrong
-# stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
+# mis-set on a job that is not the lane's -- the today-mode GitLab nightly, another
+# postsubmit -- would do is run that job in next mode and leave the
+# dashboard silently missing its today-mode run, its verdict measuring the
+# wrong stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
 # scheduled jobs are admitted by being named and every other Prow run without
 # a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
@@ -1005,7 +1010,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     echo "       The flag is for a pull request's presubmit or a job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
     echo "       postsubmit under it would run in next mode instead of today's, leaving" >&2
-    echo "       today's baseline and dashboard silently missing that run." >&2
+    echo "       its today-mode dashboard record silently missing." >&2
     exit 1
   fi
 fi
@@ -1056,15 +1061,79 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   fi
 fi
 
+# The forge table (kube-agents#3682): one row per EVAL_FORGE value, giving the
+# forge's kind (the provider the chart registers), its host, and whether it is
+# self-managed (a private host with a private CA the run supplies). A lane is a
+# row; a new forge is a new row, nothing else here changes. The self-managed
+# hosts can be overridden for a developer's own instance. hack/ci-eval-pr.sh
+# lifts this function, as it lifts the project tables, so both scripts read one
+# table; tests/test_ci_gitops_repo.py pins the rows.
+EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
+EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
+forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override
+  local kind host var example
+  case "$1" in
+    github)    echo "github github.com no"; return 0 ;;
+    gitlab)    echo "gitlab gitlab.com no"; return 0 ;;
+    ghes)      kind=github; var=EVAL_GHES_HOST; example="${EVAL_FORGE_DEFAULT_GHES_HOST}"; host="${EVAL_GHES_HOST:-${example}}" ;;
+    gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; example="${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}"; host="${EVAL_GITLAB_CE_HOST:-${example}}" ;;
+    *) return 1 ;;
+  esac
+  # A dotted bare hostname only: the row is split on whitespace, and the chart
+  # takes a host without scheme, port or path (hack/ghes-proxy/README.md). The
+  # two public hosts are not self-managed; the chart refuses them with a CA set.
+  # The chart's finer rules (reserved domains, length) stay the chart's.
+  if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    echo "ERROR: ${var}='${host}' is not a dotted bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${example}." >&2
+    return 2
+  fi
+  case "$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')" in
+    github.com|www.github.com|ssh.github.com|gitlab.com|www.gitlab.com)
+      echo "ERROR: ${var}='${host}' is a public forge, not a self-managed one; EVAL_FORGE=github or gitlab is that row." >&2
+      return 2 ;;
+  esac
+  echo "${kind} ${host} yes"
+}
+
 # --- Which forge this run deploys against (EVAL_FORGE) ----------------------
-# EVAL_FORGE picks the forge the eval run drives: github (default; the
-# resolution below) or gitlab (issue #2394). Under gitlab the GitHub
-# integration and its minter stay off, the PlatformAgent declares one GitLab
-# forge whose credential is a Kubernetes Secret (step 5 fills it from the
-# pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT),
-# and the pool project's GitLab project is its gitops repository. Mapped and gated here, ahead of the
-# GitHub resolution, so an unmapped project is refused naming this table.
+# EVAL_FORGE picks the forge the eval run drives, a row of forge_profile above:
+# github (default; the resolution below), gitlab (issue #2394), ghes (a GitHub
+# Enterprise Server at a private host) or gitlab-ce (a self-managed GitLab at a
+# private host), the last two kube-agents#3682. Under the gitlab kind the
+# GitHub integration and its minter stay off, the PlatformAgent declares one
+# GitLab forge whose credential is a Kubernetes Secret (step 5 fills it: from
+# the pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT
+# on gitlab.com, from the run's own forge state directory on a self-managed
+# instance), and the pool project's GitLab project is its gitops repository.
+# Under ghes the GitHub path runs against the private host: the pool's App and
+# repositories stay on github.com behind the proxy that serves that host. A
+# self-managed forge needs the run's private CA in the state directory; the
+# deploy writes it into the Secret the forge's caBundleRef names. Mapped and
+# gated here, ahead of the GitHub resolution, so an unmapped project is refused
+# naming this table.
 EVAL_FORGE="${EVAL_FORGE:-github}"
+# Where the lane step that stands the forge up (the forge VM, kube-agents#3683
+# and #3684) leaves what this deploy and the eval need: ca.crt for a
+# self-managed forge, agent-token and ledger-token for a per-run GitLab. A
+# private directory of the job's pod, never under the artifacts, so none of it
+# is uploaded.
+EVAL_FORGE_STATE_DIR="${EVAL_FORGE_STATE_DIR:-/tmp/eval-forge}"
+case "${EVAL_FORGE_STATE_DIR}" in
+  /*) ;;
+  *) echo "ERROR: EVAL_FORGE_STATE_DIR='${EVAL_FORGE_STATE_DIR}' must be an absolute path: the grader runs under bench/ and reads the CA by this path (kube-agents#3682)." >&2; exit 1 ;;
+esac
+FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
+# The Secret the forge's caBundleRef names, per kind: the installer's names,
+# so an install made by hand and one made here read the same way.
+GITLAB_FORGE_CA_SECRET_NAME="gitlab-forge-ca"
+GITHUB_FORGE_CA_SECRET_NAME="github-forge-ca"
+FORGE_CA_SECRET_KEY="ca.crt"
+# On a per-run GitLab there is no table to map: the lane step seeds the group
+# and the project the pool's gitlab.com layout has, `gke-agentic/<PROJECT_ID>-infra`,
+# which is also what hack/ci_gitlab_forge.py's project guard accepts (GROUP,
+# PROJECT_SUFFIX there; scripts/test_ci_gitlab_forge.py pins the pair equal).
+GITLAB_FORGE_GROUP="gke-agentic"
+GITLAB_FORGE_PROJECT_SUFFIX="-infra"
 # The Secret the forge's credentialsRef names, and the key the token sits
 # under. The key is this deploy's choice: the operator reads only the Secret's
 # name today, and the GitLab provider, when it lands, fixes the key it reads.
@@ -1077,12 +1146,39 @@ GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
 # so the pair is rotated by a human with overlap, and one home keeps that
 # the same size however many projects the pool has (docs/ci-pool-projects.md 5.6).
 GITLAB_SECRETS_PROJECT="kube-agents-prow"
-GITLAB_FORGE_HOST="gitlab.com"
-case "${EVAL_FORGE}" in
+EVAL_FORGE_PROFILE_RC=0
+EVAL_FORGE_PROFILE="$(forge_profile "${EVAL_FORGE}")" || EVAL_FORGE_PROFILE_RC=$?
+if [ "${EVAL_FORGE_PROFILE_RC}" -ne 0 ]; then
+  # 2 is a host override that is not a bare hostname; forge_profile said so itself.
+  [ "${EVAL_FORGE_PROFILE_RC}" -eq 2 ] || echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
+  exit 1
+fi
+read -r EVAL_FORGE_KIND EVAL_FORGE_HOST EVAL_FORGE_SELF_MANAGED <<<"${EVAL_FORGE_PROFILE}"
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  if [ ! -s "${FORGE_CA_FILE}" ]; then
+    echo "ERROR: EVAL_FORGE=${EVAL_FORGE} is a self-managed forge at ${EVAL_FORGE_HOST}, but ${FORGE_CA_FILE} (its private CA) is missing or empty." >&2
+    echo "       The lane step that stands the forge up writes it to EVAL_FORGE_STATE_DIR (kube-agents#3682); not deploying against a host the broker could not trust." >&2
+    exit 1
+  fi
+  # A CA, not any certificate: the grader verifies strictly, so a leaf or a
+  # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
+  if ! openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
+    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    exit 1
+  fi
+elif [ -s "${FORGE_CA_FILE}" ]; then
+  echo "ERROR: ${FORGE_CA_FILE} exists but EVAL_FORGE=${EVAL_FORGE} is ${EVAL_FORGE_HOST}, a public forge that takes no private CA; remove it or pick the self-managed forge it belongs to." >&2
+  exit 1
+fi
+# The GitLab host the values below name: the table's, public or self-managed.
+GITLAB_FORGE_HOST="${EVAL_FORGE_HOST}"
+case "${EVAL_FORGE_KIND}" in
   github) ;;
   gitlab)
-    if ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
-      echo "ERROR: EVAL_FORGE=gitlab but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      GITLAB_PROJECT="${GITLAB_FORGE_GROUP}/${PROJECT_ID}${GITLAB_FORGE_PROJECT_SUFFIX}"
+    elif ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
       echo "       Add it to gitlab_project_for_project() in hack/ci-deploy.sh once the project" >&2
       echo "       exists and the bot is a Developer on it (docs/ci-pool-projects.md 5.6)." >&2
       exit 1
@@ -1095,16 +1191,12 @@ case "${EVAL_FORGE}" in
     CHART_HELPERS="${SCRIPT_DIR}/../charts/kube-agents/templates/_helpers.tpl"
     if ! grep -Eq '^[[:space:]]+- gitlab$' "${PLATFORM_AGENT_CRD}" \
       || ! grep -Eq 'registered := list .*"gitlab"' "${CHART_HELPERS}"; then
-      echo "ERROR: EVAL_FORGE=gitlab, but the chart in this checkout does not register provider" >&2
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE}, but the chart in this checkout does not register provider" >&2
       echo "       gitlab (${PLATFORM_AGENT_CRD#"${SCRIPT_DIR}/../"} and ${CHART_HELPERS#"${SCRIPT_DIR}/../"}" >&2
       echo "       both have to list it). The GitLab provider is the operator half of" >&2
       echo "       gke-labs/kube-agents#1154; this deploy waits for it (#2394)." >&2
       exit 1
     fi
-    ;;
-  *)
-    echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default) or gitlab." >&2
-    exit 1
     ;;
 esac
 
@@ -1125,6 +1217,13 @@ if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
   echo "GitOps repo: ${GITOPS_REPO} (from EVAL_GITOPS_REPO)"
 elif GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID}")"; then
   echo "GitOps repo: ${GITOPS_REPO} (mapped from PROJECT_ID=${PROJECT_ID})"
+elif [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  # The GitHub repository is not read under the gitlab kind (the GitLab
+  # project is the gitops repository and the alias is set empty below), so a
+  # project with no GitHub row, a per-run GitLab on an unmapped project, is
+  # not a refusal here.
+  GITOPS_REPO=""
+  echo "GitOps repo: none on GitHub (EVAL_FORGE=${EVAL_FORGE}; the GitLab project ${GITLAB_PROJECT} is the gitops repository)"
 elif [ "${IS_PROW_RUN}" = "true" ]; then
   echo "ERROR: no GitOps repo is mapped for PROJECT_ID=${PROJECT_ID}." >&2
   echo "       Every project in the kube-agents-evals-project Boskos pool needs its own" >&2
@@ -1149,6 +1248,8 @@ fi
 if [ "${GITOPS_REPO}" = "none" ]; then
   echo "GitHub integration: disabled for this deploy (EVAL_GITOPS_REPO=none)"
   GITOPS_REPO=""
+elif [ -z "${GITOPS_REPO}" ] && [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  : # resolved above: no GitHub repository under the gitlab kind
 elif ! printf '%s' "${GITOPS_REPO}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
   echo "ERROR: GitOps repo '${GITOPS_REPO}' is not in owner/repo form." >&2
   echo "       The minty rule ConfigMap is keyed on the org and repo separately, so the" >&2
@@ -1183,9 +1284,9 @@ fi
 # kubeagents-platform-gsa@<harness.projectId> — exactly the GSA_NAME/PROJECT_ID
 # pair this deploy annotates the agent KSA with, so the rule is keyed on this
 # project's platform GSA and no other's.
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
-  echo "GitHub token minter: off (EVAL_FORGE=gitlab)"
+  echo "GitHub token minter: off (EVAL_FORGE=${EVAL_FORGE})"
 elif [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
   GITHUB_MINTER_ARGS=(
     --set "githubMinter.enabled=true"
@@ -1201,10 +1302,14 @@ else
 fi
 
 # The values the chart receives for the forge: forges[] + repositories[] for
-# gitlab, the deprecated github.gitRepo alias otherwise (the chart refuses both
-# at once, so the alias is set empty beside the lists).
-case "${EVAL_FORGE}" in
-  gitlab)
+# the gitlab kind and for a GitHub forge at a self-managed host (the deprecated
+# github.gitRepo alias has no host and always means github.com), the alias for
+# github.com (the chart refuses both at once, so the alias is set empty beside
+# the lists). A self-managed forge also names the CA Secret step 5 writes; the
+# chart hands it to the credential broker, and on a GitHub forge to the token
+# minter, which it points at https://<host>/api/v3.
+case "${EVAL_FORGE_KIND}:${EVAL_FORGE_SELF_MANAGED}" in
+  gitlab:*)
     GITOPS_REPO=""
     GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
     FORGE_ARGS=(
@@ -1218,7 +1323,32 @@ case "${EVAL_FORGE}" in
       --set-string "platformAgent.integration.repositories[0].repository=https://${GITLAB_FORGE_HOST}/${GITLAB_PROJECT}"
       --set-string "platformAgent.integration.repositories[0].role=gitops"
     )
-    echo "Forge: gitlab — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      FORGE_ARGS+=(
+        --set-string "platformAgent.integration.forges[0].caBundleRef.name=${GITLAB_FORGE_CA_SECRET_NAME}"
+        --set-string "platformAgent.integration.forges[0].caBundleRef.key=${FORGE_CA_SECRET_KEY}"
+      )
+    fi
+    echo "Forge: ${EVAL_FORGE} — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    ;;
+  github:yes)
+    if [ -z "${GITOPS_REPO}" ]; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} declares the GitHub forge at ${EVAL_FORGE_HOST} for the pool's repository, and none resolved (EVAL_GITOPS_REPO=none is not an option on this forge)." >&2
+      exit 1
+    fi
+    FORGE_ARGS=(
+      --set-string "platformAgent.integration.github.gitRepo="
+      --set-string "platformAgent.integration.forges[0].name=github"
+      --set-string "platformAgent.integration.forges[0].provider=github"
+      --set-string "platformAgent.integration.forges[0].host=${EVAL_FORGE_HOST}"
+      --set-string "platformAgent.integration.forges[0].namespace=${GITOPS_REPO%%/*}"
+      --set-string "platformAgent.integration.forges[0].caBundleRef.name=${GITHUB_FORGE_CA_SECRET_NAME}"
+      --set-string "platformAgent.integration.forges[0].caBundleRef.key=${FORGE_CA_SECRET_KEY}"
+      --set-string "platformAgent.integration.repositories[0].forge=github"
+      --set-string "platformAgent.integration.repositories[0].repository=https://${EVAL_FORGE_HOST}/${GITOPS_REPO}"
+      --set-string "platformAgent.integration.repositories[0].role=gitops"
+    )
+    echo "Forge: ${EVAL_FORGE} — the GitHub forge at ${EVAL_FORGE_HOST}, repository ${GITOPS_REPO} (the pool's github.com repository behind that host); the minter follows the forge's host and CA"
     ;;
   *)
     FORGE_ARGS=(--set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}")
@@ -1259,14 +1389,30 @@ preflight_fleet_reader
 # without the accessor grant, or a secret that is gone, should fail here,
 # not after the image build. The value is discarded; step 5 reads it again
 # into the Kubernetes Secret.
+# A per-run GitLab (gitlab-ce) has no pool secret: the lane step that stood
+# the instance up left the agent token in the forge state directory.
+GITLAB_FORGE_AGENT_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/agent-token"
+# Both functions below stand alone (the tests lift each by name): the source
+# switch is inline. On a self-managed instance the token is the file the lane
+# step left; on gitlab.com it is the pool's Secret Manager secret. The value is
+# newline-stripped either way (one stored with a trailing newline would
+# otherwise reach GitLab as part of the token).
 preflight_gitlab_forge_secret() {
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    if [ ! -s "${GITLAB_FORGE_AGENT_TOKEN_FILE:-}" ]; then
+      echo "FATAL: stopping before the build: ${GITLAB_FORGE_AGENT_TOKEN_FILE:-the per-run agent token file} (the per-run GitLab agent token) is missing or empty; the lane step that stands the instance up writes it (kube-agents#3683)." >&2
+      exit 1
+    fi
+    echo "GitLab forge credential: ${GITLAB_FORGE_AGENT_TOKEN_FILE} readable"
+    return 0
+  fi
   if ! gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" >/dev/null; then
     echo "FATAL: stopping before the build: Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} cannot be read as this runner (docs/ci-pool-projects.md 5.6: the secret and the runner's secretAccessor grant are hand steps)." >&2
     exit 1
   fi
   echo "GitLab forge credential: ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} readable"
 }
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   preflight_gitlab_forge_secret
 fi
 
@@ -1459,6 +1605,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
     --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
     --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
+    --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
+    --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
   )
 fi
 
@@ -1668,27 +1816,60 @@ ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}"
 # token leaves the host cluster with the lease instead of outliving it.
 GITLAB_FORGE_SECRET_LABEL="app.kubernetes.io/part-of=kube-agents"
 materialize_gitlab_forge_secret() {
-  local manifest
+  local manifest source
   # Rendered first, applied second: in one pipe the apply would run on the
   # empty stream a failed read leaves, and only then would pipefail report it.
   # tr: a value stored with a trailing newline (echo into --data-file=-) would
   # otherwise reach GitLab as part of the token.
-  manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
-    | tr -d '\r\n' \
-    | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
-        --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
-    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    source="${GITLAB_FORGE_AGENT_TOKEN_FILE}"
+    manifest="$(tr -d '\r\n' <"${GITLAB_FORGE_AGENT_TOKEN_FILE}" \
+      | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+          --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+      | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || manifest=""
+  else
+    source="Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+    manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
+      | tr -d '\r\n' \
+      | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+          --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+      | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || manifest=""
+  fi
+  if [ -z "${manifest}" ]; then
     # The read itself passed the preflight in 2d, so the stage that failed is
     # as likely a kubectl one; each stage's own stderr is just above this line.
-    echo "ERROR: could not render the GitLab forge Secret from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}; the failing stage (gcloud, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    echo "ERROR: could not render the GitLab forge Secret from ${source}; the failing stage (the read, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    return 1
+  fi
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
+  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from ${source}"
+}
+# The private CA of a self-managed forge, as the Secret the forge's caBundleRef
+# names (the installer's name per kind), so the credential broker trusts the
+# host, and the token minter too on a GitHub forge. Read from the file the lane
+# step left; the file never reaches the artifacts.
+materialize_forge_ca_secret() {
+  local name manifest
+  case "${EVAL_FORGE_KIND}" in
+    gitlab) name="${GITLAB_FORGE_CA_SECRET_NAME}" ;;
+    *) name="${GITHUB_FORGE_CA_SECRET_NAME}" ;;
+  esac
+  manifest="$(kubectl create secret generic "${name}" -n "${NAMESPACE}" \
+        --from-file="${FORGE_CA_SECRET_KEY}=${FORGE_CA_FILE}" --dry-run=client -o yaml \
+    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+    echo "ERROR: could not render the forge CA Secret ${NAMESPACE}/${name} from ${FORGE_CA_FILE}; the failing stage reported just above (kube-agents#3682)." >&2
     return 1
   }
   kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
-  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+  echo "Forge CA: Secret ${NAMESPACE}/${name} (key ${FORGE_CA_SECRET_KEY}) from ${FORGE_CA_FILE}, for ${EVAL_FORGE_HOST}"
 }
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   materialize_gitlab_forge_secret
+fi
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  materialize_forge_ca_secret
 fi
 
 # ─── 5b′. The chart's CRDs, before the chart ─────────────────────────────────

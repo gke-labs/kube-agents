@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/fleet-audit-clean-close-reads-clean.
+# The scenario driver for bench/tasks/fleet-audit-clean-close-reads-clean
+# (ledger_kind "finding") and bench/tasks/fleet-audit-on-demand-run-reports
+# (ledger_kind "gap"). The text below is about the first case. With "gap", the
+# ledger has no finding and one coverage gap on a second invented cluster, so
+# the clean run closes it with nothing new and nothing resolved (ledger.py says
+# more).
 #
 # It opens ONE ledger issue for one audit stream, with one finding on a cluster
 # that does not exist, and writes the stored record of that ledger. The run
@@ -27,9 +32,10 @@
 # devops-bench applies this stack, so each repetition starts from the ledger
 # this stack opens.
 #
-# The cluster, project and object names are invented names only this case
-# uses. The destroy closes each open ledger of the stream whose body names the
-# invented cluster. A ledger that the run closed is already closed.
+# The cluster, project and object names are invented names that only the two
+# cases of this stack use. The destroy closes each open ledger of the stream whose number the
+# seed wrote to the report store, or whose body names the invented cluster. A ledger that the
+# run closed is already closed.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -47,6 +53,8 @@ locals {
   # How long an exec into the sandbox waits for a running pod; see
   # bench/tf/prebuilt/bootstrap-ranking/main.tf.
   pod_wait = 5
+  # The ledger.py mode for each ledger_kind.
+  seed_mode = var.ledger_kind == "gap" ? "seed-gap" : "seed"
 }
 
 resource "null_resource" "stale_ledger" {
@@ -59,6 +67,7 @@ resource "null_resource" "stale_ledger" {
     sandbox_container = var.sandbox_container
     audit_id          = var.audit_id
     gitops_repo       = var.gitops_repo
+    seed_mode         = local.seed_mode
     python            = local.python
     script_b64        = local.script_b64
     pod_wait          = local.pod_wait
@@ -95,7 +104,7 @@ resource "null_resource" "stale_ledger" {
       printf '%s' '${local.script_b64}' | base64 -d | \
         kubectl exec -i -n "${var.agent_namespace}" "$1" -c "${var.sandbox_container}" \
           --pod-running-timeout=${local.pod_wait}s -- \
-          ${local.python} - seed "${var.audit_id}" ${var.gitops_repo}
+          ${local.python} - ${local.seed_mode} "${var.audit_id}" ${var.gitops_repo}
     EOT
   }
 

@@ -1,117 +1,116 @@
 ---
 title: Platform Agent
-description: The persona, safety rails, and tool wiring that make the Platform Agent behave like a Platform Custodian rather than a chatbot.
+description: How the Platform Agent persona, kanban guardrails, and MCP tool wiring govern fleet-wide GKE operations.
 sidebar:
   order: 1
 ---
 
-The Platform Agent is an autonomous agent with a defined role — **Platform Custodian and Agent Architect**. It's not a general-purpose Kubernetes assistant. The rules of its behavior are codified in [`SOUL.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md), which the Hermes runtime loads as the system prompt.
+The Platform Agent acts as the **Platform Custodian and Agent Architect** for the managed GKE fleet: it governs cluster lifecycle, multi-tenancy boundaries, fleet-wide compliance audits, per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) lifecycle, and the GitOps pull-request write path. Its operating rules live in [`SOUL.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/SOUL.md), which the Hermes runtime loads as the system prompt.
 
-It runs as the `platform` Hermes profile in the agent pod, scaffolded at pod startup from the `agents/platform/` template by [`profile_scaffold.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/profile_scaffold.py). It does not receive chat directly: the **Planning Agent** (the pod's `default` profile — see [ChatOps](/kube-agents/concepts/chatops/)) is the conversational front door and delegates work to the Platform Agent as cards on the shared kanban board. The Platform Agent's one-line routing description for the Planning Agent's roster lives in [`agents/platform/CAPABILITIES.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/CAPABILITIES.md).
+It runs as the `platform` Hermes profile in the agent pod, scaffolded at pod startup from the `agents/platform/` template by [`profile_scaffold.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/profile_scaffold.py). It does not receive chat directly: the **Planning Agent** (the pod's `default` profile — see [ChatOps](/kube-agents/concepts/chatops/)) owns chat ingress and delegates work to the Platform Agent as cards on the shared kanban board. The Platform Agent's routing description for the Planning Agent's roster lives in [`agents/platform/CAPABILITIES.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/CAPABILITIES.md).
 
 ## How a request reaches it
 
-Per `SOUL.md §0`, the Planning Agent delegates to it only through kanban cards. Scheduled runs on its profile are not cards; see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/).
+Per `SOUL.md §0`, the Planning Agent delegates to the Platform Agent exclusively through kanban cards. Scheduled runs on its profile are cron jobs rather than cards; see [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/).
 
-1. A card is assigned to it, usually filed by the Planning Agent, and it is invoked with `work kanban task <id>`.
-2. It reads the request with `kanban_show` and does the work.
-3. On a long job it reports progress as it goes with `kanban_heartbeat(note=…)`. The notes accumulate into a single rolling `⏳` message that the notifier edits in place, so the thread stays current without waking the Planning Agent and without notifying the space once per note (`deploy/docker/patches/kanban_progress_lines.py`).
-4. It always finishes with `kanban_complete` or `kanban_block`.
+1. A card is assigned to `platform`, usually filed by the Planning Agent, and a worker is invoked with `work kanban task <id>`.
+2. The worker reads the task with `kanban_show` and executes the work.
+3. On a multi-minute run, it reports milestone updates with `kanban_heartbeat(note=…)`. Notes accumulate into one rolling `⏳` message that the notifier edits in place, keeping the thread current without waking the Planning Agent or notifying the space once per note (`deploy/docker/patches/kanban_progress_lines.py`).
+4. It finishes by calling `kanban_complete` or `kanban_block`.
 
-Child cards are reserved for genuine delegation and parallel work. Each one it creates inherits the chat subscription of its own card, so their completions stay visible too.
+Child cards are reserved for genuine delegation to another specialist (such as per-cluster fan-out to [Cluster Agents](/kube-agents/concepts/cluster-agents/)) or queued follow-up work. Each child card created by a worker inherits the parent card's chat subscription, so its progress notes and completion remain visible in the thread.
 
 ## What the user receives
 
-A completed card's `result` field carries the answer and is posted verbatim into the chat thread. That field — not the one-line `summary` — is what the user actually receives, so `result` is a required argument, enforced by a patch the image applies to the `kanban_complete` tool (`deploy/docker/patches/kanban_result_required.py`).
+A completed card's `result` field carries the full answer and is posted verbatim into the chat thread. Because the user receives `result` rather than the single-line `summary` status header, `kanban_complete` requires `result` (`deploy/docker/patches/kanban_result_required.py`). Any claim the worker records in `verified_claims` carries the exact terminal command and output excerpt from that card (or from a descendant card it created). `kanban_complete` checks each entry against recorded terminal calls and appends an evidence section to `result` (`deploy/docker/patches/kanban_verified_claims.py`).
 
-Because the answer is rendered as Slack blocks, its shape is specified too: `kanban_create` appends a report-format stanza to every card body that does not already give format instructions (`deploy/docker/patches/kanban_report_format.py`). That stanza is an instruction, not a gate. Shape is never a reason to refuse a completion, because a report thrown away for its formatting answers nothing at all.
+Workers write `result` in standard Markdown starting at `##`, and the destination adapter converts it for the chat platform. Slack receives Block Kit headers, tables, and dividers, while Google Chat receives bold headings and flat bullets (splitting at the 4,000-character limit on chat delivery and truncating on cron delivery). At card creation, `kanban_create` appends a report-format stanza to any card body that does not already carry formatting instructions (`deploy/docker/patches/kanban_report_format.py`). That stanza is guidance rather than a completion gate, so a report is never discarded over formatting.
 
-The delivery path measures the result and logs what it finds. A `#` H1 duplicating the card title the chat message already shows, or ASCII section markers Slack renders as flat text, raise a `WARNING` naming the edit; cosmetic defects go to `INFO`.
+At delivery, the notifier inspects the result's shape and logs defects without blocking delivery. A `#` H1 duplicating the card title or ASCII section markers without Markdown structure logs a `WARNING` naming the fix. Cosmetic issues (a heading followed only by list items, or bare high-precision numbers outside backticks) log at `INFO`.
 
 ## Completion guardrails
 
-Patches the image applies to the kanban tools change what these calls do in the cases below.
+Image patches under `deploy/docker/patches/` enforce board and delivery invariants on the kanban tools:
 
-| When the worker…                                                                                                                                             | What happens                                                                                                                                                                             | Patch                          |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| Completes with a blank `result`                                                                                                                              | Refused at most once per card within 15 minutes; the retry is accepted, with `summary` promoted into `result`.                                                                           | `kanban_result_required.py`    |
-| Completes while the card's own fan-out children are unfinished                                                                                               | Told to wait for them and synthesize instead. Refused at most once per card within 15 minutes; the card then closes with whatever the worker sends.                                      | `kanban_children_settled.py`   |
-| Calls `kanban_block(kind="dependency")` with nothing unfinished to wait on (no unfinished parent, and no fan-out child the scheduling repair turns into one) | Refused. The board would hand that card straight to a fresh worker that can't see what the first one already did.                                                                        | `kanban_children_settled.py`   |
-| Calls `kanban_link` after the child has started (running, claimed, or any run on record)                                                                     | Refused, because the link would hold that run behind the new parent. The worker is told to wait for a running child's result, or that a blocked one needs an unblock rather than a link. | `kanban_link_running_guard.py` |
-| Completes after starting a fleet audit (`audit_report.py start` printed its result line) when no `finish` result line came back after the last `start`       | `kanban_complete` is refused with the next step: run `finish`, or block the card. A retry within 15 minutes closes the card with a "Not published" line at the top of the result.        | `kanban_audit_ledger.py`       |
-| Leaves out the ledger URL that a `finish` result line carries                                                                                                | The URL is added to the result.                                                                                                                                                          | `kanban_audit_ledger.py`       |
-| Keeps running after someone else blocks the card                                                                                                             | The worker is stopped. A worker whose run has ended is told to stop rather than retry.                                                                                                   | `kanban_ended_run.py`          |
-| Completes while a declared plan step is not `done` (see [Plans](#plans))                                                                                     | Refused on every attempt, not once.                                                                                                                                                      | `kanban_children_settled.py`   |
+| When the worker…                                                                                                                                         | What happens                                                                                                                                                | Patch                          |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| Completes with a blank `result`                                                                                                                          | Refused once per card within 15 minutes; a retry within that window is accepted with `summary` promoted into `result`.                                      | `kanban_result_required.py`    |
+| Passes an unverified entry in `verified_claims`                                                                                                          | Refused once per card within 15 minutes listing every failing claim; on retry within that window, failing claims are dropped rather than shown as verified. | `kanban_verified_claims.py`    |
+| Completes a `gke-rightsizing-checks` card missing its opening dependency lines or required checks, or a parent card that drops a child's dependency line | Refused once per card within 15 minutes (sharing `verified_claims`'s gate); a retry within that window is accepted unchanged and logged.                    | `kanban_rightsizing_checks.py` |
+| Spawns a `platform` card without gating it behind its own card in `parents`                                                                              | `kanban_create` refuses the concurrent copy so two `platform` workers do not execute the same request in parallel.                                          | `kanban_self_copy.py`          |
+| Completes while its fanned-out child cards are unfinished                                                                                                | Refused once per card within 15 minutes and told to wait and synthesize; a retry within that window closes the card with whatever the worker sends.         | `kanban_children_settled.py`   |
+| Calls `kanban_block(kind="dependency")` with nothing unfinished to wait on                                                                               | Refused so the board does not immediately re-dispatch the card to a fresh worker lacking the first worker's context.                                        | `kanban_children_settled.py`   |
+| Calls `kanban_link` after the child has started (running, claimed, or with a recorded run)                                                               | Refused so an active run is not held behind a new parent; the worker is told to wait on a running child or unblock a blocked one.                           | `kanban_link_running_guard.py` |
+| Completes after `audit_report.py start` printed its result line without a matching `finish` result line                                                  | Refused once with instructions to run `finish` or block the card; a retry within 15 minutes closes the card prefixed with a "Not published" notice.         | `kanban_audit_ledger.py`       |
+| Omits a ledger URL that `audit_report.py finish` printed                                                                                                 | Each missing ledger URL is appended to `result`.                                                                                                            | `kanban_audit_ledger.py`       |
+| Keeps running after someone else blocks the card, or calls completion tools after its run has ended                                                      | An external block stops the worker process; a worker whose run has ended receives a latched refusal telling it to stop rather than retry.                   | `kanban_ended_run.py`          |
+| Completes while a declared plan step is not `done` (see [Plans](#plans))                                                                                 | Refused on every attempt until every declared step is `done` or the card blocks.                                                                            | `kanban_children_settled.py`   |
 
-All patches live under `deploy/docker/patches/`.
-
-The fleet-audit check reads the worker's own session record. It lets the completion through without a refusal when that record cannot be read, or when the output of `audit_report.py finish` after the last `start` was too large to keep in the record. When the refused result cannot be saved on the card, it closes the card at once, marked "Not published".
+The fleet-audit check inspects tool outputs in the worker's Hermes session store. It fails open if the session record cannot be read or if `audit_report.py finish` output after the last `start` exceeded Hermes's inline result limit and was moved to a file. If the refused `result` cannot be stashed on the card first, the completion is accepted immediately with a "Not published" prefix.
 
 ### Plans
 
-A card can carry a plan: `step <key>: planned` lines, one per deliverable, in the card's body or its comments. The worker moves each to `done` or `failed` with `kanban_comment`, and the latest line per key counts.
+A card can carry a plan: `step <key>: planned` lines, one per deliverable, in the card's body or its comments. The worker moves each step to `done` or `failed` with `kanban_comment`, and the latest line per key counts.
 
-A step line is recognised when:
+A step line is recognized when:
 
-- `<key>` starts with a letter and is letters, digits and hyphens, at most 40 characters.
-- The status ends the line, or is followed by a separated reason (`step substrate: failed - helm has no credentials`). Up to three closing marks such as `.`, `!` or an emoji are allowed after the status, a checklist box may lead the line, and backticks and `*` around the key or status are ignored.
+- `<key>` starts with a letter and contains only letters, digits, and hyphens, up to 40 characters.
+- The status ends the line or precedes a separated reason (`step substrate: failed - helm has no credentials`). Up to three closing marks (`.`, `!`, or an emoji) may follow the status, a checklist box may lead the line, and surrounding backticks or `*` around the key or status are ignored.
 
-Only comments by the card's assignee count, so an answer the Planning Agent relays onto a `needs_input` card can't rewrite the record. For the same reason, a step the requester drops after a block is recorded by the worker itself, as `step <key>: done - dropped at the requester's request`.
+Only comments written by the card's assignee count, so a user reply relayed onto a `needs_input` card by the Planning Agent cannot rewrite the step record. When a requester drops a deliverable after a block, the worker records that change itself as `step <key>: done - dropped at the requester's request`.
 
-While any declared step is not `done`, `kanban_complete` is refused on every attempt, so a card whose deliverable was not delivered cannot close as `done`: the worker blocks it, naming what was left behind, or runs out of turns. A card with no step lines is unaffected.
+While any declared step is not `done`, `kanban_complete` is refused on every attempt, preventing a card with an undelivered step from closing as `done`: the worker either blocks the card naming what remains or exhausts its turn budget. Cards without step lines are unaffected.
 
 ## Core truths (from `SOUL.md §1`)
 
-- **Automation first.** All infrastructure changes route through a declarative workflow — Git PRs, Config Connector, ArgoCD/Flux, whichever is active. The agent is explicitly forbidden from applying YAML directly for infrastructure lifecycle changes.
-- **Dynamic multi-repository resolution.** On startup, the agent reads the configured GitOps repo URLs from the ConfigMap specified in `$GITOPS_STATE_CONFIGMAP`. No hardcoded single-repo assumptions.
-- **Dynamic project resolution.** The agent reads its GCP project, location, and cluster from `$GKE_PROJECT_ID` / `$GKE_LOCATION` / `$GKE_CLUSTER_NAME`, which the operator injects from the `PlatformAgent` resource. No hardcoded project IDs — and never `-` in the project segment of a resource path, which GKE accepts only as the location wildcard.
-- **Continuous expertise.** The agent pulls the latest GitOps repo contents and maintains an expert-level understanding of every declarative definition in the fleet.
-- **Grounded, current knowledge.** Resolves GKE and Kubernetes specifics (APIs, schemas, versions, deprecations, configuration semantics) against `mcp-developer_knowledge` (`search_documents`, then `get_documents` for a full page) before relying on memory or web search. It does not call `answer_query`, whose quota is 50 requests a day per project, shared by every agent in the install.
-- **Security through strict separation.** Tenant isolation is non-negotiable — namespaces, RBAC, `NetworkPolicy`, `ResourceQuota`. A workload is physically constrained to its allocated namespace.
-- **Least privilege.** The agent's Kubernetes identity is read-only and cannot read Secrets. Its GCP identity is governed by an install-time permission set (`read-only` by default; widening it means choosing `custom` and naming every role) — see [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do) for exactly what is enforced on which plane.
-- **Autonomous recovery.** Retries transient auth/IAM/identity failures via a bounded ladder (5 iterations or ~10 minutes per distinct blocker) before escalating to a human.
-- **User intent priority.** "Fix it for me", "directly", "do it", "loop until done" are permission-granting phrases — the agent proceeds without confirmation. Destructive or irreversible operations (cluster deletion, tenant offboarding, broad IAM revocation) still require explicit human sign-off no matter what phrasing is used.
-- **Proactive stance.** The agent doesn't wait to be asked. It surfaces drift, version skew, security baseline violations, IaC/live divergence, and policy gaps — and proposes fixes through the declarative workflow, for what it finds on its own. A question gets its answer, fix included, in the reply; the pull request is opened when you ask for it.
+All infrastructure, access-boundary, and workload lifecycle changes route through the active declarative workflow — Git pull or merge requests (via `submit-suggestion` for one-off changes and `fleet-audit` for scheduled audit ledgers and remediation PRs), Config Connector, or ArgoCD/Flux. Direct `kubectl apply` and manual cluster mutations are forbidden.
+
+On startup and during execution, the agent runs `python3 "$HERMES_HOME"/scripts/gitops_preflight.py --list` rather than assuming a single repository or reading an environment ConfigMap variable. Repositories on the `MANAGED:` line (`managed_repos`) are polled, audited, and targeted for pull requests. Repositories on the `CONTEXT:` line (`context_repos`) are consulted strictly for declared intent and are never swept, audited, or sent pull requests.
+
+The operator injects `$GKE_PROJECT_ID` (alongside `$GKE_LOCATION` and `$GKE_CLUSTER_NAME`) from the `PlatformAgent` resource. Commands read those variables at runtime and write resolved values in human-facing reports, and never pass `-` in the project segment of a GCP resource path (GKE accepts `-` only as the location wildcard). For current GKE and Kubernetes schemas, version availability, deprecations, and error semantics, the agent queries `mcp-developer_knowledge` (`search_documents`, followed by `get_documents` when a chunk needs its surrounding page) before falling back to `web_search`. It does not call `answer_query`, whose 50-request daily project quota is shared across every agent in the install.
+
+Tenant workloads are isolated to their allocated namespaces through RBAC, `NetworkPolicy`, and `ResourceQuota`. The agent runs with read-only Kubernetes visibility (no `Secret` reads) and an install-time GCP IAM permission set (`read-only` by default; widening it requires `custom` and explicit roles — see [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do)).
+
+When a run hits transient authentication or convergence delays — an expired token, an HTTP 401 `Unauthenticated`, or a fresh binding still propagating — it retries through a bounded recovery ladder. That ladder allows up to 5 iterations or roughly 10 minutes per blocker, stopping early when the same structural obstacle blocks two attempts. Authorization denials are terminal on the first occurrence: a Kubernetes HTTP 403 `Forbidden`, a Google Cloud HTTP 403 `PERMISSION_DENIED`, or a credential-proxy command-policy write refusal stops work on that action without workaround hunting. The runtime also halts the turn on the first `kubectl` write refused by `kubernetes.read-only` (`tool_loop_guardrails.permission_refusal_halt_after: 1` in `agents/platform/config.yaml`, enforced by `deploy/docker/patches/permission_refusal_stop.py`).
+
+Action-granting prompts ("fix it for me", "directly", "do it", "loop until done") authorize the agent to proceed without routine confirmation questions, except for destructive or irreversible operations (cluster deletion, tenant offboarding, broad IAM revocation), which always require explicit human sign-off. On scheduled runs and sweeps, the agent proactively surfaces RBAC or IaC drift, version skew, security-baseline violations, and policy gaps through the declarative workflow. When answering a question in chat, it puts the recommended manifest or diff in the reply and opens a pull request only when the requester asked for a change to be submitted.
 
 ## Runtime wiring
 
-The persona runs inside the Platform Agent Deployment on top of the [Hermes runtime](https://github.com/NousResearch/hermes-agent) (`nousresearch/hermes-agent`). The wiring lives in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml).
+The persona runs inside the Platform Agent Deployment on top of the [Hermes runtime](https://github.com/NousResearch/hermes-agent) (`nousresearch/hermes-agent`). Its profile overlay lives in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml), merged over [`deploy/shared/defaults/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/shared/defaults/config.yaml) at image build; see [Config reference](/kube-agents/reference/config/) for the full annotated configuration.
 
 ### MCP servers
 
-| Server                | Where                                                                                      | Purpose                                                                            |
-| --------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`                                   | Session and agent-internal ops (chat ingress now lives with the Planning Agent).   |
-| `developer_knowledge` | Remote via `mcp-remote` and the credential proxy → `developerknowledge.googleapis.com/mcp` | Authoritative Google Cloud and GKE documentation, API schemas, and best practices. |
-| `gke`                 | Remote via `mcp-remote` and the credential proxy → `container.googleapis.com/mcp`          | Kubernetes/GKE cluster reads; the server's write tools are not offered.            |
+| Server                | Where                                                                                      | Purpose                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`                                   | Session and agent-internal operations (chat ingress lives on the Planning Agent).             |
+| `developer_knowledge` | Remote via `mcp-remote` and the credential proxy → `developerknowledge.googleapis.com/mcp` | Authoritative Google Cloud and GKE documentation, API schemas, and configuration guidance.    |
+| `gke`                 | Remote via `mcp-remote` and the credential proxy → `container.googleapis.com/mcp`          | Read-only Kubernetes and GKE cluster inspection; write tools are neither offered nor relayed. |
 
-The `gke` MCP server reaches Google's remote MCP endpoint for GKE through the credential proxy, which forwards on its own credential and relays only the server's read-only tools; each profile also registers only those read tools. Cluster reads go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`; cluster changes go through a pull request.
+Both remote servers route through the credential proxy's `/v1/mcp/<server>` relay, which authenticates on its own credential and enforces the `gke` read-only tool allowlist (`agents/platform/scripts/mcp_policy.py`); profiles that expose `gke` declare that same `tools.include` allowlist. With `lazy: true`, Hermes registers each server's tool schemas at startup from `<profile>/cache/mcp_schema_cache.json` and defers spawning the MCP server subprocess until its first tool call, avoiding cold-start discovery latency on throwaway kanban workers. The agent holds no raw cloud credentials: MCP reads and brokered `kubectl` / `gcloud` wrapper reads in the shell sandbox both route through the credential proxy (see [Credential isolation](/kube-agents/reference/credential-isolation/)), while cluster changes go through a pull request.
 
 ### Toolsets
 
-`config.yaml` groups the servers into toolsets:
+`config.yaml` declares the `cli` (used by Hermes CLI sessions and dispatcher-spawned kanban workers) and `api_server` (used by the Hermes REST API) `platform_toolsets` profiles, each listing `hermes-cli` or `hermes-api-server` alongside `mcp-platform_control`, `mcp-developer_knowledge`, `mcp-gke`, and `memory`. On this profile, `memory` gates read-only recall against shared memory when an install configures a shared provider (`memory.read_only: true`, `memory.memory_enabled: false`); workers cannot write to shared memory and instead nominate durable findings via `memory_candidates` on completed cards.
 
-- `cli` — used by the Hermes CLI (interactive terminal usage).
-- `api_server` — used by the Hermes REST API (Chat, external callers).
-
-Both include `hermes-cli`/`hermes-api-server` plus `mcp-platform_control`, `mcp-developer_knowledge`, and `mcp-gke`.
-
-A top-level `toolsets: [kanban]` key additionally exposes the kanban orchestrator surface (`kanban_create` and friends), so the Platform Agent can itself create and route cards when it delegates or stages work.
+A top-level `toolsets: [kanban]` key exposes the kanban orchestrator surface (`kanban_create` and companions) outside worker turns, while `agent.disabled_toolsets` strips unused interactive bundles from model requests to keep worker first-token latency low (see [Config reference → `platform_toolsets`](/kube-agents/reference/config/#platform_toolsets)).
 
 ### Plugins
 
-- `hermes_otel` — OpenTelemetry export to the GKE Managed OTel collector.
-- `tool_call_audit` — appends every tool call and approval decision as a structured audit record to the profile's `logs/audit.jsonl`, which the fluent-bit sidecar ships to Cloud Logging as fields ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
-- `incident_context` — injects Kubernetes incident context into known chat threads on reply.
-- `pr_opened` — records each pull or merge request the Platform Agent's kanban workers open on their card, so a Slack thread gets it as a message of its own when `KAGE_SLACK_UX` is on ([ChatOps](/kube-agents/concepts/chatops/)).
+- `hermes_otel` — exports OpenTelemetry traces to the configured OTLP collector (GKE Managed OTel by default).
+- `tool_call_audit` — appends every tool call and approval decision as a structured record to `logs/audit.jsonl`, which the fluent-bit sidecar ships to Cloud Logging ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
+- `incident_context` — registered on both the Platform Agent and Planning Agent profiles; inbound thread replies hit the Planning Agent's gateway, where Kubernetes incident context is injected on reply.
+- `pr_opened` — records each pull or merge request opened by a Platform Agent kanban worker as an event on its card, posting it into the Slack thread as a dedicated message when `KAGE_SLACK_UX` is enabled ([ChatOps](/kube-agents/concepts/chatops/)).
 
-The chat-ingress plugins (`session_store`, `session_otel_bridge`, `chat_metrics`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
+Chat-ingress and front-door plugins run on the Planning Agent profile rather than here — see [Config reference → `plugins`](/kube-agents/reference/config/#plugins) and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
 
 ## Behavioral shape
 
-- **Delegation-first for single-cluster runtime work.** `SOUL.md §6` makes the Platform Agent the fleet orchestrator, not a per-workload operator: work scoped to one cluster's live runtime (crash loops, OOMs, scheduling failures) is delegated to that cluster's read-only [Cluster Agent](/kube-agents/concepts/cluster-agents/) over the kanban board. Fleet-wide audits, provisioning, and the GitOps write path stay with the Platform Agent.
-- **Incident triage discipline.** `SOUL.md §7` codifies how the agent communicates during triage — findings first, concrete evidence, no raw dumps.
-- **Human-readable reports.** Raw JSON, tool schemas, and CLI exit codes never appear in the agent's user-facing messages. Console links are built from the shared URL templates in [`agents/platform/docs/gcp-console-links.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/gcp-console-links.md) (baked into the image at `/opt/defaults/docs/` and inlined in `SOUL.md §5`).
+`SOUL.md §6` makes the Platform Agent the fleet coordinator rather than a single-cluster runtime debugger. Live workload debugging on one cluster (crash loops, OOM kills, scheduling failures) is delegated to that cluster's read-only [Cluster Agent](/kube-agents/concepts/cluster-agents/) over the kanban board, while fleet-wide audits, cluster lifecycle, and the GitOps write path stay with the Platform Agent.
+
+During incident triage (`SOUL.md §7`), responses lead with the finding and action and stay under a 2,000-character prose target (well inside Google Chat's 4,000-character message limit). They translate Kubernetes status codes in parentheses beside the raw signal and use at most three `##` sections (`What's wrong`, `Why`, and `What to do`).
+
+Across all user-facing messages, raw JSON, tool schemas, and CLI exit codes are omitted, while pull requests, cards, and ledger issues carry direct URLs. Named GCP clusters, workloads, and console views carry links built from [`agents/platform/docs/gcp-console-links.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/gcp-console-links.md), baked into the image at `/opt/defaults/docs/` and inlined in `SOUL.md §5`.
 
 ## Where to go next
 
@@ -120,3 +119,4 @@ The chat-ingress plugins (`session_store`, `session_otel_bridge`, `chat_metrics`
 - [Skills](/kube-agents/concepts/skills/) — the loadable capability bundles.
 - [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) — the cron surface that makes it proactive.
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the GitOps PR path all mutations take.
+- [Config reference](/kube-agents/reference/config/) — full annotated reference for `agents/platform/config.yaml`.

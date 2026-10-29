@@ -74,8 +74,8 @@ on it.
 
 ### R2 — Scheduled
 
-- The capability fires on a cron schedule in its own process with the Platform Agent's persona,
-  tools, and turn budget, as the governance audits do today.
+- The capability fires on a cron schedule in its own process with the Platform Agent's persona
+  and tools and the entry's own turn budget, as the governance audits do today.
 - A clean run posts nothing — with one exception, R5's announcement of an applied criteria
   change; a run with findings, or a failed run, reaches chat through the relay and the operator
   can reply in that thread.
@@ -158,8 +158,10 @@ configures — a gateway turn by default, or on `dispatch: kanban` a task owned 
 - Every applied change is announced in the capability's next report — what changed, why the agent
   thinks so, and how to revert it — so nothing moves silently. An applied change therefore makes
   that next run **audible**: today the helper decides silence from the run's own findings alone
-  (`silent_ok` in the `fleet-audit` helper: nothing new or resolved, no new or changed coverage gap, no
-  remediation pull request opened or closed), and a criteria change is none of those, so "first run after a criteria change" becomes one more
+  (`silent_ok` in the `fleet-audit` helper: on a scheduled run only, nothing new or resolved, no new
+  or changed coverage gap, no remediation pull request opened or closed, and the same findings as
+  the last scheduled run; see
+  [ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)), and a criteria change is none of those, so "first run after a criteria change" becomes one more
   condition that cancels silence. The announcement lands in the capability's **chat thread**
   through the relay, not the ledger — the same run may close the ledger issue, and a closed issue
   is where nobody reads.

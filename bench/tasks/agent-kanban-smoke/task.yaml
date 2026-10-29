@@ -21,8 +21,8 @@
 # swung 50s to 1618s, and on the 1618s run the improvisation went as far as
 # filing a REAL pull request against the eval GitOps repository. Grading
 # chat prose for a fact that lived on the board, on top of a work order with
-# no defined deliverable, was the flake. The board write is still asserted
-# below; the title and the receipt's wording are not, anywhere.
+# no defined deliverable, was the flake. The board write stayed asserted
+# until #4004; the title and the receipt's wording are not, anywhere.
 #
 # The deliverable is deterministic because the fleet is planted: every eval
 # project carries the seeded trio (bench/tf/fleet/), and "seeded-a",
@@ -38,14 +38,17 @@
 # Expected cost bracket: ~100-300s — one delegation round trip plus a single
 # fleet read, the shape the six domain probes budget at 150-350s, instead of
 # an open-ended work order.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the answer
+# that comes back names the planted fleet. It does not grade how the agent got
+# there (whether a kanban card was filed).
 id: agent-kanban-smoke
 name: Agent kanban smoke test
 prompt: >-
   Which GKE clusters are we running in this project right now? Give me the
   list.
 expected_output: >-
-  The front door files a kanban card for the question rather than guessing,
-  and the specialist's answer is delivered back into the thread: a list of
+  The specialist's answer is delivered back into the thread: a list of
   the project's GKE clusters read from the live fleet, naming the three
   seeded clusters (seeded-a, seeded-b and seeded-c) from observed evidence.
   Extra clusters in the list are expected — the agent's own host cluster is
@@ -82,14 +85,14 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["seeded-a", "seeded-b", "seeded-c"]
-  - name: the-kanban-card-was-actually-filed
+  # The same names inside a delivered card result, the report the notifier
+  # posts into the conversation on next ("Result of delegated task <id>:",
+  # harness._append_delivered): a front door that answered from memory, with
+  # no specialist reading the fleet, does not pass.
+  - name: the-specialists-answer-names-the-planted-fleet
     role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      # An errored kanban_create filed no card, so only successful
-      # calls count toward this objective.
-      require_success: true
+      type: report_contains
+      required_patterns:
+        - 'result of delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-a)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-b)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?seeded-c)'

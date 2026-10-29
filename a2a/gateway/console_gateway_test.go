@@ -267,6 +267,31 @@ func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
 	}
 }
 
+// A turn that handed work to kanban cards (the bridge's handoff artifact)
+// says so on its frame, so a console client waits for the cards' reports;
+// one that did not leaves the field off (TestAConsoleAnswerIsATerminalFrame
+// pins that), and the client need not wait.
+func TestAConsoleTurnThatFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-cards", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, exec, "checking the fleet.")
+	waitFor(t, "the terminal frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	if got := r.adapter.terminalPosts()[0]; !got.CardsPending || got.TaskID != origin.TaskID {
+		t.Fatalf("terminal frame = %+v, want cardsPending for %s", got, origin.TaskID)
+	}
+}
+
 // A failure on a console conversation is a terminal frame too, carrying the
 // notice text.
 func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
@@ -582,6 +607,27 @@ func TestTheConsoleStashEvictsOneEntryAtTheCap(t *testing.T) {
 	}
 }
 
+// A card filed in a delegated child's turn names the child in its reply_to;
+// the console client was told of the chain only under its root, so the
+// report's replyTo is mapped to the root. A task the record does not hold
+// passes through unchanged.
+func TestAConsoleReportFromADelegatedChildRepliesToTheRoot(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := consoleKeyPrefix + "t-replyto"
+	origin, _, child := delegated(t, r, spawn, conv, "")
+	conversations := r.g.Conversations(r.adapter).(gatewayConversations)
+	ctx := context.Background()
+	if got := conversations.ReplyToRoot(ctx, conv, child.TaskID); got != origin.TaskID {
+		t.Errorf("the child's reply_to maps to %q, want the root %q", got, origin.TaskID)
+	}
+	if got := conversations.ReplyToRoot(ctx, conv, "task-unknown"); got != "task-unknown" {
+		t.Errorf("an unknown task maps to %q, want it unchanged", got)
+	}
+	if got := conversations.ReplyToRoot(ctx, conv, origin.TaskID); got != origin.TaskID {
+		t.Errorf("the root maps to %q, want itself", got)
+	}
+}
+
 // An end the gateway declares itself carries no executor reason; its frame
 // says what the page's notice says (the bus was unreachable, or the heal
 // released a task that produced nothing), not the bare "the task failed".
@@ -604,5 +650,62 @@ func TestAConsoleGatewayDeclaredEndIsWordedBySource(t *testing.T) {
 		if last := got[len(got)-1]; last.Text != tc.want {
 			t.Errorf("source %v: frame text %q, want %q", tc.source, last.Text, tc.want)
 		}
+	}
+}
+
+// The cards are usually filed in a delegated child's turn: the child's
+// handoff marks the chain's root, and the chain's one frame (the wake's end,
+// under the root) carries cardsPending.
+func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	r.adapter.setTakesTerminals()
+	conv := consoleKeyPrefix + "t-chain-cards"
+	origin, _, child := delegated(t, r, spawn, conv, "")
+	cexec := r.execFor(t, child, targetPlatform)
+	if err := cexec.PublishArtifact(context.Background(), lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, cexec, "checking the fleet.")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	completeTask(t, r.execFor(t, wake, wakeSession), "platform is checking the fleet; its report will follow.")
+	waitFor(t, "the chain's frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	got := r.adapter.terminalPosts()
+	if len(got) != 1 || got[0].TaskID != origin.TaskID || !got[0].CardsPending {
+		t.Fatalf("terminal frames = %+v, want one for %s with cardsPending", got, origin.TaskID)
+	}
+}
+
+// The heal reads the task's fold from the stream, handoff included, so a
+// frame it produces carries cardsPending as the relay's does.
+func TestAHealedConsoleTaskThatFiledCardsSaysSo(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	conv := "console:tab-heal-cards"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, exec, "checking.")
+	waitFor(t, "the relay's frame", func() bool { return len(r.adapter.terminalPosts()) == 1 })
+
+	// Fake the relay having missed the terminal, as the heal finds it.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m2", Text: "next question"}
+	waitFor(t, "the heal's frame", func() bool { return len(r.adapter.terminalPosts()) == 2 })
+	if got := r.adapter.terminalPosts()[1]; !got.CardsPending || got.TaskID != origin.TaskID {
+		t.Fatalf("the heal's frame = %+v, want cardsPending for %s", got, origin.TaskID)
 	}
 }

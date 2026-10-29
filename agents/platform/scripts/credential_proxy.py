@@ -600,13 +600,26 @@ ADMISSION_BOUNDS = frozenset(
 # and is counted by ADMISSION_REFUSALS_METRIC instead. The top bucket holds
 # the waits that were answered just under it.
 ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
-# The version-control route's counter, by verb and outcome: the series the
-# operator reads `status.usage.remediationsProposedTotal` from, as
-# `verb="proposal-create",status="success"`. The verb label is the route
-# table's vocabulary (vcs_broker.VCS_VERBS) or LABEL_OTHER; the status label
-# reuses the exec route's outcome words.
+# The version-control route's counter, by verb, outcome and provider: the
+# series the operator reads `status.usage.remediationsProposedTotal` from, as
+# `verb="proposal-create",status="success"` summed over the provider. The verb
+# label is the route table's vocabulary (vcs_broker.VCS_VERBS) or LABEL_OTHER;
+# the status label reuses the exec route's outcome words; the provider label
+# is the built forge the route resolved the repository to (VCS_PROVIDERS, else
+# LABEL_OTHER) or VCS_PROVIDER_NONE when the route resolved no built forge:
+# every `capabilities` request (ungated; its route resolves a forge this
+# counter never sees), a host this
+# install serves no forge for (a registry stub, or no entry at all), and any
+# exit before the resolve (a verb refused, failed, busy or abandoned ahead of
+# the managed-repository resolve).
 VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
+VCS_PROVIDER_LABEL = "provider"
+VCS_PROVIDER_NONE = "none"
+# The provider label's closed set: the names of the forge classes this image
+# ships (providers.AVAILABLE), which is also the set the registry admits a
+# configured forge from, so a configured forge's name is always in it.
+VCS_PROVIDERS = frozenset(cls.name for cls in providers.AVAILABLE)
 # Proposals this install opened that the forge reports merged, counted once
 # each per broker process as the broker's reads show them
 # (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
@@ -616,7 +629,8 @@ VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
 # counted the same way beside the merged series; the series the operator reads
 # `status.usage.remediationsClosedUnmergedTotal` from. No labels.
 VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
-# The broker's own failures, by kind: work it took on and could not carry out
+# The broker's own failures, by kind and, for a timeout, by the tool it ran:
+# work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
 # code and never a refusal. A second count beside the tool counter rather
 # than a new status in it, so toolExecutionsTotal keeps its meaning across
@@ -624,6 +638,11 @@ VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
 # status.usage.brokerFailuresTotal.
 BROKER_FAILURES_METRIC = "kubeagents_broker_execution_failures_total"
 BROKER_FAILURE_KIND_LABEL = "kind"
+# The second label: the tool a timed-out command was running, from the same
+# closed set the invocations counter uses (an executable the broker serves,
+# else LABEL_OTHER); every other kind has no tool and carries the fixed word.
+BROKER_FAILURE_TOOL_LABEL = "tool"
+BROKER_FAILURE_TOOL_NONE = "none"
 # A brokered command that ran past its deadline (exit 124), recorded where
 # the command completes.
 BROKER_FAILURE_EXEC_TIMEOUT = "exec_timeout"
@@ -774,6 +793,7 @@ AUDIT_STATUS_BUSY = "busy"
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
+RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -952,6 +972,19 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # caller only where no roles are established at all (the NullAuthenticator
 # posture behind the socket).
 
+# The A2A MCP server's audience. That pod is a Go process that answers MCP
+# tool calls from outside the cluster, and its one use of this broker is to
+# read a proposal on a managed repository (the inspect_pr tool) without a
+# forge token of its own. An audience of its own rather than a share of the
+# a2a-chat one, because what the role may do is narrower than any existing
+# role's and the narrowing is per verb, not per route (ROLE_VCS_VERBS below):
+# a shared audience would hand the MCP pod the chat relay, or the A2A gateway
+# the version-control routes. Same upgrade story as the chat audience: unset
+# means the role is never conferred, so a broker on this image rendered by an
+# operator that predates the MCP pod answers that pod's token 401, "audience
+# not known", rather than with some other role's reach.
+DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
+
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
@@ -967,6 +1000,11 @@ CALLER_ROLE_SESSION = "session"
 # the Hermes container beside it, and it reaches the watcher routes and nothing
 # else.
 CALLER_ROLE_WATCHER = "watcher"
+# The A2A MCP server pod. The version-control routes only, and within them the
+# read verbs ROLE_VCS_VERBS names: the pod answers callers outside the cluster,
+# so nothing it can be asked to do may write to a forge, clone into the broker,
+# or spend the forge credential on anything but a read of a managed repository.
+CALLER_ROLE_MCP = "mcp"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -981,6 +1019,7 @@ CALLER_ROLES = (
     CALLER_ROLE_A2A_CHAT,
     CALLER_ROLE_SESSION,
     CALLER_ROLE_WATCHER,
+    CALLER_ROLE_MCP,
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
@@ -997,6 +1036,78 @@ def executable_permitted(role: str, executable: str) -> bool:
     """Whether ``role`` may run ``executable`` through /v1/exec."""
     narrowed = ROLE_EXECUTABLES.get(role)
     return narrowed is None or executable in narrowed
+
+
+# Which `POST /v1/vcs/<verb>` verbs a role may reach, checked on the verb after
+# the dispatcher folds underscores into hyphens and before the route lookup or
+# the body read. An allowlist, so a spelling that is no verb (`Proposal-View`,
+# `proposal-view/x`, a query string) is refused here rather than reaching the
+# route table's 404. A role absent here keeps every verb the route table
+# serves: the shell's surface is unchanged, and so is the no-role principal
+# behind the socket.
+#
+# The MCP role is read-only by construction, one verb:
+#
+#   * proposal-view: the inspect_pr tool. One proposal, with its diff and
+#     comments when asked; a GET on the forge, spent on a managed repository
+#     only (the managed-list check in `_dispatch_vcs_post` runs for every verb
+#     but `capabilities`).
+#
+# Left out although they are reads, because nothing the MCP pod does today
+# needs them and each is a widening argued in the change that does:
+# `proposal-list` and `proposal-commits` (more of the same repository, no
+# tool asks for it), `issue-list` / `issue-view` (another object kind),
+# `capabilities` (ungated by the managed list, so it would resolve any
+# repository the registry knows), `branch-view` and `identity` (the forge
+# credential's own login and reach, which the MCP pod has no use for), and
+# `clone` (fills the broker's disk on a caller's say-so).
+ROLE_VCS_VERBS: dict[str, frozenset[str]] = {
+    CALLER_ROLE_MCP: frozenset({"proposal-view"}),
+}
+
+
+def vcs_verb_permitted(role: str, verb: str) -> bool:
+    """Whether ``role`` may reach ``POST /v1/vcs/<verb>``.
+
+    ``verb`` is the dispatcher's normalised spelling (underscores folded into
+    hyphens); anything else is compared as given and so refused for a narrowed
+    role.
+    """
+    narrowed = ROLE_VCS_VERBS.get(role)
+    return narrowed is None or verb in narrowed
+
+
+def _validate_role_vcs_verbs(table: dict[str, frozenset[str]]) -> None:
+    """Refuse a ``ROLE_VCS_VERBS`` entry that is not what it appears to be.
+
+    Every key must be a caller role and every value a frozenset (a bare string
+    would make ``verb in narrowed`` a substring test, and "view" is in
+    "proposal-view"). Every verb must be one the route table serves, so a typo
+    does not read as policy. And the MCP entry must hold no write verb: that
+    role exists to read on behalf of callers outside the cluster, and a write
+    added to its set is the escalation this table is here to make loud. Raised
+    at import, as `_validate_route_roles` is, so a mis-edit is a red test.
+    """
+    for role, verbs in table.items():
+        if role not in CALLER_ROLES:
+            raise ValueError(f"ROLE_VCS_VERBS: {role!r} is not a caller role")
+        if not isinstance(verbs, frozenset):
+            raise TypeError(
+                f"ROLE_VCS_VERBS[{role!r}]: the verbs must be a frozenset, not {type(verbs).__name__}"
+            )
+        unknown = verbs - vcs_broker.VCS_VERBS
+        if unknown:
+            raise ValueError(
+                f"ROLE_VCS_VERBS[{role!r}]: {', '.join(sorted(unknown))} is not a vcs verb"
+            )
+    writes = table.get(CALLER_ROLE_MCP, frozenset()) & vcs_broker.WRITE_VERBS
+    if writes:
+        raise ValueError(
+            f"ROLE_VCS_VERBS[{CALLER_ROLE_MCP!r}]: {', '.join(sorted(writes))} writes to the forge"
+        )
+
+
+_validate_role_vcs_verbs(ROLE_VCS_VERBS)
 
 
 # The kubectl flags a session caller may pass. An allowlist, for the reason
@@ -1163,7 +1274,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # subscription sets, and the prefix is what this table keys the role on.
     (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
-    ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
+    # The MCP pod reaches this family and no other; which verbs within it is
+    # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
+    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
 
@@ -2126,6 +2239,13 @@ class ServiceAccountAuthenticator:
     is non-empty, the session audience is refused to anyone not named in it.
     Empty leaves the audience alone deciding, which is the pre-binding
     behaviour an older operator's rendering still gets.
+
+    ``mcp_callers`` binds the mcp role the same way, for the same reason: a
+    caller named there may present only the mcp audience, and the mcp audience
+    is refused to anyone not named. Unlike the session binding, empty does not
+    leave the audience deciding: the mcp role postdates its binding, so no
+    operator renders the audience without the callers, and an empty set
+    confers the mcp role to nobody.
     """
 
     authenticates = True
@@ -2141,6 +2261,7 @@ class ServiceAccountAuthenticator:
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
         session_callers: frozenset[str] = frozenset(),
+        mcp_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -2151,6 +2272,7 @@ class ServiceAccountAuthenticator:
         self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
         self.session_callers = session_callers
+        self.mcp_callers = mcp_callers
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -2282,6 +2404,12 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a session caller may present only the session audience")
         if role == CALLER_ROLE_SESSION and self.session_callers and username not in self.session_callers:
             raise AuthenticationError("the session audience is only for session callers")
+        if username in self.mcp_callers and role != CALLER_ROLE_MCP:
+            raise AuthenticationError("an mcp caller may present only the mcp audience")
+        # No emptiness guard, unlike the session check above: with no mcp
+        # callers named the mcp audience confers nothing.
+        if role == CALLER_ROLE_MCP and username not in self.mcp_callers:
+            raise AuthenticationError("the mcp audience is only for mcp callers")
         groups = user.get("groups") or []
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
@@ -2342,6 +2470,14 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv("CREDENTIAL_PROXY_SESSION_CALLERS", "").split(",")
         if caller.strip()
     )
+    # The ServiceAccounts the mcp role is bound to, read the same way. Unset
+    # here is not a pre-binding rendering: it means the mcp role is conferred
+    # to nobody (see ServiceAccountAuthenticator).
+    mcp_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_MCP_CALLERS", "").split(",")
+        if caller.strip()
+    )
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -2387,6 +2523,25 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif watcher_audience:
             audience_roles[watcher_audience] = CALLER_ROLE_WATCHER
+        # The A2A MCP server's audience, read raw for the same reason. A
+        # collision with any audience above is refused rather than resolved:
+        # taking it would hand the MCP pod that role's routes, or the other
+        # pod the MCP role's narrower ones.
+        mcp_audience = os.getenv("CREDENTIAL_PROXY_MCP_AUDIENCE", "").strip()
+        if mcp_audience and mcp_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_MCP_AUDIENCE equals the %s audience; the mcp "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[mcp_audience] or CALLER_ROLE_SHELL,
+            )
+        elif mcp_audience:
+            audience_roles[mcp_audience] = CALLER_ROLE_MCP
+            if not mcp_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_MCP_AUDIENCE is set but CREDENTIAL_PROXY_MCP_CALLERS "
+                    "is not; the mcp role is bound to the callers named there, so every "
+                    "caller presenting the mcp audience is refused"
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -2403,10 +2558,17 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                 "is not; the session role only exists once the chat audience split does, "
                 "so the session audience is ignored"
             )
+        if os.getenv("CREDENTIAL_PROXY_MCP_AUDIENCE", "").strip():
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_MCP_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the mcp role only exists once the chat audience split does, "
+                "so the mcp audience is ignored"
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
         session_callers=session_callers,
+        mcp_callers=mcp_callers,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(
@@ -2479,6 +2641,51 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
             handler.connection.settimeout(previous_timeout)
 
 
+# Top-level request-body keys the agent API reads a session id from. A value
+# here must be a string; any other type is refused.
+AGENT_API_SESSION_BODY_KEYS = ("id", "session_id", "sessionId", "gateway_session_key")
+# The longest session id the agent API accepts (Hermes' _MAX_SESSION_HEADER_LEN).
+# Longer top-level strings are message text, not ids, and aren't checked.
+AGENT_API_SESSION_ID_MAX_LEN = 256
+# More distinct short top-level strings than this in one body are refused
+# rather than checked one by one. No caller of the door sends more than a few.
+AGENT_API_MAX_CHECKED_BODY_STRINGS = 256
+# Free-text request-body keys: the agent API reads a message, a prompt, a title
+# or a name from these, never a session id, so the generic check skips them.
+AGENT_API_FREE_TEXT_BODY_KEYS = (
+    "message",
+    "input",
+    "instructions",
+    "text",
+    "title",
+    "name",
+    "prompt",
+    "system_prompt",
+    "system_message",
+)
+
+
+class _BridgeSessionDbs:
+    """The state.db connections one request's bridge-session checks share,
+    opened on first use and closed with the request."""
+
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self.workspace_root = workspace_root
+        self._stack = contextlib.ExitStack()
+        self._connections: list[sqlite3.Connection] | None = None
+
+    def connections(self) -> list[sqlite3.Connection]:
+        if self._connections is None:
+            self._connections = AgentAPIProxyHandler._open_bridge_session_dbs(self._stack, self.workspace_root)
+        return self._connections
+
+    def __enter__(self) -> "_BridgeSessionDbs":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stack.close()
+
+
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
@@ -2517,6 +2724,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _proxy(self) -> None:
+        with _BridgeSessionDbs(self.workspace_root) as dbs:
+            self._proxy_with(dbs)
+
+    def _proxy_with(self, dbs: "_BridgeSessionDbs") -> None:
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {self.external_key}"
         if not hmac.compare_digest(supplied, expected):
@@ -2524,7 +2735,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
         if self._targets_bridge_session(
-            self.path, self.headers, workspace_root=self.workspace_root
+            self.path, self.headers, workspace_root=self.workspace_root, dbs=dbs
         ):
             self._drain_request_body()
             self.send_error(HTTPStatus.FORBIDDEN)
@@ -2547,7 +2758,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return
         body = self.rfile.read(content_length) if content_length else None
         if body and self._targets_bridge_session(
-            self.path, self.headers, body=body, workspace_root=self.workspace_root
+            self.path, self.headers, body=body, workspace_root=self.workspace_root, dbs=dbs
         ):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -2615,6 +2826,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         cls,
         raw_session_id: Any,
         workspace_root: str | Path | None = None,
+        connections: list[sqlite3.Connection] | None = None,
     ) -> bool:
         val = str(raw_session_id or "").strip()
         while (unquoted := urllib.parse.unquote(val)) != val:
@@ -2624,6 +2836,16 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return False
         if sid.lower().startswith("a2a-"):
             return True
+        if connections is not None:
+            return any(cls._descends_from_bridge_session(conn, sid) for conn in connections)
+        with contextlib.ExitStack() as stack:
+            return any(
+                cls._descends_from_bridge_session(conn, sid)
+                for conn in cls._open_bridge_session_dbs(stack, workspace_root)
+            )
+
+    @classmethod
+    def _bridge_session_dbs(cls, workspace_root: str | Path | None = None) -> list[Path]:
         root = Path(
             workspace_root
             or getattr(cls, "workspace_root", "")
@@ -2635,31 +2857,43 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         profiles_dir = root / "profiles"
         if profiles_dir.is_dir():
             db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
-        for db_path in db_paths:
-            if not db_path.is_file():
-                continue
+        return [db_path for db_path in db_paths if db_path.is_file()]
+
+    @classmethod
+    def _open_bridge_session_dbs(
+        cls, stack: contextlib.ExitStack, workspace_root: str | Path | None = None
+    ) -> list[sqlite3.Connection]:
+        connections = []
+        for db_path in cls._bridge_session_dbs(workspace_root):
             try:
-                with contextlib.closing(
-                    sqlite3.connect(
-                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                connections.append(
+                    stack.enter_context(
+                        contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0))
                     )
-                ) as conn:
-                    cur = sid
-                    seen = {cur}
-                    for _ in range(256):
-                        row = conn.execute(
-                            "SELECT parent_session_id FROM sessions WHERE id = ?",
-                            (cur,),
-                        ).fetchone()
-                        parent = str(row[0] or "").strip() if row else ""
-                        if not parent or parent in seen:
-                            break
-                        if parent.lower().startswith("a2a-"):
-                            return True
-                        seen.add(parent)
-                        cur = parent
+                )
             except Exception as exc:
-                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+                LOGGER.debug("could not open %s: %s", db_path, exc)
+        return connections
+
+    @staticmethod
+    def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
+        cur = sid
+        seen = {cur}
+        try:
+            for _ in range(256):
+                row = conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (cur,),
+                ).fetchone()
+                parent = str(row[0] or "").strip() if row else ""
+                if not parent or parent in seen:
+                    return False
+                if parent.lower().startswith("a2a-"):
+                    return True
+                seen.add(parent)
+                cur = parent
+        except Exception as exc:
+            LOGGER.debug("could not inspect a state.db for session %s: %s", sid, exc)
         return False
 
     @classmethod
@@ -2669,16 +2903,20 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         headers: Any,
         body: bytes | None = None,
         workspace_root: str | Path | None = None,
+        dbs: "_BridgeSessionDbs | None" = None,
     ) -> bool:
         """Return True when an external request names an `a2a-*` bridge session or child.
 
         `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
         through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
-        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        headers, request-body session ids, and `state.db`
         child continuations on the external proxy stops a holder of
         `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
         `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
         """
+        if dbs is None:
+            with _BridgeSessionDbs(workspace_root) as own:
+                return cls._targets_bridge_session(path, headers, body, workspace_root, own)
         for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
             raw_values = (
                 headers.get_all(header, [])
@@ -2686,7 +2924,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 else [headers.get(header, "")]
             )
             for raw_val in raw_values:
-                if cls._is_bridge_session_id(raw_val, workspace_root):
+                if cls._is_bridge_session_id(raw_val, connections=dbs.connections()):
                     return True
         raw_path = urllib.parse.urlsplit(path).path
         while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
@@ -2699,7 +2937,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                 return True
             if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
                 if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
-                    raw_segments[idx + 1], workspace_root
+                    raw_segments[idx + 1], connections=dbs.connections()
                 ):
                     return True
         if body:
@@ -2711,12 +2949,24 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                     return True
             else:
                 if isinstance(parsed, dict):
-                    for key in ("session_id", "sessionId", "gateway_session_key"):
-                        if key in parsed and parsed[key] is not None:
-                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
-                                parsed[key], workspace_root
-                            ):
-                                return True
+                    named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
+                    if any(not isinstance(value, str) for value in named):
+                        return True
+                    # Any other top-level string short enough to be a session id is
+                    # checked too, so a field the harness reads an id from doesn't
+                    # need to be named here first.
+                    candidates = set(named) | {
+                        value
+                        for key, value in parsed.items()
+                        if key not in AGENT_API_SESSION_BODY_KEYS
+                        and key not in AGENT_API_FREE_TEXT_BODY_KEYS
+                        and isinstance(value, str)
+                        and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
+                    }
+                    if len(candidates) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
+                        return True
+                    if any(cls._is_bridge_session_id(value, connections=dbs.connections()) for value in candidates):
+                        return True
         return False
 
     @staticmethod
@@ -4170,6 +4420,16 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
 )
 
 
+def _ca_authority(entry) -> str:
+    host = str(entry.get("host") or "").strip().lower()
+    if not host:
+        return ""
+    port = entry.get("port")
+    if port not in (None, "", 0) and not isinstance(port, bool) and ":" not in host:
+        return f"{host}:{port}"
+    return host
+
+
 def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
     """git config that trusts each forge's own CA on that forge's hosts only.
 
@@ -4183,7 +4443,7 @@ def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
     pairs: list[tuple[str, str]] = []
     for entry in entries or ():
         ca_file = str(entry.get("ca_file") or "").strip()
-        host = str(entry.get("host") or "").strip().lower()
+        host = _ca_authority(entry)
         if not ca_file or not host:
             continue
         # Measured in the broker image (git 2.47, libcurl-gnutls): the file
@@ -4201,9 +4461,9 @@ def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
 def forge_ca_sources(entries) -> dict[str, str]:
     """Each forge host that names a CA, mapped to where the CA comes from."""
     return {
-        str(entry.get("host") or "").strip().lower(): str(entry.get("ca_source") or "")
+        _ca_authority(entry): str(entry.get("ca_source") or "")
         for entry in entries or ()
-        if str(entry.get("ca_file") or "").strip()
+        if str(entry.get("ca_file") or "").strip() and _ca_authority(entry)
     }
 
 
@@ -4218,7 +4478,13 @@ def _ca_reading_entries(entries) -> tuple[dict[str, str], ...]:
     except ValueError:
         return ()
     return tuple(
-        {"host": forge.hosts[0], "ca_file": forge.ca_file, "ca_source": forge.ca_source}
+        {
+            "host": f"{forge.hosts[0]}:{forge.port}"
+            if getattr(forge, "port", None) and ":" not in forge.hosts[0]
+            else forge.hosts[0],
+            "ca_file": forge.ca_file,
+            "ca_source": forge.ca_source,
+        }
         for forge in forges
         if forge.ca_file and forge.hosts
     )
@@ -5829,9 +6095,9 @@ class CommandExecutor:
             # It is a colon-separated list, and the empty string is not
             # "allow all" — it is a list containing one empty protocol name,
             # so it allows nothing and breaks every clone. The value must stay
-            # non-empty. `https` alone is correct today because every URL the
-            # skills clone, fetch or push is https (gitops_workspace builds
-            # them from a fixed https prefix).
+            # non-empty. `https` is the base; `_execute` widens it to
+            # `https:http` only when `allow_http` is set for an explicitly
+            # declared `http` forge.
             #
             # It also refuses the `file` protocol, and that is load-bearing
             # rather than incidental: `--upload-pack=<cmd>` and
@@ -6528,6 +6794,8 @@ class CommandExecutor:
         argv: list[str],
         cwd: Path,
         config: tuple[tuple[str, str], ...] = (),
+        *,
+        allow_http: bool = False,
     ) -> ExecutionResult:
         """git the broker issues on its own behalf, in a tree the agent cannot name.
 
@@ -6580,6 +6848,7 @@ class CommandExecutor:
                 cwd=str(cwd),
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
+                allow_http=allow_http,
             )
         self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
         return result
@@ -6603,6 +6872,8 @@ class CommandExecutor:
         cwd: Path,
         check: bool = True,
         config: tuple[tuple[str, str], ...] = (),
+        *,
+        allow_http: bool = False,
     ) -> subprocess.CompletedProcess:
         """git the version-control broker issues, in its own scratch tree.
 
@@ -6640,6 +6911,7 @@ class CommandExecutor:
             cwd=str(cwd),
             containment_root=self.vcs_root,
             extra_config=tuple(config),
+            allow_http=allow_http,
         )
         self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
         if check and result.exit_code != 0:
@@ -7868,6 +8140,8 @@ class CommandExecutor:
         extra_config: tuple[tuple[str, str], ...] = (),
         timeout_seconds: int | None = None,
         caller: socket.socket | None = None,
+        *,
+        allow_http: bool = False,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -7946,6 +8220,8 @@ class CommandExecutor:
                     )
                 )
             )
+        if allow_http:
+            command_environment["GIT_ALLOW_PROTOCOL"] = "https:http"
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         effective_timeout: float = (
@@ -8592,10 +8868,10 @@ class ProxyMetrics:
         self._lock = threading.Lock()
         self._tool_invocations: dict[tuple[str, str, str], int] = {}
         self._requests: dict[tuple[str, str], int] = {}
-        self._vcs: dict[tuple[str, str], int] = {}
+        self._vcs: dict[tuple[str, str, str], int] = {}
         self._merged = 0
         self._closed_unmerged = 0
-        self._failures: dict[str, int] = {}
+        self._failures: dict[tuple[str, str], int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -8680,8 +8956,15 @@ class ProxyMetrics:
         with self._lock:
             self._requests[key] = self._requests.get(key, 0) + 1
 
-    def record_vcs(self, verb: str, status: str) -> None:
-        key = (verb, status)
+    def record_vcs(self, verb: str, status: str, provider: str = VCS_PROVIDER_NONE) -> None:
+        # An exit that named no outcome, or a word outside VCS_STATUSES, is a
+        # fault of the broker's own and counts as one; a None here used to
+        # break every later render, taking the whole exposition down.
+        if status not in VCS_STATUSES:
+            status = TOOL_STATUS_ERROR
+        if provider != VCS_PROVIDER_NONE and provider not in VCS_PROVIDERS:
+            provider = LABEL_OTHER
+        key = (verb, status, provider)
         with self._lock:
             self._vcs[key] = self._vcs.get(key, 0) + 1
 
@@ -8693,10 +8976,12 @@ class ProxyMetrics:
         with self._lock:
             self._closed_unmerged += count
 
-    def record_failure(self, kind: str) -> None:
+    def record_failure(self, kind: str, tool: str = BROKER_FAILURE_TOOL_NONE) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
+        if tool != BROKER_FAILURE_TOOL_NONE and tool not in CommandExecutor.ALLOWED_EXECUTABLES:
+            tool = LABEL_OTHER
         with self._lock:
-            self._failures[kind] = self._failures.get(kind, 0) + 1
+            self._failures[(kind, tool)] = self._failures.get((kind, tool), 0) + 1
 
     def render(self) -> str:
         with self._lock:
@@ -8771,13 +9056,14 @@ class ProxyMetrics:
                     f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
                 ]
         lines += [
-            f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb and outcome.",
+            f"# HELP {VCS_REQUESTS_METRIC} Version-control requests brokered, by verb, outcome and provider (the forge the request resolved to; {VCS_PROVIDER_NONE} when the route resolved no built forge: every capabilities request, a host this install serves no forge for, and any exit before the resolve).",
             f"# TYPE {VCS_REQUESTS_METRIC} counter",
         ]
-        for (verb, status), count in vcs:
+        for (verb, status, provider), count in vcs:
             lines.append(
                 f'{VCS_REQUESTS_METRIC}{{{VCS_VERB_LABEL}="{_escape_label_value(verb)}",'
-                f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
+                f'{TOOL_STATUS_LABEL}="{_escape_label_value(status)}",'
+                f'{VCS_PROVIDER_LABEL}="{_escape_label_value(provider)}"}} {count}'
             )
         lines += [
             f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
@@ -8788,11 +9074,14 @@ class ProxyMetrics:
             f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
         ]
         lines += [
-            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
+            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind (a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error) and, for a command past its deadline, the tool it ran; every other kind carries tool={BROKER_FAILURE_TOOL_NONE}.",
             f"# TYPE {BROKER_FAILURES_METRIC} counter",
         ]
-        for kind, count in failures:
-            lines.append(f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}"}} {count}')
+        for (kind, tool), count in failures:
+            lines.append(
+                f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}",'
+                f'{BROKER_FAILURE_TOOL_LABEL}="{_escape_label_value(tool)}"}} {count}'
+            )
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -9564,7 +9853,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
                 )
                 if result.timed_out:
-                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT)
+                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT, tool=tool_label)
                 self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
                 response = {
                     "status": "completed",
@@ -10804,16 +11093,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
 
-        Counts the request under its verb and outcome once the dispatch has
-        answered, whichever exit it took; the verb label is the route table's
-        vocabulary or LABEL_OTHER, never the path.
+        Counts the request under its verb, outcome and provider once the
+        dispatch has answered, whichever exit it took; the verb label is the
+        route table's vocabulary or LABEL_OTHER, never the path, and the
+        provider is the forge the dispatch resolved, or VCS_PROVIDER_NONE for
+        every exit it took before one resolved.
         """
         # Hyphens and underscores reach the same route. A caller that guessed
         # the punctuation wrong should not get a 404 that reads as though the
         # verb does not exist.
         verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+        self.vcs_provider = VCS_PROVIDER_NONE
         status = self._dispatch_vcs_post(verb)
-        self.metrics.record_vcs(_vcs_verb_label(verb), status)
+        self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
 
     def _dispatch_vcs_post(self, verb: str) -> str:
         """Answer one version-control request and return its outcome label.
@@ -10822,7 +11114,41 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         they are a different protocol: every route here stands alone, holds
         nothing across calls and leaves nothing behind, so there is no handle
         argument for any of them to carry.
+
+        Sets `self.vcs_provider` to the resolved forge's name the moment the
+        managed-repository resolve succeeds on a built forge, so the counter
+        names the forge on every exit after that point (a refused managed
+        list, a forge fault) and the fixed word on every exit before it. A
+        registry stub (a host this install has no forge for, kept in the
+        table to name the gap) is not a forge the request reached, so it
+        leaves the fixed word in place.
         """
+        # The per-verb half of the caller split, ahead of everything that
+        # spends anything: the route table, the request slot, the body read,
+        # the managed-list resolve. `verb` is already normalised by
+        # _handle_vcs_post, so `proposal_create` is refused as the write it
+        # is; any other spelling misses the allowlist and is refused as well.
+        # A handler built without a principal (the route tests) or a
+        # principal with no role is the socket posture and keeps every verb.
+        principal = getattr(self, "principal", None)
+        role = principal.role if principal is not None else ""
+        if not vcs_verb_permitted(role, verb):
+            LOGGER.warning(
+                "vcs verb refused for role role=%s verb=%s rule=%s",
+                role,
+                _sanitize_for_logging(verb),
+                RULE_CALLER_VCS_VERB,
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "error": "this version-control verb is not available to this caller",
+                    "code": "CALLER_VERB_FORBIDDEN",
+                    "rule": RULE_CALLER_VCS_VERB,
+                },
+            )
+            return TOOL_STATUS_BLOCKED
         if self.vcs is None:
             self._json(
                 HTTPStatus.NOT_FOUND,
@@ -10890,6 +11216,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
                         refused = exc.status == HTTPStatus.FORBIDDEN or isinstance(exc, providers.ForgeUnsupported)
                         return TOOL_STATUS_BLOCKED if refused else TOOL_STATUS_ERROR
+                    if not isinstance(forge, providers.StubForge):
+                        self.vcs_provider = forge.name
                     if not self._repository_is_permitted(repository, forge):
                         # Refused on the managed list, or the list itself could
                         # not be read: the first is a refusal, the second a fault.
@@ -10936,7 +11264,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             refusal = self.executor.tls_refusal(str(exc.stderr or "")) if self.executor else None
             if refusal is not None:
                 self._json(HTTPStatus(refusal.status), _redacted_fields(refusal))
-                return
+                # A 502 like the git failure below it: the forge's certificate
+                # did not verify, a fault of the upstream, not a refusal here.
+                return TOOL_STATUS_ERROR
             self._json(
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},

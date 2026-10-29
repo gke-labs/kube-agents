@@ -1,6 +1,7 @@
 # Domain: fleet audits. Journey: a fresh install's onboarding inventory scan has
-# settled, and the four fleet audits it would otherwise leave to their schedules
-# (the next 06:20 UTC, the next Monday for cost) start at once.
+# settled, and the four fleet audits and the upgrade retrospective it would otherwise leave to their schedules
+# (the next 06:20 UTC, the next Monday for cost) start at once, then the upgrade
+# retrospective after them.
 #
 # Nothing in a conversation starts them. The `oobe` cron job
 # (agents/chat/scripts/oobe.py) reads the board for the scan's ranking card and,
@@ -19,18 +20,19 @@
 # deployed image ships one (an install that onboarded before the job existed never
 # got it), then waits up to an hour for the stage to finish its chain. The verifier
 # reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
-# and passes once the stage marked all four audits due, each has a run since its mark
+# and passes once the stage marked all five audits due, each has a run since its mark
 # that got going (running, completed, or ended after its start), and each started only after the one before it
 # ended. On an image without the job nothing starts them, which is this case's red.
 #
 # Isolation class: writes to the install under test. It replaces
 # `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` and `.oobe_audits_fired` for
 # the run and restores them,
-# files two archived cards, and adds and removes the `oobe` job. The four audits
+# files two archived cards, and adds and removes the `oobe` job. The five audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository (with none, its report in the report store) and, when it changed
 # something, posts its summary wherever the install sends audit reports. The
-# runner holds their four streams' locks for the unit (`audit_streams` below), and
+# runner holds their streams' locks for the unit (`audit_streams` below; the stage
+# also starts the upgrade retrospective after the four, so its stream is listed), and
 # every unit on one of those streams first waits up to two hours for a run the
 # install started there, so no audit case runs beside them and the next repetition
 # arms only once they have ended. The runner does not hold the infra lock for it
@@ -39,7 +41,7 @@
 # (unit_state_lock) keeps it apart from bootstrap-discovery-fanout and
 # bootstrap-inventory-ranking-delivery, whose stacks rewrite the same markers and
 # the `oobe` job.
-# Eligible tier: nightly -- each repetition runs the four audits one after another,
+# Eligible tier: nightly -- each repetition runs the five audits one after another,
 # after the previous repetition's have finished (the runner waits for them; run by
 # hand, the stage itself holds its first mark until they end).
 ---
@@ -59,7 +61,8 @@ infrastructure:
 
 validated: false
 
-# Slug per docs/designs/domains.yaml: what starts is four of the fleet audits.
+# Slug per docs/designs/domains.yaml: what starts is four of the fleet audits and
+# the upgrade retrospective.
 domain: fleet-audits
 
 # The turn below makes no tool call on purpose, so bench-gate's liveness rung
@@ -69,12 +72,15 @@ tool_calls_optional: true
 # The streams whose audits the stack starts. The runner holds their locks for the
 # whole unit (hack/ci-eval-pr.sh: task_streams), so no audit case on one of them
 # runs beside these real runs and grades the other's ledger.
+# The retrospective is the fifth audit the stage marks, after the four, and the
+# verifier grades its start like the others'.
 audit_streams:
   [
     fleet-wide-cost-analysis,
     compliance-audit,
     obtainability-audit,
     stockout-prevention,
+    upgrade-retrospective,
   ]
 
 # A turn that needs no tools. The session this reaches is the Planning Agent's,

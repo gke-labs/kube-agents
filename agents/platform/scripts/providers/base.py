@@ -201,6 +201,9 @@ class Forge:
     # CLI-backed forge grants no forge CLI.
     transport = "http"
     cli = ""
+    scheme = "https"
+    schemes: tuple[str, ...] = ("https",)
+    accepts_port = False
     # The second half of an "http" declaration: the API root every path is
     # relative to, per instance because one package serves several hosts, and
     # the "current user" route with the field that names the login (None when

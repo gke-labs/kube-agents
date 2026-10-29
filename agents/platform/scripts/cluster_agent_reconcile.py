@@ -413,8 +413,9 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
     (None, outcome) means the list could not be read; ([], "ok") means the project
     genuinely has no clusters. The caller degrades identically either way — PRUNE
-    runs off `_cluster_exists`, not this list, so a bad list can never delete
-    anything — but the outcome is what tells the bootstrap gate, and the snapshot,
+    reads this list only as proof that a cluster exists, and deletes only on a
+    NotFound from `_cluster_exists`, so a bad list can never delete anything — but
+    the outcome is what tells the bootstrap gate, and the snapshot,
     which projects the roster it is about to read actually covers.
     """
     try:
@@ -1548,6 +1549,18 @@ def reconcile(dry_run: bool = False) -> dict:
     cluster_counts: dict[str, int | None] = {}
     to_list = [e["id"] for e in entries if e["outcome"] is None and e["id"] not in listings]
     listings.update(_list_projects(to_list, listing_deadline, workers, list_budget))
+    # What each project's own `clusters list` named this run, taken before the container
+    # members are filled in below. PRUNE reads it as proof of existence and skips those
+    # describes (#3703). It is never proof of absence: a list can be partial, so a cluster
+    # missing from it is still described, and only a NotFound from that describe deletes.
+    # Asset Inventory rows are left out on purpose: the index lags, and a member project's
+    # describe is the one call that sees an IAM deny on it (the `denied` revision below).
+    seen_by_list: set[tuple[str, str, str]] = {
+        triple
+        for listed, outcome in listings.values()
+        if listed is not None and outcome == OUTCOME_OK
+        for triple in listed
+    }
     for entry in entries:
         # A container member: Asset Inventory named its clusters already.
         if "clusters" in entry and entry["id"] not in listings:
@@ -1793,7 +1806,8 @@ def reconcile(dry_run: bool = False) -> dict:
     log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
     previous_attribution = _previous_attribution(previous)
     unattributed_counts: dict[str, int] = {}
-    # Every profile that will reach the liveness check is described now, `workers` at a
+    # Every profile that will reach the liveness check, and that its project's own list did
+    # not name this run (below), is described now, `workers` at a
     # time under PRUNE's budget, and the loop below reads the answers in profile order, so
     # the log and the report are as they were when the walk was sequential. A policy prune
     # (an excluded cluster) and a scope prune (a retiring project on a clean run) need no
@@ -1813,12 +1827,24 @@ def reconcile(dry_run: bool = False) -> dict:
         and not (identities[name]["project"] not in resolved_ids
                  and lookups_clean and identities[name]["project"] in previously_retiring)
     ]
+    # A cluster its own project's list named this run exists: no describe (#3703). That turns
+    # N describes a tick into roughly the clusters that went away since the last one.
+    listed_alive = [
+        name for name in to_describe
+        if (identities[name]["project"], identities[name]["cluster"], identities[name]["location"]) in seen_by_list
+    ]
+    alive = set(listed_alive)
+    to_describe = [name for name in to_describe if name not in alive]
+    if listed_alive:
+        log(f"{len(listed_alive)} profile(s) are on their project's cluster list this run; "
+            f"describing the other {len(to_describe)}.")
     prune_budget = _prune_budget_seconds(cap, len(to_describe))
     described = _bounded_map(
         lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
         to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
         consequence="inconclusive; the profile is kept",
     )
+    described.update({name: (True, "") for name in listed_alive})
     for name in profiles:
         identity = identities[name]
         if identity is None:
