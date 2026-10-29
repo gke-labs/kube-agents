@@ -318,3 +318,27 @@ func TestSlackLayoutErrorClassifiesAGoneMessage(t *testing.T) {
 		t.Fatalf("message_not_found: %v, want ErrMessageGone alone", err)
 	}
 }
+
+// A waiting plan item draws in_progress, since Slack's task_card refuses
+// pending with invalid_blocks, and its steps stay all done: the open mark
+// follows the item's own status, not the drawn one.
+func TestSlackChatPlanDrawsAWaitingItemInProgressWithItsStepsDone(t *testing.T) {
+	tasks := slackChatPlan(&chatmsg.Plan{Items: []chatmsg.PlanItem{
+		{ID: "t_a", Title: "waiting on you", Status: chatmsg.StatusPending, Steps: []string{"found two", "asked which"}},
+	}})
+	if len(tasks) != 1 || tasks[0]["status"] != chatmsg.StatusInProgress {
+		t.Fatalf("tasks = %v, want one in_progress card", tasks)
+	}
+	raw, err := json.Marshal(tasks[0]["details"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{slackChatStepDone + " found two", slackChatStepDone + " asked which"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("details %s lack %q", raw, want)
+		}
+	}
+	if strings.Contains(string(raw), slackChatStepOpen) {
+		t.Errorf("details %s mark a step open on a waiting item", raw)
+	}
+}

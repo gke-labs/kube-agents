@@ -960,6 +960,10 @@ key and replaces it with the fixed, non-secret sentinel before forwarding to por
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
 
+A proposed route allowlist for this door, owned by kube-agents and part of the
+harness contract, is in the draft
+[`designs/agent-api-door-allowlist.md`](designs/agent-api-door-allowlist.md).
+
 ### GitHub and Minty
 
 The credential broker obtains a Google OIDC identity token and calls Minty.

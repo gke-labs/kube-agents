@@ -289,6 +289,12 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		return e
 	})
 	if err != nil {
+		// The gateway may have begun stopping during the read: leave the
+		// batch to the stop's in-order give-back.
+		if g.runCtx.Err() != nil {
+			g.dropStoppedBatch(sessionKey, batch)
+			return
+		}
 		// A transient KV failure on a terminal event must not lose the
 		// result: each event goes back to the stream for a later try, which
 		// also frees its hold on the durable while KV is down. Redelivered,

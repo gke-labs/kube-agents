@@ -59,6 +59,7 @@ grant it needs.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -66,7 +67,7 @@ import os
 import random
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -98,10 +99,6 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 # result: gcloud was not run through it, and the note is the error.
 KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
-# The exit status a `Run` reports for a command `subprocess.run` killed on
-# its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
-# and patch_readiness.py report, so a timeout reads the same in every manifest.
-TIMEOUT_RC = 124
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
@@ -153,6 +150,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
 from collect import declaration_for, indexed_workspace, release_declaration_for, release_declarations, workload_declarations  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
@@ -871,12 +869,9 @@ def log(msg: str) -> None:
     print(f"[fleet_waste] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
@@ -884,35 +879,6 @@ RunFn = Callable[..., Run]
 # structural rather than typed to `AuthorizedSession` so tests can hand in a
 # stub without importing google.auth, which is not a test-time dependency.
 SessionFn = Any
-
-
-def _text(output: str | bytes | None) -> str:
-    return output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
-
-
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # notwithstanding, and every consumer of `Run` searches and slices it as
-        # str. `collect.py`'s `_text` does the same.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn, env: dict | None = None) -> tuple[object | None, Run]:
-    result = run(argv, env=env)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def object_list(parsed: object) -> list | None:

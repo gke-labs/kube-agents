@@ -1758,6 +1758,7 @@ def _provision(shell, tmp_path, **env) -> Path:
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
             " seeded-token seeded-headroom seeded-qos seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
+            " seeded-scaled-zero"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.

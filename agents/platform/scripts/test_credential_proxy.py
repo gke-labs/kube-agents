@@ -288,6 +288,114 @@ class AgentAPIProxyTest(unittest.TestCase):
                 self.assertEqual(403, raised.exception.code)
                 self.assertEqual("", self.received_authorization)
 
+    def test_refuses_bridge_session_ids_in_any_top_level_body_key(self):
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-body", None, "compression"),
+                ("20261029_090000_bodychild", "a2a-ctx-body", None),
+            ]
+        )
+        id_keys = ("id", "session_id", "sessionId", "gateway_session_key")
+        body_keys = (*id_keys, "conversation", "previous_response_id", "other")
+        for key in body_keys:
+            for value in ("a2a-ctx-body", "A2A-ctx-body", "%612a-ctx-body", "20261029_090000_bodychild"):
+                with self.subTest(key=key, value=value):
+                    self.received_authorization = ""
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                        headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                        data=json.dumps({key: value, "input": "hi"}).encode(),
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)
+                    self.assertEqual(403, raised.exception.code)
+                    self.assertEqual("", self.received_authorization)
+        for key in id_keys:
+            with self.subTest(key=key, value=7):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps({key: 7}).encode(),
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(403, raised.exception.code)
+
+    def test_refuses_a_body_with_more_short_strings_than_it_checks(self):
+        for count, refused in ((256, False), (257, True)):
+            with self.subTest(count=count):
+                self.received_authorization = ""
+                body = {f"k{i}": f"v{i}" for i in range(count)}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}/v1/runs",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps(body).encode(),
+                    method="POST",
+                )
+                if refused:
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request)
+                    self.assertEqual(403, raised.exception.code)
+                    self.assertEqual("", self.received_authorization)
+                else:
+                    with urllib.request.urlopen(request) as response:
+                        self.assertEqual(b"proxied", response.read())
+
+    def test_one_request_opens_each_state_db_once(self):
+        self._seed_state_db_sessions([("plain-parent", None, None)])
+        opened = []
+        real = credential_proxy.AgentAPIProxyHandler._open_bridge_session_dbs.__func__
+
+        def counting(cls, stack, workspace_root=None):
+            opened.append(1)
+            return real(cls, stack, workspace_root)
+
+        with mock.patch.object(
+            credential_proxy.AgentAPIProxyHandler, "_open_bridge_session_dbs", classmethod(counting)
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/sessions/plain-parent/chat",
+                headers={
+                    "Authorization": "Bearer external-secret",
+                    "Content-Type": "application/json",
+                    "X-Hermes-Session-Id": "plain-parent",
+                },
+                data=json.dumps({"message": "hi", "note": "plain-other"}).encode(),
+                method="POST",
+            )
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(b"proxied", response.read())
+        self.assertEqual(1, len(opened))
+
+    def test_allows_body_keys_that_name_no_bridge_session(self):
+        for path, body in (
+            ("/api/sessions", {"id": "web-console-abc", "title": "Web console abc"}),
+            ("/v1/responses", {"conversation": "run-42", "input": "status of a2a-ctx-body?"}),
+            ("/v1/responses", {"input": "hi", "note": "a2a-" + "x" * 300}),
+            ("/api/sessions/web-console-abc/chat", {"message": "a2a-x"}),
+            ("/v1/responses", {"input": "a2a-x"}),
+            ("/v1/responses", {"input": "hi", "instructions": "A2A-x"}),
+            ("/api/sessions", {"session_id": "web-console-abc", "title": "a2a-x"}),
+            ("/api/sessions", {"session_id": "web-console-abc", "system_prompt": "a2a-x"}),
+            ("/api/sessions/web-console-abc/chat", {"message": "hi", "system_message": "a2a-x"}),
+            ("/v1/runs/run-1/steer", {"text": "a2a-x"}),
+            ("/api/jobs", {"name": "a2a-x", "prompt": "a2a-x"}),
+            ("/v1/runs", {"session_id": "plain", "input": "hi", "stream": True, "limit": 3}),
+        ):
+            with self.subTest(path=path, body=body):
+                self.received_authorization = ""
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers={"Authorization": "Bearer external-secret", "Content-Type": "application/json"},
+                    data=json.dumps(body).encode(),
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(b"proxied", response.read())
+                self.assertEqual("Bearer internal-sentinel", self.received_authorization)
+
     def test_allows_non_a2a_session_paths_and_headers(self):
         self._seed_state_db_sessions(
             [

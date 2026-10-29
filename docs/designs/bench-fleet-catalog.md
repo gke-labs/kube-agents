@@ -94,11 +94,11 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-six fixtures: thirty-three across the four cluster slots and three project-scoped. Three
+Thirty-seven fixtures: thirty-four across the four cluster slots and three project-scoped. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
-fixtures are on slot `a`, across the twelve seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
+fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -152,6 +152,7 @@ its roles are never published.
 | `multi-process-container`       | a       | 0   | `deployment/multi-process-worker` in `seeded-shapes`, two forked workers under one 32Mi limit                                                                                                                                     |
 | `node-image-coupled-agent`      | a       | 0   | `daemonset/cni-shaped-agent` in `seeded-shapes`, host networking plus `/etc/cni/net.d` mounted read-only                                                                                                                          |
 | `cuda-pinned-gpu-job`           | a       | 0   | `cronjob/cuda-pinned-trainer` in `seeded-shapes`, suspended, one `nvidia.com/gpu` on an `nvidia-l4` selector with a CUDA 12.2 image                                                                                               |
+| `scaled-zero-gateway`           | a       | 0   | `deployment/storefront` and its Gateway's proxy Deployment in `seeded-scaled-zero` at replicas 0, Gateway `storefront-edge` reporting Programmed=False (NoResources), no controller                                               |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -173,7 +174,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-three roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-four roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -269,15 +270,15 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Thirty-one of the thirty-three are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Thirty-two of the thirty-four are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
-`cuda-pinned-gpu-job`) and `default-pool-headroom`, covering
+`cuda-pinned-gpu-job`), `default-pool-headroom` and `scaled-zero-gateway`, covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
-API deprecation, zonal skew and the upgrade-failure shapes between them. A corpus that leans on these can go green the day the fleet
+API deprecation, zonal skew, the upgrade-failure shapes and the stall watch between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
 exists before the apply returns.
 

@@ -1,6 +1,6 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) will replace the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below, and what the summary, the `lastActiveTime` row and the testing record say about them. That design is of record and not yet implemented, so the rows here still describe what ships.
 
 ## Summary
 

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,116 @@ QUIET_AS_OF = datetime(2026, 8, 28, tzinfo=timezone.utc)
 # inside the recent window (#2747).
 SATURATED_DIR = os.path.join(TESTDATA, "saturated")
 SATURATED_AS_OF = datetime(2026, 10, 8, 18, 30, tzinfo=timezone.utc)
+
+
+RESOURCES_DOC = {"items": [
+    {"metadata": {"name": "kube-agents-evals-3"}, "status": {"state": "reconciling", "owner": "fleet-reconcile", "lastUpdate": "2026-10-27T08:31:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-4"}, "status": {"state": "busy", "owner": "pull-kube-agents-smoke-test-2115", "lastUpdate": "2026-10-27T08:40:00Z"}},
+    {"metadata": {"name": "kube-agents-evals-5"}, "status": {"state": "free", "owner": "", "lastUpdate": "2026-10-27T08:00:00Z"}},
+    "not an object",
+    {"metadata": {}, "status": {"owner": "x"}},
+]}
+
+
+class HeldProjectsTest(unittest.TestCase):
+    def test_the_held_map_names_each_holders_project(self):
+        self.assertEqual(pp._held_from(RESOURCES_DOC), {
+            "kube-agents-evals-3": {"owner": "fleet-reconcile", "state": "reconciling", "since": "2026-10-27T08:31:00Z"},
+            "kube-agents-evals-4": {"owner": "pull-kube-agents-smoke-test-2115", "state": "busy", "since": "2026-10-27T08:40:00Z"},
+        })
+
+    def test_from_dir_reads_the_resources_file_or_says_it_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp).ok)
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+            self.assertTrue(source.ok)
+            self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+            # A capture that is not an object (`jq .items`) is an error line, not a traceback.
+            Path(tmp, pp.BOSKOS_RESOURCES_FILE).write_text("[]")
+            shape = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx", from_dir=tmp)
+        self.assertFalse(shape.ok)
+        self.assertIn("not a JSON object", shape.error)
+
+    def test_the_kubectl_path_lists_the_resource_objects(self):
+        calls = []
+        def fake_run(cmd, timeout=0):
+            calls.append((list(cmd), timeout))
+            return 0, json.dumps(RESOURCES_DOC), ""
+        with unittest.mock.patch.object(pp, "run_cmd", fake_run), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            source = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertTrue(source.ok)
+        self.assertEqual(calls, [(["kubectl", "--context", "my-ctx", "-n", "boskos", "get", "resources.boskos.k8s.io", "-o", "json"], pp.BOSKOS_TIMEOUT_SECONDS)], "the Boskos timeout, like the other Boskos reads")
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (0, "[]", "")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx").error)
+        with unittest.mock.patch.object(pp, "run_cmd", lambda cmd, timeout=0: (1, "", "Error from server (Forbidden)")), unittest.mock.patch.object(pp.shutil, "which", return_value="/usr/bin/kubectl"):
+            denied = pp.fetch_held(pp.BOSKOS_VIA_KUBECTL, "my-ctx")
+        self.assertFalse(denied.ok)
+        self.assertIn("Forbidden", denied.error)
+
+    def test_the_in_cluster_path_needs_the_pods_environment(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+        self.assertFalse(source.ok)
+        self.assertIn("not running in a cluster", source.error)
+        self.assertFalse(pp.fetch_held(pp.BOSKOS_VIA_NONE, "ctx").ok)
+
+    def test_the_in_cluster_path_reads_as_the_pod(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        seen = {}
+        def fake_urlopen(request, timeout=None, context=None):
+            seen.update(url=request.full_url, auth=request.get_header("Authorization"), timeout=timeout)
+            if seen.get("code"):
+                raise urllib.error.HTTPError(request.full_url, seen["code"], "nope", {}, None)
+            return Response(json.dumps(seen.get("body", RESOURCES_DOC)).encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token, ca = Path(tmp, "token"), Path(tmp, "ca.crt")
+            token.write_text("pod-token\n")
+            ca.write_text("not read: the TLS context is stubbed")
+            env = {pp.IN_CLUSTER_HOST_ENV: "10.0.0.1", pp.IN_CLUSTER_PORT_ENV: "443"}
+            with unittest.mock.patch.dict(os.environ, env), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_TOKEN_FILE", str(token)), \
+                    unittest.mock.patch.object(pp, "IN_CLUSTER_CA_FILE", str(ca)), \
+                    unittest.mock.patch.object(pp.ssl, "create_default_context", lambda cafile=None: cafile), \
+                    unittest.mock.patch.object(pp.urllib.request, "urlopen", fake_urlopen):
+                source = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+                self.assertTrue(source.ok, source.error)
+                self.assertEqual(sorted(source.value), ["kube-agents-evals-3", "kube-agents-evals-4"])
+                self.assertEqual((seen["url"], seen["auth"], seen["timeout"]), (f"https://10.0.0.1:443{pp.BOSKOS_RESOURCES_API_PATH}", "Bearer pod-token", pp.BOSKOS_TIMEOUT_SECONDS))
+                # The answer the periodic gets until the RoleBinding exists.
+                seen["code"] = 403
+                denied = pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx")
+                self.assertFalse(denied.ok)
+                self.assertIn("HTTP 403", denied.error)
+                self.assertIn("boskos-crd-reader", denied.error)
+                seen["code"], seen["body"] = None, []
+                self.assertIn("not a JSON object", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+                token.unlink()
+                self.assertIn("no service-account token", pp.fetch_held(pp.BOSKOS_VIA_HTTP, "ctx").error)
+
+    def test_measure_publishes_held_and_its_error(self):
+        code, out = run(from_dir=BREACH_DIR, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertIn("held", summary)
+        self.assertIsNone(summary["held"])
+        self.assertIn(pp.BOSKOS_RESOURCES_FILE, summary["held_error"])
+        # With the file beside the other artifacts the map is published as read.
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in os.listdir(BREACH_DIR):
+                os.symlink(os.path.join(BREACH_DIR, name), os.path.join(tmp, name))
+            with open(os.path.join(tmp, pp.BOSKOS_RESOURCES_FILE), "w") as fh:
+                json.dump(RESOURCES_DOC, fh)
+            code, out = run(from_dir=tmp, as_of=BREACH_AS_OF, window_days=1, as_json=True)
+        summary = json.loads(out)
+        self.assertEqual((summary["held"], summary["held_error"]), (pp._held_from(RESOURCES_DOC), None))
 
 
 def run(**kwargs):
@@ -848,6 +959,7 @@ class LiveClock(unittest.TestCase):
         calls = []
         with unittest.mock.patch.object(pp, "collect_waits", return_value=pp.Source(error="not read")), \
                 unittest.mock.patch.object(pp, "fetch_pool_state", return_value=pp.Source(error="not read")), \
+                unittest.mock.patch.object(pp, "fetch_held", return_value=pp.Source(error="not read")), \
                 unittest.mock.patch.object(pp, "fetch_live_queue",
                                            side_effect=lambda now, from_dir=None: calls.append(now) or pp.Source(error="not read")):
             with contextlib.redirect_stdout(io.StringIO()):

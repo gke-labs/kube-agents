@@ -1284,6 +1284,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/intercepted-events", None),
         ("GET", "/v1/sessions/sess-1/tasks", None),
         ("POST", "/v1/sessions/sess-1/cards/stop", {"context_id": "c"}),
+        ("POST", "/v1/board/actions", {"action": "retry", "tasks": ["t-1"]}),
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
     )
@@ -5152,6 +5153,136 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(sent, [self.QUOTA])
 
 
+class TestBoardHealthCardRelay(unittest.TestCase):
+    """The kanban-board-health job's Slack leg posts its card, with Retry and Drop on each row.
+
+    Only for the report the card was said with, with KAGE_SLACK_UX on: as Block
+    Kit through the Slack relay, or under next as a chat message through the
+    gateway. Everywhere else, and whenever the card does not post, the report
+    goes out as written.
+    """
+
+    SLACK_THREAD = "1712345678.000100"
+    HOME = "C0123456789"
+    BLOCKS_TS = "1712345999.000200"
+    REPORT = "**1 task is stuck and needs someone to decide.**\n\n**Triage x**\nStopped 1 day ago before finishing."
+    CARD = {
+        "version": 1,
+        "text": REPORT,
+        "headline": "1 task is stuck and needs someone to decide.",
+        "rows": [{"title": "Triage x", "count": 1, "status": "Stopped 1 day ago before finishing.", "held": "",
+                  "tasks": ["t_1"]}],
+        "more": "",
+    }
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM"):
+            os.environ.pop(key, None)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        os.environ["KAGE_SLACK_UX"] = "1"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.environ["KANBAN_HEALTH_STATE"] = str(Path(tmp.name) / "kanban_board_health.json")
+        Path(tmp.name, "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(self, report=REPORT, platforms=("slack",), job_id="kanban-board-health", blocks_post=None):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": "spaces/AAA/threads/T1"}
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post("/v1/cron-reports", json={"job_id": job_id, "report": report})
+        self.posts = poster.call_args_list
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_with_a_relay_the_card_posts_as_blocks_with_its_buttons(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        (args, _kwargs), = [(c.args, c.kwargs) for c in self.posts]
+        channel, text, blocks, _thread = args
+        self.assertEqual((channel, text), (self.HOME, self.REPORT))
+        self.assertEqual(blocks, session_kv_server.board_health_card.blocks_from_card(self.CARD)[0])
+        self.assertIn({"kage_board.retry", "kage_board.drop"}, [
+            {e["action_id"] for e in b["elements"]} for b in blocks if b["type"] == "actions"
+        ])
+        self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
+
+    def test_under_next_the_card_goes_to_the_gateway_with_its_rows_actions(self):
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        chat, text = via.call_args.args[2:4]
+        self.assertEqual(chat["rows"][0]["tasks"], ["t_1"])
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
+    def test_the_card_is_found_under_the_agent_home_with_no_override(self):
+        """Production: no KANBAN_HEALTH_STATE, the card beside the record under PLATFORM_AGENT_HOME."""
+        os.environ.pop("KANBAN_HEALTH_STATE", None)
+        os.environ.pop("KANBAN_HEALTH_HOME", None)
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        cron = Path(home.name, "profiles", "platform", "cron")
+        cron.mkdir(parents=True)
+        (cron / "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        os.environ["PLATFORM_AGENT_HOME"] = home.name
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.posts), 1)
+    def test_a_refused_card_posts_the_report(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+
+        def refuse(*args, **kwargs):
+            raise session_kv_server.slack_blocks_post.Refused("invalid_blocks")
+
+        _, calls = self._post(blocks_post=refuse)
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+
+    def test_a_card_said_with_other_text_is_not_used(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        other = self.REPORT.replace("1 day", "2 days")
+        _, calls = self._post(report=other, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(self.posts, [])
+        self.assertEqual([c.args for c in calls], [("slack", other, "", "")])
+
+    def test_flag_off_another_job_or_google_chat_posts_the_report(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(job_id="stall-watch", blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+        _, calls = self._post(platforms=("google_chat",), blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args[:2] for c in calls], [("google_chat", self.REPORT)])
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(self.posts, [])
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -10518,6 +10649,153 @@ def closing_conn(conn):
     return closing(conn)
 
 
+class TestBoardAction(unittest.TestCase):
+    """POST /v1/board/actions: Retry and Drop on the board-health card's rows.
+
+    The board is a temporary SQLite file through `KANBAN_DB_PATH`, and Hermes'
+    kanban module is a stub whose `unblock_task` and `archive_task` move the
+    row as the real ones do: unblock only a blocked card, to ready; archive any
+    card that is not already archived.
+    """
+
+    def setUp(self):
+        import sqlite3
+        import types
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.board = Path(self._tmpdir.name) / "kanban.db"
+        with sqlite3.connect(self.board) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, worker_pid INTEGER);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, kind TEXT
+                );
+                """
+            )
+        self.calls = []
+        self.raise_on = set()
+        test = self
+        kanban = types.ModuleType("hermes_cli.kanban_db")
+
+        def unblock_task(conn, task_id, new_status="ready"):
+            test.calls.append(("unblock", task_id))
+            if task_id in test.raise_on:
+                raise RuntimeError("database is locked")
+            cur = conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = 'blocked'", (new_status, task_id))
+            conn.commit()
+            return cur.rowcount == 1
+
+        def archive_task(conn, task_id, *, signal_fn=None):
+            test.calls.append(("archive", task_id))
+            cur = conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ? AND status <> 'archived'", (task_id,))
+            conn.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'archived')", (task_id,))
+            conn.commit()
+            return cur.rowcount == 1
+
+        kanban.unblock_task = unblock_task
+        kanban.archive_task = archive_task
+        package = types.ModuleType("hermes_cli")
+        package.__path__ = []
+        package.kanban_db = kanban
+        modules = patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": kanban})
+        modules.start()
+        self.addCleanup(modules.stop)
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.board))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def card(self, task_id, status, title=None):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("INSERT INTO tasks (id, title, status) VALUES (?, ?, ?)", (task_id, title or f"card {task_id}", status))
+
+    def status(self, task_id):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            return conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+
+    def act(self, action, tasks, by="Jayanti"):
+        return self.client.post("/v1/board/actions", json={"action": action, "tasks": tasks, "by": by})
+
+    def test_retry_unblocks_a_blocked_card(self):
+        self.card("t_a", "blocked", "Investigate payments-api")
+        response = self.act("retry", ["t_a"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["results"],
+            [{"id": "t_a", "title": "Investigate payments-api", "status": "ready", "outcome": "done"}],
+        )
+        self.assertEqual(self.status("t_a"), "ready")
+
+    def test_drop_archives_a_blocked_card(self):
+        self.card("t_a", "blocked")
+        response = self.act("drop", ["t_a"])
+        self.assertEqual(response.json()["results"][0]["outcome"], "done")
+        self.assertEqual(self.status("t_a"), "archived")
+
+    def test_a_card_no_longer_blocked_is_left_alone(self):
+        """A stale button: the card was unblocked and claimed, or finished, since the post."""
+        for task_id, status in (("t_run", "running"), ("t_done", "done"), ("t_ready", "ready")):
+            self.card(task_id, status)
+        for action in ("retry", "drop"):
+            with self.subTest(action=action):
+                results = self.act(action, ["t_run", "t_done", "t_ready"]).json()["results"]
+                self.assertEqual([r["outcome"] for r in results], ["moved"] * 3)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_run"), "running")
+
+    def test_a_missing_or_archived_card_is_gone(self):
+        self.card("t_old", "archived")
+        results = self.act("drop", ["t_old", "t_nope"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_old", "outcome": "gone"}, {"id": "t_nope", "outcome": "gone"}])
+
+    def test_a_row_of_several_cards_acts_on_each(self):
+        self.card("t_a", "blocked")
+        self.card("t_b", "blocked")
+        results = self.act("retry", ["t_a", "t_b", "t_a"]).json()["results"]
+        self.assertEqual([(r["id"], r["outcome"]) for r in results], [("t_a", "done"), ("t_b", "done")])
+
+    def test_one_card_raising_does_not_stop_the_rest(self):
+        self.card("t_a", "blocked")
+        self.card("t_b", "blocked")
+        self.raise_on.add("t_a")
+        results = self.act("retry", ["t_a", "t_b"]).json()["results"]
+        self.assertEqual([(r["id"], r["outcome"]) for r in results], [("t_a", "failed"), ("t_b", "done")])
+        self.assertEqual(self.status("t_b"), "ready")
+
+    def test_bad_requests_are_refused(self):
+        self.card("t_a", "blocked")
+        for body in (
+            {"action": "delete", "tasks": ["t_a"]},
+            {"action": "retry", "tasks": []},
+            {"action": "retry", "tasks": "t_a"},
+            {"action": "retry", "tasks": [""]},
+            {"action": "retry", "tasks": ["x" * 65]},
+            {"action": "retry", "tasks": [f"t_{i}" for i in range(51)]},
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.client.post("/v1/board/actions", json=body).status_code, 400)
+        self.assertEqual(self.status("t_a"), "blocked")
+
+    def test_cards_the_deadline_leaves_unstarted_answer_failed(self):
+        self.card("t_a", "blocked")
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 0.0):
+            results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "failed"}])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_a"), "blocked")
+    def test_no_board_answers_every_card_gone(self):
+        self.board.unlink()
+        results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "gone"}])
 class TestDriftBacklog(unittest.TestCase):
     """`POST /v1/drift-backlog` and the digest that follows it."""
 

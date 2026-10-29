@@ -34,11 +34,13 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_health_card
 import board_snapshot
 import chat_notify
 import cron_schedule
 import findings_queue
 import gitops_workspace
+import kanban_board_health
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
@@ -4761,6 +4763,41 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
     return text
 
 
+def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) -> dict | None:
+    """With ``KAGE_SLACK_UX`` on, the board-health card the report was said with (:mod:`board_health_card`).
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the job is ``kanban-board-health``, and its card file was written
+    for this very report. Never raises: a card that cannot be read posts as
+    text.
+    """
+    if platform != SLACK_PLATFORM or job_id != kanban_board_health.JOB_ID or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    try:
+        return board_health_card.load(kanban_board_health.agent_home(), report)
+    except Exception as exc:  # noqa: BLE001 - the report still posts, as text
+        logger.warning(f"Relay for {job_id}: board-health card unreadable, posting text: {exc!r}")
+        return None
+
+
+def _post_board_health_card(
+    profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Post the board-health card; where it landed, or None to post the report as text.
+
+    Block Kit through the Slack relay, or under ``spec.mode: next`` a chat
+    message through the gateway, with the outcomes of :func:`_post_audit_card`.
+    """
+    routed = chat_notify.routes(SLACK_PLATFORM)
+    if not (routed or slack_blocks_post.configured()):
+        return None
+    built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
+    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
     """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
 
@@ -5262,7 +5299,14 @@ def relay_cron_report(
         summary = None
         # A truncated report keeps its notice, which the blocks have no place for,
         # and the rest of it.
-        if headline and not truncation_notice:
+        board = None if truncation_notice else _board_health_card(platform, report, leg_chat_id, job_id)
+        if board is not None:
+            # The stuck tasks alone, as a card with Retry and Drop on each row;
+            # where it does not post, the report goes out as written.
+            posted = _post_board_health_card(
+                profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+            )
+        elif headline and not truncation_notice:
             posted = _post_audit_blocks(
                 profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
@@ -8889,6 +8933,124 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         ", deadline reached" if budget.hit else "",
     )
     return result
+
+
+# --------------------------------------------------------------------------
+# Retry and Drop on the board-health card (kanban_board_health.py,
+# board_health_card.py). Each row of the stuck-task card carries the ids of
+# the cards it stands for, and a tap on either button reaches here: from the
+# Slack adapter's click handler under today (slack_ux_clicks.py), and from the
+# gateway through the hermes-bridge's board route under next
+# (a2a/hermes-bridge/board.go). Who may press is decided before this call, by
+# whichever of the two the click came through; this route checks the card.
+#
+# Only a card still `blocked` is touched, so a stale button does not retry a
+# card that finished or archive one that is running again. Retry is Hermes'
+# `unblock_task`, which checks the card is blocked inside its own write and
+# returns it to `ready` for the dispatcher. Drop is the card stop's
+# `_archive_card`, Hermes' `archive_task` with our worker kill; the blocked
+# check is the read just before it, so a card unblocked and claimed in that
+# instant would be archived as a running card, its worker killed, as a card
+# stop would. Nothing here writes a card's status itself. Every card is
+# started inside the card stop's deadline, and one the deadline leaves
+# unstarted answers `failed`, so the answer comes before the callers give up.
+# --------------------------------------------------------------------------
+
+BOARD_ACTION_RETRY = "retry"
+BOARD_ACTION_DROP = "drop"
+BOARD_ACTIONS = frozenset({BOARD_ACTION_RETRY, BOARD_ACTION_DROP})
+# The one status either button acts on.
+BOARD_ACTION_STUCK_STATUS = "blocked"
+# A row is one card, or the cards sharing its title; the card caps its rows.
+BOARD_ACTION_MAX_TASKS = 50
+BOARD_ACTION_TASK_ID_MAX_CHARS = 64
+# Who pressed, for the log line: a display name or a member id.
+BOARD_ACTION_BY_MAX_CHARS = 200
+# Each card's outcome in the answer.
+BOARD_OUTCOME_DONE = "done"
+BOARD_OUTCOME_MOVED = "moved"
+BOARD_OUTCOME_GONE = "gone"
+BOARD_OUTCOME_FAILED = "failed"
+
+
+def _board_action_one(kanban_db, conn: sqlite3.Connection, action: str, task_id: str, budget: _Budget) -> Dict[str, Any]:
+    """One card's Retry or Drop: its outcome, title and the status it holds now."""
+    row = conn.execute("SELECT title, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row[1] == "archived":
+        return {"id": task_id, "outcome": BOARD_OUTCOME_GONE}
+    entry: Dict[str, Any] = {"id": task_id, "title": row[0] or "", "status": row[1]}
+    if row[1] != BOARD_ACTION_STUCK_STATUS:
+        return {**entry, "outcome": BOARD_OUTCOME_MOVED}
+    if action == BOARD_ACTION_RETRY:
+        if kanban_db.unblock_task(conn, task_id):
+            return {**entry, "status": "ready", "outcome": BOARD_OUTCOME_DONE}
+    else:
+        outcome, _detail = _archive_card(kanban_db, conn, task_id, budget)
+        if outcome == "stopped":
+            return {**entry, "status": "archived", "outcome": BOARD_OUTCOME_DONE}
+        if outcome == "gone":
+            return {"id": task_id, "outcome": BOARD_OUTCOME_GONE}
+    after = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return {**entry, "status": after[0] if after else None, "outcome": BOARD_OUTCOME_MOVED}
+
+
+@app.post("/v1/board/actions", dependencies=[Depends(verify_api_key)])
+def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Retry or Drop the stuck cards one row of the board-health card names; see the section comment.
+
+    Body: ``action`` (``retry`` or ``drop``), ``tasks`` (the row's card ids)
+    and ``by`` (who pressed, logged). Answers each card's ``outcome``:
+    ``done``, ``moved`` (no longer blocked: someone or something got there
+    first), ``gone`` (no such card, or archived) or ``failed`` (Hermes raised;
+    the message stays in this log). A board that is not there answers every
+    card ``gone``.
+    """
+    action = str(request_data.get("action") or "").strip().lower()
+    tasks = request_data.get("tasks")
+    by = str(request_data.get("by") or "").strip()[:BOARD_ACTION_BY_MAX_CHARS]
+    if action not in BOARD_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {sorted(BOARD_ACTIONS)}")
+    if (
+        not isinstance(tasks, list)
+        or not tasks
+        or len(tasks) > BOARD_ACTION_MAX_TASKS
+        or not all(isinstance(t, str) and t.strip() and len(t) <= BOARD_ACTION_TASK_ID_MAX_CHARS for t in tasks)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"tasks must be 1 to {BOARD_ACTION_MAX_TASKS} card ids of at most {BOARD_ACTION_TASK_ID_MAX_CHARS} characters",
+        )
+    ids = list(dict.fromkeys(t.strip() for t in tasks))
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return {"action": action, "results": [{"id": i, "outcome": BOARD_OUTCOME_GONE} for i in ids]}
+    try:
+        kanban_db, connect_tracked = _hermes_kanban()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
+    budget = _Budget()
+    results = []
+    try:
+        conn = _card_stop_connect(connect_tracked, board)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+    with closing(conn):
+        for task_id in ids:
+            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+                continue
+            try:
+                results.append(_board_action_one(kanban_db, conn, action, task_id, budget))
+            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest untried
+                logger.error("board action: %s on %s failed: %s", action, task_id, exc)
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+    logger.info(
+        "board action %s by %s: %s",
+        action,
+        by or "someone",
+        ", ".join(f"{r['id']} {r['outcome']}" for r in results),
+    )
+    return {"action": action, "results": results}
 
 
 # --------------------------------------------------------------------------

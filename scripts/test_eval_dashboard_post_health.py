@@ -2176,6 +2176,44 @@ class WatchedPeriodics(RunHarness):
 
     DAILY = "ci-kube-agents-fleet-reconcile-daily"
 
+    def test_a_failed_note_says_how_the_build_died(self):
+        doc = health("GREEN")
+        doc["periodics"] = {self.DAILY: dict(periodic_note(summary="1 project(s) not reconciled"), node="gke-kube-agents-prow-default-pool-eb220b2a-ru4s", last_event="NodeNotReady", last_line="/bin/sh: python3: not found")}
+        doc["periodics_read"] = [self.DAILY]
+        self.tick(doc, T14)
+        text = self.opener.texts[0]
+        self.assertIn("(build 100) failed: 1 project(s) not reconciled.\n- how it died: log `/bin/sh: python3: not found`, node `gke-kube-agents-prow-default-pool-eb220b2a-ru4s`, pod event NodeNotReady\nEffect:", text)
+        digest = post_health.periodic_digest_lines(doc, T14)
+        self.assertTrue(any("failed" in line and "log `/bin/sh: python3: not found`" in line for line in digest), digest)
+
+    def test_jobs_that_died_the_same_way_are_one_message(self):
+        sweep = "ci-kube-agents-pull-sweep"
+        line = "/bin/sh: python3: not found"
+        doc = health("GREEN")
+        doc["periodics"] = {
+            self.DAILY: dict(periodic_note(summary="1 project(s) not reconciled", detail=["kube-agents-evals-3: refused (x); next: y"], dry_run=True), node="gke-kube-agents-prow-default-pool-eb220b2a-ru4s", last_event="Evicted", last_line=line),
+            sweep: dict(periodic_note(job=sweep, label="GitOps pull sweep", build="200", finished="2026-09-14T13:50:00+00:00", stale_after_h=1), node="gke-kube-agents-prow-default-pool-eb220b2a-9e1h", last_line=line),
+        }
+        doc["periodics_read"] = [self.DAILY, sweep]
+        self.tick(doc, T14)
+        self.assertEqual(len(self.opener.texts), 1)
+        text = self.opener.texts[0]
+        self.assertEqual(text.count("🟠"), 1, "one block, not two")
+        self.assertTrue(text.startswith(f"🟠 *Eval seeded fleet and Eval GitOps repos: 2 jobs failed on the same log line.*\nEach build's log ends on the same line, `{line}`; one place to look first.\n"), text)
+        # Each job keeps what its own block would say: what it does, its run, the dry flag, its detail, its node and event.
+        self.assertIn(f"`{self.DAILY}` runs daily at 08:30 UTC and re-applies the seeded-fleet stack in every pool project, waiting for the leased ones. Its 9:40 AM ET run (build 100) (a dry run: nothing was applied) failed: 1 project(s) not reconciled.\n- kube-agents-evals-3: refused (x); next: y\n- how it died: node `gke-kube-agents-prow-default-pool-eb220b2a-ru4s`, pod event Evicted\n", text)
+        self.assertIn(f"`{sweep}` runs every ten minutes and closes the pull requests", text)
+        self.assertIn("Its 9:50 AM ET run (build 200) failed.\n- how it died: node `gke-kube-agents-prow-default-pool-eb220b2a-9e1h`\n", text)
+        self.assertEqual(text.count(line), 1, "the shared line is said once, in the header")
+        self.assertIn("Effect: drifted fixtures stay drifted", text)
+        self.assertIn("pull requests a run left behind stay open", text)
+        self.assertIn(f"`{sweep}`: Runbook: ", text)
+        # Different last lines: two blocks, as before.
+        self.setUp()
+        doc["periodics"][sweep]["last_line"] = "fatal: could not read Username"
+        self.tick(doc, T14)
+        self.assertEqual(self.opener.texts[0].count("🟠"), 2)
+
     def test_a_due_gitlab_token_is_said_once_as_its_own_note_and_cleared_by_name(self):
         sweep = "ci-kube-agents-pull-sweep"
         line = "gitlab token kube-agents-prow/gitlab-ledger-token: expires 2026-11-01, in 25 day(s); rotate it (docs/ci-pool-projects.md 5.6)"

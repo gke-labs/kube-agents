@@ -1,13 +1,10 @@
 {
   "concepts/autonomous-watchdogs.md": {
-    "banned-word": 1,
-    "antithesis": 1,
-    "long-paragraph": 16,
     "long-sentence": 36
   },
   "concepts/chatops.md": {
-    "long-paragraph": 34,
-    "long-sentence": 85
+    "long-paragraph": 33,
+    "long-sentence": 84
   },
   "concepts/cluster-agents.md": {
     "long-paragraph": 4,
@@ -18,16 +15,14 @@
     "long-sentence": 31
   },
   "concepts/governance-sops.md": {
-    "long-paragraph": 4,
-    "long-sentence": 17
+    "long-sentence": 16
   },
   "concepts/inference-gateway.md": {
     "long-paragraph": 9,
     "long-sentence": 18
   },
   "concepts/observability.md": {
-    "long-paragraph": 10,
-    "long-sentence": 27
+    "long-sentence": 24
   },
   "concepts/skills.md": {
     "long-paragraph": 2,
@@ -111,10 +106,9 @@
     "long-sentence": 9
   },
   "operator/platformagent-crd.md": {
-    "banned-word": 6,
-    "long-paragraph": 55,
-    "long-table-cell": 10,
-    "long-sentence": 189
+    "long-paragraph": 54,
+    "long-table-cell": 9,
+    "long-sentence": 188
   },
   "overview/architecture.mdx": {
     "long-paragraph": 2,

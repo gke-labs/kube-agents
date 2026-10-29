@@ -53,10 +53,34 @@ func authorityFor(t *testing.T, conversation, viaTask string) json.RawMessage {
 	return mustJSON(t, a)
 }
 
+// pub publishes for the fake gateway and the tests' background publishers,
+// which run on goroutines the test does not wait for. Once the test has
+// ended, its context is done and the bus is being torn down, so a publish
+// that fails then is the teardown, not a finding; and a Fatal from any
+// goroutine after the test ended panics the whole test binary, so no later
+// test in the package runs. While the test runs, a failed publish is
+// reported with Error, on every path: FailNow is only for the test's own
+// goroutine, and these helpers also run on the subscription's.
 func pub(t *testing.T, js jetstream.JetStream, subject string, env *lib.Envelope) {
 	t.Helper()
-	if _, err := js.Publish(context.Background(), subject, mustJSON(t, env)); err != nil {
-		t.Fatal(err)
+	ctx := t.Context()
+	if _, err := js.Publish(ctx, subject, mustJSON(t, env)); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		t.Error(err)
+	}
+}
+
+// pause waits d on a goroutine the test does not wait for, and reports false
+// as soon as the test ends instead, so the caller can stop rather than touch
+// a bus that is being torn down.
+func pause(t *testing.T, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-t.Context().Done():
+		return false
 	}
 }
 
@@ -111,11 +135,12 @@ func publishRun(t *testing.T, js jetstream.JetStream, addressee, taskID, answer 
 
 // gatewayScenario says what the fake gateway does with an ordinary turn.
 type gatewayScenario struct {
-	finish   bool // the root task completes with answerText
-	delegate bool // the root delegates; a child runs and a wake task carries the answer
-	handoff  bool // the root acknowledges and hands its work to kanban cards (no wake task ever)
-	bigChild bool // with delegate: the child's events total more than readMaxBytes, and no wake task comes
-	decoys   bool // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	finish   bool      // the root task completes with answerText
+	delegate bool      // the root delegates; a child runs and a wake task carries the answer
+	handoff  bool      // the root acknowledges and hands its work to kanban cards (no wake task ever)
+	bigChild bool      // with delegate: the child's events total more than readMaxBytes, and no wake task comes
+	decoys   bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	frames   *frameLog // when set, every frame the gateway reads is recorded
 	// lateStart delays the root's first event after its submission, as an
 	// executor's cold start does.
 	lateStart time.Duration
@@ -124,6 +149,26 @@ type gatewayScenario struct {
 	// gateway publishes on can produce. A delay inside noticeSettle is the
 	// notice the window exists to catch; past it, the notice is dropped.
 	lateNotice time.Duration
+}
+
+// sentFrame is one console frame as the fake gateway read it.
+type sentFrame struct{ token, text string }
+
+type frameLog struct {
+	mu     sync.Mutex
+	frames []sentFrame
+}
+
+func (l *frameLog) add(f sentFrame) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.frames = append(l.frames, f)
+}
+
+func (l *frameLog) all() []sentFrame {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]sentFrame(nil), l.frames...)
 }
 
 // runFakeGateway answers console frames the way the console door does: a
@@ -144,15 +189,24 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		if json.Unmarshal(m.Data, &f) != nil {
 			return
 		}
+		if sc.frames != nil {
+			sc.frames.add(sentFrame{token, f.Text})
+		}
 		notice := func(text string) {
 			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "n1", Text: text}))
 		}
 		switch f.Text {
-		case statusQuery:
+		case statusQuery, statusText:
 			notice("Nothing is running in this conversation.")
 			return
 		case stopText:
 			notice("Stopped the running task.")
+			return
+		case sessionOnText:
+			notice("Session started.")
+			return
+		case sessionOffText:
+			notice("Session ended.")
 			return
 		}
 		i := n.Add(1)
@@ -204,7 +258,9 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishResult(t, js, fakeAddressee, root, ackText)
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 		default:
-			time.Sleep(sc.lateStart)
+			if !pause(t, sc.lateStart) {
+				return
+			}
 			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
 		}
 	})
@@ -808,7 +864,9 @@ func TestASecondMessageWaitsForTheRunningTurn(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(time.Second)
+		if !pause(t, time.Second) {
+			return
+		}
 		publishResult(t, js, fakeAddressee, "task-root1", answerText)
 		publishStatus(t, js, fakeAddressee, "task-root1", lib.StateCompleted, true)
 	}()

@@ -76,8 +76,9 @@ type liveHarness struct {
 	store     *Store
 	status    *httptest.Server
 	svcConn   *nats.Conn
-	// tls trusts the test CA the rendered conf's serving pair is minted from.
-	tls nats.Option
+	// dial trusts the test CA the rendered conf's serving pair is minted
+	// from and sets the suite's connect timeout (withTestTLS).
+	dial nats.Option
 }
 
 func startLiveHarness(t *testing.T) *liveHarness {
@@ -176,7 +177,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 	}
 	conf := replaceConfKey(string(rendered), "issuer: ", issuerPub)
 	conf = replaceConfKey(conf, "xkey: ", xkeyPub)
-	conf, tlsOpt := withTestTLS(t, conf)
+	conf, dialOpt := withTestTLS(t, conf)
 
 	confPath := t.TempDir() + "/nats.conf"
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
@@ -187,6 +188,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		t.Fatalf("the rendered nats.conf was refused: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
+	serverConnectBudget(opts)
 	// Every port the render pins moves to a free one, the monitor included;
 	// see startHarness.
 	opts.Port, opts.Websocket.Port, opts.HTTPPort = -1, -1, -1
@@ -232,7 +234,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), tlsOpt)
+	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), dialOpt)
 	if err != nil {
 		t.Fatalf("the callout could not connect: %v", err)
 	}
@@ -248,7 +250,7 @@ func startLiveHarness(t *testing.T) *liveHarness {
 
 	return &liveHarness{
 		k8s: admin, namespace: envtestNamespace, nats: srv,
-		store: store, status: status, svcConn: svcConn, tls: tlsOpt,
+		store: store, status: status, svcConn: svcConn, dial: dialOpt,
 	}
 }
 
@@ -268,7 +270,7 @@ func (h *liveHarness) mintToken(t *testing.T, sa string, audiences ...string) st
 func (h *liveHarness) connect(t *testing.T, user, token string) (*nats.Conn, chan error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.nats.ClientURL(), h.tls,
+	nc, err := nats.Connect(h.nats.ClientURL(), h.dial,
 		nats.Token(token),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -432,7 +434,7 @@ func TestLiveATokenForAnotherAudienceIsRefused(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			token := h.mintToken(t, provisionSAName, tc.audiences...)
-			nc, err := nats.Connect(h.nats.ClientURL(), h.tls, nats.Token(token), nats.Name("wrong-audience"))
+			nc, err := nats.Connect(h.nats.ClientURL(), h.dial, nats.Token(token), nats.Name("wrong-audience"))
 			if err == nil {
 				nc.Close()
 				t.Fatalf("a token minted for audiences %v authenticated to the bus", tc.audiences)
@@ -447,7 +449,7 @@ func TestLiveATokenForAnotherAudienceIsRefused(t *testing.T) {
 	// is what stops the two cases above passing because the identity is
 	// unusable for some unrelated reason.
 	t.Run("the control: the same identity with the right audience connects", func(t *testing.T) {
-		nc, err := nats.Connect(h.nats.ClientURL(), h.tls,
+		nc, err := nats.Connect(h.nats.ClientURL(), h.dial,
 			nats.Token(h.mintToken(t, provisionSAName, busAudience)),
 			nats.CustomInboxPrefix("_INBOX.provision"), nats.Name("provision"))
 		if err != nil {
@@ -463,7 +465,7 @@ func TestLiveAnUnmappedServiceAccountIsRefused(t *testing.T) {
 	h := startLiveHarness(t)
 	token := h.mintToken(t, strangerSAName, busAudience)
 
-	nc, err := nats.Connect(h.nats.ClientURL(), h.tls, nats.Token(token), nats.Name("stranger"))
+	nc, err := nats.Connect(h.nats.ClientURL(), h.dial, nats.Token(token), nats.Name("stranger"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a ServiceAccount absent from the identity map connected")

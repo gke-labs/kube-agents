@@ -91,7 +91,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	// so both pods reach the assertion.
 	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, true)
 	a2aGateway := buildA2AGatewayDeployment(agent)
-	a2aCallout := buildA2ACalloutDeployment(agent)
+	a2aCallout := buildA2ACalloutDeployment(agent, "")
 	a2aVerifier := buildA2AVerifierDeployment(agent)
 	a2aConsole := buildA2AConsoleDeployment(agent)
 	a2aMCP := buildA2AMCPDeployment(agent)

@@ -6,7 +6,8 @@
 #
 # The sweep is not started by a conversation. The `oobe` cron job's scan stage
 # on the Planning Agent's profile files it once per install, together
-# with one audit card per Cluster Agent. Nothing a chat prompt says reaches that
+# with one audit card per Cluster Agent up to the first-run cap, which this
+# case pins at its maximum (below). Nothing a chat prompt says reaches that
 # path, so the prompt below only reads the board; the grade comes from the
 # stack and the verifiers.
 #
@@ -35,9 +36,11 @@
 # whose `oobe` job is missing or paused, where nothing
 # would file the sweep.
 #
-# Isolation class: read-only on the cluster; it re-files the onboarding sweep
-# on the install under test, and the destroy archives every
-# `bootstrap-inventory-*` card. Eligible tier: nightly -- the fan-out's cards take dispatcher slots
+# Isolation class: read-only on the cluster; it writes the cap file and
+# re-files the onboarding sweep on the install under test, and the destroy
+# archives every `bootstrap-inventory-*` card and removes the cap file. Like
+# the capped case, the stack refuses an install that already has an operator's
+# cap file rather than overwrite it. Eligible tier: nightly -- the fan-out's cards take dispatcher slots
 # that other cases' cards running at the same time would use.
 ---
 id: bootstrap-discovery-fanout
@@ -55,7 +58,15 @@ infrastructure:
   # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
   # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh), because they
   # name the install the runner deployed and no task may choose a different
-  # one. The stack defaults everything else.
+  # one. The stack defaults everything else but the first-run cluster card
+  # cap, pinned at bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_MAX:
+  # `one-card-per-cluster-agent` expects a card for every ready Cluster Agent,
+  # which holds only under a cap at or above the roster. At the default of 6
+  # this case would go red the first night the eval install has a seventh
+  # Cluster Agent; past 24 it needs bootstrap-discovery-capped's grading
+  # instead. bench/tests/test_bootstrap_handoff.py holds it at the maximum.
+  variables:
+    first_run_cluster_cards: 24
 
 validated: false
 
