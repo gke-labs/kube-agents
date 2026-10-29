@@ -194,8 +194,10 @@ const injectStatusFolded = "folded"
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
 // injectStatusUnrouted is the daemon's answer to a k8s-event-followup for a
-// session no chat thread is routed to: accepted, nothing posted, nothing to
-// retry (session_kv_server, _inject_followup).
+// session with neither a chat thread nor a card: accepted, nothing posted,
+// nothing to retry (session_kv_server, _inject_followup). A session with a
+// card but no thread, every session on an install without a chat surface,
+// gets the line on its card and is answered like a routed one.
 const injectStatusUnrouted = "unrouted"
 
 // healthzPath is the daemon's unauthenticated health route, which lists the

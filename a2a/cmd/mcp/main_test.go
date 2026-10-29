@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,7 +108,7 @@ func TestConfigFromEnvWithoutABrokerOffersNoInspectPR(t *testing.T) {
 		t.Error("a broker client with no broker URL")
 	}
 	names := toolNames(toolsFor(nil, nil, s.broker))
-	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolManageSession}
+	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolManageSession, mcp.ToolReadTopics}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools = %v, want %v (no %s)", names, want, mcp.ToolInspectPR)
 	}
@@ -128,7 +129,7 @@ func TestConfigFromEnvWithABrokerOffersInspectPR(t *testing.T) {
 		t.Fatal("no broker client with a broker URL")
 	}
 	names := toolNames(toolsFor(nil, nil, s.broker))
-	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolManageSession, mcp.ToolInspectPR}
+	want := []string{mcp.ToolConnectionStatus, mcp.ToolSendMessage, mcp.ToolTaskControl, mcp.ToolManageSession, mcp.ToolReadTopics, mcp.ToolInspectPR}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools = %v, want %v", names, want)
 	}
@@ -163,6 +164,27 @@ func TestConfigFromEnvRefusesToStartWithABrokerAndNoUsableToken(t *testing.T) {
 				t.Errorf("started with %s", name)
 			}
 		})
+	}
+}
+
+// The config errors for the password file name the file, so the operator can
+// find the mount, and never its content: realMain logs them.
+func TestPasswordFileErrorsNameTheFileNotItsContent(t *testing.T) {
+	token := file(t, "tok")
+	for name, pass := range map[string]string{
+		"missing": filepath.Join(t.TempDir(), "absent"),
+		"empty":   file(t, "\n"),
+	} {
+		_, err := configFromEnv(env(map[string]string{envBusURL: "tls://bus:4222", envTokenFile: token, envPasswordFile: pass}))
+		if err == nil || !strings.Contains(err.Error(), pass) {
+			t.Errorf("%s: err = %v, want it to name %s", name, err, pass)
+		}
+	}
+	// Only line endings are trimmed, so a whitespace-only file is a password
+	// and there is no error after the read that could carry it.
+	s, err := configFromEnv(env(map[string]string{envBusURL: "tls://bus:4222", envTokenFile: token, envPasswordFile: file(t, " \n")}))
+	if err != nil || s.bus.Password != " " {
+		t.Fatalf("got %q, %v; want the one-space password", s.bus.Password, err)
 	}
 }
 

@@ -25,6 +25,8 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/gateway"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 const (
@@ -52,6 +54,12 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if args := os.Args[1:]; isFeedbackCommand(args) {
+		if err := feedbackMain(ctx, args, os.Stdout, os.Stderr, log); err != nil {
+			return exitFailure
+		}
+		return 0
+	}
 	if err := realMain(ctx, log); err != nil {
 		return exitFailure
 	}
@@ -127,15 +135,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
-	natsOpts := []nats.Option{
-		// The gateway user may only subscribe under its own inbox prefix
-		// (per-user _INBOX prefixes, deployment spec); the JS API replies
-		// every publish and consume depends on land there.
-		nats.CustomInboxPrefix("_INBOX.gateway"),
-	}
-	if cfg.NATSUser != "" {
-		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
-	}
+	natsOpts := gatewayNATSOptions(cfg)
 	client, err := lib.Connect(ctx, cfg.NATSURL,
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
@@ -246,6 +246,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
 		defer runNotifier(ctx, notifier, client)()
+		armHomeLearn(ctx, cfg, backendAdapter, notifier, log)
 	}
 	// The console's route runs whenever the console does: a card filed from
 	// a console turn reports back into its conversation as a notify frame.
@@ -262,6 +263,21 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
 	return serve(ctx, cfg, gw.Metrics(), log, gw.Run)
+}
+
+// gatewayNATSOptions is how the gateway's user dials, the gateway's own
+// connection and the feedback export's alike.
+func gatewayNATSOptions(cfg *gateway.Config) []nats.Option {
+	natsOpts := []nats.Option{
+		// The gateway user may only subscribe under its own inbox prefix
+		// (per-user _INBOX prefixes, deployment spec); the JS API replies
+		// every publish and consume depends on land there.
+		nats.CustomInboxPrefix("_INBOX.gateway"),
+	}
+	if cfg.NATSUser != "" {
+		natsOpts = append(natsOpts, nats.UserInfo(cfg.NATSUser, cfg.NATSPassword))
+	}
+	return natsOpts
 }
 
 // chatNotifier builds the chat.notify route for the backend adapter, or nil
@@ -300,6 +316,31 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	}
 	n.SetConversations(conversations(gchat))
 	return n
+}
+
+// armHomeLearn lets a Slack gateway learn its home channel from the first
+// admitted channel mention and record it (gateway/slack_home_channel.go), when
+// the operator armed it (Config.HomeLearnArmed). The record client is the
+// pod's own ServiceAccount, whose Role reaches that one ConfigMap; one that
+// cannot be built leaves the learn off and chat ingress untouched.
+func armHomeLearn(ctx context.Context, cfg *gateway.Config, backend gateway.Adapter, notifier *gateway.Notifier, log *slog.Logger) {
+	slack, ok := backend.(*gateway.SlackAdapter)
+	if !ok || !cfg.HomeLearnArmed() {
+		return
+	}
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("home channel learn not armed: no in-cluster config", "err", err)
+		return
+	}
+	cs, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		log.Error("home channel learn not armed: no Kubernetes client", "err", err)
+		return
+	}
+	slack.SetHomeLearner(notifier, cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage)
+	slack.AdoptHomeRecord(ctx)
+	log.Info("home channel learn armed", "record", cfg.HomeChannelRecord)
 }
 
 // runNotifier runs a chat.notify route until ctx ends, and returns the stop

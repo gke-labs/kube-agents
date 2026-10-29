@@ -12,12 +12,13 @@ import (
 // The home-channel record: under mode next the operator owns an empty
 // ConfigMap beside the A2A gateway, which a gateway that learns the Slack
 // home channel from the first admitted mention in a channel may read and
-// patch (spec.integration.slack.homeChannelPolicy auto). This release ships
-// the object, the Role rule and the gateway's env for it; no gateway reads or
-// writes it yet, and the operator reads nothing from it, so homeChannel alone
-// decides what the agent and the HomeChannelUnset condition say. The reader
-// and the admission that trusts it ship in one change, so no release holds a
-// signal nothing answers. The gateway writes the data keys with a merge patch;
+// patch (spec.integration.slack.homeChannelPolicy auto). The gateway's learn
+// (a2a/gateway/slack_home_channel.go) is the caller: it reads and patches the
+// record only under an A2A_HOME_CHANNEL_LEARN this operator does not render,
+// and the operator reads nothing from it, so homeChannel alone decides what
+// the agent and the HomeChannelUnset condition say. The admission that trusts
+// the record and the switch that arms the learn ship in one change, so no
+// release holds a signal nothing answers. The gateway writes the data keys with a merge patch;
 // the operator applies the object with no data, so server-side apply never
 // resets a key it did not set.
 const (

@@ -103,6 +103,8 @@ in, where the operator sets it.
 4. **How the operator reaches the agent** — a terminal when no chat flag is passed (see
    [Handing over a chat-less install](#handing-over-a-chat-less-install)), `--enable-google-chat`,
    or `--enable-slack` (tokens in `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`).
+   `--enable-web-console` adds a browser chat page for chat-less installs, reached by port-forward
+   ([Web console](../../../docs/site/src/content/docs/deploy/web-console.md)).
    `--enable-hermes-dashboard=true` adds the Hermes Web UI, which a port-forward cannot reach under
    gVisor; the
    [PlatformAgent reference](../../../docs/site/src/content/docs/operator/platformagent-crd.md)
@@ -189,8 +191,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   status leaves the cluster unchanged — relay the options and stop.
 - `SUCCESS`, or `SUCCESS_PENDING_ROLLOUT` (applied, but a deployment had not reported ready; relay
   the `kubectl rollout status` command the installer printed): relay how to reach the agent — the
-  terminal commands in [Handing over a chat-less install](#handing-over-a-chat-less-install), which
-  also fetch credentials, or the chat platform the operator enabled — then confirm the pods with
+  terminal commands in [Handing over a chat-less install](#handing-over-a-chat-less-install) (including
+  the `kubectl port-forward` command for the web console when `--enable-web-console` was enabled),
+  which also fetch credentials, or the chat platform the operator enabled — then confirm the pods with
   `kubectl get pods -n kubeagents-system`. Relay `network_policy_enforcement` when it is not
   `enforced` ([Machine-Readable Results](#machine-readable-results)).
 
@@ -245,7 +248,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 In `--generate-only` mode, the installer:
 
 1. Writes `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`. One refusal lives inside this step rather than after it: if the cluster already exists, nothing stated a memory mode (no `--memory=`, no `MEMORY` in `install.env`), and the run cannot ask the cluster whether it is running the Hindsight memory store, the generator stops instead of defaulting to a value whose apply would delete the store's database. That applies under `--generate-only` and `--dry-run` as well, because both write the same real `terraform.tfvars` and `--generate-only` exists to hand it to `lifecycle.sh apply`. It exits 1 having written no `terraform.tfvars` at all — the opposite of the step-2 refusals below. Pass `--memory=hindsight|file|off`, record `MEMORY` in `install.env`, or restore access to the cluster.
-2. Runs the same pre-apply validation checks a real run does: the GitOps organization check, the service-account ownership check, the scope container preflight when a folder or organisation is declared, which on this route, and on the interactive `g` answer, only warns (the apply it hands off may run as another identity; a run that applies, `-y` or the interactive `Y`, refuses, exit 1 with no report status like the ownership check, when the credentials Terraform applies with cannot set IAM policy on a container or an enforced organisation policy forbids the Cloud Asset API), the scope export sink preflight when the drift ingress is on and `SCOPE_PROJECTS` lists a project the drift sinks will cover, which warns and refuses on the same routes when those credentials cannot create a Log Router sink (`logging.sinks.create`) in one of them (a project whose sink the install's Terraform state already holds warns instead when the credentials can read it), and the existing-cluster node-pool and NetworkPolicy consent gates, but not the live-scope check, which needs the install's kubeconfig context and runs only on a run that will apply; the handoff says so. The interactive `g` answer is given after the pre-flight summary, by which point that check has run too, so the two routes differ in that one check. A cluster needing `--migrate-node-pools`, or one enforcing no NetworkPolicy that was given neither `--enable-network-policy` nor `--accept-no-network-policy`, is refused (`REFUSED_MISSING_NODE_POOL_MIGRATION`, `REFUSED_MISSING_NETWORK_POLICY`), as is one that cannot be described (`FAILED_PREFLIGHT_CLUSTER_UNREADABLE`). A `REFUSED_*` status is a question for the operator, not a flag to add: see [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns). Step 1 has already written both files by then, so a refusal exits 1 leaving `install.env` and `terraform.tfvars` on disk — unvalidated, and with no handoff printed. Do not read the presence of `terraform.tfvars` as success; read the report status.
+2. Runs the same pre-apply validation checks a real run does: the GitOps organization check, the service-account ownership check, the scope container preflight when a folder or organisation is declared, which on this route, and on the interactive `g` answer, only warns (the apply it hands off may run as another identity; a run that applies, `-y` or the interactive `Y`, refuses, exit 1 with no report status like the ownership check, when the credentials Terraform applies with cannot set IAM policy on a container or an enforced organisation policy forbids the Cloud Asset API), the scope export sink preflight when the drift ingress is on and `SCOPE_PROJECTS` lists a project the drift sinks will cover, which warns and refuses on the same routes when those credentials cannot create a Log Router sink (`logging.sinks.create`) in one of them (a project whose sink the install's Terraform state already holds warns instead when the credentials can read it), and the existing-cluster node-pool and NetworkPolicy consent gates, but not the live-scope check, which needs the install's kubeconfig context and runs only on a run that will apply; the handoff says so. The interactive `g` answer is given after the pre-flight summary, by which point that check has run too, so the two routes differ in that one check. A cluster needing `--migrate-node-pools`, or one enforcing no NetworkPolicy that was given neither `--enable-network-policy` nor `--accept-no-network-policy` (or that combines `--enable-web-console` with `--accept-no-network-policy`), is refused (`REFUSED_MISSING_NODE_POOL_MIGRATION`, `REFUSED_MISSING_NETWORK_POLICY`, `REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY`), as is one that cannot be described (`FAILED_PREFLIGHT_CLUSTER_UNREADABLE`). A `REFUSED_*` status is a question for the operator, not a flag to add: see [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns). Step 1 has already written both files by then, so a refusal exits 1 leaving `install.env` and `terraform.tfvars` on disk — unvalidated, and with no handoff printed. Do not read the presence of `terraform.tfvars` as success; read the report status.
 3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, OTel scope, and, with Google Chat or Slack on, the chat setup checklist commands to run after the apply) and the `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
 4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`, or exits 1 with the `REFUSED_*` / `FAILED_PREFLIGHT_*` status from step 2.
 
@@ -278,17 +281,26 @@ consent and you must obtain it before passing one. Present each pending change w
 - **Legacy node pools** (`REFUSED_MISSING_NODE_POOL_MIGRATION`) — two answers: `--migrate-node-pools`
   recreates every node on those pools and restarts the workloads on them, kube-agents' or not; or
   stop. There is no install without Workload Identity.
-- **No NetworkPolicy enforcement** (`REFUSED_MISSING_NETWORK_POLICY`) — three answers, and you
-  present all three:
+- **No NetworkPolicy enforcement** (`REFUSED_MISSING_NETWORK_POLICY`) — three answers (or when
+  `--enable-web-console` is enabled, `--enable-network-policy`, `--enable-web-console=false` paired
+  with `--accept-no-network-policy`, or stop, since the web console requires NetworkPolicy enforcement
+  and cannot be combined with `--accept-no-network-policy`), and you present the applicable ones:
   1. `--enable-network-policy` enables the legacy Calico addon: a control-plane update that may
      recreate node pools and restart workloads unrelated to kube-agents.
-  2. `--accept-no-network-policy` installs without enforcement. The cluster is not modified. Every
+  2. `--accept-no-network-policy` installs without enforcement (unavailable when `--enable-web-console`
+     is enabled unless `--enable-web-console=false` is also passed to turn the web console off). The cluster is not modified. Every
      NetworkPolicy kube-agents ships is inert: the agent pod's egress confinement, the shell
      sandbox's deny-all (the sandbox is where model-authored commands run), and the LiteLLM,
      minter and Hindsight policies. The confinement lost is kube-agents'
      own, not the operator's workloads'; "we trust the workloads in this cluster" does not answer
      it. Recorded in the report and on the `PlatformAgent`.
   3. Stop. The cluster is unchanged.
+- **Web console without NetworkPolicy enforcement** (`REFUSED_WEB_CONSOLE_WITHOUT_NETWORK_POLICY`) —
+  emitted when `--enable-web-console` (`WEB_CONSOLE_ENABLED=true`) is combined with
+  `--accept-no-network-policy` (`ACCEPT_NO_NETWORK_POLICY=true`) against a cluster that still
+  enforces no NetworkPolicy. Present the operator's choices: enable NetworkPolicy enforcement
+  (`--enable-network-policy` and remove `ACCEPT_NO_NETWORK_POLICY=true` from `install.env`), disable
+  the web console (`--enable-web-console=false` / `WEB_CONSOLE_ENABLED=false`), or stop.
 - **gVisor node pool** — on an existing Standard cluster `--enable-gvisor=true` (the default) adds a
   billable `gvisor-pool` node pool. Say so; `--enable-gvisor=false` runs the agent unsandboxed instead.
 
@@ -364,7 +376,8 @@ Chat is opt-in and both platforms default off, and a non-interactive run with no
 has no chat and the operator has no way to reach the agent unless you give them one. The
 installer prints it at the chat-configuration step and again when it finishes, under
 `--- [Talking to the Agent from a Terminal] ---`, with the cluster, region, project and namespace
-already substituted. Relay those two commands verbatim:
+already substituted. Relay those two commands verbatim (plus the `Web Console` `kubectl port-forward`
+command and `http://localhost:8080` URL when `--enable-web-console` was enabled):
 
 ```bash
 gcloud container clusters get-credentials <CLUSTER_NAME> --location <REGION> --project <PROJECT_ID> --dns-endpoint
@@ -375,8 +388,11 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   on a cluster publishing no externally reachable DNS endpoint, and the installer omits it there.
 - `-p platform` reaches the Platform Agent. A bare `hermes` reaches the Planning Agent front door,
   which is where a chat message would have landed.
-- `kubectl port-forward` is not an alternative: the agent is sandboxed under gVisor by default and
-  the forward cannot see into the sandbox. `kubectl exec` enters it.
+- `kubectl port-forward` to the agent pod is not an alternative: the agent is sandboxed under gVisor
+  by default and the forward cannot see into the sandbox. `kubectl exec` enters it. (When
+  `--enable-web-console` is enabled, the separate web console pod does not run under gVisor and is
+  reached via the `kubectl port-forward svc/kube-agents-web-console -n kubeagents-system 8080:8080`
+  command the installer prints.)
 - Say what the operator does not get until they enable a platform: scheduled reports and
   alert-driven triage are delivered to chat only, and the first-run inventory report waits on a
   human connecting over chat — read it with
@@ -589,9 +605,10 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--slack-home-channel-name=NAME`          | Display name of that channel (e.g. `#gke-alerts`)                                                                                                                                                                                                                                                                                                                                 | _unset_                                                                                                                                            |
 | `--enable-gvisor=true\|false`             | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                                                                                                                                                     | `true`                                                                                                                                             |
 | `--enable-hermes-dashboard=true\|false`   | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                                                                                                                                             | `false`                                                                                                                                            |
+| `--enable-web-console=true\|false`        | Deploy the web console, a browser page for the agent reached by `kubectl port-forward`: chat threads, event triage and scheduled checks, and usage. Requires NetworkPolicy enforcement (cannot be combined with `--accept-no-network-policy`)                                                                                                                                     | `false`                                                                                                                                            |
 | `--enable-gke-backup-plan=true\|false`    | Provision a GKE Backup Plan for the cluster                                                                                                                                                                                                                                                                                                                                       | `false`                                                                                                                                            |
 | `--migrate-node-pools`                    | Authorize migrating legacy GCE metadata server node pools to `GKE_METADATA` (recreates those nodes, restarts their workloads). Without it such a cluster is refused unchanged. The cluster's owner decides; never pass it unasked                                                                                                                                                 | `false`                                                                                                                                            |
-| `--enable-network-policy`                 | Authorize enabling the legacy Calico NetworkPolicy addon on an existing Standard cluster without Dataplane V2 (may recreate nodes). One of two answers; with neither the cluster is refused unchanged. The owner decides; never pass it unasked                                                                                                                                   | `false`                                                                                                                                            |
-| `--accept-no-network-policy`              | The other answer: install without modifying the cluster. Every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included; recorded in the report and on the `PlatformAgent`. The owner decides; never pass it unasked                                                                                                                                           | `false`                                                                                                                                            |
+| `--enable-network-policy`                 | Authorize enabling the legacy Calico NetworkPolicy addon on an existing Standard cluster without Dataplane V2 (may recreate nodes). One of two answers (or the only answer when `--enable-web-console` is enabled); with neither the cluster is refused unchanged. The owner decides; never pass it unasked                                                                       | `false`                                                                                                                                            |
+| `--accept-no-network-policy`              | The other answer (unavailable when `--enable-web-console` is enabled): install without modifying the cluster. Every NetworkPolicy kube-agents ships is then inert, the agent sandbox's included; recorded in the report and on the `PlatformAgent`. The owner decides; never pass it unasked                                                                                      | `false`                                                                                                                                            |
 | `--memory=MODE`                           | Long-term agent memory engine: `file` \| `hindsight` \| `off`                                                                                                                                                                                                                                                                                                                     | `file`                                                                                                                                             |
 | `-h, --help, -?`                          | Output CLI usage banner and parameter details                                                                                                                                                                                                                                                                                                                                     | `N/A`                                                                                                                                              |

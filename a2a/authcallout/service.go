@@ -364,7 +364,7 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			if id.Topics != nil {
 				topics = *id.Topics
 			}
-			g, err := profileGrants(id.Profile, att.PodName, topics)
+			g, err := profileGrants(id.Profile, id.Tier, att.PodName, topics)
 			if err != nil {
 				return "", nil, "", fmt.Errorf("%s narrows on profile %q, but %w", att.ServiceAccount, id.Profile, err)
 			}

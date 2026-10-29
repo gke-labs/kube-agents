@@ -260,6 +260,24 @@ class RepKinds(unittest.TestCase):
         self.assertFalse(t.collapsed, "nothing graded, nothing collapsed")
         self.assertTrue(health.Task(task("x", "ffc")).collapsed, "a ceiling rep never softens a collapse")
 
+    def test_the_fixture_drift_marker_is_the_bench_modules(self):
+        module = SCORER.parent / "fixture_drift.py"
+        label = next(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in module.read_text(encoding="utf-8").splitlines()
+            if line.startswith("FIXTURE_DRIFT_LABEL = ")
+        )
+        self.assertEqual(health.FIXTURE_DRIFT_MARKER, f"({label}:")
+
+    def test_drifted_fixture_reps_are_neither_graded_nor_storms(self):
+        drifted = {"result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade (fixture-drift:crashloop-workload: pod crashloop status.containerStatuses[*].lastState.terminated.reason any_eq OOMKilled: observed none)"}
+        self.assertEqual(health.rep_kind(drifted), "fixture")
+        t = health.Task({"name": "x", "result": "infra", "reps": [dict(drifted, n=i + 1) for i in range(3)]})
+        self.assertEqual((t.passes, t.fails, t.storms, t.ceilings, t.fixtures, t.graded), (0, 0, 0, 0, 3, 0))
+        self.assertFalse(t.collapsed)
+        r = health.Run({"build_id": "1", "pr": 1, "result": "SUCCESS", "tasks": [{"name": "x", "result": "infra", "reps": [dict(drifted, n=i + 1) for i in range(3)]}]})
+        self.assertEqual((r.storm_reps, r.total_reps), (0, 3))
+
 
 # --------------------------------------------------------------------------- #
 # Rule 1: shared break
@@ -2765,6 +2783,36 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual(mixed["condition"], "fixture_drift")
         self.assertIn("re-applied", mixed["advice"])
         self.assertIn(health.ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=role), mixed["advice"])
+
+    def test_drift_no_re_apply_clears_names_the_remedy_not_the_re_apply(self):
+        # #4005: keyed on the op in the drift lines. DRIFT_ROLE stands in for the role carrying them.
+        age = 'cluster createTime age_hours_ge 24: observed "2026-09-07T22:00:00+00:00", 2.0 hours old (why: Clears itself)'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000) (why: seeded_b_pin.py holds it)'
+
+        def with_lines(lines, drifted=(DRIFT_ROLE,)):
+            doc = scan(drifted={project(1): list(drifted)}, previous={project(1): list(drifted)})
+            for role, detail in zip(drifted, lines):
+                doc["projects"][project(1)]["roles"][role]["detail"] = detail
+            return doc
+
+        aged = self.judge(with_lines([[age]]))
+        self.assertEqual(aged["condition"], "fixture_drift")
+        self.assertTrue(aged["advice"].startswith(health.ADVICE_FIXTURE_NO_REAPPLY.split("{remedy}")[0].format(roles=DRIFT_ROLE, projects=project(1))), aged["advice"])
+        self.assertIn("clears itself at Tue 6:00 PM ET", aged["advice"], "createTime + 24h on the reader's clock")
+        self.assertNotIn("re-applied", aged["advice"])
+        ahead_only = self.judge(with_lines([[ahead]]))["advice"]
+        self.assertIn("until the channel ships a newer patch of that minor", ahead_only)
+        self.assertNotIn("re-applied", ahead_only)
+        both = self.judge(with_lines([[age], [ahead]], drifted=(DRIFT_ROLE, OTHER_ROLE)))["advice"]
+        self.assertIn(f"{DRIFT_ROLE} reads a cluster under its age gate", both)
+        self.assertIn(f"{OTHER_ROLE} reads a master ahead of its release channel", both)
+        # One ordinary line beside them keeps the re-apply advice.
+        mixed = self.judge(with_lines([[age, DRIFT_DETAIL]]))["advice"]
+        self.assertIn("re-applied", mixed)
+        self.assertNotIn("age gate", mixed)
+        # An unset channel on the same op is the stack's to restore: the re-apply advice.
+        unset = self.judge(with_lines([['cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset']]))["advice"]
+        self.assertIn("re-applied", unset)
 
     def test_the_same_role_on_the_same_project_two_scans_running_degrades(self):
         result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [DRIFT_ROLE]}))

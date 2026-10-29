@@ -385,6 +385,7 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"1": {"account", "grants", "identities", "publish", "serviceAccount", "subscribe", "user", "version"},
 	"2": {"account", "grants", "identities", "narrowing", "publish", "serviceAccount", "subscribe", "user", "version"},
 	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
+	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.

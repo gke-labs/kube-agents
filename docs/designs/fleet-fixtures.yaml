@@ -240,7 +240,9 @@ fixtures:
       so the held version can be absent from REGULAR; while another roster or
       validMasterVersions still offers it (so on 2026-10-14; nothing in the
       stack keeps it) upgrade check 3.1 branch (a) does not fire and the
-      cluster carries branch (b) at major. See
+      cluster carries branch (b) at major. A held version newer than every
+      REGULAR patch of its minor is drift (`not_ahead_of_channel` in
+      fixtures.json): agents read it as current or ahead, not behind. See
       docs/designs/bench-fleet-catalog.md.
 
   - role: drift-outlier
@@ -253,7 +255,41 @@ fixtures:
       open-for-eval block. The drift SOP excludes a cluster whose createTime is
       under 24 hours old from every cohort, and its cohort floor is three
       clusters: replacing c silences the finding for a day, and so does
-      replacing any cluster on a project whose fleet predates slot d.
+      replacing any cluster on a project whose fleet predates slot d. The
+      hourly scan reports a c under a day old as drift.
+
+  - role: drift-peer-a
+    slot: a
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot a's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-b
+    slot: b
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot b's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
+
+  - role: drift-peer-d
+    slot: d
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Not a defect: slot d's master authorized networks on, with the
+      open-for-eval block, one of the majority drift-outlier is outvoted by.
+      The hourly scan asserts the block. Its age is not asserted: one new peer
+      leaves seeded-c outvoted 2/3 by the other two.
 
   - role: readiness-surge-blocked
     slot: b
@@ -295,11 +331,12 @@ fixtures:
       - healthcheck/drain-timeout-<prefix>-b
     defect: >-
       A Compute Engine backend service on the default pool's instance group
-      whose connection draining timeout is 3600 seconds, six times the 600
+      whose connection draining timeout is 720 seconds, a fifth over the 600
       seconds GKE waits per node during a pool upgrade, behind a TCP health
       check and no forwarding rule, so it routes nothing and costs nothing;
-      every default-pool node recreate on this cluster waits the 600 seconds
-      on it.
+      every default-pool node recreate on this cluster waits the 720 seconds
+      on it, which stays under the 30 minutes after which GKE fails the node
+      step.
 
   - role: readiness-failclosed-webhook
     slot: b
