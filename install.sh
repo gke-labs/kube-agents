@@ -970,7 +970,7 @@ Flags for AI Agents & Automation:
   --slack-home-channel-policy=POLICY
                                 auto (the default, also empty) or manual: sets
                                 spec.integration.slack.homeChannelPolicy on the PlatformAgent;
-                                the CRD reference says what each value does
+                                the CRD reference describes the field
   --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
                                 GKE_METADATA. Recreates those nodes and restarts every workload on
                                 them, kube-agents' or not. Without it a cluster with legacy pools is

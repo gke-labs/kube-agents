@@ -215,7 +215,7 @@ edits the keys on its own screens.
 `SLACK_HOME_CHANNEL_POLICY` (`--slack-home-channel-policy`) is `auto` (the default, also empty) or
 `manual`, and renders `spec.integration.slack.homeChannelPolicy` on the PlatformAgent; the
 [CRD reference](../../docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
-says what each value does. The interview does not ask for it: the field is an opt-out, set in the
+describes the field. The interview does not ask for it: the field is an opt-out, set in the
 file by the few installs that want it. `write_tfvars_from_state` refuses any other spelling before
 a file is written, on every route, because the CRD accepts only those two. A shell export of the
 key, like an export of any Slack key, is read only when the file does not assign it: a first

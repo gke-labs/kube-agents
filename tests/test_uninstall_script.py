@@ -1162,6 +1162,10 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')
         self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
         self.assertLess(mode_at, call_at)
+        # And the Slack home channel policy, refused outside the same kind of enum.
+        policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
+        self.assertLess(policy_at, call_at)
         # The data volume size likewise: the generator refuses a malformed size.
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")

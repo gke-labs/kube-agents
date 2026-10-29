@@ -936,6 +936,9 @@ main() {
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
+  # The Slack home channel policy, likewise: the generator refuses a value
+  # outside the CRD's enum, and the destroy removes the release whatever it says.
+  export SLACK_HOME_CHANNEL_POLICY=""
   # The data volume size, likewise: the generator refuses a malformed size,
   # and a teardown must not stop on a typo in install.env.
   export PLATFORM_AGENT_STORAGE_SIZE=""
