@@ -30,8 +30,7 @@ operator renders `spec.harness.tuning.busReplicas` servers. When the field is un
 install keeps the server count its bus already runs (an install from before this change
 stays on one server), and a new bus gets three. Every stream and bucket the provision Job
 creates takes `min(3, servers)` replicas. The servers find each other through a headless
-routes Service on 6222, with route TLS verified both ways under the bus CA and a route
-user of their own (the callout does not govern routes). A `maxUnavailable: 1` budget and
+routes Service on 6222, authenticated to each other by mutual TLS under the bus CA (the callout does not govern routes, and no route password is rendered). A `maxUnavailable: 1` budget and
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 

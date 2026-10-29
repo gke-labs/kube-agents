@@ -498,11 +498,6 @@ const (
 	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
-	// a2aNATSRouteCredsKey names the route user's password in the creds
-	// Secret: it authenticates the cluster routes between the bus's
-	// own servers. Not a client credential: the auth callout does not govern
-	// routes, so they carry their own user, and only a NATS pod reads it.
-	a2aNATSRouteCredsKey = "route-password" // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
 	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
@@ -1605,7 +1600,7 @@ func randomA2APassword() (string, error) {
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
 	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
-	a2aBridgeActivityKey, a2aNATSRouteCredsKey,
+	a2aBridgeActivityKey,
 }
 
 // a2aActivityHookEvents are the hook events the door reads: the tool calls
@@ -2150,7 +2145,7 @@ http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 pid_file: "` + a2aNATSPidFile + `"
 # How long a stopping server spreads its clients' reconnects over.
 lame_duck_duration: "` + strconv.Itoa(a2aNATSLameDuckSeconds) + `s"
-` + renderA2ANATSCluster(agent, pw) + `
+` + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -2330,18 +2325,22 @@ authorization {
 // the cluster from that peer's gossip, so the list does not change with the
 // replica count.
 //
-// TLS, verified both ways. Each server presents the serving certificate as a
-// client (it carries ClientAuth for this) and checks its peer's against the
-// bus CA. The peers it learns by gossip arrive as IPs, which no certificate
-// here names; nats-server dials those with the TLS name saved from the
-// explicit route's hostname (saveRouteTLSName in its route.go), which is why
-// the routes Service's name is one of the certificate's SANs.
-//
-// And a route user. The auth callout governs client connections, not routes,
-// so without a cluster authorization block anything that reached 6222 with a
-// certificate from the bus CA could join as a server. The bus fence admits
-// 6222 from the bus's own pods only; this is the second lock.
-func renderA2ANATSCluster(agent *agentv1alpha1.PlatformAgent, pw func(key string) string) string {
+// Authentication is mutual TLS, verified both ways. Each server presents the
+// serving certificate as a client (it carries ClientAuth for this) and
+// requires its peer's, checked against the bus CA. nats-server enforces that
+// on every route as soon as the cluster has a tls block, whatever verify says
+// (it sets RequireAndVerifyClientCert for clusters, opts.go); verify: true
+// states it. So the tls block is the lock, and a test pins it. The serving
+// certificate is the only one the bus CA signs with ClientAuth, and only the
+// NATS pods mount it, so holding the serving key is what joining the cluster
+// takes; the bus fence also admits 6222 from the bus's own pods and nothing
+// else. The auth callout governs clients, not routes, and no route password
+// is rendered: it would add a credential that a holder of the serving key
+// does not need. The peers each server learns by gossip arrive as IPs, which
+// no certificate here names; nats-server dials those with the TLS name saved
+// from the explicit route's hostname (saveRouteTLSName in its route.go), which
+// is why the routes Service's name is one of the certificate's SANs.
+func renderA2ANATSCluster(agent *agentv1alpha1.PlatformAgent) string {
 	if a2aNATSReplicas(agent) <= 1 {
 		return ""
 	}
@@ -2361,12 +2360,8 @@ cluster {
   # stream led by the peer until the next restart. A single route per peer
   # carries every account; this bus's traffic needs no more.
   pool_size: -1
-  authorization {
-    user: ` + a2aNATSRouteUser + `
-    password: "` + pw(a2aNATSRouteCredsKey) + `"
-  }
   routes: [
-    "nats-route://` + a2aNATSRouteUser + `:` + pw(a2aNATSRouteCredsKey) + `@` + routeHost + `:` + strconv.Itoa(a2aNATSRoutePort) + `"
+    "nats-route://` + routeHost + `:` + strconv.Itoa(a2aNATSRoutePort) + `"
   ]
   tls {
     cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
@@ -2377,10 +2372,6 @@ cluster {
 }
 `
 }
-
-// a2aNATSRouteUser is the user the bus's servers present to each other on
-// their routes (renderA2ANATSCluster). Not a client identity.
-const a2aNATSRouteUser = "route"
 
 // a2aNATSRoutesName is the headless Service the cluster routes dial.
 func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {

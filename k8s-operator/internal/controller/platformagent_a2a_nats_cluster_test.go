@@ -213,21 +213,25 @@ func TestTheBusFenceAdmitsRoutesFromItsOwnServersOnly(t *testing.T) {
 	}
 }
 
-// The route user is the servers' login to each other. It appears in the
-// cluster block and nowhere else: not in an account, not in auth_users, so it
-// cannot open a client connection.
-func TestTheRouteUserLivesOnlyInTheClusterBlock(t *testing.T) {
+// Routes authenticate by certificate alone: the cluster block has a tls block
+// naming the bus CA (nats-server requires and verifies a client certificate on
+// every route once there is one), and renders no route user or password, in
+// the block or in the route URL.
+func TestTheRoutesAuthenticateByCertificateOnly(t *testing.T) {
 	conf := renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
 	block := a2aClusterBlockRe.FindString(conf)
-	if !strings.Contains(block, "user: "+a2aNATSRouteUser) || !strings.Contains(block, `password: "pw-`+a2aNATSRouteCredsKey+`"`) {
-		t.Errorf("the cluster block has no route user and password:\n%s", block)
+	for _, want := range []string{"tls {", "verify: true", `ca_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCAKey + `"`, `cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`} {
+		if !strings.Contains(block, want) {
+			t.Errorf("the cluster block lacks %q:\n%s", want, block)
+		}
 	}
-	rest := a2aClusterBlockRe.ReplaceAllString(conf, "")
-	if regexp.MustCompile(`user: ` + a2aNATSRouteUser + `\b`).MatchString(rest) {
-		t.Error("the route user appears outside the cluster block")
+	for _, unwanted := range []string{"authorization", "user:", "password", "pw-"} {
+		if strings.Contains(block, unwanted) {
+			t.Errorf("the cluster block carries %q; routes authenticate by certificate:\n%s", unwanted, block)
+		}
 	}
-	if strings.Contains(rest, "pw-"+a2aNATSRouteCredsKey) {
-		t.Error("the route password appears outside the cluster block")
+	if regexp.MustCompile(`nats-route://[^"]*@`).MatchString(block) {
+		t.Errorf("the route URL carries credentials:\n%s", block)
 	}
 }
 
@@ -363,8 +367,8 @@ func TestEveryProvisionedStreamTakesTheConfiguredReplicaCount(t *testing.T) {
 // The peers each server learns by gossip arrive as IPs, which the test
 // certificate does not name. That they connect at all is nats-server dialling
 // them with the TLS name saved from the explicit route (saveRouteTLSName), the
-// behaviour the render's SANs rely on. A fourth server with the wrong route
-// password does not join.
+// behaviour the render's SANs rely on. A fourth server whose certificate comes
+// from another CA does not join: routes authenticate by certificate.
 func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("c", "1")
@@ -378,19 +382,21 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	}
 
 	ports := a2aFreePorts(t, 4)
-	start := func(i int, routePassword string) *natsserver.Server {
+	// tlsDir, when set, is a serving pair from another CA: a server that can
+	// reach 6222 but does not hold the bus's serving key.
+	start := func(i int, tlsDir string) *natsserver.Server {
 		t.Helper()
 		c := strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-"+strconv.Itoa(i), 1)
 		c = strings.Replace(c, `pid_file: "`+a2aNATSPidFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, 1)
 		c = strings.Replace(c, routeHost, "localhost:"+strconv.Itoa(ports[0]), 1)
 		c = strings.Replace(c, "port: "+strconv.Itoa(a2aNATSRoutePort), "port: "+strconv.Itoa(ports[i]), 1)
-		if routePassword != "" {
-			// Only the cluster block's own password: the one this server
-			// would accept from a peer, and the one it dials with.
-			c = strings.ReplaceAll(c, string(creds.Data[a2aNATSRouteCredsKey]), routePassword)
+		if tlsDir != "" {
+			c = strings.ReplaceAll(c, a2aNATSTLSMountDir+"/", tlsDir+"/")
+		} else {
+			c = a2aWithTestTLS(t, c)
 		}
 		path := filepath.Join(t.TempDir(), "nats.conf")
-		if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, c)), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(c), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		opts, err := natsserver.ProcessConfigFile(path)
@@ -488,10 +494,34 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		}
 	}
 
-	intruder := start(3, "0123456789abcdef0123456789abcdef")
+	// A serving pair from a CA of its own, as anything that is not one of the
+	// bus's servers would have: it names the right host and is not signed by
+	// the bus CA. It trusts the bus CA, though, so its own handshake with a
+	// bus server succeeds and the refusal, if any, is the bus server's check
+	// of its certificate (verify: true), which is what this exercises.
+	foreignCA := t.TempDir()
+	busTLSDir, _ := a2aTestTLSMaterial(t)
+	busCAPEM, err := os.ReadFile(filepath.Join(busTLSDir, a2aNATSTLSCAKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, caKey, _, _, err := generateA2ANATSCA(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, []string{a2aTestServerName}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: busCAPEM} {
+		if err := os.WriteFile(filepath.Join(foreignCA, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	intruder := start(3, foreignCA)
 	time.Sleep(3 * time.Second)
 	if peers := a2aRoutePeers(t, intruder); len(peers) != 0 {
-		t.Errorf("a server with the wrong route password joined, peering with %v", peers)
+		t.Errorf("a server with a certificate from another CA joined, peering with %v", peers)
 	}
 	for i, s := range servers {
 		if peers := a2aRoutePeers(t, s); len(peers) != 2 || slices.Contains(peers, "a2a-test-nats-3") {
