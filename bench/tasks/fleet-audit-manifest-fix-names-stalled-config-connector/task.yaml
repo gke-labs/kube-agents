@@ -13,10 +13,10 @@
 # note's first sentence and the object as the note names it, so the worker's
 # own words cannot pass the check.
 #
-# RED ON MAIN, AND WHY. Before the change nothing writes the note, so the
-# phrase is absent even when the fix edits the planted file. The finding_ids
-# objective tells a red from a broken run: if it fails too, the stockout
-# finding on the pool was never filed and the run proves nothing.
+# RED AND BROKEN. When `finish` writes no note, the phrase is absent even
+# when the fix edits the planted file. The finding_ids objective tells a red
+# from a broken run: if it fails too, the stockout finding on the pool was
+# never filed and the run proves nothing.
 #
 # THE PLANT (prebuilt/kcc-stalled-declaration). One ContainerNodePool for the
 # seeded pinned-inference-pool, in the namespace eval-kcc-stalled on the
