@@ -235,11 +235,15 @@ func TestTheSwarmRouteIgnoresTheDeployment(t *testing.T) {
 		t.Errorf("the deployment's address was dialled %d times", n)
 	}
 	// And it is not decoded at all: no field of the request takes it, so
-	// nothing can log, store or forward it.
-	rt := reflect.TypeOf(swarmRequest{})
-	for i := 0; i < rt.NumField(); i++ {
-		if name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ","); name == "deployment" {
-			t.Errorf("swarmRequest.%s decodes the deployment", rt.Field(i).Name)
+	// nothing can log, store or forward it. Decoding is the check, since
+	// encoding/json also matches untagged fields and names in any case.
+	for _, key := range []string{"deployment", "Deployment", "DEPLOYMENT"} {
+		var got swarmRequest
+		if err := json.Unmarshal([]byte(`{"`+key+`":{"name":"x","busAuthValue":"secret-marker"}}`), &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, swarmRequest{}) {
+			t.Errorf("a request holding only %q decoded into %+v; want nothing taken", key, got)
 		}
 	}
 }
