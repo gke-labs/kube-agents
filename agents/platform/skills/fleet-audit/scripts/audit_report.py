@@ -18764,6 +18764,39 @@ def _remediation_file_index(finding: dict, root: Path) -> dict[KccKey, KccDeclar
     return index
 
 
+def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dict[KccKey, KccDeclaration]:
+    """The Config Connector objects of the fix's file that the fix is about.
+
+    A file with one object: that object. A file with more: only the one that
+    is the finding's own object (`NodePool/<n>` is the `ContainerNodePool`
+    whose GKE name is `<n>` on the finding's cluster, `Cluster/<n>` the
+    `ContainerCluster` `<n>`, another kind the objects of that
+    `metadata.name`, of that kind when the file declares it), because a stall of another object in the same file
+    says nothing about this fix. Empty when no object is the finding's own:
+    then the audit cannot tell which object the fix changes.
+    """
+    if len(index) <= 1:
+        return index
+    prefix, _, name = str(finding.get("object") or "").partition("/")
+    if not name:
+        return {}
+    kinds = _KCC_OBJECT_KINDS.get(prefix)
+    cluster = str(finding.get("cluster") or "").rpartition("/")[2]
+    pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
+    if kinds:
+        return {
+            key: declaration
+            for key, declaration in index.items()
+            if key[0] in kinds and key[1] == name and (key[0] not in pool_kinds or key[2] == cluster)
+        }
+    named_kind = prefix in {key[0] for key in index}
+    return {
+        key: declaration
+        for key, declaration in index.items()
+        if declaration.name == name and (not named_kind or key[0] == prefix)
+    }
+
+
 def _finding_project(finding: dict) -> str:
     """The project of `finding`'s `project/location/name` cluster, or `""`."""
     parts = str(finding.get("cluster") or "").split("/")
@@ -18966,7 +18999,10 @@ def disclose_stalled_kcc_remediations(
     It also writes `KCC_STALLED_FINDING_FIELD` on each finding whose fix file
     or own `Cluster/` or `NodePool/` object (`_object_stalls`) is unready, for
     the merged-but-persisting line and comment, which then state the stall
-    in place of their guess at a cause. A `manifest` fix uses its own object
+    in place of their guess at a cause. When the file declares more than one
+    Config Connector object, only the finding's own object counts
+    (`_fix_declarations`); when none is the finding's own, the fix gets no
+    Config Connector text. A `manifest` fix uses its own object
     only when its file declares a Config Connector object: a fix to another
     file (a `ComputeClass`, say) did not change a declaration Config
     Connector applies, so no Config Connector text goes on it.
@@ -18980,7 +19016,7 @@ def disclose_stalled_kcc_remediations(
         before = remediation.get("note") if isinstance(remediation, dict) else None
         _strip_kcc_stalled_note(remediation)
         finding.pop(KCC_STALLED_FINDING_FIELD, None)
-        index = _remediation_file_index(finding, root) if stalled else {}
+        index = _fix_declarations(finding, _remediation_file_index(finding, root)) if stalled else {}
         in_file = _remediation_file_stalls(finding, index, stalled, health.hosts) if index else []
         is_manifest = isinstance(remediation, dict) and remediation.get("kind") == MANIFEST_REMEDIATION_KIND
         object_fallback = bool(stalled) and (bool(index) or not is_manifest)

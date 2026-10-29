@@ -23021,6 +23021,42 @@ metadata:
         self.disclose([own], kcc_manifest(record))
         self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
 
+    TWO_POOLS = "\n---\n".join(
+        "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+        f"  name: {pool}\n  namespace: infra\nspec:\n  location: us-central1\n  clusterRef:\n    name: prod-usc1\n"
+        for pool in ("pool-a", "pool-b")
+    )
+
+    def pool_fix(self, pool):
+        self.write("pools.yaml", self.TWO_POOLS)
+        return make_finding(
+            fid=pool, cluster="acme/us-central1/prod-usc1", obj=f"NodePool/{pool}",
+            remediation={"kind": "manifest", "path": "pools.yaml", "note": "Raise the ceiling."},
+        )
+
+    def pool_stall(self, pool):
+        return {"kind": "ContainerNodePool", "namespace": "infra", "name": pool, "why": "UpdateFailed", "cluster": "prod-usc1"}
+
+    def test_a_stall_of_another_object_in_the_same_file_gives_no_note(self):
+        """The file declares pool-a and pool-b; the fix is for pool-a; only
+        pool-b is stalled. That says nothing about pool-a's fix."""
+        finding = self.pool_fix("pool-a")
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-b"))), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_stall_of_the_findings_own_object_in_a_shared_file_gives_the_note(self):
+        finding = self.pool_fix("pool-b")
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-b"))), ["pool-b"])
+        note = finding["remediation"]["note"]
+        self.assertIn("`ContainerNodePool infra/pool-b`", note)
+        self.assertNotIn("pool-a", note)
+
+    def test_a_shared_file_with_no_object_of_the_finding_gives_no_note(self):
+        finding = self.pool_fix("pool-a")
+        finding["object"] = "Namespace/infra"
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-a"), self.pool_stall("pool-b"))), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
     def test_a_fix_to_a_file_with_no_config_connector_object_gets_no_config_connector_text(self):
         """The finding's node pool is unready, but the fix edits a
         `ComputeClass`: the merged fix did not change a Config Connector
@@ -23063,14 +23099,18 @@ metadata:
                 self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
 
     def test_a_file_of_many_unready_objects_names_two_and_counts_the_rest(self):
-        names = ("a", "b", "c")
-        self.write(KCC_CLUSTER_FILE, "\n---\n".join(KCC_CLUSTER_DECLARATION.replace("prod-usc1", n) for n in names))
+        # Three objects of one name and three kinds; the finding names a kind
+        # the file does not declare, so all three are the finding's own.
+        kinds = ("PubSubTopic", "PubSubSubscription", "PubSubSchema")
+        declaration = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: {kind}\nmetadata:\n  name: events\n  namespace: infra\n"
+        self.write(KCC_CLUSTER_FILE, "\n---\n".join(declaration.format(kind=kind) for kind in kinds))
         finding = kcc_finding()
-        self.disclose([finding], kcc_manifest(*(dict(KCC_CLUSTER, name=n, why="UpdateFailed") for n in names)))
+        finding["object"] = "Workload/events"
+        self.disclose([finding], kcc_manifest(*(dict(KCC_TOPIC, kind=kind, name="events", why="UpdateFailed") for kind in kinds)))
         last = finding["remediation"]["note"].split("\n\n")[-1]
-        self.assertIn("`ContainerCluster infra/a`", last)
-        self.assertIn("`ContainerCluster infra/b`", last)
-        self.assertNotIn("infra/c`", last)
+        self.assertIn("`PubSubTopic infra/events`", last)
+        self.assertIn("`PubSubSubscription infra/events`", last)
+        self.assertNotIn("PubSubSchema", last)
         self.assertIn("and 1 more unready object(s) in this file", last)
 
     def test_a_controller_message_cannot_break_out_of_its_code_span(self):
