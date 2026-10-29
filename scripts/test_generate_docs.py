@@ -198,7 +198,7 @@ class CapabilitiesTest(unittest.TestCase):
         jobs = [
             job
             for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
-            if job.get("enabled") and generate_docs.AUDIT_SKILL in job.get("skills", [])
+            if job.get("enabled") and generate_docs.is_audit(job)
         ]
         audits = generate_docs.governance_audits()
         self.assertEqual(sorted(a["id"] for a in audits), sorted(j["id"] for j in jobs))
@@ -314,18 +314,42 @@ class CronHelperJobsTest(unittest.TestCase):
 
     def test_exactly_the_enabled_non_audit_jobs_are_listed_in_roster_order(self):
         roster = generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
-        expected = [
-            job["id"]
-            for job in roster
-            if job.get("enabled") and generate_docs.AUDIT_SKILL not in job.get("skills", [])
-        ]
+        expected = [job["id"] for job in roster if job.get("enabled") and not generate_docs.is_audit(job)]
         self.assertTrue(expected)
         body = generate_docs.gen_cron_helper_jobs()
         listed = re.findall(r"^\| `([^`]+)` \|", body, re.M)
         self.assertEqual(listed, expected)
         for job in roster:
-            if generate_docs.AUDIT_SKILL in job.get("skills", []):
+            if generate_docs.is_audit(job):
                 self.assertNotIn(f"`{job['id']}`", body)
+
+    def test_helpers_and_audits_partition_the_enabled_roster(self):
+        # The two regions share `is_audit`; this holds them to the roster from
+        # the other side, so neither can gain or lose an entry on its own.
+        enabled = [
+            job["id"]
+            for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+            if job.get("enabled")
+        ]
+        helpers = [job["id"] for job in generate_docs.helper_jobs()]
+        audits = [audit["id"] for audit in generate_docs.governance_audits()]
+        self.assertEqual(sorted(helpers + audits), sorted(enabled))
+        self.assertFalse(set(helpers) & set(audits))
+
+    def test_a_null_skills_entry_is_a_helper_in_both_regions(self):
+        # `jobs.json` readers elsewhere in the tree accept `"skills": null`;
+        # the helper filter used to raise `TypeError` on it while the audit
+        # filter read it as no skills.
+        roster = [
+            helper_job("no-skills", "0 6 * * *", skills=None),
+            audit_job("audit", {"expr": "0 6 * * *"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+            audits = [audit["id"] for audit in generate_docs.governance_audits()]
+        self.assertIn("| `no-skills` | script, `no_skills.py` |", body)
+        self.assertNotIn("`audit`", body)
+        self.assertEqual(audits, ["audit"])
 
     def test_disabled_and_audit_entries_are_left_out(self):
         roster = [

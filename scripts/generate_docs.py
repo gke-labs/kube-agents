@@ -480,6 +480,17 @@ def gen_cron_job_example(job_id: str = EXAMPLE_JOB_ID) -> str:
     return f"```json\n{rendered}\n```"
 
 
+def is_audit(job: dict) -> bool:
+    """Whether a roster entry is a governance audit: it carries the `fleet-audit` skill.
+
+    The one predicate behind `helper_jobs()` and `governance_audits()`, so the
+    two regions partition the enabled roster between them and cannot drift. A
+    missing or `null` `skills` reads as no skills, as every other roster reader
+    in the tree treats it.
+    """
+    return AUDIT_SKILL in (job.get("skills") or [])
+
+
 def helper_jobs() -> list[dict]:
     """The enabled Platform Agent roster entries that are not fleet audits.
 
@@ -488,11 +499,7 @@ def helper_jobs() -> list[dict]:
     A disabled entry is a tombstone on its way out (see `gen_cron_jobs`) and
     is left out for the same reason.
     """
-    return [
-        job
-        for job in load_roster(PLATFORM_CRON_ROSTER)
-        if job.get("enabled") and AUDIT_SKILL not in job.get("skills", [])
-    ]
+    return [job for job in load_roster(PLATFORM_CRON_ROSTER) if job.get("enabled") and not is_audit(job)]
 
 
 def helper_kind(job: dict) -> str:
@@ -616,7 +623,7 @@ def governance_audits() -> list[dict[str, str]]:
     """Return the enabled governance audits in the order the README lists them."""
     audits = []
     for job in load_roster(PLATFORM_CRON_ROSTER):
-        if not job.get("enabled") or AUDIT_SKILL not in (job.get("skills") or []):
+        if not job.get("enabled") or not is_audit(job):
             continue
         sop = SOP_REF_RE.search(job.get("prompt") or "")
         if not sop:
