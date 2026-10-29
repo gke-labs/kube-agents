@@ -117,10 +117,19 @@ class VerifierTest(unittest.TestCase):
         root = stage()
         apply(root)
         path = root / RELATIVE
-        path.write_text(path.read_text().replace(f"if _kage_age > {EDIT_WINDOW_SECONDS}:", "if False:"))
+        path.write_text(path.read_text().replace(f'if {EDIT_WINDOW_SECONDS} < _kage_age < float("inf"):', "if False:"))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
         self.assertTrue(any("no previous_message on a parent edited earlier" in f for f in failures), failures)
+
+    def test_a_window_without_the_finite_bound_is_refused(self):
+        root = stage()
+        apply(root)
+        path = root / RELATIVE
+        path.write_text(path.read_text().replace(' < _kage_age < float("inf"):', " < _kage_age:"))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("non-finite ts" in f for f in failures), failures)
 
     def test_a_moved_method_is_reported_not_raised(self):
         root = stage(ADAPTER_STUB.replace("def _normalize_changed_message", "def _normalize_change"))
@@ -157,6 +166,10 @@ class RestartedAdapterTest(unittest.TestCase):
     def test_a_second_edit_is_routed(self):
         self.assertEqual(self.normalize(verify.SECOND_EDIT)["ts"], verify.ROOT_TS)
         self.assertEqual(self.normalize(verify.BARE_SECOND_EDIT)["ts"], verify.ROOT_TS)
+
+    def test_an_edit_with_a_non_finite_ts_is_routed(self):
+        for event in verify.NON_FINITE_EDITS:
+            self.assertEqual(self.normalize(event)["ts"], verify.ROOT_TS, event)
 
     def test_an_edit_inside_the_window_is_routed(self):
         late = {**verify.BARE_EDIT, "event_ts": f"{float(verify.EDIT_TS) + EDIT_WINDOW_SECONDS - 1:.6f}"}

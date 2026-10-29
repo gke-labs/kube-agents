@@ -12,7 +12,7 @@ is empty, as it is after a restart:
   from ``previous_message``'s, and one for that parent with no
   ``previous_message``, whose ``edited.ts`` is hours older than the event;
 - a user's edit, a second edit, and an edit or second edit with no
-  ``previous_message`` (or with an event ts that does not parse) still return
+  ``previous_message`` (or with a ts that is garbled, inf or nan) still return
   the normalized message;
 - a change to a message already routed to the agent still returns None.
 
@@ -102,6 +102,13 @@ BARE_SECOND_EDIT = {**BARE_EDIT, "event_ts": EDIT_TS}
 #: An edit with no previous_message and no event ts that parses: kept, never dropped for a missing field.
 BARE_EDIT_NO_EVENT_TS = {**BARE_EDIT, "ts": "", "event_ts": "garbled"}
 
+#: Edits whose ts parses to a non-finite float: kept, as a ts that does not parse is.
+NON_FINITE_EDITS = (
+    {**BARE_EDIT, "event_ts": "inf"},
+    {**BARE_EDIT, "event_ts": "nan"},
+    {**BARE_EDIT, "message": {**BARE_EDIT["message"], "edited": {"user": "U1", "ts": "-Infinity"}}},
+)
+
 
 def fail(msg: str) -> None:
     FAILURES.append(msg)
@@ -159,7 +166,8 @@ def main() -> int:
                             (BARE_EDIT, "an edit with no previous_message"),
                             (MALFORMED_PREVIOUS_EDIT, "an edit with a malformed previous_message"),
                             (BARE_SECOND_EDIT, "a second edit with no previous_message"),
-                            (BARE_EDIT_NO_EVENT_TS, "an edit with no previous_message and no event ts")):
+                            (BARE_EDIT_NO_EVENT_TS, "an edit with no previous_message and no event ts"),
+                            *((e, "an edit with a non-finite ts") for e in NON_FINITE_EDITS)):
             got = run(text, event)
             if got is not RAISED and (not isinstance(got, dict) or got.get("ts") != ROOT_TS):
                 fail(f"{what} is not routed as the edited message: {got!r}")

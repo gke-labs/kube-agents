@@ -25,8 +25,9 @@ when the message's ``edited.ts`` differs from ``previous_message``'s. With no
 older than the event's ``event_ts`` (or ``ts``). Both come from Slack's clock
 and an edit's event is stamped as it is made, so a real edit lands inside the
 window, while a later change to a parent edited once still carries that old
-``edited.ts`` and would otherwise replay the opening ask. An event ts that does
-not parse keeps the change, so a missing field never drops a real edit. One
+``edited.ts`` and would otherwise replay the opening ask. A ts that does not
+parse, or parses to ``inf`` or ``nan``, keeps the change, so a bad field never
+drops a real edit. One
 narrow gap is left: a bare change arriving within the window of the parent's
 edit, with a restart in between, still reads as that edit. A
 metadata change, a link unfurl and a bot-side rewrite of another message are not edits. The
@@ -88,7 +89,8 @@ GUARD_PATCHED = GUARD_ANCHOR + (
     '                _kage_age = float(event.get("event_ts") or event.get("ts")) - float(_kage_edited.get("ts"))\n'
     "            except (TypeError, ValueError):\n"
     "                _kage_age = 0.0\n"
-    f"            if _kage_age > {EDIT_WINDOW_SECONDS}:\n"
+    "            # A non-finite ts (`inf`, `nan`) fails this chain and keeps the change.\n"
+    f'            if {EDIT_WINDOW_SECONDS} < _kage_age < float("inf"):\n'
     "                return None\n"
 )
 
