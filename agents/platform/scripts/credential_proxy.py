@@ -2800,18 +2800,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             return True
         if connections is not None:
             return any(cls._descends_from_bridge_session(conn, sid) for conn in connections)
-        for db_path in cls._bridge_session_dbs(workspace_root):
-            try:
-                with contextlib.closing(
-                    sqlite3.connect(
-                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
-                    )
-                ) as conn:
-                    if cls._descends_from_bridge_session(conn, sid):
-                        return True
-            except Exception as exc:
-                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
-        return False
+        with contextlib.ExitStack() as stack:
+            return any(
+                cls._descends_from_bridge_session(conn, sid)
+                for conn in cls._open_bridge_session_dbs(stack, workspace_root)
+            )
 
     @classmethod
     def _bridge_session_dbs(cls, workspace_root: str | Path | None = None) -> list[Path]:
@@ -2827,6 +2820,22 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         if profiles_dir.is_dir():
             db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
         return [db_path for db_path in db_paths if db_path.is_file()]
+
+    @classmethod
+    def _open_bridge_session_dbs(
+        cls, stack: contextlib.ExitStack, workspace_root: str | Path | None = None
+    ) -> list[sqlite3.Connection]:
+        connections = []
+        for db_path in cls._bridge_session_dbs(workspace_root):
+            try:
+                connections.append(
+                    stack.enter_context(
+                        contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0))
+                    )
+                )
+            except Exception as exc:
+                LOGGER.debug("could not open %s: %s", db_path, exc)
+        return connections
 
     @staticmethod
     def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
@@ -2915,22 +2924,8 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
                         return True
                     if candidates:
                         with contextlib.ExitStack() as stack:
-                            connections = []
-                            for db_path in cls._bridge_session_dbs(workspace_root):
-                                try:
-                                    connections.append(
-                                        stack.enter_context(
-                                            contextlib.closing(
-                                                sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-                                            )
-                                        )
-                                    )
-                                except Exception as exc:
-                                    LOGGER.debug("could not open %s: %s", db_path, exc)
-                            if any(
-                                cls._is_bridge_session_id(value, workspace_root, connections)
-                                for value in candidates
-                            ):
+                            connections = cls._open_bridge_session_dbs(stack, workspace_root)
+                            if any(cls._is_bridge_session_id(value, connections=connections) for value in candidates):
                                 return True
         return False
 
