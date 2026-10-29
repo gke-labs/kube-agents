@@ -1297,7 +1297,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		}
 		deleted, ok := s.store.DeleteConversation(target)
 		if !ok {
-			return fmt.Sprintf("Conversation or session %q was not found.\n", target), "", "", nil
+			return fmt.Sprintf("Conversation or session %q was not found, or more than one conversation matches it by name or role; name it by alias or console token.\n", target), "", "", nil
 		}
 		return fmt.Sprintf("Deleted session **`%s`**.\n", FirstNonEmptyStr(deleted.Alias, target)), "", "", nil
 

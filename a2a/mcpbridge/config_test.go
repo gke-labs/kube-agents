@@ -275,3 +275,46 @@ func TestEnrichDeploymentVersionStatusSemverAndTargetCommitish(t *testing.T) {
 		t.Fatalf("branch 'main' with ahead_by=0 should not report UpgradeAvailable=true")
 	}
 }
+
+func TestDeleteConversationRefusesAmbiguousRoleMatch(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		parentA, parentB = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+		workerA, workerB = "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+	)
+	if err := store.WithUpdateLock(func(cfg *PersistentConfig) bool {
+		now := time.Now().UTC()
+		cfg.Conversations["session-a"] = ConversationEntry{Alias: "session-a", Token: MintConversationToken(), HostConversationID: workerA, ParentHostConversationID: parentA, SubagentRole: "Reviewer", CreatedAt: now, LastUsedAt: now}
+		cfg.Conversations["session-b"] = ConversationEntry{Alias: "session-b", Token: MintConversationToken(), HostConversationID: workerB, ParentHostConversationID: parentB, SubagentRole: "Reviewer", CreatedAt: now, LastUsedAt: now}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both windows' workers carry the role "Reviewer"; deleting by its slug must not
+	// pick one of them at random.
+	if deleted, ok := store.DeleteConversation("session-reviewer"); ok {
+		t.Fatalf("ambiguous role match deleted %q; want nothing deleted", deleted.Alias)
+	}
+	snap := store.Snapshot()
+	if _, okA := snap.Conversations["session-a"]; !okA {
+		t.Fatal("window A's worker entry was deleted")
+	}
+	if _, okB := snap.Conversations["session-b"]; !okB {
+		t.Fatal("window B's worker entry was deleted")
+	}
+
+	// An exact alias still deletes exactly that entry.
+	deleted, ok := store.DeleteConversation("session-a")
+	if !ok || deleted.HostConversationID != workerA {
+		t.Fatalf("DeleteConversation(session-a) = %+v, %v", deleted, ok)
+	}
+	// With one worker left the role slug is unambiguous again.
+	deleted, ok = store.DeleteConversation("session-reviewer")
+	if !ok || deleted.HostConversationID != workerB {
+		t.Fatalf("DeleteConversation(session-reviewer) = %+v, %v; want the remaining worker", deleted, ok)
+	}
+}

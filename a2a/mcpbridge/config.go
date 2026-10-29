@@ -899,6 +899,12 @@ func (s *ConfigStore) SetConversationSessionMode(aliasOrToken string, sessionMod
 }
 
 // DeleteConversation removes a conversation entry by alias, console token, or session member name.
+//
+// The alias wins, then an exact identifier (console token, host conversation ID or session
+// worker ID) that names one entry. The looser forms (a "session-" prefix, an alias slug, or a subagent role slug) delete only when
+// exactly one entry matches: the store is shared by every bridge process on the machine, and
+// several windows' workers can share a role such as "Session Worker", so an ambiguous match
+// deletes nothing rather than whichever entry map iteration reaches first.
 func (s *ConfigStore) DeleteConversation(aliasOrToken string) (ConversationEntry, bool) {
 	if s == nil {
 		return ConversationEntry{}, false
@@ -908,25 +914,49 @@ func (s *ConfigStore) DeleteConversation(aliasOrToken string) (ConversationEntry
 	if target == "" {
 		return ConversationEntry{}, false
 	}
-	trimmedSessionPrefix := strings.TrimPrefix(target, "session-")
-	for alias, entry := range s.cfg.Conversations {
-		roleSlug := SanitizeAliasSlug(entry.SubagentRole)
-		if alias == target ||
-			entry.Token == target ||
-			strings.TrimSpace(entry.HostConversationID) == target ||
-			strings.TrimSpace(entry.SessionWorkerID) == target ||
-			(trimmedSessionPrefix != target && alias == trimmedSessionPrefix) ||
-			SanitizeAliasSlug(alias) == target ||
-			"session-"+SanitizeAliasSlug(alias) == target ||
-			(roleSlug != "" && (roleSlug == target || "session-"+roleSlug == target || roleSlug == trimmedSessionPrefix)) {
-			delete(s.cfg.Conversations, alias)
-			RemoveEntrySessionPodsLocked(&s.cfg, entry)
-			HealActiveConversationLocked(&s.cfg)
-			_ = s.saveLocked()
-			return entry, true
+	matchKey := ""
+	if _, ok := s.cfg.Conversations[target]; ok {
+		matchKey = target
+	} else {
+		var exact []string
+		for alias, entry := range s.cfg.Conversations {
+			if entry.Token == target ||
+				strings.TrimSpace(entry.HostConversationID) == target ||
+				strings.TrimSpace(entry.SessionWorkerID) == target {
+				exact = append(exact, alias)
+			}
+		}
+		switch len(exact) {
+		case 0:
+		case 1:
+			matchKey = exact[0]
+		default:
+			return ConversationEntry{}, false
 		}
 	}
-	return ConversationEntry{}, false
+	if matchKey == "" {
+		trimmedSessionPrefix := strings.TrimPrefix(target, "session-")
+		var loose []string
+		for alias, entry := range s.cfg.Conversations {
+			roleSlug := SanitizeAliasSlug(entry.SubagentRole)
+			if (trimmedSessionPrefix != target && alias == trimmedSessionPrefix) ||
+				SanitizeAliasSlug(alias) == target ||
+				"session-"+SanitizeAliasSlug(alias) == target ||
+				(roleSlug != "" && (roleSlug == target || "session-"+roleSlug == target || roleSlug == trimmedSessionPrefix)) {
+				loose = append(loose, alias)
+			}
+		}
+		if len(loose) != 1 {
+			return ConversationEntry{}, false
+		}
+		matchKey = loose[0]
+	}
+	entry := s.cfg.Conversations[matchKey]
+	delete(s.cfg.Conversations, matchKey)
+	RemoveEntrySessionPodsLocked(&s.cfg, entry)
+	HealActiveConversationLocked(&s.cfg)
+	_ = s.saveLocked()
+	return entry, true
 }
 
 // RemoveEntrySessionPodsLocked removes any cached ActiveSessionPods matching entry from cfg.Deployments.
