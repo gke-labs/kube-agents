@@ -284,6 +284,9 @@ func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
 	// was not written by a learn and applies at once.
 	learned := map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: image}
 	restart := "rollout restart deployment/" + a2aGatewayName(slackTestAgent("next", true)) + " -n " + slackTestAgent("next", true).Namespace
+	// The stale exit: an upgrade's new gateway re-stamps the record itself,
+	// so the message says so before it names the restart.
+	upgrade := "During an operator upgrade the new gateway does that as it starts, and no action is needed; otherwise restart it"
 	for _, tc := range []struct {
 		name      string
 		crHome    string
@@ -306,8 +309,8 @@ func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
 		{"manual ignores the record", "", "manual", record(learned), "", "", true, []string{"manual"}, nil},
 		{"manual with the cr set", "C0CR", "manual", record(learned), "", "C0CR", false, nil, nil},
 		{"manual is named before a malformed record", "", "manual", record(map[string]string{homeChannelRecordSlackKey: "D0DM", homeChannelRecordReaderKey: image}), "", "", true, []string{"manual"}, []string{"not a channel id"}},
-		{"stale reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: "ghcr.io/x/a2a-gateway:old"}), "", "", true, []string{"C0LEARNED", "ghcr.io/x/a2a-gateway:old", image, restart}, []string{"old...", image + "..."}},
-		{"stale with no reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}), "", "", true, []string{"C0LEARNED", "no confirming gateway image", restart}, nil},
+		{"stale reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: "ghcr.io/x/a2a-gateway:old"}), "", "", true, []string{"C0LEARNED", "ghcr.io/x/a2a-gateway:old", image, upgrade, restart}, []string{"old...", image + "..."}},
+		{"stale with no reader", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}), "", "", true, []string{"C0LEARNED", "no confirming gateway image", upgrade, restart}, nil},
 		{"stale reader over the display bound is cut, not echoed, and the cut is marked", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: strings.Repeat("x", 40000)}), "", "", true, []string{"C0LEARNED", shown(strings.Repeat("x", 40000)), restart}, []string{unshown(strings.Repeat("x", 40000))}},
 		{"stale reader with control characters is printed without them", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: "ghcr.io/x/a2a-gateway:old\n\x1b[31mred"}), "", "", true, []string{"ghcr.io/x/a2a-gateway:old", "red"}, []string{"\n", "\x1b"}},
 		{"reader equal but for a non-printable rune is compared without it", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordReaderKey: image + "\u200b"}), "", "C0LEARNED", false, nil, nil},
