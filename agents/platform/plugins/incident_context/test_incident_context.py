@@ -369,6 +369,70 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(result["action"], "rewrite")
 
 
+class ApplyRecordingTest(unittest.TestCase):
+    """An `apply` in an incident's thread is recorded for the recurrence hold."""
+
+    def reply(self, text, report="the report", recovered=None, thread_id="T1"):
+        with patch.object(ic, "_lookup", return_value=report), \
+                patch.object(ic, "_recover_bot_thread", return_value=recovered), \
+                patch.object(ic, "_lookup_recent", return_value=[]), \
+                patch.object(ic, "_post") as post:
+            result = ic.on_inbound(event=_Event(text=text, platform="slack", chat_id="C1", thread_id=thread_id))
+        return result, post
+
+    def test_every_form_an_apply_arrives_in_is_recorded(self):
+        forms = (
+            "apply",
+            "Apply.",
+            "apply please",
+            "please apply",
+            "yes, apply Option B",
+            "ok apply b, thanks",
+            "<@U123> apply",
+            "@kube-agents apply",
+            "*apply*",
+            "`apply`",
+            "&gt; apply",
+            ":+1: apply",
+            "~not that one~ apply Option B",
+            "apply Option B: Raise the memory limit to 128Mi",
+            "apply: Raise the memory limit to 128Mi",
+        )
+        for text in forms:
+            with self.subTest(text=text):
+                result, post = self.reply(text)
+                post.assert_called_once_with(ic.APPLY_PATH, {"chat_id": "C1", "thread_id": "T1"})
+                self.assertEqual(result["action"], "rewrite", "the reply still reaches the agent with its report")
+
+    def test_a_reply_that_only_mentions_apply_is_not_recorded(self):
+        for text in (
+            "apply the change",
+            "can you apply option B?",
+            "do not apply",
+            "applying now",
+            "what would apply do?",
+            "I am not sure — apply",
+            "~apply~",
+        ):
+            with self.subTest(text=text):
+                _result, post = self.reply(text)
+                post.assert_not_called()
+
+    def test_an_apply_outside_an_incidents_thread_is_not_recorded(self):
+        _result, post = self.reply("apply", report=None)
+        post.assert_not_called()
+        # Recovered through the raw payload: answered at top level, so its card
+        # carries no subscription to the incident's thread for the hold to match.
+        _result, post = self.reply("apply", report=None, recovered="the report")
+        post.assert_not_called()
+
+    def test_a_dead_server_does_not_cost_the_reply(self):
+        with patch.object(ic, "_lookup", return_value="the report"), \
+                patch.object(ic, "SESSION_KV_URL", "http://127.0.0.1:1"):
+            result = ic.on_inbound(event=_Event(text="apply", platform="slack", chat_id="C1", thread_id="T1"))
+        self.assertEqual(result["action"], "rewrite")
+
+
 class FailOpenTest(unittest.TestCase):
     """A Session KV server that is down must never eat a user's message."""
 

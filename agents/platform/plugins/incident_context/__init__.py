@@ -24,6 +24,37 @@ logger = logging.getLogger(__name__)
 _LEADING_MENTION_RE = re.compile(r"^<@[UWB][A-Z0-9]+>\s*")
 
 
+# A human's `apply` of an incident's proposed fix, read as
+# deploy/docker/patches/slack_ux_clicks.py reads a typed one (TYPED_STRUCK,
+# TYPED_MARKUP, TYPED_LEAD, TYPED_APPLY; copied because a gateway plugin is
+# loaded by file path): struck-through text and inline markup dropped, then any
+# lead of mentions, a blockquote, emoji codes, punctuation or a yes/ok/please,
+# then `apply`, `apply Option B` or `apply B` ending the reply or ending in a
+# courtesy, or followed by `:` and the option's text as a Slack option button's
+# value is (slack_ux_incident.OPTION_REPLY / SINGLE_REPLY).
+_APPLY_STRUCK = re.compile(r"(?<![\w~])~(?=\S)[^~\n]+?(?<=\S)~(?![\w~])")
+_APPLY_MARKUP = str.maketrans("", "", "*_~`'\"‘’“”")
+_APPLY_LEAD = re.compile(
+    r"^(?:\s+|<@[UWB][A-Z0-9]+>|@\S+|&gt;|:[\w+-]+:|[^\w\s]|(?:yes|ok|okay|sure|please)\b)*",
+    re.IGNORECASE,
+)
+_APPLY_RE = re.compile(
+    r"apply(?:\s+(?:option\s+)?[A-Z]\b)?"
+    r"(?::.*|[,.!]*(?:\s*(?:please|thanks|thank\s+you|ty)[.!]*)?\s*)",
+    re.IGNORECASE | re.DOTALL,
+)
+# Where an `apply` in an incident's thread is recorded, and how long the record
+# may take before the reply goes on without it (as long as a lookup's).
+APPLY_PATH = "/v1/incidents/apply"
+POST_TIMEOUT_S = 2
+
+
+def _is_apply(text):
+    """Whether *text* applies the incident's proposed fix (_APPLY_RE)."""
+    cleaned = _APPLY_STRUCK.sub("", text or "").translate(_APPLY_MARKUP)
+    return _APPLY_RE.fullmatch(cleaned, _APPLY_LEAD.match(cleaned).end()) is not None
+
+
 def _is_slash_command(text):
     """Whether `legacy_slash_commands` would see a command at the front of *text*."""
     stripped = _LEADING_MENTION_RE.sub("", (text or "").strip(), count=1)
@@ -58,6 +89,13 @@ def on_inbound(*, event, **_):
         return None
     thread_id = getattr(src, "thread_id", None)
     report = _lookup(chat_id, thread_id) if thread_id else None
+    # An `apply` in the incident's own thread is recorded, so the recurrence
+    # hold can count the fix it asks for (session_kv_server's
+    # INCIDENT_APPLY_CARD_WINDOW_S). Only on this hit: a reply recovered below
+    # is answered at top level, so the card it files carries no subscription
+    # to the incident's thread for the hold to match.
+    if report and _is_apply(getattr(event, "text", "")):
+        _post(APPLY_PATH, {"chat_id": chat_id, "thread_id": thread_id})
     if not report:
         report = _recover_bot_thread(platform, chat_id, thread_id, _raw_thread(event))
     if report:
@@ -303,6 +341,22 @@ def _lookup(chat_id, thread_id):
 def _lookup_recent(chat_id):
     payload = _get("/v1/incidents/recent?" + urlencode({"chat_id": chat_id}))
     return (payload or {}).get("reports") or []
+
+def _post(path, body):
+    """POST *body* as JSON; fail-open like _get, so a dead server never breaks the message."""
+    headers = {"Content-Type": "application/json"}
+    token = (os.environ.get("SESSION_KV_API_KEY") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"{SESSION_KV_URL}{path}", data=json.dumps(body).encode(), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=POST_TIMEOUT_S):
+            pass
+    except Exception:
+        pass
+
 
 def _get(path):
     # The Session KV server now authenticates every data route. An unset key
