@@ -91,6 +91,11 @@ type filterConfig struct {
 	// node-provision timeout, past which a pod still pending is stuck whatever
 	// the autoscaler last said, and the count backstop applies again.
 	scaleUpHold time.Duration
+	// failedSchedulingMinSpan is how long, by its own first and last
+	// sighting, a FailedScheduling with no autoscaler verdict must have
+	// lasted before the count backstop passes it. Zero turns the check off.
+	// See defaultFailedSchedulingMinSpan.
+	failedSchedulingMinSpan time.Duration
 	// autopilotScaleToZeroHold enables the hold on an Autopilot cluster that has
 	// scaled itself to zero nodes, where GKE's own system pods stay Pending by
 	// design and no autoscaler verdict is ever recorded against them. On by
@@ -117,6 +122,9 @@ type filterThresholds struct {
 	// as a fifth positional argument for the same reason the counts do, and
 	// zero means "the default", as it does for them.
 	scaleUpHold time.Duration
+	// failedSchedulingMinSpan is --failedscheduling-min-span, on the same
+	// terms as settle below: zero means the default, negative turns it off.
+	failedSchedulingMinSpan time.Duration
 	// disableAutopilotScaleToZeroHold switches the Autopilot scale-to-zero hold
 	// off. Phrased as a disable, against the grain of the flag that sets it, so
 	// that the zero value is the shipped default here as it is for every count
@@ -156,21 +164,24 @@ const (
 	// on its own. The value is the issue's decision, chosen over three
 	// (defaultMinCount) to sit past a normal scale-up's first attempts.
 	defaultFailedSchedulingMinCount = 5
-	// failedSchedulingMinSpan is how long, by its own first and last sighting,
-	// a FailedScheduling with no autoscaler verdict must have lasted before the
-	// count backstop passes it. The count alone climbs in seconds whenever the
+	// defaultFailedSchedulingMinSpan is how long, by its own first and last
+	// sighting, a FailedScheduling with no autoscaler verdict must have lasted
+	// before the count backstop passes it (--failedscheduling-min-span). The count alone climbs in seconds whenever the
 	// cluster churns: a node scale-down cordons and taints a node and deletes
 	// its pods, the scheduler retries the evicted pod's replacement on each
 	// change, and no verdict is ever recorded against it (measured live: count
 	// five three seconds after the first attempt, the pod placed five seconds
-	// later). A pod still stuck is re-sighted at least every five minutes, the
-	// scheduler's unschedulable-queue flush, so this delays its card to that
-	// sighting and never silences it. Measured over 30 days on six clusters,
+	// later). On the core/v1 recorder (GKE's own schedulers) a pod still stuck
+	// is re-sighted at least every five minutes, the scheduler's
+	// unschedulable-queue flush, so this delays its card to that sighting and
+	// never silences it; on an events.k8s.io/v1 recorder the next sighting is
+	// the series refresh, which already gates the count
+	// (failedSchedulingStaleAfter). Measured over 30 days on six clusters,
 	// 182 pods with no verdict were Pending for 4s at the median and 65s at
 	// the longest, and every one of the 40 the count alone passed scheduled
 	// inside 65s; two minutes holds all of them with twice the margin. Any
 	// value up to the five-minute flush gives a stuck pod the same worst case.
-	failedSchedulingMinSpan = 2 * time.Minute
+	defaultFailedSchedulingMinSpan = 2 * time.Minute
 	// defaultScaleUpHold is cluster-autoscaler's default max-node-provision-time.
 	// A scale-up the autoscaler has not delivered by then is one it has given
 	// up on, so a pod still pending past it is reported on the count.
@@ -226,6 +237,13 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 	if scaleUpHold <= 0 {
 		scaleUpHold = defaultScaleUpHold
 	}
+	failedSchedulingMinSpan := th.failedSchedulingMinSpan
+	switch {
+	case failedSchedulingMinSpan == 0:
+		failedSchedulingMinSpan = defaultFailedSchedulingMinSpan
+	case failedSchedulingMinSpan < 0:
+		failedSchedulingMinSpan = 0
+	}
 	settle := th.settle
 	switch {
 	case settle == 0:
@@ -261,6 +279,7 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		imagePullTransientMinCount: orDefault(th.imagePullTransientMinCount),
 		failedSchedulingMinCount:   failedSchedulingMinCount,
 		scaleUpHold:                scaleUpHold,
+		failedSchedulingMinSpan:    failedSchedulingMinSpan,
 		autopilotScaleToZeroHold:   autopilotScaleToZeroHold,
 		settle:                     settle,
 	}
@@ -374,8 +393,8 @@ const (
 	// backstop, with no autoscaler verdict on record.
 	gateFailedSchedulingMinCount filterGate = "failedscheduling_min_count"
 	// gateFailedSchedulingMinSpan is a FailedScheduling past the count
-	// backstop whose sightings do not yet span failedSchedulingMinSpan, with
-	// no autoscaler verdict on record.
+	// backstop whose sightings do not yet span --failedscheduling-min-span,
+	// with no autoscaler verdict on record.
 	gateFailedSchedulingMinSpan filterGate = "failedscheduling_min_span"
 	// gateFailedSchedulingStale is a FailedScheduling the scheduler stopped
 	// re-emitting long enough ago that the pod is no longer pending; see
@@ -536,13 +555,13 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     damps that burst; the price is a slower card on a cluster without an
 //     autoscaler while the message keeps changing.
 //   - Past the count, the event's own sightings must span
-//     failedSchedulingMinSpan. A scale-down drain records no verdict and
+//     --failedscheduling-min-span. A scale-down drain records no verdict and
 //     drives the count to five in seconds, for a pod placed seconds later.
-//     Zero timestamps fail open, as the settle gate's do.
+//     Zero timestamps fail open, as the settle gate's do; zero turns it off.
 //
-// Not a settle timer: a live event is never delayed by wall-clock time, only
-// by what the autoscaler said, how often the scheduler has repeated it, and
-// over how long its own sightings say it did.
+// Measured on the event's own stamps, never on the watcher's clock: a replay
+// after a restart reads as it did live. The span is the only time-based hold,
+// and it applies only with no autoscaler verdict on record.
 // Each decision logs one line naming the pod and what decided it, which is
 // what a reader has in the pod log; the gate labels on
 // k8s_event_watcher_events_filtered_total are the same decisions counted.
@@ -589,9 +608,9 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, f.cfg.failedSchedulingMinCount)
 		return gateFailedSchedulingMinCount
 	}
-	if !settled(ev, failedSchedulingMinSpan) {
+	if f.cfg.failedSchedulingMinSpan > 0 && !settled(ev, f.cfg.failedSchedulingMinSpan) {
 		log.Printf("held %s pod=%s/%s (count=%d, lasted %s < %s, no autoscaler verdict on record)",
-			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second), failedSchedulingMinSpan)
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second), f.cfg.failedSchedulingMinSpan)
 		return gateFailedSchedulingMinSpan
 	}
 	return gateAccepted
