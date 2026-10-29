@@ -728,10 +728,9 @@ run leaves in its `finished.json` metadata are the record that it was one, and s
 so that such a run is never itself taken for a green.
 
 The smoke grades a pull request with `main`'s grader: `bench/` at the commit the change was merged
-onto, with the change's own `bench/tasks/`, and the verdict's `Graded by` line names that commit. A
-change to the harness, a verifier or `bench-gate` grades the pull requests after it merges, not
-itself, and a presubmit case that needs such a change reds until it is on `main`: land the grader
-change first, then the case ([`testing-strategy.md`](designs/testing-strategy.md) §4.2).
+onto, with the change's own `bench/tasks/`, and the verdict's `Graded by` line names that commit
+([`testing-strategy.md`](designs/testing-strategy.md#pinning-and-baselines) has the rule for a
+case that needs a grader change).
 
 Do not post `/test pull-kube-agents-smoke-test` on an approved pull request whose `Smoke gate` is
 green, above all one in the merge queue. The run posts a pending smoke status, and if the queue's

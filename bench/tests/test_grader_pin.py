@@ -61,7 +61,7 @@ def _lift(pattern: str, flags: int = re.MULTILINE | re.DOTALL) -> str:
 
 
 def _constants() -> str:
-    return _lift(r'^readonly EVAL_GRADER_TREE=.*?\nreadonly EVAL_GRADER_CASES_DIR=[^\n]*')
+    return _lift(r'^readonly EVAL_GRADER_TREE=.*?\nreadonly EVAL_FLEET_CATALOG=[^\n]*')
 
 
 def _function(name: str) -> str:
@@ -103,6 +103,7 @@ def change(tmp_path):
     _write(repo / "bench" / "kube_agents_bench" / "grader.py", "main\n")
     _write(repo / "bench" / "tasks" / "kept" / "task.yaml", "id: kept  # main\n")
     _write(repo / "bench" / "tasks" / "gone" / "task.yaml", "id: gone\n")
+    _write(repo / "bench" / "tf" / "fleet" / "fixtures.json", '{"catalog": "main"}\n')
     _git(repo, "init", "-q")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
@@ -111,6 +112,7 @@ def change(tmp_path):
     _write(repo / "bench" / "tasks" / "kept" / "task.yaml", "id: kept  # change\n")
     shutil.rmtree(repo / "bench" / "tasks" / "gone")
     _write(repo / "bench" / "tasks" / "added" / "task.yaml", "id: added\n")
+    _write(repo / "bench" / "tf" / "fleet" / "fixtures.json", '{"catalog": "change"}\n')
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "change")
     return repo, base
@@ -249,6 +251,7 @@ def _step(repo: Path, env: dict, unreadable: str = "") -> subprocess.CompletedPr
     body = "\n".join(
         [
             _constants(),
+            _function("grader_pin_applies"),
             f'SCRIPT_DIR="{repo / "hack"}"',
             f'BENCH_DIR="{repo / "hack"}/../bench"',
             "TASKS=(./tasks/kept/task.yaml ./tasks/added/task.yaml)",
@@ -307,3 +310,40 @@ def test_a_case_main_cannot_read_reds_the_job(change):
     assert proc.returncode == 1
     assert MESSAGE in proc.stderr
     assert f"  {reason}" in proc.stderr
+
+
+# --------------------------------------------------------------------------
+# The fleet catalog, read before the extraction, comes from the base too
+# --------------------------------------------------------------------------
+
+
+def _catalog_step(repo: Path, env: dict) -> subprocess.CompletedProcess:
+    block = _lift(r'^if \[ -z "\$\{FLEET_CATALOG:-\}" \] && grader_pin_applies; then.*?^fi$')
+    body = "\n".join(
+        [_constants(), _function("grader_pin_applies"), f'SCRIPT_DIR="{repo / "hack"}"', block,
+         'echo "FLEET_CATALOG=${FLEET_CATALOG:-}"']
+    )
+    scrubbed = {k: v for k, v in os.environ.items() if k not in ("PULL_NUMBER", "JOB_TYPE", "PULL_BASE_SHA", "FLEET_CATALOG")}
+    return subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True,
+                          check=False, env={**scrubbed, **env})
+
+
+def test_a_change_reads_the_base_fleet_catalog(change):
+    repo, base = change
+    proc = _catalog_step(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": base})
+    assert proc.returncode == 0, proc.stderr
+    assert Path(_out(proc, "FLEET_CATALOG")).read_text(encoding="utf-8") == '{"catalog": "main"}\n'
+
+
+def test_the_nightly_reads_its_own_fleet_catalog(change):
+    repo, _ = change
+    proc = _catalog_step(repo, {"JOB_TYPE": "periodic"})
+    assert proc.returncode == 0, proc.stderr
+    assert _out(proc, "FLEET_CATALOG") == ""
+
+
+def test_a_change_with_no_base_catalog_stops(change):
+    repo, _ = change
+    proc = _catalog_step(repo, {"JOB_TYPE": "presubmit", "PULL_BASE_SHA": "0" * 40})
+    assert proc.returncode == 1
+    assert "main's fleet catalog" in proc.stderr

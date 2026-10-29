@@ -13,7 +13,7 @@ alias with `no_parent_owners`, so a root approver does not count for either, and
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
 them, since the merge-blocking presubmit runs on that lane (below). The script, `hack/ci-eval-pr.sh`,
 carries it too: it grades every pull request with `main`'s `bench/` at `PULL_BASE_SHA` and the change's
-own cases, and the rule keeps a change from taking that step out with a root approval
+own cases, and the rule keeps a root approval alone from editing that step out of the script
 ([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
 Nothing else carries the rule:
 `hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers

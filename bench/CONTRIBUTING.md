@@ -53,10 +53,8 @@ contract; this page does not restate it.
 **Check:** `make bench-case-check` locally, `scripts/test_task_registration.py` in CI. The CI
 lint asserts that the validator returned nothing at all, so every rule in it gates.
 
-A pull request's presubmit grades its cases with `main`'s `bench/`, not its own. A new check type
-or field lands in a pull request of its own, before an edit to a presubmit case that uses it; in
-one pull request, the presubmit reds that case as one `main`'s grader cannot read. A new case is
-exempt, because it lands in the nightly, which grades with `main`'s head.
+A pull request's presubmit grades its cases with `main`'s `bench/`, so a new check type lands
+before the presubmit case that uses it ([`testing-strategy.md`](../docs/designs/testing-strategy.md#pinning-and-baselines)).
 
 What review holds a case to beyond the validator: the objective names a thing the fixture
 planted, and a run that did not do the work cannot reach it; the safeguard names the thing

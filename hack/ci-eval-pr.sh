@@ -93,6 +93,9 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # place of the target's. Both relative to the repository root.
 readonly EVAL_GRADER_TREE="bench"
 readonly EVAL_GRADER_CASES_DIR="tasks"
+# The seeded fleet's catalog inside that tree, read before the tree is
+# extracted (the fleet step), so taken from PULL_BASE_SHA on its own.
+readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
 
 # A repetition the launcher could not start because GitHub's token endpoint
 # failed transiently (record_unit_not_run, beside run_one_unit). The unit
@@ -948,6 +951,22 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # bench/tf/fleet/README.md, "A read-only credential for evaluations".
 # FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
 # use, and a Prow job refuses it: set there it would restore the fallback.
+# Whether this run grades a change against a merge target, in which case the
+# change is graded by main's grader (section 6, "Grade with the merge
+# target's grader"). Defined here because the fleet catalog below is part of
+# that grader: it maps each fixture role a check reads to a cluster, so a pull
+# request reads main's copy, not its own.
+grader_pin_applies() { # -> 0 when this run grades a change against a merge target
+  [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
+}
+if [ -z "${FLEET_CATALOG:-}" ] && grader_pin_applies; then
+  FLEET_CATALOG="$(mktemp)"
+  if [ -z "${PULL_BASE_SHA:-}" ] || ! git -C "${SCRIPT_DIR}/.." show "${PULL_BASE_SHA}:${EVAL_GRADER_TREE}/${EVAL_FLEET_CATALOG}" > "${FLEET_CATALOG}" 2>/dev/null; then
+    echo "ERROR: this run grades a change but main's fleet catalog (${EVAL_GRADER_TREE}/${EVAL_FLEET_CATALOG} at PULL_BASE_SHA='${PULL_BASE_SHA:-}') could not be read; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  export FLEET_CATALOG
+fi
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 _fleet_refuse_opt_in_under_prow || exit 1
@@ -2557,7 +2576,7 @@ fi
 # ─── Grade with the merge target's grader (#1560, section 6) ─────────────────
 # A pull request is graded by main's grader, not its own: everything under
 # bench/ but bench/tasks/ -- harness, verifiers, bench-gate, the devops-bench
-# pin in uv.lock, the fleet and the case stacks under bench/tf/ -- comes from
+# pin in pyproject.toml, the fleet and the case stacks under bench/tf/ -- comes from
 # PULL_BASE_SHA, the commit clonerefs merged the change onto, and the cases
 # come from the change. Otherwise a change could edit what grades it. The two
 # trees are joined in a scratch directory, and BENCH_DIR points there for
@@ -2572,15 +2591,12 @@ fi
 # needs it (decided 2026-10-28). A new case lands in the nightly, which grades
 # from HEAD, so only a change to a presubmit case is held to that order.
 #
-# hack/OWNERS puts this script under the eval-crew alias, so a change that
-# takes the pin out needs an eval-crew approval. EVAL_GRADER_SHA names the
+# hack/OWNERS puts this script under the eval-crew alias, so an edit to it
+# needs an eval-crew approval (the helpers it sources are root-approved). EVAL_GRADER_SHA names the
 # commit that graded the run; `bench-gate suite` writes it into
 # eval-verdict.json and the verdict markdown, and a grader that predates it
-# ignores the variable.
-grader_pin_applies() { # -> 0 when this run grades a change against a merge target
-  [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
-}
-
+# ignores the variable. grader_pin_applies is defined at the fleet step, which
+# reads main's fleet catalog for the same reason.
 # main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
 # extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
 # is gone, and one it adds is there.
@@ -2637,7 +2653,10 @@ if grader_pin_applies; then
   BENCH_DIR="${GRADER_ROOT}/${EVAL_GRADER_TREE}"
   EVAL_GRADER_SHA="${PULL_BASE_SHA}"
   echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
-  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${TASKS[@]}")"; then
+  # The first `uv run` in a fresh directory syncs the venv over the network;
+  # one retry absorbs a transient fetch failure.
+  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${TASKS[@]}")" \
+      && ! GRADER_UNREADABLE="$(grader_unreadable_cases "${TASKS[@]}")"; then
     echo "ERROR: could not check that main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) reads this change's cases (above); the run does not start." >&2
     exit 1
   fi
