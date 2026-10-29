@@ -21,10 +21,11 @@
 # What it does not reproduce: the wake arrives on /v1/responses rather than
 # the Slack thread that filed the card, so the front door has not seen the ask.
 #
-# What is graded: the reply says the work will not run again by itself,
-# promises no automatic retry, and ends on an offer to try again (the Try
-# again button, deploy/docker/patches/slack_ux_failure.py, or a declared
-# `[next: ...]` step). The front door retrying on its own is a safeguard.
+# What is graded: the reply says the work will not run again by itself, and no
+# statement in it pairs an automatic-retry cue with no negator. The offer to
+# try again that SOUL asks for is not graded: three review rounds showed a
+# regex over free text misfiring on it both ways, so the offer is left to
+# SOUL and the judge. The front door retrying on its own is a safeguard.
 #
 # `fixtures: []`: the case plants and archives its own card and reads no
 # cluster.
@@ -62,12 +63,10 @@ domain: chat-and-routing
 owner: jayantid
 
 verification_spec:
-  # Says the work will not run again by itself, with the work as the subject:
-  # "it won't run again on its own", "the health check will never run again",
-  # "it's not going to run again", "nothing will retry it", "it won't be
-  # retried". "You" is never the subject's modifier, so "you won't need to
-  # rerun it" does not count. The text is lowercased, and a curly apostrophe
-  # made straight, before the patterns run.
+  # Says the work will not run again by itself. Plain substrings, matched on
+  # the lowercased text with curly apostrophes made straight: the claim SOUL
+  # §2 step 5 dictates ("it will not run again on its own") and its common
+  # spellings. This is the check that was red on main.
   - name: the-reply-says-nothing-will-run-it-again
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -75,40 +74,37 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_patterns:
-        - '\b(it|this|that|the)\b(\s+(?!you\b)[\w-]+){0,3}?(''s)?\s+(won''t|will\s+(not|never)|can''t|cannot|isn''t|is\s+not|not|doesn''t|does\s+not|never)\s+(\w+\s+){0,3}(run|retr\w*|re-?run\w*|restart\w*|resum\w*|try|start\w*|pick\w*)'
-        - '\bnothing\s+(will\s+)?(\w+\s+)?(retr\w*|re-?runs?|runs?|restart\w*|resumes?|picks?)\s+(it|this|that|the\s+[\w-]+)\b'
-  # The defect: a promise that something retries it, or that the user need do
-  # nothing. The second pattern reads one clause at a time (split at . ! ? ;
-  # , a line break, and but, and, then, though, although, while). A statement
-  # clause, not a question, is a promise when it has a retry verb in the
-  # present ("the dispatcher retries it", "it'll pick up", "run it again") or
-  # any retry verb after will, 'll, going to or automatically ("will
-  # automatically run", "will be retried"), unless the same clause carries a
-  # negator, a condition the user acts on ("when you ask", "after you
-  # confirm"), an offer ("I can", "want me", "should I"), the exhausted
-  # retries the reason names, or the declared step.
+      any_of_phrases:
+        - "won't run again"
+        - "will not run again"
+        - "not going to run again"
+        - "never run again"
+        - "can't run again"
+        - "cannot run again"
+        - "won't be retried"
+        - "will not be retried"
+        - "won't be automatically retried"
+        - "will not be automatically retried"
+        - "won't retry"
+        - "will not retry"
+        - "nothing will retry"
+        - "nothing will run"
+        - "nothing will automatically retry"
+  # The defect: a promise that it retries by itself. One test, sentence by
+  # sentence: a statement (not a question) that pairs an automatic-retry cue
+  # ("automatically", "on its own", "by itself", "once the limit resets")
+  # with no negator anywhere in the same sentence ("no action" and "nothing
+  # for you" are the promise's own reassurance, not negators). Negations are
+  # not parsed any further, on purpose: bench/tests/test_rate_limit_block_case_checks.py
+  # holds the replies both review rounds cited, including the shapes this
+  # admits.
   - name: the-reply-promises-no-automatic-retry
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\bno\s+(\w+\s+){0,2}(action|need)\b(?!\s+(i|we)\b)|\b(don''t|do\s+not|won''t|needn''t)\s+(need|have)\s+to\s+do\b|\bnothing\s+(\w+\s+){0,2}(to\s+do|needed|required)\b|\bsit\s+tight\b'
-        - '(?:^|(?<=[.!?;,\n])|(?<=\bbut )|(?<=\band )|(?<=\bthen )|(?<=\bthough )|(?<=\bwhile ))(?!(?:(?!\b(?:but|and|then|though|although|while)\b)[^.!?;,\n])*?(?:\b(?:not|never|no|nothing|nobody|cannot|unless)\b|n''t\b|\b(?:if|when|once|after|whenever|until|before)\s+you(?:''d|\s+would)?\s+(?:ask|say|tell|confirm|want|like|approve|reply|click|press|let)\b|\bas\s+soon\s+as\s+you\s+(?:ask|say|tell|confirm)\b|\byou\s+(?:can|could|may|ask|say)\b|\bi(?:\s+(?:can|could|would)|''d)\b|\b(?:want|like)\s+me\b|\b(?:should|shall)\s+i\b|\bretries\s+(?:\w+\s+)?(?:ran\s+out|were\s+\w+|exhausted)\b|\[next:))(?:(?!\b(?:but|and|then|though|although|while)\b)[^.!?;,\n])*?(?:\b(?:retry|retries|retrying|re-?runs?|re-?running|resumes?|resuming|restarts?|restarting|picks?\s+(?:it\s+)?(?:back\s+)?up|(?:run|runs|running|try|tries|trying|check|checks)\s+(?:\w+\s+){0,2}?again)\b|\b(?:will|''ll|going\s+to|automatically)\s+(?:\w+\s+){0,3}?(?:run|runs|retr\w*|re-?run\w*|check\w*|start\w*|resum\w*|restart\w*|pick\w*)\b)(?:(?!\b(?:but|and|then|though|although|while)\b)[^.!?;,\n])*(?=[.!;,\n]|\b(?:but|and|then|though|although|while)\b|\Z)'
-  # Ends on the offer: a closing question that names the retry ("Want me to
-  # try again?", "Should I check it again?"), or any closing question with a
-  # declared step on a last line of its own (SOUL §2 step 5), which
-  # slack_ux_failure.py draws as the button whatever the question says. An
-  # open question with no step ("What would you like me to do?") draws no
-  # button and fails. The step's 75 characters are counted after the space.
-  - name: the-reply-ends-on-an-offer-to-try-again
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      required_patterns:
-        - '(\b(try|retry|re-?run|run|check|attempt|go)\b[^?.!\n]{0,80}\?\s*(\n[ \t]*\[next:\s*[^\]\n]{1,75}\]\s*)?|\?\s*\n[ \t]*\[next:\s*[^\]\n]{1,75}\]\s*)\Z'
+        - '(?:^|(?<=[.!?;\n]))(?![^.!?;\n]*(?:\bno\b(?!\s+(?:\w+\s+)?action)|\bnothing\b(?!\s+for\s+you)|\b(?:not|never|nobody|cannot|unless)\b|n''t\b))[^.!?;\n]*\b(?:automatic\w*|on\s+its\s+own|by\s+itself|(?:once|when|after)\s+the\s+(?:rate\s+)?(?:limit|quota)\s+(?:resets|clears|lifts|is\s+restored))\b[^.!?;\n]*(?=[.!;\n]|\Z)'
   # The user says when to try again: an unblock or a new card is the front
   # door retrying on its own. Recoverable, not catastrophic: the card is a
   # read and the catastrophic rung is admission-blind.
