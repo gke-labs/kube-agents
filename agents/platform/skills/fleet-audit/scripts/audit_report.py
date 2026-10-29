@@ -18652,7 +18652,8 @@ class KccStall(NamedTuple):
     when the collector did not record them. `host` is the manifest entry the
     object was read on: the cluster that runs that Config Connector.
     `project` is the GCP project the object manages (its
-    `cnrm.cloud.google.com/project-id` annotation), `""` when not known.
+    `cnrm.cloud.google.com/project-id` annotation, else its namespace's
+    annotation, else the namespace's name), `""` when not known.
     `location` is the object's `spec.location`, `""` when it has none.
     """
 
@@ -18807,14 +18808,16 @@ def _remediation_file_index(finding: dict, root: Path) -> dict[KccKey, KccDeclar
 def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dict[KccKey, KccDeclaration]:
     """The Config Connector objects of the fix's file that the fix is about.
 
-    Only the finding's own object, also when the file declares one object
-    (`NodePool/<n>` is the `ContainerNodePool` whose GKE name is `<n>` on the
-    finding's cluster, `Cluster/<n>` the `ContainerCluster` `<n>`, another
-    kind the objects of that `metadata.name`, of that kind when the file
-    declares it). A stall of another object in the same file says nothing
-    about this fix: a `Deployment` fix in a file that also declares its
-    `IAMServiceAccount` did not change that account. Empty when no object is
-    the finding's own: then the fix gets no Config Connector text.
+    Only the finding's own object, also when the file declares one object:
+    `NodePool/<n>` is the `ContainerNodePool` whose GKE name is `<n>` on the
+    finding's cluster, `Cluster/<n>` the `ContainerCluster` `<n>`, and
+    `<Kind>/<n>` the object of that Config Connector kind and that
+    `metadata.name`. A finding of another kind (a `Deployment`, a
+    `HorizontalPodAutoscaler`) has no Config Connector object of its own, even
+    when the file declares one of the same name: a `Deployment` fix in a file
+    that also declares its `IAMServiceAccount` did not change that account.
+    Empty when no object is the finding's own: then the fix gets no Config
+    Connector text.
     """
     prefix, _, name = str(finding.get("object") or "").partition("/")
     if not name:
@@ -18828,12 +18831,9 @@ def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dic
             for key, declaration in index.items()
             if key[0] in kinds and key[1] == name and (key[0] not in pool_kinds or key[2] == cluster)
         }
-    named_kind = prefix in {key[0] for key in index}
-    return {
-        key: declaration
-        for key, declaration in index.items()
-        if declaration.name == name and (not named_kind or key[0] == prefix)
-    }
+    # The index holds Config Connector kinds only, so a match on the kind is
+    # also the test that the finding's kind is a Config Connector kind.
+    return {key: declaration for key, declaration in index.items() if key[0] == prefix and declaration.name == name}
 
 
 def _finding_location(finding: dict) -> str:

@@ -23177,6 +23177,21 @@ metadata:
         self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
         self.assertNotIn("Config Connector", audit_report.render_persists_comment(AUDIT, finding, NOW))
 
+    def test_a_finding_of_a_kind_config_connector_does_not_hold_has_no_config_connector_object(self):
+        """apps/api.yaml declares Deployment api and IAMServiceAccount api in
+        payments; the finding is on Deployment/api; the account is stalled.
+        The same name does not make the account the finding's own object."""
+        self.write(
+            "apps/api.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n  namespace: payments\n---\n"
+            "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: api\n  namespace: payments\n",
+        )
+        finding = make_finding(fid="d", cluster="acme/us-central1/prod-usc1", obj="Deployment/api",
+                               remediation={"kind": "manifest", "path": "apps/api.yaml", "note": "Add a probe."})
+        account = {"kind": "IAMServiceAccount", "namespace": "payments", "name": "api", "why": "UpdateFailed: Error 403"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(account)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
     def test_a_single_config_connector_object_that_is_the_findings_gives_the_note(self):
         self.write(
             "iam/web-sa.yaml",
@@ -23266,18 +23281,22 @@ metadata:
                 self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
 
     def test_a_file_of_many_unready_objects_names_two_and_counts_the_rest(self):
-        # Three objects of one name and three kinds; the finding names a kind
-        # the file does not declare, so all three are the finding's own.
-        kinds = ("PubSubTopic", "PubSubSubscription", "PubSubSchema")
-        declaration = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: {kind}\nmetadata:\n  name: events\n  namespace: infra\n"
-        self.write(KCC_CLUSTER_FILE, "\n---\n".join(declaration.format(kind=kind) for kind in kinds))
+        # Three objects that are all the finding's own: `ComputeAddress
+        # events` in three regions, for a finding on `ComputeAddress/events`.
+        regions = ("us-central1", "us-east1", "europe-west1")
+        declaration = (
+            "apiVersion: compute.cnrm.cloud.google.com/v1beta1\nkind: ComputeAddress\nmetadata:\n"
+            "  name: events\n  namespace: infra\nspec:\n  location: {region}\n"
+        )
+        self.write(KCC_CLUSTER_FILE, "\n---\n".join(declaration.format(region=region) for region in regions))
         finding = kcc_finding()
-        finding["object"] = "Workload/events"
-        self.disclose([finding], kcc_manifest(*(dict(KCC_TOPIC, kind=kind, name="events", why="UpdateFailed") for kind in kinds)))
+        finding["object"] = "ComputeAddress/events"
+        self.disclose([finding], kcc_manifest(*(
+            {"kind": "ComputeAddress", "namespace": "infra", "name": "events", "why": "UpdateFailed", "location": region}
+            for region in regions
+        )))
         last = finding["remediation"]["note"].split("\n\n")[-1]
-        self.assertIn("`PubSubTopic infra/events`", last)
-        self.assertIn("`PubSubSubscription infra/events`", last)
-        self.assertNotIn("PubSubSchema", last)
+        self.assertEqual(last.count("`ComputeAddress infra/events`"), 2)
         self.assertIn("and 1 more unready object(s) in this file", last)
 
     def test_a_controller_message_cannot_break_out_of_its_code_span(self):
@@ -23357,22 +23376,23 @@ class TestStalledKccInFinish(HarnessTestCase):
 
     def stalled_manifest(self):
         # The candidate the sweep needs to open the fix on its own.
+        # The finding is on `Cluster/prod-usc1`, the one object of the fix's file.
         candidate = {
             "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
-            "object": "Namespace/no-network-policy", "severity": "critical",
+            "object": "Cluster/prod-usc1", "severity": "critical",
             "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
         }
         manifest = _full_manifest(candidates=[candidate])
-        # The file's one object is the finding's own (`no-network-policy`).
-        manifest["clusters"][0]["kcc_unready"] = [dict(KCC_CLUSTER, name="no-network-policy"), KCC_TOPIC]
+        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
         return manifest
 
     def doc_and_file(self):
         target = self.workspace / KCC_CLUSTER_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(KCC_CLUSTER_DECLARATION.replace("prod-usc1", "no-network-policy"), encoding="utf-8")
+        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
         finding = make_finding(
-            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."}
+            obj="Cluster/prod-usc1",
+            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."},
         )
         return make_doc(findings=[finding])
 
@@ -33883,13 +33903,14 @@ class TestStoreLedger(HarnessTestCase):
         self.claim()
         target = self.workspace / KCC_CLUSTER_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        # The file's one object is the finding's own (`no-network-policy`).
-        target.write_text(KCC_CLUSTER_DECLARATION.replace("prod-usc1", "no-network-policy"), encoding="utf-8")
+        # The finding is on `Cluster/prod-usc1`, the one object of the fix's file.
+        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
         finding = make_finding(
-            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."}
+            obj="Cluster/prod-usc1",
+            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."},
         )
-        manifest = _full_manifest(candidates=[{**self.netpol_candidate(), "severity": "critical"}])
-        manifest["clusters"][0]["kcc_unready"] = [dict(KCC_CLUSTER, name="no-network-policy"), KCC_TOPIC]
+        manifest = _full_manifest(candidates=[{**self.netpol_candidate(), "severity": "critical", "object": "Cluster/prod-usc1"}])
+        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
         manifest_path = self.tmp_path / "manifest.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         self.start()
