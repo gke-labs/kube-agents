@@ -565,8 +565,12 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			rec := record.NewFakeRecorder(8)
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
-			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+			converting, err := r.resolveA2ABusReplicas(ctx, agent)
+			if err != nil {
 				t.Fatal(err)
+			}
+			if converting != tc.wantEvent {
+				t.Errorf("converting = %v, want %v", converting, tc.wantEvent)
 			}
 			if agent.Status.BusReplicas != tc.want {
 				t.Errorf("status.busReplicas = %d, want %d", agent.Status.BusReplicas, tc.want)
@@ -582,7 +586,7 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 			for len(rec.Events) > 0 {
 				<-rec.Events
 			}
-			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+			if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
 			if len(rec.Events) != 0 {
@@ -674,7 +678,7 @@ func TestABusReadErrorIsNotReadAsNoBus(t *testing.T) {
 			return c.Get(ctx, key, obj, opts...)
 		}}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(4)}
-	if err := r.resolveA2ABusReplicas(context.Background(), agent); err == nil {
+	if _, err := r.resolveA2ABusReplicas(context.Background(), agent); err == nil {
 		t.Fatalf("a failed StatefulSet read resolved to %d servers instead of failing the pass", agent.Status.BusReplicas)
 	}
 }
@@ -743,5 +747,68 @@ func TestTheResolvedBusCountIsWrittenToStatus(t *testing.T) {
 	}
 	if stored.Status.BusReplicas != 1 {
 		t.Errorf("stored status.busReplicas = %d, want the resolved 1", stored.Status.BusReplicas)
+	}
+}
+
+// A conversion provisions the bus again, after it rolls out, in both
+// directions and back: the conversion changes STREAM_REPLICAS and so the Job's
+// digested name, the superseded-Job sweep removes the old shape's Job, and the
+// bus gate holds the new one until the roll is done. A conversion back to an
+// earlier shape gets a fresh Job, not that shape's old completed one.
+func TestAConversionProvisionsTheBusAgain(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	threeServerJob := buildA2AProvisionJob(agent).Name
+	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
+		t.Fatalf("no provision Job before the conversion: %v", err)
+	}
+
+	// Convert to one server: the three-server Job is swept as superseded,
+	// and the one-server Job waits for the roll.
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the completed provision Job survived the conversion pass (err=%v)", err)
+	}
+	if !state.jobHeld {
+		t.Error("the provision Job was not held on the conversion pass, before the bus rolled out")
+	}
+
+	// And back to three, on a bus rolled out at one: the three-server Job's
+	// name again, created fresh rather than found complete.
+	reportBusRolledOut(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	agent.Spec.Harness.Tuning.BusReplicas = ptr.To(3)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	reportBusRolledOut(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	job := &batchv1.Job{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, job); err != nil {
+		t.Fatalf("no provision Job after converting back to three: %v", err)
+	}
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete {
+			t.Error("the provision Job after converting back is the old completed one, not a fresh run")
+		}
 	}
 }

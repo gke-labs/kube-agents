@@ -3943,7 +3943,7 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 // When the field asks for a count other than the one running, the pass about
 // to convert the bus says so on the PlatformAgent, since the conversion is
 // what empties it.
-func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (converting bool, err error) {
 	running := 0
 	sts := &appsv1.StatefulSet{}
 	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
@@ -3958,7 +3958,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 					running = ordinal + 1
 				}
 			case !errors.IsNotFound(err):
-				return err
+				return false, err
 			}
 		}
 		if running == 2 {
@@ -3967,7 +3967,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 			running = 3
 		}
 	default:
-		return err
+		return false, err
 	}
 	if running != 1 && running != 3 {
 		running = 0
@@ -3980,12 +3980,13 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	if want == 0 {
 		want = agentv1alpha1.DefaultBusReplicas
 	}
-	if running != 0 && want != running && int(agent.Status.BusReplicas) != want {
+	converting = running != 0 && want != running
+	if converting && int(agent.Status.BusReplicas) != want {
 		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
 			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
 	}
 	agent.Status.BusReplicas = int32(want)
-	return nil
+	return converting, nil
 }
 
 // reasonA2ABusConverting is the Warning resolveA2ABusReplicas records when a
@@ -5604,7 +5605,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// First: everything below renders from the server count, and a count
 	// read before this would be last pass's, or the default.
 	state.busReplicasPersisted = agent.Status.BusReplicas
-	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
 
