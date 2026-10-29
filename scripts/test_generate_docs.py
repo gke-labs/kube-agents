@@ -289,6 +289,77 @@ class CapabilitiesTest(unittest.TestCase):
         )
 
 
+def helper_job(job_id: str, expr: str, **overrides) -> dict:
+    job = {
+        "id": job_id,
+        "name": job_id.replace("-", " ").title(),
+        "schedule": {"kind": "cron", "expr": expr, "display": expr},
+        "skills": [],
+        "no_agent": True,
+        "script": f"{job_id.replace('-', '_')}.py",
+        "enabled": True,
+    }
+    job.update(overrides)
+    return job
+
+
+class CronHelperJobsTest(unittest.TestCase):
+    """The watchdogs page's helper-job table is the roster's non-audit entries."""
+
+    def test_the_block_is_registered_for_the_watchdogs_page(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["cron-helper-jobs"],
+            ((generate_docs.WATCHDOGS_PAGE,), generate_docs.gen_cron_helper_jobs),
+        )
+
+    def test_exactly_the_enabled_non_audit_jobs_are_listed_in_roster_order(self):
+        roster = generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+        expected = [
+            job["id"]
+            for job in roster
+            if job.get("enabled") and generate_docs.AUDIT_SKILL not in job.get("skills", [])
+        ]
+        self.assertTrue(expected)
+        body = generate_docs.gen_cron_helper_jobs()
+        listed = re.findall(r"^\| `([^`]+)` \|", body, re.M)
+        self.assertEqual(listed, expected)
+        for job in roster:
+            if generate_docs.AUDIT_SKILL in job.get("skills", []):
+                self.assertNotIn(f"`{job['id']}`", body)
+
+    def test_disabled_and_audit_entries_are_left_out(self):
+        roster = [
+            helper_job("off", "0 6 * * *", enabled=False),
+            helper_job("audit", "0 6 * * *", no_agent=None, skills=[generate_docs.AUDIT_SKILL]),
+            helper_job("kept", "0 6 * * *"),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertNotIn("`off`", body)
+        self.assertNotIn("`audit`", body)
+        self.assertIn("| `kept` | script, `kept.py` |", body)
+
+    def test_the_type_column_tells_a_script_from_a_prompt_job(self):
+        roster = [
+            helper_job("plain-prompt", "0 7 * * 6", no_agent=None, script=None),
+            helper_job("prompt-after", "0 7 * * 6", no_agent=None, script="queue.py"),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertIn("| `plain-prompt` | prompt | Weekly, Saturday 07:00 |", body)
+        self.assertIn("| `prompt-after` | prompt, after `queue.py` |", body)
+
+    def test_an_unglossed_schedule_shows_its_expression_and_a_name_is_escaped(self):
+        roster = [
+            helper_job("odd", "7 3 * * 2", name="A | B <x>"),
+            helper_job("interval", "", schedule={"kind": "interval", "minutes": 5, "display": "every 5m"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertIn("| `odd` | script, `odd.py` | `7 3 * * 2` | A \\| B &lt;x&gt; |", body)
+        self.assertIn("| `every 5m` |", body)
+
+
 class CRDFieldBlocksTest(unittest.TestCase):
     """The three CRD field pages are registered, rendered as tables, and selectable."""
 

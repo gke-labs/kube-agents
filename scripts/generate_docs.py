@@ -80,6 +80,16 @@ CRON_ROSTERS = (
 EXAMPLE_JOB_ID = "compliance-audit"
 # The roster file's own indentation, so the example reads as the file spells it.
 EXAMPLE_INDENT = 2
+# How the helper-jobs table names a roster entry's kind: a `no_agent` script
+# that runs no model, a prompt job, or a prompt job with a pre-run script whose
+# output goes above the prompt (the weekly brief is the one such entry).
+HELPER_KIND_SCRIPT = "script, `{script}`"
+HELPER_KIND_PROMPT = "prompt"
+HELPER_KIND_PROMPT_AFTER_SCRIPT = "prompt, after `{script}`"
+HELPER_JOBS_HEADER = (
+    "| Job | Type | Cadence | Name |",
+    "| --- | ---- | ------- | ---- |",
+)
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
 IMAGES_JSON = REPO / "images.json"
@@ -436,6 +446,56 @@ def gen_cron_job_example(job_id: str = EXAMPLE_JOB_ID) -> str:
     return f"```json\n{rendered}\n```"
 
 
+def helper_jobs() -> list[dict]:
+    """The enabled Platform Agent roster entries that are not fleet audits.
+
+    An audit carries the `fleet-audit` skill; everything else on the roster is
+    a helper: the pollers, the watches, the collectors and the weekly brief.
+    A disabled entry is a tombstone on its way out (see `gen_cron_jobs`) and
+    is left out for the same reason.
+    """
+    return [
+        job
+        for job in load_roster(PLATFORM_CRON_ROSTER)
+        if job.get("enabled") and AUDIT_SKILL not in job.get("skills", [])
+    ]
+
+
+def helper_kind(job: dict) -> str:
+    script = job.get("script", "")
+    if job.get("no_agent"):
+        return HELPER_KIND_SCRIPT.format(script=script)
+    if script:
+        return HELPER_KIND_PROMPT_AFTER_SCRIPT.format(script=script)
+    return HELPER_KIND_PROMPT
+
+
+def gen_cron_helper_jobs() -> str:
+    """Render the Platform Agent's non-audit roster as a table, in roster order.
+
+    The watchdogs page used to list these jobs in one paragraph that restated
+    `jobs.json` by hand; this region reads the roster so an entry added,
+    retired or rescheduled there changes the page on the next `docs-generate`.
+    """
+    rows = list(HELPER_JOBS_HEADER)
+    for job in helper_jobs():
+        schedule = job.get("schedule", {})
+        expr = schedule.get("expr", "")
+        shown = expr or schedule.get("display", "")
+        # The gloss where the expression has one; otherwise the expression
+        # itself, since a dash would hide a schedule the roster does carry.
+        cadence = CRON_CADENCE.get(expr) or f"`{shown}`"
+        rows.append(
+            "| `{id}` | {kind} | {cadence} | {name} |".format(
+                id=job.get("id", ""),
+                kind=helper_kind(job),
+                cadence=cadence,
+                name=md_escape(job.get("name") or job.get("id", "")),
+            )
+        )
+    return "\n".join(rows)
+
+
 def read_frontmatter(path: Path) -> dict[str, str]:
     text = path.read_text(encoding="utf-8")
     m = re.match(r"^---\n(.*?)\n---", text, re.S)
@@ -747,6 +807,7 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
         (WATCHDOGS_PAGE, SKILLS_CONCEPT_PAGE, CRON_PAGE),
         gen_cron_job_example,
     ),
+    "cron-helper-jobs": ((WATCHDOGS_PAGE,), gen_cron_helper_jobs),
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
     "capabilities": ((README,), gen_capabilities),
