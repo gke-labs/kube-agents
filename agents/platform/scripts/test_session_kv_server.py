@@ -7,7 +7,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 import unittest
 from unittest.mock import MagicMock, patch
@@ -3333,6 +3333,86 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             second.join(5)
         self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
         self.assertFalse(first.is_alive() or second.is_alive())
+
+    def _start(self, session_id, name):
+        return session_kv_server._TriageStart(session_id, {**self.PAYLOAD, "name": name}, None, None, 0.0)
+
+    def _unanswered_turn(self, board, hold_s):
+        # The first start's `/chat` ends START_UNKNOWN; the board dict stands in
+        # for the newest live same-branch card the lookup would read.
+        turns = []
+
+        def turn(start):
+            turns.append(start.session_id)
+            return session_kv_server.START_UNKNOWN if start.session_id == "k8s-evt-a" else session_kv_server.START_OK
+
+        patches = [
+            patch.dict(os.environ, {self.ENV: "true"}, clear=False),
+            patch.object(session_kv_server, "_attempt_triage_start_unlocked", side_effect=turn),
+            patch.object(session_kv_server, "_live_pull_request_sibling", side_effect=lambda branch: board["newest"]),
+            patch.object(session_kv_server, "INCIDENT_START_UNKNOWN_POLL_S", 0.02),
+            patch.object(session_kv_server, "INCIDENT_START_UNKNOWN_HOLD_S", hold_s),
+        ]
+        return turns, patches
+
+    def test_an_unanswered_turn_holds_the_lock_until_its_card_is_on_the_board(self):
+        board = {"newest": ""}
+        turns, patches = self._unanswered_turn(board, 10.0)
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            logs = stack.enter_context(self.assertLogs(session_kv_server.logger, level="INFO"))
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first.start()
+            first.join(0.3)
+            # The turn returned START_UNKNOWN and the lock is still held.
+            self.assertTrue(first.is_alive())
+            self.assertEqual(turns, ["k8s-evt-a"])
+            second.start()
+            second.join(0.3)
+            self.assertTrue(second.is_alive())
+            self.assertEqual(turns, ["k8s-evt-a"])
+            board["newest"] = "t_1a000001"
+            first.join(5)
+            second.join(5)
+        self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertTrue(any("INCIDENT_START_HELD session=k8s-evt-a until=card" in line for line in logs.output), logs.output)
+
+    def test_an_unanswered_turn_releases_the_lock_once_the_hold_has_passed(self):
+        board = {"newest": ""}
+        turns, patches = self._unanswered_turn(board, 0.2)
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            logs = stack.enter_context(self.assertLogs(session_kv_server.logger, level="WARNING"))
+            first = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"),))
+            second = threading.Thread(target=session_kv_server._attempt_triage_start, args=(self._start("k8s-evt-b", "test-pod-6cfdb6b98b-k8m12"),))
+            first.start()
+            second.start()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(turns, ["k8s-evt-a", "k8s-evt-b"])
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertTrue(any("INCIDENT_START_HELD session=k8s-evt-a until=timeout" in line for line in logs.output), logs.output)
+
+    def test_an_answered_turn_releases_the_lock_at_once(self):
+        # START_OK: `/chat` returned, the cards are filed, nothing to wait for;
+        # and with the opt-in off the start reads no board at all.
+        lookups = []
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False), patch.object(
+            session_kv_server, "_attempt_triage_start_unlocked", return_value=session_kv_server.START_OK
+        ), patch.object(session_kv_server, "_live_pull_request_sibling", side_effect=lambda branch: lookups.append(branch) or ""), patch.object(
+            session_kv_server, "_triage_sleep", side_effect=AssertionError("held")
+        ):
+            session_kv_server._attempt_triage_start(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"))
+        self.assertEqual(lookups, [session_kv_server._incident_branch("k8s-evt-a", {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-zwv24"})])
+        with patch.dict(os.environ, {}, clear=False), patch.object(
+            session_kv_server, "_attempt_triage_start_unlocked", return_value=session_kv_server.START_UNKNOWN
+        ), patch.object(session_kv_server, "_live_pull_request_sibling", side_effect=AssertionError("read")):
+            os.environ.pop(self.ENV, None)
+            session_kv_server._attempt_triage_start(self._start("k8s-evt-a", "test-pod-6cfdb6b98b-zwv24"))
 
     def test_an_unreadable_board_fails_open_to_the_one_parent(self):
         import sqlite3

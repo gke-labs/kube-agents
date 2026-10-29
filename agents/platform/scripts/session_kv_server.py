@@ -335,11 +335,25 @@ INCIDENT_PR_SIBLING_ID_RE = re.compile(r"t_[0-9a-f]{8,32}")
 # turn filed (`/chat` returns once the turn has filed its cards). The lock is
 # one of a fixed number of stripes keyed by the branch, so the table never
 # grows with the number of incidents; two branches sharing a stripe only wait
-# on each other. Held for at most one turn (TRIAGE_CHAT_TIMEOUT_S plus the
-# retry budget), so a waiter costs a pool slot for that long and no longer.
+# on each other. Each holder keeps it for at most one turn (TRIAGE_CHAT_TIMEOUT_S
+# plus the retry budget, plus INCIDENT_START_UNKNOWN_HOLD_S after a turn the
+# gateway did not answer), and a waiter holds its triage pool slot while it
+# waits: the k-th start for one branch begins up to k-1 turns after the first,
+# and the pool has one slot fewer for every waiter. Folding
+# (INCIDENT_WORKLOAD_DEDUP_SECONDS) is what keeps a crashing Deployment's
+# replicas from being k starts.
 INCIDENT_START_LOCK_STRIPES = 64
 # A wait on that lock at or past this many seconds is logged.
 INCIDENT_START_WAIT_LOG_S = 1.0
+# After `/chat` ends START_UNKNOWN (a read timeout past TRIAGE_CHAT_TIMEOUT_S,
+# or a 5xx with the turn sent) the turn may still be running and its cards not
+# yet on the board, so the stripe stays held until the branch's newest live
+# pull-request card is no longer the one this start's prompt saw, or this long
+# has passed. A turn still filing past that is the window the lock does not
+# cover.
+INCIDENT_START_UNKNOWN_HOLD_S = 300.0
+# How often the held stripe re-reads the board for that card.
+INCIDENT_START_UNKNOWN_POLL_S = 5.0
 # The newest unsettled pull-request card whose body names the branch. `instr`
 # rather than `LIKE`, so nothing in the branch is read as a wildcard.
 INCIDENT_PR_SIBLING_SQL = """
@@ -2875,7 +2889,8 @@ def _live_pull_request_sibling(branch: str) -> str:
     files anything, so two starts for one branch running at once would each
     find no sibling; `_attempt_triage_start` holds the branch's start lock
     (`_incident_start_lock`) across the turn so the second one looks after the
-    first has filed its cards.
+    first has filed its cards, and past a turn the gateway did not answer until
+    the card shows up or `INCIDENT_START_UNKNOWN_HOLD_S` passes.
     """
     if not branch:
         return ""
@@ -3931,16 +3946,51 @@ def _incident_start_lock(payload: Dict[str, Any], session_id: str):
     return _INCIDENT_START_LOCKS[zlib.crc32(branch.encode("utf-8")) % INCIDENT_START_LOCK_STRIPES]
 
 
+def _hold_for_unanswered_turn(session_id: str, branch: str, sibling_seen: str) -> None:
+    """Keep the branch's start lock while a turn `/chat` did not answer may still be filing.
+
+    `_attempt_triage_start_unlocked` treats START_UNKNOWN as started, since a
+    second `/chat` would file a second pair of cards; but the turn's own cards
+    may not be on the board yet, and the next same-branch start would run its
+    sibling lookup before they are. So the stripe stays held until the branch's
+    newest live pull-request card is no longer the one this start's prompt saw
+    (`sibling_seen`), or INCIDENT_START_UNKNOWN_HOLD_S has passed. Past that, a
+    turn still running is the window the lock does not cover, and the log line
+    says which way the hold ended.
+    """
+    deadline = time.monotonic() + INCIDENT_START_UNKNOWN_HOLD_S
+    while True:
+        if _live_pull_request_sibling(branch) != sibling_seen:
+            logger.info(f"INCIDENT_START_HELD session={session_id} until=card")
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            logger.warning(
+                f"INCIDENT_START_HELD session={session_id} until=timeout held={INCIDENT_START_UNKNOWN_HOLD_S:.0f}s"
+            )
+            return
+        _triage_sleep(min(INCIDENT_START_UNKNOWN_POLL_S, deadline - now))
+
+
 def _attempt_triage_start(start: _TriageStart) -> None:
+    lock = _incident_start_lock(start.payload, start.session_id)
+    serialized = not isinstance(lock, nullcontext)
     began = time.monotonic()
-    with _incident_start_lock(start.payload, start.session_id):
+    with lock:
         waited = time.monotonic() - began
         if waited >= INCIDENT_START_WAIT_LOG_S:
             logger.info(f"INCIDENT_START_SERIALIZED session={start.session_id} waited={waited:.0f}s")
-        _attempt_triage_start_unlocked(start)
+        # Read under the lock, so it is the sibling the prompt about to be
+        # built sees; the hold below compares against it.
+        branch = _incident_branch(start.session_id, start.payload) if serialized else ""
+        sibling_seen = _live_pull_request_sibling(branch) if serialized else ""
+        outcome = _attempt_triage_start_unlocked(start)
+        if serialized and outcome == START_UNKNOWN:
+            _hold_for_unanswered_turn(start.session_id, branch, sibling_seen)
 
 
-def _attempt_triage_start_unlocked(start: _TriageStart) -> None:
+def _attempt_triage_start_unlocked(start: _TriageStart) -> str:
+    """Create the session and send the turn; the `START_*` value the attempt ended on."""
     session_id = start.session_id
     waited = time.monotonic() - start.queued_at
     logger.info(f"TRIAGE_DEQUEUED session={session_id} waited={waited:.0f}s")
@@ -3968,14 +4018,14 @@ def _attempt_triage_start_unlocked(start: _TriageStart) -> None:
                 # running, so it is neither retried nor reported as not started.
                 mark_triage_state(start.event_row_id, TRIAGE_STATE_STARTED)
                 logger.info(f"TRIAGE_STARTED session={session_id} answer={attempt.outcome} {attempt.detail}".rstrip())
-                return
+                return attempt.outcome
             if attempt.detail == GATEWAY_SESSION_LOST:
                 if recreated:
                     attempt = attempt._replace(outcome=START_FATAL, detail=f"http-{GATEWAY_SESSION_NOT_FOUND}")
                 need_session = recreated = True
         if attempt.outcome == START_FATAL:
             _triage_not_started(start, attempt.detail)
-            return
+            return attempt.outcome
         now = time.monotonic()
         left = TRIAGE_QUEUE_WAIT_LIMIT_S - (now - start.queued_at)
         if attempt.answered:
@@ -3987,7 +4037,7 @@ def _attempt_triage_start_unlocked(start: _TriageStart) -> None:
             left = min(left, TRIAGE_RETRY_BUDGET_S - budget_spent)
         if answered >= TRIAGE_RETRY_MAX_ATTEMPTS or left <= 0:
             _triage_not_started(start, attempt.detail)
-            return
+            return attempt.outcome
         delay = min(_triage_retry_delay(retry, attempt.retry_after), left)
         if attempt.answered:
             budget_spent += delay
