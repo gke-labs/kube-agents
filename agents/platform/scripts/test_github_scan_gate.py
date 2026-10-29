@@ -1416,19 +1416,17 @@ class PrCommentsSweepTest(unittest.TestCase):
             warnings,
             [
                 "**Comments on [toolkit#19](https://github.com/acme/toolkit/pull/19) aren't being answered.** "
-                "GitHub didn't respond when Kage tried to read its comments. It keeps trying every 10 minutes."
+                "Kage couldn't reach GitHub to read its comments just now. It keeps trying every 10 minutes."
             ],
         )
         self.assertIn("acme/toolkit#19 (FORGE_CALL_FAILED)", stderr)
 
     def test_each_reason_says_whether_retrying_helps(self):
-        """A 403 or 404 needs a person; a hop that never reached the forge says the forge was not asked."""
+        """A 403 or 404 needs a person; a transient fault says it keeps trying."""
         cases = {
             "FORGE_FORBIDDEN": ("GitHub accepted Kage's credentials but refused", "an admin needs to"),
             "FORGE_NOT_FOUND": ("GitHub couldn't find the repository", "an admin needs to"),
-            forge.REASON_SANDBOX_UNREACHABLE: ("Kage's connection to GitHub failed before it could ask", "keeps trying"),
-            forge.REASON_UNREACHABLE: ("Kage's connection to GitHub failed before it could ask", "keeps trying"),
-            "FORGE_UNAVAILABLE": ("GitHub didn't respond", "keeps trying"),
+            forge.REASON_SANDBOX_UNREACHABLE: ("Kage couldn't reach GitHub", "keeps trying"),
         }
         for reason, (opening, ending) in cases.items():
             with self.subTest(reason=reason):
@@ -1467,11 +1465,20 @@ class PrCommentsSweepTest(unittest.TestCase):
 
     def test_two_codes_that_read_the_same_post_once(self):
         first, _ = self._unreadable_tick(reason="FORGE_CALL_FAILED")
-        for code in ("FORGE_UNAVAILABLE", "FORGE_CALL_FAILED", "FORGE_UNAVAILABLE"):
+        for code in ("BROKER_UNREACHABLE", "FORGE_CALL_FAILED", "SANDBOX_UNREACHABLE", "FORGE_UNAVAILABLE"):
             warnings, logged = self._unreadable_tick(reason=code)
             self.assertEqual(warnings, [], f"{code} reads the same sentence, so it is not news")
             self.assertIn(code, logged)
         self.assertEqual(len(first), 1)
+
+    def test_an_outage_that_spans_the_upgrade_posts_once(self):
+        """A record holding a sentence from before the forge was named reads as its replacement."""
+        record = Path(self.home, gate.UNREADABLE_RECORD)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        old = "GitHub didn't respond when Kage tried to read the pull request. It keeps trying every 10 minutes."
+        record.write_text(json.dumps({"acme/toolkit#12": old}), encoding="utf-8")
+        warnings, _ = self._unreadable_tick()
+        self.assertEqual(warnings, [])
 
     def test_a_new_reason_posts_again(self):
         self._unreadable_tick()

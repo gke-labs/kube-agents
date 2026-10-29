@@ -296,7 +296,7 @@ whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
 any other says "It will try again at its next scheduled run." Both degrade
 quietly, so both are pinned at image build
 ([`verify_scheduler_failure_line.py`](../../deploy/docker/plugins/verify_scheduler_failure_line.py)):
-each of the scheduler's failure lines still carries the words the relay matches,
+each of the scheduler's summarized failure lines still carries the words the relay matches,
 and the image's roster still has a job that reads as daily. A failure no
 retry clears says so instead of promising one: rejected credentials, and the
 scheduler's blocked-configuration line (which it sends once, running the job no

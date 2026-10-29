@@ -130,13 +130,25 @@ PR_MAX_REFUSALS_DEFAULT = pr_triggers.MAX_REFUSALS_DEFAULT
 UNREADABLE_LINE = "**Comments on {pr} aren't being answered.** {why}"
 READABLE_AGAIN_LINE = "**Comments on {pr} are being answered again.**"
 # Each sentence names the forge by the pull request's host (`_forge_name`), and
-# ends on whether the next tick may clear it or a person has to act first.
-UNREADABLE_WHY_DEFAULT = "{forge} didn't respond when Kage tried to read its comments. It keeps trying every 10 minutes."
-# The call never reached the forge: the sandbox hop or the credential broker
-# failed first.
-UNREADABLE_WHY_UNREACHABLE = (
-    "Kage's connection to {forge} failed before it could ask for the comments. It keeps trying every 10 minutes."
-)
+# ends on whether the next tick may clear it or a person has to act first. The
+# default covers every transient code -- the sandbox hop, the broker, and the
+# forge's own 502 and 503 -- with one sentence that does not say which side
+# failed: a hop that times out may already have asked the forge, and a slow
+# forge alternating between them must not post a new line at each switch.
+UNREADABLE_WHY_DEFAULT = "Kage couldn't reach {forge} to read its comments just now. It keeps trying every 10 minutes."
+# The sentences this job posted before each named its forge, by the reason
+# that replaced them. A record holding one is read as its replacement, so an
+# outage that spans the upgrade is not posted twice.
+UNREADABLE_WHY_LEGACY = {
+    "GitHub didn't respond when Kage tried to read the pull request. It keeps trying every 10 minutes.": "",
+    "GitHub's rate limit was reached when Kage tried to read the pull request. It keeps trying every 10 minutes.": (
+        "FORGE_RATE_LIMITED"
+    ),
+    "GitHub refused Kage's credentials when it tried to read the pull request. It keeps trying every 10 minutes.": (
+        "FORGE_UNAUTHENTICATED"
+    ),
+}
+LEGACY_FORGE = "GitHub"
 # A conversation too long for one page never clears on its own; the label is
 # the way out. The forge's 403 and 404 do not clear either: the credential or
 # the repository has to change.
@@ -158,8 +170,6 @@ UNREADABLE_WHY = {
         "{forge} couldn't find the repository with Kage's credentials: it is gone, renamed, or hidden from "
         "them. Retrying won't help; an admin needs to fix the repository's name or its access."
     ),
-    forge.REASON_SANDBOX_UNREACHABLE: UNREADABLE_WHY_UNREACHABLE,
-    forge.REASON_UNREACHABLE: UNREADABLE_WHY_UNREACHABLE,
 }
 # What a host is called in those sentences. A host no forge serves by default (a
 # self-managed instance) is named as itself; a repository with neither a URL nor
@@ -237,7 +247,15 @@ def _load_unreadable() -> dict[str, str]:
         return {}
     if not isinstance(record, dict):
         return {}
-    return {str(key): str(reason) for key, reason in record.items()}
+    return {str(key): _current_why(str(why)) for key, why in record.items()}
+
+
+def _current_why(why: str) -> str:
+    """`why` as this version words it: a sentence from before the forge was named maps to its replacement."""
+    reason = UNREADABLE_WHY_LEGACY.get(why)
+    if reason is None:
+        return why
+    return UNREADABLE_WHY.get(reason, UNREADABLE_WHY_DEFAULT).format(forge=LEGACY_FORGE)
 
 
 def _save_unreadable(record: dict[str, str]) -> None:
