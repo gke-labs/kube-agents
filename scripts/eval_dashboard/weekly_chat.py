@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Post the weekly health summary to the CI-health Chat space, once a week.
 
-weekly_email.py writes the summary (``--chat-out``: ``{week_end, text}``)
-when the week's page passes every integrity check; a refused week writes
+weekly_email.py writes the summary (``--chat-out``: ``{week_end, text,
+card}``) when the week's page passes every integrity check; a refused week writes
 none, so there is nothing to post. This script posts it on the first tick at
 or after POST_HOUR on the Monday after the week ends, Toronto time (9 AM
 ET), and records the week in a small state object (``--state``, a local path
@@ -11,7 +11,9 @@ the same tick, posts nothing for that week. A Monday missed is retried
 each tick until the summary moves to the next week (weekly_email.py's week
 ends the Sunday before today, UTC: Sunday 7 or 8 PM Toronto).
 
-It posts the way post_health.py does: the Smoke Health app's token in
+It posts the card (cardsV2) with the text as its fallback, or the text alone
+when the summary has no card or Chat refuses the card (HTTP 400: nothing was
+posted), the way post_health.py posts: the Smoke Health app's token in
 CI_HEALTH_CHAT_TOKEN and the space in CI_HEALTH_CHAT_SPACE (or the webhook
 alternative), through post_health.Sender. CI_HEALTH_MUTE=true posts nothing
 and records nothing, so a week muted on Monday posts once unmuted, within
@@ -40,11 +42,11 @@ import urllib.request
 
 try:
     from eval_dashboard import post_health
-    from eval_dashboard.weekly_email import CHAT_TEXT_KEY, CHAT_WEEK_KEY
+    from eval_dashboard.weekly_email import CHAT_CARD_KEY, CHAT_TEXT_KEY, CHAT_WEEK_KEY
 except ImportError:  # run as a script: scripts/eval_dashboard/weekly_chat.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import post_health
-    from eval_dashboard.weekly_email import CHAT_TEXT_KEY, CHAT_WEEK_KEY
+    from eval_dashboard.weekly_email import CHAT_CARD_KEY, CHAT_TEXT_KEY, CHAT_WEEK_KEY
 
 # The send time: the Monday after the week's last night (a Sunday), at this
 # hour on the reader's clock (post_health.LOCAL_TZ, Toronto), the digest's
@@ -60,6 +62,9 @@ STATE_POSTED_KEY = "posted_at"
 # more URLs matched no objects", as collect.py reads them); any other failure
 # is not "never posted".
 NOT_FOUND_RE = re.compile(r"matched no objects|NotFound|404")
+# Chat refusing the card itself: nothing was posted, so the text alone goes
+# out instead, still once.
+HTTP_BAD_REQUEST = 400
 
 
 def log(message: str) -> None:
@@ -99,7 +104,7 @@ def parse_args(argv):
     parser.add_argument("--message", required=True, type=pathlib.Path, help="the summary weekly_email.py --chat-out wrote")
     parser.add_argument("--state", required=True, help="the last posted week: local path or gs:// object (this script's only write)")
     parser.add_argument("--now", help="evaluate as of this ISO 8601 time (default: now)")
-    parser.add_argument("--dry-run", action="store_true", help="print the summary instead of posting; records nothing")
+    parser.add_argument("--dry-run", action="store_true", help="print the message body instead of posting; records nothing")
     return parser.parse_args(argv)
 
 
@@ -112,6 +117,7 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         message = json.loads(args.message.read_text())
         week_end = datetime.date.fromisoformat(message[CHAT_WEEK_KEY])
         text = message[CHAT_TEXT_KEY]
+        card = message.get(CHAT_CARD_KEY)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         log(f"no weekly summary to post ({args.message}: {exc}); the email was not rendered this tick")
         return 0
@@ -128,7 +134,7 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         log(f"weekly summary for the week ending {week_end}: already posted at {state.get(STATE_POSTED_KEY)}")
         return 0
     if args.dry_run:
-        print(text)
+        print(text if card is None else json.dumps(post_health.Sender.body(text, card), indent=2, ensure_ascii=False))
         return 0
     sender = post_health.Sender.from_env(environ, opener)
     if not sender.configured:
@@ -140,7 +146,11 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
     except (OSError, subprocess.CalledProcessError) as exc:
         log(f"weekly summary for the week ending {week_end}: {args.state} could not be written ({exc}); not posting, the next tick retries")
         return 1
-    if not sender.send(text):
+    sent = sender.send(text, card)
+    if not sent and card is not None and sender.status == HTTP_BAD_REQUEST:
+        log(f"weekly summary for the week ending {week_end}: Chat refused the card (HTTP {HTTP_BAD_REQUEST}); posting the text instead")
+        sent = sender.send(text)
+    if not sent:
         log(f"ERROR: weekly summary for the week ending {week_end}: the post failed after the week was recorded in "
             f"{args.state}; it is NOT retried and this week's summary is missed (delete the object to post it again)")
         return 1

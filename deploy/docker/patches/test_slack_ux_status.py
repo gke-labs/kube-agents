@@ -974,7 +974,9 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub("t_a"), "gave_up"))
         _run(runtime.settle_row(adapter, _sub("t_b"), "blocked"))
         tasks = [v for n, v in adapter.calls if n == "update"][-1]
-        self.assertEqual([t["status"] for t in tasks], ["error", "pending"])
+        # A waiting row draws in_progress (Slack's task_card refuses pending); its title says it waits.
+        self.assertEqual([t["status"] for t in tasks], ["error", "in_progress"])
+        self.assertTrue(tasks[1]["title"].endswith(slack_status.WAITING_ON_YOU), tasks[1]["title"])
         self.assertIn((CHANNEL, THREAD), runtime._plans)
 
     def _tasks(self, adapter):
@@ -1005,7 +1007,7 @@ class PlanTest(_RuntimeCase):
         adapter = _Adapter()
         _run(runtime.settle_row(adapter, _sub(), "blocked", "", "seeded-a"))
         [task] = self._tasks(adapter)
-        self.assertEqual((task["status"], task["title"]), ("pending", slack_status.WAITING_ON_YOU))
+        self.assertEqual((task["status"], task["title"]), ("in_progress", slack_status.WAITING_ON_YOU))
         self.assertIn((CHANNEL, THREAD), runtime._plans)
         self.assertEqual(self._sent(adapter), ["suspended"])
         _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
@@ -1157,7 +1159,8 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(adapter.calls[-1], ("setStatus", "processing"))
         tasks = [v for n, v in adapter.calls if n == "update"][-1]
-        self.assertEqual([t["status"] for t in tasks], ["in_progress", "pending"])
+        self.assertEqual([t["status"] for t in tasks], ["in_progress", "in_progress"])
+        self.assertTrue(tasks[1]["title"].endswith(slack_status.WAITING_ON_YOU), tasks[1]["title"])
 
     def _move(self, adapter, event_id, moved, task="t_a"):
         return _run(runtime.deliver_row(adapter, _sub(task), event_id, "check payments", f"→ {moved}", moved))
@@ -1202,7 +1205,7 @@ class PlanTest(_RuntimeCase):
         self._note(adapter, 1, "reading logs")
         self.assertTrue(self._move(adapter, 2, "review"))
         tasks = [v for n, v in adapter.calls if n == "update"][-1]
-        self.assertEqual([t["status"] for t in tasks], ["pending"])
+        self.assertEqual([(t["status"], t["title"]) for t in tasks], [("in_progress", slack_status.WAITING_ON_YOU)])
         self.assertEqual(adapter.calls[-1], ("setStatus", "suspended"))
 
     def test_a_move_into_review_whose_edit_is_refused_goes_to_the_rolling_message(self):
@@ -1628,8 +1631,9 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(self._kinds(adapter).count("post"), 1)
         updates = [v for n, v in adapter.calls if n == "update"]
         self.assertEqual(
-            [u[0]["status"] for u in updates], ["pending", "in_progress", "in_progress", "complete"],
+            [u[0]["status"] for u in updates], ["in_progress", "in_progress", "in_progress", "complete"],
         )
+        self.assertEqual(updates[0][0]["title"], slack_status.WAITING_ON_YOU)
         self.assertEqual(runtime._lapsed, {})
 
     def test_a_set_aside_plan_with_only_a_running_row_expires(self):

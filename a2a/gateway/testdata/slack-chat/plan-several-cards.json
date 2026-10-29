@@ -10,7 +10,7 @@
         "type": "task_card"
       },
       {
-        "status": "pending",
+        "status": "in_progress",
         "task_id": "t_b",
         "title": "seeded-b · waiting on you",
         "type": "task_card"

@@ -1102,13 +1102,20 @@ stays. The checks:
   footer names those models and the two weeks' dates; a week that changed model
   says so in the intro.
 
-The weekly Chat post is the same week in a few lines: the pass rate with its
+The weekly Chat post is the same week as a Chat card: the pass rate with its
 change from last week (or why no change is called: how many nights counted and
 why the rest were left out), the "Needs attention" areas with their open-bug
-counts and links, the three strongest areas, the task time (the median, the
-90th percentile and the area with the slowest median, with the median's change
-when the week has a trend), and links to the page and the dashboard. The
-render step writes it (`--chat-out`) only when the page passes, from the
+counts and a button to each area's open bugs (the section is left out when no
+area needs attention), every area's pass rate as a ten-step bar, best first
+(collapsed to the first three), the task time (the median, the 90th percentile
+and the area with the slowest median), buttons to the page, the dashboard and
+all open nightly bugs, and the models the week ran. The message carries the
+same week in a few lines of text, without Chat's markup, as the card's
+fallback for notifications; that text also names the three strongest areas and
+the median's change when the week has a trend. If Chat refuses the card (HTTP
+400, so nothing was posted), the step posts that text, with its links, instead.
+The
+render step writes both (`--chat-out`) only when the page passes, from the
 numbers the page printed, so the two cannot disagree and a refused week posts
 nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
 the first tick at or after 9 AM Toronto time on the Monday after the week ends,
@@ -1127,7 +1134,7 @@ Locally,
 `python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html --chat-out weekly-chat.json`
 renders against any downloaded pair (it reads the issues with `gh`), and
 `python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
-prints the post.
+prints the message body it would post.
 
 ## The seeded-fleet scan
 

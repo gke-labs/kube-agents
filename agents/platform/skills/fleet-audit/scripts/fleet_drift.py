@@ -28,11 +28,12 @@ agent to do once the manifest hands it the outliers.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from collections import Counter
@@ -57,9 +58,6 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
-# manifest whichever layer cut it off.
-TIMEOUT_RC = 124
 # The credential proxy's admitted count at the operator's default limit;
 # collect.py's MAX_WORKERS comment has the reasoning.
 MAX_WORKERS = 4
@@ -112,6 +110,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -229,44 +228,14 @@ def log(msg: str) -> None:
     print(f"[fleet_drift] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def _text(output: str | bytes | None) -> str:
-    # `TimeoutExpired` carries the child's output as bytes even under `text=True`,
-    # and every reader of `Run` matches markers against a str.
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output or ""
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn) -> tuple[object | None, Run]:
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def output_digest(text: str) -> str:
@@ -285,26 +254,6 @@ def _record(argv_str: str, result: Run) -> dict:
 # --------------------------------------------------------------------------- #
 # §1: fleet enumeration
 # --------------------------------------------------------------------------- #
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all -- neither the active
-    # project nor `projects list` answered. An empty fleet is then a failure
-    # to look, not a fleet with nothing in it, and the manifest says so.
-    error: str | None
-    # Set when discovery resolved part of the fleet and lost the rest: the
-    # active project answered and `projects list` did not, so the scope is one
-    # project out of an unknown number. A warning on stderr was all this used
-    # to be, and stderr is not in the manifest -- so the run read one project,
-    # marked every entry `collected`, and the document that followed carried no
-    # coverage gap. `finish` then has no reason to hold a previous ledger
-    # finding on a cluster in any other project: it is absent from the
-    # document, absent from the manifest, and therefore announced resolved and
-    # its remediation pull request stale-closed. `collect_fleet` turns this
-    # into a `gate-failed` target so the loss is a row the document must
-    # account for, the way a project whose `clusters list` failed already is.
-    partial: str | None = None
-
 
 def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     """§1.1's project scope. `--project` scopes the run to one project; else

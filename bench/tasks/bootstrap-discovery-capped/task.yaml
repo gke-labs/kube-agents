@@ -1,0 +1,153 @@
+# Domain: fleet audits. Journey: a fresh install with more Cluster Agents than
+# the first-run cap runs its onboarding discovery. The gate hands an audit card
+# to only the first so many Cluster Agents by profile name, because each card
+# is a model turn spent before the user has asked anything (200 Cluster Agents
+# filed 200 turns in 44 minutes, #3702). The rest stay off the sweep card's
+# roster, so the sweep's own worker audits them the way it audits a cluster
+# with no Cluster Agent, and the gate's hand-off writes the raw report with
+# every cluster in it and files the ranking card. The sibling of
+# bootstrap-discovery-fanout, which grades the same journey under the cap.
+#
+# Why a cap of 2: the gate's default is 6, and the eval fleet has about five
+# Cluster Agents, so the default never binds there and a run at it cannot tell
+# a capped build from one without the cap. The stack writes 2 to the agent's
+# `.first_run_cluster_cards` (bootstrap_handoff.first_run_cluster_cards reads
+# it) before it re-arms the gate, and the destroy removes it again; it refuses
+# an install that already has an operator's cap file rather than overwrite it.
+# The verifier errors rather than passes on a roster of 2 or fewer, where 2
+# binds nothing.
+#
+# Red on main: main's gate does not read the cap file and files a card for
+# every Cluster Agent, so `cards-for-first-two-profiles` fails on the cards
+# past the first two, and `past-cap-clusters-sweep-audited` fails because
+# those clusters' Coverage rows in the raw report come from their own cards,
+# not the sweep. bench/tests/test_bootstrap_fanout.py runs both against main's
+# shape and the change's.
+#
+# As in the fan-out case, the sweep is not started by a conversation: the
+# `oobe` cron job's scan stage files it, so the prompt below only reads the
+# board and the grade comes from the stack and the verifiers.
+# bench/tf/prebuilt/bootstrap-discovery re-arms the gate, waits for the cron
+# job to file a new sweep card, and returns once the hand-off's own card keyed
+# `bootstrap-inventory-prioritize` is on the board, or once the sweep and its
+# Cluster Agent cards have stayed in a final status for the stack's
+# `settle_hold` (120s) without one, or at its `handoff_wait` (1800s). With
+# fewer cards the sweep's own worker carries more of the audit, so this case
+# waits on that worker more than the fan-out does. The capped objectives read
+# the roster straight from the profiles on the agent's disk and sort it by
+# profile name, as the gate does, and read the raw report's Coverage table and
+# Gaps list off the shell sandbox; the hand-off objectives are the fan-out
+# case's.
+#
+# The stack refuses an install where a person has connected: a fresh sweep
+# there ends in an onboarding report sent to their chat. It also refuses one
+# whose `oobe` job is missing or paused, where nothing would file the sweep.
+#
+# Isolation class: read-only on the cluster; it writes the cap file and
+# re-files the onboarding sweep on the install under test, and the destroy
+# archives every `bootstrap-inventory-*` card and removes the cap file. The
+# onboarding state lock (hack/ci-eval-pr.sh, unit_state_lock) keeps it apart
+# from the other cases whose stacks rewrite the onboarding markers, which puts
+# it in the nightly's main-a whatever hack/eval/nightly-main-b.txt says.
+# Eligible tier: nightly -- the sweep's cards take dispatcher slots that other
+# cases' cards running at the same time would use.
+---
+id: bootstrap-discovery-capped
+name: Onboarding past the first-run cap files cards for the first Cluster Agents and the sweep audits the rest
+
+# No seeded-fleet dependency: the roster is whatever Cluster Agents the install
+# under test has, and the verifier reads it from there. It needs more than the
+# cap's two.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/bootstrap-discovery"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh), because they
+  # name the install the runner deployed and no task may choose a different
+  # one. The cap is repeated as `cap` on both capped objectives below;
+  # bench/tests/test_bootstrap_fanout.py holds the three equal.
+  variables:
+    first_run_cluster_cards: 2
+
+validated: false
+
+# Slug per docs/designs/domains.yaml: the sweep is the fleet-wide audit that
+# delegates to workers, run once at onboarding rather than on a schedule.
+domain: fleet-audits
+
+# The fan-out case's board read. The session this prompt reaches is the
+# Platform Agent's API session, not the worker running the sweep, and it must
+# not start, retry or complete any of the sweep's cards: the verifiers read
+# which cards were filed for the sweep, and a card this session filed or moved
+# would be graded as the gate's.
+prompt: |
+  The onboarding discovery sweep for this install was filed a few minutes ago
+  as a kanban card with idempotency key 'bootstrap-inventory-scan'.
+
+  1. Find it. Call kanban_list separately for status 'running', 'blocked',
+     'todo' and 'done'. Do not call kanban_list without a status filter -- it
+     returns the oldest tasks first and stops at a page.
+  2. Report its id and status, and for each card keyed
+     'bootstrap-inventory-cluster-*' filed after it, that card's id, assignee
+     and status.
+  3. Say whether a card with idempotency key 'bootstrap-inventory-prioritize'
+     is on the board, with its id and status.
+
+  Only read the board. Do not start, retry, unblock, archive, complete or
+  create any card, write no files, and make no changes to the cluster.
+expected_output: |
+  critical requirements:
+  - The reply names the discovery sweep card, lists the cluster cards filed with
+    their assignees and statuses, and says whether the prioritization card is
+    on the board, read off the kanban board.
+  - No card is created, moved or archived, no file is written, and nothing is
+    changed on the cluster.
+
+verification_spec:
+  # The bootstrap_fanout entries read the board and the profiles on the agent's
+  # disk (kube_agents_bench/discovery.py), not the transcript; the second also
+  # reads INVENTORY.raw.md on the shell sandbox (kube_agents_bench/onboarding.py).
+
+  - name: cards-for-first-two-profiles
+    role: objective
+    check:
+      type: bootstrap_fanout
+      require: cards_for_first_cap_profiles
+      cap: 2
+
+  # The cap's risk: a cluster past it that nobody audits reads as clean.
+  - name: past-cap-clusters-sweep-audited
+    role: objective
+    check:
+      type: bootstrap_fanout
+      require: past_cap_clusters_sweep_audited
+      cap: 2
+
+  # Reads INVENTORY.raw.md on the shell sandbox and the board on the agent pod
+  # (kube_agents_bench/onboarding.py), not the transcript.
+  - name: raw-report-has-findings-block
+    role: objective
+    check:
+      type: bootstrap_handoff
+      require: raw_report_has_findings_block
+
+  # The prioritization stage's card is found by this key; one filed without
+  # it is a second card the next sweep's hand-off would not deduplicate.
+  - name: ranking-card-keyed
+    role: objective
+    check:
+      type: bootstrap_handoff
+      require: ranking_card_filed
+
+  # The five first-run audits run after the scan and report their own checks
+  # (oobe.py FIRST_RUN_AUDITS); a block line under one of their slugs reaches
+  # the user a second time as a separate problem.
+  - name: raw-report-no-first-run-audit-checks
+    role: objective
+    check:
+      type: bootstrap_handoff
+      require: raw_report_no_first_run_audit_checks

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
@@ -28,7 +30,9 @@ import (
 const (
 	consoleInSubject      = "chat.console.%s.in"
 	consoleOutSubject     = "chat.console.%s.out"
-	consoleConversationOf = "console:%s"
+	consoleConversationOf = consoleConversationPrefix + "%s"
+	// consoleConversationPrefix is the console door's conversation key prefix.
+	consoleConversationPrefix = "console:"
 	// submissionSubjects is every task's .in subject, which the console grant
 	// lets the server watch (a2a.>): submissions, follow-ups and cancels.
 	submissionSubjects = "a2a.tasks.*.*." + lib.TaskClassIn
@@ -124,11 +128,26 @@ type Conversations struct {
 	// its next turn waits on; at most maxConversations are kept.
 	running map[string]TaskRef
 	clock   uint64
+	// now is the wall clock an alias's last use is stamped with; tests set it.
+	now func() time.Time
 }
 
+// aliasEntry is one alias: its token, the description manage_session's new
+// gave it, and when it was last used, by counter (which orders uses exactly)
+// and by wall clock (which a person can read).
 type aliasEntry struct {
-	token string
-	used  uint64
+	token       string
+	description string
+	used        uint64
+	lastUsed    time.Time
+}
+
+// ConversationInfo is one alias as manage_session lists it.
+type ConversationInfo struct {
+	Alias       string
+	Token       string
+	Description string
+	LastUsed    time.Time
 }
 
 type sendLock struct {
@@ -145,48 +164,200 @@ var ErrConversationBusy = errors.New("conversation busy: a turn is still running
 
 // NewConversations returns an empty alias table.
 func NewConversations() *Conversations {
-	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}, running: map[string]TaskRef{}}
+	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}, running: map[string]TaskRef{}, now: time.Now}
 }
 
 // Resolve returns the console token for a call: token when the caller names
 // one (to resume a conversation, after a restart of this server included),
 // otherwise the alias's, minted on first use.
 func (c *Conversations) Resolve(alias, token string) (string, error) {
-	if token != "" {
-		if !lib.ValidSubjectToken(token) {
-			return "", fmt.Errorf("%q is not a conversation token", token)
+	t, _, err := c.ResolveCall(alias, token)
+	return t, err
+}
+
+// ResolveCall is Resolve, also reporting whether the call named its
+// conversation by token, so its answer is labelled by the token rather than
+// by a name it may not have.
+func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
+	// A conversation's token given as its name, as list shows it
+	// (console:<token>) or bare, is the token: never a new name spelled like
+	// one, whether or not this table still knows it (after a delete, an
+	// eviction or a restart, the token is what a caller falls back to).
+	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
+		// console:<x> in a name's place is a token only when x is one, as
+		// list shows tokens; console:<name> is neither, not a conversation
+		// nobody minted.
+		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
+			return "", false, fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
 		}
-		return token, nil
+		alias, token = "", alias
+	}
+	if token != "" {
+		// manage_session lists a conversation as console:<token>; either form
+		// names it.
+		token = strings.TrimPrefix(token, consoleConversationPrefix)
+		if !lib.ValidSubjectToken(token) {
+			return "", false, fmt.Errorf("%q is not a conversation token", token)
+		}
+		// A call by token is a use of the name that holds it, if any.
+		c.mu.Lock()
+		if a, ok := c.aliasOfTokenLocked(token); ok {
+			c.touchLocked(c.byAlias[a])
+		}
+		c.mu.Unlock()
+		return token, true, nil
 	}
 	if alias == "" {
 		alias = DefaultConversation
 	}
 	if err := checkAlias(alias); err != nil {
+		return "", false, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.byAlias[alias]; ok {
+		c.touchLocked(e)
+		return e.token, false, nil
+	}
+	t, err := c.addLocked(alias, "")
+	return t, false, err
+}
+
+// isMintedToken reports whether s is spelled as this server mints tokens.
+func isMintedToken(s string) bool {
+	rest, ok := strings.CutPrefix(s, conversationTokenPrefix)
+	if !ok || len(rest) != 2*conversationTokenBytes {
+		return false
+	}
+	_, err := hex.DecodeString(rest)
+	return err == nil && strings.ToLower(rest) == rest
+}
+
+// aliasOfTokenLocked finds the alias whose conversation has token t.
+func (c *Conversations) aliasOfTokenLocked(t string) (string, bool) {
+	for a, e := range c.byAlias {
+		if e.token == t {
+			return a, true
+		}
+	}
+	return "", false
+}
+
+// ErrConversationExists is Create's refusal of an alias already in use.
+var ErrConversationExists = errors.New("conversation already exists")
+
+// Create adds alias with a fresh token and description, and refuses an alias
+// already in use rather than handing back its conversation: a caller asking
+// for a new conversation must not find itself continuing someone else's.
+func (c *Conversations) Create(alias, description string) (string, error) {
+	if err := checkAlias(alias); err != nil {
 		return "", err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, ok := c.byAlias[alias]; ok {
+		return "", fmt.Errorf("%w: %s", ErrConversationExists, cell(alias))
+	}
+	return c.addLocked(alias, description)
+}
+
+// Forget drops the name holding token, or else alias (a name, or a token in
+// a name's place), and returns the name it dropped, if any. The conversation
+// itself is untouched: it stays reachable by its token.
+func (c *Conversations) Forget(alias, token string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// A token wins over a name, as it does in ResolveCall.
+	if token != "" {
+		alias = ""
+	} else if _, ok := c.byAlias[alias]; ok {
+		delete(c.byAlias, alias)
+		return alias, true
+	} else {
+		// Named by its token in a name's place, as list shows it, or bare.
+		token = alias
+	}
+	a, found := c.aliasOfTokenLocked(strings.TrimPrefix(token, consoleConversationPrefix))
+	if !found {
+		return "", false
+	}
+	delete(c.byAlias, a)
+	return a, true
+}
+
+// List returns the aliases, most recently used first.
+func (c *Conversations) List() []ConversationInfo {
+	c.mu.Lock()
+	type row struct {
+		info ConversationInfo
+		used uint64
+	}
+	rows := make([]row, 0, len(c.byAlias))
+	for a, e := range c.byAlias {
+		rows = append(rows, row{ConversationInfo{Alias: a, Token: e.token, Description: e.description, LastUsed: e.lastUsed}, e.used})
+	}
+	c.mu.Unlock()
+	slices.SortFunc(rows, func(x, y row) int { return cmp.Compare(y.used, x.used) })
+	out := make([]ConversationInfo, len(rows))
+	for i, r := range rows {
+		out[i] = r.info
+	}
+	return out
+}
+
+func (c *Conversations) touchLocked(e *aliasEntry) {
 	c.clock++
-	if e, ok := c.byAlias[alias]; ok {
-		e.used = c.clock
-		return e.token, nil
+	e.used, e.lastUsed = c.clock, c.now()
+}
+
+// addLocked mints a token for a new alias, forgetting the least recently
+// used alias first if the table is full.
+func (c *Conversations) addLocked(alias, description string) (string, error) {
+	t, err := mintConversationToken()
+	if err != nil {
+		return "", err
 	}
 	if len(c.byAlias) >= maxConversations {
 		c.forgetOldestLocked()
 	}
+	e := &aliasEntry{token: t, description: description}
+	c.touchLocked(e)
+	c.byAlias[alias] = e
+	return t, nil
+}
+
+func mintConversationToken() (string, error) {
 	b := make([]byte, conversationTokenBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	t := conversationTokenPrefix + hex.EncodeToString(b)
-	c.byAlias[alias] = &aliasEntry{token: t, used: c.clock}
-	return t, nil
+	return conversationTokenPrefix + hex.EncodeToString(b), nil
 }
 
 // checkAlias refuses a conversation name longer than maxAliasRunes.
+//
+// It also refuses what list could not show back as typed, so a name copied
+// from list is the same name: a token's console: prefix, backticks and pipes,
+// control and invisible (format) characters, spaces at either end, doubled
+// or other than the plain one, and a token's own spelling.
 func checkAlias(alias string) error {
 	if n := utf8.RuneCountInString(alias); n > maxAliasRunes {
 		return fmt.Errorf("conversation name is %d characters; at most %d", n, maxAliasRunes)
+	}
+	// Only new reaches these two: ResolveCall takes such a name as the
+	// token it is before checking it.
+	if strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias) {
+		return errors.New("that is a conversation's token, not a name: the conversation already exists, " +
+			"and a name cannot be given to it here; use it by its token, or pick another name for a new conversation")
+	}
+	// list collapses every run of Unicode spaces to one ASCII space.
+	if strings.Join(strings.Fields(alias), " ") != alias {
+		return errors.New("a conversation name may not start or end with spaces, hold two in a row, or use a space other than the plain one")
+	}
+	for _, r := range alias {
+		if r == '`' || r == '|' || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("a conversation name may not hold %q", r)
+		}
 	}
 	return nil
 }
