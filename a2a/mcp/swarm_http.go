@@ -56,7 +56,7 @@ const (
 	noteTasksPartial     = "the TASKS read was partial, so tasks may be missing: %v"
 	noteTasksBusy        = "the TASKS read was skipped because this server's bus readers were busy; no tasks were read, try again in a few seconds"
 	noteTasksOldest      = "TASKS holds more than %d messages since the window began; the oldest were not read, so older tasks may be missing"
-	noteTasksNarrowed    = "TASKS since the window began holds more than one read's %d MiB; only its newest messages were read, so older tasks may be missing"
+	noteTasksBudget      = "the TASKS read reached its %d MiB budget before the newest messages, which it reads last, so the newest tasks and states may be missing"
 	noteDroppedEntries   = "%d conversation entries in the request were dropped: an alias or token that is not valid"
 	noteNotConnected     = "not connected to the bus; no tasks were read"
 	noteCardsUnavailable = "the agent cards could not be read"
@@ -69,12 +69,6 @@ var swarmTaskWindow = swarmRecent
 // swarmTaskLimit bounds the messages one TASKS read takes: the newest this
 // many on the stream. A variable for tests.
 var swarmTaskLimit = maxTaskEvents
-
-// swarmReadNarrowings bounds how often a TASKS read that passed the bus
-// reader's byte budget (readMaxBytes) starts again from the newer half of
-// what it read, so the newest messages are the ones it keeps: the reader
-// delivers oldest first and stops at its budget.
-const swarmReadNarrowings = 6
 
 // maxSwarmPromptRunes caps the prompt kept of a submission; the projection
 // shortens it further for display.
@@ -282,16 +276,17 @@ func (h *swarmHandler) taskSet(ctx context.Context) swarmTaskSet {
 	case errors.Is(err, errReadersBusy):
 		set.notes = append(set.notes, noteTasksBusy)
 		return set
+	case errors.Is(err, ErrReadByteBudget):
+		set.notes = append(set.notes, fmt.Sprintf(noteTasksBudget, readMaxBytes>>20))
 	case err != nil:
 		set.notes = append(set.notes, fmt.Sprintf(noteTasksPartial, err))
 	}
 	if read.oldestDropped {
 		set.notes = append(set.notes, fmt.Sprintf(noteTasksOldest, swarmTaskLimit))
 	}
-	if read.narrowed {
-		set.notes = append(set.notes, fmt.Sprintf(noteTasksNarrowed, readMaxBytes>>20))
-	}
-	if ctx.Err() != nil {
+	// A read cut short, by its caller, its deadline or its byte budget,
+	// answers this call only: it is not what the next caller should see.
+	if err != nil || ctx.Err() != nil {
 		return set
 	}
 	h.cached, h.cachedAt = set, h.clock()
@@ -457,6 +452,8 @@ type swarmTaskRead struct {
 	submitted bool
 	task      SwarmTask
 	events    []*lib.Envelope
+	// firstAt is when the read's first message of the task was stored.
+	firstAt time.Time
 }
 
 // swarmRead is what one TASKS read found, and how it fell short.
@@ -466,9 +463,6 @@ type swarmRead struct {
 	// found none older than the window, so the window held more than the
 	// read takes, and its oldest messages were not read.
 	oldestDropped bool
-	// narrowed: the window held more than the bus reader's byte budget, so
-	// the read started again further on and holds only its newest part.
-	narrowed bool
 }
 
 // swarmTasks reads the newest swarmTaskLimit messages on TASKS in one drain
@@ -494,26 +488,17 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		start = state.LastSeq - limit + 1
 	}
 	var (
-		reads       map[TaskRef]*swarmTaskRead
+		reads       = map[TaskRef]*swarmTaskRead{}
 		order       []*swarmTaskRead
-		submittedAt map[TaskRef]time.Time // the first .in older than the window
+		submittedAt = map[TaskRef]time.Time{} // the first .in older than the window
 		sawOlder    bool
 		read        swarmRead
-		derr        error
 	)
-	// The bus reader delivers oldest first and stops at its byte budget, so
-	// a window past the budget would be read without its newest part. Such a
-	// read starts again from the newer half of where it began, until it fits.
-	for narrowings := 0; ; narrowings++ {
-		reads, order, submittedAt, sawOlder = map[TaskRef]*swarmTaskRead{}, nil, map[TaskRef]time.Time{}, false
-		derr = b.readSwarmWindow(ctx, s, start, since, reads, &order, submittedAt, &sawOlder)
-		if !errors.Is(derr, ErrReadByteBudget) || narrowings == swarmReadNarrowings || start >= state.LastSeq || ctx.Err() != nil {
-			break
-		}
-		start += (state.LastSeq - start + 1) / 2
-		read.narrowed = true
-	}
-	read.oldestDropped = start > state.FirstSeq && !sawOlder && !read.narrowed
+	// One drain, oldest first, within the bus reader's byte budget: a window
+	// past the budget stops before its newest messages, and the error says
+	// so (ErrReadByteBudget).
+	derr := b.readSwarmWindow(ctx, s, start, since, reads, &order, submittedAt, &sawOlder)
+	read.oldestDropped = start > state.FirstSeq && !sawOlder
 	addresseeOf := make(map[string]string, len(order))
 	for _, rd := range order {
 		if _, dup := addresseeOf[rd.ref.TaskID]; dup {
@@ -582,6 +567,9 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 			reads[ref] = rd
 			*order = append(*order, rd)
 		}
+		if rd.firstAt.IsZero() {
+			rd.firstAt = at
+		}
 		if class != lib.TaskClassIn {
 			noteQuestion(rd, env, seq)
 			rd.events = append(rd.events, env)
@@ -614,11 +602,16 @@ func (b *NATSBus) readSwarmWindow(ctx context.Context, s jetstream.Stream, start
 		rd.task.ViaTaskID = via
 		rd.task.Submitted = at
 		// It is the submission only if nothing of the task came before it:
-		// not an older .in, and no event earlier in the read.
-		if older, ok := submittedAt[ref]; ok {
+		// not an older .in, and no event earlier in the read. When events
+		// came first, this .in is a steer, and the task began no later than
+		// its first event in the read.
+		switch older, ok := submittedAt[ref]; {
+		case ok:
 			rd.task.Submitted = older
-		} else if len(rd.events) == 0 {
+		case len(rd.events) == 0:
 			rd.task.Prompt = text
+		case rd.firstAt.Before(at):
+			rd.task.Submitted = rd.firstAt
 		}
 	})
 	return derr
