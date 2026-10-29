@@ -1319,6 +1319,20 @@ class Failures(Base):
         self.assertEqual(code, 0)
         self.assertIn("dry run: would report", out.getvalue())
 
+    def test_a_report_script_missing_from_the_image_needs_an_admin(self) -> None:
+        """No retry puts the script back, so the line says the image is missing it and an admin has to act."""
+        empty = Path(self.tmp.name) / "no-skill-scripts"
+        empty.mkdir()
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        with mock.patch.dict(os.environ, {watch.SKILL_SCRIPTS_DIR_ENV: str(empty)}):
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.calls, [])
+        self.assertTrue(
+            out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_SCRIPT_MISSING, next=watch.FAILED_NEEDS_ADMIN)), out
+        )
+        self.assertIn(f"{watch.REPORT_MODULE}.py not found under {empty}", out)
+
     def test_an_unparsable_ledger_is_refused_not_overwritten(self) -> None:
         self.home.mkdir(parents=True)
         (self.home / watch.LEDGER_FILE_NAME).write_text('{"targets": {')
@@ -2937,6 +2951,7 @@ class PlainFailureLine(unittest.TestCase):
             (watch.ProjectUnresolved("number"), watch.FAILED_REASON_UNRESOLVED),
             (watch.SandboxTimedOut("slow"), watch.FAILED_REASON_TIMED_OUT),
             (watch.WriteFailed("disk full"), watch.FAILED_REASON_WRITE),
+            (watch.ReportScriptMissing("not found"), watch.FAILED_REASON_SCRIPT_MISSING),
             (OSError("cannot fork"), watch.FAILED_REASON_ERROR),
         )
         for error, reason in cases:

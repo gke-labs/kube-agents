@@ -586,12 +586,15 @@ FAILED_REASON_REFUSED = "It couldn't read the clusters in the install's scope"
 FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
 FAILED_REASON_UNRESOLVED = "It couldn't look up the fleet's projects"
 FAILED_REASON_WRITE = "It couldn't save its report"
+FAILED_REASON_SCRIPT_MISSING = "The agent image is missing its report script"
 FAILED_REASON_TIMED_OUT = "Reading the fleet took too long"
 FAILED_REASON_ERROR = "It hit an error"
-# The reasons a retry does not clear: the install's scope, the roster or the
-# disk has to change first. A refusal is decided by its causes instead
-# (`REFUSAL_CAUSES_THAT_CLEAR`).
-FAILED_REASONS_NEED_ADMIN = frozenset({FAILED_REASON_SCOPE_UNREADABLE, FAILED_REASON_UNRESOLVED, FAILED_REASON_WRITE})
+# The reasons a retry does not clear: the install's scope, the roster, the
+# disk or the image has to change first. A refusal is decided by its causes
+# instead (`REFUSAL_CAUSES_THAT_CLEAR`).
+FAILED_REASONS_NEED_ADMIN = frozenset(
+    {FAILED_REASON_SCOPE_UNREADABLE, FAILED_REASON_UNRESOLVED, FAILED_REASON_WRITE, FAILED_REASON_SCRIPT_MISSING}
+)
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -710,6 +713,12 @@ class ScopeUnreadable(RuntimeError):
 
 class ProjectUnresolved(RuntimeError):
     """Every project the table ran is a number the report could not resolve: nothing was read under a key."""
+
+
+class ReportScriptMissing(RuntimeError):
+    """The skill's report script is not where the image puts it: no run clears it, the
+    image does. A RuntimeError still, so a project's run that hits it is that project's
+    table failure, and a tick where every run did is the tick's failure line."""
 
 
 class WriteFailed(Exception):
@@ -832,7 +841,7 @@ def skill_scripts_dir() -> Path:
     for candidate in candidates:
         if (candidate / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)).is_file():
             return candidate
-    raise RuntimeError(f"{REPORT_MODULE}.py not found under {', '.join(str(c) for c in candidates)}")
+    raise ReportScriptMissing(f"{REPORT_MODULE}.py not found under {', '.join(str(c) for c in candidates)}")
 
 
 def scope_args_path() -> Path:
@@ -2274,6 +2283,8 @@ def failure_reason(exc: Exception) -> str:
     """Why a tick failed, in the channel's words: the kind of failure, never its text."""
     if isinstance(exc, WriteFailed):
         return FAILED_REASON_WRITE
+    if isinstance(exc, ReportScriptMissing):
+        return FAILED_REASON_SCRIPT_MISSING
     if isinstance(exc, ReportRefused):
         return FAILED_REASON_REFUSED
     if isinstance(exc, ScopeUnreadable):
