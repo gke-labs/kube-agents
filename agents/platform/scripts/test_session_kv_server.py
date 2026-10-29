@@ -3187,9 +3187,12 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         # The refusal stands: nothing here reaps the copy on the card's behalf
         # (vcs_client spares the clone's own destination), so the text says who
         # clears it and when the reaper does.
-        self.assertIn("Every later card for this branch meets the same refusal until a person clears the copy", body)
-        self.assertIn("until a `prepare` for another branch runs after the copy has gone untouched for the copy TTL", body)
+        self.assertIn("Every later card for this branch meets the same refusal until a person clears the copy or publishes what is in it.", body)
         self.assertNotIn("is removed by the next `prepare` for this branch", body)
+        # No TTL promise either: a refused `prepare` runs `git status`, which
+        # refreshes the index `_last_touched` reads, so a branch that keeps
+        # drawing cards keeps its copy alive for the reaper.
+        self.assertNotIn("copy TTL", body)
         self.assertNotIn("reap_stale_copies", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
@@ -3212,9 +3215,6 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertIn("If the triage parent has no report (`result` is empty or its `status` is not `done`)", body)
         self.assertIn("Never change the live cluster directly", body)
         self.assertIn("open nothing", body)
-        # The card's "24 hours by default" is vcs_client's default copy TTL.
-        self.assertEqual(float(os.environ.get("KUBE_AGENTS_VCS_TTL_HOURS", "24")), 24.0)
-        self.assertIn("(24 hours by default)", body)
 
     def test_without_a_live_sibling_call_2_has_the_one_parent(self):
         self.assertFalse(self.board.exists())
