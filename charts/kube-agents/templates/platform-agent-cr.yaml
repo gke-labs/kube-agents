@@ -193,13 +193,16 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
       {{- end }}
       {{- if hasKey $tuning "maxSessions" }}
       maxSessions: {{ $tuning.maxSessions }}
+      {{- end }}
+      {{- if hasKey $tuning "busReplicas" }}
+      busReplicas: {{ $tuning.busReplicas }}
       {{- end }}
       {{- with $tuning.default }}
       default:
