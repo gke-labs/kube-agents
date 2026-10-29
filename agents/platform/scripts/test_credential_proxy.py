@@ -347,7 +347,7 @@ class AgentAPIProxyTest(unittest.TestCase):
         for path, body in (
             ("/api/sessions", {"id": "web-console-abc", "title": "Web console abc"}),
             ("/v1/responses", {"conversation": "run-42", "input": "status of a2a-ctx-body?"}),
-            ("/v1/responses", {"input": "a2a-" + "x" * 300}),
+            ("/v1/responses", {"input": "hi", "note": "a2a-" + "x" * 300}),
             ("/api/sessions/web-console-abc/chat", {"message": "a2a-x"}),
             ("/v1/responses", {"input": "a2a-x"}),
             ("/v1/responses", {"input": "hi", "instructions": "A2A-x"}),
