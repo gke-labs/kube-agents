@@ -211,9 +211,10 @@ func writeNonClusterProfile(t *testing.T, base, profile string) {
 	}
 }
 
-// clusterprofiles.Discoverer owns the scan itself and is tested there; these
-// cover what discoverClusterProfiles adds on top of it — a Kubernetes client
-// per cluster, and a skipped profile becoming a log line and a metric.
+// clusterprofiles.DiscoverAndBuild owns the scan, the skip policy and the skip
+// log lines, and is tested there; these cover what discoverClusterProfiles adds
+// on top of it — a Kubernetes client per cluster, and a skipped profile
+// becoming a metric.
 
 func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
 	stubGKE(t)

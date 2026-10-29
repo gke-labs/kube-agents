@@ -29,6 +29,10 @@ import (
 )
 
 const (
+	// skipConsequence finishes a skipped profile's log line, "its cluster will
+	// NOT be ...": what this binary does with a cluster the scan loses.
+	skipConsequence = "joined"
+
 	// clusterIdentityProbeTimeout bounds the startup check that the credentials
 	// reach the cluster the flags name. Short, because both sources are local:
 	// the metadata server is on the node and the kubeconfig is on disk, so a
@@ -174,10 +178,6 @@ func applyJoinThrottle(cfg *rest.Config) {
 // The same seam k8s-event-watcher uses, deliberately: two binaries scanning the
 // same directory the same way is the reason the scan is a package.
 var profilesDiscovery clusterprofiles.Discoverer
-
-// skipConsequence finishes a skipped profile's log line, "its cluster will NOT
-// be ...": what this binary does with a cluster the scan loses.
-const skipConsequence = "joined"
 
 // profileCluster is one fleet cluster the join can read, discovered from a
 // Cluster Agent profile rather than from a credential flag.
