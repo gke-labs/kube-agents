@@ -103,25 +103,31 @@ stop at once; the relay's render drain is bounded by that budget, and a batch st
 it runs out is abandoned and given back. That makes two replicas acting at once unlikely, not
 impossible: a paused process, or a clock that jumps, can still overlap the next leader.
 
-So writes are fenced by the Lease's own epoch. `leaseTransitions` counts every acquisition, so
-each leader's term has a number no earlier term shares. On acquiring the lease, and before it
-starts any work, the new leader raises a term marker in the session-state bucket to its epoch.
-Every record write, task-index write and session delete then checks two epochs: the marker's and
-the stored record's. A write from an epoch older than either is refused, and the write is
-conditional on the record revision it checked. So a deposed leader's write fails on every record
-once the new term has started, including records the new leader hasn't touched yet. The marker
-alone would leave a gap between reading it and writing, and the record's own epoch closes it for
-any record the new leader has written.
+So writes are fenced by a term number. The term isn't the Lease's `leaseTransitions`: the Lease
+can be deleted and recreated (by hand, or by a reinstall or restore that keeps the bus volume),
+and its count would start again under records stamped with later numbers. Instead the term is a
+counter in the session-state bucket, beside the records it fences. On acquiring the lease, and
+before it starts any work, the new leader increments the counter and takes the result as its
+term. Every record write, task-index write and session delete checks two terms: the counter's and
+the stored record's. A write from a term older than either is refused, and the write is
+conditional on the record revision it checked.
+
+That fences most of a deposed leader's writes, not all of them. Once the new term has started, a
+deposed write is refused on any record the new leader has written. It's also refused on every
+other record, unless the deposed leader read the counter before the new term began and then
+paused before writing. The counter and the record are separate keys, and nothing makes the pair
+atomic. A write that slips through that gap lands on a record the new leader hasn't read yet, so
+the new leader reads it as current state and carries on from it.
 
 The election's identity is the pod name plus a per-process id. client-go lets a process whose
-identity matches the current holder renew without waiting and without counting a transition, so a
-container restarting in the same pod under the bare pod name would carry on in the old term with
-no new epoch. With the per-process id, a restarted container is a new holder: it waits out the
-lease like any other and gets the next epoch.
+identity matches the current holder renew without waiting, so a container restarting in the same
+pod under the bare pod name would carry on as leader with no acquisition, and so no new term.
+With the per-process id, a restarted container is a new holder: it waits out the lease like any
+other and starts a new term.
 
-The epoch fences records, not every side effect. A deposed leader in the overlap can still post
-to a chat, publish a task or spawn a pod before it learns it lost. Its record write then fails, so
-what it did isn't on record: a post may be duplicated, and a spawned pod is untracked, which the
+The term fences records, not every side effect. A deposed leader in the overlap can still post
+to a chat, publish a task or spawn a pod before it learns it lost. Its record write then usually
+fails, so what it did isn't on record: a post may be duplicated, and a spawned pod is untracked, which the
 new leader's sweep removes (the turn that spawned it is lost with it). That's the residue, and the
 step-down budget keeps its window to seconds.
 
@@ -175,7 +181,7 @@ that from being a trap:
 - **Every caller is updated in the same change as the standby's 503:** the bench harness's
   inject transport (`bench/kube_agents_bench/harness.py` and `inject_transport.py`), which
   drives the required smoke gate, resolves the holder and re-resolves on a 503 or a dropped
-  tunnel; `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` and `hack/rollback-roundtrip.sh`; and
+  tunnel; `hack/rollback-roundtrip.sh`, the one script that port-forwards a door; and
   `bench/README.md` and the docs that show a door port-forward. That change lands before the
   operator renders a second replica, so the gate never sees a standby it can't route around.
 
@@ -188,9 +194,9 @@ ingress gap above.
 ### Alternatives considered
 
 - **Electing through a NATS KV key** instead of a Kubernetes Lease. It needs no Kubernetes grant,
-  and its revision would be an epoch. It lost because the doors' clients reach the active pod
-  with `kubectl`, which can read a Lease and not a bus key, and a Lease already counts its
-  transitions.
+  and the term would live with the records. It lost because the doors' clients reach the active
+  pod with `kubectl`, which can read a Lease and not a bus key. The term counter is in the bus
+  anyway, so the Lease only elects.
 - **Readiness true only on the active replica,** to route by Service. It deadlocks every
   rollout: a Deployment counts an unready pod as unavailable, so with `maxUnavailable: 0` the new
   pod never goes Ready as a standby and the old leader is never stopped, and with
@@ -237,17 +243,20 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
 ## Build, as follow-ups
 
 1. **Fenced session-record writes.** `Registry.Put` becomes a write conditional on the revision it
-   checked, refusing a write from an epoch older than the term marker's or the stored record's.
+   checked, refusing a write from a term older than the term counter's or the stored record's.
    The task index and session deletes take the same check. The seventeen callers don't change,
    and within one term the last write still wins, as it does with one active replica today. The
-   registry gains the call that raises the marker, which the election makes. Until the election
-   exists, every write carries epoch 0.
+   registry gains the call that starts a term, which the election makes. Until the election
+   exists, every write carries term 0, and term 0 fences nothing.
 2. **Leader election in the gateway.** It lands after the relay's ack-after-render change.
-   Acquire (identity: pod name and per-process id), raise the term marker, renew and step down; all of `Run`'s and
+   Acquire (identity: pod name and per-process id), start a term, renew and step down; all of `Run`'s and
    `realMain`'s work gated on the lease; the step-down order and budget above; the relay's delayed
    bind after a takeover from an expired lease; release on SIGTERM. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
    takeover renders the dead leader's held events before newer ones.
+   Rolling back from this step needs nothing: a gateway without the election writes at term 0,
+   which fences nothing, so step 1's build and anything older still write after terms have
+   started.
 3. **The standby's doors:** 503 with the holder and the exact port-forward command, the `hack/`
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
