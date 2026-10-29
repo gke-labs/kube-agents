@@ -462,12 +462,14 @@ drift_pid=""
 # could not end a supervisor whose process is ignoring the signal -- which is the
 # only state a supervisor can still be in by the time the loop above gives up.
 drain_supervised() {
+  # The budget is the first argument, never read from the environment:
+  # spec.deployment.env reaches this container unfiltered, and a variable
+  # would have made the supervisors' drain a knob nothing documents.
+  local budget="$1"
+  shift
   local pid
   local waited=0
   local running
-  # The supervisors' budget unless the caller set DRAIN_BUDGET_SECONDS for
-  # this call, as terminate() does for the credential runtime.
-  local budget="${DRAIN_BUDGET_SECONDS:-${SHUTDOWN_DRAIN_SECONDS}}"
 
   for pid in "$@"; do
     pkill -TERM -P "${pid}" 2>/dev/null || true
@@ -500,11 +502,11 @@ terminate() {
   [[ -z "${drift_pid}" ]] || supervisors+=("${drift_pid}")
   # One shared drain budget, not one each: the two run concurrently and the pod's
   # grace period does not grow with the number of processes in the container.
-  [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${supervisors[@]}"
+  [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS. Its child commands
   # get the same SIGTERM first, as a supervisor's process does.
-  [[ -z "${runtime_pid}" ]] || DRAIN_BUDGET_SECONDS="${RUNTIME_DRAIN_SECONDS}" drain_supervised "${runtime_pid}"
+  [[ -z "${runtime_pid}" ]] || drain_supervised "${RUNTIME_DRAIN_SECONDS}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM

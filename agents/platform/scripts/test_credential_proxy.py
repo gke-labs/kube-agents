@@ -8476,10 +8476,12 @@ class GracefulShutdownTest(unittest.TestCase):
     """
 
     SUBSCRIPTION = "projects/kagents-dev/subscriptions/a2a-chat-sub"
+    # The two Chat routes: a Chat pull creates a Pub/Sub receipt the stop has
+    # to hand back. The Slack route is not here on purpose (see the test
+    # below): its queue is in-process and already acknowledged to Slack.
     PULL_ROUTES = (
         ("/v1/chat/a2a/events", {"subscription": SUBSCRIPTION}),
         ("/v1/chat/events", {}),
-        ("/v1/chat/slack/events", {}),
     )
 
     def setUp(self):
@@ -8548,6 +8550,17 @@ class GracefulShutdownTest(unittest.TestCase):
                 self.assertEqual(HTTPStatus.OK, captured["status"])
                 self.assertEqual(1, relay.pulls)
 
+    def test_a_slack_pull_is_served_through_the_window(self):
+        # Refusing it would only lose events: they are acknowledged to Slack
+        # on arrival and die with the process, so every one the gateway takes
+        # in the window is one fewer lost.
+        CredentialProxyHandler.shutting_down.set()
+        relay = self._relay()
+        handler, captured = self._handler("/v1/chat/slack/events", relay)
+        handler.do_GET()
+        self.assertEqual(HTTPStatus.OK, captured["status"])
+        self.assertEqual(1, relay.pulls)
+
     def test_an_ack_still_lands_during_the_window(self):
         CredentialProxyHandler.shutting_down.set()
         relay = self._relay()
@@ -8557,9 +8570,21 @@ class GracefulShutdownTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.OK, captured["status"])
         self.assertEqual([("r1", True)], relay.settled)
 
+    @staticmethod
+    def _api_core_stub():
+        """pull() imports google.api_core on call; neither it nor Pub/Sub is here."""
+        retry = types.SimpleNamespace(Retry=lambda deadline: None)
+        exceptions = types.SimpleNamespace(DeadlineExceeded=type("DeadlineExceeded", (Exception,), {}))
+        api_core = types.SimpleNamespace(retry=retry, exceptions=exceptions)
+        return mock.patch.dict(
+            sys.modules,
+            {"google.api_core": api_core, "google.api_core.retry": retry, "google.api_core.exceptions": exceptions},
+        )
+
     def _chat_relay(self, receipts):
         relay = GoogleChatRelay.__new__(GoogleChatRelay)
         relay._lock = threading.Lock()
+        relay._closed = False
         relay._receipts = dict(receipts)
         relay.subscription_path = self.SUBSCRIPTION
         relay.subscriber = mock.Mock()
@@ -8580,6 +8605,45 @@ class GracefulShutdownTest(unittest.TestCase):
         self.assertEqual({}, relay._receipts)
         self.assertEqual(0, relay.release_unsettled())
         self.assertEqual(1, relay.subscriber.modify_ack_deadline.call_count)
+
+    def test_a_pull_that_returns_after_the_hand_back_nacks_instead_of_holding_a_receipt(self):
+        # The gateway's long poll is almost always in flight at SIGTERM and
+        # nothing interrupts it; a message it receives after release_unsettled
+        # cleared the map would otherwise sit under a receipt nobody settles.
+        relay = self._chat_relay({})
+        message = types.SimpleNamespace(
+            ack_id="ack-late",
+            message=types.SimpleNamespace(data=b"{}", attributes={}, message_id="m-late"),
+        )
+        relay.subscriber.pull.return_value = types.SimpleNamespace(received_messages=[message])
+
+        self.assertEqual(0, relay.release_unsettled())
+        with self._api_core_stub():
+            self.assertIsNone(relay.pull())
+
+        relay.subscriber.modify_ack_deadline.assert_called_once_with(
+            request={
+                "subscription": self.SUBSCRIPTION,
+                "ack_ids": ["ack-late"],
+                "ack_deadline_seconds": 0,
+            }
+        )
+        self.assertEqual({}, relay._receipts)
+
+    def test_a_pull_before_the_hand_back_still_holds_its_receipt(self):
+        relay = self._chat_relay({})
+        message = types.SimpleNamespace(
+            ack_id="ack-1",
+            message=types.SimpleNamespace(data=b"{}", attributes={}, message_id="m-1"),
+        )
+        relay.subscriber.pull.return_value = types.SimpleNamespace(received_messages=[message])
+
+        with self._api_core_stub():
+            event = relay.pull()
+
+        self.assertEqual("m-1", event["messageId"])
+        self.assertEqual(["ack-1"], list(relay._receipts.values()))
+        relay.subscriber.modify_ack_deadline.assert_not_called()
 
     def test_a_failed_hand_back_is_logged_and_counts_nothing(self):
         relay = self._chat_relay({"r1": "ack-1"})

@@ -359,12 +359,14 @@ const (
 	// ready replica: an eviction, a drain or a Recreate rollout of its one
 	// pod. The workload's name alone says what to describe, not what the
 	// install is doing meanwhile, and that is what the reader watching a
-	// silent chat needs. Google Chat only: the A2A gateway pulls Chat through
-	// the broker's relay and the messages wait in Pub/Sub, whereas Slack on a
-	// next install is the gateway's own socket. Brokered commands are the
-	// shell's kubectl, git, gh and gcloud, every one of which dials the
-	// broker's Service.
-	credentialBrokerDownMessageSuffix = "; while the credential broker is away, Google Chat messages wait in Pub/Sub and brokered commands fail"
+	// silent chat needs. Brokered commands are the shell's kubectl, git, gh
+	// and gcloud, every one of which dials the broker's Service. The Chat
+	// clause is added only where googleChatEnabled: the A2A gateway pulls
+	// Chat through the broker's relay and the messages wait in Pub/Sub,
+	// whereas Slack on a next install is the gateway's own socket, and an
+	// install with no Chat has no such queue to name.
+	credentialBrokerDownMessageSuffix     = "; while the credential broker is away, brokered commands fail"
+	credentialBrokerDownChatMessageSuffix = " and Google Chat messages wait in Pub/Sub"
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
@@ -4364,6 +4366,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			condMsg = fmt.Sprintf("Waiting for %s to become ready", strings.Join(notReady, " and "))
 			if brokerNotReady {
 				condMsg += credentialBrokerDownMessageSuffix
+				if googleChatEnabled(agent) {
+					condMsg += credentialBrokerDownChatMessageSuffix
+				}
 			}
 		}
 	}

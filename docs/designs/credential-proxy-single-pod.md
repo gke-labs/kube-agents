@@ -60,8 +60,8 @@ back to Pub/Sub, and exits; without that the message waits out its 60 s ack dead
 replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
 AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
 protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
-`PlatformAgent` reads `Provisioning` and its `Ready` message names the Deployment and what waits on
-it.
+`PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
+names the Deployment and what waits on it.
 
 ## 3. Measured: two replicas behind today's Service
 

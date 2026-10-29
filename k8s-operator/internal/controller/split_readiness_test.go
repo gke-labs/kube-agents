@@ -215,7 +215,24 @@ func TestAGatewayWithoutItsBrokerIsNotReady(t *testing.T) {
 		t.Errorf("got phase %q, want Provisioning: nothing in the agent can mint a credential", phase)
 	}
 	want := "Waiting for Deployment test-agent-credential-proxy to become ready; " +
-		"while the credential broker is away, Google Chat messages wait in Pub/Sub and brokered commands fail"
+		"while the credential broker is away, brokered commands fail"
+	if msg != want {
+		t.Errorf("got message %q, want %q", msg, want)
+	}
+}
+
+// With Google Chat on, the clause also names the queue the Chat messages wait
+// in: the A2A gateway pulls Chat through the broker's relay. Without it (the
+// test above) there is no such queue, and the message must not name one.
+func TestABrokerlessInstallWithGoogleChatNamesThePubSubWait(t *testing.T) {
+	agent := splitReadinessAgent()
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	_, msg := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 0))
+
+	want := "Waiting for Deployment test-agent-credential-proxy to become ready; " +
+		"while the credential broker is away, brokered commands fail and Google Chat messages wait in Pub/Sub"
 	if msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
@@ -232,7 +249,7 @@ func TestTheMessageNamesEveryWorkloadItIsWaitingOn(t *testing.T) {
 		t.Errorf("got phase %q, want Provisioning", phase)
 	}
 	want := "Waiting for StatefulSet test-agent-shell and Deployment test-agent-credential-proxy to become ready; " +
-		"while the credential broker is away, Google Chat messages wait in Pub/Sub and brokered commands fail"
+		"while the credential broker is away, brokered commands fail"
 	if msg != want {
 		t.Errorf("got message %q, want %q", msg, want)
 	}
