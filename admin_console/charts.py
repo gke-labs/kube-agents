@@ -44,6 +44,7 @@ EXCLUDED_SYMBOL = "circle-open"
 EXCLUDED_LABEL = "excluded from fit"
 FLEET_LABEL = "this fleet"
 CONTAINER_LIMIT_KEY = "container limit"
+THRESHOLD_KEY = "threshold"
 BOTTLENECK_CHART_HEIGHT = 440
 # The share axis stops at 4 times the limit: past that, every line has long since failed.
 BOTTLENECK_SHARE_CEILING = 4.0
@@ -53,6 +54,13 @@ MEASURED_RANGE_LABEL = "measured"
 MEASURED_RANGE_OPACITY = 0.12
 PROFILE_LINE_WIDTH = 1
 MEASURED_KEY = "measured run"
+BREAKDOWN_CHART_HEIGHT = 360
+# A breakdown chart's value axis stops at twice the largest limit, so a line is seen crossing its limit.
+BREAKDOWN_LIMIT_HEADROOM = 2.0
+# Above the largest measured run by a quarter, so the dots sit inside the plot.
+BREAKDOWN_MEASURED_HEADROOM = 1.25
+# Narrow charts label each tenfold step only.
+BREAKDOWN_TICKS = (1, 10, 100, 1000, 10000)
 BOTTLENECK_TICKS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000)
 
 
@@ -452,6 +460,69 @@ def bottleneck_chart(
     log_axis: bool = True,
 ) -> go.Figure:
     """Each key check against its limit as the fleet grows, with the runs and the example fleets marked."""
+    figure = _growth_chart(series, profiles, measured, fleet_clusters, colors, nodes_per_cluster, log_axis,
+                           value_format=".0%", value_suffix=" of its limit")
+    figure.add_hline(
+        y=LIMIT_SHARE,
+        line={"color": PALETTE.danger, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+        annotation_text=LIMIT_SHARE_LABEL,
+        annotation_position="bottom right",
+        annotation_font_color=TEXT,
+    )
+    figure.update_yaxes(title="Share of the limit", tickformat=".0%", range=[0, BOTTLENECK_SHARE_CEILING])
+    return _base_layout(figure, height=BOTTLENECK_CHART_HEIGHT)
+
+
+def breakdown_chart(
+    series: list[BottleneckSeries],
+    title: str,
+    unit: str,
+    profiles: tuple[FleetProfile, ...],
+    measured: float,
+    fleet_clusters: float,
+    colors: Mapping[str | None, str],
+    nodes_per_cluster: float,
+    log_axis: bool = True,
+) -> go.Figure:
+    """One metric in its own unit as the fleet grows, one line per owner with its limit dotted in its colour."""
+    palette = [colors.get(item.label, PALETTE.accent) for item in series]
+    suffix = f" {unit}" if unit else ""
+    figure = _growth_chart(series, profiles, measured, fleet_clusters, palette, nodes_per_cluster, log_axis,
+                           value_format=",.2f", value_suffix=suffix, ticks=BREAKDOWN_TICKS)
+    for item, color in zip(series, palette):
+        if item.limit is not None:
+            figure.add_hline(y=item.limit, line={"color": color, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH})
+    limits = [item.limit for item in series if item.limit is not None]
+    if limits:
+        owned = any(item.label in colors for item in series)
+        _style_key(figure, CONTAINER_LIMIT_KEY if owned else THRESHOLD_KEY, dash=THRESHOLD_DASH)
+        # Tall enough to show every line cross its limit, every measured run, and a line that starts above its limit.
+        seen = [point.share for item in series for point in item.measured]
+        starts = [item.shares[0] for item in series if not math.isnan(item.shares[0])]
+        top = max(
+            max(limits) * BREAKDOWN_LIMIT_HEADROOM,
+            max(seen, default=0.0) * BREAKDOWN_MEASURED_HEADROOM,
+            max(starts, default=0.0) * BREAKDOWN_LIMIT_HEADROOM,
+        )
+        figure.update_yaxes(range=[0, top])
+    figure.update_yaxes(title=f"{title} ({unit})" if unit else title, rangemode="tozero")
+    return _base_layout(figure, height=BREAKDOWN_CHART_HEIGHT)
+
+
+def _growth_chart(
+    series: list[BottleneckSeries],
+    profiles: tuple[FleetProfile, ...],
+    measured: float,
+    fleet_clusters: float,
+    colors: list[str],
+    nodes_per_cluster: float,
+    log_axis: bool,
+    *,
+    value_format: str,
+    value_suffix: str,
+    ticks: tuple[float, ...] = (),
+) -> go.Figure:
+    """The lines, the measured runs, the measured range and the example fleets, shared by the growth charts."""
     figure = go.Figure()
     for index, item in enumerate(series):
         color = colors[index % len(colors)]
@@ -465,7 +536,7 @@ def bottleneck_chart(
                 legendgroup=item.label,
                 line={"color": color, "width": HARNESS_LINE_WIDTH},
                 customdata=[_fleet_hover(fleet) for fleet in item.fleets],
-                hovertemplate=f"<b>{label}</b>: %{{y:.0%}} of its limit<br>%{{customdata}}<extra></extra>",
+                hovertemplate=f"<b>{label}</b>: %{{y:{value_format}}}{value_suffix}<br>%{{customdata}}<extra></extra>",
             )
         )
         for excluded in (False, True):
@@ -483,7 +554,7 @@ def bottleneck_chart(
                     marker={"color": color, "size": HARNESS_MARKER_SIZE, "symbol": EXCLUDED_SYMBOL if excluded else MEASURED_SYMBOL},
                     customdata=[point.key for point in points],
                     hovertemplate=(
-                        f"<b>{label}</b>, measured: %{{y:.0%}} of the limit<br>%{{x:,.0f}} clusters · %{{customdata}}"
+                        f"<b>{label}</b>, measured: %{{y:{value_format}}}{value_suffix}<br>%{{x:,.0f}} clusters · %{{customdata}}"
                         + (f" ({EXCLUDED_LABEL})" if excluded else "")
                         + "<extra></extra>"
                     ),
@@ -496,13 +567,6 @@ def bottleneck_chart(
     figure.add_annotation(
         x=position(max(measured, first)), y=1, xref="x", yref="paper", text=MEASURED_RANGE_LABEL,
         showarrow=False, xanchor="right", yanchor="top", font={"color": TEXT},
-    )
-    figure.add_hline(
-        y=LIMIT_SHARE,
-        line={"color": PALETTE.danger, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
-        annotation_text=LIMIT_SHARE_LABEL,
-        annotation_position="bottom right",
-        annotation_font_color=TEXT,
     )
     for profile in profiles:
         figure.add_vline(
@@ -519,7 +583,7 @@ def bottleneck_chart(
     )
     _style_key(figure, FLEET_LABEL, dash=FLEET_DASH)
     _style_key(figure, MEASURED_KEY, symbol=MEASURED_SYMBOL)
-    ticks = [value for value in BOTTLENECK_TICKS if first <= value <= series[0].clusters[-1]] if series else []
+    ticks = [value for value in (ticks or BOTTLENECK_TICKS) if first <= value <= series[0].clusters[-1]] if series else []
     figure.update_xaxes(
         title="Clusters, and the nodes they hold",
         type="log" if log_axis else "linear",
@@ -529,12 +593,5 @@ def bottleneck_chart(
         gridcolor=GRID,
         zeroline=False,
     )
-    figure.update_yaxes(
-        title="Share of the limit",
-        tickformat=".0%",
-        range=[0, BOTTLENECK_SHARE_CEILING],
-        showgrid=True,
-        gridcolor=GRID,
-        zeroline=False,
-    )
-    return _base_layout(figure, height=BOTTLENECK_CHART_HEIGHT)
+    figure.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False)
+    return figure

@@ -12,7 +12,7 @@ if str(PACKAGE_PARENT) not in sys.path:
 import streamlit as st
 
 from admin_console import harness_limits as hl
-from admin_console.charts import bottleneck_chart, harness_limit_chart
+from admin_console.charts import bottleneck_chart, breakdown_chart, harness_limit_chart
 from admin_console.connection_session import recover_app_shell
 from admin_console.ui import PALETTE, section_title
 
@@ -56,6 +56,11 @@ CURVE_NOTE = (
     "Turn the logarithmic axis off to see the lines straight. A real queue, such as the broker's "
     "8 command slots, grows faster than a straight line once it fills, so past the measured range "
     "the lines are a lower bound."
+)
+BREAKDOWN_CAPTION = (
+    "The same predictions in each resource's own unit, one line per container; a dotted line in a "
+    "container's colour is its limit. The proxy wait's line is the 60-second refusal bound, and the "
+    "response time's the 60-second investigate gate for a fan-out question."
 )
 CHART_CAPTION = (
     "Filled points are runs; open points are left out of the fit (a failed or declined prompt, work "
@@ -230,6 +235,30 @@ st.plotly_chart(
     key=f"{KEY_PREFIX}:bottlenecks:{scope}:{log_axis}",
 )
 st.caption(CURVE_NOTE)
+st.markdown("**Each resource on its own**")
+for first in range(0, len(hl.BREAKDOWN_OWNERS), CHART_COLUMNS):
+    row = st.columns(CHART_COLUMNS)
+    for column, metric in zip(row, list(hl.BREAKDOWN_OWNERS)[first : first + CHART_COLUMNS]):
+        spec = hl.metric_spec(metric)
+        with column:
+            st.markdown(f"**{spec.label}**")
+            st.plotly_chart(
+                breakdown_chart(
+                    hl.breakdown_series(records, fleet, limits, metric),
+                    spec.label,
+                    spec.unit,
+                    hl.FLEET_PROFILES,
+                    hl.measured_clusters(records),
+                    fleet[hl.CLUSTERS],
+                    colors,
+                    fleet[hl.NODES],
+                    log_axis,
+                ),
+                width="stretch",
+                config=CHART_CONFIG,
+                key=f"{KEY_PREFIX}:breakdown:{scope}:{metric}:{log_axis}",
+            )
+st.caption(BREAKDOWN_CAPTION)
 
 with st.expander("Measured runs"):
     operation_column, factor_column = st.columns(2)

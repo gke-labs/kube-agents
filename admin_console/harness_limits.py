@@ -421,6 +421,15 @@ BOTTLENECK_CHECKS = (
     (CPU_PEAK, AGENT_CONTAINER),
     (MEMORY_PEAK, AGENT_CONTAINER),
 )
+# The breakdown charts: one metric each, in its own unit, one line per owner.
+BREAKDOWN_OWNERS = MappingProxyType(
+    {
+        MEMORY_PEAK: SIZED_CONTAINERS,
+        CPU_PEAK: SIZED_CONTAINERS,
+        PROXY_WAIT_MAX: (None,),
+        RESPONSE: (None,),
+    }
+)
 # Cluster counts the bottleneck chart is drawn at: about 12 per tenfold, from 1 to 10,000.
 BOTTLENECK_POINTS_PER_DECADE = 12
 BOTTLENECK_DECADES = 4
@@ -1587,6 +1596,56 @@ class BottleneckSeries:
     # The whole fleet at each point, for the tooltip.
     fleets: tuple[dict[str, float], ...] = ()
     measured: tuple[MeasuredShare, ...] = ()
+    # The owner's threshold in the series' unit, for a breakdown chart; None on the combined chart.
+    limit: float | None = None
+
+
+def _growth_counts() -> tuple[float, ...]:
+    return tuple(
+        10 ** (step / BOTTLENECK_POINTS_PER_DECADE)
+        for step in range(BOTTLENECK_POINTS_PER_DECADE * BOTTLENECK_DECADES + 1)
+    )
+
+
+def _growth(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    metric: str,
+    container: str | None,
+    divisor: float,
+    label: str,
+    limit: float | None = None,
+) -> BottleneckSeries | None:
+    """One prediction and its measured runs as the fleet grows in clusters, each value divided by ``divisor``."""
+    counts = _growth_counts()
+    fleets = tuple(scaled_fleet(fleet, clusters) for clusters in counts)
+    only = gated_operations(metric)
+    values = []
+    for point in fleets:
+        prediction = predict(records, metric, container, point, only=only)
+        values.append(prediction.value / divisor if prediction else math.nan)
+    if all(math.isnan(value) for value in values):
+        return None
+    measured = tuple(
+        MeasuredShare(
+            record.totals[CLUSTERS],
+            value / divisor,
+            record.key,
+            record.excluded(metric) or capped(record, metric, container),
+        )
+        for record in records
+        if record.totals.get(CLUSTERS)
+        and (only is None or record.operation in only)
+        and (value := record.value(metric, container)) is not None
+    )
+    return BottleneckSeries(label, counts, tuple(values), fleets, measured, limit)
+
+
+def _threshold(metric: str, container: str | None, limits: Mapping[str, Mapping[str, float]]) -> float | None:
+    if metric in CONTAINER_LIMIT_KEYS:
+        return limits.get(container, {}).get(CONTAINER_LIMIT_KEYS[metric]) or None
+    lines = FIXED_LINES.get(metric)
+    return lines[-1].value if lines else None
 
 
 def bottleneck_series(
@@ -1595,39 +1654,34 @@ def bottleneck_series(
     limits: Mapping[str, Mapping[str, float]],
 ) -> list[BottleneckSeries]:
     """Each key check's prediction against its threshold as the fleet grows in clusters, its shape kept."""
-    counts = tuple(
-        10 ** (step / BOTTLENECK_POINTS_PER_DECADE)
-        for step in range(BOTTLENECK_POINTS_PER_DECADE * BOTTLENECK_DECADES + 1)
-    )
     series = []
     for metric, container in BOTTLENECK_CHECKS:
-        if metric in CONTAINER_LIMIT_KEYS:
-            threshold = limits.get(container, {}).get(CONTAINER_LIMIT_KEYS[metric])
-        else:
-            threshold = FIXED_LINES[metric][0].value
+        threshold = _threshold(metric, container, limits)
         if not threshold:
             continue
-        shares = []
-        fleets = tuple(scaled_fleet(fleet, clusters) for clusters in counts)
-        for point in fleets:
-            prediction = predict(records, metric, container, point)
-            shares.append(prediction.value / threshold if prediction else math.nan)
-        if all(math.isnan(share) for share in shares):
-            continue
-        measured = tuple(
-            MeasuredShare(
-                record.totals[CLUSTERS],
-                value / threshold,
-                record.key,
-                record.excluded(metric) or capped(record, metric, container),
-            )
-            for record in records
-            if record.totals.get(CLUSTERS) and (value := record.value(metric, container)) is not None
-        )
         name = metric_spec(metric).label
-        series.append(
-            BottleneckSeries(f"{name} · {container}" if container else name, counts, tuple(shares), fleets, measured)
+        item = _growth(records, fleet, metric, container, threshold, f"{name} · {container}" if container else name)
+        if item is not None:
+            series.append(item)
+    return series
+
+
+def breakdown_series(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    limits: Mapping[str, Mapping[str, float]],
+    metric: str,
+) -> list[BottleneckSeries]:
+    """One metric in its own unit as the fleet grows, one line per owner, each with its threshold."""
+    spec = metric_spec(metric)
+    series = []
+    for owner in BREAKDOWN_OWNERS.get(metric, (None,)):
+        item = _growth(
+            records, fleet, metric, owner, spec.scale, owner or spec.label,
+            limit=(threshold / spec.scale) if (threshold := _threshold(metric, owner, limits)) else None,
         )
+        if item is not None:
+            series.append(item)
     return series
 
 

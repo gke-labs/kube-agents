@@ -215,7 +215,8 @@ per container with its `PlatformAgent` field, the node pool, and the data volume
 install cannot hold the fleet, it gives how many installs it needs: one install holds clusters
 up to the first limit that no setting raises, such as the sandbox shell's fixed CPU. A chart
 shows each key limit as a share of its default as the fleet grows, with the example fleets
-marked.
+marked. Four smaller charts show memory, CPU, the credential proxy's longest wait and the
+response time in their own units, one line per container with its limit.
 
 The collapsed **Measured runs** section plots each metric against one factor, one operation
 at a time. A factor sits at its measured value from the run's totals, per cluster for nodes
