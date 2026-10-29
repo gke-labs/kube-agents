@@ -1285,8 +1285,9 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// reference (nothing from a template does), so without this a
 		// deleted next-mode agent leaks a 40Gi JetStream volume per server.
 		// Every ordinal the bus can have, not just the current replica count:
-		// a StatefulSet scaled down keeps its higher ordinals' claims, so a
-		// bus lowered from three servers to one still owns three. Guarded by
+		// claims can outlive their servers (a StatefulSet deleted with the
+		// CR's finalizer still pending, or one that predates the retention
+		// policy that deletes them on scale-down), so every ordinal is checked. Guarded by
 		// the instance label the claim template stamps, because a name is not
 		// ownership: a PVC squatting one of these names that this render did
 		// not create is left alone rather than destroyed.
@@ -3254,7 +3255,12 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
-		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		// The bus fence renders from the server count; resolve it first, as
+		// the stack does, rather than read a status a fresh CR has not had
+		// written yet and render a three-server fence for a one-server bus.
+		if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+			errs = append(errs, err)
+		} else if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			var pnErr *profileNamespaceError
 			if goerrors.As(err, &pnErr) {
 				r.profileNamespaceFailure(ctx, agent, "fence", pnErr.err)

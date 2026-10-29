@@ -4034,10 +4034,14 @@ const (
 // server has no peer to wait for.
 func a2aNATSMinReadySeconds(replicas int) int32 {
 	if replicas > 1 {
-		return 20
+		return a2aNATSClusterMinReadySeconds
 	}
 	return 0
 }
+
+// a2aNATSClusterMinReadySeconds is the pause between a multi-server bus's
+// rolled servers (a2aNATSMinReadySeconds).
+const a2aNATSClusterMinReadySeconds = 20
 
 // a2aNATSReadinessPath is the server's health endpoint as the readiness probe
 // reads it. A single server keeps the full /healthz, which includes JetStream.
