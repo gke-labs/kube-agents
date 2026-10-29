@@ -98,7 +98,19 @@ type Row struct {
 	Text     string `json:"text"`
 	Severity string `json:"severity,omitempty"`
 	Detail   string `json:"detail,omitempty"`
+	// Tasks are the board cards the row stands for, and Actions the buttons
+	// a renderer draws under it (RowActionRetry, RowActionDrop), labelled by
+	// the renderer, never by the sender. A click is no turn: it acts on
+	// Tasks. Both or neither.
+	Tasks   []string `json:"tasks,omitempty"`
+	Actions []string `json:"actions,omitempty"`
 }
+
+// Row action values: the board-health card's buttons on a stuck row.
+const (
+	RowActionRetry = "retry"
+	RowActionDrop  = "drop"
+)
 
 // Fold is the message's one collapsed section.
 type Fold struct {
@@ -181,7 +193,7 @@ var leaf *shape
 // like any other, not the headline.
 var messageShape = &shape{keys: map[string]*shape{
 	schemaKey: leaf, "headline": leaf, "note": leaf, "detail": leaf, "tone": leaf, "after": leaf,
-	"rows": {list: true, keys: map[string]*shape{"text": leaf, "severity": leaf, "detail": leaf}},
+	"rows": {list: true, keys: map[string]*shape{"text": leaf, "severity": leaf, "detail": leaf, "tasks": leaf, "actions": leaf}},
 	"fold": {keys: map[string]*shape{
 		"title": leaf, "text": leaf,
 		"table": {keys: map[string]*shape{"columns": leaf, "rows": leaf}},

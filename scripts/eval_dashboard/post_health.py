@@ -1237,12 +1237,60 @@ def _periodic_footer(words: dict, history_url: str) -> str:
     return f"{runbook}Build: {history_url}"
 
 
+def shared_cause_groups(notes: dict[str, dict]) -> list[list[str]]:
+    """The failed jobs, two or more, whose builds ended with the same last log
+    line: one cause, one message. A job with no last line, or alone with
+    its own, is not grouped."""
+    by_line: dict[str, list[str]] = {}
+    for job, note in sorted(notes.items()):
+        if note.get("verdict") == periodics.VERDICT_FAILED and note.get(periodics.KEY_LAST_LINE):
+            by_line.setdefault(note[periodics.KEY_LAST_LINE], []).append(job)
+    return [jobs for jobs in by_line.values() if len(jobs) > 1]
+
+
+def render_shared_cause(jobs: list[str], notes: dict[str, dict]) -> str:
+    """One block for jobs whose builds died on the same log line: where and
+    the line, then each job as its own block would say it (what it does, its
+    run, its detail lines, its own node and Warning pod event), the effects,
+    a footer per job."""
+    words = {job: _job_words(job, notes[job]) for job in jobs}
+    places = " and ".join(dict.fromkeys(words[job]["place"] for job in jobs))
+    lines = [
+        f"🟠 *{places}: {len(jobs)} jobs failed on the same log line.*",
+        f"Each build's log ends on the same line, `{notes[jobs[0]][periodics.KEY_LAST_LINE]}`; one place to look first.",
+    ]
+    for job in jobs:
+        note = notes[job]
+        does = f"`{job}` {words[job]['does']}." if words[job].get("does") else f"`{job}`."
+        dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
+        how = f": {note['summary']}" if note.get("summary") else ""
+        lines.append(f"{does} Its {clock(parse_iso(note.get('finished_at')))} run (build {note['build']}){dry} failed{how}.")
+        lines.extend(f"- {line}" for line in note.get("detail") or [])
+        # The shared line is in the header; the node and the event are this job's.
+        own = periodics.cause_text({key: value for key, value in note.items() if key != periodics.KEY_LAST_LINE})
+        if own:
+            lines.append(f"- how it died: {own}")
+    effects = " ".join(dict.fromkeys(words[job]["effect"] for job in jobs if words[job].get("effect")))
+    lines.append(" ".join(part for part in ("Effect:", effects, periodics.SCOPE_LINE) if part))
+    lines.extend(f"`{job}`: {_periodic_footer(words[job], notes[job]['history_url'])}" for job in jobs)
+    return "\n".join(lines)
+
+
 def render_periodic(health: dict, prev: dict | None) -> str:
     """One block per job with news, four lines each: where and what stopped
-    happening; which job, what it does, which run and how it failed; what that
-    costs and the scope; the runbook and the build."""
+    happening; which job, what it does, which run and how it failed (and how
+    the build died: the log line that says so, the node and a Warning pod
+    event, when read); what that costs and the scope; the runbook and the
+    build. Failed jobs whose builds died on the same log line share one block."""
+    news = periodic_news(health, prev)
     blocks = []
-    for job, note in sorted(periodic_news(health, prev).items()):
+    grouped: set[str] = set()
+    for jobs in shared_cause_groups(news):
+        blocks.append(render_shared_cause(jobs, news))
+        grouped.update(jobs)
+    for job, note in sorted(news.items()):
+        if job in grouped:
+            continue
         when = clock(parse_iso(note.get("finished_at")))
         words = _job_words(job, note)
         does = f"`{job}` {words['does']}." if words.get("does") else f"`{job}`."
@@ -1268,6 +1316,9 @@ def render_periodic(health: dict, prev: dict | None) -> str:
         how = f": {note['summary']}" if note.get("summary") else ""
         lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
         lines.extend(f"- {line}" for line in note.get("detail") or [])
+        cause = periodics.cause_text(note)
+        if cause:
+            lines.append(f"- how it died: {cause}")
         lines.append(effect)
         lines.append(footer)
         blocks.append("\n".join(lines))
@@ -1367,7 +1418,8 @@ def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str
         elif note.get("verdict") == periodics.VERDICT_TOKEN:
             lines.append(f"🟡 {words['place']}: {words['absence']} (build {note['build']} passed {dated_clock(parse_iso(note.get('finished_at')), now)}; {'; '.join(note.get('detail') or [])}); {note['history_url']}")
         else:
-            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
+            cause = periodics.cause_text(note)
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}{f'; {cause}' if cause else ''}); {note['history_url']}")
     return lines
 
 

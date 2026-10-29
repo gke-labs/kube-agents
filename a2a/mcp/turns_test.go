@@ -53,10 +53,34 @@ func authorityFor(t *testing.T, conversation, viaTask string) json.RawMessage {
 	return mustJSON(t, a)
 }
 
+// pub publishes for the fake gateway and the tests' background publishers,
+// which run on goroutines the test does not wait for. Once the test has
+// ended, its context is done and the bus is being torn down, so a publish
+// that fails then is the teardown, not a finding; and a Fatal from any
+// goroutine after the test ended panics the whole test binary, so no later
+// test in the package runs. While the test runs, a failed publish is
+// reported with Error, on every path: FailNow is only for the test's own
+// goroutine, and these helpers also run on the subscription's.
 func pub(t *testing.T, js jetstream.JetStream, subject string, env *lib.Envelope) {
 	t.Helper()
-	if _, err := js.Publish(context.Background(), subject, mustJSON(t, env)); err != nil {
-		t.Fatal(err)
+	ctx := t.Context()
+	if _, err := js.Publish(ctx, subject, mustJSON(t, env)); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		t.Error(err)
+	}
+}
+
+// pause waits d on a goroutine the test does not wait for, and reports false
+// as soon as the test ends instead, so the caller can stop rather than touch
+// a bus that is being torn down.
+func pause(t *testing.T, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-t.Context().Done():
+		return false
 	}
 }
 
@@ -204,7 +228,9 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishResult(t, js, fakeAddressee, root, ackText)
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 		default:
-			time.Sleep(sc.lateStart)
+			if !pause(t, sc.lateStart) {
+				return
+			}
 			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
 		}
 	})
@@ -808,7 +834,9 @@ func TestASecondMessageWaitsForTheRunningTurn(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(time.Second)
+		if !pause(t, time.Second) {
+			return
+		}
 		publishResult(t, js, fakeAddressee, "task-root1", answerText)
 		publishStatus(t, js, fakeAddressee, "task-root1", lib.StateCompleted, true)
 	}()

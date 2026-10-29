@@ -27,6 +27,7 @@ its latency block, `nightly_latency.py`). `nightly_bugs.py` files an
 issue for a case the nightly fails on every run three nights in a row, and
 (`nightly_infra.py`) one for the infra owner when the nightly or a case is
 kept from running. `weekly_email.py` renders the weekly health email
-from the same nightly runs, refusing when an integrity check fails.
+from the same nightly runs, refusing when an integrity check fails, and
+`weekly_chat.py` posts its summary to the Chat space once a week.
 docs/ci-health.md is the page for all of them.
 """

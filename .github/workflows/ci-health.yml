@@ -19,7 +19,8 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # bugs -> post -> comment, so the Brief a reader opens from a message
 # already shows the verdict the message names.
 # The weekly health email renders after the bug filer and is
-# published beside data.json; nothing sends it yet.
+# published beside data.json; its summary is posted to the same space once a
+# week, Monday from 9 AM Toronto (scripts/eval_dashboard/weekly_chat.py).
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -713,8 +714,9 @@ jobs:
           [ -f work/store.json ] && store_args=(--store work/store.json)
           python3 scripts/eval_dashboard/coverage_gaps.py --data work/data.json "${store_args[@]}" "$mode"
 
-      # The token goes to the poster step alone, as a masked step output
-      # rather than through GITHUB_ENV, so no later step sees it.
+      # The token goes to the two poster steps alone (the next one and the
+      # weekly summary's), as a masked step output rather than through
+      # GITHUB_ENV, so no other step sees it.
       - name: Mint a Chat token
         id: chat_token
         if: env.CI_HEALTH_MUTE != 'true'
@@ -774,9 +776,11 @@ jobs:
       # rendered only when every integrity check passes; a refusal prints its
       # reasons and leaves the last published copy in place. Same gate as the
       # render: a failed collect has nothing new to publish. Best-effort, like
-      # the filer. Nothing sends it yet: TODO(#3440) the mail route and its
+      # the filer. It also writes the week's Chat summary, which the next
+      # step posts. Nothing mails it: TODO(#3440) the mail route and its
       # permissions.
       - name: Render the weekly health email
+        id: weekly_email
         if: steps.collect.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 3
@@ -785,8 +789,26 @@ jobs:
         run: |
           store_args=()
           [ -f work/store.json ] && store_args+=(--store work/store.json)
-          python3 scripts/eval_dashboard/weekly_email.py --data work/data.json "${store_args[@]}" --out work/health-email.html
+          python3 scripts/eval_dashboard/weekly_email.py --data work/data.json "${store_args[@]}" --out work/health-email.html --chat-out work/weekly-chat.json
           gcloud storage cp --cache-control=no-cache work/health-email.html "$DASHBOARD_BUCKET/health-email.html"
+
+      # The weekly summary (docs/ci-health.md, "The weekly health email"):
+      # posted once a week, on the first tick from Monday 9 AM Toronto, for
+      # the week the page just published covers; weekly-chat-state.json
+      # records the week posted, so later ticks and re-runs stay silent. Only
+      # after a render that passed and was uploaded, so the post never links
+      # a stale page. Muted like the post above; best-effort, retried next
+      # tick.
+      - name: Post the weekly health summary (Mondays)
+        if: steps.weekly_email.outcome == 'success' && env.CI_HEALTH_MUTE != 'true'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
+        run: |
+          python3 scripts/eval_dashboard/weekly_chat.py \
+            --message work/weekly-chat.json \
+            --state "$DASHBOARD_BUCKET/weekly-chat-state.json"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'

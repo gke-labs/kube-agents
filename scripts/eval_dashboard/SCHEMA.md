@@ -1227,7 +1227,9 @@ while its GitLab sweep report names a token that is due, dead or unreadable
 "the run passed; N token(s) to rotate", and its `absence`, `effect` and
 `runbook` are the credential's words rather than the sweep's): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
-place, absence, does, effect, runbook}`. `detail` (on `FAILED`, and the token lines on `TOKEN`)
+place, absence, does, effect, runbook}`, plus on `FAILED`, each only when it
+was read, `node` (the build pod's node), `last_event` (a Warning event's
+reason) and `last_line` (the log line that says how the build died). `detail` (on `FAILED`, and the token lines on `TOKEN`)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, each with its one next

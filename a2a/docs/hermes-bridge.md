@@ -224,6 +224,9 @@ subject under `chat.board.reply.gateway.`, the one namespace it may publish ther
 replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
 key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and reads nothing else
 ([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
+A request with a body is a board-health row's Retry or Drop instead (`lib.BoardAction`): the
+bridge relays its known fields to session-kv's `POST /v1/board/actions` on a goroutine of its own,
+so a snapshot is not held behind it, and answers with what session-kv said, or the error.
 
 Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
 subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,

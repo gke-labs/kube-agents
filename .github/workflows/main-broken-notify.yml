@@ -23,13 +23,15 @@ name: Notify on Broken Main
 # What may go on the list: a workflow whose green on a push to main is a
 # statement about the tree, not about the push. The script depends on that and
 # cannot check it -- see its docstring. Every workflow below rebuilds or
-# re-checks everything it covers on every run it starts, and `Operator Tests`
-# and `A2A Module Tests` only start on a push that touches their own paths.
+# re-checks everything it covers on every run it starts, and `Operator Tests`,
+# `A2A Module Tests` and `k8s-api-proxy Tests` only start on a push that
+# touches their own paths.
 #
 # `A2A Module Tests` joined the list on 2026-10-13, the day `Run A2A Module
 # Tests` became a required context. It copies `Operator Tests`' trigger
 # arrangement, a `paths:` filter on push and whole-suite runs, so the same
-# reading of its push history holds.
+# reading of its push history holds. `k8s-api-proxy Tests` joined on
+# 2026-10-28 for the same reason, with the same arrangement.
 #
 # `Documentation Checks` and `Python Unit Tests` joined the list after both sat
 # red on main for thirteen hours (2026-09-03 20:54Z to 2026-09-04 10:34Z,
@@ -77,6 +79,7 @@ on:
       - Actionlint
       - Docker Build
       - Documentation Checks
+      - k8s-api-proxy Tests
       - Operator Tests
       - Python Unit Tests
       - Validate Repo Structure
