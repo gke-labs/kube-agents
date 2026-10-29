@@ -845,7 +845,6 @@ type TuningSpec struct {
 	// 1 is for a throwaway, single-node or cost-bound install that accepts
 	// that outage; it saves two NATS pods and two 40Gi volumes.
 	//
-	//
 	// Unset, an install keeps the count its bus already runs, so an install
 	// from before the three-server default stays on one server, and a new bus
 	// gets three (status.busReplicas shows which applies).

@@ -19,14 +19,18 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -51,11 +55,11 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 		wantCluster   bool
 		wantReadiness string
 	}{
-		{"default", a2aTestAgent(), 3, 3, true, "/healthz?js-server-only=true"},
-		{"busReplicas 3", a2aTestAgentWithBusReplicas(3), 3, 3, true, "/healthz?js-server-only=true"},
+		{"default", a2aTestAgent(), 3, 3, true, "/healthz?js-enabled-only=true"},
+		{"busReplicas 3", a2aTestAgentWithBusReplicas(3), 3, 3, true, "/healthz?js-enabled-only=true"},
 		{"busReplicas 1", a2aTestAgentWithBusReplicas(1), 1, 1, false, "/healthz"},
 		// Past the CRD's enum: the default, never a two-server cluster.
-		{"busReplicas 2 past the schema", a2aTestAgentWithBusReplicas(2), 3, 3, true, "/healthz?js-server-only=true"},
+		{"busReplicas 2 past the schema", a2aTestAgentWithBusReplicas(2), 3, 3, true, "/healthz?js-enabled-only=true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := tc.agent
@@ -89,6 +93,21 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 			}
 			if got := len(pod.TopologySpreadConstraints) > 0; got != tc.wantCluster {
 				t.Errorf("topology spread present = %v, want %v", got, tc.wantCluster)
+			}
+			if tc.wantCluster {
+				// The hostname spread is the HA: DoNotSchedule with a
+				// minimum of three domains, so a third server waits for a
+				// third node rather than doubling up on one.
+				if !slices.ContainsFunc(pod.TopologySpreadConstraints, func(c corev1.TopologySpreadConstraint) bool {
+					return c.TopologyKey == corev1.LabelHostname && c.WhenUnsatisfiable == corev1.DoNotSchedule &&
+						c.MinDomains != nil && *c.MinDomains == 3 && c.MaxSkew == 1
+				}) {
+					t.Errorf("no hostname spread with DoNotSchedule and minDomains 3: %+v", pod.TopologySpreadConstraints)
+				}
+			}
+			if p := sts.Spec.PersistentVolumeClaimRetentionPolicy; p == nil ||
+				p.WhenScaled != appsv1.DeletePersistentVolumeClaimRetentionPolicyType || p.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+				t.Errorf("claim retention = %+v, want delete on scale-down and retain on StatefulSet deletion", p)
 			}
 			if got := sts.Spec.MinReadySeconds > 0; got != tc.wantCluster {
 				t.Errorf("minReadySeconds > 0 = %v, want %v", got, tc.wantCluster)
@@ -350,7 +369,7 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	if !a2aClusterBlockRe.MatchString(conf) {
 		t.Fatal("the default render has no cluster block")
 	}
-	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain + ":" + strconv.Itoa(a2aNATSRoutePort)
+	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc:" + strconv.Itoa(a2aNATSRoutePort)
 	if !strings.Contains(conf, routeHost) {
 		t.Fatalf("the cluster block does not route to %s", routeHost)
 	}
@@ -532,6 +551,11 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 		{"set to 3 on a single-server bus converts it", ptr.To(3), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 3, true},
 		{"set to 1 on a cluster converts it", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 1, true},
 		{"set to what runs is no conversion", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, false},
+		// Claims 0 and 1 without 2 read as a cluster, so setting 1 over
+		// them is a conversion and says so.
+		{"set to 1 over a deleted cluster's two claims converts it", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object {
+			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
+		}, 1, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -565,5 +589,159 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 				t.Error("the conversion Event repeated on the next pass")
 			}
 		})
+	}
+}
+
+// The provision Job is not created until the bus has rolled out: every replica
+// updated and Ready, on a status that has seen the applied generation. A Job
+// that ran mid-conversion would find the old streams, create nothing, and
+// leave the bus empty once the last server restarted into the new shape.
+func TestTheProvisionJobWaitsForTheBusToRollOut(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	reportCalloutStatus(t, ctx, cl, agent, 2, 2, 2)
+	jobKey := client.ObjectKey{Name: buildA2AProvisionJob(agent).Name, Namespace: agent.Namespace}
+
+	// Two of three servers Ready: held.
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 3, ReadyReplicas: 2, UpdatedReplicas: 3, CurrentRevision: "r", UpdateRevision: "r"}
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	state, err := r.reconcileA2A(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.jobHeld {
+		t.Error("the provision Job was not held with a server not Ready")
+	}
+	if err := cl.Get(ctx, jobKey, &batchv1.Job{}); !errors.IsNotFound(err) {
+		t.Errorf("the provision Job exists mid-rollout (err=%v)", err)
+	}
+
+	// Every server Ready but one still on the old revision: held.
+	if err := cl.Get(ctx, client.ObjectKey{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: 3, ReadyReplicas: 3, UpdatedReplicas: 3, CurrentRevision: "old", UpdateRevision: "r"}
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	if state, err = r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if !state.jobHeld {
+		t.Error("the provision Job was not held with a server still on the old revision")
+	}
+
+	// Rolled out: created.
+	reportBusRolledOut(t, ctx, cl, agent)
+	if state, err = r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if state.jobHeld {
+		t.Error("the provision Job is held on a bus that has rolled out")
+	}
+	if err := cl.Get(ctx, jobKey, &batchv1.Job{}); err != nil {
+		t.Errorf("the provision Job was not created once the bus rolled out: %v", err)
+	}
+}
+
+// A StatefulSet read that fails for any reason but NotFound fails the pass: it
+// is not read as "no bus", which would give a running single-server bus three
+// servers and empty it.
+func TestABusReadErrorIsNotReadAsNoBus(t *testing.T) {
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.StatefulSet); ok {
+				return apierrors.NewServiceUnavailable("informer not ready")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		}}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(4)}
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err == nil {
+		t.Fatalf("a failed StatefulSet read resolved to %d servers instead of failing the pass", agent.Status.BusReplicas)
+	}
+}
+
+// Lowering a cluster to one server takes the routes Service and the budget away
+// rather than leaving them: a budget over one server would block its drains.
+func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	routes := client.ObjectKey{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace}
+	pdb := client.ObjectKey{Name: a2aNATSName(agent), Namespace: agent.Namespace}
+	if err := cl.Get(ctx, routes, &corev1.Service{}); err != nil {
+		t.Fatalf("a new bus rendered no routes Service: %v", err)
+	}
+	if err := cl.Get(ctx, pdb, &policyv1.PodDisruptionBudget{}); err != nil {
+		t.Fatalf("a new bus rendered no budget: %v", err)
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, routes, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the routes Service survived lowering the bus to one server (err=%v)", err)
+	}
+	if err := cl.Get(ctx, pdb, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the budget survived lowering the bus to one server (err=%v)", err)
+	}
+}
+
+// The resolved count reaches the stored status even on a pass where nothing
+// else changed: the writer is told the persisted value differs.
+func TestTheResolvedBusCountIsWrittenToStatus(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	// One pass to bring the conditions current, so the next is a no-op but
+	// for the count.
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	persisted := agent.Status.BusReplicas
+	agent.Status.BusReplicas = 1
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{busReplicasPersisted: persisted}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.BusReplicas != 1 {
+		t.Errorf("stored status.busReplicas = %d, want the resolved 1", stored.Status.BusReplicas)
 	}
 }

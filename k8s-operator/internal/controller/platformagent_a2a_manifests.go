@@ -2343,7 +2343,10 @@ func renderA2ANATSCluster(agent *agentv1alpha1.PlatformAgent, pw func(key string
 	if a2aNATSReplicas(agent) <= 1 {
 		return ""
 	}
-	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain
+	// <service>.<namespace>.svc, not the fully qualified name: a cluster with
+	// a DNS domain other than cluster.local resolves this through the pod's
+	// search path, and the serving certificate names it either way.
+	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc"
 	return `
 cluster {
   name: ` + a2aNATSName(agent) + `
@@ -2513,13 +2516,24 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			// StatefulSet; routing through a second Service avoids that.
 			ServiceName: name,
 			Replicas:    ptr.To(int32(replicas)),
-			// A rolled server is Ready once it serves (the readiness probe
-			// below), before its stream replicas have caught up. Holding the
-			// next roll for this long gives them the time, so a rollout does
-			// not take a second replica of an R3 stream down while the first
-			// is still behind, which would stall writes on that stream.
+			// A rolled server is Ready once JetStream is enabled on it (the
+			// readiness probe below), before its stream replicas have caught
+			// up. Holding the next roll for this long is an allowance for
+			// that, not a guarantee: a stream that takes longer to catch up
+			// has its writes stall while a second of its replicas restarts,
+			// until it does. Raft quorum keeps it from losing data either way.
 			MinReadySeconds: a2aNATSMinReadySeconds(replicas),
 			Selector:        &metav1.LabelSelector{MatchLabels: selector},
+			// A scale-down deletes the claims of the servers it removes. Kept,
+			// they would hold the old cluster's metadata and streams, and a
+			// later return to three servers would bring that stale state back
+			// rather than start empty as a conversion does. Deleting the
+			// StatefulSet keeps them: a flip to today and back finds the bus
+			// where it left it, and handleDeletion reaps them with the CR.
+			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,
@@ -4016,14 +4030,18 @@ func a2aNATSMinReadySeconds(replicas int) int32 {
 
 // a2aNATSReadinessPath is the server's health endpoint as the readiness probe
 // reads it. A single server keeps the full /healthz, which includes JetStream.
-// A cluster member reports ready as a server (js-server-only): the full check
-// waits for a JetStream meta leader, which a fresh cluster cannot elect until
-// a second server is up, and the StatefulSet's OrderedReady policy does not
-// start the second until the first is Ready. With the full check, a new
-// install's bus would never form.
+// A cluster member reports ready once JetStream is enabled on it
+// (js-enabled-only), which is the one level of the check that does not wait
+// for a JetStream meta leader. A fresh cluster cannot elect one until a second
+// server is up, and the StatefulSet's OrderedReady policy does not start the
+// second until the first is Ready, so any check that waits for the leader
+// deadlocks the bus before it forms. js-server-only is not enough: in
+// nats-server 2.10 it skips the stream and consumer checks but still requires
+// the meta leader (monitor.go, healthz), measured live as a 503 on a lone
+// second server.
 func a2aNATSReadinessPath(replicas int) string {
 	if replicas > 1 {
-		return "/healthz?js-server-only=true"
+		return "/healthz?js-enabled-only=true"
 	}
 	return "/healthz"
 }
@@ -5446,6 +5464,12 @@ type a2aProvisionState struct {
 	// a2aMCPTokenUnownedReason for its token Secret (ensureA2AMCPToken), ""
 	// otherwise. The status writers carry it as a2aMCPIdentityConditionType.
 	mcpNotRendered string
+	// busReplicasPersisted is status.busReplicas as the CR carried it before
+	// this pass resolved it (resolveA2ABusReplicas sets the in-memory copy).
+	// The status writers skip a pass whose status is unchanged, and they
+	// compare against the in-memory copy, so this is what tells them the
+	// resolved count still has to be written.
+	busReplicasPersisted int32
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5579,6 +5603,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 
 	// First: everything below renders from the server count, and a count
 	// read before this would be last pass's, or the default.
+	state.busReplicasPersisted = agent.Status.BusReplicas
 	if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
 	}
@@ -5659,6 +5684,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.applyManaged(ctx, agent, sts); err != nil {
 		return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
 	}
+	// The apply's response: the generation the provision Job's bus gate
+	// requires the StatefulSet's status to have observed.
+	natsGeneration := sts.Generation
 
 	svc := buildA2ANATSService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
@@ -5807,12 +5835,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// above went through a2aReader, so a stale NotFound cannot
 		// re-create a Job that exists. A held Job is a pass with
 		// done=false, which is already the requeue.
-		if hold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent); err != nil {
+		calloutHold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent)
+		if err != nil {
 			return state, err
-		} else if hold {
+		}
+		busHold, err := r.a2aProvisionJobWaitsForBus(ctx, agent, natsGeneration)
+		if err != nil {
+			return state, err
+		}
+		if hold := calloutHold || busHold; hold {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready",
-				"job", job.Name, "callout", a2aCalloutName(agent))
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus has rolled out",
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
@@ -6380,6 +6414,44 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Con
 		return true, nil
 	}
 	return !a2aCalloutServesAnyReplica(callout), nil
+}
+
+// a2aProvisionJobWaitsForBus reports whether the provision Job's creation must
+// wait for the NATS StatefulSet to finish rolling out: every replica on the
+// current revision and Ready, on a status that has observed the generation
+// this pass applied (natsGeneration).
+//
+// Provisioning creates the streams and buckets on the bus as it is when the
+// Job runs, and converting the bus between one server and a cluster deletes
+// every stream when the last server restarts into the new shape
+// (spec-nats-deployment.md). A conversion changes STREAM_REPLICAS and so the
+// Job's digested name, which would start the new Job at once, against a bus
+// still half in the old shape: it would find the old streams, create nothing,
+// complete, and leave the bus with no streams once the roll finished, until
+// the Job's TTL. Waiting for the roll is what makes the Job run on the bus it
+// provisions. Creation only, like the callout gate: a Job that exists is the
+// Job controller's to retry.
+func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForBus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, natsGeneration int64) (bool, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return !a2aNATSRolledOut(sts, natsGeneration), nil
+}
+
+// a2aNATSRolledOut reads a StatefulSet's status as rolled out at generation.
+func a2aNATSRolledOut(sts *appsv1.StatefulSet, generation int64) bool {
+	want := int32(1)
+	if sts.Spec.Replicas != nil {
+		want = *sts.Spec.Replicas
+	}
+	st := sts.Status
+	return st.ObservedGeneration >= generation &&
+		st.Replicas == want && st.ReadyReplicas == want && st.UpdatedReplicas == want &&
+		(st.UpdateRevision == "" || st.CurrentRevision == st.UpdateRevision)
 }
 
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be

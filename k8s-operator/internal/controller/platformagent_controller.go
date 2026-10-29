@@ -4165,14 +4165,16 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
-		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
+		a2a.busReplicasPersisted == agent.Status.BusReplicas {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
-			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
+			live.Status.BusReplicas == agent.Status.BusReplicas
 	}) {
 		return nil
 	}
@@ -4542,6 +4544,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
+		a2a.busReplicasPersisted == agent.Status.BusReplicas &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&

@@ -7343,8 +7343,10 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
-	// or wedged at maxUnavailable 0.
+	// or wedged at maxUnavailable 0. The bus is up; this test is about the
+	// callout gate alone.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	reportBusRolledOut(t, ctx, cl, agent)
 	state, err := r.reconcileA2A(ctx, agent)
 	if err != nil {
 		t.Fatal(err)
