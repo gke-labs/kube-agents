@@ -1025,3 +1025,16 @@ def test_job_seconds_are_read_for_completed_runs_only(monkeypatch):
     monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: out)
     durations = operations.job_seconds("ctx", "ns", "/home", ("compliance-audit", "stall-watch"), "2026-10-28T20:00:00Z")
     assert durations == {"compliance-audit": pytest.approx(1203.72, abs=0.01)}
+
+
+def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
+    seen = {}
+
+    def fake_run(args, *, stdin=None, timeout=0, env=None):
+        seen["kubeconfig"] = (env or {}).get("KUBECONFIG")
+        return ""
+
+    monkeypatch.setattr(kube, "run", fake_run)
+    monkeypatch.setenv("KUBECONFIG", "/shared/kubeconfig")
+    kube.delete_cluster("p", "z", "scale-01")
+    assert seen["kubeconfig"] and seen["kubeconfig"] != "/shared/kubeconfig"
