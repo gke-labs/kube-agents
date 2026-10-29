@@ -1094,11 +1094,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 #     output, once, then drops it on the retry. Accepted claims are appended to
 #     `result` as an evidence section. A card's claim also passes when it
 #     matches one the gate accepted on a card it created.
-#   * kanban_rightsizing_checks: a second rule in that gate. A card whose body
-#     names the gke-rightsizing-checks skill must open its result with its
-#     dependency lines and show the five checks, and a card above such cards
-#     must carry their dependency lines word for word. Refused once, then
-#     accepted, with the gate's one refusal per card.
+#   * kanban_rightsizing_checks: a second rule in that gate. kanban_complete
+#     takes `rightsizing`, one entry per workload with its dependency kind and
+#     the five checks, required on a card whose body names the
+#     gke-rightsizing-checks skill and refused once when missing or invalid.
+#     A Platform card whose request asks to cut requests or limits, and that
+#     created no card, is refused once when it passed no entries.
+#     The gate renders a card's entries, and its settled descendants', in
+#     `result` before any evidence section, so a summary cannot drop one.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
@@ -1155,9 +1158,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
     grep -q "_apply_verified_claims_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "record_terminal_call(command, returncode, output)" /opt/hermes/tools/terminal_tool_result.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_rightsizing_checks.py /opt/hermes && \
-    grep -q "^import tools.kanban_rightsizing_checks" /opt/hermes/tools/kanban_tools.py && \
+    grep -q "^from tools import kanban_rightsizing_checks as _kanban_rightsizing_checks" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 -c "from tools import kanban_verified_claims as g, kanban_rightsizing_checks as r; assert r.rightsizing_rule in g.RULES" && \
+    grep -q "^_kanban_rightsizing_checks.apply_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_result.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_report_format.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_verified_claims.py && \
@@ -1496,9 +1500,25 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # (or extract_reasoning) under agent/ or in run_agent.py, so a Hermes bump
 # that adds a fourth such site gets read. See the module
 # docstring in deploy/docker/patches/apply_reasoning_not_reply.py.
+#
+# unstructured_reasoning_replay rides it too (#3206): Gemini through LiteLLM
+# sometimes writes its reasoning as plain assistant content under a first line
+# `thought` or `thought:`, with reasoning_content empty, and once a session's
+# history holds one such reply the model imitates it on later calls. One call
+# is inserted in each place the main loop builds a model call's messages,
+# agent/turn_context.py's build_api_messages (every turn) and
+# agent/chat_completion_helpers.py's _iteration_summary_api_messages (the
+# iteration-limit summary), and sends such a reply to the model as a fixed
+# placeholder, its tool_calls kept so each still pairs with its result;
+# state.db keeps the original. The rule is hermes_cli/unstructured_reasoning.py,
+# copied in below. The Hermes bridge withholds such a reply from the user when
+# it is the answer (a2a/hermes-bridge/reasoning_leak.go). See the module
+# docstrings in deploy/docker/patches/apply_unstructured_reasoning_replay.py
+# and deploy/docker/patches/unstructured_reasoning.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      deploy/docker/patches/permission_refusal_stop.py \
+     deploy/docker/patches/unstructured_reasoning.py \
      /opt/hermes/hermes_cli/
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
@@ -1523,6 +1543,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_permission_refusal_stop.py \
      deploy/docker/patches/apply_reasoning_not_reply.py \
      deploy/docker/patches/verify_reasoning_not_reply.py \
+     deploy/docker/patches/apply_unstructured_reasoning_replay.py \
+     deploy/docker/patches/verify_unstructured_reasoning_replay.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1536,6 +1558,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cgroup_memory_sample.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_permission_refusal_stop.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_reasoning_not_reply.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_unstructured_reasoning_replay.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kube_observe_refusal(" /opt/hermes/agent/tool_guardrails.py && \
@@ -1554,6 +1577,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'kube-agents patch: cluster-dns-not-local' /opt/hermes/agent/model_metadata.py && \
     grep -q 'kube-agents patch: cgroup-memory-sample' /opt/hermes/gateway/lifecycle_ledger.py && \
     grep -q 'kube-agents patch: reasoning_not_reply' /opt/hermes/agent/turn_final_response.py && \
+    grep -q 'kube-agents patch: unstructured_reasoning_replay' /opt/hermes/agent/turn_context.py && \
+    grep -q 'kube-agents patch: unstructured_reasoning_replay' /opt/hermes/agent/chat_completion_helpers.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1566,6 +1591,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_permission_refusal_stop.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_reasoning_not_reply.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_unstructured_reasoning_replay.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
@@ -2663,7 +2689,7 @@ RUN set -eu; \
       echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
       exit 1; \
     fi; \
-    for binary in gcloud kubectl gh git helm k9s yq; do \
+    for binary in gcloud kubectl gh git helm k9s yq leeway; do \
       if command -v "${binary}" >/dev/null 2>&1; then \
         echo "cluster tooling is back in the agent image: ${binary}" >&2; \
         exit 1; \

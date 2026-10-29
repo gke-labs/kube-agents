@@ -125,6 +125,40 @@ def kanban_task() -> Path:
 
 
 @pytest.fixture
+def measured_kanban_task(write_task) -> Path:
+    """`agent-kanban-smoke` as the inject measurement run (#2039) declared it.
+
+    The answer check, and the router-scope `kanban_create` check #4004 dropped
+    from the real task file. The captured inject record (``INJECT_RUN``)
+    carries both entries, so the tests of how the lane grades a check its
+    transport blinds read the case this way.
+    """
+    return write_task(
+        "agent-kanban-smoke",
+        {
+            "id": "agent-kanban-smoke",
+            "name": "Agent kanban smoke test",
+            "prompt": "Which GKE clusters are we running in this project right now? Give me the list.",
+            "infrastructure": {"deployer": "noop"},
+            "verification_spec": [
+                {
+                    "name": "the-answer-names-the-planted-fleet",
+                    "role": "objective",
+                    "mode": "assert",
+                    "check": {"type": "report_contains", "required_phrases": ["seeded-a", "seeded-b", "seeded-c"]},
+                },
+                {
+                    "name": "the-kanban-card-was-actually-filed",
+                    "role": "objective",
+                    "mode": "assert",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"], "require_success": True},
+                },
+            ],
+        },
+    )
+
+
+@pytest.fixture
 def write_task(tmp_path: Path):
     """Write a synthetic ``<case-id>/task.yaml`` and return its path.
 

@@ -60,20 +60,40 @@ jobs:
   # errors would red the merge gate with every test passing. diff-cover is
   # unpinned on purpose (see the exclusion-pattern comment below), which makes
   # it the likeliest thing here to break on someone else's release. Its two
-  # steps are therefore continue-on-error -- a broken report costs the comment,
-  # not the merge. What is left able to fail the job is the suite itself and
-  # coverage.py writing its own data, which are the two things that should.
-  test:
-    name: Run Python Unit Tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  # steps in the `test` job below are therefore continue-on-error -- a broken
+  # report costs the comment, not the merge. What is left able to fail the
+  # required check is the suite itself, coverage.py writing and joining its
+  # data, and a shard that did not finish, which are the things that should.
+  #
+  # The sweep runs as three shards on three runners (`test-shard`), and `test`
+  # joins their coverage and carries the required check's name. On one runner
+  # the sweep took about 18 minutes, most of every merge-queue build, while its
+  # longest single file takes five; three shards of the heavy-first order come
+  # out at about six minutes each. The Makefile's PYTHON_TEST_SHARD says how a
+  # shard picks its files.
+  test-shard:
+    name: Run Python Unit Tests (shard ${{ matrix.shard }}/3)
+    # Pinned, not ubuntu-latest: on 2026-10-26 ubuntu-latest moved to 26.04,
+    # where hack/ci-env.sh's `tail -c` byte caps let more than the cap
+    # through and bash names a piped script's frame "bash" rather than
+    # install.sh, so the four tests that hold those behaviours fail. Move off the pin once they pass
+    # there (#3952).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      # Every shard runs to the end: a red file in one shard must not cancel
+      # the others, whose verdicts and coverage the join below still needs.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     # No pull-requests: write here, deliberately. This job runs the pull
     # request's own Makefile and tests, and on a fork PR the token is
     # read-only whatever this block asks for -- which in this repository is
     # every PR, since branches live on forks. The comment is posted by
     # coverage-comment.yml on the workflow_run trigger, which runs in the
-    # base repository's context; this job's whole hand-off is the artifact.
+    # base repository's context; a shard hands its coverage to the `test` job,
+    # and that job hands the report to the poster.
     permissions:
       contents: read
 
@@ -87,12 +107,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # diff-cover diffs against the merge base, which a shallow clone
-          # does not have.
-          fetch-depth: 0
-          # Nothing after checkout needs git credentials (diff-cover diffs
-          # locally), and this job executes the pull request's own Makefile
-          # and tests -- don't leave a token on disk for them to read.
+          # The default depth: the sweep reads no history (the agent-image
+          # job runs the same sweep at this depth), and diff-cover, which
+          # does, runs in the `test` job. Nothing after checkout needs git
+          # credentials, and this job
+          # executes the pull request's own Makefile and tests -- don't
+          # leave a token on disk for them to read.
           persist-credentials: false
 
       - name: Set up Python
@@ -159,8 +179,92 @@ jobs:
       # it `make coverage` reports the number and exits 0 whatever the tests
       # did, which for the required check would mean reporting success on a
       # red suite.
+      #
+      # PYTHON_TEST_SHARD: this job's third of the sweep. Its coverage and its
+      # list of failing files go to the join in `test` below. Set in the
+      # environment, not on make's command line: a command-line value also
+      # travels in MAKEFLAGS into every make the tests start.
       - name: Run Python unit tests under coverage
+        env:
+          PYTHON_TEST_SHARD: ${{ matrix.shard }}/3
         run: make coverage COVERAGE_SKIP_GO=1 COVERAGE_STRICT=1
+
+      # !cancelled() rather than success(): a shard with a red file still
+      # hands its coverage and its failing-file list to the join, which is
+      # where the required check decides.
+      - name: Upload this shard's coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-coverage-shard-${{ matrix.shard }}
+          path: |
+            .coverage-data/.coverage
+            .coverage-data/failed-files.txt
+          # .coverage is a dot file, which the action leaves out by default.
+          include-hidden-files: true
+          if-no-files-found: error
+          # Long enough for "Re-run failed jobs" days later: the join needs
+          # the passed shards' data as well as the re-run shard's.
+          retention-days: 7
+
+  # The required `Run Python Unit Tests` check: joins the three shards'
+  # coverage into one coverage.xml and one total, and holds COVERAGE_STRICT
+  # over every shard's failing files. `always()` rather than the default
+  # `success()` or `!cancelled()`: a red shard, or a run cancelled while the
+  # shards ran, would otherwise skip this job, and a skipped job reports
+  # success to a required check, so the queue could merge with no tests run.
+  # The cost is a red join on a run that was cancelled, such as a pull
+  # request's run superseded by a newer push. The last step also fails unless
+  # every shard succeeded, so a shard that died before it uploaded anything
+  # cannot pass either.
+  test:
+    name: Run Python Unit Tests
+    needs: test-shard
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04 # pinned, as the test-shard job above says
+    timeout-minutes: 15
+
+    # As for the shards: no pull-requests: write; the comment is posted by
+    # coverage-comment.yml from this job's artifact.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # diff-cover diffs against the merge base, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # No pip cache: the shards' cache holds the whole test set, and this job
+      # installs two packages.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      # The two tools alone: nothing here imports the code under test. Both
+      # are unpinned in requirements-test.txt as here, so a coverage release
+      # between the shards' install and this one could change the data
+      # schema; combine then fails, which fails the check closed.
+      - name: Install coverage and diff-cover
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install coverage diff-cover
+
+      - name: Download the shards' coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: python-coverage-shard-*
+          path: .coverage-data
+
+      # COVERAGE_STRICT=1: fail when any shard's sweep had a failing file. The
+      # target also fails when a shard's directory, data or failing-file list
+      # is missing, so a shard that wrote nothing reads as red, not green.
+      - name: Join the shards' coverage
+        run: make coverage-merge COVERAGE_SHARD_COUNT=3 COVERAGE_STRICT=1
 
       # !cancelled() rather than success(): COVERAGE_STRICT makes the step
       # above fail on a red suite, and a red pull request still wants its
@@ -231,6 +335,16 @@ jobs:
             coverage-total.txt
           if-no-files-found: ignore
 
+      - name: Every shard succeeded
+        if: ${{ always() }}
+        env:
+          SHARDS: ${{ needs.test-shard.result }}
+        run: |
+          if [ "$SHARDS" != "success" ]; then
+            echo "::error::The test shards ended '$SHARDS', not success."
+            exit 1
+          fi
+
   # The same sweep once more on the interpreter the platform agent image runs.
   # `.python-version` is CI's Python and the one the coverage job above measures
   # on; `.agent-python-version` is the Python inside the image built from
@@ -249,7 +363,7 @@ jobs:
   # runs every directory in PYTHON_TEST_DIRS on it.
   test-agent-python:
     name: Run Python Unit Tests on the agent image's Python
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, as the test-shard job above says
     timeout-minutes: 35
     permissions:
       contents: read
@@ -304,7 +418,7 @@ jobs:
   # git SHA pinned in bench/pyproject.toml.
   bench-tests:
     name: Run Bench Harness Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, as the test-shard job above says
     timeout-minutes: 15
 
     steps:

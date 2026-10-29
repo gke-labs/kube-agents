@@ -307,13 +307,21 @@ RunFn = Callable[..., Run]
 QueryFn = Callable[[str, str], "tuple[list[dict], str | None]"]
 
 
+def _text(output: str | bytes | None) -> str:
+    # `TimeoutExpired` carries the child's output as bytes even under `text=True`,
+    # and every reader of `Run` matches markers against a str.
+    if isinstance(output, bytes):
+        return output.decode(errors="replace")
+    return output or ""
+
+
 def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
     t0 = time.monotonic()
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
     except subprocess.TimeoutExpired as exc:
-        return Run(argv, TIMEOUT_RC, exc.stdout or "", exc.stderr or "", time.monotonic() - t0)
+        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
     except Exception as exc:
         return Run(argv, -1, "", str(exc), time.monotonic() - t0)
 

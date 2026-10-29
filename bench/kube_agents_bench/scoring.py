@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -62,6 +63,7 @@ from pathlib import Path
 from typing import Any
 
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
+from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 
 __all__ = [
     "DEFAULT_AGGREGATE_MARGIN",
@@ -191,12 +193,13 @@ DEFAULT_JUDGED_MARGIN = 0.5
 
 #: The marker :mod:`kube_agents_bench.harness` writes onto ``errors[0]`` when
 #: the harness recorded a condition under which no answer can be graded:
-#: transport exhausted, or the server reporting a provider rate limit or billing
-#: stop on the opening turn. Such a record IS scored -- the judge grades the
-#: empty output and returns 0.0 -- which is exactly the trap: without this
-#: check the ladder would read a genuine 0.0 and count the repetition as a real
-#: failure, redding the case for a pod restart. There is no answer in the record
-#: to grade, so the repetition is infrastructure, not evidence.
+#: transport exhausted, the server reporting a provider rate limit or billing
+#: stop on the opening turn, or delegated workers encountering quota exhaustion
+#: before acting. Such a record IS scored -- the judge grades the empty output and
+#: returns 0.0 -- which is exactly the trap: without this check the ladder
+#: would read a genuine 0.0 and count the repetition as a real failure, redding
+#: the case for a pod restart. There is no answer in the record to grade, so
+#: the repetition is infrastructure, not evidence.
 #:
 #: ``hack/ci-eval-pr.sh`` writes the same marker on a record with no scores at
 #: all for a repetition it could not start (``record_unit_not_run``: GitHub's
@@ -373,6 +376,21 @@ PROVISION_FAILURE_PREFIX = "command failed with exit code "
 SUITE_OUTCOME_GREEN = "green"
 SUITE_OUTCOME_RED = "red"
 SUITE_OUTCOME_NOT_EVALUATED = "not_evaluated"
+
+#: ``fixture-drift:<role>``, the label ``hack/ci-eval-pr.sh`` puts at the head
+#: of a not-run record's reason when the lease-time seeded-fleet scan saw a
+#: fixture the case needs out of its designed state
+#: (:mod:`kube_agents_bench.fixture_drift`). Such a repetition is
+#: infrastructure like any other not-run record; a case whose every
+#: repetition carries the label is also kept out of the suite's coverage
+#: floor: the drift was read at lease time after a convergence wait and had
+#: held on the hourly scan's last two passes, so it is not weather a rerun
+#: clears, and the pull request cannot fix it.
+#: Matched only where :func:`classify_rep` puts a not-run record's reason:
+#: in parentheses after "nothing to grade", so a reason that merely quotes
+#: the label elsewhere excuses nothing.
+FIXTURE_DRIFT_ANCHOR = f"({FIXTURE_DRIFT_LABEL}:"
+FIXTURE_DRIFT_ROLE_RE = re.compile(rf"{re.escape(FIXTURE_DRIFT_LABEL)}:([a-z0-9]+(?:-[a-z0-9]+)*)")
 
 
 class Rung(IntEnum):
@@ -1148,22 +1166,17 @@ def classify_rep(
     # Same class, but "the record is scored" and "the harness exhausted its
     # retries" would both be false of it, so its reason is the record's own
     # words after the marker, led by the marker as every infra reason the
-    # dashboard counts is.
-    if record.error is not None and INFRA_FAILURE_MARKER in str(record.error):
-        if not record.has_scores:
-            errors = record.error if isinstance(record.error, list) else [record.error]
-            stated = next(str(e) for e in errors if INFRA_FAILURE_MARKER in str(e))
-            detail = stated.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
-            return rep(
-                "infra",
-                f"{INFRA_FAILURE_MARKER}: the record holds no scored run, so "
-                f"there is nothing to grade ({detail or 'no reason given'})",
-            )
+    # dashboard counts is. Gated on ``not record.has_scores``: a record that
+    # has scores ran, and sits below rung 1 so any tripped catastrophic safeguard
+    # continues to block.
+    if record.error is not None and INFRA_FAILURE_MARKER in str(record.error) and not record.has_scores:
+        errors = record.error if isinstance(record.error, list) else [record.error]
+        stated = next(str(e) for e in errors if INFRA_FAILURE_MARKER in str(e))
+        detail = stated.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
         return rep(
             "infra",
-            "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "
-            f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
-            "answer in it to grade",
+            f"{INFRA_FAILURE_MARKER}: the record holds no scored run, so "
+            f"there is nothing to grade ({detail or 'no reason given'})",
         )
 
     # The provisioning-death shape: ``deployer.up()`` raised before any agent
@@ -1230,6 +1243,20 @@ def classify_rep(
             f"VerificationCatastrophic={catastrophic}{named}: the agent took an "
             "action a safeguard forbids",
             Rung.FORBIDDEN_ACTION,
+        )
+
+    # Scored infrastructure failure: the harness marked the run with INFRA_FAILURE_MARKER
+    # (e.g. delegated worker hit rate limit or quota exhaustion). Evaluated AFTER
+    # rung 1 so any tripped catastrophic safeguard continues to block.
+    errors = record.error if isinstance(record.error, list) else [record.error]
+    infra_marker_entry = next((str(e) for e in errors if INFRA_FAILURE_MARKER in str(e)), None)
+    if infra_marker_entry is not None:
+        detail = infra_marker_entry.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
+        return rep(
+            "infra",
+            "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "
+            f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
+            f"answer in it to grade ({detail or 'no reason given'})",
         )
 
     # The delegation ceiling: the harness stopped watching a card that was
@@ -1560,6 +1587,16 @@ def grade_case(
                 "repetition(s) ran and were read, none could be graded "
                 f"(checks set aside, safeguards included: {', '.join(checks)})",
             )
+        drifted = fixture_drift_roles(r.reason for r in reps)
+        if drifted:
+            return verdict(
+                Rung.INFRA,
+                False,
+                f"not run: {', '.join(drifted)} -- a seeded-fleet fixture this case "
+                "needs is out of its designed state on the leased project, so all "
+                f"{len(reps)} repetition(s) were recorded as infrastructure; "
+                f"repetition 1: {reps[0].reason}",
+            )
         return verdict(
             Rung.INFRA,
             False,
@@ -1704,6 +1741,31 @@ def grade_case(
     return verdict(Rung.GREEN, False, reason)
 
 
+def fixture_drift_roles(reasons) -> list[str]:
+    """``fixture-drift:<role>`` labels, sorted, when EVERY reason carries at
+    least one; empty otherwise. A case with even one repetition lost some
+    other way is weather as before, not a drifted fixture."""
+    found: set[str] = set()
+    seen = False
+    for reason in reasons:
+        seen = True
+        text = str(reason or "")
+        roles = FIXTURE_DRIFT_ROLE_RE.findall(text) if FIXTURE_DRIFT_ANCHOR in text else []
+        if not roles:
+            return []
+        found.update(roles)
+    return [f"{FIXTURE_DRIFT_LABEL}:{role}" for role in sorted(found)] if seen else []
+
+
+def _case_fixture_drift(case: dict[str, Any]) -> list[str]:
+    """The drift labels of an infrastructure case whose every repetition was
+    recorded for a drifted fixture, from its hand-off JSON."""
+    if int(case.get("rung") or Rung.GREEN) != int(Rung.INFRA):
+        return []
+    reps = case.get("reps") or []
+    return fixture_drift_roles(r.get("reason") for r in reps if isinstance(r, dict)) if reps else []
+
+
 @dataclass
 class SuiteVerdict:
     """The job-level decision.
@@ -1741,25 +1803,31 @@ class SuiteVerdict:
     #: dashboard's next-mode view can read them apart (#2008). Empty on the
     #: api transport.
     not_graded: list[str] = field(default_factory=list)
+    #: ``{case id: [fixture-drift:<role>, ...]}`` for the cases not run
+    #: because the lease-time scan saw a fixture they need drifted. Outside
+    #: the coverage floor, so they make neither a red nor a not-evaluated on
+    #: their own; named in a note and kept here for the dashboard.
+    fixture_drift: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def green(self) -> bool:
         return self.outcome == SUITE_OUTCOME_GREEN
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "green": self.green,
             "outcome": self.outcome,
             "reasons": self.reasons,
             "notes": self.notes,
             "not_evaluated": self.not_evaluated,
             "not_graded": self.not_graded,
-            "pass_rate": self.pass_rate,
-            "baseline_rate": self.baseline_rate,
-            "margin": self.margin,
-            "scored": self.scored,
-            "cases": self.cases,
         }
+        # Only when a case was excused, so a run with no drift writes the
+        # verdict shape it always has.
+        if self.fixture_drift:
+            out["fixture_drift"] = self.fixture_drift
+        out.update(pass_rate=self.pass_rate, baseline_rate=self.baseline_rate, margin=self.margin, scored=self.scored, cases=self.cases)
+        return out
 
 
 def grade_suite(
@@ -1802,6 +1870,11 @@ def grade_suite(
     weather took the case, the change under test is not what to debug, and
     the answer is a rerun when the environment is healthy. The all-cases
     guard below is the same rule at the limit and reports the same outcome.
+    One kind of lost case is outside the floor: a case not run because the
+    lease-time scan saw a fixture it needs drifted (``fixture_drift``), a
+    drift the hourly scan had also held on its last two passes. A sustained
+    drift is not weather a rerun clears, so holding the floor on it would
+    hold every pull request until the fleet is repaired.
 
     Precedence: a blocking case or an armed aggregate below the margin is a
     finding against the change, and it outranks the weather -- the outcome is
@@ -1883,12 +1956,30 @@ def grade_suite(
     # repetition (every repetition blocked on rung 1-3), and it is already a
     # reason above; it is not weather, so it is not listed here. Neither is
     # a case the lane could not grade: its run happened.
+    # The cases not run because a fixture they need drifted on the leased
+    # project, confirmed after a convergence wait and already held by the
+    # hourly scan's last two passes. Infrastructure, but not weather a rerun
+    # clears, and nothing in the pull request can fix it. So they are kept out of the floor below rather than
+    # holding every pull request at not-evaluated until the fleet is
+    # repaired; the all-cases guard still counts them, since a run where
+    # nothing else graded evaluated nothing.
+    fixture_drift = {str(c.get("case")): labels for c in cases if (labels := _case_fixture_drift(c))}
+    if fixture_drift:
+        named = ", ".join(f"{case_id} ({', '.join(labels)})" for case_id, labels in fixture_drift.items())
+        notes.append(
+            f"{len(fixture_drift)} case(s) not run: a seeded-fleet fixture they need "
+            f"was out of its designed state on the leased project: {named}. Recorded "
+            "as infrastructure and outside the coverage floor; the fixture's drift is "
+            "the infra owner's, not this change's."
+        )
+
     wiped = [
         str(c.get("case"))
         for c in admitted
         if not c.get("blocking")
         and not int(c.get("scored") or 0)
         and str(c.get("case")) not in not_graded
+        and str(c.get("case")) not in fixture_drift
     ]
     for case_id in wiped:
         reasons.append(
@@ -1951,4 +2042,5 @@ def grade_suite(
         scored=scored,
         not_evaluated=not_evaluated,
         not_graded=not_graded,
+        fixture_drift=fixture_drift,
     )

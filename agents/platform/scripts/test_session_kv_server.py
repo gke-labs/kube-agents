@@ -1284,6 +1284,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/intercepted-events", None),
         ("GET", "/v1/sessions/sess-1/tasks", None),
         ("POST", "/v1/sessions/sess-1/cards/stop", {"context_id": "c"}),
+        ("POST", "/v1/board/actions", {"action": "retry", "tasks": ["t-1"]}),
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
     )
@@ -3053,8 +3054,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self.assertIn(
                 "**Who acts on this:**\n"
                 "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
-                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                + session_kv_server.TRIAGE_FIX_AGAINST_LIVE_OBJECT
+                + "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
                 "(no `kubectl scale`, `patch`, or `apply`).",
                 body,
             )
@@ -3096,7 +3098,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
         self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
         slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
-        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        self.assertIn(r"is\s+being\s+opened\s+automatically", slack)
         task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
         self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
         off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
@@ -3111,6 +3113,16 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             r"^platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled-[0-9a-f]{8}$",
         )
         self.assertIn("**submit-suggestion**", body)
+        self.assertIn("Implement ONLY that recommended option", body)
+        self.assertIn("changing only the file(s) that option calls for", body)
+        self.assertIn("edit only the synced workload manifest(s)", body)
+        self.assertIn("never bundle any non-recommended option", body)
+        self.assertIn(
+            "never touch unrelated manifests or infrastructure definitions that the recommended option does not target",
+            body,
+        )
+        self.assertNotIn("ArgoCD", body)
+        self.assertNotIn("unapplied Terraform", body)
         self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
         # The refusal is quoted the way vcs_client._refuse_to_discard words it.
         self.assertIn("`there is already a copy at <path> with ...`", body)
@@ -4396,6 +4408,100 @@ class TestIsFleetAuditJob(unittest.TestCase):
                     self.assertFalse(session_kv_server._is_fleet_audit_job(profile, job_id))
 
 
+class TestProfileHome(unittest.TestCase):
+    """A profile's directory is resolved once, under the agent home; a name that leaves it is no profile."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def test_the_default_profile_is_the_agent_home_and_a_named_one_sits_under_profiles(self):
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            self.assertEqual(session_kv_server._profile_home("default"), self.home)
+            self.assertEqual(session_kv_server._profile_home("platform"), os.path.join(self.home, "profiles", "platform"))
+            self.assertEqual(session_kv_server._profile_home("seeded-a.v2"), os.path.join(self.home, "profiles", "seeded-a.v2"))
+
+    def test_a_profile_that_leaves_the_profiles_directory_is_none(self):
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            for profile in ("..", ".", "../..", "../platform", "profiles/platform", "a/b", self.home, "/etc", "", "a b"):
+                with self.subTest(profile=profile):
+                    self.assertIsNone(session_kv_server._profile_home(profile))
+
+    def test_a_home_of_slash_or_dot_still_resolves(self):
+        # `agent_home` returns "/" for PLATFORM_AGENT_HOME=/ and "." for
+        # PLATFORM_AGENT_HOME=.: the first is a root that already ends in a
+        # separator, the second resolves against the working directory, as the
+        # open would.
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value="/"):
+            self.assertEqual(session_kv_server._profile_home("default"), "/")
+            self.assertEqual(session_kv_server._profile_home("platform"), "/profiles/platform")
+            self.assertIsNone(session_kv_server._profile_home(".."))
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.home)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            self.assertEqual(session_kv_server._profile_home("default"), os.getcwd())
+            self.assertEqual(session_kv_server._profile_home("platform"), os.path.join(os.getcwd(), "profiles", "platform"))
+            self.assertIsNone(session_kv_server._profile_home(".."))
+
+    def test_the_state_db_of_a_profile_that_leaves_the_data_root_is_none(self):
+        # A `state.db` where a climb out of `profiles/` would land, the data
+        # root itself: the default profile's store, never `..`'s.
+        root = Path(self.home)
+        (root / "state.db").write_bytes(b"")
+        self.assertEqual(session_kv_server._profile_state_db(root, "default"), root / "state.db")
+        self.assertEqual(session_kv_server._profile_state_db(root, ""), root / "state.db")
+        for profile in ("..", "../..", "a/b", self.home):
+            with self.subTest(profile=profile):
+                self.assertIsNone(session_kv_server._profile_state_db(root, profile))
+        self.assertIsNone(session_kv_server._profile_state_db(root, "platform"))  # no store there
+
+    def test_a_relative_home_whose_working_directory_is_gone_names_no_profile(self):
+        # `agent_home` returns "." for PLATFORM_AGENT_HOME=.; once the process's
+        # working directory is unlinked, `abspath` cannot resolve it. That is
+        # no profile, not an exception: each reader keeps its fallback.
+        import gitops_workspace
+
+        self.addCleanup(os.chdir, os.getcwd())
+        gone = tempfile.mkdtemp()
+        os.chdir(gone)
+        os.rmdir(gone)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            self.assertIsNone(session_kv_server._profile_home("platform"))
+            self.assertIsNone(session_kv_server._profile_home("default"))
+        self.assertIsNone(session_kv_server._profile_state_db(Path("."), "platform"))
+
+    def test_a_profile_that_is_a_symlink_out_of_the_profiles_directory_is_none(self):
+        # `profiles/<name>` that points outside the profiles directory is no
+        # profile, even though its name is one segment and its lexical path
+        # stays under `profiles/`: the store it would reach is not the
+        # profile's. A link that stays inside, and a home that is itself a
+        # link, both pass.
+        import gitops_workspace
+
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        (Path(outside) / "state.db").write_bytes(b"")
+        profiles = os.path.join(self.home, "profiles")
+        os.makedirs(os.path.join(profiles, "platform"))
+        os.symlink(outside, os.path.join(profiles, "escaped"))
+        os.symlink(os.path.join(profiles, "platform"), os.path.join(profiles, "alias"))
+        linked_home = os.path.join(outside, "home-link")
+        os.symlink(self.home, linked_home)
+        with patch.object(gitops_workspace, "agent_home", return_value=self.home):
+            self.assertIsNone(session_kv_server._profile_home("escaped"))
+            self.assertEqual(session_kv_server._profile_home("alias"), os.path.join(profiles, "alias"))
+        self.assertIsNone(session_kv_server._profile_state_db(Path(self.home), "escaped"))
+        self.assertEqual(
+            session_kv_server._profile_home("platform", linked_home), os.path.join(linked_home, "profiles", "platform")
+        )
+
+
 class TestAuditChatReport(unittest.TestCase):
     """A fleet-audit job posts the report its run's `finish` left, never its final message."""
 
@@ -4936,6 +5042,24 @@ class TestSchedulerFailureLine(unittest.TestCase):
                 failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
                 self.assertTrue(failure.text.endswith("It will try again at its next scheduled run."))
 
+    def test_a_profile_that_leaves_the_profiles_directory_reads_no_roster(self):
+        # A daily roster where a climb out of `profiles/` would land, the agent
+        # home itself: readable as the default profile's, never as `..`'s, so
+        # the line for such a profile says "next scheduled run", not "tomorrow".
+        import cron_schedule
+
+        cron = os.path.join(self.home, "cron")
+        os.makedirs(cron)
+        with open(os.path.join(cron, "jobs.json"), "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "obtainability-audit", "schedule": {"kind": "cron", "expr": "50 6 * * *"}}]}, handle)
+        self.assertTrue(session_kv_server._runs_daily("default", "obtainability-audit"))
+        for profile in ("..", "../..", self.home, "a/b"):
+            with self.subTest(profile=profile), patch.object(cron_schedule, "open", create=True) as opened:
+                self.assertFalse(session_kv_server._runs_daily(profile, "obtainability-audit"))
+                opened.assert_not_called()
+                failure = session_kv_server.scheduler_failure_line(profile, "obtainability-audit", self.TITLE, self.QUOTA)
+                self.assertTrue(failure.text.endswith(session_kv_server.SCHEDULER_FAILURE_NEXT_UNKNOWN))
+
     def test_every_leg_gets_the_same_line_with_no_clock_time(self):
         self.roster("50 6 * * *")
         _, sent = self.post(platforms=("slack", "google_chat"))
@@ -4984,8 +5108,20 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(len(sent), 1)
 
     def test_a_profile_that_is_not_one_segment_reads_no_ledger(self):
+        import sqlite3
+
+        # A ledger with a clean run where a climb out of `profiles/` would land,
+        # the agent home itself: read as the default profile's, never as `..`'s.
         self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
-        for profile in ("..", "../..", "/var/lib/x", "a/b"):
+        cron = os.path.join(self.home, "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('obtainability-audit', 'completed', '2026-10-21T06:50:00+00:00')")
+        with patch.object(session_kv_server.sqlite3, "connect", wraps=sqlite3.connect) as connect:
+            self.assertTrue(session_kv_server._run_completed_since("default", "obtainability-audit", 0.0))
+            connect.assert_called_once()
+        for profile in ("..", "../..", "/var/lib/x", self.home, "a/b"):
             with self.subTest(profile=profile), patch.object(session_kv_server.sqlite3, "connect") as connect:
                 self.assertTrue(session_kv_server._run_completed_since(profile, "obtainability-audit", 0.0))
                 connect.assert_not_called()
@@ -5017,6 +5153,136 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(sent, [self.QUOTA])
 
 
+class TestBoardHealthCardRelay(unittest.TestCase):
+    """The kanban-board-health job's Slack leg posts its card, with Retry and Drop on each row.
+
+    Only for the report the card was said with, with KAGE_SLACK_UX on: as Block
+    Kit through the Slack relay, or under next as a chat message through the
+    gateway. Everywhere else, and whenever the card does not post, the report
+    goes out as written.
+    """
+
+    SLACK_THREAD = "1712345678.000100"
+    HOME = "C0123456789"
+    BLOCKS_TS = "1712345999.000200"
+    REPORT = "**1 task is stuck and needs someone to decide.**\n\n**Triage x**\nStopped 1 day ago before finishing."
+    CARD = {
+        "version": 1,
+        "text": REPORT,
+        "headline": "1 task is stuck and needs someone to decide.",
+        "rows": [{"title": "Triage x", "count": 1, "status": "Stopped 1 day ago before finishing.", "held": "",
+                  "tasks": ["t_1"]}],
+        "more": "",
+    }
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM"):
+            os.environ.pop(key, None)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        os.environ["KAGE_SLACK_UX"] = "1"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.environ["KANBAN_HEALTH_STATE"] = str(Path(tmp.name) / "kanban_board_health.json")
+        Path(tmp.name, "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(self, report=REPORT, platforms=("slack",), job_id="kanban-board-health", blocks_post=None):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": "spaces/AAA/threads/T1"}
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post("/v1/cron-reports", json={"job_id": job_id, "report": report})
+        self.posts = poster.call_args_list
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_with_a_relay_the_card_posts_as_blocks_with_its_buttons(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        (args, _kwargs), = [(c.args, c.kwargs) for c in self.posts]
+        channel, text, blocks, _thread = args
+        self.assertEqual((channel, text), (self.HOME, self.REPORT))
+        self.assertEqual(blocks, session_kv_server.board_health_card.blocks_from_card(self.CARD)[0])
+        self.assertIn({"kage_board.retry", "kage_board.drop"}, [
+            {e["action_id"] for e in b["elements"]} for b in blocks if b["type"] == "actions"
+        ])
+        self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
+
+    def test_under_next_the_card_goes_to_the_gateway_with_its_rows_actions(self):
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        chat, text = via.call_args.args[2:4]
+        self.assertEqual(chat["rows"][0]["tasks"], ["t_1"])
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
+    def test_the_card_is_found_under_the_agent_home_with_no_override(self):
+        """Production: no KANBAN_HEALTH_STATE, the card beside the record under PLATFORM_AGENT_HOME."""
+        os.environ.pop("KANBAN_HEALTH_STATE", None)
+        os.environ.pop("KANBAN_HEALTH_HOME", None)
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        cron = Path(home.name, "profiles", "platform", "cron")
+        cron.mkdir(parents=True)
+        (cron / "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        os.environ["PLATFORM_AGENT_HOME"] = home.name
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.posts), 1)
+    def test_a_refused_card_posts_the_report(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+
+        def refuse(*args, **kwargs):
+            raise session_kv_server.slack_blocks_post.Refused("invalid_blocks")
+
+        _, calls = self._post(blocks_post=refuse)
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+
+    def test_a_card_said_with_other_text_is_not_used(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        other = self.REPORT.replace("1 day", "2 days")
+        _, calls = self._post(report=other, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(self.posts, [])
+        self.assertEqual([c.args for c in calls], [("slack", other, "", "")])
+
+    def test_flag_off_another_job_or_google_chat_posts_the_report(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(job_id="stall-watch", blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+        _, calls = self._post(platforms=("google_chat",), blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args[:2] for c in calls], [("google_chat", self.REPORT)])
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(self.posts, [])
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -6444,6 +6710,47 @@ class TestDriftInject(unittest.TestCase):
             / "SKILL.md"
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
+
+    def test_the_card_handles_an_object_git_does_not_declare(self):
+        """No declared state means no revert, and the card has to say so twice.
+
+        Once as the instruction, and once in **Done when**, which otherwise
+        demands revert-or-codify and so makes a report that correctly offers no
+        revert unfinishable. The card defers the list of GitOps markers to the
+        skill ("the skill lists them"), so the skill has to carry one: the
+        worker has no repository to check, and the markers are all it has.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("establish whether git declares this object at all", card)
+        self.assertIn("no declared state to revert to", card)
+        # A delete leaves no live object, so no markers proves nothing and the
+        # revert has to survive: gitops-drift-deleted-policy-triage expects it.
+        # No pull request can delete an object git never held, and chat turns
+        # every lettered option into an 'apply' button, so deletion is an
+        # unlettered Manual step (observed: a lettered "Delete unmanaged
+        # namespace" option with "apply Option B" beside it).
+        self.assertIn("never a lettered option, never the recommendation", card)
+        self.assertIn("- **Manual step (<title>):**", card)
+        # Only a person's kubectl subcommands read as "not in git"; a manager
+        # the card cannot name may be a pipeline's and keeps the revert.
+        self.assertIn("its only field managers are a person's `kubectl` subcommands", card)
+        self.assertIn("a field manager you do not recognise", card)
+        self.assertIn("A deleted object carries nothing to read", card)
+        self.assertIn("keep the revert", card)
+        done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("for an object git does not declare", done_when)
+        self.assertIn("proposes codifying it", done_when)
+
+        skill = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for marker in ("argocd-controller", "kustomize-controller", "configsync.gke.io"):
+            self.assertIn(marker, skill, f"the skill the card defers to no longer names {marker}")
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
@@ -8057,6 +8364,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             self.assertNotIn(leaked, sess_serialized)
         self.assertIn("[REDACTED_SECRET]", serialized)
         self.assertIn("[REDACTED_PRIVATE_KEY]", serialized)
+        # A manifest's `data` is blanked by shape, a ConfigMap's as a Secret's.
+        self.assertNotIn("kept_plain_value", serialized)
+        self.assertIn("plain_field", serialized)
         for preserved in (
             "app-tls-secret",
             "/var/run/secrets/token",
@@ -8070,7 +8380,6 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "tls.crt:  1679 bytes",
             "cert.pem: OK",
             "cert.pem: PEM certificate",
-            "kept_plain_value",
             "/etc/creds/mounted-path",
             "deployment-controller mounts them",
             "/opt/data/gitops/x",
@@ -8130,7 +8439,7 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", benign), benign)
 
     def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
-        # `_CLI_USERPASS_FLAG_RE` and `_CLI_SHORT_P_RE` end a command's segment
+        # `worker_transcript.CLI_USERPASS_FLAG_RE` and `CLI_SHORT_P_RE` end a command's segment
         # at `&`, `;` or `|`; inside a quoted argument those are data.
         for cmd, cred, kept in (
             (
@@ -8169,8 +8478,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(cleaned, crafted_line)
 
     def test_secret_read_command_detector_covers_every_output_form(self):
-        # The detector keys on "get secret" plus any output shaping or pipe,
-        # not on an enumerated list of formatters an agent may not pick.
+        # The detector fails closed: a `kubectl get` of a secret is served only
+        # as the bare list, a store's command only as one of its named lists,
+        # and a form no list named withholds (the grammar's own cases live in
+        # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
@@ -8207,9 +8518,23 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "sops --decrypt secrets.enc.yaml",
             "kubectl exec deploy/api -- cat /etc/db-creds/password",
             "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+            # a form no list named fails closed (the grammar's own cases
+            # live in test_worker_transcript.py)
+            "kubectl get secret db -n prod --some-flag-added-next-release",
+            "kubectl get secrets -n $NS",
+            "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
+            "printf secret/db | xargs kubectl get -n prod -o yaml",
+            "aws secretsmanager batch-get-secret-value --secret-id-list db",
+            "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
         ]
         served = [
             "kubectl get secrets -n kube-system",
+            "kubectl get secret db -n prod --ignore-not-found",
+            "kubectl get secrets -A 2>/dev/null",
+            "kubectl get secrets -n prod | wc -l",
+            "kubectl get pods -n external-secrets",
+            "kubectl get pods -n prod -l app=kubectl-proxy",
+            "kubectl get pods -n vault",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
             "kubectl get secrets -n kube-system --show-labels",
@@ -10324,6 +10649,153 @@ def closing_conn(conn):
     return closing(conn)
 
 
+class TestBoardAction(unittest.TestCase):
+    """POST /v1/board/actions: Retry and Drop on the board-health card's rows.
+
+    The board is a temporary SQLite file through `KANBAN_DB_PATH`, and Hermes'
+    kanban module is a stub whose `unblock_task` and `archive_task` move the
+    row as the real ones do: unblock only a blocked card, to ready; archive any
+    card that is not already archived.
+    """
+
+    def setUp(self):
+        import sqlite3
+        import types
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.board = Path(self._tmpdir.name) / "kanban.db"
+        with sqlite3.connect(self.board) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, worker_pid INTEGER);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, kind TEXT
+                );
+                """
+            )
+        self.calls = []
+        self.raise_on = set()
+        test = self
+        kanban = types.ModuleType("hermes_cli.kanban_db")
+
+        def unblock_task(conn, task_id, new_status="ready"):
+            test.calls.append(("unblock", task_id))
+            if task_id in test.raise_on:
+                raise RuntimeError("database is locked")
+            cur = conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = 'blocked'", (new_status, task_id))
+            conn.commit()
+            return cur.rowcount == 1
+
+        def archive_task(conn, task_id, *, signal_fn=None):
+            test.calls.append(("archive", task_id))
+            cur = conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ? AND status <> 'archived'", (task_id,))
+            conn.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'archived')", (task_id,))
+            conn.commit()
+            return cur.rowcount == 1
+
+        kanban.unblock_task = unblock_task
+        kanban.archive_task = archive_task
+        package = types.ModuleType("hermes_cli")
+        package.__path__ = []
+        package.kanban_db = kanban
+        modules = patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": kanban})
+        modules.start()
+        self.addCleanup(modules.stop)
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.board))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def card(self, task_id, status, title=None):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("INSERT INTO tasks (id, title, status) VALUES (?, ?, ?)", (task_id, title or f"card {task_id}", status))
+
+    def status(self, task_id):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            return conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+
+    def act(self, action, tasks, by="Jayanti"):
+        return self.client.post("/v1/board/actions", json={"action": action, "tasks": tasks, "by": by})
+
+    def test_retry_unblocks_a_blocked_card(self):
+        self.card("t_a", "blocked", "Investigate payments-api")
+        response = self.act("retry", ["t_a"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["results"],
+            [{"id": "t_a", "title": "Investigate payments-api", "status": "ready", "outcome": "done"}],
+        )
+        self.assertEqual(self.status("t_a"), "ready")
+
+    def test_drop_archives_a_blocked_card(self):
+        self.card("t_a", "blocked")
+        response = self.act("drop", ["t_a"])
+        self.assertEqual(response.json()["results"][0]["outcome"], "done")
+        self.assertEqual(self.status("t_a"), "archived")
+
+    def test_a_card_no_longer_blocked_is_left_alone(self):
+        """A stale button: the card was unblocked and claimed, or finished, since the post."""
+        for task_id, status in (("t_run", "running"), ("t_done", "done"), ("t_ready", "ready")):
+            self.card(task_id, status)
+        for action in ("retry", "drop"):
+            with self.subTest(action=action):
+                results = self.act(action, ["t_run", "t_done", "t_ready"]).json()["results"]
+                self.assertEqual([r["outcome"] for r in results], ["moved"] * 3)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_run"), "running")
+
+    def test_a_missing_or_archived_card_is_gone(self):
+        self.card("t_old", "archived")
+        results = self.act("drop", ["t_old", "t_nope"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_old", "outcome": "gone"}, {"id": "t_nope", "outcome": "gone"}])
+
+    def test_a_row_of_several_cards_acts_on_each(self):
+        self.card("t_a", "blocked")
+        self.card("t_b", "blocked")
+        results = self.act("retry", ["t_a", "t_b", "t_a"]).json()["results"]
+        self.assertEqual([(r["id"], r["outcome"]) for r in results], [("t_a", "done"), ("t_b", "done")])
+
+    def test_one_card_raising_does_not_stop_the_rest(self):
+        self.card("t_a", "blocked")
+        self.card("t_b", "blocked")
+        self.raise_on.add("t_a")
+        results = self.act("retry", ["t_a", "t_b"]).json()["results"]
+        self.assertEqual([(r["id"], r["outcome"]) for r in results], [("t_a", "failed"), ("t_b", "done")])
+        self.assertEqual(self.status("t_b"), "ready")
+
+    def test_bad_requests_are_refused(self):
+        self.card("t_a", "blocked")
+        for body in (
+            {"action": "delete", "tasks": ["t_a"]},
+            {"action": "retry", "tasks": []},
+            {"action": "retry", "tasks": "t_a"},
+            {"action": "retry", "tasks": [""]},
+            {"action": "retry", "tasks": ["x" * 65]},
+            {"action": "retry", "tasks": [f"t_{i}" for i in range(51)]},
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.client.post("/v1/board/actions", json=body).status_code, 400)
+        self.assertEqual(self.status("t_a"), "blocked")
+
+    def test_cards_the_deadline_leaves_unstarted_answer_failed(self):
+        self.card("t_a", "blocked")
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 0.0):
+            results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "failed"}])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_a"), "blocked")
+    def test_no_board_answers_every_card_gone(self):
+        self.board.unlink()
+        results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "gone"}])
 class TestDriftBacklog(unittest.TestCase):
     """`POST /v1/drift-backlog` and the digest that follows it."""
 

@@ -1361,16 +1361,19 @@ class TestSanitizationAndMutationRemoval(unittest.TestCase):
     def test_sanitize_log_text_zero_width_bidi_c1_and_tags(self):
         # Verify stripping of zero-width space (U+200B), BOM (U+FEFF), bidi override (U+202E),
         # DEL (0x7F), C1 control (0x80), 8-bit CSI (0x9B), and Unicode tag block (U+E0001).
-        raw = "normal\u200btext\ufeff\u202esmuggled\x7f\x80\x9b31mcolor\U000e0041end\n"
+        raw = "normal\u200btext\ufeff\u202esmuggled\x7f\x80\x9b31mcolor\U000e0041end\u2028sep\u2029par\u2800blank\n"
         sanitized = _sanitize_log_text(raw)
         self.assertNotIn("\u200b", sanitized)
+        # The three code points the shared filter added over the server's old copy.
+        for separator in ("\u2028", "\u2029", "\u2800"):
+            self.assertNotIn(separator, sanitized)
         self.assertNotIn("\ufeff", sanitized)
         self.assertNotIn("\u202e", sanitized)
         self.assertNotIn("\x7f", sanitized)
         self.assertNotIn("\x80", sanitized)
         self.assertNotIn("\x9b", sanitized)
         self.assertNotIn("\U000e0041", sanitized)
-        self.assertIn("normaltextsmuggledcolorend", sanitized)
+        self.assertIn("normaltextsmuggledcolorendseppar", sanitized)
 
     def test_sanitize_audit_value_zero_width_bidi_c1_and_tags(self):
         raw = {

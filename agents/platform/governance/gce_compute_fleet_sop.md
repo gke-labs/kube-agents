@@ -169,7 +169,7 @@ python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py f
 ```
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
-- **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
+- **An on-demand run is never silent.** `finish` returns `silent_ok: true` only for a scheduled run. On a run that a person asked for, `silent_ok` is always `false`, so report the outcome and the ledger URL.
 - `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.

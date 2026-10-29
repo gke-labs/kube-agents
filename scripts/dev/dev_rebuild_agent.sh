@@ -34,7 +34,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$SELECTED_AGENT" ]; then
-  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  if is_non_interactive; then
     SELECTED_AGENT="platform"
   else
     echo -ne "  ${C_CYAN}Select agent to rebuild (platform) [${C_WHITE}platform${C_CYAN}]: ${C_RESET}"
@@ -233,7 +233,7 @@ execute_redeploy() {
         # Both lists: the credential proxy is a native sidecar, so it is an
         # initContainer. Querying only .containers[] silently skips its image
         # update and leaves the dev loop running a stale proxy.
-        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}') || return 1
         # Both containers built from the credential-proxy image, wherever they
         # turn up: `envoy-credential-proxy` is the credential runtime, now a
         # native sidecar in the agent pod, and `agent-api-auth` is what is left
@@ -249,10 +249,14 @@ execute_redeploy() {
         container_name=$(echo "$container_names" | grep -E "agent|${AGENT_TARGET}" | grep -Fxv agent-api-auth | head -n 1)
         if [ -n "$container_name" ]; then
           image_updates=("${container_name}=${IMAGE_URI}" ${image_updates[@]+"${image_updates[@]}"})
-        elif [ ${#image_updates[@]} -eq 0 ]; then
-          image_updates=("${AGENT_TARGET}=${IMAGE_URI}")
         fi
-        kubectl set image "deployment/${dep}" -n "${ns}" "${image_updates[@]}" 2>/dev/null || true
+        # A Deployment whose name holds the agent's but runs neither container
+        # (the a2a callout on a next install) has nothing of ours to update.
+        if [ ${#image_updates[@]} -eq 0 ]; then
+          print_info "No agent or credential-proxy container in Deployment '${dep}'; skipping."
+          continue
+        fi
+        kubectl set image "deployment/${dep}" -n "${ns}" "${image_updates[@]}" || return 1
         dep_found=1
       fi
     done

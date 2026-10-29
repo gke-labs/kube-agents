@@ -3,10 +3,11 @@
 # about 30% of repetitions on unrelated pull requests and on main: Vertex
 # 429s, #3399, and real misses where the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} as
-# configured or open); `consistency` is on the coverage allowlist in
-# docs/designs/domains.yaml until it returns, after #3448 merges, the
-# agent-side fix (#3605) lands and the case passes the roster's bar on the
-# Gemini nightly.
+# configured or open); `consistency` was on the coverage allowlist in
+# docs/designs/domains.yaml from then until consistency-drift-outlier took
+# the domain's roster seat on 2026-10-26. This case returns after #3448
+# merges, the agent-side fix (#3605) lands and it passes the roster's bar on
+# the Gemini nightly.
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
@@ -18,7 +19,8 @@
 # run. Full audit SOP fidelity lives in
 # the fleet-audits canary (compliance-rbac-overgrant, 606s measured
 # 2026-08-26; nightly 2026-09-22 to 2026-09-29, presubmit held out since
-# (#2013)) and, in the nightly tier, consistency-drift-outlier.
+# (#2013)) and consistency-drift-outlier (nightly from 2026-08-26, on the
+# blocking roster since 2026-10-26).
 # Expected cost bracket: ~150-350s.
 #
 # Planted defect required: the seeded fleet's slot-c cluster carries no

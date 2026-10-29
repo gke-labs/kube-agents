@@ -121,8 +121,8 @@ same target on every pull request, and it is a required check, so a warning-seve
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
 shellcheck step in `.github/workflows/validate.yml`) from
 <https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
-package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two releases behind, and a
-release two behind reports a different set of findings than CI.
+package on the GitHub-hosted runner image is whatever release that image's Ubuntu ships, not the
+one the job pins and asserts, and a different release reports a different set of findings than CI.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
 place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
@@ -274,6 +274,8 @@ loop while you work:
   `OK`. [`tests/integration/README.md`](../tests/integration/README.md) is the tier's contract;
   [`testing-map.md`](testing-map.md) says which suite runs where.
 - `make docs-check`, plus `cd docs/site && npm ci && npm run build` if you touched `docs/site/`.
+  `make docs-check` needs `go` on `PATH`: the CRD field pages are read from the operator's Go API
+  types, and the check fails without it.
 
 ## The automated review
 
@@ -594,8 +596,9 @@ The two labels are the two people:
   (GoogleCloudPlatform/oss-test-infra#2748). An `lgtm` given before that change reached Prow
   (2026-10-22 14:43Z) has no stored tree, and a push still strips it.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
-  the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
-  presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
+  the changed paths — [`OWNERS`](../OWNERS) at the root,
+  [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
+  [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
   and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs or what blocks; the nightly file and the case directories under
@@ -650,16 +653,16 @@ ruleset requires these checks — on the head for a pull request to enter the qu
 commit for it to merge: `cla/google`, `actionlint`, `build`, `prettier`, `validate`,
 `Run Controller Tests`, `Run Python Unit Tests`, `Documentation Checks`,
 `Validate Conventional Commit PR Title`, `Agent instructions cite assets that exist`,
-`Run A2A Module Tests`, `Smoke gate`, and `Merge labels`. It also requires conversation resolution,
-but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
+`Run A2A Module Tests`, `Run k8s-api-proxy Tests`, `Smoke gate`, and `Merge labels`. It also
+requires conversation resolution, but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
 checks. A reader who checks the repository settings for the review requirement therefore finds
 nothing and concludes wrongly. Only these checks block a merge: a red or cancelled check outside
 the list does not, and `AI Review` is not in it.
 
 `Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
-`Agent instructions cite assets that exist` joined the set on 2026-09-02, and
-`Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
-could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
+`Agent instructions cite assets that exist` joined the set on 2026-09-02,
+`Run A2A Module Tests` on 2026-10-13, and `Run k8s-api-proxy Tests` on 2026-10-28; before its
+date, a pull request one of them had not run on could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
 
 ```bash
 gh api repos/gke-labs/kube-agents/rules/branches/main \
@@ -670,7 +673,8 @@ Every workflow behind one of those checks, bar `Smoke gate` and `Merge labels`, 
 pull request whose base is a `release/` branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`.
 A backport pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook
 in `scripts/release/README.md` ("Patch releases from a release line") is what happens after it
-merges. A `release/` branch requires the same contexts bar `Smoke gate` and `Merge labels`, also
+merges. A `release/` branch requires the same contexts bar `Smoke gate`, `Merge labels` and
+`Run k8s-api-proxy Tests` (no line carries it yet; see `scripts/release/README.md`), also
 through a ruleset; its branch protection rule has no `required_status_checks` at all. No queue
 runs on a `release/` branch and Tide no longer merges in this repository, so nothing merges a
 backport yet. How one merges is still open, and `scripts/release/README.md` still describes Tide. Read a line's
@@ -722,6 +726,13 @@ kind of verdict, so a run after an override reuses it in seconds. The reused run
 ordinary `Job succeeded.`; the `/override` comment, the build log's `REVALIDATED` line and a key the
 run leaves in its `finished.json` metadata are the record that it was one, and step 0 reads the key
 so that such a run is never itself taken for a green.
+
+Do not post `/test pull-kube-agents-smoke-test` on an approved pull request whose `Smoke gate` is
+green, above all one in the merge queue. The run posts a pending smoke status, and if the queue's
+`Smoke gate` reads it before the run reports, the queue fails the group and removes the pull
+request. The sweep puts it back once after the first such removal since the last push, but a second
+one keeps it out until a push. If `Smoke gate` is pending, a `/test` or a push is how you get a
+fresh green. `/retest` is fine: it reruns only failed contexts.
 
 No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
 changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository

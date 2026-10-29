@@ -191,7 +191,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Three KV buckets ride the same JetStream deployment:
+Four KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -223,6 +223,16 @@ Three KV buckets ride the same JetStream deployment:
   it is a denial it has to be enumerated over every principal on the bus rather than
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
+- `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
+  exchange it rated: user content that can hold cluster data. The one bucket with a max
+  age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
+  past it a new rating is refused until older ones expire. The gateway's user is
+  the only reader and writer of its records by grant, with the registry's four verbs on
+  `KV_feedback`; provision and seed hold STREAM.INFO on it, which can list its keys (task
+  id and rater),
+  and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
+  same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
+  design owns what a record holds ("Answer feedback").
 
 ## Accounts and connection-time authorization
 
@@ -402,8 +412,8 @@ Layout:
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
   `web` user for the read-only web UI, one of the two bus credentials published to a
-  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
-  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` (less `a2a.cap.>`,
+  so it cannot join the verifier's queue group) and its own inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
   ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
@@ -624,7 +634,11 @@ Layout:
   agent pod that holds session-kv's bearer. No other principal holds either subject, and the
   reply namespace is its own for the notify route's reason. The bridge's password is reachable
   from the agent's terminal like every grant in that pod, so a forged board can reach the Home
-  tab of an admitted member; it carries no authority beyond what it shows. Core NATS.
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS. A request
+  with a body is a board-health row's Retry or Drop (spec-chatops-gateway.md, "The board-health
+  card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
+  subjects and grants, and only the gateway may publish the request, so no other principal can
+  ask the bridge to act; session-kv acts only on cards still `blocked`.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for

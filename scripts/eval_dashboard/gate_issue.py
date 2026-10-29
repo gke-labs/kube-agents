@@ -54,7 +54,7 @@ passing mention of a role or node elsewhere is not the tracker; case names
 never match an unlabelled body (a roster tracker lists them all), and the
 deadline pair, having no identifier, needs the label. The bot's own
 `nightly-red` issues are never adopted: a case's bug is not the gate's
-tracker. The four infrastructure shapes -- lost pods, fixture drift,
+tracker; nor are its coverage-gap issues (coverage_gaps.py), a domain's. The four infrastructure shapes -- lost pods, fixture drift,
 pool drift, deadline kills -- are assigned to `infra_owner` in
 docs/designs/domains.yaml and end with a line mentioning `infra_backup`; an
 OUTAGE's issue (a shared break, which may be any case's code) is not.
@@ -115,6 +115,10 @@ LABELS_PATH = "issues/{number}/labels"
 # The bot's other issue family (nightly_bugs.py): a case's bug, never the
 # gate's tracker.
 NEVER_ADOPT_LABELS = frozenset({"nightly-red"})
+# The coverage-gap filer's issues share the `presubmit-gate` label and name
+# nightly cases in their bodies; one is a domain's, never an outage's
+# (coverage_gaps.py).
+NEVER_ADOPT_MARKER = "<!-- kube-agents-bot:coverage-gap "
 # Who the bot's own issues are filed as (the workflow's GITHUB_TOKEN). Only
 # these are closed; anyone else's is adopted and left open.
 BOT_LOGINS = frozenset({"github-actions[bot]"})
@@ -227,7 +231,7 @@ Filed automatically by the smoke health bot; edit freely. Fix PRs: reference thi
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
 FIXTURE_DRIFT_BODY = """\
-The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the repair below.
+The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. The presubmit and the nightly run the same check on their own lease and record each case whose grade depends on a drifted role as infrastructure (`fixture-drift:<role>`) instead of running it, so while the drift lasts those cases red no pull request and guard nothing either. A red on such a case comes only from a run whose own scan could not read the role; that red is the fixture's, not the pull request's. The repair below puts the cases back in the gate.
 
 **Drifted roles**
 
@@ -242,7 +246,7 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 
 {evidence}
 
-**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`. `default-pool-headroom` is the other exception: it reads capacity, not an unapplied stack; while seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, a re-apply changes nothing and the pool's size in `bench/tf/fleet/main.tf`, `seeded_a_default`, is the fix: if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands.)
+**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`. `default-pool-headroom` is another exception: it reads capacity, not an unapplied stack; while seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, a re-apply changes nothing and the pool's size in `bench/tf/fleet/main.tf`, `seeded_a_default`, is the fix: if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands. Two drift lines no re-apply clears, by their assertion rather than their role, and a hand run of `hack/fleet_reconcile.py --drifted` skips a project whose only drift is these: a line reading `age_hours_ge` is a cluster under its age gate, seeded-c's `createTime` under 24 hours old, which clears itself at `createTime` plus 24 hours, so retest after then; a `version-laggard` line reading `not_ahead_of_channel` and "newer than every" is seeded-b running a patch newer than any its channel offers for that minor, which `seeded_b_pin.py` holds until REGULAR ships a newer patch of that minor; sooner, re-create seeded-b under a lease (`bench/tf/fleet/README.md`, the recovery).)
 
 Incident brief: {brief}
 
@@ -262,7 +266,7 @@ POOL_DRIFT_MARKER = "<!-- kube-agents-bot:pool-drift {findings} -->"
 POOL_DRIFT_MARKER_RE = re.compile(r"<!-- kube-agents-bot:pool-drift ([^ >]*) -->")
 POOL_DRIFT_BODY = """\
 {marker}
-The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), {consequence}
+The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a pool drift, {consequence}
 
 **Findings**
 
@@ -650,9 +654,9 @@ class Tracker:
         kind, matched on the ids its marker carries and nothing else."""
         for issue in self.open_issues():
             labelled = LABEL in label_names(issue)
-            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue) or (labelled_only and not labelled):
-                continue
             title, body = issue.get("title", ""), issue.get("body") or ""
+            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue) or NEVER_ADOPT_MARKER in body or (labelled_only and not labelled):
+                continue
             if marker is not None:
                 found = marker.search(body)
                 if found and set(names) <= set(found.group(1).split(",")):

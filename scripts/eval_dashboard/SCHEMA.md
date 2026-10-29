@@ -168,6 +168,13 @@ layout and are collected from the moment they start running.
       `delegation-ceiling`. The run page, the PR view and the PR comment's
       result cell count it in a case's total and name it apart; the Cases
       page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      An `infra` rep whose `reason` carries `fixture-drift:<role>` is a
+      **fixture** rep: `hack/ci-eval-pr.sh` recorded it without running it
+      because the lease-time seeded-fleet scan saw a fixture the case needs
+      out of its designed state (`bench/kube_agents_bench/fixture_drift.py`).
+      The same readers count it apart from the storm and the ceiling, and
+      `classify.py` classes a case whose ungraded reps are all of this kind
+      `fixture-drift`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -207,9 +214,13 @@ layout and are collected from the moment they start running.
       decimal each. `agent_s`
       is the agent run's wall clock (`results.json`'s `latency`, which
       devops-bench takes around the harness run: the delegation wait is in
-      it, provisioning, fixtures, verification and the judge are not); `turn1_s` is the opening chat turn on the api transport,
+      it, provisioning, fixtures, verification and the judge are not); `turn1_s` is the opening chat turn: on the api transport
       the attempt that succeeded only, with no retry, backoff or status
-      poll in it (none on the inject transport). The collector consumes the
+      poll in it; on the inject transport the opening task from the door
+      accepting it (from the POST that went out) to the read that saw it completed (a wait in the
+      bridge's queue and the one-second poll pause are in it), and none
+      for a task that failed, ran to its budget, ended only on the stream
+      without the relay's post, lost an opening POST's reply (the task may have started before the retry), or was lost to infrastructure. The collector consumes the
       line whole, like the report line; it keeps only these two keys, as
       floats, when the value is a finite number above zero, and skips an
       unknown key or a value that does not parse. Each key is **absent**
@@ -551,22 +562,23 @@ what the renderer does with them.
 ### `coverage` — from `docs/designs/domains.yaml`
 
 - `domains_total` — number of entries under `domains:`.
-- `uncovered` — the `allowlist` entries (the domains known-uncovered
-  today).
+- `uncovered` — the `slug` of each `allowlist` record (the domains
+  known-uncovered today), in file order. The records' other fields (`since`,
+  `issue`, `owner`, `expires`) are not carried.
 - `domains_covered` — `domains_total − len(uncovered)`.
 
 ## Sources
 
 - `--pr-glob <gs glob>` (repeatable) — Prow build dirs, read with
-  `gsutil cat`. **Read-only.** How they are discovered depends on whether
+  `gcloud storage cat`. **Read-only.** How they are discovered depends on whether
   there is a watermark (below): a cold sweep lists the glob itself with
-  `gsutil ls`, a walk of every PR directory that grows with the archive and
-  passes the collector's per-call timeout (`GSUTIL_TIMEOUT_S`) at ~1700
+  `gcloud storage ls`, a walk of every PR directory that grows with the archive and
+  passes the collector's per-call timeout (`GCLOUD_TIMEOUT_S`) at ~1700
   builds; an incremental scan lists the job's directory index instead.
 - `--index-prefix <gs prefix>` — Prow's per-job directory index,
   `gs://<bucket>/pr-logs/directory/<job>/`: one `<build_id>.txt` object per
   build holding the `gs://` path of that build's directory (its
-  `latest-build.txt` is ignored). One `gsutil ls` of the prefix names every
+  `latest-build.txt` is ignored). One `gcloud storage ls` of the prefix names every
   build in seconds; the ids above the watermark (plus `pending_builds`) are
   the only pointers read, and only those builds are then read,
   `READ_WORKERS` at a time. Defaults to the index derived from each
@@ -574,8 +586,8 @@ what the renderer does with them.
   listed even with a watermark. It changes how a `--pr-glob` scan finds
   builds, not whether one happens: `--merge-with` alone still recomputes
   without touching the bucket. A listing that fails or times out is a
-  `warning: gsutil ls ... failed` line and nothing new; a pointer that
-  cannot be read is a `warning: gsutil cat ... failed` line and that one
+  `warning: gcloud storage ls ... failed` line and nothing new; a pointer that
+  cannot be read is a `warning: gcloud storage cat ... failed` line and that one
   build deferred to `pending_builds`. The refresh workflow greps for either
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
@@ -601,7 +613,7 @@ what the renderer does with them.
   one, a listing that matched no objects (the
   index purged or moved, the job renamed, while a run from before sits on
   record) is the same note, and any other failure is the refusal line, as
-  it is for the presubmit. A listing that hangs past `GSUTIL_TIMEOUT_S` is
+  it is for the presubmit. A listing that hangs past `GCLOUD_TIMEOUT_S` is
   the refusal line either way, as for the nightly.
 - `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
   periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
@@ -614,7 +626,7 @@ what the renderer does with them.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
-  `latest-build.txt` (ignored), no pointer objects, so one `gsutil ls`
+  `latest-build.txt` (ignored), no pointer objects, so one `gcloud storage ls`
   names every build and the watermark filter runs on it directly. Every
   build read through it is `tier: "nightly"`, `pr: null`, `job` the
   prefix's last segment (or `--nightly-job`). Given without a value it is
@@ -623,7 +635,7 @@ what the renderer does with them.
   cluster default `gs://kube-agents-prow`); omitted, no
   nightly scan happens (`--merge-with` alone still recomputes without
   touching the bucket). A prefix that does not list is read three ways. A
-  prefix with no objects (`gsutil` says "matched no objects") is a job
+  prefix with no objects (`gcloud storage ls` says "matched no objects") is a job
   that has not run there yet — before its first night, or after its bucket
   moved while nights from the old one are on record — so that is a
   `note: nightly prefix ... did not list` line and no nightly runs this
@@ -632,11 +644,11 @@ what the renderer does with them.
   publishing. Any other failure with no night on record (no nightly
   watermark) is the same note: the periodic may simply not exist yet. With
   a night on record, any other failure is a
-  `warning: gsutil ls failed for ...` line — the refusal line — because a
+  `warning: gcloud storage ls failed for ...` line — the refusal line — because a
   prefix that listed yesterday and not today is the bucket or the grant
   failing, and republishing would freeze the nightly record under a fresh
   `generated_at` with nothing said. A listing that hangs past
-  `GSUTIL_TIMEOUT_S` is the refusal line either way, as any hung `gsutil`
+  `GCLOUD_TIMEOUT_S` is the refusal line either way, as any hung `gcloud storage`
   call is.
 - `--nightly-job <name>` — the `job` recorded on nightly runs; default
   derived from the prefix.
@@ -820,7 +832,7 @@ recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
 the suite could not evaluate; empty on every other verdict), `cases[]`
 (`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
 do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
-ceiling}`) and `health_at` (the verdict in force when it finished, from
+ceiling, fixture}`) and `health_at` (the verdict in force when it finished, from
 history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -877,8 +889,8 @@ when none is on record),
 each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
-previous_build, parts[], missing_parts[], running_parts[], turn1_p50_s,
-turn1_p95_s, cases[]}`. A
+previous_build, parts[], missing_parts[], running_parts[],
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, cases[]}`. A
 night is one nightly run, or the main, main-b and writers parts' runs of
 one date:
 a run's date is the UTC date of its start plus 15 minutes
@@ -919,6 +931,12 @@ run is on record no night names main-b; once the main job runs the whole
 matrix again, a night short of a main case is incomplete without naming a
 part, and one short of a former main-b or writers case reports that part
 missing.
+`verdict_withheld_by` is the first of `main` and `main-b` the night lacks
+— in `missing_parts[]` or `running_parts[]`, or, for `main`, absent from
+`parts[]` — and `null` otherwise: that half's cases were never compared, so
+neither the digest nor the Nightly page and the Brief give a newly-failing
+verdict for the night, though `newly_failing` still lists what the parts on
+record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
 infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s}` with `state` in `pass|partial|fail|infra`
@@ -1088,7 +1106,8 @@ that path the same way before the lookup. `partial` is `null`, or
 (`--deadline-s`) between waves of fetches with objects left for the next
 tick, which finds them absent from its `--prior` and reads them first;
 `warnings[]` names each line that
-would not parse (skipped, never fatal); `error` is set when the read did
+would not parse and each object the read could not fetch (failed, or gone
+since the listing), in gcloud's words (skipped, never fatal); `error` is set when the read did
 not happen — the listing failed, or the workflow called `--fail-with` for a
 read its `timeout` killed or its wall clock could not fit — and the
 document is the prior read written back with the reason. The reader lists
@@ -1208,7 +1227,9 @@ while its GitLab sweep report names a token that is due, dead or unreadable
 "the run passed; N token(s) to rotate", and its `absence`, `effect` and
 `runbook` are the credential's words rather than the sweep's): `{job, label, verdict, since, build,
 finished_at, result, stale_after_h, dry_run, detail[], summary, history_url,
-place, absence, does, effect, runbook}`. `detail` (on `FAILED`, and the token lines on `TOKEN`)
+place, absence, does, effect, runbook}`, plus on `FAILED`, each only when it
+was read, `node` (the build pod's node), `last_event` (a Warning event's
+reason) and `last_line` (the log line that says how the build died). `detail` (on `FAILED`, and the token lines on `TOKEN`)
 is the report's lines, the projects capped at five (then `and N more`) and the
 run's lines after the cap: for the reconcile the
 projects it refused, failed or was interrupted in, each with its one next
@@ -1433,7 +1454,7 @@ the setup, the judge, the `<scoring>-f<fleet>-v<verifiers>` directory and the
 | `cluster-agent-crashloop-debug` | 3/3 with `OutcomeValidity` 0.9: a pass that is not 1.0 |
 | `upgrades-fleet-version-table`  | 3/3, `OutcomeValidity` 0.8                             |
 
-`scripts/test_eval_dashboard_store.py` serves them through a fake `gsutil`
+`scripts/test_eval_dashboard_store.py` serves them through a fake `gcloud`
 (`ls` of the tree, `cat` of the files) and pins the parse, the window, the
 per-key cap and the incremental read; `scripts/test_eval_dashboard_trend.py`
 derives the trend from them and renders the page.

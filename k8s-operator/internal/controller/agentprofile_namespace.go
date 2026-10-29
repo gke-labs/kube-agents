@@ -66,6 +66,21 @@ func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Namespace + profileNamespaceSuffix
 }
 
+// profileNamespaceOf is the profile namespace for a profile: the one beside
+// its own namespace, which is its agent's. It needs no agent, so a profile
+// deleted after its agent still finds its ServiceAccounts.
+func profileNamespaceOf(p *agentv1alpha1.AgentProfile) string {
+	return p.Namespace + profileNamespaceSuffix
+}
+
+// agentNamespaceOfProfileServiceAccount is the namespace whose agent renders
+// a profile ServiceAccount's map entry, the one beside a profile namespace.
+// Any other namespace holds no ServiceAccount the map reads.
+func agentNamespaceOfProfileServiceAccount(ns string) (string, bool) {
+	agentNS, ok := strings.CutSuffix(ns, profileNamespaceSuffix)
+	return agentNS, ok && agentNS != ""
+}
+
 // resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted.
 func resolveProfileCeiling(agent *agentv1alpha1.PlatformAgent) int {
 	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.Ceiling != nil {
@@ -199,16 +214,15 @@ func profileNamespacePeer(agent *agentv1alpha1.PlatformAgent) networkingv1.Netwo
 	}
 }
 
-// profileNamespaceExists reads the profile namespace. A namespace that
-// doesn't exist is an install the chart didn't make it for (a CR applied by
-// hand, or a chart from before #3655): profile work renders nothing there,
-// and the operator never creates it.
-func (r *PlatformAgentReconciler) profileNamespaceExists(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
-	// Through a2aReader: Namespace is a kind this controller doesn't
-	// otherwise watch, and a cached Get would start a cluster-wide informer
-	// for it on every install.
+// profileNamespaceReady reads the profile namespace through reader, which
+// both callers pass uncached: Namespace is a kind neither controller
+// watches, and a cached Get would start a cluster-wide informer for it on
+// every install. A namespace that doesn't exist is an install the chart
+// didn't make it for (a CR applied by hand, or a chart from before #3655):
+// profile work renders nothing there, and the operator never creates it.
+func profileNamespaceReady(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	var ns corev1.Namespace
-	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+	if err := reader.Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -226,6 +240,11 @@ func (r *PlatformAgentReconciler) profileNamespaceExists(ctx context.Context, ag
 		return false, nil
 	}
 	return true, nil
+}
+
+// profileNamespaceExists is profileNamespaceReady through the uncached reader.
+func (r *PlatformAgentReconciler) profileNamespaceExists(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	return profileNamespaceReady(ctx, r.a2aReader(), agent)
 }
 
 // reconcileProfileFence applies the profile namespace's fence, and reports

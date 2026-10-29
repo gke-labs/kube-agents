@@ -49,7 +49,9 @@ Chat Agent's home, and a job on another profile would gate itself on a different
 Stages this job takes over keep their `.bootstrap_*` markers, so an install upgraded mid-onboarding
 carries on from where it was. One whose `oobe` an earlier image already removed carries on through
 the old jobs, which the sync leaves enabled while no `oobe` job exists. New stages use `.oobe_*`. The `bootstrap_onboarding` plugin keeps the
-first message: it greets, and links the delivery to that chat.
+first message: it greets, links the delivery to that chat, and holds delivery until the greeting turn
+ends (`.bootstrap_greeting_pending.<turn>`, dropped by delivery itself after `GREETING_WAIT_SECONDS`),
+so the report follows the greeting.
 
 Order within a tick: delivery, then the scan, then the audits (§5 says why delivery is first). The
 audits wait for the scan rather than

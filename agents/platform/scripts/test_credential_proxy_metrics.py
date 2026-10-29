@@ -731,6 +731,49 @@ class BrokerFailureLabelsTest(unittest.TestCase):
         self.assertEqual(1, _series(families, self.FAMILY, kind="exec_timeout", tool="other"))
 
 
+class VcsProviderLabelsTest(unittest.TestCase):
+    """The version-control family carries a provider beside verb and status:
+    the built forge a request resolved to, `none` on every exit before one
+    did (the ungated capabilities verb included), so a query by provider
+    finds which forge is failing and a query by verb and status alone sums
+    the forges."""
+
+    FAMILY = "kubeagents_vcs_requests_total"
+
+    def test_two_providers_under_one_verb_and_status_are_two_series(self):
+        metrics = ProxyMetrics()
+        metrics.record_vcs("proposal-create", "success", "github")
+        metrics.record_vcs("proposal-create", "success", "github")
+        metrics.record_vcs("proposal-create", "success", "gitlab")
+        metrics.record_vcs("proposal-list", "blocked")
+        families = _parse(metrics.render())
+        self.assertEqual(2, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="github"))
+        self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="gitlab"))
+        self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-list", status="blocked", provider="none"))
+        self.assertEqual(3, len(families[self.FAMILY]))
+        self.assertIn("provider", metrics.render().split(f"# HELP {self.FAMILY}", 1)[1].split("\n", 1)[0])
+
+    def test_a_provider_outside_the_known_set_is_folded_to_other(self):
+        metrics = ProxyMetrics()
+        metrics.record_vcs("proposal-create", "success", "bitbucket")
+        families = _parse(metrics.render())
+        self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="other"))
+        self.assertNotIn("bitbucket", metrics.render())
+
+    def test_a_status_outside_the_closed_set_is_folded_to_error(self):
+        # An exit that named no outcome (a bare return) or an unlisted word
+        # lands under error rather than breaking the whole exposition.
+        metrics = ProxyMetrics()
+        metrics.record_vcs("proposal-create", None, "github")
+        metrics.record_vcs("proposal-create", "weird", "github")
+        metrics.record_vcs("proposal-create", "success", "github")
+        families = _parse(metrics.render())
+        self.assertEqual(2, _series(families, self.FAMILY, verb="proposal-create", status="error", provider="github"))
+        self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="github"))
+        self.assertNotIn("None", metrics.render())
+        self.assertNotIn("weird", metrics.render())
+
+
 class BrokerFailureCountingTest(_BrokerFixture):
     """The broker's own failures count by kind: a timeout, a broker fault on
     the exec route, a git failure on the version-control route; a refusal, a
@@ -834,8 +877,10 @@ class BrokerFailureCountingTest(_BrokerFixture):
                 self.assertEqual(want, kind(label(path), status))
 
     def test_an_unreadable_managed_list_counts_as_vcs_failed_despite_its_503(self):
+        forge = mock.Mock()
+        forge.name = "github"
         broker = mock.Mock()
-        broker.registry.resolve.return_value = ("github", "example.com/o/r")
+        broker.registry.resolve.return_value = (forge, "example.com/o/r")
         with (
             mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
             mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
@@ -887,7 +932,7 @@ class BrokerFailureCountingTest(_BrokerFixture):
 
 
 class VcsRequestCountingTest(_BrokerFixture):
-    """The version-control route counts by verb and outcome, the way the exec route counts tools."""
+    """The version-control route counts by verb, outcome and provider, the way the exec route counts tools."""
 
     def post_vcs(self, verb, payload=None):
         request = urllib.request.Request(
@@ -902,15 +947,17 @@ class VcsRequestCountingTest(_BrokerFixture):
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
-    def assert_vcs_count(self, verb, status, expected=1, msg=None):
+    def assert_vcs_count(self, verb, status, expected=1, msg=None, provider="none"):
         """Assert the series reaches `expected`, polling first: the outcome is
         recorded after the response is written, so a scrape right behind the
         answer can precede the increment, and a series that already exists from
         an earlier request reads one short. At the deadline the assertion fails
-        with the last value seen, so a miscount still names the real number."""
+        with the last value seen, so a miscount still names the real number.
+        `provider` is `none` unless the request resolved a forge: the routes
+        `vcs_route` builds are ungated, so nothing resolves one."""
         deadline = time.monotonic() + 2.0
         while True:
-            count = _series(self.families(), "kubeagents_vcs_requests_total", verb=verb, status=status)
+            count = _series(self.families(), "kubeagents_vcs_requests_total", verb=verb, status=status, provider=provider)
             if count == expected or time.monotonic() > deadline:
                 break
             time.sleep(0.02)
@@ -924,6 +971,47 @@ class VcsRequestCountingTest(_BrokerFixture):
             mock.patch.object(credential_proxy.vcs_broker, "UNGATED_VERBS", frozenset({verb})),
         ):
             yield
+
+    @contextlib.contextmanager
+    def gated_route(self, verb, fn, forge_name="github"):
+        """A gated route behind a registry that resolves every repository to
+        one forge named `forge_name`, with the managed list answering yes."""
+        forge = mock.Mock()
+        forge.name = forge_name
+        broker = mock.Mock()
+        broker.registry.resolve.return_value = (forge, "example.com/o/r")
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={verb: fn}),
+            mock.patch.object(credential_proxy, "repository_is_managed", return_value=True),
+        ):
+            yield
+
+    def test_a_proposal_through_a_resolved_forge_carries_its_provider(self):
+        with self.gated_route("proposal-create", lambda payload: {"number": 7}):
+            status, _ = self.post_vcs("proposal-create", {"repository": "github:example.com/o/r"})
+        self.assertEqual(200, status)
+        self.assert_vcs_count("proposal-create", "success", provider="github")
+        self.assertIsNone(_series(self.families(), "kubeagents_vcs_requests_total", verb="proposal-create", status="success", provider="none"))
+
+    def test_a_request_refused_before_a_forge_resolved_carries_provider_none(self):
+        # A body that is not an object is refused before the resolve; a host no
+        # forge serves is refused by the resolve itself. Neither names a forge.
+        with self.gated_route("proposal-create", lambda payload: {"number": 7}):
+            status, _ = self.post_vcs("proposal-create", ["not", "an", "object"])
+        self.assertEqual(400, status)
+        self.assert_vcs_count("proposal-create", "error", provider="none")
+        broker = mock.Mock()
+        broker.registry.resolve.side_effect = credential_proxy.providers.ForgeUnsupported("bitbucket.example is not a forge this install serves")
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-create": lambda payload: {"number": 7}}),
+        ):
+            status, _ = self.post_vcs("proposal-create", {"repository": "bitbucket.example/o/r"})
+        self.assertEqual(501, status)
+        self.assert_vcs_count("proposal-create", "blocked", provider="none")
+        for labels in self.families()["kubeagents_vcs_requests_total"]:
+            self.assertEqual("none", dict(labels)["provider"])
 
     def test_a_proposal_the_forge_accepted_counts_as_success_under_its_verb(self):
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
@@ -1013,8 +1101,10 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assert_vcs_count("proposal-list", "abandoned")
 
     def test_an_unreadable_managed_list_counts_as_error_not_blocked(self):
+        forge = mock.Mock()
+        forge.name = "github"
         broker = mock.Mock()
-        broker.registry.resolve.return_value = ("github", "example.com/o/r")
+        broker.registry.resolve.return_value = (forge, "example.com/o/r")
         with (
             mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
             mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
@@ -1023,8 +1113,9 @@ class VcsRequestCountingTest(_BrokerFixture):
             status, body = self.post_vcs("proposal-list", {"repository": "o/r"})
         self.assertEqual(503, status)
         self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", body["code"])
-        self.assert_vcs_count("proposal-list", "error")
-        self.assertIsNone(_series(self.families(), "kubeagents_vcs_requests_total", verb="proposal-list", status="blocked"))
+        # The forge resolved before the list was read, so the fault names it.
+        self.assert_vcs_count("proposal-list", "error", provider="github")
+        self.assertIsNone(_series(self.families(), "kubeagents_vcs_requests_total", verb="proposal-list", status="blocked", provider="github"))
 
     def test_every_label_value_is_from_the_closed_vocabularies(self):
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
@@ -1036,6 +1127,71 @@ class VcsRequestCountingTest(_BrokerFixture):
             pairs = dict(labels)
             self.assertIn(pairs["verb"], credential_proxy.vcs_broker.VCS_VERBS | {credential_proxy.LABEL_OTHER})
             self.assertIn(pairs["status"], credential_proxy.VCS_STATUSES)
+            self.assertIn(pairs["provider"], credential_proxy.VCS_PROVIDERS | {credential_proxy.VCS_PROVIDER_NONE, credential_proxy.LABEL_OTHER})
+
+    @contextlib.contextmanager
+    def real_registry_route(self, forges, verb, fn, managed):
+        """A gated route behind the real `providers.Registry` built from
+        `forges` (each given a token file), with the managed list answering
+        `managed`: the resolve is the registry's own, stubs and all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "token"
+            token.write_text("tok\n", encoding="utf-8")
+            # GitHub scopes by App installation and refuses allowed_paths.
+            entries = [
+                {**entry, "token_path": str(token), **({} if entry["provider"] == "github" else {"allowed_paths": ()})}
+                for entry in forges
+            ]
+            broker = mock.Mock()
+            broker.registry = credential_proxy.providers.Registry({"forges": entries})
+            with (
+                mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+                mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={verb: fn}),
+                mock.patch.object(credential_proxy, "repository_is_managed", return_value=managed),
+            ):
+                yield
+
+    def test_every_shipped_forge_records_its_own_name(self):
+        # Behavioural rather than a read of the constant: each forge class the
+        # image ships, configured on a host of its own, resolves a repository
+        # there and the series carries that class's name unfolded.
+        for cls in credential_proxy.providers.AVAILABLE:
+            with self.subTest(provider=cls.name):
+                host = cls.default_hosts[0] if cls.default_hosts else f"{cls.name}.example.com"
+                with self.real_registry_route([{"provider": cls.name, "host": host}], "proposal-view", lambda payload: {"proposal": {}}, True):
+                    status, _ = self.post_vcs("proposal-view", {"repository": f"https://{host}/acme/infra", "number": 1})
+                self.assertEqual(200, status)
+                self.assert_vcs_count("proposal-view", "success", provider=cls.name)
+
+    def test_a_host_the_registry_only_stubs_records_no_provider(self):
+        # A github-only install: gitlab.com and bitbucket.org resolve to the
+        # registry's placeholder forges, which name a gap, not a forge this
+        # install has. The series must not call them one.
+        with self.real_registry_route([{"provider": "github", "host": "github.com"}], "proposal-view", lambda payload: {"proposal": {}}, False):
+            for repository in ("https://gitlab.com/acme/infra", "https://bitbucket.org/acme/infra"):
+                status, _ = self.post_vcs("proposal-view", {"repository": repository, "number": 1})
+                self.assertEqual(403, status, repository)
+            status, _ = self.post_vcs("proposal-view", {"repository": "https://github.com/acme/infra", "number": 1})
+            self.assertEqual(403, status)
+        self.assert_vcs_count("proposal-view", "blocked", 2, provider="none")
+        self.assert_vcs_count("proposal-view", "blocked", 1, provider="github")
+        self.assertEqual(2, len(self.families()["kubeagents_vcs_requests_total"]))
+
+    def test_a_tls_refusal_from_git_counts_as_error_and_leaves_the_exposition_readable(self):
+        def untrusted(payload):
+            raise subprocess.CalledProcessError(
+                128, ["git", "fetch"],
+                stderr="fatal: unable to access 'https://github.com/o/r/': SSL certificate problem: certificate signer not trusted\n",
+            )
+
+        with self.gated_route("proposal-create", untrusted):
+            status, body = self.post_vcs("proposal-create", {"repository": "github:example.com/o/r"})
+        # Answered 502 by name, the same status as any other git failure on
+        # this route: the forge's certificate did not verify, which is a fault
+        # of the upstream, not a refusal at the route.
+        self.assertEqual((502, "FORGE_TLS_UNTRUSTED"), (status, body["code"]))
+        self.assert_vcs_count("proposal-create", "error", provider="github")
+        self.assertIn("# TYPE kubeagents_vcs_requests_total counter", CredentialProxyHandler.metrics.render())
 
     def test_the_verb_vocabulary_is_the_route_table(self):
         self.assertEqual(set(credential_proxy.vcs_broker.route_table(mock.Mock())), set(credential_proxy.vcs_broker.VCS_VERBS))

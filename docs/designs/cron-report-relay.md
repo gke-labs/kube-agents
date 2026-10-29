@@ -181,6 +181,18 @@ summary's headline, its finding rows, its other lines under them, and "Look at t
 one" with no link button. Where the card does not post, `headline_from_summary` goes out
 as text, and the fallbacks are those of the ledger card.
 
+`kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
+says: the script leaves its rows, each with the ids of the cards it stands for, in a file
+beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
+only when its text is the report being relayed, with the flag on and a channel known.
+`_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
+under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
+(`chat_from_card`), with Retry and Drop under each row; its outcomes, and the report going
+out as text where the card does not post, are the audit card's. A tap on either is no turn:
+it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
+edits the row
+([the job's section](../../agents/platform/cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)).
+
 ## Why no agent turn runs over the report
 
 The relay first ran one Chat Agent turn over each report, told to reproduce it
@@ -241,15 +253,19 @@ run saves the previous run's finding ids on the entry before it touches the ledg
 that run filed, rendered or not, so a finding a body over budget cut is not the run's new; a later
 `finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
 whole run, and its line states the run's new and resolved findings, or says the change is unknown
-when the first `finish` had no trusted memory of the previous run. Its JSON line still counts
-against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
+when the first `finish` had no trusted memory of the previous run. With the ids, the first
+`finish` saves what it read about the last scheduled run, so the line on that chat report that
+says the change since the last scheduled run also covers the whole run (`run_since_scheduled`).
+The JSON line of the later `finish` still counts against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
 `finish` does not save the mid-run memory it reads after an earlier one filled the entry without
 them. A no-forge or HELD report, or an entry without those
 ids, keeps a label that says its counts are against the earlier `finish`: the report above, or
 what it published. The earlier `finish` saves its
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
-it writes the report store. When that was `false` the later one is not silent either and its automatic
-sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
+it writes the report store. With it, it saves `news`: true when it reported news or opened a pull
+request. When `news` was true the later one is not silent either and its automatic
+sweep opens no pull request (`earlier_finish`, `silent_floor`). The floor does not read `silent_ok`,
+because an on-demand `finish` always gets `silent_ok: false`, also when it reported nothing new. A `finish` with no `start` fills no entry,
 but while a current record holds this repository's entry with a saved verdict it is taken for a
 later `finish` of that run, and the
 relay posts that run's report again with its own under it. The relay
@@ -707,6 +723,10 @@ carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
 scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
 sender and carries no such guard; no roster job uses `"all"`.
+
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+That sentence controls silence, not delivery: a prompt without it only makes the job noisier
+([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 
 ## How the switch is wired: `chat` is a platform
 

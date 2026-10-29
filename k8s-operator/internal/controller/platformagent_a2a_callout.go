@@ -103,7 +103,8 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	1 -> serviceAccount, user, account, grants
 //	2 -> adds narrowing
 //	3 -> adds profile and topics (the AgentProfile entry)
-const a2aIdentityMapSchema = "3"
+//	4 -> adds tier (one AgentProfile entry per tier, #3655)
+const a2aIdentityMapSchema = "4"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -535,8 +536,8 @@ const a2aAuthDelegatorRole = "system:auth-delegator"
 // Each would rewrite the other's Subjects on every reconcile, so one namespace's
 // callout silently loses TokenReview and refuses every connection with an error
 // indistinguishable from a bad token; and teardown then fails the ownership
-// check and returns "refusing to delete unowned" forever. The controller
-// already spells cluster-scoped names this way elsewhere.
+// check and leaves the binding to the other agent. The controller already
+// spells cluster-scoped names this way elsewhere.
 func a2aCalloutClusterRoleBindingName(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("kubeagents:a2a-callout-tokenreview:%s:%s", agent.Namespace, agent.Name)
 }

@@ -76,19 +76,32 @@ RUN apt-get update && \
       wget && \
     rm -rf /var/lib/apt/lists/*
 
-# The credential-free utility CLIs, at the versions the agent image carried
-# before #737 moved them here. This is now their only home — deploy/docker's
-# step 2 says so and its guard enforces it — so a version bump has one place to
-# happen. k9s did not come across: it is a full-screen terminal UI, and every
-# command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
-# it could not run even if a skill asked for it. Nothing in agents/ does.
+# The credential-free utility CLIs: yq and helm (at the versions the agent
+# image carried before #737 moved them here) plus leeway for GKE capacity,
+# spot, and zonal topology-skew diagnostics. This is their only home —
+# deploy/docker's step 2 says so and its guard enforces it — so a version bump
+# has one place to happen. leeway holds no credentials of its own; inside the
+# sandbox session `CREDENTIAL_PROXY_URL` is set (`pkg/clusters/broker.go`:
+# `BrokerFromEnv` sets `ShellMode: true`), so `leeway report` (`v0.1.3+`) leaves
+# `Cluster.Config = nil` and `fetchViaKubectl` (`pkg/report/collector.go`)
+# shells out to the sandbox's `kubectl` credential-proxy shim on `PATH`
+# (`/opt/credential-proxy/bin/kubectl`, governed by `KUBECTL_READ_VERBS`) rather
+# than dialing the Kubernetes API server directly through `client-go`.
+# k9s did not come across: it is a full-screen terminal UI, and every command
+# here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
+# could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
-    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH} && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz "https://github.com/go-steer/leeway/releases/download/v0.1.3/leeway_v0.1.3_linux_${ARCH}.tar.gz" && \
+    tar -xzf /tmp/leeway.tar.gz -C /usr/local/bin leeway && \
+    chmod +x /usr/local/bin/leeway && \
+    rm -f /tmp/leeway.tar.gz && \
+    /usr/local/bin/leeway version
 
 # OpenTofu, for one command: `tofu fmt -check -diff`, the gcp-terraform skill's
 # syntax check on the HCL it writes before a pull request. It is the only check
@@ -133,6 +146,24 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Cloud API relay (`credential_proxy_client.ApiSession`, over `requests`)
 # for the REST reads no CLI exposes, which is the whole arrangement.
 RUN pip install --no-cache-dir pyyaml requests
+
+# Precompile the standard library to bytecode at build time (#4027).
+# python:3.14-slim ships no precompiled .pyc files in the standard library, and
+# PYTHONDONTWRITEBYTECODE=1 (needed so root runs do not write caches into /opt/defaults)
+# prevents Python from caching bytecode at runtime. Without this, every invocation of
+# python3 or credential-proxy-exec re-compiles the standard library from source,
+# costing ~0.85s of CPU per command in the shell.
+# Precompiled bytecode is baked into /usr/local/lib/python3.14/ and never touches
+# /opt/defaults, so PYTHONDONTWRITEBYTECODE=1 can safely stay.
+#
+# No `-o`: the runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
+# plain `.cpython-NNN.pyc` that a bare compileall writes, not an `.opt-N` one.
+# An `-o` or `-oN` would write `.opt-N.pyc` files that nothing loads, quietly
+# putting the runtime back to compiling from source.
+RUN STDLIB="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
+    [ -d "$STDLIB" ] && \
+    { python3 -m compileall -q -j 0 "$STDLIB" || true; } && \
+    [ "$(find "$STDLIB" -name '*.pyc' ! -name '*.opt-*.pyc' | head -500 | wc -l)" -ge 500 ]
 
 # A real git with no credential and no way to reach a host.
 #
@@ -585,6 +616,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
+     agents/platform/scripts/untrusted_text.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
@@ -685,6 +717,7 @@ COPY agents/platform/scripts/forge.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
+     agents/platform/scripts/untrusted_text.py \
      /opt/vcs/libexec/platform/
 COPY deploy/sandbox/trusted-closure-guard.py /opt/vcs/libexec/trusted-closure-guard.py
 RUN set -e; \

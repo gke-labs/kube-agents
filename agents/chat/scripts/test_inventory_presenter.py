@@ -1,4 +1,4 @@
-"""Tests for inventory_presenter and its flag gate in bootstrap_delivery."""
+"""Tests for inventory_presenter and the text path's flag gate in bootstrap_delivery."""
 
 import contextlib
 import io
@@ -18,7 +18,6 @@ sys.path.insert(0, str(HERE.parent.parent / "platform" / "scripts"))
 
 import bootstrap_delivery
 import inventory_presenter
-import oobe
 
 #: A paragraph of this many "1 more clusters" runs (96 KB) took 60 seconds with
 #: the scope-noun lookahead unbounded.
@@ -1552,8 +1551,8 @@ class DeliveryFlagTest(unittest.TestCase):
         self.assertEqual(self._run("1"), delivered(PRESENTED))
         self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
 
-    def test_flag_on_without_a_relay_prints_the_text(self):
-        # A Slack origin with a chat id, so only the missing relay stops the blocks.
+    def test_flag_on_with_no_card_prints_the_text(self):
+        # No files beside the report, so no card: the reshaped text goes and no blocks are posted.
         import slack_blocks_post
 
         with mock.patch.object(slack_blocks_post, "post") as poster:
@@ -1579,83 +1578,6 @@ class DeliveryFlagTest(unittest.TestCase):
         boom = mock.patch.object(inventory_presenter, "present", side_effect=ValueError("boom"))
         with boom, contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self._run("1"), delivered(REPORT))
-
-
-
-class BlocksDeliveryTest(unittest.TestCase):
-    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
-
-    def setUp(self):
-        import slack_blocks_post
-
-        self.sbp = slack_blocks_post
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.d = Path(self._tmp.name)
-        (self.d / "INVENTORY.md").write_text(REPORT, encoding="utf-8")
-        (self.d / ".user_aligned").touch()
-
-    def _run(self, post, flag="1", origin=ORIGIN):
-        env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
-        env.update({"KAGE_SLACK_UX": flag, "SLACK_RELAY_URL": RELAY_URL})
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
-            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
-            mock.patch.object(self.sbp, "post", side_effect=post) as poster,
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(err),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        self.posts = poster.call_args_list
-        return out.getvalue()
-
-    def test_posts_blocks_into_the_origin_and_prints_only_the_audits_note(self):
-        self.assertEqual(self._run(lambda *a: "9.9"), RUNNING_NOTE + "\n")
-        (post,) = self.posts
-        channel, text, blocks, thread_ts = post.args
-        self.assertEqual((channel, thread_ts), ("C1", "1.5"))
-        self.assertEqual(blocks[-1]["elements"][0]["text"]["text"], "Fix the first one")
-        self.assertTrue(text.startswith("*I scanned 3 clusters and 41 workloads and found 22 things to look at."))
-        self.assertTrue((self.d / ".bootstrap_completed").exists())
-        self.assertEqual((self.d / "INVENTORY.delivered.md").read_text(encoding="utf-8"), REPORT)
-
-    def test_a_skip_goes_out_as_its_own_message_after_the_blocks(self):
-        (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
-        with contextlib.redirect_stderr(io.StringIO()):
-            oobe.skip(self.d, oobe.SKIP_NOT_NEW, 1000.0)
-        self.assertEqual(
-            self._run(lambda *a: "9.9"),
-            f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
-        )
-        self.assertEqual(len(self.posts), 1)
-
-    def test_flag_off_is_byte_identical(self):
-        self.assertEqual(self._run(lambda *a: "9.9", flag="0"), delivered(REPORT))
-        self.assertEqual(self.posts, [])
-
-    def test_a_refusal_that_is_not_about_blocks_is_not_retried(self):
-        self.assertEqual(self._run(self.sbp.Refused("channel_not_found")), delivered(PRESENTED))
-        self.assertEqual(len(self.posts), 1)
-
-    def test_refused_blocks_are_not_retried(self):
-        # The card has no fold to leave out, so the same blocks would be refused again.
-        self.assertEqual(self._run(self.sbp.Refused("invalid_blocks")), delivered(PRESENTED))
-        self.assertEqual(len(self.posts), 1)
-
-    def test_a_relay_failure_prints_the_text(self):
-        self.assertEqual(self._run(OSError("connection refused")), delivered(PRESENTED))
-        self.assertEqual(len(self.posts), 1)
-
-    def test_a_post_that_may_have_landed_still_prints_the_text(self):
-        # The first inventory is sent once, so a second copy beats none.
-        self.assertEqual(self._run(TimeoutError("timed out")), delivered(PRESENTED))
-        self.assertEqual(len(self.posts), 1)
-
-    def test_no_chat_id_prints_the_text(self):
-        self.assertEqual(self._run(lambda *a: "9.9", origin={"platform": "slack"}), delivered(PRESENTED))
-        self.assertEqual(self.posts, [])
 
 
 
@@ -1733,64 +1655,6 @@ class FoldTest(unittest.TestCase):
     def test_a_report_that_does_not_parse_has_no_chat_message(self):
         self.assertIsNone(inventory_presenter.chat("# Report\n\n| Cluster | ... |\n"))
 
-
-class GatewayDeliveryTest(unittest.TestCase):
-    """Under spec.mode: next the card goes through the gateway as a chat message."""
-
-    ORIGIN = {"platform": "slack", "chat_id": "C1", "thread_id": "1.5"}
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.d = Path(self._tmp.name)
-        (self.d / "INVENTORY.md").write_text(REPORT, encoding="utf-8")
-        (self.d / ".user_aligned").touch()
-
-    def _run(self, returncode=0, origin=ORIGIN):
-        import slack_blocks_post
-
-        env = {k: v for k, v in os.environ.items() if k != "KAGE_SLACK_UX"}
-        env.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "slack"})
-        seen = {}
-
-        def run(argv, **_kwargs):
-            path = argv[argv.index("--chat-file") + 1]
-            with open(path, encoding="utf-8") as handle:
-                seen["chat"] = json.load(handle)
-            seen["argv"], seen["path"] = argv, path
-            return types.SimpleNamespace(returncode=returncode, stdout="{}", stderr="refused")
-
-        out, err = io.StringIO(), io.StringIO()
-        with (
-            mock.patch.dict(os.environ, env, clear=True),
-            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
-            mock.patch.object(bootstrap_delivery.sandbox_exec, "sandbox_enabled", return_value=False),
-            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
-            mock.patch.object(slack_blocks_post, "post") as relay,
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(err),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        relay.assert_not_called()
-        return out.getvalue(), seen
-
-    def test_posts_the_card_into_the_origin_thread_and_prints_only_the_audits_note(self):
-        out, seen = self._run()
-        self.assertEqual(out, RUNNING_NOTE + "\n")
-        self.assertEqual(seen["argv"][:6], ["a2a", "notify", "--platform", "slack", "--chat-file", seen["path"]])
-        self.assertEqual(seen["argv"][seen["argv"].index("--thread") + 1], "C1/1.5")
-        self.assertEqual(seen["argv"][-1], PRESENTED)
-        self.assertEqual(seen["chat"]["choices"][0], {"text": "Fix the first one", "primary": True})
-        self.assertFalse(os.path.exists(seen["path"]))
-
-    def test_a_refusal_prints_the_text(self):
-        out, _ = self._run(returncode=1)
-        self.assertEqual(out, delivered(PRESENTED))
-
-    def test_no_thread_prints_the_text(self):
-        out, seen = self._run(origin={"platform": "slack", "chat_id": "C1"})
-        self.assertEqual(out, delivered(PRESENTED))
-        self.assertEqual(seen, {})
 
 if __name__ == "__main__":
     unittest.main()

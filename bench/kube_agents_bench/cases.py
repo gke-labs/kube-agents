@@ -39,7 +39,10 @@ from typing import Any
 
 import yaml
 
+from kube_agents_bench import stop_hook
+
 __all__ = [
+    "HARNESS_WRITTEN_ENTRIES",
     "TRACE_GRADABLE_CHECK_TYPES",
     "TRANSPORT_BLIND_CHECK_TYPES",
     "WORKER_BLIND_CHECK_TYPES",
@@ -84,6 +87,11 @@ TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
 # outputs, so it is blind the same way.
 WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
+# Entries the harness writes on the trajectory itself (``stop_hook.py``), not
+# calls read off the door's trace, so a lossy trace says nothing about them:
+# a ``tool_called`` leaf naming only these is graded on every record.
+HARNESS_WRITTEN_ENTRIES = frozenset({stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY})
+_TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
@@ -204,6 +212,18 @@ def _leaves(node: Any) -> list[dict[str, Any]]:
     return [{}]
 
 
+def _harness_written(leaf: dict[str, Any]) -> bool:
+    """Whether a leaf is a ``tool_called`` over harness-written entries
+    only, which no transport blinds."""
+    names = leaf.get(_TOOL_CALLED_NAMES_KEY) or []
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+        and bool(names)
+        and set(names) <= HARNESS_WRITTEN_ENTRIES
+    )
+
+
 def _reads_the_workers(leaf: dict[str, Any]) -> bool:
     """Whether a transport-blind leaf is blind on every inject record: a
     worker type, a ``tool_called`` outside the ``router`` scope, or a
@@ -262,7 +282,8 @@ def _transport_blind_checks(
         check = entry.get("check")
         leaves = _leaves(check)
         if not leaves or not all(
-            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES for leaf in leaves
+            str(leaf.get("type") or "") in TRANSPORT_BLIND_CHECK_TYPES and not _harness_written(leaf)
+            for leaf in leaves
         ):
             continue
         name = str(entry["name"])

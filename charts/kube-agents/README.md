@@ -22,8 +22,9 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 - A Secret with the agent's credentials in the release namespace (name from
   `platformAgent.credentials.secretName`, default `platform-agent-secrets`),
   holding `API_SERVER_KEY` plus your model-provider key (`ANTHROPIC_API_KEY`,
-  `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none, it authenticates
-  with Workload Identity, and for `openai_compatible` the
+  `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none by default,
+  since it authenticates with Workload Identity unless
+  `litellm.vertex.credentialsSecretRef` is set, and for `openai_compatible` the
   `OPENAI_COMPATIBLE_API_KEY` is optional) and optional `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
   (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
@@ -228,24 +229,34 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 (gemini/anthropic/openai/vertex_ai/openai_compatible/sap, or any other LiteLLM provider slug with
 `litellm.modelDefaultName` set) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity, `openai_compatible`, whose key is optional, and `sap` and the other slugs,
+uses Workload Identity by default (or a service-account key Secret when
+`litellm.vertex.credentialsSecretRef` is set), `openai_compatible`, whose key is optional, and `sap` and the other slugs,
 whose credentials come from the Secret `litellm.envFromSecret` names (all below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
+needs — a request's own `max_tokens` still wins (on non-adaptive Claude models
+with `fallback.reasoningEffort` set to `low`/`medium`/`high`, LiteLLM sets
+`thinking.budget_tokens` to `1024`/`2048`/`4096` and Anthropic requires
+`maxTokens > budget_tokens`). `litellm.reasoningEffort`
 (`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
-under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
+under every primary alias the same way (the fallback alias carries
+`fallback.reasoningEffort`); LiteLLM maps it to `thinkingLevel` on Gemini 3.x
 ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
 On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
-`thinking` key under every alias, which a `reasoningEffort` value replaces
+`thinking` key under every primary alias, which a `reasoningEffort` value replaces
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
 and only a Claude model gets the prompt-caching breakpoints
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching)).
-Set `litellm.enabled=false`
+`litellm.fallback` and `litellm.dropParams` (both off
+by default) add a fallback alias at a specified reasoning effort with
+`router_settings.fallbacks` to it and drop parameters the
+provider refuses; `litellm.vertex.credentialsSecretRef` and `projectSecretRef`
+read a Vertex service-account key and project from a Secret. The site's
+inference-gateway page has the rendered shapes. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -314,9 +325,11 @@ it is off.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
-Vertex AI has no API key. The gateway calls
+Vertex AI has no API key by default. The gateway calls
 `projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
-as a Google Service Account reached through Workload Identity. `projectId`
+as a Google Service Account reached through Workload Identity by default (or a
+service-account key Secret when `litellm.vertex.credentialsSecretRef` is set).
+`projectId`
 defaults to `platformAgent.harness.projectId`; `location` defaults to `global`
 rather than the harness location, since a model is only callable from a
 location that serves it. Set a region for a data-residency requirement or a
@@ -520,6 +533,28 @@ sets, and the restart a new or rotated CA Secret needs, are in
 [GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
 in the token minter guide.
 
+### Web console
+
+`webConsole.*` renders the web console's Deployment, a ClusterIP Service and a
+deny-all ingress NetworkPolicy. `enabled` defaults to `false`;
+`install.sh --enable-web-console` turns it on, and the render fails if it is set
+without `platformAgent.enabled`. The Service type is not configurable,
+because the console holds the agent's API key and has no login of its own:
+`kubectl port-forward` is the only way in. When `litellm.enabled`, the chart
+also renders a headless Service, `<release>-web-console-litellm-peers`, that
+selects the LiteLLM pods so the console can read each replica's token and spend
+counters. `webConsole.agentIdentity.gcpServiceAccount` and `.roles` record the
+agent's Google Cloud identity for the console's About panel; the Terraform
+composition fills them from the IAM module, and the console never reads IAM
+itself. With `webConsole.environment.enabled` (the default) the chart also
+renders the console's ServiceAccount, a ClusterRole that lists nodes,
+namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
+gets/patches the `PlatformAgent` resource (for repository topology, preferred
+model annotations, and applied PR annotations). `values.yaml` describes
+each toggle. The
+[Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
+is canonical for what it does and how it is reached.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -596,6 +631,25 @@ policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and fr
 `platformAgent.monitoringScraperNamespace` when set, and nothing else; the health port, and
 the webhook port when the webhooks render, stay open. A `helm upgrade --reuse-values` from
 a release that predates `operator.metrics` renders with the listener off until the value is set.
+
+### Health-cohort rules (`platformAgent.healthRules`)
+
+`platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
+`Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
+operator's gauges, and the recording rules for their ratios; the alerts are listed on
+[Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
+Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
+into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
+in `gmp-public`; configure that first, since a Cloud Monitoring alerting policy does not read a
+`Rules` object. `true` fails at apply time where the `Rules` CRD is absent. Every threshold and
+sample floor is a value under `platformAgent.healthRules.thresholds`, with its default in
+`values.yaml`; set a ratio through a values file or `--set-json` (`helm --set` keeps a decimal as a
+string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
+the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
+defaults and keeps the release's values, or every threshold set; the schema requires the whole
+block and the template says so when it is missing. The rules read the operator's scrape, so
+enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
+render with a message.
 
 ### Turning telemetry off
 
@@ -1014,7 +1068,8 @@ creation. `--set quotaPreflight.enabled=false` skips it.
 What it sums: the chart's own workloads from `values.yaml` — the operator, LiteLLM and
 the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, which
 have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
-`platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
+`platformAgent.cleanupHook.enabled` is true) and the web console (one pod, when
+`webConsole.enabled` is true) — plus the pods the operator renders, whose
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas` (an over-count above one,
 since the operator runs the gateway as a single replica whatever the value); the shell sandbox, the
