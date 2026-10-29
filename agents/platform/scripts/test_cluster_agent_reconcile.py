@@ -3246,8 +3246,7 @@ class ScopeTest(HomesMixin):
         # the projects: gcloud lists and describes, as it would have before the relay.
         for failed in ({"status": 0, "error": {"exception": "ConnectionError"}},
                        {"status": 401, "error": {"error": "unauthorized"}},
-                       {"status": 503, "error": {"code": "RELAY_CREDENTIAL_UNAVAILABLE"}},
-                       {"status": 504, "error": {"code": "UPSTREAM_TIMEOUT"}}):
+                       {"status": 503, "error": {"code": "RELAY_CREDENTIAL_UNAVAILABLE"}}):
             with self.subTest(failed=failed):
                 profiles, identities = self._profiles("a")
                 _, relay = self._relay(lists={self.MGMT: failed})
@@ -3257,11 +3256,26 @@ class ScopeTest(HomesMixin):
                 self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
                 self.assertEqual(deleted, [])
 
+    def test_one_call_google_did_not_answer_is_that_reads_unknown_and_the_relay_stays_on(self):
+        # The management project is a batch of one. An UPSTREAM_* answer comes after the
+        # broker accepted the read and is about that call to Google, so it is that list's
+        # failure, as a timed-out gcloud list is, and PRUNE still describes through the relay.
+        profiles, identities = self._profiles("a")
+        batches, relay = self._relay(
+            lists={self.MGMT: {"status": 504, "error": {"code": "UPSTREAM_TIMEOUT", "error": "upstream timed out"}}},
+            gets={self._key("a"): {"status": 200}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(([], []), (lists, describes))
+        self.assertNotEqual(report["projects"][self.MGMT], rec.OUTCOME_OK)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertEqual(2, len(batches))
+
     def test_a_describe_batch_that_failed_in_the_relay_falls_back_to_gcloud(self):
         profiles, identities = self._profiles("a", "b")
         _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
             self._key("a"): {"status": 0, "error": {"exception": "ReadTimeout"}},
-            self._key("b"): {"status": 504, "error": {"code": "UPSTREAM_TIMEOUT"}}})
+            self._key("b"): {"status": 401, "error": {"error": "unauthorized"}}})
         report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
         self.assertEqual([], lists)
         self.assertEqual(["a", "b"], sorted(describes))

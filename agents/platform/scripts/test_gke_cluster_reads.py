@@ -91,12 +91,14 @@ class GkeClusterReadsTest(unittest.TestCase):
 
     def test_a_call_reads_for_no_longer_than_the_budget_left(self):
         url = f"{self.API}/projects/p1/locations/-/clusters"
-        for asked, budget in ((25.0, 25.0), (None, reads.DEFAULT_BUDGET_SECONDS), (0, reads.DEFAULT_BUDGET_SECONDS),
-                              (True, reads.DEFAULT_BUDGET_SECONDS)):
+        for asked, budget in ((25.0, 25.0), (7.0, 7.0), (None, reads.DEFAULT_BUDGET_SECONDS),
+                              (0, reads.DEFAULT_BUDGET_SECONDS), (True, reads.DEFAULT_BUDGET_SECONDS)):
             with self.subTest(asked=asked), mock.patch.object(reads.time, "monotonic", return_value=1000.0):
                 _, session = self._run({url: (200, {})}, {"projects": ["p1"], "budget_seconds": asked})
                 (connect, read), = session.timeouts
                 self.assertAlmostEqual(min(budget, connect + reads.MAX_READ_TIMEOUT), connect + read)
+                # A short budget is not spent on the connect allowance: the read gets half.
+                self.assertGreaterEqual(read, min(budget / 2, reads.MAX_READ_TIMEOUT))
 
     def test_a_call_the_budget_cannot_cover_is_not_started(self):
         # The read starts 24.5 s into a 25 s budget: it is not sent, and the row says why,

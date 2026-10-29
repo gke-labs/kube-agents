@@ -93,8 +93,10 @@ def _call(url: str, deadline: float) -> tuple[int, dict | None, dict | None]:
     left = deadline - time.monotonic()
     if left < MIN_CALL_SECONDS:
         return 0, None, {"skipped": "budget"}
-    connect = min(credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, left)
-    timeout = (connect, min(MAX_READ_TIMEOUT, max(MIN_CALL_SECONDS, left - connect)))
+    # The broker is a ClusterIP a hop away: the connect gets at most half of what is
+    # left, and the read the rest, so the two never pass the deadline.
+    connect = min(credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS, left / 2)
+    timeout = (connect, min(MAX_READ_TIMEOUT, left - connect))
     try:
         response = _session().get(url, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - reported, not raised: one read is one row

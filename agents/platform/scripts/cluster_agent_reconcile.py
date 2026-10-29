@@ -175,7 +175,9 @@ _api_disabled_this_run: set[str] = set()
 # with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
 # hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
 # settle time after it. Creates still run in the fixed order.
-# Every lookup is a gcloud process the credential proxy runs. The pool was sized to the
+# A project list or describe goes through the broker's Cloud API relay first (#3703; see
+# GKE_READS_HELPER below); this pool is the gcloud fallback, and the path every other
+# lookup takes. Each gcloud lookup is a process the credential proxy runs. The pool was sized to the
 # four requests the proxy admitted under its child memory budget at the old 1Gi default
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's
 # children budget, 704 MiB of the 1 GiB limit after BROKER_RESIDENT_RESERVE_BYTES and
@@ -442,12 +444,13 @@ _RELAY_OFF_RULES = frozenset({"gcp.api.host", "gcp.api.host-refused"})
 # Refusals about one read: that read goes to gcloud, and the batch's others stand.
 _RELAY_ROW_CODES = frozenset({"SECURITY_POLICY_BLOCKED", "UPSTREAM_UNEXPECTED", "UPSTREAM_RESPONSE_TOO_LARGE",
                               "UPSTREAM_REDIRECTED"})
-# The broker's own codes for a call it could not complete: no credential, no upstream,
-# a timeout, an answer it could not relay. One of them on one row is that read's
-# "unknown"; on every row of a batch it is the relay failing as a whole, like a 401 or a
-# call that got no HTTP answer at all, and the run falls back to gcloud.
-_RELAY_TRANSPORT_CODES = frozenset({"RELAY_CREDENTIAL_UNAVAILABLE", "UPSTREAM_UNAVAILABLE", "UPSTREAM_TIMEOUT",
-                                    "UPSTREAM_TRUNCATED", "UPSTREAM_UNRELAYABLE"})
+# Failures that say the relay cannot serve this caller at all: no HTTP answer from the
+# broker, a 401, or the broker without its own credential. One on one row is that read's
+# "unknown"; on every row of a batch the run falls back to gcloud. The broker's other
+# failure codes (UPSTREAM_TIMEOUT and the rest) are about one call to Google, come only
+# after the relay has accepted the read, and stay that read's "unknown" however many
+# rows carry them -- the management project is a batch of one.
+_RELAY_UNREACHABLE_CODES = frozenset({"RELAY_CREDENTIAL_UNAVAILABLE"})
 _relay_unusable_this_run = False
 
 
@@ -537,7 +540,7 @@ def _transport_failure(row) -> bool:
     error = error if isinstance(error, dict) else {}
     if error.get("skipped"):
         return False
-    return not row.get("status") or row.get("status") == 401 or error.get("code") in _RELAY_TRANSPORT_CODES
+    return not row.get("status") or row.get("status") == 401 or error.get("code") in _RELAY_UNREACHABLE_CODES
 
 
 def _check_relay_batch(rows: list) -> None:
