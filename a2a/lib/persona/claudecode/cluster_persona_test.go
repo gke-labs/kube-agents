@@ -217,6 +217,12 @@ func TestTheClusterPersonaSkillsLackNoSourceFile(t *testing.T) {
 		if path.Base(rel) == persona.SkillFile && path.Dir(path.Dir(rel)) == "." {
 			return nil
 		}
+		// A cluster skill the persona doesn't carry has no copy to hold its
+		// other files.
+		skill, _, _ := strings.Cut(rel, "/")
+		if _, err := os.Stat(path.Join(clusterPersonaDir, persona.SkillsDir, skill)); err != nil {
+			return nil
+		}
 		if _, err := os.Stat(path.Join(clusterPersonaDir, persona.SkillsDir, rel)); err != nil {
 			t.Errorf("agents/cluster/skills/%s has no copy in the persona: copy it to agents/cluster/persona/skills/%s", rel, rel)
 		}
@@ -281,15 +287,12 @@ var (
 			{"<gsa-name>@<project-id>", "GSA_NAME@PROJECT_ID", 2},
 		},
 	}
-	// gke-workload-troubleshooting names three things a profile pod does not
-	// have: SETTINGS.md, a Hermes toolset name, and a GitOps checkout to run
-	// git log in. The persona copy asks the task's parameters, names the MCP
-	// server's tools, and reads past image tags from the ReplicaSets.
+	// gke-workload-troubleshooting names two things a profile pod does not
+	// have: SETTINGS.md and a Hermes toolset name. The persona copy asks the
+	// task's parameters and names the MCP server's tools.
 	troubleshootingEdits = []skillEdit{
 		{"from the user or active `SETTINGS.md` config:", "from the user or the task's parameters:", 1},
 		{"query `mcp-developer_knowledge` first", "query the `developer_knowledge` MCP server's tools first", 1},
-		{`    2. Check the Git repository history for the last known working image tag for this workload. Run ` + "`" + `git log -p -S "<image_name>" -- <manifest_file_path>` + "`" + ` (or use ` + "`" + `git log` + "`" + ` on the folder containing manifests) to identify the previous working tag in Git.`, `    2. Find the last image tag that ran from the workload's ReplicaSets, which keep each revision's pod template: ` + "`" + `kubectl get rs -n <namespace> -o custom-columns='NAME:.metadata.name,REVISION:.metadata.annotations.deployment\.kubernetes\.io/revision,IMAGES:.spec.template.spec.containers[*].image'` + "`" + `.`, 1},
-		{`    3. If the invalid tag is a recent change in git history, compare it to the tag from the last successful commit.`, `    3. If the invalid tag is the newest revision's, compare it to the tag of the last revision whose pods ran.`, 1},
 	}
 	allowedSkillRewrites = map[string][]skillRewrite{
 		"gke-stall-detection": {
