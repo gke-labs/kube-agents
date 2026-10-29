@@ -52,12 +52,12 @@ It projects only the conversations the request names. This server's own conversa
 
 It reads, bounded:
 
-- the newest 4096 messages on `TASKS`, keeping those from the last hour, within one bus read's 4 MiB budget. When the hour holds more messages or more bytes than that, the read starts further on, so the oldest are the ones not read, and `notes` says so; a read cut short, or skipped because the server's bus readers are busy, is still answered, with a line in `notes`;
+- the newest 4096 messages on `TASKS`, keeping those from the last hour, in one drain within a bus read's 4 MiB budget. When the hour holds more messages than that, the oldest are the ones not read. When the messages hold more bytes than the budget, the drain, which reads oldest first, stops before the newest, so the newest tasks and states may be missing. Either way `notes` says so. A read cut short (by the budget, its deadline or its caller), or skipped because the server's bus readers are busy, is still answered with a line in `notes`, and isn't kept for the next call;
 - the agent cards, from the same cached read `connection_status` uses.
 
 A call holds at most one bus reader, and concurrent calls share it: one `TASKS` read answers every call for three seconds, so the swarm view never takes the readers the turn tools need.
 
-It keeps only the tasks of those conversations, and the tasks delegated from them. A task submitted before the hour that took a follow-up message inside it is still shown, since it is live, but without a prompt: the follow-up isn't its submission.
+It keeps only the tasks of those conversations, and the tasks delegated from them. A task submitted before the hour that took a follow-up message inside it is still shown, since it is live, but without a prompt: the follow-up isn't its submission. A task whose submission is older than the read's start (the hour, or the newest 4096 messages) isn't shown even while it runs, since the conversation it belongs to is only on its submission.
 
 It never reads the request's `deployment`: the server takes no endpoint or credential from a client, and always answers for the install it runs in (`deploymentIgnored: true`). Pending push events aren't served yet (`pendingEventsServed: false`, `pendingEvents: []`).
 

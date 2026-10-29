@@ -234,6 +234,14 @@ func TestTheSwarmRouteIgnoresTheDeployment(t *testing.T) {
 	if n := dialled.Load(); n != 0 {
 		t.Errorf("the deployment's address was dialled %d times", n)
 	}
+	// And it is not decoded at all: no field of the request takes it, so
+	// nothing can log, store or forward it.
+	rt := reflect.TypeOf(swarmRequest{})
+	for i := 0; i < rt.NumField(); i++ {
+		if name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ","); name == "deployment" {
+			t.Errorf("swarmRequest.%s decodes the deployment", rt.Field(i).Name)
+		}
+	}
 }
 
 // End to end: a console conversation's task and its delegated child are
@@ -535,11 +543,10 @@ func TestTheSwarmRouteReadsTheNewestTasks(t *testing.T) {
 	}
 }
 
-// A window holding more than the bus reader's byte budget is read from
-// further on until it fits, so the newest task keeps its state, the oldest
-// are what goes, and the notes say so. The reader delivers oldest first and
-// stops at its budget, so without that the newest would be what went.
-func TestTheSwarmReadKeepsTheNewestPastTheReadBudget(t *testing.T) {
+// A window holding more than the bus reader's byte budget is read oldest
+// first and stops at the budget, so the answer says the newest may be
+// missing, and the cut read is not cached for the next caller.
+func TestASwarmReadPastTheBudgetSaysTheNewestMayBeMissing(t *testing.T) {
 	h, _, js := swarmBus(t)
 	// The test bus caps each stream at 1 MiB; this one must hold more than
 	// the reader's budget.
@@ -548,36 +555,19 @@ func TestTheSwarmReadKeepsTheNewestPastTheReadBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	big := strings.Repeat("x", 600<<10)
-	// About three times the budget, so only reading from the newer half
-	// fits within swarmReadNarrowings tries.
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 8; i++ {
 		id := fmt.Sprintf("t-old%d", i)
 		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
 		publishArtifact(t, js, "s-triage", id, lib.ArtifactResult, big)
 	}
 	publishSubmission(t, js, "s-triage", "t-new", consoleConversationPrefix+convTriage, "the newest turn", "")
-	publishRun(t, js, "s-triage", "t-new", answerText, true)
 
 	set := h.taskSet(context.Background())
-	var newest *SwarmTask
-	for i := range set.tasks {
-		if set.tasks[i].TaskID == "t-new" {
-			newest = &set.tasks[i]
-		}
+	if !slices.ContainsFunc(set.notes, func(n string) bool { return strings.Contains(n, "the newest tasks and states may be missing") }) {
+		t.Errorf("notes = %q, want the budget cut reported", set.notes)
 	}
-	if newest == nil || newest.Task == nil || newest.Task.State != lib.StateCompleted {
-		t.Fatalf("the newest task = %+v, want it read with its state", newest)
-	}
-	if len(set.tasks) >= 21 {
-		t.Errorf("read all %d tasks; the test publishes too little to pass the budget", len(set.tasks))
-	}
-	if !slices.ContainsFunc(set.notes, func(n string) bool { return strings.Contains(n, "only its newest messages were read") }) {
-		t.Errorf("notes = %q, want the narrowed read reported", set.notes)
-	}
-	for _, n := range set.notes {
-		if strings.Contains(n, "partial") || strings.Contains(n, "oldest were not read") {
-			t.Errorf("a narrowed read that fits reported %q", n)
-		}
+	if !h.cachedAt.IsZero() {
+		t.Error("a read cut by the byte budget was cached")
 	}
 }
 
@@ -764,6 +754,8 @@ func TestAnInAfterTheTasksEventsIsNotItsPrompt(t *testing.T) {
 	_, bus, js := swarmBus(t)
 	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "original prompt", "")
 	publishRun(t, js, "s-triage", "t-1", "", false)
+	time.Sleep(50 * time.Millisecond)
+	steerAt := time.Now()
 	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "STEER TEXT", "")
 	swarmTaskLimit = 3 // the two events and the steer
 	read, err := bus.swarmTasks(context.Background(), time.Now().Add(-time.Hour))
@@ -772,6 +764,10 @@ func TestAnInAfterTheTasksEventsIsNotItsPrompt(t *testing.T) {
 	}
 	if p := read.tasks[0].Prompt; p != "" {
 		t.Errorf("prompt = %q, want none", p)
+	}
+	// Nor is the steer's time the task's start: its first event is earlier.
+	if s := read.tasks[0].Submitted; !s.Before(steerAt) {
+		t.Errorf("submitted %v, want no later than the first event, before the steer at %v", s, steerAt)
 	}
 	// And with the submission in the read, it is the prompt.
 	swarmTaskLimit = 4
