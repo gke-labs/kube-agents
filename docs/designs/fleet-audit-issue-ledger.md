@@ -812,15 +812,24 @@ one cluster entry ran Config Connector (carries `kcc_unready`, also empty), the 
 ready on one host and not ready on another. Then a match is certain only when the recorded object's
 target project (its `cnrm.cloud.google.com/project-id` annotation, which the collector records as
 `project`) is known and equals the file object's project annotation, or the finding's project when
-the file has none. With one such host, the name decides. The collectors leave out the transient reasons
+the file has none. With one such host, a recorded project that is known must still agree, because
+one management cluster can hold an object of the same name for each project; an object with no
+recorded project matches on its name. A `Cluster/` or `NodePool/` finding's own object with no
+recorded project does not match when the manifest holds a cluster of the same name in another
+project. The collectors leave out the transient reasons
 `Updating` and `Deleting`, which Config Connector sets while it still applies the object. The note is
 the last paragraph of the remediation note, starts "**Config Connector is not applying this
 file.**", and names each matched object and the controller's reason in code spans; when the reason
 is `DependencyNotReady`, it also names the object that the message references when that object is
 not ready on the same host cluster, and so on down the chain. It names at most two objects in the
 file, each with the unready objects it waits on, and counts the rest. The
-fix keeps `kind: manifest`: the change is correct and belongs in that file, the stall usually clears
-before anyone reads the ledger, and degrading the fix would drop a correct pull request. The note
+fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before anyone
+reads the ledger, and degrading the fix would drop the pull request. The note does not say that the
+change is correct, because the reason can reject the change itself (a node pool change that sets
+both `max_node_count` and `total_max_node_count` fails with `UpdateFailed`): it says to correct the
+declaration if the reason rejects the change, and that otherwise the change takes effect when
+Config Connector applies the object again. The `pr-merged-persists` row and comment say the same,
+because the comment is posted once and never updated. The note
 fits the note cap: the worker's note is cut, and the text `finish` wrote at its start stays whole.
 Unlike a route note, it saves no `uncut_note`, so the carry removes the note but does not bring
 back the text it cut. The pass first removes an earlier copy of the note from every remediation,
