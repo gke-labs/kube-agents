@@ -69,8 +69,10 @@ func TestADelegateCallPublishesTheArtifactAndEndsTheTurn(t *testing.T) {
 	const session, taskID = "chat-test-del", "task-del-1"
 	submit(t, c, session, taskID, "find out how the fleet is")
 	sock := delegateSock(t)
+	armed := filepath.Join(filepath.Dir(sock), "armed")
 	harness := stub(t, `
 trap '' TERM
+touch `+armed+`
 echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
 read first || exit 1
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"I will ask the platform agent."}]}}'
@@ -83,6 +85,9 @@ sleep 60
 	cfg.TaskDeadline = 2 * time.Minute
 	cfg.KillGrace = 5 * time.Second
 	done := runAdapter(context.Background(), cfg)
+	// The reply path ends the harness with SIGTERM; the first request waits
+	// for the stub to have ignored it (waitPath says why).
+	waitPath(t, armed, "the stub never armed its TERM trap")
 
 	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"})
 	if !reply.OK {
@@ -195,8 +200,10 @@ func TestADelegateCallAfterCancelIsRefused(t *testing.T) {
 	origin := submit(t, c, session, taskID, "find out how the fleet is")
 	sock := delegateSock(t)
 	marker := filepath.Join(filepath.Dir(sock), "termed")
+	armed := filepath.Join(filepath.Dir(sock), "armed")
 	harness := stub(t, `
 trap 'touch `+marker+`' TERM
+touch `+armed+`
 echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
 read first || exit 1
 while true; do sleep 1; done
@@ -207,6 +214,7 @@ while true; do sleep 1; done
 	cfg.KillGrace = 10 * time.Second
 	done := runAdapter(context.Background(), cfg)
 	waitState(t, c, session, taskID, lib.StateWorking)
+	waitPath(t, armed, "the stub never armed its TERM trap")
 
 	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, origin.ContextID, origin.CorrelationID,
 		lib.WithTo(lib.Party{Session: session}))
@@ -218,16 +226,7 @@ while true; do sleep 1; done
 	if err := c.Publish(ctx, lib.TaskInSubject(session, taskID), env); err != nil {
 		t.Fatalf("publish cancel: %v", err)
 	}
-	deadline := time.Now().Add(waitDeadline)
-	for {
-		if _, err := os.Stat(marker); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("harness never received SIGTERM")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitPath(t, marker, "harness never received SIGTERM")
 
 	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"})
 	if reply.OK || !strings.Contains(reply.Message, "already ended") {
@@ -283,16 +282,7 @@ while true; do sleep 1; done
 	cfg.KillGrace = 10 * time.Second
 	done := runAdapter(context.Background(), cfg)
 
-	deadline := time.Now().Add(waitDeadline)
-	for {
-		if _, err := os.Stat(marker); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("harness never received SIGTERM from the deadline")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitPath(t, marker, "harness never received SIGTERM from the deadline")
 
 	reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"})
 	if reply.OK || !strings.Contains(reply.Message, "already ended") {
@@ -322,8 +312,10 @@ func TestAnEvictionAfterADelegateCallCompletesTheTurn(t *testing.T) {
 	const session, taskID = "chat-test-del4", "task-del-4"
 	submit(t, c, session, taskID, "find out how the fleet is")
 	sock := delegateSock(t)
+	armed := filepath.Join(filepath.Dir(sock), "armed")
 	harness := stub(t, `
 trap '' TERM
+touch `+armed+`
 echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
 read first || exit 1
 sleep 120
@@ -335,6 +327,9 @@ sleep 120
 	ctx, evict := context.WithCancel(context.Background())
 	defer evict()
 	done := runAdapter(ctx, cfg)
+	// The delegation's SIGTERM must find the trap armed, or the stub dies and
+	// the turn completes without ever reaching the eviction branch under test.
+	waitPath(t, armed, "the stub never armed its TERM trap")
 
 	if reply := askDelegate(t, sock, lib.DelegateRequest{Addressee: "platform", Text: "how is the fleet?"}); !reply.OK {
 		t.Fatalf("refused: %+v", reply)
