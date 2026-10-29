@@ -194,8 +194,11 @@ operation it supports onto routes. One entry per route:
 - a path template, with `{session}` as the only placeholder;
 - every request field the harness reads a session id from, in the harness's own order of
   precedence: the path placeholder, named headers, named top-level body keys;
-- the headers, top-level body keys and query parameters the route accepts, with bounds where they
-  matter (a list's `limit`, for example). Anything else is refused. This matters as much as the
+- the top-level body keys, query parameters and harness headers the route accepts, with bounds
+  where they matter (a list's `limit`, for example). Anything else is refused. The lists come from
+  what the callers in §3.3 actually send, not from everything the harness's route would take, and
+  the header list governs only the harness's own namespace (`X-Hermes-*` on Hermes); standard HTTP
+  headers such as `Authorization`, `Content-Type`, `Accept` and `User-Agent` pass. This matters as much as the
   route: on Hermes, an allowed turn or create route also takes fields that set a session's system
   prompt, its model lock, its source or its memory scope, and none of today's callers send them;
 - whether the response streams.
@@ -234,7 +237,8 @@ operations:
     - { method: GET, path: "/api/sessions/{session}" }
     - method: GET
       path: "/api/sessions/{session}/messages"
-      query: { order: [asc, desc], limit: { max: 500 } }
+      query:
+        { order: [latest, oldest], limit: { max: 500 }, offset: { min: 0 } }
   session.list:
     - method: GET
       path: /api/sessions
@@ -337,10 +341,16 @@ session:
   `a2a-*` children (CP:2789-2825).
 - **Through the door:** the door writes the origin itself, as the caller's class, and only for a
   session it saw created. The caller doesn't declare its origin; its key does.
-  - On `session.create`, the door records the id only when the harness answers that it created
-    the session. An answer that says the session already existed records nothing.
-  - On `turn.respond`, the door keeps its own record of the response ids it returned, and to which
-    class. It accepts a `previous_response_id` only if that id was returned to the same class, and
+  - On `session.create`, the caller supplies the id (the console does). Before forwarding, the
+    door writes a `pending` record for that id with the caller's class. If the harness answers that
+    it created the session, the door promotes the record, and only then releases the response, so
+    a turn the caller sends next finds it. If the harness refuses, or answers that the session
+    already existed, the door drops the `pending` record. If the door can't write the record, it
+    refuses the create. A `pending` record left by a door restart is promoted on the next read if
+    the session exists and has no messages from anyone else, and dropped otherwise.
+  - On `turn.respond`, the door records the response ids it returned, and to which class, in the
+    same registry as the origins (the Session KV server's per-session metadata), so a door restart
+    loses nothing. It accepts a `previous_response_id` only if that id was returned to the same class, and
     it namespaces `conversation` names per class, so two classes can't land in one chain by
     choosing the same name. A turn with neither starts a new session, which the door records from
     the session id the harness reports in its response. If the harness doesn't report one, the
@@ -354,8 +364,9 @@ session:
   are in-pod writers inside one trust boundary, so a declared origin is good enough for them.
 - **No record means no read.** A session with no origin record is readable by no class through the
   door. That fails closed where today's inference fails open.
-- **When the record can't be read.** The door caches origins (they never change once written) and
-  refuses an origin-scoped request if the Session KV server can't answer for an uncached session.
+- **When the record can't be read.** The door caches origins it has found (they never change once
+  written), never caches a miss, and refuses an origin-scoped request if the Session KV server
+  can't answer for an uncached session.
   `health`, `models` and `turn.respond` on a new chain don't need a lookup.
 
 The door's read rules then become:
@@ -487,6 +498,9 @@ tells an operator whether anything of theirs would be refused.
 - A `session.create` the harness answers with "already exists" records nothing, and a
   `previous_response_id` returned to another class is refused.
 - With the Session KV server down, an uncached origin-scoped read is refused.
+- A create whose `pending` record can't be written is refused. A create interrupted after the
+  harness's answer leaves a `pending` record that the next read resolves.
+- A `previous_response_id` returned before a door restart is still accepted for the same class.
 
 **The descriptor:**
 
@@ -497,8 +511,8 @@ tells an operator whether anything of theirs would be refused.
 
 **Callers against their class:**
 
-- A contract test lists each caller's routes, from the call sites in §3.3, and asserts every one
-  maps to an operation its class allows. A caller that starts using a new route fails here before
+- A contract test lists each caller's routes, query parameters, body keys and harness headers, from
+  the call sites in §3.3, and asserts every one is in a route its class allows. A caller that starts using a new route fails here before
   it fails in a cluster.
 - In e2e, the console and bench happy paths run with their class keys, and one request per class
   outside its list is refused.
