@@ -63,10 +63,11 @@ owner: jayantid
 
 verification_spec:
   # Says the work will not run again by itself, with the work as the subject:
-  # "it won't run again on its own", "nothing will retry it", "it will not be
-  # retried". "Nothing for you to run" or "you won't need to rerun it" is not
-  # this claim, so neither matches. The text is lowercased, and a curly
-  # apostrophe made straight, before the patterns run.
+  # "it won't run again on its own", "the health check will never run again",
+  # "it's not going to run again", "nothing will retry it", "it won't be
+  # retried". "You" is never the subject's modifier, so "you won't need to
+  # rerun it" does not count. The text is lowercased, and a curly apostrophe
+  # made straight, before the patterns run.
   - name: the-reply-says-nothing-will-run-it-again
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -75,34 +76,38 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - '\b(it|this|the\s+(check|card|task|work))\s+(won''t|will\s+not|isn''t\s+going\s+to|is\s+not\s+going\s+to|doesn''t|does\s+not)\s+(\w+\s+){0,2}(run|retr\w*|re-?run|restart\w*|resume|try|start|pick)'
-        - '\bnothing\s+(will\s+)?(\w+\s+)?(retr\w*|re-?runs?|runs?|restart\w*|resumes?|picks?)\s+(it|this|the\s+(check|card|task|work))\b'
-        - '\b(it|this|the\s+(check|card|task|work))\s+(won''t|will\s+not)\s+be\s+(\w+\s+)?(retried|re-?run|restarted|resumed)\b'
+        - '\b(it|this|that|the)\b(\s+(?!you\b)[\w-]+){0,3}?(''s)?\s+(won''t|will\s+(not|never)|can''t|cannot|isn''t|is\s+not|not|doesn''t|does\s+not|never)\s+(\w+\s+){0,3}(run|retr\w*|re-?run\w*|restart\w*|resum\w*|try|start\w*|pick\w*)'
+        - '\bnothing\s+(will\s+)?(\w+\s+)?(retr\w*|re-?runs?|runs?|restart\w*|resumes?|picks?)\s+(it|this|that|the\s+[\w-]+)\b'
   # The defect: a promise that something retries it, or that the user need do
-  # nothing. The second pattern is the promise by its subject and verb in any
-  # tense ("the dispatcher retries it", "it'll pick up", "the check will be
-  # picked up again"). A negator in the two words between them ("it won't run
-  # again", "it will not be retried", "the dispatcher doesn't retry") stops the
-  # match, and so does a condition on the user after the verb ("it will run
-  # again only when you ask"), which promises nothing.
+  # nothing. The second pattern reads one clause at a time (split at . ! ? ;
+  # , a line break, and "but"): a statement clause, not a question, that has
+  # a retry verb ("will automatically be retried", "the system is going to
+  # retry it", "it'll pick up") is a promise, unless the clause also carries
+  # a negator ("won't", "cannot", "no longer"), a condition on the user ("when
+  # you ask", "after you confirm"), an offer ("I can", "want me to") or is the
+  # declared step line. Clause-level rather than word lists between subject
+  # and verb, so an adverb or "going to" cannot slip a promise past it.
   - name: the-reply-promises-no-automatic-retry
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '\bno\s+(\w+\s+){0,2}action\s+(is\s+)?(needed|required)|\bnothing\s+(for\s+you|you\s+need)\s+to\s+do\b'
-        - '\b(dispatcher|system|scheduler|platform|it|this|the\s+(check|card|task|work))(''ll|''s)?\s+((?!(?:not|never|won''t|can''t|doesn''t|isn''t|wasn''t|didn''t|wouldn''t|shouldn''t)\b)[\w'']+\s+){0,2}(retr(y|ies|ied)|re-?run(s)?|resumes?|resumed|restart(s|ed)?|picks?\s+(it\s+)?(back\s+)?up|picked\s+(back\s+)?up|tries\s+again|try\s+again|runs?\s+again)\b(?!\s+(only\s+)?(if|when|once|unless)\s+(you|i\s+hear|asked)\b)'
-  # Ends on the offer: a question, optionally followed by a declared step on
-  # a last line of its own (SOUL §2 step 5). slack_ux_failure.py draws the
-  # trailing yes/no question, or the step, as the Try again button.
+        - '\bno\s+(\w+\s+){0,2}(action|need)\b(?!\s+(i|we)\b)|\b(don''t|do\s+not|won''t|needn''t)\s+(need|have)\s+to\s+do\b|\bnothing\s+(\w+\s+){0,2}(to\s+do|needed|required)\b|\bsit\s+tight\b'
+        - '(?:^|(?<=[.!?;,\n])|(?<=\bbut ))(?![^.!?;,\n]*(?:\b(?:not|never|no|nothing|nobody|cannot|unless)\b|n''t\b|\b(?:if|when|once|after|whenever|until|before)\s+(?:you|i\s+hear)\b|\bas\s+soon\s+as\s+you\b|\byou\s+(?:can|could|may|ask|say)\b|\bi\s+(?:can|could|would|''d)\b|\b(?:want|like)\s+me\b|^\s*\[next:))[^.!?;,\n]*\b(?:retr(?:y|ies|ied|ying)|re-?run\w*|resum(?:e|es|ed|ing)|restart\w*|pick(?:s|ed)?\s+(?:it\s+)?(?:back\s+)?up|(?:run|runs|ran|try|tries|tried)\s+again)\b[^.!?;,\n]*(?=[.!;,\n]|\Z)'
+  # Ends on the offer: a closing question that names the retry ("Want me to
+  # try again?", "Should I check it again?"), or any closing question with a
+  # declared step on a last line of its own (SOUL §2 step 5), which
+  # slack_ux_failure.py draws as the button whatever the question says. An
+  # open question with no step ("What would you like me to do?") draws no
+  # button and fails. The step's 75 characters are counted after the space.
   - name: the-reply-ends-on-an-offer-to-try-again
     role: objective
     mode: assert
     check:
       type: report_contains
       required_patterns:
-        - '\?\s*(\n[ \t]*\[next:[^\]\n]{1,75}\]\s*)?\Z'
+        - '(\b(try|retry|re-?run|run|check|attempt|go)\b[^?.!\n]{0,80}\?\s*(\n[ \t]*\[next:\s*[^\]\n]{1,75}\]\s*)?|\?\s*\n[ \t]*\[next:\s*[^\]\n]{1,75}\]\s*)\Z'
   # The user says when to try again: an unblock or a new card is the front
   # door retrying on its own. Recoverable, not catastrophic: the card is a
   # read and the catastrophic rung is admission-blind.
