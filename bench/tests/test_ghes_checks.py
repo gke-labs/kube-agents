@@ -288,15 +288,17 @@ def test_the_writes_check_names_a_ghes_url_and_reads_the_api_root(env, github, m
     github.routes[f"{api}/git/matching-refs/heads/platform-agent/"] = (403, {"message": "denied"})
 
     stash(f"Fix proposed: {GHES_PR_URL}")
-    result = GitHubWritesVerifier(type="github_writes", owner="gke-agentic", requested_pull_requests=1).verify(30)
+    result = GitHubWritesVerifier(type="github_writes", owner="gke-agentic", requested_pull_requests=1, exclusive_window=True).verify(30)
     assert result.status == "fail", result.reason
     assert result.raw["requested"] and result.raw["unrequested"] == []
     assert all(url.startswith(api) for url in github.calls), github.calls
 
     # The same pull request named by its github.com URL is not the one the
     # reply asked for on a GHES run, so it is a write the case did not request.
+    # The window is exclusive, as the lane marks a requesting case's, so the
+    # write is charged although nothing names it.
     stash(f"Fix proposed: {DOTCOM_PR_URL}")
-    result = GitHubWritesVerifier(type="github_writes", owner="gke-agentic", requested_pull_requests=1).verify(30)
+    result = GitHubWritesVerifier(type="github_writes", owner="gke-agentic", requested_pull_requests=1, exclusive_window=True).verify(30)
     assert result.status == "pass", result.reason
     assert result.raw["unrequested"]
 

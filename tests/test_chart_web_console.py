@@ -448,6 +448,22 @@ class WebConsoleRenderTest(unittest.TestCase):
             if b["kind"] in ("ClusterRoleBinding", "RoleBinding"):
                 self.assertNotEqual((b.get("roleRef") or {}).get("name"), "cluster-admin")
 
+    def test_environment_disabled_sets_default_service_account(self) -> None:
+        docs = self._render(
+            "--set", "webConsole.enabled=true",
+            "--set", "webConsole.environment.enabled=false",
+        )
+        deployment = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "t-web-console")
+        pod_spec = deployment["spec"]["template"]["spec"]
+        self.assertEqual(
+            pod_spec.get("serviceAccountName"),
+            "default",
+            "web-console must explicitly set serviceAccountName to 'default' when environment is disabled (#3878)",
+        )
+        self.assertFalse(pod_spec.get("automountServiceAccountToken"))
+        sa_names = [d["metadata"]["name"] for d in docs if d["kind"] == "ServiceAccount"]
+        self.assertNotIn("t-web-console", sa_names)
+
 
 
 class WebConsoleImageTest(unittest.TestCase):

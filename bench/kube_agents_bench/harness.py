@@ -64,7 +64,9 @@ Environment:
         and no transcript is kept.
     KUBE_AGENTS_TIMING_FILE: When set, the opening turn's wall-clock seconds
         are written there as ``{"turn1_s": ...}`` (best effort; the
-        presubmit sets it per repetition). Unset, nothing is written.
+        presubmit sets it per repetition), on either transport: under
+        ``inject`` the opening task from the door accepting it to its
+        terminal. Unset, nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -2240,6 +2242,16 @@ class KubeAgentsHarness(AgentHarness):
             # disagree about whether the tunnel is up.
             base_url = f"http://127.0.0.1:{local_port}"
 
+        # When the opening POST the door accepted went out: the opening
+        # turn's clock starts there, as the api path's starts at the attempt
+        # that succeeds, and a transport retry after the acceptance (a
+        # dropped poll) rejoins it rather than restarting it. An opening POST
+        # whose reply was lost may have started the task already, and the
+        # door's dedupe hands the retry the same task, so its start is
+        # unknown: such a turn is not timed (opening_post_lost).
+        opening_accepted: list[float] = []
+        opening_post_lost: list[bool] = []
+
         def _exchange(task: inject.InjectTask, budget: float, *, opening: bool) -> inject.Exchange:
             """One task to its terminal, through the transport retry.
 
@@ -2266,9 +2278,12 @@ class KubeAgentsHarness(AgentHarness):
                             inject.check_budget(budget, task.first_event_grace)
                         elif budget < floor:
                             budget = floor
+                    posted = time.monotonic()
                     task_id = task.submit()
                     if deadline is None:
                         deadline = time.monotonic() + budget
+                        if opening and task_id and not opening_post_lost:
+                            opening_accepted.append(posted)
                     if not task_id:
                         # The door started nothing and said why. No agent saw
                         # the prompt, so this is the run class rather than an
@@ -2300,6 +2315,8 @@ class KubeAgentsHarness(AgentHarness):
                         )
                     return task.await_terminal(task_id, deadline=deadline)
                 except inject.InjectUnavailable as exc:
+                    if opening and deadline is None and task.unanswered_post:
+                        opening_post_lost.append(True)
                     failures += 1
                     _log.warning(
                         "inject: exchange on %s failed in transport (%d/%d): %s",
@@ -2432,6 +2449,7 @@ class KubeAgentsHarness(AgentHarness):
         )
         try:
             exchange = _exchange(task, timeout, opening=True)
+            opening_ended = time.monotonic()
         except inject.BudgetBelowFloor as exc:
             # Configuration, refused before the POST: the same class as a
             # non-numeric budget, and nothing ran.
@@ -2547,6 +2565,23 @@ class KubeAgentsHarness(AgentHarness):
                 f"(reason: {exchange.fold.terminal_reason or 'none given'})"
             )
 
+        opening_took = opening_ended - opening_accepted[0] if opening_accepted else None
+        if (
+            opening_took is not None
+            and opening_took < timeout
+            and exchange.outcome == inject.OUTCOME_TERMINAL
+            and exchange.fold.terminal == inject.STATE_COMPLETED
+        ):
+            # The opening task completed and the relay posted it: timed from
+            # the door accepting the POST to the read that saw the terminal,
+            # any wait in the bridge's queue and the poll pause included.
+            # Nothing else is timed, as only a turn that answered is on the
+            # api path: not a failed or canceled terminal, not one read only
+            # off the stream (its settle wait for the relay would pad the
+            # time), not one the deadline read found (the time is the
+            # budget), and nothing the paths above classified as
+            # infrastructure.
+            _write_turn_timing(opening_took)
         result = _inject_result(exchange, identity)
         if timed_out:
             # On the record whether or not the cancel was confirmed: a

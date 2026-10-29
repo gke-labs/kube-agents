@@ -7273,6 +7273,9 @@ def _run_objective(command: str) -> str:
         (f"watch -n 300 python3 {_SCRIPT_PATH} --readiness", True),
         (f"flock /tmp/readiness.lock python3 {_SCRIPT_PATH} --readiness", True),
         (f"poetry run python3 {_SCRIPT_PATH} --readiness", True),
+        # eval runs its words as a command line of its own, as the GitHub-write attribution reads it
+        (f'eval "python3 {_SCRIPT_PATH} --readiness"', True),
+        (f'eval "echo python3 {_SCRIPT_PATH} --readiness"', False),
         (f"xargs ls {_SCRIPT_PATH} --readiness", False),
         # which flags take a value is not tabled, so the word after a bare flag is read as its value: the stated limit
         ("sudo -n ls fleet_upgrade_report.py --readiness", True),

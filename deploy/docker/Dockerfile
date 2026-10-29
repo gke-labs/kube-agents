@@ -888,8 +888,9 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
 # Slack, flag or not: a message_changed that is not an edit (no `edited`, or
-# the same `edited.ts` as previous_message, since Slack keeps it once set) is
-# dropped instead of being read as a new message. Slack sends one for a thread's
+# the same `edited.ts` as previous_message, since Slack keeps it once set, or
+# with no previous_message an `edited.ts` older than the event by more than a
+# minute) is dropped instead of being read as a new message. Slack sends one for a thread's
 # parent whenever a reply in the thread changes, and after a restart empties the
 # adapter's processed-ts map that change re-ran the thread's opening @mention.
 # A real edit carries a new `edited`, so an @mention edited in still gets its turn.

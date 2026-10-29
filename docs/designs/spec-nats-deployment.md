@@ -412,8 +412,8 @@ Layout:
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
   `web` user for the read-only web UI, one of the two bus credentials published to a
-  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
-  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` (less `a2a.cap.>`,
+  so it cannot join the verifier's queue group) and its own inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
   ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
@@ -634,7 +634,11 @@ Layout:
   agent pod that holds session-kv's bearer. No other principal holds either subject, and the
   reply namespace is its own for the notify route's reason. The bridge's password is reachable
   from the agent's terminal like every grant in that pod, so a forged board can reach the Home
-  tab of an admitted member; it carries no authority beyond what it shows. Core NATS.
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS. A request
+  with a body is a board-health row's Retry or Drop (spec-chatops-gateway.md, "The board-health
+  card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
+  subjects and grants, and only the gateway may publish the request, so no other principal can
+  ask the bridge to act; session-kv acts only on cards still `blocked`.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for

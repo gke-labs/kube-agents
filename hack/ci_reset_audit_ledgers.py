@@ -252,13 +252,17 @@ def main(argv: list[str] | None = None) -> int:
         "--forge", choices=(FORGE_GITHUB, FORGE_GITLAB), default=FORGE_GITHUB,
         help="github: --repo is owner/name on github.com; gitlab: --repo is the project path under the pool's group (hack/ci_gitlab_forge.py)",
     )
+    parser.add_argument("--host", default=None, help="gitlab only: the instance's hostname (default gitlab.com); a self-managed GitLab (kube-agents#3682)")
+    parser.add_argument("--ca-file", default=None, help="gitlab only: a PEM CA to trust for --host, the instance's private CA")
     args = parser.parse_args(argv)
+    if args.forge != FORGE_GITLAB and (args.host or args.ca_file):
+        parser.error("--host and --ca-file apply to --forge gitlab only")
     token = os.environ.get(TOKEN_ENV, "")
     if not token:
         print(f"ERROR: {TOKEN_ENV} is not set; nothing to authenticate with", file=sys.stderr)
         return 2
     forge = "GitLab" if args.forge == FORGE_GITLAB else "GitHub"
-    host = FORGE_HOSTS[args.forge]
+    host = args.host or FORGE_HOSTS[args.forge]
     # Run as a script this module is __main__, and the GitLab module's import
     # of it by name loads a second copy with a ResetError of its own; the
     # refusals caught below are both classes, so a guard's refusal is an
@@ -273,7 +277,8 @@ def main(argv: list[str] | None = None) -> int:
 
             refusals = (ResetError, gitlab.ResetError)
             limited = (gitlab.RateLimited,)
-            unclosed = gitlab.reset_ledgers(args.repo, args.project, args.build, token, args.audit, args.dry_run)
+            gitlab.configure_ca(args.ca_file)
+            unclosed = gitlab.reset_ledgers(args.repo, args.project, args.build, token, args.audit, args.dry_run, host=host)
         else:
             unclosed = reset(args.repo, args.project, args.build, token, args.audit, args.dry_run)
     except refusals as exc:

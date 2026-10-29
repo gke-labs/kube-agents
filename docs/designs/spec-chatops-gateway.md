@@ -2140,6 +2140,19 @@ most 50 members are republished to. Admission is the inbound allowlist (`slackPr
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
 A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
 
+**The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
+chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
+(`actions`, `retry` and `drop`; spec-a2a-payloads.md, "Chat messages"). The renderer lays such a
+row out as its text over an actions block keyed by the row (`kage_board.row.<n>`), labels the
+buttons Retry and Drop itself, and puts the row's ids, joined by commas, in their value
+(`slack_board.go`). A tap is never a turn. It is admitted by the Home tab's rule above, then sent
+over the board route as a request with a body (`lib.BoardAction`), which the Hermes bridge relays
+to session-kv's `POST /v1/board/actions`; that unblocks (Retry) or archives (Drop) the row's cards
+while they are still `blocked`, and answers each card's outcome. The row is then edited in place:
+its buttons give way to "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>", or "No longer
+stuck. <name>, <time>" when the cards had already moved, the time as Slack's date token; a tap that did not land
+keeps the buttons under a line saying so, and so does a row whose edit Slack refused, so a second tap asks again. One tap per row at a time, and one edit of a card at a time, each from the blocks the last one sent, in this process. A message whose rows carry buttons is drawn without its side bar, so every row stays in the message's own blocks where the edit finds it.
+
 ### Answer feedback (added 10/16)
 
 A chat user rates the final answer of an ask 👍 or 👎, and the rating keeps the exchange so an

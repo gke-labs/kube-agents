@@ -11,13 +11,13 @@ This is the persona format. The bus persona content (the session agent's
 persona and the `a2a-topics` skill) is a different thing and lives in
 [`a2a/persona`](../../persona/README.md).
 
-| Path              | What it holds                                                                                                                                                                                                   |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `persona.yaml`    | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description` (at most 1024 bytes), `tier`, `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
-| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                                          |
-| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                                                   |
-| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                                    |
-| `README.md`       | Optional, never rendered                                                                                                                                                                                        |
+| Path              | What it holds                                                                                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `persona.yaml`    | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description` (at most 1024 bytes), `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
+| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                                  |
+| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                                           |
+| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                            |
+| `README.md`       | Optional, never rendered                                                                                                                                                                                |
 
 `tools` is the allowlist. An entry is a built-in (`read_file`,
 `web_search`, `shell`), an MCP server from `mcp.yaml` (`gke`), or one of
@@ -33,6 +33,8 @@ a server reached around the broker would be outside both.
 
 `Load` also refuses:
 
+- a `tier` in `persona.yaml`: a tier is authority, which the AgentProfile
+  grants, never the persona;
 - a symlink anywhere, and any top-level file the format does not define
   (a skill directory may hold any regular files);
 - a `SKILL.md` frontmatter key other than `name`, `description`, `license`

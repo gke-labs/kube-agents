@@ -86,7 +86,7 @@ const streams = [
   { name: "TASKS", subjects: ["a2a.tasks.>"] },
   { name: "DIRECTORY", subjects: ["a2a.agents.>"], max_msgs_per_subject: 1 },
   // shared.probe is provisioned but has no writer in any grant — see dev/nats.conf.
-  { name: "TOPICS-STATE", subjects: ["a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"], max_msgs_per_subject: 8 },
+  { name: "TOPICS-STATE", subjects: ["a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"], max_msgs_per_subject: 8 },
   { name: "TOPICS-JOURNAL", subjects: ["a2a.topics.shared.annotations"] },
 ];
 for (const s of streams) {

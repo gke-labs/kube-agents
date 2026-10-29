@@ -121,8 +121,8 @@ same target on every pull request, and it is a required check, so a warning-seve
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
 shellcheck step in `.github/workflows/validate.yml`) from
 <https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
-package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two releases behind, and a
-release two behind reports a different set of findings than CI.
+package on the GitHub-hosted runner image is whatever release that image's Ubuntu ships, not the
+one the job pins and asserts, and a different release reports a different set of findings than CI.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
 place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
@@ -653,16 +653,16 @@ ruleset requires these checks — on the head for a pull request to enter the qu
 commit for it to merge: `cla/google`, `actionlint`, `build`, `prettier`, `validate`,
 `Run Controller Tests`, `Run Python Unit Tests`, `Documentation Checks`,
 `Validate Conventional Commit PR Title`, `Agent instructions cite assets that exist`,
-`Run A2A Module Tests`, `Smoke gate`, and `Merge labels`. It also requires conversation resolution,
-but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
+`Run A2A Module Tests`, `Run k8s-api-proxy Tests`, `Smoke gate`, and `Merge labels`. It also
+requires conversation resolution, but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
 checks. A reader who checks the repository settings for the review requirement therefore finds
 nothing and concludes wrongly. Only these checks block a merge: a red or cancelled check outside
 the list does not, and `AI Review` is not in it.
 
 `Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
-`Agent instructions cite assets that exist` joined the set on 2026-09-02, and
-`Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
-could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
+`Agent instructions cite assets that exist` joined the set on 2026-09-02,
+`Run A2A Module Tests` on 2026-10-13, and `Run k8s-api-proxy Tests` on 2026-10-28; before its
+date, a pull request one of them had not run on could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
 
 ```bash
 gh api repos/gke-labs/kube-agents/rules/branches/main \
@@ -673,7 +673,8 @@ Every workflow behind one of those checks, bar `Smoke gate` and `Merge labels`, 
 pull request whose base is a `release/` branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`.
 A backport pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook
 in `scripts/release/README.md` ("Patch releases from a release line") is what happens after it
-merges. A `release/` branch requires the same contexts bar `Smoke gate` and `Merge labels`, also
+merges. A `release/` branch requires the same contexts bar `Smoke gate`, `Merge labels` and
+`Run k8s-api-proxy Tests` (no line carries it yet; see `scripts/release/README.md`), also
 through a ruleset; its branch protection rule has no `required_status_checks` at all. No queue
 runs on a `release/` branch and Tide no longer merges in this repository, so nothing merges a
 backport yet. How one merges is still open, and `scripts/release/README.md` still describes Tide. Read a line's

@@ -123,8 +123,10 @@ HOLD_LABELS = (
 STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
+#: k8s-api-proxy/ is there by choice, and only until the sandbox routes kubectl through the
+#: proxy (issue #4087); test_merge_gate fails once it does.
 SMOKE_SKIP_RE = re.compile(
-    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/)"
+    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/|k8s-api-proxy/)"
     r"|^scripts/test_[^/]+\.py$|^[^/]+\.md$"
     r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh)$"
 )

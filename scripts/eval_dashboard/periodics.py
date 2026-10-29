@@ -45,6 +45,71 @@ JOB_HISTORY_ROOT = "https://oss.gprow.dev/job-history/gs/kube-agents-periodic-lo
 POINTER = "latest-build.txt"
 FINISHED = "finished.json"
 ARTIFACTS_DIR = "artifacts"
+# What Prow writes beside a build's finished.json: the pod it ran in (its node
+# and events) and its log. Read for a failed build only, for the note's cause.
+PODINFO = "podinfo.json"
+BUILD_LOG = "build-log.txt"
+# How much of a failed build's log is read, from the end: the last few lines
+# of any job here fit, and the whole log of a long reconcile does not.
+BUILD_LOG_TAIL_BYTES = 4096
+# The last log line is quoted in a Chat message; longer is cut with an ellipsis.
+LAST_LINE_MAX_CHARS = 200
+LAST_LINE_ELLIPSIS = "…"
+# podinfo.json as Prow's sidecar writes it: the pod and its events. Only an
+# event Kubernetes itself classed as a Warning (NodeNotReady, Evicted,
+# OOMKilling) says how a build died; Normal ones are the pod's life. Prow's
+# list is not time-ordered, so the last Warning is taken wherever it sits.
+PODINFO_KEY_POD = "pod"
+PODINFO_KEY_SPEC = "spec"
+PODINFO_KEY_NODE_NAME = "nodeName"
+PODINFO_KEY_EVENTS = "events"
+EVENT_KEY_REASON = "reason"
+EVENT_KEY_TYPE = "type"
+EVENT_TYPE_WARNING = "Warning"
+# The log tail is read as bytes and decoded leniently: a range cut inside a
+# multibyte character must cost one character, not the line (as
+# scripts/pool_pressure.py reads its head).
+BUILD_LOG_ENCODING = "utf-8"
+BUILD_LOG_DECODE_ERRORS = "replace"
+# What makes a log line the cause rather than the script's own stdout summary
+# (which the report already carries): a line that starts like an error
+# (`ERROR:`, `fatal:`, `KeyError:`, `urllib.error.HTTPError:`) or ends like
+# one (`: not found`, `denied`, `Killed`, `timed out`). Anchored, not a
+# substring: a sweep line naming a branch such as `agent/fix-imagepull-error`
+# is not an error. A traceback's header is not a shape: the exception line
+# under it is the cause, and a tail cut above it falls to the last-line rule.
+# The last such line is quoted; with none, the last line only when the build
+# wrote no report, which is a script that died before its summary.
+ERROR_LINE_RE = re.compile(
+    r"^(?:ERROR|FATAL|[\w.]*(?:Error|Exception))\b|(?::\s*not found|Killed|denied|timed out|No such file or directory)\s*$",
+    re.IGNORECASE,
+)
+ENTRYPOINT_ERROR_MARKER = '"level":"error"'
+# The quoted line reaches Chat, the tracking issues (through the evidence) and
+# the public health.json, from a bucket only the job can read: credential
+# shapes are scrubbed first, and control characters and Chat markup dropped.
+SCRUB_PATTERNS = (
+    (re.compile(r"://[^\s/:@]+:[^\s/@]+@"), "://[redacted]@"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}"), "[redacted]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]+"), "[redacted]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]+"), "[redacted]"),
+    (re.compile(r"\bya29\.[\w-]+"), "[redacted]"),
+    (re.compile(r"\bAIza[\w-]{35}"), "[redacted]"),
+    (re.compile(r"\b(Bearer|Basic|Authorization:\s*token)\s+\S+", re.IGNORECASE), r"\1 [redacted]"),
+    (re.compile(r"(private[_-]token|access[_-]token|api[_-]?key|password|(?:client[_-])?secret|token)(\"?\s*[=:]\s*)\S+", re.IGNORECASE), r"\1\2[redacted]"),
+    (re.compile(r"-----BEGIN[^-]*-----.*"), "[redacted key]"),
+)
+CONTROL_CHARS_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+CHAT_MARKUP = {"<": "‹", ">": "›"}
+# Prow's entrypoint logs JSON lines into build-log.txt around the process
+# (its timeout, its grace period); they carry `"level":"error"` but are not
+# the script's words. The script's own error line wins; with none, the
+# entrypoint's first error `message` (the timeout) is the cause.
+ENTRYPOINT_LINE_PREFIX = '{"component":"entrypoint"'
+ENTRYPOINT_KEY_MESSAGE = "message"
+# A backtick inside the quoted line would end the Chat code span early.
+LINE_QUOTE_CHAR = "`"
+LINE_QUOTE_SUBSTITUTE = "'"
 # The pointer moves at job start, so the newest build is often still running;
 # the one before it has finished. Three covers a run of aborted builds.
 FALLBACK_BUILDS = 3
@@ -154,14 +219,18 @@ SUPERSEDED_KEY_RECOVERY = "recovery"
 # The superseding run a recovery was decided on: what the clear cites, read
 # or not on the tick that sends it.
 SUPERSEDED_KEY_BY = "by"
-# gsutil's absent-object wording, the set scripts/release/poll_rc_eval_verdict.py
-# settled on for the Prow archive; the same wording here. Never a bare 404,
-# because gsutil echoes the failing URL and a 19-digit build id can contain
-# those digits.
-NOT_FOUND_PATTERNS = ("matched no objects", "no urls matched", "notfoundexception: 404")
+# gcloud storage's absent-object wording, the set
+# scripts/release/poll_rc_eval_verdict.py settled on for the Prow archive;
+# the same wording here. An absent object is "matched no objects" on every
+# verb; an absent bucket is "<gs://bucket> not found: 404". Never a bare
+# 404, because gcloud echoes the failing URL and a 19-digit build id can
+# contain those digits; "not found: 404" is anchored on the words before it.
+NOT_FOUND_PATTERNS = ("matched no objects", "not found: 404")
 # A NotFound that names the bucket rather than an object: every job reads as
-# "never ran" for as long as it lasts, so it is warned, unlike an absent pointer.
-BUCKET_MISSING_MARKER = "bucket does not exist"
+# "never ran" for as long as it lasts, so it is warned, unlike an absent
+# pointer. `cat` never says this of an absent object (that is "matched no
+# objects"), so on a read it is the bucket.
+BUCKET_MISSING_MARKER = "not found: 404"
 # GitHub Actions renders a line with this prefix as a workflow warning, as the
 # sibling pool-pressure step's `echo "::warning::..."` does.
 WARNING_PREFIX = "::warning::"
@@ -194,6 +263,12 @@ KEY_DOES = "does"
 KEY_EFFECT = "effect"
 KEY_RUNBOOK = "runbook"
 KEY_SUMMARY = "summary"
+# A failed build's cause, from podinfo.json and the log's tail: the node the
+# pod ran on, a Warning event's reason, and the log line that says how it died.
+KEY_NODE = "node"
+KEY_LAST_EVENT = "last_event"
+KEY_LAST_LINE = "last_line"
+CAUSE_KEYS = (KEY_NODE, KEY_LAST_EVENT, KEY_LAST_LINE)
 # periodics_runs only, for a job with extra reports: True when the GitLab
 # report was read and names no token to rotate, False when it names one, None
 # when it was not read (absent, unreadable, or a failed read). What clears a
@@ -304,7 +379,7 @@ class Unreadable(Exception):
 def _finished(job: str, build: str, runner) -> dict | None:
     """The build's finished.json, None when it has none (still running or
     aborted); Unreadable when the read itself failed."""
-    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
     if out is None:
         if _not_found(err):
             return None
@@ -320,8 +395,90 @@ def _finished(job: str, build: str, runner) -> dict | None:
     return doc
 
 
+def _cause_read(path: str, runner, ranged: bool = False) -> str | None:
+    """One best-effort read for the cause: the object's text, or None on any
+    failure. Not collect._gcloud_storage_call: its text mode decodes strictly,
+    and a tail cut inside a multibyte character would raise out of the fetch
+    and blind every job after this one; here the bytes are decoded leniently.
+    A ranged read is `--range=-N`, the object's last N bytes."""
+    args = ["cat", f"--range=-{BUILD_LOG_TAIL_BYTES}", path] if ranged else ["cat", path]
+    try:
+        proc = runner([collect.DEFAULT_GCLOUD, collect.STORAGE_GROUP, *args], capture_output=True, timeout=collect.GCLOUD_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout
+    text = out.decode(BUILD_LOG_ENCODING, errors=BUILD_LOG_DECODE_ERRORS) if isinstance(out, bytes) else (out or "")
+    if ranged and len(out or "") >= BUILD_LOG_TAIL_BYTES:
+        # A suffix range starts wherever the object's length puts it: the
+        # first line of a full tail is a fragment, not a line.
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    return text
+
+
+def quotable(line: str) -> str:
+    """A log line fit to quote outside the bucket: credential shapes
+    scrubbed, Chat markup and the code-span backtick replaced."""
+    for pattern, replacement in SCRUB_PATTERNS:
+        line = pattern.sub(replacement, line)
+    for char, substitute in CHAT_MARKUP.items():
+        line = line.replace(char, substitute)
+    return line.replace(LINE_QUOTE_CHAR, LINE_QUOTE_SUBSTITUTE)
+
+
+def _entrypoint_message(line: str) -> str:
+    """The `message` of one of Prow's entrypoint JSON lines; the line itself
+    when it does not parse."""
+    try:
+        doc = json.loads(line)
+    except ValueError:
+        return line
+    return str(doc.get(ENTRYPOINT_KEY_MESSAGE) or line) if isinstance(doc, dict) else line
+
+
+def _failed_build_cause(job: str, build: str, runner, has_report: bool) -> dict:
+    """The node a failed build's pod ran on and a Warning pod event
+    (podinfo.json), and the line of its log that says how it died (a ranged
+    read of the tail: the last error-shaped line, or the last line of all when
+    the build wrote no report), for the note to say how the run died rather
+    than only that it did. Best-effort: an absent or unreadable object leaves
+    its keys out."""
+    cause: dict = {}
+    out = _cause_read(f"{LOGS_ROOT}/{job}/{build}/{PODINFO}", runner)
+    if out is not None:
+        try:
+            podinfo = json.loads(out)
+        except ValueError:
+            podinfo = None
+        if isinstance(podinfo, dict):
+            pod = podinfo.get(PODINFO_KEY_POD)
+            spec = pod.get(PODINFO_KEY_SPEC) if isinstance(pod, dict) else None
+            node = spec.get(PODINFO_KEY_NODE_NAME) if isinstance(spec, dict) else None
+            if node:
+                cause[KEY_NODE] = str(node)
+            events = podinfo.get(PODINFO_KEY_EVENTS)
+            warnings = [
+                str(event[EVENT_KEY_REASON])
+                for event in (events if isinstance(events, list) else [])
+                if isinstance(event, dict) and event.get(EVENT_KEY_REASON) and event.get(EVENT_KEY_TYPE) == EVENT_TYPE_WARNING
+            ]
+            if warnings:
+                cause[KEY_LAST_EVENT] = warnings[-1]
+    out = _cause_read(f"{LOGS_ROOT}/{job}/{build}/{BUILD_LOG}", runner, ranged=True)
+    if out is not None:
+        lines = [" ".join(line.split()) for line in CONTROL_CHARS_RE.sub("", out).splitlines() if line.strip()]
+        own = [line for line in lines if not line.startswith(ENTRYPOINT_LINE_PREFIX) and ERROR_LINE_RE.search(line)]
+        prow = [_entrypoint_message(line) for line in lines if line.startswith(ENTRYPOINT_LINE_PREFIX) and ENTRYPOINT_ERROR_MARKER in line]
+        chosen = own[-1] if own else (prow[0] if prow else (lines[-1] if lines and not has_report else None))
+        if chosen:
+            chosen = quotable(chosen)
+            cause[KEY_LAST_LINE] = chosen if len(chosen) <= LAST_LINE_MAX_CHARS else chosen[: LAST_LINE_MAX_CHARS - len(LAST_LINE_ELLIPSIS)] + LAST_LINE_ELLIPSIS
+    return cause
+
+
 def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
-    out, err = collect._gsutil_call(["-q", "ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
+    out, err = collect._gcloud_storage_call(["ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
     if out is None:
         log(f"{WARNING_PREFIX}could not list {job}'s builds behind a running {newest}: {err.strip()}", file=sys.stderr)
         return []
@@ -348,7 +505,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     None is also what a pointer that cannot be read for a reason other than
     NotFound returns, after a warning: the bot has gone blind on this job, and
     an absent reading holds any open note rather than ending it."""
-    out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
     if out is None:
         if not _not_found(err):
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
@@ -391,7 +548,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # than never. Any other failure is unreadable and the tick is blind
             # on this job, as for finished.json: a note is posted once, and one
             # written without its projects would stay so.
-            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -414,7 +571,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # not an object is said in its own lines; a read that fails for
             # another reason follows the main report's rule above: a failed
             # build's note is posted once, so it goes out whole or not yet.
-            out, err = collect._gsutil_call(["-q", "cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -427,6 +584,8 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
                     return None
         if extras:
             reading[KEY_EXTRA_ARTIFACTS] = extras
+        if not reading[KEY_PASSED]:
+            reading.update(_failed_build_cause(periodic.job, build, runner, has_report=reading[KEY_ARTIFACT] is not None))
         return reading
     return None
 
@@ -846,7 +1005,22 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_EFFECT: TOKEN_EFFECT if verdict == VERDICT_TOKEN else periodic.effect,
             KEY_RUNBOOK: TOKEN_RUNBOOK if verdict == VERDICT_TOKEN else periodic.runbook,
         }
+        if verdict == VERDICT_FAILED:
+            notes[periodic.job].update({key: reading[key] for key in CAUSE_KEYS if reading.get(key)})
     return notes
+
+
+def cause_text(note: dict) -> str | None:
+    """How a failed build died, for the evidence and the message: the log line
+    that says so, the node, a Warning pod event; None when none was read."""
+    parts = []
+    if note.get(KEY_LAST_LINE):
+        parts.append(f"log `{note[KEY_LAST_LINE]}`")
+    if note.get(KEY_NODE):
+        parts.append(f"node `{note[KEY_NODE]}`")
+    if note.get(KEY_LAST_EVENT):
+        parts.append(f"pod event {note[KEY_LAST_EVENT]}")
+    return ", ".join(parts) if parts else None
 
 
 def _named_failures(artifact) -> list[str]:
@@ -1002,7 +1176,8 @@ def evidence(note: dict) -> str:
     detail = f": {'; '.join(note[KEY_DETAIL])}" if note.get(KEY_DETAIL) else ""
     if note[KEY_VERDICT] == VERDICT_TOKEN:
         return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} passed at {note[KEY_FINISHED_AT]}{detail}"
-    return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}"
+    cause = cause_text(note)
+    return f"{note[KEY_LABEL]}: build {note[KEY_BUILD]} failed at {note[KEY_FINISHED_AT]}{detail}" + (f" ({cause})" if cause else "")
 
 
 def parse_args(argv):

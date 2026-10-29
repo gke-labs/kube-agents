@@ -26,10 +26,10 @@ runs `hack/fleet-kubeconfigs.sh` against the project and requires every fixture 
 then runs `hack/fleet-fixture-state.py` and requires each of them to be in its **designed
 state** — the `state` assertions beside each role in `fixtures.json` (the crashloop has a
 recorded OOMKilled termination, `checkout-gateway` has two Ready replicas and no PDB in its
-namespace, `seeded-b`'s master is still one minor behind its channel with the exclusion
-window ahead of now, `seeded-c` at least a day old). That last one means a project applied
-today fails the check until tomorrow, the drift SOP's age gate below. Presence alone passed
-on 2026-09-07 while every slot-a fixture sat
+namespace, `seeded-b`'s master is still one minor behind its channel, on no patch newer
+than the channel offers, with the exclusion window ahead of now, `seeded-c` at least a day
+old). That last one means a project applied today fails the check until tomorrow, the drift
+SOP's age gate below. Presence alone passed on 2026-09-07 while every slot-a fixture sat
 Pending (#1278); the state pass is what would have failed that project. A role on a cluster
 it could not reach usually reports as unchecked rather than absent; the warnings that
 override that default are in `docs/ci-pool-projects.md` §6.
@@ -39,7 +39,11 @@ re-initializing against that project's bucket and naming the project on the appl
     tofu init -reconfigure \
               -backend-config="bucket=<project>-tf-state" \
               -backend-config="prefix=seeded-fleet"
+    tofu apply -var="project_id=<project>" -target=google_container_cluster.seeded_a
     tofu apply -var="project_id=<project>"
+
+The first apply creates `seeded-a` alone, because the scaled-zero gateway fixture reads the Gateway
+API CRDs that GKE installs with it; on a project that already has it, it changes nothing.
 
 Local validation without credentials: `tofu init -backend=false && tofu validate`.
 
@@ -48,15 +52,16 @@ writer: from `main`, under a Boskos lease per project, creates and in-place upda
 the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
 address, or per resource to cover every instance of a `count` or `for_each` one, with its
 reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
-pool's replace on a minor roll is the standing one). Its two Prow
+pool's replace on a minor roll and the scaled-zero gateway's status writer are the two standing ones). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
-never from a laptop while a run holds the project. The two hand recoveries below (`seeded_b`'s
-cluster, a targeted destroy; `inventory_api`, a replace) are the exception: the script passes neither
-`-target` nor `-replace`, so they run by hand
-from a `main` checkout, under a lease on the project. A `default-pool-headroom` drift is the one no re-apply or hand recovery clears: it means seeded-a's default pool is within the 100m margin of full, and the repair is a larger `machine_type` or `node_count` on `seeded_a_default` in `main.tf`, merged, which the postsubmit then rolls project by project. The script's `init` runs with `-lockfile=readonly`, so the
+never from a laptop while a run holds the project. The three hand recoveries (`seeded_b`'s
+cluster, a targeted destroy; `inventory_api`, a replace; and `-replace=terraform_data.scaled_zero_status`,
+which rewrites the scaled-zero gateway's status after an out-of-band edit the fixture-state scan reports)
+are the exception: the script passes neither `-target` nor `-replace`, so they run by hand
+from a `main` checkout, under a lease on the project. A recovery that re-creates `seeded_a`, and a project's first apply, run as two applies: `-target=google_container_cluster.seeded_a` first, then the whole stack, because the scaled-zero gateway fixture's `kubernetes_manifest` resources read the Gateway API CRDs at plan time and GKE installs them only with the cluster (`scripts/provision_ci_pool_project.sh` does this). A `default-pool-headroom` drift is the one no re-apply or hand recovery clears: it means seeded-a's default pool is within the 100m margin of full, and the repair is a larger `machine_type` or `node_count` on `seeded_a_default` in `main.tf`, merged, which the postsubmit then rolls project by project. The script's `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
 here, and commit the result. A resource type that needs a project role the reconciler does not hold
@@ -95,8 +100,10 @@ found on such a patch, the script holds the pin instead, at the newest REGULAR p
 that minor above the running one if there is one, else at the running version, and the
 apply after that step does the minor bump, one minor per apply (GKE's control-plane
 rule), so a master the hold left two minors behind reaches the target over two applies.
-While a hold lasts the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
-`version-laggard` as drifted until REGULAR ships a patch above the running one, and if
+While a hold lasts the master may run a patch newer than any REGULAR patch of its minor,
+and after a minor roll the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
+`version-laggard` as drifted on either (`not_ahead_of_channel`,
+`minor_behind_channel_default`) until REGULAR ships a patch above the running one, and if
 REGULAR drops the minor first no pin can recover, so the cluster is upgraded by hand off
 the channel or destroyed and re-created (the recovery below). `seeded-b`'s node pool is
 driven from the same derived pin and deliberately **not** `ignore_changes`'d, so it
@@ -250,6 +257,7 @@ The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 | `multi-process-worker`, a shell supervisor forking two workers under one 32Mi limit: the shape a cgroup v2 node OOM-kills whole (entry 15)                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `seeded-a` / ns `seeded-shapes`      | `multi-process-container`       | `upgrades-multi-process-oom-group-named`, `upgrades-fleet-readiness-multi-process-container`, `upgrades-retrospective-multi-process-container`                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cni-shaped-agent`, a host-network DaemonSet mounting `/etc/cni/net.d` read-only: a network plugin's coupling to the node image (entry 17)                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `seeded-a` / ns `seeded-shapes`      | `node-image-coupled-agent`      | `upgrades-node-image-coupled-agent-named`, `upgrades-fleet-readiness-node-image-coupled-agent`                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cuda-pinned-trainer`, a suspended CronJob requesting one GPU on an `nvidia-l4` pool with a CUDA 12.2 image: the driver dependency in a manifest that never runs (entry 18)                                                                                                                                                                                                                                                                                                                                                                                                                      | `seeded-a` / ns `seeded-shapes`      | `cuda-pinned-gpu-job`           | `upgrades-cuda-pinned-gpu-job-named`, `upgrades-fleet-readiness-cuda-pinned-gpu-job`, `upgrades-retrospective-cuda-pinned-gpu-job`                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `storefront` and the Gateway's proxy Deployment at replicas 0, Gateway `storefront-edge` Programmed=False (NoResources) with status written by `gateway_status.py`: a switched-off environment, not a stall                                                                                                                                                                                                                                                                                                                                                                                      | `seeded-a` / ns `seeded-scaled-zero` | `scaled-zero-gateway`           | `cluster-agent-scaled-zero-gateway-silence` (parked until the role is planted)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 The `environment=seeded` resource label is the cohort confinement, the same class of
 fixture-determinism as the pool taints: the drift SOP resolves environment from

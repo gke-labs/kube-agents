@@ -1,13 +1,14 @@
 # First-Time Environment Discovery & Inventory Scan (`bootstrap-inventory-scan`)
 
 **Purpose:** The fleet half of first-time GKE environment discovery: enumerate the fleet, audit any
-cluster that has no Cluster Agent, and complete.
+cluster that has no Cluster Agent or is past the first-run cap, and complete.
 
 You do not fan out and you do not write the report. The onboarding gate (`bootstrap_scan_gate.py`
-and `bootstrap_handoff.py`, scripts) files one audit card per Cluster Agent itself, and once those
-cards settle it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md`
-and files the card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your
-job is the fleet list, the clusters no Cluster Agent covers, and the gaps.
+and `bootstrap_handoff.py`, scripts) files the audit cards itself, one per Cluster Agent up to the
+first-run cap; your card names any cluster past the cap, and you audit those. Once the cards settle
+it writes their structured `metadata`, with yours, into `/opt/data/INVENTORY.raw.md` and files the
+card that ranks it into the report delivered to chat as `/opt/data/INVENTORY.md`. Your job is the
+fleet list, the clusters no Cluster Agent card covers, and the gaps.
 
 ---
 
@@ -46,7 +47,7 @@ reach it, an entry in `gaps` saying so.
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
 clusters Step 1 kept, after dropping the excluded ones, that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
+The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
 `cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
 shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup
 probe, read-only root filesystem, added capabilities, namespace quota, addons, observability and
@@ -91,8 +92,8 @@ audited) and this `metadata`:
 ```
 
 `fleet` is every cluster Step 1 listed: the hand-off names any of them that no audit reported on, so
-a silent gap does not read as a clean cluster. `clusters` is an empty list when every cluster had an
-agent. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
+a silent gap does not read as a clean cluster. `clusters` is an empty list only when no cluster
+lacked a Cluster Agent and none was past the first-run cap. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
 once and summarise it. A Cluster Agent cannot see that resource, so the report shows it beside their
 observability findings. A cluster you could not reach goes in `gaps`, not silently out of `fleet`. If you could not
 list the clusters at all, say so in `gaps` and complete anyway — onboarding runs once.
