@@ -980,25 +980,35 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
     def _session_publish_derivation(cls) -> str:
         """Every executor publish grant the callout derives, as Go source.
 
-        That is the Publish literal `executorGrants` starts both narrowings
-        from (session pods and AgentProfile pods), plus the bodies of
-        `sessionGrants`, `profileWorkerGrants` and `profileGrants`, which
-        append to it. The literal alone, not all of `executorGrants`: its
-        consumer filters name `…in` as a READ, which is what the assertions
-        here distinguish. Each narrowing is required to call `executorGrants`
-        (the profile one through `profileWorkerGrants`), so one that stopped
-        would not silently fall out of what is read.
+        That is the Publish literal `executorTaskGrants` starts both
+        narrowings from (session pods, through `executorGrants`, and
+        AgentProfile pods' task connections), plus the bodies of
+        `sessionGrants`, `profileTaskGrants`, `profileWorkerGrants` and
+        `profileGrants`, which append to it or stand beside it. The literal
+        alone, not all of `executorTaskGrants`: its consumer filters name
+        `…in` as a READ, which is what the assertions here distinguish. Each
+        executor narrowing is required to call it (the session through
+        `executorGrants`), so one that stopped would not silently fall out of
+        what is read. A profile pod's own connection (`profileWorkerGrants`,
+        through `profileGrants`) keeps its profile-wide task plane until
+        #3889's worker PR removes it; it is read too, so a task-plane publish
+        added there is caught.
         """
-        body = h.go_function_body(h.text("a2a_session_grants"), "executorGrants")
+        sessions = h.text("a2a_session_grants")
+        body = h.go_function_body(sessions, "executorTaskGrants")
         block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
-        assert block is not None, "executorGrants no longer starts from a Publish literal"
-        session = h.go_function_body(h.text("a2a_session_grants"), "sessionGrants")
+        assert block is not None, "executorTaskGrants no longer starts from a Publish literal"
+        assert "executorTaskGrants(" in h.go_function_body(sessions, "executorGrants"), (
+            "executorGrants no longer derives from executorTaskGrants"
+        )
+        session = h.go_function_body(sessions, "sessionGrants")
+        task = h.go_function_body(h.text("a2a_profile_grants"), "profileTaskGrants")
         worker = h.go_function_body(h.text("a2a_profile_grants"), "profileWorkerGrants")
         profile = h.go_function_body(h.text("a2a_profile_grants"), "profileGrants")
-        for narrowing in (session, worker):
-            assert "executorGrants(" in narrowing, "a narrowing no longer starts from executorGrants"
+        assert "executorGrants(" in session, "sessionGrants no longer starts from executorGrants"
+        assert "executorTaskGrants(" in task, "profileTaskGrants no longer starts from executorTaskGrants"
         assert "profileWorkerGrants(" in profile, "profileGrants no longer starts from profileWorkerGrants"
-        return block.group(1) + "\n".join((session, worker, profile))
+        return block.group(1) + "\n".join((session, task, worker, profile))
 
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.
@@ -1202,23 +1212,24 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 f"addressee's in subject",
             )
         # The task-plane half, the per-session consumer's read filter among
-        # it, is built by executorGrants, which AgentProfile pods share
-        # (gke-labs#2469). The session reaches it only as
-        # executorGrants(pod, pod), and inside it every TaskInSubject names
-        # the addressee argument, so the session's calls still name pod.
+        # it, is built by executorTaskGrants, which AgentProfile pods share
+        # (gke-labs#2469, and the task connection since #3889). The session
+        # reaches it only as executorGrants(pod, pod), a wrapper passing "*"
+        # for the task, and inside executorTaskGrants every TaskInSubject
+        # names the addressee argument, so the session's calls still name pod.
         self.assertEqual(
             ["pod, pod"],
             [a.strip() for a in re.findall(r"executorGrants\(([^)]*)\)", body)],
             "sessionGrants no longer derives its task-plane grants as executorGrants(pod, pod)",
         )
-        executor = h.go_function_body(src, "executorGrants")
+        executor = h.go_function_body(src, "executorTaskGrants")
         calls = re.findall(r"TaskInSubject\(\s*([^,]+),", executor)
-        self.assertTrue(calls, "executorGrants calls TaskInSubject nowhere; the probe above is vacuous")
+        self.assertTrue(calls, "executorTaskGrants calls TaskInSubject nowhere; the probe above is vacuous")
         for arg in calls:
             self.assertEqual(
                 "addressee",
                 arg.strip(),
-                f"executorGrants calls TaskInSubject({arg.strip()}, ...): every "
+                f"executorTaskGrants calls TaskInSubject({arg.strip()}, ...): every "
                 f"executor, sessions included, would hold a grant on that "
                 f"addressee's in subject",
             )

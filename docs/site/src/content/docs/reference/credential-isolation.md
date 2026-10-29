@@ -13,7 +13,7 @@ This page summarizes the architecture. The canonical design — including scope,
 
 ## Pod anatomy
 
-Each PlatformAgent runs as three Pods.
+Each PlatformAgent runs as three Pods. Under `spec.mode: next`, the first-install default, the operator adds the A2A stack's Pods beside them and one container to the gateway Pod; [the `next` Pods](#the-next-pods) below lists them.
 
 | Pod / container                        | Trust level | Role                                                                                                                                                                                                                                                                               |
 | -------------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -22,10 +22,26 @@ Each PlatformAgent runs as three Pods.
 | &nbsp;&nbsp;`agent-api-auth`           | Trusted     | The PlatformAgent API front door; the event watcher, which forwards cluster events on its own Kubernetes-API token; and, where enabled, the drift detector, which pulls audit records. Both make their Google calls (fleet clusters, Pub/Sub) through the broker's watcher routes. |
 | &nbsp;&nbsp;`fluent-bit`               | Trusted     | Log forwarding.                                                                                                                                                                                                                                                                    |
 | &nbsp;&nbsp;`platform-agent-dashboard` | Untrusted   | Optional local dashboard (also credential-free).                                                                                                                                                                                                                                   |
+| &nbsp;&nbsp;`hermes-bridge`            | Untrusted   | Under `mode: next` only. Takes tasks off the bus and runs each as a turn on the agent's API server. Built from the agent image with the agent's mounts; holds the `bridge` bus password, never the Pod's bus token.                                                                |
 | **`<name>-shell`**                     | Untrusted   | `sshd`, `/opt/data`, the agent's tools and the CLI wrappers. Everything the model executes runs here.                                                                                                                                                                              |
 | **`<name>-credential-proxy`**          | Trusted     | Envoy, the credentialed command and chat runtime, the Minty client. Runs nothing the model wrote.                                                                                                                                                                                  |
 
 `agent-api-auth` is a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`, needing Kubernetes 1.29+ — so it starts before the others and does not appear in `spec.containers`.
+
+### The `next` Pods
+
+Under `spec.mode: next` the operator also renders the A2A stack ([Architecture → Deployment topology](/kube-agents/overview/architecture/#deployment-topology)). The session pods are the only ones that run an agent; the rest hold the one bus identity each needs and no forge or cloud credential:
+
+- **`<name>-a2a-nats-0`**: the NATS JetStream bus, with the TLS websocket listener the console server proxies to. It holds the certificate its listeners serve and nothing of the agent's.
+- **`<name>-a2a-callout`** (two replicas): the auth callout that authenticates every bus client, resolving a projected ServiceAccount token to its principal's grants with a Kubernetes `TokenReview`. It holds the issuer keys in `<name>-a2a-callout-keys`.
+- **`<name>-a2a-verifier`** (two replicas): the capability verifier, the only principal that may read the `cap` bucket; a task submitted while no verifier is ready is refused.
+- **`<name>-a2a-gateway`**: the chat backend and the console door. It holds the Slack tokens when it holds Slack, and reaches Google Chat through the broker with the `kubeagents-credential-proxy-a2a-chat` audience described below.
+- **`<name>-a2a-console`**: the console server, which hands the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page the shared `console` bus password and proxies its websocket. Reachable only through `kubectl port-forward`.
+- **`<name>-a2a-provision-<hash>`**: the Job that provisions the streams, once per change.
+- **Session pods** (`<profile>-<animal>-<hex>`): one per `/session` conversation, all on one session ServiceAccount distinct from the gateway's, fenced by an egress NetworkPolicy and a ResourceQuota. They read a cluster only under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, through the broker, as the next paragraph says. [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) covers their bus identity.
+- **`<name>-a2a-mcp`**, opt-in: the [MCP server](/kube-agents/reference/a2a-mcp/), holding the `console` password and its own bearer token.
+
+Under `today` none of them is rendered, and the gateway Pod has no `hermes-bridge` container. Switching back removes them and keeps the bus volume and its credentials Secret ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
 
 ```mermaid
 flowchart TB

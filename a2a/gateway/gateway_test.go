@@ -1906,13 +1906,11 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 		}
 		return false
 	})
-	after, err := r.g.reg.Get(ctx, conv)
-	if err != nil || after == nil {
-		t.Fatal(err)
-	}
-	if !after.LastActivity.After(stale) {
-		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
-	}
+	// The gateway writes the record after it posts the answer, so the
+	// reap's clock is polled for rather than read once (see waitForRecord).
+	after := waitForRecord(t, r, conv, "a verified turn to count for the reap", func(rec *SessionRecord) bool {
+		return rec.LastActivity.After(stale)
+	})
 	if !after.LastTaskActivity.Equal(stale) {
 		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
 	}

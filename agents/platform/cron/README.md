@@ -224,7 +224,8 @@ resolves the number) with the reason and the remedy in
 `logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
 ships, and kept in `last-failure.txt` by the kind of failure until the next
 clean tick posts the recovery. A roster spelling that is not a project, no GCP
-project at all, and a ledger it refuses to overwrite end the same way. A failure a retry may clear (a timeout, a
+project at all, a ledger it refuses to overwrite, and an agent image missing the
+report script end the same way. A failure a retry may clear (a timeout, a
 sandbox that failed) says instead that it tries again tomorrow, or at its next
 scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
@@ -520,9 +521,11 @@ missed, and a daily repeat of the same list is noise. The ids last said, and
 when, are kept in `profiles/platform/cron/kanban_board_health.json` under the
 agent home; a card that comes unstuck drops out of it, so it is new again if it
 sticks again, and a record that cannot be read says every stuck card again. The
-record is written before the scheduler delivers, so a run that finds a
-`last_delivery_error` on this job's entry stamped after the last post says the
-cards again rather than leaving them unsaid for a week. The
+record is written before the scheduler delivers, so a run that finds a hard
+delivery failure (graded as `chat-delivery-watch` grades it) on this job's
+entry stamped after the last post says the cards again rather than leaving
+them unsaid for a week. A partial or degraded relay, or a note on a report that
+arrived, landed somewhere and is not said again. The
 board's other findings (invariant violations and the engine's other rules) are
 rare and still print on every run that finds them, under
 `kanban board health: attention required`. It fires at 12:35 UTC, half an hour

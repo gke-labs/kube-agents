@@ -11,8 +11,16 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either, and the inject
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
-them, since the merge-blocking presubmit runs on that lane (below). Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt`, a new case directory under `bench/tasks/` and the script itself need only the normal approvers
+them, since the merge-blocking presubmit runs on that lane (below). The script, `hack/ci-eval-pr.sh`,
+carries it too: it grades every pull request with `main`'s `bench/` at `PULL_BASE_SHA` and the change's
+own cases, and the rule keeps a root approval alone from editing that step out. So do the files that
+run inside it or decide whether it runs: `hack/ci-env.sh` and `hack/fleet-kubeconfigs.sh` (sourced),
+`hack/ci-deploy.sh` (its functions are evaluated), `hack/ci-revalidate.sh` (step 0, which can reuse a
+verdict in place of a run), `hack/fleet-fixture-state.py` (its report excuses cases) and
+`scripts/installer/gke_dns_endpoint.sh` (sourced by `ci-env.sh`, under `scripts/installer/OWNERS`)
+([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
+Nothing else carries the rule:
+`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding

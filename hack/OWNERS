@@ -6,16 +6,30 @@
 # hack/eval/inject-lane-exclusions.txt takes a case out of every pull
 # request's matrix and, for a roster case, out of what can red one, and
 # hack/eval/inject-lane-safeguards.yaml adds a rung 1 check to every case
-# there. Everything else under hack/ -- hack/eval/nightly-cases.txt,
-# ci-eval-pr.sh itself, the deploy scripts -- matches no filter and falls
-# through to the root OWNERS, so a new case lands in the nightly with the
-# normal approvers (#1546, decided 2026-09-15). docs/eval-gate-roster.md
-# states the rule.
+# there. ci-eval-pr.sh joins them because it extracts main's grader for every
+# pull request (#1560 section 6, decided 2026-10-28): a change that took that
+# step out would be graded by its own bench/, so it needs an eval-crew approver
+# too, and so does every file here that runs inside that script or decides
+# whether it runs: ci-env.sh and fleet-kubeconfigs.sh, which it sources;
+# ci-deploy.sh, whose functions it evals; ci-revalidate.sh, whose exit 0
+# reuses an earlier verdict in place of a run; and fleet-fixture-state.py,
+# whose report excuses a case as infrastructure. (scripts/installer/OWNERS
+# covers gke_dns_endpoint.sh, which ci-env.sh sources.) Everything else under
+# hack/ -- hack/eval/nightly-cases.txt, the subprocess helpers that reset the
+# environment or mint tokens -- matches no filter and falls through to the
+# root OWNERS, so a new case lands in the nightly with the normal approvers
+# (#1546, decided 2026-09-15). docs/eval-gate-roster.md states the rule.
 filters:
   'eval/(presubmit-cases|blocking-roster|inject-lane-exclusions)\.txt$':
     approvers:
     - eval-crew
   'eval/inject-lane-safeguards\.yaml$':
+    approvers:
+    - eval-crew
+  '^(ci-eval-pr|ci-env|fleet-kubeconfigs|ci-deploy|ci-revalidate)\.sh$':
+    approvers:
+    - eval-crew
+  '^fleet-fixture-state\.py$':
     approvers:
     - eval-crew
 options:

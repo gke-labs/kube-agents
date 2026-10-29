@@ -978,8 +978,9 @@ Spyglass under `logs/<job>/<build>`, a periodic's path, in the bucket the
 run's `runs[].log_url` names (without it: `gs://kube-agents-prow`, the
 bucket before 2026-09-15). The nights are
 never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
-first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
-and Prow's time to write `finished.json`) of `generated_at`, oldest first,
+started inside `RUNNING_MAX_AGE` (12 h 30 m: the longest part's 12-hour
+budget, Prow's grace and a late collector tick to record `finished.json`; the
+start is read from the snowflake build ID, else `first_seen`) of `generated_at`, oldest first,
 each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
@@ -995,7 +996,7 @@ record (`green` is Prow's `SUCCESS`; `tasks` counts the
 run's task rows by result); `running[]` the lane's `pending_builds` as
 `{build, first_seen}`, only those first seen inside `RUNNING_MAX_AGE` (8 h,
 the presubmit's ceiling plus upload time) of the reference time, as the Grid's
-columns and the nightly's `running[]` are bounded; `counts` over every lane
+columns and the nightly's `running[]` (12 h 30 m from its start) are bounded; `counts` over every lane
 pull-request run on record. `job` is the
 name the newest lane pull-request run carries, else the default. The Brief's "GitLab
 lane" section is this block and nothing else reads it: the lane's runs are

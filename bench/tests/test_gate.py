@@ -83,6 +83,7 @@ def _clean_env(monkeypatch):
         "PULL_NUMBER",
         "RC_COMMIT_SHA",
         "PULL_BASE_SHA",
+        "EVAL_GRADER_SHA",
         "GIT_COMMIT",
         "EVAL_BASELINE_STORE",
         "EVAL_BASELINE_MAX_OBJECTS",
@@ -702,6 +703,39 @@ def test_the_suite_json_records_the_aggregate(tmp_path, monkeypatch):
     doc = json.loads(out.read_text(encoding="utf-8"))
     assert doc["green"] is False
     assert doc["pass_rate"] == 0.25 and doc["baseline_rate"] == 0.9
+
+
+GRADER_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_the_verdict_names_the_grader_sha(tmp_path):
+    """A pull request is graded by main's bench/ (hack/ci-eval-pr.sh, section 6),
+    so the verdict says which commit that was, in both files."""
+    md, out = tmp_path / "verdict.md", tmp_path / "suite.json"
+    main(["suite", "--case-result", str(case_file(tmp_path, "a")),
+          "--grader-sha", GRADER_SHA, "--markdown-out", str(md), "--json-out", str(out)])
+    assert f"Graded by `bench/` at `{GRADER_SHA}`" in md.read_text(encoding="utf-8").splitlines()
+    assert json.loads(out.read_text(encoding="utf-8"))["grader_sha"] == GRADER_SHA
+
+
+def test_the_grader_sha_comes_from_the_environment(tmp_path, monkeypatch):
+    """The shell exports EVAL_GRADER_SHA rather than passing the flag, so a
+    grader from before the flag still runs; the flag wins over it."""
+    monkeypatch.setenv("EVAL_GRADER_SHA", GRADER_SHA)
+    out = tmp_path / "suite.json"
+    main(["suite", "--case-result", str(case_file(tmp_path, "a")), "--json-out", str(out)])
+    assert json.loads(out.read_text(encoding="utf-8"))["grader_sha"] == GRADER_SHA
+    main(["suite", "--case-result", str(case_file(tmp_path, "a")), "--grader-sha", "f" * 40,
+          "--json-out", str(out)])
+    assert json.loads(out.read_text(encoding="utf-8"))["grader_sha"] == "f" * 40
+
+
+def test_without_a_grader_sha_the_verdict_says_nothing_of_one(tmp_path):
+    md, out = tmp_path / "verdict.md", tmp_path / "suite.json"
+    main(["suite", "--case-result", str(case_file(tmp_path, "a")),
+          "--markdown-out", str(md), "--json-out", str(out)])
+    assert "Graded by" not in md.read_text(encoding="utf-8")
+    assert "grader_sha" not in json.loads(out.read_text(encoding="utf-8"))
 
 
 def test_the_aggregate_margin_comes_from_the_environment(tmp_path, monkeypatch):

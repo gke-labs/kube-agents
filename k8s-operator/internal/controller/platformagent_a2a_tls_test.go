@@ -212,7 +212,7 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 	}
 	gateway := buildA2AGatewayDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "")
 	job := buildA2AProvisionJob(agent)
 	agentPod := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
 	// The bridge sidecar sets its own NATS_URL but takes the CA env and mount

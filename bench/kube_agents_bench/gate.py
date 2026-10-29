@@ -117,6 +117,14 @@ _DEFAULT_BASELINE_DIR = "baselines"
 AGENT_TRANSPORT_ENV = "AGENT_TRANSPORT"
 TRANSPORT_INJECT = "inject"
 
+#: The commit whose ``bench/`` graded the run, which ``suite`` names in the
+#: verdict: hack/ci-eval-pr.sh exports it, as main's ``PULL_BASE_SHA`` on a
+#: pull request (the change's cases, main's grader) and HEAD elsewhere. An
+#: environment default rather than a flag the shell passes, so the script can
+#: set it while main's grader predates the flag. ``--grader-sha`` overrides.
+GRADER_SHA_ENV = "EVAL_GRADER_SHA"
+GRADER_SHA_KEY = "grader_sha"
+
 #: Rung 6 compares a run only with history from its own mode, because the
 #: mode is a component of the version key (``VersionKey.mode``). Before it
 #: was, main's judged record was the today-mode nightly's over the api
@@ -562,7 +570,11 @@ def _record_says(case: dict[str, Any]) -> str:
 
 
 def _markdown(
-    verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
+    verdict: Any,
+    cases: list[dict[str, Any]],
+    *,
+    admission_column: bool = False,
+    grader_sha: str | None = None,
 ) -> str:
     not_evaluated = verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
     lines = [
@@ -571,6 +583,8 @@ def _markdown(
         f"**{SUITE_HEADLINES[verdict.outcome]}**",
         "",
     ]
+    if grader_sha:
+        lines += [f"Graded by `bench/` at `{grader_sha}`", ""]
     if not_evaluated:
         # The banner says what to do, because the headline alone invites the
         # wrong action: a pull request author who sees a red job debugs the
@@ -769,6 +783,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         verdict,
         cases,
         admission_column=_store_configured(args) or _record_decided(cases),
+        grader_sha=args.grader_sha,
     )
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
@@ -829,6 +844,10 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         out.write_text(text, encoding="utf-8")
     if args.json_out:
         doc = verdict.to_dict()
+        # Only when known: a run that names no grader writes the document
+        # it always wrote (tests/test_store_unset_golden.py pins it).
+        if args.grader_sha:
+            doc[GRADER_SHA_KEY] = args.grader_sha
         if args.partial:
             doc["partial"] = True
             doc["partial_note"] = args.partial
@@ -1166,6 +1185,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "this is not the run's verdict: banner the markdown with NOTE and "
             "mark the JSON partial; for a run the deadline ended before its "
             "suite step"
+        ),
+    )
+    suite.add_argument(
+        "--grader-sha",
+        default=os.environ.get(GRADER_SHA_ENV) or None,
+        help=(
+            "the commit whose bench/ graded this run, named in the markdown "
+            f"and as {GRADER_SHA_KEY} in the JSON (default: ${GRADER_SHA_ENV})"
         ),
     )
     suite.set_defaults(func=_cmd_suite)

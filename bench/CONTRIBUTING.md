@@ -53,6 +53,10 @@ contract; this page does not restate it.
 **Check:** `make bench-case-check` locally, `scripts/test_task_registration.py` in CI. The CI
 lint asserts that the validator returned nothing at all, so every rule in it gates.
 
+A pull request's eval jobs grade its cases with `main`'s `bench/`, so a new check type, case key
+or fleet role lands before any case those jobs run uses it, including a nightly case on a lane list
+such as `hack/eval/gitlab-cases.txt` ([`testing-strategy.md`](../docs/designs/testing-strategy.md#pinning-and-baselines)).
+
 What review holds a case to beyond the validator: the objective names a thing the fixture
 planted, and a run that did not do the work cannot reach it; the safeguard names the thing
 the case must not do; and the stack is the cheapest one that plants the defect. A case with
