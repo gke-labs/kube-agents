@@ -200,11 +200,23 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 // conversation by token, so its answer is labelled by the token rather than
 // by a name it may not have.
 func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
-	t, named, byToken, evicted, err := c.resolve(alias, token)
+	r, err := c.resolve(alias, token)
 	if err != nil {
 		return "", false, err
 	}
-	return t, byToken, c.listen(t, named, evicted)
+	if err := c.listen(r.token, r.named, r.evicted); err != nil {
+		// A name whose conversation is not listened to is not kept, as
+		// Create does not keep one, so a retry is not refused as existing.
+		if r.created != "" {
+			c.mu.Lock()
+			if e, ok := c.byAlias[r.created]; ok && e.token == r.token {
+				delete(c.byAlias, r.created)
+			}
+			c.mu.Unlock()
+		}
+		return "", false, err
+	}
+	return r.token, r.byToken, nil
 }
 
 // listen tells events of a conversation resolved and of one the table
@@ -220,17 +232,56 @@ func (c *Conversations) listen(token string, named bool, evicted string) error {
 // resolve is ResolveCall's table work: the token, whether the table holds it
 // by a name, whether the call named it by token, and the token of an alias
 // forgotten to make room.
-func (c *Conversations) resolve(alias, token string) (string, bool, bool, string, error) {
-	// A conversation's token given as its name, as list shows it
-	// (console:<token>) or bare, is the token: never a new name spelled like
-	// one, whether or not this table still knows it (after a delete, an
-	// eviction or a restart, the token is what a caller falls back to).
+func (c *Conversations) resolve(alias, token string) (resolved, error) {
+	alias, token, err := nameOrToken(alias, token)
+	if err != nil {
+		return resolved{}, err
+	}
+	if token != "" {
+		// A call by token is a use of the name that holds it, if any.
+		c.mu.Lock()
+		if a, ok := c.aliasOfTokenLocked(token); ok {
+			c.touchLocked(c.byAlias[a])
+		}
+		c.mu.Unlock()
+		return resolved{token: token, byToken: true}, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.byAlias[alias]; ok {
+		c.touchLocked(e)
+		return resolved{token: e.token, named: true}, nil
+	}
+	t, evicted, err := c.addLocked(alias, "")
+	if err != nil {
+		return resolved{}, err
+	}
+	return resolved{token: t, named: true, created: alias, evicted: evicted}, nil
+}
+
+// resolved is what resolve found: the token, whether a name in the table
+// holds it, whether the call named it by token, the name it created (if it
+// did), and the token of an alias forgotten to make room.
+type resolved struct {
+	token   string
+	named   bool
+	byToken bool
+	created string
+	evicted string
+}
+
+// nameOrToken sorts a call's conversation into a name or a token, by the
+// rules every tool shares: a conversation's token given as its name, as list
+// shows it (console:<token>) or bare, is the token, never a new name spelled
+// like one, whether or not this table still knows it (after a delete, an
+// eviction or a restart, the token is what a caller falls back to); and
+// console:<x> in a name's place is a token only when x is one. A token comes
+// back without its prefix and checked; a name comes back checked, default
+// when none was given.
+func nameOrToken(alias, token string) (string, string, error) {
 	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
-		// console:<x> in a name's place is a token only when x is one, as
-		// list shows tokens; console:<name> is neither, not a conversation
-		// nobody minted.
 		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
-			return "", false, false, "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
+			return "", "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
 		}
 		alias, token = "", alias
 	}
@@ -239,30 +290,17 @@ func (c *Conversations) resolve(alias, token string) (string, bool, bool, string
 		// names it.
 		token = strings.TrimPrefix(token, consoleConversationPrefix)
 		if !lib.ValidSubjectToken(token) {
-			return "", false, false, "", fmt.Errorf("%q is not a conversation token", token)
+			return "", "", fmt.Errorf("%q is not a conversation token", token)
 		}
-		// A call by token is a use of the name that holds it, if any.
-		c.mu.Lock()
-		if a, ok := c.aliasOfTokenLocked(token); ok {
-			c.touchLocked(c.byAlias[a])
-		}
-		c.mu.Unlock()
-		return token, false, true, "", nil
+		return "", token, nil
 	}
 	if alias == "" {
 		alias = DefaultConversation
 	}
 	if err := checkAlias(alias); err != nil {
-		return "", false, false, "", err
+		return "", "", err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if e, ok := c.byAlias[alias]; ok {
-		c.touchLocked(e)
-		return e.token, true, false, "", nil
-	}
-	t, evicted, err := c.addLocked(alias, "")
-	return t, err == nil, false, evicted, err
+	return alias, "", nil
 }
 
 // isMintedToken reports whether s is spelled as this server mints tokens.
@@ -322,31 +360,22 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 // names by token, or by a name the table already holds, and whether the
 // table holds it by a name. An unknown name is refused, not created.
 func (c *Conversations) lookup(alias, token string) (string, bool, error) {
-	if token == "" && strings.HasPrefix(alias, consoleConversationPrefix) {
-		alias, token = "", alias
-	}
-	if token != "" {
-		token = strings.TrimPrefix(token, consoleConversationPrefix)
-		if !lib.ValidSubjectToken(token) {
-			return "", false, fmt.Errorf("%q is not a conversation token", token)
-		}
-		return token, false, nil
-	}
-	if alias == "" {
-		alias = DefaultConversation
-	}
-	if err := checkAlias(alias); err != nil {
+	alias, token, err := nameOrToken(alias, token)
+	if err != nil {
 		return "", false, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if token != "" {
+		// A call by token is a use of the name that holds it, if any.
+		if a, ok := c.aliasOfTokenLocked(token); ok {
+			c.touchLocked(c.byAlias[a])
+		}
+		return token, false, nil
+	}
 	if e, ok := c.byAlias[alias]; ok {
 		c.touchLocked(e)
 		return e.token, true, nil
-	}
-	if a, ok := c.aliasOfTokenLocked(alias); ok {
-		c.touchLocked(c.byAlias[a])
-		return alias, true, nil
 	}
 	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", cell(alias))
 }
@@ -1087,6 +1116,9 @@ type TurnOutcome struct {
 	Reports      []EventFrame
 	ReportsEnd   reportsEnd
 	ReportCursor uint64
+	// ReportsDropped: the conversation's buffer dropped a frame posted
+	// after the turn was sent, which may have been one of its reports.
+	ReportsDropped bool
 	// Cards is what the gateway's result for the root said about cards,
 	// as last read while gathering.
 	Cards cardsSignal
@@ -1259,6 +1291,7 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 	for {
 		page, changed := b.events.snapshot(w.token)
 		out.Reports, out.ReportCursor = nil, page.Cursor
+		out.ReportsDropped = page.Dropped > 0 && page.DroppedNewest > w.since
 		newest := last
 		for _, f := range page.Frames {
 			if f.Kind == frameKindNotify && f.Cursor > w.since && w.inChain(f.ReplyTo) {

@@ -1111,3 +1111,131 @@ func TestTheRootsResultIsMatchedByTaskOrMessageID(t *testing.T) {
 		t.Errorf("a turn recorded %d results, cap %d", len(w.results), maxTurnResults)
 	}
 }
+
+// poll_events takes a conversation by the rules every tool shares: a bare
+// minted token, or console:<token>, names it and labels the answer by it;
+// console:<name> is refused rather than listened to.
+func TestPollEventsTakesTokensAsEveryToolDoes(t *testing.T) {
+	s, _, _, convs := eventsServer(t)
+	tok, err := convs.Resolve("ops", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conv := range []string{tok, consoleConversationPrefix + tok} {
+		out := poll(t, s, map[string]any{"conversation": conv})
+		mustContain(t, out, "Conversation by token `"+tok+"`")
+	}
+	if res := callTool(t, s, ToolPollEvents, map[string]any{"conversation": consoleConversationPrefix + "ops"}); !res.IsError {
+		t.Errorf("console:<name> was taken: %s", res.Content[0].Text)
+	}
+}
+
+// Past the count bound, the frame with the oldest cursor goes: an edited
+// report keeps its place in the buffer but is newer than the frames after it.
+func TestTheBoundDropsTheOldestCursorNotTheFirstInPlace(t *testing.T) {
+	l, add := testLog()
+	for i := 0; i < maxEventsPerConversation; i++ {
+		add(notifyFrame(fmt.Sprintf("n-%d", i), "task-a", "r"))
+	}
+	edit := notifyFrame("n-0", "task-a", "edited")
+	edit.Edit = true
+	add(edit)
+	add(notifyFrame("n-new", "task-a", "r"))
+	ids := map[string]bool{}
+	for _, f := range l.frames {
+		ids[f.MessageID] = true
+	}
+	if !ids["n-0"] || ids["n-1"] || !ids["n-new"] {
+		t.Errorf("kept n-0 %v, n-1 %v, n-new %v; want the edited n-0 kept and n-1, the oldest cursor, dropped", ids["n-0"], ids["n-1"], ids["n-new"])
+	}
+}
+
+// A poll waiting on a conversation whose listener is removed wakes at once,
+// rather than waiting out its wait on a log no longer listened to.
+func TestARemovedListenerWakesItsPoll(t *testing.T) {
+	e := NewEvents(&fakeSubscriber{})
+	if _, err := e.Watch("tok", false); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		e.Since(context.Background(), "tok", 0, 5*time.Second)
+		done <- time.Since(start)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	e.Unname("tok")
+	select {
+	case took := <-done:
+		if took > 2*time.Second {
+			t.Errorf("the poll took %s", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a poll on a removed listener did not wake")
+	}
+}
+
+// A poll that waits holds the conversation's listener: a delete meanwhile
+// does not drop it, and a report posted during the wait is returned.
+func TestAWaitingPollHoldsItsListener(t *testing.T) {
+	s, b, nc, convs := eventsServer(t)
+	tok, err := convs.Resolve("ops", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make(chan string, 1)
+	go func() { out <- poll(t, s, map[string]any{"conversation": "ops", "wait_seconds": 5}) }()
+	time.Sleep(300 * time.Millisecond)
+	if _, ok := convs.Forget("ops", ""); !ok {
+		t.Fatal("forget")
+	}
+	b.Events().Unname(tok)
+	publishNotify(nc, tok, notifyFrame("n-late", "task-x", "posted during the wait"))
+	select {
+	case got := <-out:
+		mustContain(t, got, "posted during the wait")
+	case <-time.After(8 * time.Second):
+		t.Fatal("the poll did not return")
+	}
+}
+
+// A name minted by a send whose listener could not start is not kept: the
+// retry works, and the table does not list it.
+func TestResolveRollsBackWhenListeningFails(t *testing.T) {
+	fs := &failingSubscriber{}
+	fs.fails.Store(1)
+	c := NewConversations().WithEvents(NewEvents(fs))
+	if _, err := c.Resolve("ops", ""); err == nil {
+		t.Fatal("a resolve whose listener failed succeeded")
+	}
+	if got := c.List(); len(got) != 0 {
+		t.Errorf("table holds %+v after the failed listen", got)
+	}
+	if _, err := c.Create("ops", ""); err != nil {
+		t.Fatalf("new after the failed send: %v", err)
+	}
+}
+
+// A turn whose conversation dropped frames after it was sent says a report
+// may have been among them.
+func TestDroppedReportsAreSaid(t *testing.T) {
+	var sb strings.Builder
+	writeReports(&sb, TurnOutcome{ReportsEnd: reportsQuiet, ReportsDropped: true}, "tok")
+	mustContain(t, sb.String(), "a report on this turn may be among them")
+}
+
+// A turn during which its conversation's buffer dropped frames says a report
+// may have been among them: past the count bound, the oldest frames posted
+// after the turn was sent go.
+func TestATurnSaysItsConversationDroppedFrames(t *testing.T) {
+	setReportQuiet(t, time.Second)
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, after: func(nc *nats.Conn, token string, turn int32) {
+		time.Sleep(reportDelay)
+		for i := 0; i < maxEventsPerConversation+20; i++ {
+			publishNotify(nc, token, notifyFrame(fmt.Sprintf("n-other-%d", i), "task-elsewhere", "noise"))
+		}
+		publishNotify(nc, token, notifyFrame("n-boot-1", fmt.Sprintf("task-root%d", turn), cardReport))
+	}})
+	text := send(t, s, map[string]any{"text": "restart checkout", "wait_seconds": turnWaitSecs})
+	mustContain(t, text, cardReport, "a report on this turn may be among them")
+}

@@ -145,9 +145,6 @@ type gatewayScenario struct {
 	// own goroutine, with the gateway's connection: a card's posts come
 	// from there (publishNotify).
 	after func(nc *nats.Conn, token string, turn int32)
-	// before, when set, runs on the gateway's goroutine before its notice
-	// about the turn.
-	before func(nc *nats.Conn, token string, turn int32)
 	// root, when set, names the turn's task and says whether it finishes:
 	// a turn given an earlier turn's task is the gateway steering it.
 	root func(turn int32) (id string, finish bool)
@@ -220,9 +217,6 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			return
 		}
 		i := n.Add(1)
-		if sc.before != nil {
-			sc.before(nc, token, i)
-		}
 		// An earlier task's terminal, posted to the conversation as the
 		// console relay does (kind "result"), is not a notice about this
 		// turn and must not be taken for one.

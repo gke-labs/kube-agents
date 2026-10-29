@@ -284,6 +284,10 @@ func (e *Events) sweepLocked() ([]lib.Subscription, error) {
 func (e *Events) removeLocked(l *eventLog) []lib.Subscription {
 	delete(e.logs, l.token)
 	e.bytes -= l.bytes
+	// A poll waiting on this log wakes and reads afresh, rather than waiting
+	// out its wait on a log no longer listened to.
+	close(l.changed)
+	l.changed = make(chan struct{})
 	if l.sub == nil {
 		return nil
 	}
@@ -402,12 +406,17 @@ func (l *eventLog) add(f ConsoleOutFrame, cursor uint64) bool {
 		l.bytes += frameSize(f)
 		at = len(l.frames) - 1
 	}
+	// Past a bound, the frame with the oldest cursor goes, not the first
+	// in place: an edit keeps its place but takes a new cursor. The frame
+	// just written stays.
 	for len(l.frames) > maxEventsPerConversation || l.bytes > maxEventBytesPerConversation {
-		i := 0
-		if at == 0 {
-			i = 1
+		i := -1
+		for j := range l.frames {
+			if j != at && (i < 0 || l.frames[j].Cursor < l.frames[i].Cursor) {
+				i = j
+			}
 		}
-		if i >= len(l.frames) {
+		if i < 0 {
 			break
 		}
 		l.drop(i)
@@ -508,6 +517,6 @@ func inertBlock(text string) string {
 			run = 0
 		}
 	}
-	fence := strings.Repeat("`", max(3, longest+1))
-	return fence + "text\n" + strings.TrimRight(text, "\n") + "\n" + fence + "\n"
+	fence := strings.Repeat("`", max(minFenceLen, longest+1))
+	return fence + fenceText + "\n" + strings.TrimRight(text, "\n") + "\n" + fence + "\n"
 }

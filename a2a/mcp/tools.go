@@ -166,6 +166,12 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 		fmt.Fprintf(sb, "\n%s The wait ended while reports were still being gathered, so the reports shown are those that "+
 			"had arrived by then; %s, or wait longer with a larger wait_seconds.\n", cardsLine(out), later)
 	}
+	if out.ReportsDropped {
+		fmt.Fprintf(sb, "\nThis server's buffer for the conversation dropped frames posted since this turn was sent "+
+			"(it keeps at most %d frames or %d KiB a conversation, and %d MiB in all, dropping the oldest), "+
+			"so a report on this turn may be among them and is lost.\n",
+			maxEventsPerConversation, maxEventBytesPerConversation>>10, maxEventBytesTotal>>20)
+	}
 }
 
 // cardsLine says the turn's tasks ended, and what the gateway's result said
@@ -235,7 +241,6 @@ func PollEventsTool(events *Events, convs *Conversations) Tool {
 			if a.WaitSeconds < 0 || a.WaitSeconds > maxPollSeconds {
 				return "", fmt.Errorf("wait_seconds is %d; it takes 0 to %d", a.WaitSeconds, maxPollSeconds)
 			}
-			byToken := a.ConversationToken != "" || strings.HasPrefix(a.Conversation, consoleConversationPrefix)
 			// Looked up, not resolved: a reader names a conversation that
 			// exists, and a mistyped name must not mint a new one. Watched
 			// here so that the answer can say whether the server had been
@@ -248,8 +253,18 @@ func PollEventsTool(events *Events, convs *Conversations) Tool {
 			if err != nil {
 				return "", fmt.Errorf("listen to the conversation's posts: %w", err)
 			}
+			// A poll that waits holds the conversation's listener for the
+			// wait, so a delete or an eviction meanwhile does not drop it.
+			if a.WaitSeconds > 0 {
+				unpin, err := events.Pin(token)
+				if err != nil {
+					return "", fmt.Errorf("listen to the conversation's posts: %w", err)
+				}
+				defer unpin()
+			}
 			var sb strings.Builder
-			writeConversation(&sb, a.Conversation, token, byToken)
+			// Named by token exactly when no name in the table holds it.
+			writeConversation(&sb, a.Conversation, token, !named)
 			since := a.Since
 			if cur := events.Cursor(); since > cur {
 				fmt.Fprintf(&sb, "since %d is past this conversation's cursor %d (this server may have restarted); reading from 0.\n\n", since, cur)
