@@ -220,12 +220,11 @@ never a key, so its clusters earn no report until it resolves: when nothing
 was read under a key (it is the only project, or every other is an unresolved
 number too), the tick fails, posted once as a plain line ("The upgrade readiness
 check didn't run today", why, and that an admin needs to fix it, since no retry
-resolves the number; a roster spelling that is not a project, no GCP project at
-all, and a ledger it refuses to overwrite say the same) with the reason and the
-remedy in
+resolves the number) with the reason and the remedy in
 `logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
 ships, and kept in `last-failure.txt` by the kind of failure until the next
-clean tick posts the recovery. A failure a retry may clear (a timeout, a
+clean tick posts the recovery. A roster spelling that is not a project, no GCP
+project at all, and a ledger it refuses to overwrite end the same way. A failure a retry may clear (a timeout, a
 sandbox that failed) says instead that it tries again tomorrow, or at its next
 scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
