@@ -3,7 +3,9 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -232,9 +234,59 @@ func TestConsoleConfirmFrameCarriesTheConfirmIntent(t *testing.T) {
 	}
 }
 
-// The inject door takes intent "confirm" and refuses any other.
-func TestInjectConfirmIntent(t *testing.T) {
+// The inject door refuses intent "confirm" with a 400 unless it is armed to
+// take it (A2A_INJECT_CONFIRM), and starts nothing for the refused post.
+func TestInjectConfirmIntentNeedsItsFlag(t *testing.T) {
 	r := startInjectRig(t)
+	body, _ := json.Marshal(injectRequest{Conversation: "c-confirm-off", Author: injectTestAuthor, Text: "open the PR", Intent: IntentConfirm})
+	resp, err := r.do(t, http.MethodPost, r.base+injectPath, body, injectTestToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(reply), "A2A_INJECT_CONFIRM") {
+		t.Fatalf("intent confirm on an unarmed door = %d %s; want 400 naming A2A_INJECT_CONFIRM", resp.StatusCode, reply)
+	}
+	key, _ := injectConversationKey("c-confirm-off")
+	if rec, _ := r.g.reg.Get(context.Background(), key); rec != nil {
+		t.Fatalf("a refused confirm left a conversation record: %+v", rec)
+	}
+
+	// A typed message on the same door is unaffected.
+	body, _ = json.Marshal(injectRequest{Conversation: "c-typed-off", Author: injectTestAuthor, Text: "hi"})
+	resp, err = r.do(t, http.MethodPost, r.base+injectPath, body, injectTestToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("typed message on the same door = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestInjectConfirmEnvNeedsTheDoor(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_INJECT_LISTEN", "")
+	t.Setenv("A2A_INJECT_CONFIRM", "true")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_INJECT_CONFIRM") {
+		t.Fatalf("FromEnv with A2A_INJECT_CONFIRM and no door = %v; want a refusal naming it", err)
+	}
+	t.Setenv("A2A_INJECT_LISTEN", "127.0.0.1:8099")
+	t.Setenv("A2A_INJECT_TOKEN", "s3cret")
+	cfg, err := FromEnv()
+	if err != nil || !cfg.InjectConfirm {
+		t.Fatalf("FromEnv armed = %+v, %v; want InjectConfirm", cfg, err)
+	}
+	t.Setenv("A2A_INJECT_CONFIRM", "yes")
+	if cfg, err := FromEnv(); err != nil || cfg.InjectConfirm {
+		t.Fatalf(`FromEnv with A2A_INJECT_CONFIRM=yes = %v, %v; only "true" arms it`, cfg != nil && cfg.InjectConfirm, err)
+	}
+}
+
+// The inject door, armed for it, takes intent "confirm" and refuses any other.
+func TestInjectConfirmIntent(t *testing.T) {
+	r := startInjectRigWith(t, func(c *Config) { c.InjectConfirm = true })
 	resp, err := r.do(t, http.MethodPost, r.base+injectPath,
 		[]byte(`{"conversation":"c-bad","author":"1001","text":"hi","intent":"cancel"}`), injectTestToken)
 	if err != nil {

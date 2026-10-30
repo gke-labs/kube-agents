@@ -628,6 +628,9 @@ type injectConversation struct {
 type InjectAdapter struct {
 	listen string
 	token  string
+	// allowConfirm is whether the door takes intent "confirm"
+	// (Config.InjectConfirm); set once by AllowConfirm before Start.
+	allowConfirm bool
 	// firstEventGrace is the gateway's, reported to callers and never
 	// enforced here; see injectResponse.FirstEventGraceSeconds.
 	firstEventGrace time.Duration
@@ -715,6 +718,14 @@ func NewInjectAdapter(listen, token string, firstEventGrace time.Duration, log *
 		notify:          make(chan struct{}),
 	}, nil
 }
+
+// injectConfirmOffError is the 400 for intent "confirm" on a door not armed
+// to take it.
+const injectConfirmOffError = `intent "confirm" is not enabled on this inject door: it requests a change, and only an install armed for evals (A2A_INJECT_CONFIRM=true) takes it`
+
+// AllowConfirm lets the door take intent "confirm" (Config.InjectConfirm).
+// Call it before Start; without it the door refuses that intent with a 400.
+func (a *InjectAdapter) AllowConfirm() { a.allowConfirm = true }
 
 // authorized reports whether one request carries the door's bearer token,
 // answering 401 itself when it does not.
@@ -1382,6 +1393,10 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Intent != "" && req.Intent != IntentConfirm {
 		injectError(w, http.StatusBadRequest, fmt.Sprintf("intent is empty or %q", IntentConfirm))
+		return
+	}
+	if req.Intent == IntentConfirm && !a.allowConfirm {
+		injectError(w, http.StatusBadRequest, injectConfirmOffError)
 		return
 	}
 
