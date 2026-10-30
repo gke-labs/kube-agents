@@ -1834,10 +1834,9 @@ func (s *Server) ensureConnected(ctx context.Context) (*gatewayBridgeSession, er
 			}
 			return nil, errNoDeploymentsSaved
 		}
-		_ = s.store.UpsertDeployments(discovered)
-		prof, ok = s.store.ActiveDeployment()
-		if !ok {
-			return nil, errNoDeploymentsSaved
+		var uerr error
+		if prof, uerr = s.store.UpsertDiscoveredForAutoConnect(discovered); uerr != nil {
+			return nil, uerr
 		}
 	}
 	return s.connectSessionLocked(ctx, prof, true)

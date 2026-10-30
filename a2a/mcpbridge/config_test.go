@@ -503,3 +503,47 @@ func TestUpsertKeepsAgentProfilesWhenTheScanCouldNotReadThem(t *testing.T) {
 		t.Fatalf("a scan that read no AgentProfiles left %v; want none", got)
 	}
 }
+
+func TestEnsureConnectedRefusesToPickAmongSeveralDiscoveredDeployments(t *testing.T) {
+	two := []DeploymentProfile{
+		{Name: "alpha", KubeContext: "ctx-a", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+		{Name: "beta", KubeContext: "ctx-b", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+	}
+	tunnelDown := errors.New("tunnel down")
+	for _, tc := range []struct {
+		name       string
+		discovered []DeploymentProfile
+		ambiguous  bool
+	}{
+		{"two installs", two, true},
+		{"one install", two[:1], false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv, err := NewServer(ServerOptions{Store: store, Cluster: failingClusterAccess{discoverEntries: tc.discovered, tunnelErr: tunnelDown}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(srv.Close)
+			_, err = srv.ensureConnected(context.Background())
+			if tc.ambiguous {
+				if !errors.Is(err, errDeploymentAmbiguous) || !strings.Contains(err.Error(), "alpha, beta") {
+					t.Fatalf("ensureConnected with two installs and none active = %v; want the ambiguity error naming both", err)
+				}
+				if p, ok := store.ActiveDeployment(); ok {
+					t.Fatalf("the refused auto-connect left %q active", p.Name)
+				}
+				if len(store.Snapshot().Deployments) != 2 {
+					t.Fatal("the discovered installs were not saved for a later connect_deployment")
+				}
+				return
+			}
+			if !errors.Is(err, tunnelDown) {
+				t.Fatalf("ensureConnected with one install = %v; want it to try that install (and hit the tunnel error)", err)
+			}
+		})
+	}
+}

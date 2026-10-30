@@ -486,12 +486,51 @@ func (s *ConfigStore) resolveDeploymentKeyLocked(p DeploymentProfile, batch []De
 // ContextProbeFailure entries describe no deployment and are skipped.
 func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 	defer s.lockForUpdate()()
+	s.upsertDeploymentsLocked(profiles)
+	return s.saveLocked()
+}
+
+// UpsertDiscoveredForAutoConnect saves a discovery scan made because no deployment was
+// active, and returns the deployment to connect to. One discovered deployment is it; more
+// than one is the same ambiguity error an empty connect_deployment selector gets, and none
+// of them is made active, so the user names one instead of the bridge picking by sort order.
+// A deployment made active meanwhile (another bridge process) is returned as is.
+func (s *ConfigStore) UpsertDiscoveredForAutoConnect(profiles []DeploymentProfile) (DeploymentProfile, error) {
+	defer s.lockForUpdate()()
+	_, wasActive := s.cfg.Deployments[s.cfg.ActiveDeployment]
+	wasActive = wasActive && s.cfg.ActiveDeployment != ""
+	keys := s.upsertDeploymentsLocked(profiles)
+	if !wasActive && len(keys) > 1 {
+		s.cfg.ActiveDeployment = ""
+		_ = s.saveLocked()
+		sort.Strings(keys)
+		return DeploymentProfile{}, fmt.Errorf("%w: no deployment is active; name one of %s", errDeploymentAmbiguous, strings.Join(keys, ", "))
+	}
+	if err := s.saveLocked(); err != nil {
+		return DeploymentProfile{}, err
+	}
+	p, ok := s.cfg.Deployments[s.cfg.ActiveDeployment]
+	if !ok || s.cfg.ActiveDeployment == "" {
+		return DeploymentProfile{}, errNoDeploymentsSaved
+	}
+	return p, nil
+}
+
+// upsertDeploymentsLocked is UpsertDeployments without the save; it returns the distinct
+// saved keys the profiles were merged under.
+func (s *ConfigStore) upsertDeploymentsLocked(profiles []DeploymentProfile) []string {
+	var keys []string
+	seen := make(map[string]bool, len(profiles))
 	for _, p := range profiles {
 		if p.Name == "" || p.IsContextProbeFailure() {
 			continue
 		}
 		key := s.resolveDeploymentKeyLocked(p, profiles)
 		p.Name = key
+		if !seen[key] {
+			seen[key] = true
+			keys = append(keys, key)
+		}
 		if existing, ok := s.cfg.Deployments[key]; ok {
 			if p.DirectMCPURL == "" {
 				p.DirectMCPURL = existing.DirectMCPURL
@@ -556,7 +595,7 @@ func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 		sort.Strings(names)
 		s.cfg.ActiveDeployment = names[0]
 	}
-	return s.saveLocked()
+	return keys
 }
 
 // SyncDiscoveredDeployments merges a full kubeconfig scan into the store: it upserts the
