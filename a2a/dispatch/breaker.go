@@ -1,7 +1,6 @@
 package dispatch
 
 import (
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -21,7 +20,7 @@ const (
 type ptKey struct{ profile, tier string }
 
 // breaker is one (profile, tier)'s run of lease expiries. After threshold in
-// a row it opens: new submissions there are refused until openUntil. Past
+// a row it opens: new submissions there stay queued until openUntil. Past
 // that it is half open: it admits one task at a time; the next expiry opens
 // it at once, and a task that finishes closes it.
 type breaker struct {
@@ -40,27 +39,29 @@ type breakers struct {
 
 func newBreakers() *breakers { return &breakers{m: map[ptKey]*breaker{}} }
 
-// admit refuses a submission while profile's breaker at tier is open. Half
-// open, it lets one task through at a time: while busy (a task of that
-// profile and tier is in flight) it says wait, and the submission stays
-// queued rather than being refused.
-func (b *breakers) admit(profile, tier string, now time.Time, busy bool) (*refusal, bool) {
+// wait reports whether a submission of profile at tier must stay queued
+// rather than be admitted, and whether that is because its breaker is open:
+// while open; and while half open, either with a task of that profile and
+// tier in flight (busy) or with an older submission of theirs waiting
+// (older), so the oldest held task is the one tried, one at a time. A held
+// submission is never refused for the breaker: it waits, as over a cap, and
+// ends with queue-timeout if the breaker never closes. A refusal would let
+// one input that keeps killing workers fail every other user's task on that
+// tier for the cooldown.
+func (b *breakers) wait(profile, tier string, now time.Time, busy, older bool) (wait, open bool) {
 	if b == nil {
-		return nil, false
+		return false, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	br, ok := b.m[ptKey{profile, tier}]
 	switch {
 	case !ok:
-		return nil, false
+		return false, false
 	case now.Before(br.openUntil):
-		return &refusal{ReasonBreakerOpen, fmt.Sprintf("tasks of profile %s at tier %s kept losing their workers; "+
-			"refusing new ones until %s", profile, tier, br.openUntil.UTC().Format(time.RFC3339))}, false
-	case br.halfOpen && busy:
-		return nil, true
+		return true, true
 	}
-	return nil, false
+	return br.halfOpen && (busy || older), false
 }
 
 // expired counts a task of profile at tier whose lease expired, and opens
@@ -131,6 +132,23 @@ func (d *Dispatcher) inFlight(profile, tier string) bool {
 	defer d.mu.Unlock()
 	for k := range d.active {
 		if k.profile == profile && k.tier == tier {
+			return true
+		}
+	}
+	return false
+}
+
+// olderWaiting reports whether a submission of profile at tier other than
+// taskID, queued before queued, is waiting here.
+func (d *Dispatcher) olderWaiting(profile, tier, taskID string, queued time.Time) bool {
+	durables := map[string]bool{
+		lib.ProfileDurableName(profile, tier, lib.SubmitKindTop):   true,
+		lib.ProfileDurableName(profile, tier, lib.SubmitKindChild): true,
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for id, w := range d.waiting {
+		if id != taskID && durables[w.durable] && w.queued.Before(queued) {
 			return true
 		}
 	}

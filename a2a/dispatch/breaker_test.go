@@ -7,49 +7,65 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// A breaker opens at its threshold of expiries in a row, refuses until its
-// cooldown ends, then admits half open: the next expiry opens it at once,
-// and a finished task closes it. Each (profile, tier) has its own.
-func TestABreakerOpensRefusesAndCloses(t *testing.T) {
+// A breaker opens at its threshold of expiries in a row and holds until its
+// cooldown ends, then is half open: the next expiry opens it at once, and a
+// finished task closes it. Each (profile, tier) has its own.
+func TestABreakerOpensHoldsAndCloses(t *testing.T) {
 	b := newBreakers()
 	cfg := lib.DispatchConfig{BreakerThreshold: 2, BreakerCooldownSeconds: 60}
 	t0 := time.Unix(1_000_000, 0)
+	held := func(at time.Time) bool { w, _ := b.wait("tse", "read", at, false, false); return w }
 
 	b.expired(cfg, "tse", "read", t0)
-	if r := b.admit1("tse", "read", t0); r != nil {
-		t.Fatalf("open after one expiry of two: %+v", r)
+	if held(t0) {
+		t.Fatal("held after one expiry of two")
 	}
 	b.expired(cfg, "tse", "read", t0)
-	r := b.admit1("tse", "read", t0.Add(time.Second))
-	if r == nil || r.reason != ReasonBreakerOpen {
-		t.Fatalf("closed after two expiries: %+v", r)
+	if w, open := b.wait("tse", "read", t0.Add(time.Second), false, false); !w || !open {
+		t.Fatalf("after two expiries: wait %v, open %v; want both", w, open)
 	}
-	if r := b.admit1("tse", "unattended", t0.Add(time.Second)); r != nil {
-		t.Errorf("another tier's breaker opened too: %+v", r)
+	if w, _ := b.wait("tse", "unattended", t0.Add(time.Second), false, false); w {
+		t.Error("another tier's breaker opened too")
 	}
 	if got := b.open(t0.Add(time.Second)); len(got) != 1 || got[0] != "tse/read" {
 		t.Errorf("open = %v", got)
 	}
 
-	// Past the cooldown: half open, admitting, and one expiry opens it.
 	half := t0.Add(61 * time.Second)
-	if r := b.admit1("tse", "read", half); r != nil {
-		t.Fatalf("still refusing after the cooldown: %+v", r)
+	if held(half) {
+		t.Fatal("still holding after the cooldown with nothing in flight")
 	}
 	b.expired(cfg, "tse", "read", half)
-	if r := b.admit1("tse", "read", half.Add(time.Second)); r == nil {
-		t.Fatal("a half-open breaker stayed closed after an expiry")
+	if !held(half.Add(time.Second)) {
+		t.Fatal("a half-open breaker didn't open again on an expiry")
 	}
 
-	// A finished task closes it outright: the threshold applies again.
 	b.finished("tse", "read")
 	later := half.Add(2 * time.Second)
-	if r := b.admit1("tse", "read", later); r != nil {
-		t.Fatalf("open after a finished task: %+v", r)
+	if held(later) {
+		t.Fatal("held after a finished task")
 	}
 	b.expired(cfg, "tse", "read", later)
-	if r := b.admit1("tse", "read", later); r != nil {
-		t.Errorf("one expiry after closing opened it: %+v", r)
+	if held(later) {
+		t.Error("one expiry after closing opened it")
+	}
+}
+
+// Half open, the breaker tries one task at a time, the oldest held: with a
+// task in flight, or an older submission waiting, a submission waits; with
+// neither, it is admitted. None of these is "open".
+func TestAHalfOpenBreakerTriesTheOldestOneAtATime(t *testing.T) {
+	b := newBreakers()
+	cfg := lib.DispatchConfig{BreakerThreshold: 1, BreakerCooldownSeconds: 60}
+	t0 := time.Unix(1_000_000, 0)
+	b.expired(cfg, "tse", "read", t0)
+	half := t0.Add(61 * time.Second)
+	for _, c := range []struct {
+		busy, older, want bool
+	}{{true, false, true}, {false, true, true}, {false, false, false}} {
+		if w, open := b.wait("tse", "read", half, c.busy, c.older); w != c.want || open {
+			t.Errorf("busy %v older %v: wait %v open %v; want wait %v, not open", c.busy, c.older, w, open, c.want)
+		}
 	}
 }
 
@@ -61,8 +77,8 @@ func TestBreakerDefaults(t *testing.T) {
 }
 
 // End to end: two tasks whose workers stop renewing open the breaker at a
-// threshold of 2, and a third submission is rejected breaker-open, with the
-// refusal tombstoned and the breaker shown in health.
+// threshold of 2. A third submission is held queued, not refused: no
+// terminal, shown waiting, and the breaker in health.
 func TestLeaseExpiriesOpenTheBreaker(t *testing.T) {
 	b := newBus(t, "tse-0", "tse-1")
 	b.ensure("tse", 2, 0, "read")
@@ -82,17 +98,16 @@ func TestLeaseExpiriesOpenTheBreaker(t *testing.T) {
 		}
 	}
 	b.submit("tse", "read", lib.SubmitKindTop, "task-3")
-	ts := b.waitTerminal("task-3", 10*time.Second)
-	if ts.state != lib.StateRejected || !hasReason(ts, ReasonBreakerOpen) {
-		t.Errorf("task-3 terminal %+v, want rejected breaker-open", ts)
+	waitFor(t, 10*time.Second, "task-3 shown waiting", func() bool {
+		return d.Health().Waiting[lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)] == 1
+	})
+	time.Sleep(2 * time.Second) // several retries
+	if ts := b.terminalsOf("task-3"); len(ts) != 0 {
+		t.Errorf("task-3 terminals %+v while the breaker is open; want it held", ts)
 	}
 	if got := d.Health().OpenBreakers; len(got) != 1 || got[0] != "tse/read" {
 		t.Errorf("health open breakers = %v", got)
 	}
-	waitFor(t, 5*time.Second, "task-3's refusal tombstone", func() bool {
-		_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", lib.ProfileLeaseRefusedPod, "task-3")]
-		return ok
-	})
 }
 
 // A task that runs to its end clears its (profile, tier)'s run of expiries.
@@ -111,36 +126,11 @@ func TestAFinishedTaskClearsTheBreaker(t *testing.T) {
 	})
 }
 
-// admit1 is admit with nothing in flight, for the state tests.
-func (b *breakers) admit1(profile, tier string, now time.Time) *refusal {
-	r, _ := b.admit(profile, tier, now, false)
-	return r
-}
-
-// Half open, the breaker lets one task through at a time: with a task of
-// that profile and tier in flight, a submission waits rather than being
-// refused; with none, it is admitted.
-func TestAHalfOpenBreakerTriesOneTaskAtATime(t *testing.T) {
-	b := newBreakers()
-	cfg := lib.DispatchConfig{BreakerThreshold: 1, BreakerCooldownSeconds: 60}
-	t0 := time.Unix(1_000_000, 0)
-	b.expired(cfg, "tse", "read", t0)
-	half := t0.Add(61 * time.Second)
-	if r, wait := b.admit("tse", "read", half, true); r != nil || !wait {
-		t.Errorf("half open with a task in flight: refusal %+v, wait %v; want wait", r, wait)
-	}
-	if r, wait := b.admit("tse", "read", half, false); r != nil || wait {
-		t.Errorf("half open with nothing in flight: refusal %+v, wait %v; want admitted", r, wait)
-	}
-	if r, wait := b.admit("tse", "read", t0.Add(time.Second), false); r == nil || wait {
-		t.Errorf("open: refusal %+v, wait %v; want refused", r, wait)
-	}
-}
-
-// End to end: after the cooldown a half-open breaker runs one task while the
-// next waits queued, never rejected, and the second runs once the first has
-// finished.
-func TestAHalfOpenBreakerQueuesTheNextTask(t *testing.T) {
+// End to end: tasks submitted while the breaker is open wait; after the
+// cooldown the oldest held one is tried alone, the next waits queued (never
+// refused) and runs once the first has finished. The task whose expiry
+// opened the breaker, submitted again under its id, is never run again.
+func TestAHalfOpenBreakerTriesTheOldestHeldTask(t *testing.T) {
 	b := newBus(t, "tse-0", "tse-1", "tse-2")
 	b.ensure("tse", 2, 0, "read")
 	dead := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
@@ -148,7 +138,7 @@ func TestAHalfOpenBreakerQueuesTheNextTask(t *testing.T) {
 	w1 := b.worker("tse", "read", "tse-1", answerAccept, 3*time.Second)
 	w2 := b.worker("tse", "read", "tse-2", answerAccept, 3*time.Second)
 	ti := oneProfile("tse", 2, "tse-0")
-	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 2 })
+	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 4 })
 	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
@@ -156,25 +146,44 @@ func TestAHalfOpenBreakerQueuesTheNextTask(t *testing.T) {
 		t.Fatalf("task-1 terminal %+v, want lease-expired", ts)
 	}
 	ti.pool.Set("tse", "read", "tse-1", "tse-2")
-	time.Sleep(2500 * time.Millisecond) // past the cooldown: half open
-
 	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	time.Sleep(500 * time.Millisecond)
 	b.submit("tse", "read", lib.SubmitKindTop, "task-3")
-	waitFor(t, 10*time.Second, "the probe task started", func() bool { return w1.startedCount()+w2.startedCount() == 1 })
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1") // the poison input, again
+
+	waitFor(t, 15*time.Second, "the probe task started", func() bool { return w1.startedCount()+w2.startedCount() == 1 })
+	started := func(w *fakeWorker, id string) bool { return w.startedTask(id) }
+	if !started(w1, "task-2") && !started(w2, "task-2") {
+		t.Errorf("the probe was not the oldest held task, task-2")
+	}
 	time.Sleep(time.Second)
 	if n := w1.startedCount() + w2.startedCount(); n != 1 {
 		t.Fatalf("%d tasks started while half open; want one at a time", n)
 	}
-	// The held-back one is queued and shown waiting, as over a cap.
 	if n := d.Health().Waiting[lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)]; n != 1 {
-		t.Errorf("%d submissions shown waiting while the probe runs; want 1", n)
+		t.Errorf("%d submissions shown waiting while the probe runs; want task-3", n)
 	}
 	waitFor(t, 20*time.Second, "both tasks finished", func() bool {
 		return len(b.terminalsOf("task-2")) > 0 && len(b.terminalsOf("task-3")) > 0
 	})
 	for _, id := range []string{"task-2", "task-3"} {
-		if ts := b.terminalsOf(id)[0]; hasReason(ts, ReasonBreakerOpen) || ts.state == lib.StateRejected {
-			t.Errorf("%s was refused while half open: %+v", id, ts)
+		if ts := b.terminalsOf(id)[0]; ts.state == lib.StateRejected || ts.state == lib.StateFailed {
+			t.Errorf("%s ended %+v; want it run", id, ts)
 		}
 	}
+	if started(w1, "task-1") || started(w2, "task-1") {
+		t.Error("the task whose expiry opened the breaker ran again")
+	}
+}
+
+// startedTask reports whether the worker started taskID.
+func (w *fakeWorker) startedTask(taskID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, id := range w.started {
+		if id == taskID {
+			return true
+		}
+	}
+	return false
 }

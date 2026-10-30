@@ -193,7 +193,7 @@ type Dispatcher struct {
 	droppedAnswers atomic.Int64
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
-	// breakers refuse a (profile, tier) whose tasks keep losing their
+	// breakers hold back a (profile, tier) whose tasks keep losing their
 	// workers (breaker.go).
 	breakers *breakers
 }
@@ -579,8 +579,8 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	now := d.now()
 	ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errHeldBack) {
-		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), ReasonBreakerOpen)
-		log.Debug("held back at admission; the submission stays queued", "reason", ReasonBreakerOpen)
+		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), waitBreaker)
+		log.Debug("held back at admission; the submission stays queued", "reason", waitBreaker)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
@@ -810,90 +810,123 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		d.mu.Lock()
 		pod := d.freePodLocked(pods, h.profile, h.tier, tried)
 		var ch chan lib.DispatchAccept
-		var ok offerKey
 		if pod != "" {
-			h.pod = pod
-			ch = make(chan lib.DispatchAccept, 1)
-			ok = offerKey{h.profile, h.tier, pod, h.taskID}
-			d.offers[ok] = ch
+			ch = d.registerOfferLocked(h, pod)
 		}
 		d.mu.Unlock()
 		if pod == "" {
 			return lib.LeaseRecord{}, "", nil
 		}
 		tried[pod] = true
-		subject := lib.DispatchSubject(h.profile, h.tier, pod)
-		// giveUp withdraws the offer, abandons it on the pod when there is
-		// a reason to, and only then frees the pod for another offer.
-		giveUp := func(reason string) {
-			d.mu.Lock()
-			delete(d.offers, ok)
-			d.mu.Unlock()
-			if reason != "" {
-				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: reason})
-			}
-			d.mu.Lock()
-			h.pod = ""
-			d.mu.Unlock()
+		rec, key, taken, err := d.offerTo(ctx, log, envelope, snap, prof, h, pod, ch, acceptTimeout)
+		if err != nil {
+			return lib.LeaseRecord{}, "", err
 		}
-
-		deadline := d.now().Add(seconds(prof.ActiveDeadlineSeconds))
-		msg := lib.DispatchMessage{Type: lib.DispatchOffer, TaskID: h.taskID, Kind: h.kind, Envelope: envelope,
-			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
-			AcceptSeconds: snap.AcceptTimeoutSeconds}
-		if err := d.send(subject, msg); err != nil {
-			giveUp("")
-			log.Warn("offer not sent", "pod", pod, "err", err)
-			continue
-		}
-		timer := time.NewTimer(acceptTimeout)
-		var acc lib.DispatchAccept
-		var answered bool
-		select {
-		case acc = <-ch:
-			answered = true
-		case <-timer.C:
-		case <-ctx.Done():
-			// Stopping mid-offer: nothing was written, so the next
-			// instance dispatches the task afresh; this pod is told to
-			// drop it (and drops it anyway, never confirmed).
-			timer.Stop()
-			giveUp(abandonStopping)
-			return lib.LeaseRecord{}, "", ctx.Err()
-		}
-		timer.Stop()
-		switch {
-		case answered && acc.Accepted:
-			now := d.now()
-			key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
-			rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
-				ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease),
-				Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
-			if err := d.putLease(ctx, key, rec); err != nil {
-				// Unrecorded, the task can't be confirmed: a restart
-				// would not know it had started.
-				giveUp(abandonUnrecorded)
-				return lib.LeaseRecord{}, "", fmt.Errorf("record the lease before the confirm: %w", err)
-			}
-			d.mu.Lock()
-			delete(d.offers, ok)
-			h.confirmed = true
-			d.mu.Unlock()
-			if err := d.send(subject, lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}); err != nil {
-				// The lease is running; with no confirm the worker never
-				// starts, no renewal comes, and the task fails
-				// lease-expired. It is never offered again.
-				log.Warn("confirm not sent; the task fails when its lease runs out", "pod", pod, "err", err)
-			}
+		if taken == offerTaken {
 			return rec, key, nil
-		case answered:
-			log.Info("offer declined", "pod", pod, "reason", acc.Reason)
-			giveUp("")
-		default:
-			log.Info("offer not accepted in time; abandoning it on that pod", "pod", pod, "timeout", acceptTimeout)
-			giveUp(abandonTimedOut)
 		}
 	}
+}
+
+// offerOutcome is how one offer to one pod ended.
+type offerOutcome int
+
+const (
+	// offerNotTaken: declined, unanswered in time, or not sent; the pod is
+	// freed and was told to drop the task where there was reason to.
+	offerNotTaken offerOutcome = iota
+	// offerTaken: accepted, the lease recorded and the confirm sent.
+	offerTaken
+)
+
+// registerOfferLocked marks pod as h's offer target (busy in memory) and
+// returns the channel its accept arrives on. d.mu must be held.
+func (d *Dispatcher) registerOfferLocked(h *holding, pod string) chan lib.DispatchAccept {
+	h.pod = pod
+	ch := make(chan lib.DispatchAccept, 1)
+	d.offers[offerKey{h.profile, h.tier, pod, h.taskID}] = ch
+	return ch
+}
+
+// offerTo offers h's task to pod, whose offer registerOfferLocked made, and
+// waits up to acceptTimeout for its answer: offer, accept, then the lease
+// record and the confirm, or an abandon (contract addendum 5). The pool's
+// hand-off tries pods in turn with it; a Job offers its own pod once.
+func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []byte, snap lib.DispatchConfig,
+	prof lib.DispatchProfile, h *holding, pod string, ch chan lib.DispatchAccept, acceptTimeout time.Duration) (lib.LeaseRecord, string, offerOutcome, error) {
+	ok := offerKey{h.profile, h.tier, pod, h.taskID}
+	subject := lib.DispatchSubject(h.profile, h.tier, pod)
+	// giveUp withdraws the offer, abandons it on the pod when there is
+	// a reason to, and only then frees the pod for another offer.
+	giveUp := func(reason string) {
+		d.mu.Lock()
+		delete(d.offers, ok)
+		d.mu.Unlock()
+		if reason != "" {
+			_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: reason})
+		}
+		d.mu.Lock()
+		h.pod = ""
+		d.mu.Unlock()
+	}
+
+	deadline := d.now().Add(seconds(prof.ActiveDeadlineSeconds))
+	msg := lib.DispatchMessage{Type: lib.DispatchOffer, TaskID: h.taskID, Kind: h.kind, Envelope: envelope,
+		Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
+		AcceptSeconds: snap.AcceptTimeoutSeconds}
+	if err := d.send(subject, msg); err != nil {
+		giveUp("")
+		log.Warn("offer not sent", "pod", pod, "err", err)
+		return lib.LeaseRecord{}, "", offerNotTaken, nil
+	}
+	timer := time.NewTimer(acceptTimeout)
+	var acc lib.DispatchAccept
+	var answered bool
+	select {
+	case acc = <-ch:
+		answered = true
+	case <-timer.C:
+	case <-ctx.Done():
+		// Stopping mid-offer: nothing was written, so the next
+		// instance dispatches the task afresh; this pod is told to
+		// drop it (and drops it anyway, never confirmed).
+		timer.Stop()
+		giveUp(abandonStopping)
+		return lib.LeaseRecord{}, "", offerNotTaken, ctx.Err()
+	}
+	timer.Stop()
+	switch {
+	case answered && acc.Accepted:
+		now := d.now()
+		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
+		rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
+			ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(h.lease),
+			Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds}
+		if err := d.putLease(ctx, key, rec); err != nil {
+			// Unrecorded, the task can't be confirmed: a restart
+			// would not know it had started.
+			giveUp(abandonUnrecorded)
+			return lib.LeaseRecord{}, "", offerNotTaken, fmt.Errorf("record the lease before the confirm: %w", err)
+		}
+		d.mu.Lock()
+		delete(d.offers, ok)
+		h.confirmed = true
+		d.mu.Unlock()
+		if err := d.send(subject, lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}); err != nil {
+			// The lease is running; with no confirm the worker never
+			// starts, no renewal comes, and the task fails
+			// lease-expired. It is never offered again.
+			log.Warn("confirm not sent; the task fails when its lease runs out", "pod", pod, "err", err)
+		}
+		return rec, key, offerTaken, nil
+	case answered:
+		log.Info("offer declined", "pod", pod, "reason", acc.Reason)
+		giveUp("")
+	default:
+		log.Info("offer not accepted in time; abandoning it on that pod", "pod", pod, "timeout", acceptTimeout)
+		giveUp(abandonTimedOut)
+	}
+	return lib.LeaseRecord{}, "", offerNotTaken, nil
 }
 
 // freePodLocked is a pod of the (profile, tier) pool that holds no task
