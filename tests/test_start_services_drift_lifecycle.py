@@ -989,15 +989,18 @@ _PATHOLOGICAL_COMPONENTS = 65000
 _PATHOLOGICAL_SECONDS = 5.0
 
 
-def _watcher_values_passed(text: str) -> set[str]:
-    """Every WATCHER_* name a watcher flag takes its value from.
+def _watcher_values_passed(watcher: str) -> set[str]:
+    """Every WATCHER_* name read anywhere in the watcher's command line.
 
-    Matched on the prefix, not the closing brace, and on either separator Go's
-    flag package takes, so `"${WATCHER_X:-2m}"`, an unquoted or prefixed value,
-    `--flag "${WATCHER_X}"`, and a digit in the flag or the name are all found:
-    any of them is a ninth tunable added without a normaliser.
+    The command runs from the binary's path to the `|| true` that ends it, and
+    every WATCHER_* token inside it counts, however it is quoted, prefixed or
+    nested: `"${ROOT:-/opt}/${WATCHER_X}"` and `"${A:-${WATCHER_X}}"` are found
+    as surely as `"${WATCHER_X}"`. The lookbehind keeps EVENT_WATCHER_* out;
+    the supervisor's own WATCHER_* settings sit outside the command.
     """
-    return set(re.findall(r'--[a-z0-9-]+[= ]"?[^"\s$]*\$\{?(WATCHER_[A-Z0-9_]+)', text))
+    command = re.search(r"/usr/local/bin/k8s-event-watcher\b(.*?)\|\| true", watcher, re.S)
+    assert command, "the watcher's command line was not found"
+    return set(re.findall(r"(?<![A-Z0-9_])WATCHER_[A-Z0-9_]+", command.group(1)))
 
 
 class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
@@ -1138,6 +1141,9 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
     def test_the_unnormalised_value_check_sees_every_spelling_of_a_flag(self) -> None:
         """The scan behind the last assertion below, on spellings it must not miss."""
         for line, want in (
+            ('--new-flag="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/${WATCHER_NEW}"', "WATCHER_NEW"),
+            ('--new-flag="${EVENT_WATCHER_NEW:-${WATCHER_NEW}}"', "WATCHER_NEW"),
+            ('--new-flag="$(printf %s "${WATCHER_NEW}")"', "WATCHER_NEW"),
             ('--new-flag="${WATCHER_NEW:-2m}"', "WATCHER_NEW"),
             ("--new-flag=${WATCHER_NEW}", "WATCHER_NEW"),
             ("--new-flag=$WATCHER_NEW", "WATCHER_NEW"),
@@ -1148,7 +1154,8 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             ('--settle="${WATCHER_SETTLE}"', "WATCHER_SETTLE"),
         ):
             with self.subTest(line=line):
-                self.assertEqual({want}, _watcher_values_passed(line))
+                command = f"/usr/local/bin/k8s-event-watcher \\\n  {line} || true"
+                self.assertEqual({want}, _watcher_values_passed(command))
 
     def test_a_duration_is_bounded_in_components(self) -> None:
         many = "1s" * _DURATION_MAX_COMPONENTS
