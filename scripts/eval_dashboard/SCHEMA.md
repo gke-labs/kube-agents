@@ -180,7 +180,7 @@ layout and are collected from the moment they start running.
       `classify.py` classes a case whose ungraded reps are all of this kind
       `fixture-drift`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
-      or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
+      or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
       not `storm`: a broken replay is a defect in the image under test, not
       infrastructure weather (#2328).

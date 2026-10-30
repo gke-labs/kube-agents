@@ -58,9 +58,13 @@ A first line of `[bench:slack-question-wake]` makes the run a replay of the wake
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
-the front door there under `spec.mode: next` too. Under next the reply to that wake is posted
-nowhere, and a `session: fresh` answer carries today's Slack thread context, which next's door
-does not send, so a case that grades either stays in `hack/eval/inject-lane-exclusions.txt`. A
+the front door there under `spec.mode: next` too. A `session: fresh` answer carries today's Slack
+thread context, which next's door does not send, so a case with one stays in
+`hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
+same front door writes it, so a case that grades that reply still runs on the inject lane. A
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
+`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card

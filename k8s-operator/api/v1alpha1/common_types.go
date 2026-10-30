@@ -467,10 +467,34 @@ type HarnessSpec struct {
 	// +optional
 	Tuning *TuningSpec `json:"tuning,omitempty"`
 
+	// Retention bounds how long the agent keeps its own working data: the session
+	// history in every profile's state.db and its rotated log files. Absent keeps
+	// the operator's default.
+	// +optional
+	Retention *RetentionSpec `json:"retention,omitempty"`
+
 	// Experimental holds opt-in behaviour that is not supported and may change
 	// or disappear in any release.
 	// +optional
 	Experimental *ExperimentalSpec `json:"experimental,omitempty"`
+}
+
+// RetentionSpec sets how long the agent keeps its working data.
+type RetentionSpec struct {
+	// SessionDays is how many days of inactivity an ended session is kept before
+	// Hermes' own pruning deletes it, with its messages and transcript files, in
+	// every profile: the front door's conversations, the Platform Agent's, and each
+	// Cluster Agent's. Rotated log backups older than this are removed too. Open,
+	// pinned and mid-turn sessions are never pruned, and the daily job pins a
+	// session another still points to as its parent before it prunes. Unset uses the operator's default
+	// (defaultSessionRetentionDays in the controller, 90). The minimum is 90 for
+	// now: some readers follow a session's lineage further than the parent guard
+	// has been shown to hold below that. Lowering it deletes the older history at
+	// the next daily prune.
+	// +kubebuilder:validation:Minimum=90
+	// +kubebuilder:validation:Maximum=365
+	// +optional
+	SessionDays *int `json:"sessionDays,omitempty"`
 }
 
 // ExperimentalSpec gathers the unsupported switches. Nothing here carries a

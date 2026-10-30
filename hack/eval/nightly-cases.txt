@@ -922,6 +922,14 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# A card the AI model's rate limit blocked is not promised a retry: the wake
+# reply says it will not run again on its own and offers to try again (SOUL
+# §2 step 5, #3766). Plants its own card through card_wake.py; one front-door
+# turn, no card round trip, no fixture: +3 units at the 200s default. It runs
+# on the inject lane too: next posts the wake's reply nowhere, but the same
+# SOUL sentence writes it, so the nightly still measures the rule (#4004).
+./tasks/chat-rate-limit-block-promises-no-retry/task.yaml
+
 # A reply typed under a pushed report is answered with the report (#4059):
 # the harness stores the report for the conversation as the kanban notifier
 # would, then sends the reply on it; the hermes-bridge attaches the stored
