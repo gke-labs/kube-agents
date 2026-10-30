@@ -527,3 +527,35 @@ func TestInspectPullRequestCutShortDiffIsNotAdvertised(t *testing.T) {
 		})
 	}
 }
+
+func TestInspectPullRequestReportsAnIncompleteFilesListing(t *testing.T) {
+	const prPath = "/repos/example-org/example-infra/pulls/42"
+	var ghServer *httptest.Server
+	ghServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == prPath && r.Header.Get(acceptHeader) == acceptGitHubDiff:
+			_, _ = w.Write([]byte("diff --git a/a.go b/a.go\n+x\n"))
+		case r.URL.Path == prPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{"number": testPRNumber, "title": "t", "state": "open", "html_url": testPRURL, "changed_files": 150})
+		case r.URL.Path == prPath+"/files" && r.URL.Query().Get("page") == "2":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"secondary rate limit"}`))
+		case r.URL.Path == prPath+"/files":
+			w.Header().Set(linkHeader, `<`+ghServer.URL+prPath+`/files?per_page=100&page=2>; rel="next"`)
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"filename": "a.go", "status": "modified"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(ghServer.Close)
+	insp, err := InspectPullRequest(context.Background(), nil, ghServer.URL, testPRURL, "", filepath.Join(t.TempDir(), "out"))
+	if err != nil {
+		t.Fatalf("InspectPullRequest: %v", err)
+	}
+	if !strings.Contains(insp.FilesError, "403") {
+		t.Fatalf("FilesError = %q; want the refused page 2", insp.FilesError)
+	}
+	if md := FormatPRInspectionMarkdown(insp); !strings.Contains(md, "incomplete") || !strings.Contains(md, "1 of 150") {
+		t.Fatalf("the summary presents the partial listing as whole:\n%s", md)
+	}
+}

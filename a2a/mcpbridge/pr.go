@@ -126,6 +126,10 @@ type PRInspection struct {
 	// over 20k lines / 300 files, a transport error, or a failed gh pr diff) so an empty
 	// result is never presented as a complete native diff file.
 	DiffError string `json:"diffError,omitempty"`
+	// FilesError explains why Files stopped before the end of the listing (a failed or
+	// refused page, a next link the bridge would not follow, the page bound), so a partial
+	// list is never presented as the whole.
+	FilesError string `json:"filesError,omitempty"`
 }
 
 // ExtractPRReferences scans text for GitHub PR URLs and owner/repo#number references
@@ -442,9 +446,14 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 	// The files endpoint is paginated: follow rel="next" until exhausted (bounded by
 	// maxPRFilesPages) so a PR with more than one page of changed files lists every file.
 	filesEndpoint := fmt.Sprintf(githubAPIPRFilesFormat, strings.TrimRight(apiBaseURL, "/"), repo, num, githubAPIPRFilesPerPage)
-	for page := 0; filesEndpoint != "" && page < maxPRFilesPages; page++ {
+	for page := 0; filesEndpoint != ""; page++ {
+		if page >= maxPRFilesPages {
+			insp.FilesError = fmt.Sprintf("stopped after %d pages of changed files", maxPRFilesPages)
+			break
+		}
 		fReq, fErr := http.NewRequestWithContext(ctx, http.MethodGet, filesEndpoint, nil)
 		if fErr != nil {
+			insp.FilesError = fmt.Sprintf("changed files page %d: %v", page+1, fErr)
 			break
 		}
 		fReq.Header.Set(acceptHeader, acceptGitHubJSON)
@@ -454,6 +463,7 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		}
 		fResp, dErr := http.DefaultClient.Do(fReq)
 		if dErr != nil {
+			insp.FilesError = fmt.Sprintf("changed files page %d: %v", page+1, dErr)
 			break
 		}
 		var fileList []struct {
@@ -462,10 +472,18 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 			Deletions int    `json:"deletions"`
 			Status    string `json:"status"`
 		}
-		pageOK := fResp.StatusCode == http.StatusOK && json.NewDecoder(fResp.Body).Decode(&fileList) == nil
-		nextEndpoint := nextPageURL(fResp.Header.Get(linkHeader), filesEndpoint)
+		var pageErr error
+		if fResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(fResp.Body, maxDiffErrorBodyBytes))
+			pageErr = &githubHTTPError{Endpoint: filesEndpoint, StatusCode: fResp.StatusCode, Body: strings.TrimSpace(string(body))}
+		} else if err := json.NewDecoder(fResp.Body).Decode(&fileList); err != nil {
+			pageErr = fmt.Errorf("decoding: %w", err)
+		}
+		link := fResp.Header.Get(linkHeader)
+		nextEndpoint := nextPageURL(link, filesEndpoint)
 		_ = fResp.Body.Close()
-		if !pageOK {
+		if pageErr != nil {
+			insp.FilesError = fmt.Sprintf("changed files page %d: %v", page+1, pageErr)
 			break
 		}
 		for _, f := range fileList {
@@ -475,6 +493,9 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 				Deletions: f.Deletions,
 				Status:    f.Status,
 			})
+		}
+		if nextEndpoint == "" && strings.Contains(link, linkRelNext) {
+			insp.FilesError = fmt.Sprintf("changed files page %d names a next page the bridge does not follow", page+1)
 		}
 		filesEndpoint = nextEndpoint
 	}
@@ -758,6 +779,13 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 				mcp.InertField(f.Path), mcp.InertField(FirstNonEmptyStr(f.Status, "modified")), f.Additions, f.Deletions, patchLink)
 		}
 		sb.WriteString("\n")
+	}
+	if insp.FilesError != "" || len(insp.Files) < insp.ChangedFiles {
+		fmt.Fprintf(&sb, "⚠️ **Changed files listing is incomplete**: %d of %d file(s) listed", len(insp.Files), insp.ChangedFiles)
+		if insp.FilesError != "" {
+			fmt.Fprintf(&sb, " — %s", mcp.InertField(insp.FilesError))
+		}
+		sb.WriteString(".\n\n")
 	}
 
 	if strings.TrimSpace(insp.UnifiedDiff) != "" {
