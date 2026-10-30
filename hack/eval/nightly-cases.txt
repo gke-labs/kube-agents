@@ -1010,6 +1010,12 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
+# normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
+# documentation/web search loops (#3141). deployer: noop, read-only, no fixture,
+# 200s default until it has a record.
+./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
+
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
 # one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
 # seeded-c) finish without polling, exploring system namespaces, or re-scanning,
