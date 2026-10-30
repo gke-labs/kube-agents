@@ -41,8 +41,9 @@ var NotifySubjects = map[string]string{
 // NotifyRequest is the body of a chat.notify request.
 type NotifyRequest struct {
 	// Text is the message, chunked under the backend cap on the way out,
-	// except on a conversation request with an Update key, which is one
-	// message (an edit reaches one) and is cut to one chunk.
+	// except on a request with an Update key, which is one message (an
+	// edit reaches one): a conversation's is cut to one chunk, and a home
+	// thread's is keyed only when it fits one, else chunked and unkeyed.
 	Text string `json:"text"`
 	// Thread, when set, is the thread to reply on. It must be a thread of
 	// the home channel; empty starts a new thread there. On Google Chat it
@@ -70,11 +71,13 @@ type NotifyRequest struct {
 	ContextID    string `json:"context_id,omitempty"`
 	// Chat and Update carry a card's work after its task ends, on a request
 	// aimed at a conversation: Chat a kube-agents.chat/v1 object, with Text
-	// its fallback, laid out by a backend that renders it (Slack) and posted
-	// as Text by any other; Update a sender-chosen key whose later request
-	// edits the message the first posted in the same conversation. A home
-	// channel request may carry Chat too (the fleet-audit or first-inventory card), laid
-	// out the same way; it ignores Update.
+	// its fallback, laid out by a backend that renders it (Slack, Google
+	// Chat) and posted as Text by any other; Update a sender-chosen key
+	// whose later request edits the message the first posted in the same
+	// conversation or home-channel thread. A home channel request may carry
+	// Chat too (the fleet-audit or first-inventory card), laid out the same
+	// way, and Update: one with no Thread binds its key to the thread it
+	// starts (the event watcher's alert, which its triage edits).
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
 	// AnswerTo, on a conversation request, says the post answers an ask:

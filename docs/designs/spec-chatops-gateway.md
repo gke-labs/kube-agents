@@ -1641,12 +1641,17 @@ lays out a home-channel request's `chat` message as it lays out a conversation's
 audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
 is dropped and its `text` posted. The `mark` is not read on a home post (it is drawn on an ask's
 plan, which a home thread has none of); the `update` key is kept per home thread as it is per
-conversation: a later request with the key on that thread edits the message, laid out or as text,
-and one that finds no message there (another thread's, a restart, a failed edit) posts anew, its
-text cut to one chunk. A keyed request with no thread starts one and binds its key to it, which is
-how the event watcher's alert, posted under `alert-<session>`, is edited into its triage. Google
-Chat under `next` lays a home-channel `chat` message out and edits it the same way ("Chat messages
-on Google Chat"). Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+conversation, in the same table and under the same bounds (16 keys a thread, 1,024 threads and
+conversations together, the least recently used forgotten first): a later request with the key on
+that thread edits the message, laid out or as text; one that finds no message there (another
+thread's, one forgotten, one lost to a restart) or a message that can no longer be edited posts
+anew; and a laid-out edit that fails otherwise is retried once and then left as it was, as a
+conversation's is ("Chat messages" below). A keyed message is one message, so its text is posted or
+edited as text only when it fits one chunk; a keyed request whose text is longer and whose layout
+does not land is posted in chunks and unkeyed, as before. A keyed request with no thread starts one
+and binds its key to it, which is how the event watcher's alert, posted under `alert-<session>`, is
+edited into its triage. Google Chat under `next` lays a home-channel `chat` message out and edits it
+the same way ("Chat messages on Google Chat"). Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
 `text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
@@ -2194,8 +2199,8 @@ Chat and posted as the text elsewhere. The first request with an `update` key po
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.
-A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
-forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
+A conversation or home thread keeps 16 keys and the gateway keys for 1,024 of them together, the
+least recently used forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
 `mark` is drawn once its post lands, on the ask of the chain its `update` key is bound to
 (spec-a2a-payloads.md, "Card work after the task ends"): the first keyed `mark` binds the key
 to the conversation's latest chain, recorded on that chain's root history entry beside its

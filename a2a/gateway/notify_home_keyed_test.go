@@ -2,7 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -31,7 +31,7 @@ type fakeHomePoster struct {
 
 func (f *fakeHomePoster) PostNotifyMessage(space, thread string, m OutMessage) (string, string, error) {
 	if f.refuseLayout {
-		return "", "", errors.New("layout: " + ErrLayoutRefused.Error())
+		return "", "", fmt.Errorf("%w: fake", ErrLayoutRefused)
 	}
 	f.chats = append(f.chats, m.Chat)
 	return f.PostNotify(space, thread, m.Text)
@@ -141,24 +141,70 @@ func TestNotifyHomeKeyedRequestOnABackendWithoutEditsPostsAnew(t *testing.T) {
 	}
 }
 
-// A backend that lays nothing out posts a keyed chat request's text, once,
-// and keeps the key, so the next request edits it as text.
-func TestNotifyHomeKeyedChatOnATextOnlyBackendEditsAsText(t *testing.T) {
-	type textEditor struct{ *fakeHomePoster }
+// A keyed chat request whose layout the backend refuses posts its text,
+// once and keyed, when the text fits one message, so the next request edits
+// it as text.
+func TestNotifyHomeKeyedChatWhoseLayoutIsRefusedIsOneTextMessage(t *testing.T) {
 	p := &fakeHomePoster{fakeNotifyPoster: &fakeNotifyPoster{landsIn: testHomeThread}, refuseLayout: true}
-	n, err := NewGchatNotifier(textEditor{p}, testHome, nil)
+	n, err := NewGchatNotifier(p, testHome, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	long := strings.Repeat("report line\n", 400)
-	first := serveJSON(t, n, homeKeyed(long, "plan-c1-1", testHomeThread))
-	second := serveJSON(t, n, homeKeyed("settled", "plan-c1-1", testHomeThread))
+	first := serveJSON(t, n, homeKeyed("triage, as text", "alert-s1", testHomeThread))
+	second := serveJSON(t, n, homeKeyed("settled", "alert-s1", testHomeThread))
 	if first.Error != "" || second.Error != "" || second.MessageID != first.MessageID {
 		t.Fatalf("replies %+v, %+v; want the text post edited", first, second)
 	}
-	posts := p.all()
-	if len(posts) != 1 || len(posts[0].text) >= len(long) || len(p.edits) != 1 || p.edits[0].text != "settled" {
-		t.Fatalf("posts = %d (%d bytes of %d), edits = %+v; want one cut chunk then a text edit", len(posts), len(posts[0].text), len(long), p.edits)
+	if posts := p.all(); len(posts) != 1 || posts[0].text != "triage, as text" || len(p.edits) != 1 || p.edits[0].text != "settled" {
+		t.Fatalf("posts = %+v, edits = %+v; want one text post then a text edit", posts, p.edits)
+	}
+}
+
+// A keyed request whose text does not fit one message, and whose layout
+// does not land, is posted in chunks and unkeyed, as before the route read
+// keys: the alert its key names is left as it was, and the next keyed
+// request still edits the alert.
+func TestNotifyHomeKeyedTextThatOverflowsOneMessagePostsInChunksUnkeyed(t *testing.T) {
+	n, p := newHomeKeyedNotifier(t)
+	alert := serveJSON(t, n, lib.NotifyRequest{Text: "🚨 alert", Update: "alert-s1"})
+	p.refuseLayout = true
+	long := strings.Repeat("report line\n", 400)
+	triage := serveJSON(t, n, homeKeyed(long, "alert-s1", alert.ThreadID))
+	if triage.Error != "" || triage.MessageID == alert.MessageID || len(p.edits) != 0 {
+		t.Fatalf("triage = %+v (alert %q), edits = %+v; want chunks under the alert and no edit", triage, alert.MessageID, p.edits)
+	}
+	chunks := len(p.all()) - 1
+	var joined strings.Builder
+	for _, post := range p.all()[1:] {
+		joined.WriteString(post.text)
+	}
+	if chunks < 2 || strings.Count(joined.String(), "report line") != 400 {
+		t.Fatalf("posts = %d; want the whole text in chunks, got %d lines", len(p.all()), strings.Count(joined.String(), "report line"))
+	}
+	p.refuseLayout = false
+	settled := serveJSON(t, n, homeKeyed("settled", "alert-s1", alert.ThreadID))
+	if settled.MessageID != alert.MessageID || len(p.edits) != 1 || len(p.all()) != 1+chunks {
+		t.Fatalf("settled = %+v, edits = %+v, posts = %d; want the alert edited and nothing new posted", settled, p.edits, len(p.all()))
+	}
+	// Text alone that overflows goes the same way, keyed or not.
+	overflow := serveJSON(t, n, lib.NotifyRequest{Text: long, Update: "alert-s1", Thread: alert.ThreadID})
+	if overflow.Error != "" || overflow.MessageID == alert.MessageID || len(p.all()) != 1+2*chunks {
+		t.Fatalf("overflow = %+v, posts = %d; want chunks again", overflow, len(p.all()))
+	}
+}
+
+// A backend that lays nothing out and edits nothing posts a keyed chat
+// request's text, and the next request with the key posts anew.
+func TestNotifyHomeKeyedChatOnABackendWithoutLayoutPostsItsText(t *testing.T) {
+	p := &fakeNotifyPoster{landsIn: testHomeThread}
+	n := newTestNotifier(t, p)
+	first := serveJSON(t, n, homeKeyed("triage, as text", "alert-s1", testHomeThread))
+	second := serveJSON(t, n, homeKeyed("settled", "alert-s1", testHomeThread))
+	if first.Error != "" || second.Error != "" || second.MessageID == first.MessageID {
+		t.Fatalf("replies %+v, %+v; want two posts", first, second)
+	}
+	if posts := p.all(); len(posts) != 2 || posts[0].text != "triage, as text" || posts[1].text != "settled" {
+		t.Fatalf("posts = %+v; want the texts", posts)
 	}
 }
 

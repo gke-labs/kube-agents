@@ -595,15 +595,15 @@ artifact names).
 
 ### Where one may appear
 
-| Carrier                                                | Renders as                                       | Its text fallback                                    |
-| ------------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------- |
-| `result` artifact, on the chunk with `lastChunk: true` | the answer                                       | the artifact's text as folded per A2A chunking rules |
-| `turn` artifact, on the chunk with `lastChunk: true`   | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
-| `progress` artifact                                    | the task's one live message, edited in place     | the TextPart in the same part list                   |
-| `notice` artifact                                      | one message of its own, posted once              | the TextPart in the same part list                   |
-| the message of an `input-required` `status-update`     | the question                                     | the TextPart in the same message                     |
-| the message of a terminal `status-update`              | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
-| a conversation chat.notify request (Card work, below)  | a card's post, or an edit of one by `update` key | the request's `text`                                 |
+| Carrier                                                                     | Renders as                                       | Its text fallback                                    |
+| --------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------- |
+| `result` artifact, on the chunk with `lastChunk: true`                      | the answer                                       | the artifact's text as folded per A2A chunking rules |
+| `turn` artifact, on the chunk with `lastChunk: true`                        | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
+| `progress` artifact                                                         | the task's one live message, edited in place     | the TextPart in the same part list                   |
+| `notice` artifact                                                           | one message of its own, posted once              | the TextPart in the same part list                   |
+| the message of an `input-required` `status-update`                          | the question                                     | the TextPart in the same message                     |
+| the message of a terminal `status-update`                                   | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
+| a chat.notify request to a conversation or a home thread (Card work, below) | a card's post, or an edit of one by `update` key | the request's `text`                                 |
 
 At most one chat message per artifact chunk or status message. `plan` is read only in
 `progress` and on a conversation chat.notify (Card work, below). In `progress` the chat message is the whole current state, not a delta, so a
@@ -786,15 +786,16 @@ carry the same chat message:
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
   the place of the request's raw `blocks` for a conversation post. A home-channel request
   may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
-  the same way, with its `update` and `mark` not read.)
+  the same way, its `update` key kept per home thread as below and its `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that
   message in place instead of posting a new one, which is how a plan stays one message
   per thread and an answered question settles where it was asked. An `update` key edits
-  only a message the gateway itself posted for that same conversation and key. A key it
-  has no message for (another conversation's, one evicted, or one lost to a restart)
-  posts a new message and edits nothing. A conversation holds at most 16 live keys, and
-  the least recently used is evicted first, so a chatty card can't grow gateway state without bound.
+  only a message the gateway itself posted for that same conversation, or home-channel
+  thread, and key. A key it has no message for (another conversation's or thread's, one
+  evicted, or one lost to a restart) posts a new message and edits nothing. A conversation
+  or home thread holds at most 16 live keys, and the least recently used is evicted first,
+  so a chatty card can't grow gateway state without bound.
 - **`mark`** on a conversation notify marks the message of the chain the card belongs to,
   and counts as that chain's newest writer once every task in it has ended. A notify names
   no task, so its `update` key names the chain: the first notify with a key and a `mark`
@@ -852,8 +853,7 @@ post the gateway draws rating controls on, under the ask the plan's key is bound
 nothing, so a fan-out flags its creator's completion alone. The notifier has not seen the ask, so the bridge records its kind on the conversation route
 (`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
 typed answer read back onto the question it answers, which needs the backend's own
-history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
-stands), it posts each notify's text, a later `update` of the same key included.
+history.
 
 **Stopping the cards (gke-labs#3263).** A `stop` cancels the conversation's task, and by
 then that task has usually ended. The cards it filed are what still runs, and no carrier

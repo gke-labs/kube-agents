@@ -85,12 +85,15 @@ const (
 	// request may not post into, whatever the reason: no session record, a
 	// context id that does not match, or a record that cannot be read.
 	notifyConversationRefused = "not a live conversation with that context"
-	// notifyUpdateKeysMax is the spec's cap on a conversation's live update
-	// keys (spec-a2a-payloads.md, "Card work after the task ends"): past
-	// it the least recently used key is forgotten, and a later request with
-	// it posts anew. notifyUpdateConversationsMax bounds the conversations
-	// the keys are kept for, the least recently used forgotten first, so
-	// the store is bounded however many conversations the agent works in.
+	// notifyUpdateKeysMax is the spec's cap on a conversation's, or a home
+	// thread's, live update keys (spec-a2a-payloads.md, "Card work after
+	// the task ends"): past it the least recently used key is forgotten,
+	// and a later request with it posts anew. notifyUpdateConversationsMax
+	// bounds the conversations and home threads together that the keys are
+	// kept for, the least recently used forgotten first, so the store is
+	// bounded however many conversations the agent works in and alerts it
+	// raises (a storm of alerts evicts a conversation's keys, and its next
+	// keyed request posts anew, as the spec allows).
 	notifyUpdateKeysMax          = 16
 	notifyUpdateConversationsMax = 1024
 	// notifyUpdateKeyMax bounds an update key, which the sender picks.
@@ -159,6 +162,11 @@ type notifyChatPoster interface {
 // says where the value came from (homePostHint).
 var homePostChannelErrors = []string{"channel_not_found", "is_archived", "not_in_channel"}
 
+// errNotifyNoTextEdit is editKeyedWith's answer when the layout did not
+// land and no text edit was allowed (the text does not fit one message):
+// the message is left as it was and the caller posts the text in chunks.
+var errNotifyNoTextEdit = errors.New("the layout did not land and the text does not fit one message")
+
 // notifyChatEditor is the optional half a backend that edits a home-channel
 // message in place adds: the message a keyed home request last posted on a
 // thread, laid out or as text. SlackAdapter and GoogleChatAdapter implement
@@ -212,8 +220,8 @@ type Notifier struct {
 	mu       sync.Mutex
 	stopping bool
 
-	// updates is where a conversation request's update key last posted
-	// (notifyUpdates). Only the worker reads or writes it.
+	// updates is where a conversation request's, or a home thread's, update
+	// key last posted (notifyUpdates). Only the worker reads or writes it.
 	updates notifyUpdates
 	// metrics counts the chat messages conversation requests carry; nil
 	// counts nothing (a Notifier armed without the gateway's
@@ -929,16 +937,21 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 // conversation request's is; one that breaks a rule is dropped whole, logged
 // and counted, and so is one the backend refuses, and the text stands. A key
 // is one message per home thread, as it is per conversation
-// (spec-a2a-payloads.md, "Card work after the task ends"): a keyed request
-// edits the message its key last posted on the thread, laid out or as text,
-// and posts one message, its text cut to one chunk, when the key has none
-// there (another thread's, one forgotten, one lost to a restart, a backend
-// that does not edit) or the edit fails. A keyed request with no thread
-// starts one and binds its key to it, so the request that edits it names
-// that thread. An unkeyed request whose chat message the backend lays out is
-// one message; otherwise it is not answered here, and post sends its text in
-// chunks as it always has. The mark is not read on a home post: it is drawn
-// on an ask's plan, which a home thread has none of.
+// (spec-a2a-payloads.md, "Card work after the task ends"), in the same table
+// and under the same bounds: a keyed request edits the message its key last
+// posted on the thread, laid out or as text, and posts one message when the
+// key has none there (another thread's, one forgotten, one lost to a
+// restart, a backend that does not edit) or the message can no longer be
+// edited. A keyed message is one message, so its text goes as text only
+// when it fits one chunk: a keyed request whose text is longer and whose
+// layout does not land (none, refused, or a backend without one) is not
+// answered here, and post sends the text in chunks, unkeyed, as it did
+// before this route read keys. A keyed request with no thread starts one
+// and binds its key to it, so the request that edits it names that thread.
+// An unkeyed request whose chat message the backend lays out is one
+// message; otherwise it is not answered here either. The mark is not read
+// on a home post: it is drawn on an ask's plan, which a home thread has
+// none of.
 func (n *Notifier) postHome(job notifyJob) bool {
 	home, thread, key := job.home, job.req.Thread, job.req.Update
 	m := OutMessage{Text: job.req.Text}
@@ -970,11 +983,22 @@ func (n *Notifier) postHome(job notifyJob) bool {
 		n.log.Info("notify posted", "home", home, "thread", landed, "message", message, "chat", true)
 		return true
 	}
-	text := OutMessage{Text: truncateRunes(m.Text, discordChunk)}
+	text := OutMessage{Text: m.Text}
+	fits := utf8.RuneCountInString(m.Text) <= discordChunk
+	if m.Chat == nil && !fits {
+		return false
+	}
+	var textEdit *OutMessage
+	if fits {
+		textEdit = &text
+	}
 	if editor, edits := n.poster.(notifyChatEditor); edits && thread != "" {
 		if message, ok := n.updates.get(notifyHomeKeyPrefix+thread, key); ok {
 			edit := func(m OutMessage) error { return editor.EditNotifyMessage(home, thread, message, m) }
-			edited, err := n.editKeyedWith(edit, home, m, text)
+			edited, err := n.editKeyedWith(edit, home, []any{"home", home, "thread", thread, "message", message}, m, textEdit)
+			if errors.Is(err, errNotifyNoTextEdit) {
+				return false
+			}
 			if err != nil {
 				n.reply(job, lib.NotifyReply{Error: "edit failed: " + err.Error()})
 				return true
@@ -991,6 +1015,9 @@ func (n *Notifier) postHome(job notifyJob) bool {
 	if m.Chat != nil {
 		message, landed, err = poster.PostNotifyMessage(home, thread, m)
 		if !n.chatOutcome(home, err) {
+			if !fits {
+				return false
+			}
 			message, landed, err = n.poster.PostNotify(home, thread, text.Text)
 		}
 	} else {
@@ -1016,12 +1043,16 @@ func (n *Notifier) postHome(job notifyJob) bool {
 // out and as text otherwise, and reports whether an edit landed.
 func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) (bool, error) {
 	edit := func(m OutMessage) error { return n.conv.EditMessage(conversation, message, m) }
-	return n.editKeyedWith(edit, conversation, m, text)
+	return n.editKeyedWith(edit, conversation, []any{"conversation", conversation}, m, &text)
 }
 
 // editKeyedWith is editKeyed through edit, the backend's edit of the one
-// message; where names the conversation or home channel in the log.
-func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, m, text OutMessage) (bool, error) {
+// message. where names the conversation or home channel for the outcome
+// count, scope is what the log says of the message's place, and text is the
+// edit made when the layout does not land, or nil when none may be (the
+// text does not fit one message): then the message is left as it was and
+// the answer is errNotifyNoTextEdit.
+func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, scope []any, m OutMessage, text *OutMessage) (bool, error) {
 	var layoutErr error
 	if m.Chat != nil {
 		layoutErr = edit(m)
@@ -1034,7 +1065,7 @@ func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, m, t
 			// the sender's next request edits it.
 			layoutErr = edit(m)
 			if isTransientEdit(layoutErr) {
-				n.log.Warn("notify: the keyed edit failed twice; the message is left as it was", "conversation", where, "err", layoutErr)
+				n.log.Warn("notify: the keyed edit failed twice; the message is left as it was", append(scope, "err", layoutErr)...)
 				return false, layoutErr
 			}
 		}
@@ -1044,11 +1075,17 @@ func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, m, t
 			}
 		}
 	}
-	if err := edit(text); err != nil {
+	if text == nil {
+		if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
+			n.chatOutcome(where, layoutErr)
+		}
+		return false, errNotifyNoTextEdit
+	}
+	if err := edit(*text); err != nil {
 		// The message itself cannot be edited (gone, or the API failing):
 		// the layout was not what failed, so nothing is counted refused,
 		// and the request posts anew.
-		n.log.Warn("notify: editing the keyed message failed; posting a new one", "conversation", where, "err", err)
+		n.log.Warn("notify: editing the keyed message failed; posting a new one", append(scope, "err", err)...)
 		return false, nil
 	}
 	if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
