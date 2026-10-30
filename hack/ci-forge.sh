@@ -459,22 +459,25 @@ if [ ! -e /var/gitlab/private/seeded ]; then
   # environment), the group, the project with its README, the bot's
   # membership, and the manifest committed to the default branch, which keeps
   # GitLab's default protection, so the bot cannot push it and opens merge
-  # requests instead.
+  # requests instead. Every namespace needs the instance's organization since
+  # GitLab 17 ("Namespace organization can't be blank" without it).
   docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" -e GROUP="$GROUP" -e PROJECT="$PROJECT" gitlab gitlab-rails runner '
 admin = User.find_by_username("root")
 pw = SecureRandom.hex(24)
-res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10).execute
+org = Organizations::Organization.respond_to?(:default_organization) ? Organizations::Organization.default_organization : Organizations::Organization.first
+raise "no organization" unless org
+res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10, organization_id: org.id).execute
 u = res.respond_to?(:payload) ? (res.payload[:user] || res[:user]) : res
 raise "user create failed: #{res.inspect}" unless u && u.persisted?
 {"agent" => ["api", "write_repository"], "ledger" => ["api"]}.each do |name, scopes|
   t = u.personal_access_tokens.build(name: name, scopes: scopes, expires_at: ENV["TOKEN_DAYS"].to_i.days.from_now)
   t.set_token(File.read("/var/gitlab/private/" + name + "-token").strip); t.save!
 end
-g = Groups::CreateService.new(admin, name: ENV["GROUP"], path: ENV["GROUP"], visibility_level: Gitlab::VisibilityLevel::PRIVATE).execute
+g = Groups::CreateService.new(admin, name: ENV["GROUP"], path: ENV["GROUP"], visibility_level: Gitlab::VisibilityLevel::PRIVATE, organization_id: org.id).execute
 g = g.payload[:group] if g.respond_to?(:payload)
 g = g[:group] if g.is_a?(Hash)
 raise "group create failed: #{g.inspect}" unless g && g.persisted?
-p = Projects::CreateService.new(admin, name: ENV["PROJECT"], path: ENV["PROJECT"], namespace_id: g.id, visibility_level: Gitlab::VisibilityLevel::PRIVATE, initialize_with_readme: true).execute
+p = Projects::CreateService.new(admin, name: ENV["PROJECT"], path: ENV["PROJECT"], namespace_id: g.id, visibility_level: Gitlab::VisibilityLevel::PRIVATE, initialize_with_readme: true, organization_id: org.id).execute
 raise "project create failed: #{p.inspect}" unless p && p.persisted?
 p.add_developer(u)
 r = Files::CreateService.new(p, admin, start_branch: p.default_branch, branch_name: p.default_branch, commit_message: File.read("/var/gitlab/seed/message").strip, file_path: File.read("/var/gitlab/seed/path").strip, file_content: File.read("/var/gitlab/seed/content")).execute

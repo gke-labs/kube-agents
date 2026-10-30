@@ -431,7 +431,7 @@ class ForgeScriptTest(unittest.TestCase):
         # The startup script the VM runs: root makes the bot (a Developer), its two tokens set to the given values, the group, the project and the file; readiness last.
         startup = (self.gstate / "startup-script").read_text()
         for marker in ("gitlab-rails runner", "Users::CreateService", "set_token", '"agent" => ["api", "write_repository"]', '"ledger" => ["api"]',
-                       "Groups::CreateService.new(admin", "Projects::CreateService.new(admin", "initialize_with_readme: true", "add_developer(u)",
+                       "Groups::CreateService.new(admin", "Projects::CreateService.new(admin", "initialize_with_readme: true", "add_developer(u)", "organization_id: org.id",
                        "Files::CreateService.new(p, admin", "gitlab_signup_enabled']=false", "/users/sign_in"):
             self.assertIn(marker, startup)
         self.assertNotIn("api/v4", startup, "no API call with a token on the VM; rails does it all as root")
