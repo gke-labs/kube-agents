@@ -56,6 +56,9 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 # its rule rather than a second one.
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
+# The runner's reader of `scope_exclude:` (hack/ci-eval-pr.sh), loaded the same way.
+SCOPE_EXCLUDE_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "scope_exclude.py"
+SCOPE_EXCLUDE_MODULE_NAME = "bench_scope_exclude"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
@@ -281,6 +284,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "cluster-agent-scaled-zero-gateway-silence": (
+        "#4098: needs bench/tf/fleet's scaled-zero-gateway role on every pool project "
+        "(the postsubmit reconcile) and stall_report.py's scale-to-zero rule for Gateways "
+        "and HTTPRoutes; without the rule the case is red every run"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -326,11 +334,6 @@ FIXTURE_NOT_READY = {
         "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
         "re-apply); no pool project has a backend service draining longer than the 600 s "
         "GKE waits per node"
-    ),
-    "scope-excluded-cluster-not-listed": (
-        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
-        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
-        "cluster exclusion and the case cannot patch the CR for a run"
     ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
@@ -453,6 +456,13 @@ FIXTURE_NOT_READY = {
         "provisioning files; every CI eval install leaves INCIDENT_TRIAGE_OPEN_PULL_REQUEST off "
         "(which the nightly AutoOps triage cases require) and no pool *-infra repository carries "
         "both paths, so no CI tier can run it; run it by hand against such an install"
+    ),
+    "incident-triage-open-pr-reminder": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and "
+        "INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 in spec.deployment.env and a GitOps repository "
+        "declaring eval-pr-reminder-workload; every CI eval install leaves "
+        "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
+        "tier can run it; run it by hand against such an install"
     ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
@@ -720,6 +730,15 @@ def audit_streams_reader() -> Any:
     spec = importlib.util.spec_from_file_location(AUDIT_STREAMS_MODULE_NAME, AUDIT_STREAMS_FILE)
     if spec is None or spec.loader is None:
         raise CaseError(f"{AUDIT_STREAMS_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def scope_exclude_reader() -> Any:
+    spec = importlib.util.spec_from_file_location(SCOPE_EXCLUDE_MODULE_NAME, SCOPE_EXCLUDE_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{SCOPE_EXCLUDE_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -1190,6 +1209,28 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                     f"'audit_streams:' names {', '.join(unknown)}, which "
                     f"{PLATFORM_JOBS_FILE.relative_to(REPO_ROOT)} does not define"
                 )
+
+    # The seeded slots a case excludes from the install's scope. The runner
+    # resolves each to its cluster through the fleet's .fleet-context; a slot
+    # the catalogue does not declare resolves to nothing, so every repetition
+    # would be recorded as infrastructure, and a case that excludes every slot
+    # has no seeded cluster left to ask about.
+    if "scope_exclude" in spec:
+        reader = scope_exclude_reader()
+        try:
+            slots = reader.declared_slots(path)
+        except reader.ScopeExcludeError as exc:
+            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...]}}: {exc}")
+        else:
+            catalog = _catalog_slots()
+            unknown = sorted(set(slots) - catalog)
+            if unknown:
+                problems.append(
+                    f"'scope_exclude:' names slot(s) {', '.join(unknown)}, which "
+                    f"{ROLE_CATALOG.relative_to(REPO_ROOT)} does not declare"
+                )
+            elif set(slots) >= catalog:
+                problems.append("'scope_exclude:' excludes every seeded slot; leave at least one in scope")
 
     # The expected-fail marker. bench-gate inverts a marked case's verdict,
     # and its loader (bench/kube_agents_bench/cases.py, _coerce_bool) refuses

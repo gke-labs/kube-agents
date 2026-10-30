@@ -1036,6 +1036,11 @@ func webIdentity() a2aIdentity {
 		// Denying the whole `a2a.cap.>` namespace rather than the verify
 		// subject alone also takes away the reply traffic, which this
 		// credential had no reason to see either.
+		//
+		// TODO(#3889): deny `a2a.dispatch.>` here and on console when the
+		// dispatch subjects land. Neither reads offers, and an offer will
+		// carry a task credential (bound to its pod, so useless copied, but
+		// no reason to hand it to a browser).
 		denySubscribe: []string{"a2a.cap.>"},
 	}
 }

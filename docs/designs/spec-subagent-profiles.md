@@ -184,7 +184,7 @@ above and the platform worked profile below are design sketches from before the 
 
 ## How a profile becomes a pod
 
-**Amended 10/22 (#3655, #3660):** profile pods and their ServiceAccounts run in their own namespace, `<agent-ns>-profiles`, not the CR's, so profile work never takes a session slot. The chart creates it, and the operator renders its pod quota (the warm workers, a surge pod per warm pool, and `spec.harness.tuning.profiles.ceiling` for Jobs) and a fence that lets its pods reach DNS, the bus and LiteLLM only. The rest of this section describes the Job-per-task path and changes with the dispatcher PRs, as #3660's "Changes to companion specs" lists.
+**Amended 10/22 (#3655, #3660):** profile pods and their ServiceAccounts run in their own namespace, `<agent-ns>-profiles`, not the CR's, so profile work never takes a session slot. The chart creates it, and the operator renders its pod quota (the warm workers, a surge pod per warm pool, and `spec.harness.tuning.profiles.ceiling` for Jobs) and a fence that lets its pods reach DNS, the bus, LiteLLM and the credential broker's credentialed port only. The rest of this section describes the Job-per-task path and changes with the dispatcher PRs, as #3660's "Changes to companion specs" lists.
 
 **Submission is a message, not an API call.** An orchestrator delegates by publishing a
 `kind: message` envelope to `a2a.tasks.{profile}.{taskId}.in` - the profile is the
@@ -318,14 +318,102 @@ What the operator renders per profile, as built (amended 10/6):
   from the profile and the consumer names and inbox from the attested pod name, the same way
   it already does for session pods. A refused profile is left out of the map rather than
   failing it for everyone.
+- Per-task credentials (#3889), staged. A worker gets two connections. Its pod connection,
+  which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and
+  its topics. After it accepts a task it opens a task connection with the token as the
+  connection token and a task credential as the password. The dispatcher signs the
+  credential (`a2a/taskcred`), and the callout refuses it unless its pod name and UID are
+  the pod the token is bound to, and its profile and tier are the entry's. The task
+  connection gets that one task's `.events` publish and its three consumers, filtered
+  exactly on the task. They and its inbox are named for the task, not the pod
+  (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a consumer's
+  info, pull and delete subjects carry only its name, and a pod-named consumer would be
+  reachable from the pod's next task. A credential may run to the callout's maximum task
+  lifetime, measured both from now and from its issue time. That is 6h until #4121's
+  operator renders it from the profile deadline cap, and it can exceed the grant TTL. A setting the callout can't use refuses every task credential, never
+  falling back to 6h, and the callout keeps serving everything else. The connection's JWT
+  still expires at the earlier of the credential and the grant TTL, and the worker
+  reconnects with the same credential. The password carries the credential because the
+  server copies CONNECT's `jwt` field into its `$SYS` advisories and `connz`, and a refused
+  connection would publish it. The operator generates the task-signing key beside the
+  callout's keys, in a Secret only the dispatcher will mount (nothing mounts it yet), and
+  renders the public half into the callout's environment. The narrowing lands in steps: the
+  first PR adds the task connection, and the pod connection keeps its profile-wide task
+  reach. The worker PR moves the worker onto the task connection and removes that reach, and
+  it has to land before #3659's tiers stronger than Read go live.
+- Proxy confinement (#3889). A worker's `kubectl` and `gcloud` are the credential-proxy
+  shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
+  ask the metadata server for the broker's Workload Identity token). The broker gives them a
+  role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
+  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  The operator renders the audience, an identity map from each tier's ServiceAccount to its
+  (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
+  entries), those ServiceAccounts on the broker's callers, and the task-signing public key
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
+  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
+  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
+  max lifetime yet. The broker's fence admits the profile namespace and
+  the profile namespace's fence lets it out to the broker's credentialed port.
+  - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
+    every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The
+    broker verifies it in Python (`task_credential.py`, held to `taskcred.Verify` by golden
+    fixtures in `a2a/taskcred/testdata`) and binds it: its pod and pod UID must be the ones
+    the TokenReview attests, and its profile and tier the ServiceAccount's map entry. It logs
+    the credential's `jti`, never the token. A credential that fails refuses the request. No
+    credential leaves the caller local-only commands: `gcloud version`,
+    `kubectl version --client`, `--help` on a command, and the `kubectl config` reads
+    `get-contexts` and `current-context`, the ones the read-only policy admits (`config view` is refused, since
+    `--flatten` prints credentials). A local-only command runs isolated, against no
+    kubeconfig and with no `get-credentials` handling, with or without a credential.
+    `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
+    broker's own account and default project.
+  - With a credential, every call is held to its target (`task_confinement.py`). Every
+    `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
+    call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`
+    and `--insecure-skip-tls-verify` are refused. `gcloud --project` must be the target's, and
+    a missing one is set to it, not the broker's default; `--cluster`, `--location`,
+    `--region` and `--zone` must be the target's; `get-credentials` must name the target
+    exactly; `--impersonate-service-account`, `--account` and the other identity flags are
+    refused; reads with no project scope (`projects list`, `organizations`, `billing`,
+    org-scoped `asset` searches, `storage`) are refused; and a `projects/<id>/...` name in any
+    argument must name the target. gcloud is held to an allowlist of its own
+    (`GCLOUD_CONFINED_COMMANDS`): each read says how it names a project (by `--project`, by a
+    positional project id, by a metrics scope, by a `<location>-docker.pkg.dev/<project>` or
+    `gcr.io/<project>` image path), and a read the policy admits but the table doesn't name is
+    refused, so a later addition to the read list fails closed. Each argv is parsed once,
+    with the CLI's flag arity; a flag whose value starts with `-` when written apart from it,
+    or with `--` when written `=value`, is refused, as is an unknown flag. The broker runs
+    the argv rebuilt from that parse (the command words, then each flag as one
+    `--name=value` token, then positionals), and its executor reads the parse for the
+    kubeconfig, isolation and `get-credentials`, never parsing the argv again. The shim honours no
+    `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the pool
+    less the session share and one (never below one), so the platform agent's shell keeps a
+    slot given a pool larger than the session share plus one.
+  - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
+    `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
+    `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.
+    And the injection is unconditional: every credentialed `kubectl` call carries `--context`
+    for the target, and every `gcloud` call `--project` (a GKE call `--location`, a node-pool
+    call `--cluster`), so a stored default changed some other way still can't move a call.
+  - Known limits. It is a confinement layer over the broker's IAM, not a sandbox. A project
+    named by number is refused; one inside a `--filter` or `--format` expression, or in a form
+    the allowlist doesn't parse for a command it admits as flag-named, is bounded by IAM
+    alone. A zonal read
+    under a regional target is refused rather than matched. A warm pod's credential stays
+    valid until its task's deadline plus the skew: the adapter removes the file at task end,
+    and a broker check that a newer credential supersedes an older one would need per-pod
+    state across replicas. A change to the identity map re-renders the broker's environment
+    and so restarts it.
 - The card: the operator is a bus principal for this and nothing else. Its entry publishes on
   `a2a.agents.*` and direct-gets the directory, so reconcile can tell a missing or stale card
   from a current one. The grant is a wildcard over the profile token because callout grants are
   fixed for the life of a connection, and a profile created later still has to be publishable.
 
-Two limits of what is built. Credentials are per profile, as decided 8/24, so two pods of one
-profile can reach each other's task subjects; per-task credentials stay with the authority
-work. And a profile deleted while its agent is on `today` releases its finalizer with no
+Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
+task connection) land, a worker's pod connection still reaches every task of its profile, so
+two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
 tombstone, because there is no bus to publish one on. The directory survives a flip to
 `today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
 Nothing sweeps directory entries that have no profile. Fixing that means either holding
@@ -693,6 +781,9 @@ Three small items to fold back into the payload spec rather than fork here (fold
   attenuation machinery exists (`Attenuate`, the hop chain) but has no production
   caller, and bus credentials are still per-principal. It is a named tightening
   against built machinery now rather than against a plan, which is a better position
-  to be in, but it is not done.
+  to be in, but it is not done. **Amended 10/28 (#3889):** staged. Its first PR adds a
+  worker's task connection, granted one task's subjects on a task credential the
+  dispatcher signs; the worker PR moves the worker onto it and removes the pod
+  connection's profile-wide task reach, before #3659's tiers stronger than Read go live.
 - ~~**Worker session naming.**~~ Decided 8/24: the animals stay - `<profile>-<animal>`
   per run, with `from.profile` carrying the structure.

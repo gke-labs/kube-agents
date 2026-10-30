@@ -119,8 +119,8 @@ func newAddresseeTestService(t *testing.T, tokens map[string]Attested, reserved 
 func authorizeAddresseeToken(svc *Service, token string) (string, error) {
 	req := &jwt.AuthorizationRequestClaims{}
 	req.ConnectOptions.Token = token
-	_, _, user, err := svc.authorize(context.Background(), req)
-	return user, err
+	d, err := svc.authorize(context.Background(), req)
+	return d.user, err
 }
 
 // One refusal per reserved addressee, with the reason the log line carries.

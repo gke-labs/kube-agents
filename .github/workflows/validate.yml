@@ -126,10 +126,11 @@ jobs:
           )
           helm lint charts/kube-agents "${SET_FLAGS[@]}"
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" > /dev/null
-          # A default render must carry the agent-RBAC admission policies. The
-          # Python suite checks the template and the values gate; only a real
-          # render proves the two combine into installable objects.
-          for name in kube-agents-agent-readonly kube-agents-agent-binding-scope; do
+          # A default render must carry the admission policies (the agent-RBAC
+          # pair and the A2A gateway's pod policy). The Python suite checks the
+          # templates and the values gate; only a real render proves the two
+          # combine into installable objects.
+          for name in kube-agents-agent-readonly kube-agents-agent-binding-scope kube-agents-a2a-gateway-pod; do
             count=$(helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
               | grep -c "^  name: $name$" || true)
             if [ "$count" -ne 2 ]; then
@@ -146,6 +147,19 @@ jobs:
             echo "the admission policies rendered on 1.29, where the API is not v1" >&2
             exit 1
           fi
+          # The operator's A2A_GATEWAY_POD_POLICY follows the gateway pod policy:
+          # set in a default render, absent where the policy is not rendered.
+          if ! helm template test-release charts/kube-agents "${SET_FLAGS[@]}" | grep -q "name: A2A_GATEWAY_POD_POLICY"; then
+            echo "a default render does not set A2A_GATEWAY_POD_POLICY on the operator" >&2
+            exit 1
+          fi
+          for off in "--kube-version 1.29.0" "--set admissionPolicy.enabled=false"; do
+            # shellcheck disable=SC2086 # two words each, split on purpose
+            if helm template test-release charts/kube-agents "${SET_FLAGS[@]}" $off | grep -q "name: A2A_GATEWAY_POD_POLICY"; then
+              echo "A2A_GATEWAY_POD_POLICY is set with $off, where the policy is not rendered" >&2
+              exit 1
+            fi
+          done
           # Render again with explicit image tags to cover the override path.
           helm template test-release charts/kube-agents "${SET_FLAGS[@]}" \
             --set operator.image.tag=v9.9.9 \

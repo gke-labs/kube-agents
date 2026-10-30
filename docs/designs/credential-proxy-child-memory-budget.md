@@ -388,7 +388,13 @@ does not move with the limit.
 counts reclaimable page cache, eight threads can pass the check before any child has grown, and
 the behaviour cannot be asserted in a unit test. The reservation model is deterministic and
 testable; a live reading could be layered on later as a second check if the constants prove
-wrong.
+wrong. Since #4315 the broker exports the live reading without admitting on it: the cgroup's
+`memory.current`, `memory.peak`, `memory.max`, `memory.stat` and `memory.events`, its own and
+Envoy's `VmRSS`/`VmHWM`, and the children's `ru_maxrss` after each reap, as series
+(`kubeagents_credential_proxy_cgroup_memory_bytes`, `…_cgroup_memory_events_total`,
+`…_process_memory_bytes`, `…_child_peak_rss_bytes`) and as `memory high-water` log lines. That is
+the measurement §1 was made by hand, kept running: it says on any fleet whether the constants
+hold, which the second check would need to know first.
 
 ## 4. Testing
 
@@ -422,6 +428,8 @@ produces no second wave, so the broker log shows budget waits only when the hour
 stall-watch tick coincide or long execs hold the budget; every listing completes (no `CREDENTIAL_PROXY_BUSY` in the
 stall-watch output), the container's cgroup `memory.peak` stays under the limit, the container
 does not restart, and the tick's wall time is within a minute of what it was before the change.
+The broker now reads `memory.peak` itself (§3), so on any install this check is its
+`kubeagents_credential_proxy_cgroup_memory_bytes{kind="peak"}` series against `kind="limit"`.
 
 ## 5. Sequencing
 

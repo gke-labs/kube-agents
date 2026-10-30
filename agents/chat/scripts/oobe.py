@@ -276,6 +276,14 @@ def scan_settled(data_dir: Path, now: float) -> bool:
     state = bootstrap_handoff.read_board(board, sweep_id)
     if state is None:
         return False
+    # The hand-off's own budget for the clusters past the cap, the live roster included when the
+    # marker pinned nothing (a failed listing at filing still sent the worker to audit them).
+    marker = data_dir / SCAN_FILED_MARKER
+    state["uncarded"] = bootstrap_handoff.uncarded_budget(
+        marker,
+        bootstrap_handoff.sweep_cluster_cards(data_dir, marker),
+        lambda: bootstrap_scan_gate.cluster_agents(capped=False),
+    )
     wait = bootstrap_handoff.deadline(state) + RANKING_ALLOWANCE_SECONDS
     if now - filed_at >= wait:
         _log(

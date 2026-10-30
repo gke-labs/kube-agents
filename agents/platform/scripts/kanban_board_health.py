@@ -146,6 +146,9 @@ from pathlib import Path
 # A sibling in the shared scripts directory: the agent home is `PLATFORM_AGENT_HOME`,
 # never `HERMES_HOME`, which under the platform roster names the profile home.
 import gitops_workspace
+# Grades `last_delivery_error` the way the delivery ledger does, so a note on a
+# post that landed is not read as a lost post.
+from chat_delivery_watch import GRADE_HARD, grade_error, is_delivered_note
 
 # Severity floor applied to what `hermes kanban diagnostics` returns. "error" on
 # purpose: the engine's warning-tier rules are useful to pull on demand but too
@@ -634,9 +637,12 @@ def last_post_undelivered(home: Path, said_at, env=None) -> bool:
     store with ``last_run_at`` and, on a failure, ``last_delivery_error``. An
     error stamped at or after ``said_at`` belongs to that run (or a later one),
     so the tasks are said again rather than left unreported for a week. Under
-    ``STATE_ENV`` (tests and hand runs) the store is not read. A failure grade
-    can also mark a post that landed (``feedback_prompt.py`` says why), which
-    costs a repeat card the next day, not a silent week.
+    ``STATE_ENV`` (tests and hand runs) the store is not read. Only a hard
+    failure (``chat_delivery_watch.grade_error``) counts: a partial or
+    degraded relay, or a scheduler note on a delivered report, landed
+    somewhere and is not said again. A hard grade can also mark a post that
+    landed (``feedback_prompt.py`` says why), which costs a repeat card the
+    next day, not a silent week.
     """
     if said_at is None or (env if env is not None else os.environ).get(STATE_ENV):
         return False
@@ -646,7 +652,8 @@ def last_post_undelivered(home: Path, said_at, env=None) -> bool:
         return False
     jobs = data.get("jobs", []) if isinstance(data, dict) else data
     job = next((j for j in jobs if isinstance(j, dict) and j.get("id") == JOB_ID), None) if isinstance(jobs, list) else None
-    if not job or not job.get("last_delivery_error"):
+    error = str(job.get("last_delivery_error") or "") if job else ""
+    if not error or is_delivered_note(error) or grade_error(error) != GRADE_HARD:
         return False
     try:
         run_at = datetime.fromisoformat(str(job.get("last_run_at")).replace("Z", "+00:00"))

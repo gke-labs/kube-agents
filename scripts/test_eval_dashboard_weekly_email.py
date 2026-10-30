@@ -15,8 +15,10 @@ import json
 import pathlib
 import tempfile
 import unittest
+import unittest.mock
 
 import yaml
+from eval_dashboard import post_health
 from eval_dashboard import weekly_email as we
 
 JOB = "ci-kube-agents-eval-nightly"
@@ -891,6 +893,8 @@ class ChatPost(Base):
             summary = json.loads(chat.read_text())
             self.assertEqual(summary["week_end"], WEEK_END.isoformat())
             self.assertEqual(summary["text"], self.chat(runs)[0])
+            self.assertEqual(summary["card"]["cardId"], we.CARD_ID)
+            self.assertEqual(set(summary), {we.CHAT_WEEK_KEY, we.CHAT_TEXT_KEY, we.CHAT_CARD_KEY})
 
     def test_a_refused_week_writes_no_summary_and_says_so(self):
         data = data_of(timed_runs())
@@ -908,6 +912,122 @@ class ChatPost(Base):
             self.assertFalse(chat.exists())
             self.assertIn("footer:", err.getvalue())
             self.assertIn("nothing is posted for this week", err.getvalue())
+
+
+def card_texts(section):
+    """Each widget's text, a decoratedText's or a textParagraph's."""
+    return [(w.get("decoratedText") or w.get("textParagraph") or {}).get("text") for w in section["widgets"]]
+
+
+class ChatCard(Base):
+    """The weekly Chat post as a cardsV2 card: the same week as chat_text."""
+
+    def card(self, runs, store=None):
+        week, _, failures = we.produce_week(data_of(runs), store or store_of(runs), self.rows(), WEEK_END, bugs_of(), NOW, REPO, self.root)
+        self.assertEqual(failures, [])
+        return week, we.chat_card(week)
+
+    def test_a_trend_week(self):
+        week, card = self.card(timed_runs())
+        self.assertEqual(card["cardId"], "weekly-health")
+        self.assertEqual(card["card"]["header"], {"title": "kube-agents · weekly health", "subtitle": "Nightly evals · Oct 12–18",
+                                                  "imageUrl": "https://gke-labs.github.io/kube-agents/agent-icon.png", "imageType": "SQUARE"})
+        lead, attention, areas, time, close = card["card"]["sections"]
+        self.assertNotIn("header", lead)
+        self.assertEqual(card_texts(lead), ["<b>63% of test runs passed</b>", "105 of 168 runs · 8 scenarios",
+                                            f'<font color="{we.BAD}">▼ 12 points from last week</font>'])
+        self.assertEqual(attention["header"], "Needs attention")
+        self.assertEqual(card_texts(attention), ["🟠 Observability 50%, few scenarios · 1 open bug", "🔴 Cost 33%, down 34 · 0 open bugs"])
+        self.assertEqual([w["decoratedText"]["button"] for w in attention["widgets"]],
+                         [{"text": "View", "onClick": {"openLink": {"url": we.bugs_url(REPO, slug)}}} for slug in ("obs", "cost")])
+        self.assertEqual(areas["header"], "By area")
+        self.assertEqual(card_texts(areas), ["Chat  ▰▰▰▰▰▰▰▰▰▰  100%", "Observability  ▰▰▰▰▰▱▱▱▱▱  50%",
+                                             "Cost  ▰▰▰▱▱▱▱▱▱▱  33%"])
+        # Long rows wrap rather than cut off the figures at the end.
+        self.assertTrue(all(w["decoratedText"]["wrapText"] for w in attention["widgets"] + areas["widgets"]))
+        # Three areas: nothing to collapse.
+        self.assertNotIn("collapsible", areas)
+        self.assertEqual(time, {"header": "Task time", "widgets": [
+            {"textParagraph": {"text": "⏱ Typical 4 min · slowest 10% over 10 min · Slowest area: Cost (10 min)"}}]})
+        self.assertNotIn("header", close)
+        self.assertEqual(close["widgets"][0]["buttonList"]["buttons"], [
+            {"text": "Full report", "onClick": {"openLink": {"url": "https://storage.cloud.google.com/kube-agents-dashboards/evals/health-email.html"}}},
+            {"text": "Dashboard", "onClick": {"openLink": {"url": "https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html"}}},
+            {"text": "All open bugs", "onClick": {"openLink": {
+                "url": "https://github.com/gke-labs/kube-agents/issues?q=is%3Aissue%20is%3Aopen%20label%3Anightly-red"}}},
+        ])
+        self.assertEqual(card_texts(close)[1], f'<font color="{we.FAINT}">Model: {MODEL} · next mode</font>')
+        # The page's numbers, and the plain-text post beside it.
+        self.assertIn("down 12 points from last week", we.chat_text(week))
+        for url in (we.bugs_url(REPO, "obs"), we.bugs_url(REPO, "cost")):
+            self.assertTrue(we.well_formed(url))
+
+    def test_an_up_week_and_a_steady_week(self):
+        week, _ = self.card(timed_runs())
+        week["overall"].update(trend=we.TREND_UP, change=4)
+        self.assertEqual(card_texts(we.chat_card(week)["card"]["sections"][0])[2], f'<font color="{we.GOOD}">▲ 4 points from last week</font>')
+        week["overall"].update(trend=we.TREND_STEADY, change=1)
+        self.assertEqual(card_texts(we.chat_card(week)["card"]["sections"][0])[2], "→ steady with last week")
+
+    def test_a_no_trend_week_says_why(self):
+        _, card = self.card(timed_runs(truncated=THIS_WEEK[3:]))
+        self.assertEqual(card_texts(card["card"]["sections"][0]), [
+            "<b>63% of test runs passed</b>", "45 of 72 runs · 8 scenarios", "No trend this week: 3 of 7 nights counted (4 cut off)"])
+        self.assertIn("🔴 Cost 33% · 0 open bugs", card_texts(card["card"]["sections"][1]))
+
+    def test_a_short_last_week_is_the_one_named(self):
+        _, card = self.card(week_runs(days=THIS_WEEK + LAST_WEEK[:3]))
+        self.assertIn("No trend this week: 3 of last week's 7 nights counted (4 not run)", card_texts(card["card"]["sections"][0]))
+
+    def test_a_model_change_is_said_and_both_models_named(self):
+        runs = week_runs()
+        _, card = self.card(runs, store_of(runs, models={d: OTHER_MODEL for d in THIS_WEEK}))
+        lead = card_texts(card["card"]["sections"][0])
+        self.assertEqual(lead[-1], f"This week ran {OTHER_MODEL}; last week ran {MODEL}, so the change compares two models.")
+        self.assertIn(f"Models: {OTHER_MODEL} (this week), {MODEL} (last week) · next mode", card_texts(card["card"]["sections"][-1])[1])
+
+    def test_no_area_needing_attention_omits_the_section_and_no_timing(self):
+        cases = {c: d for c, d in CASES.items() if d == "chat"}
+        runs = [run(int(r["started"][8:10]), [{**t, "reps": [{k: v for k, v in rep.items() if k != "agent_s"} for rep in t["reps"]]}
+                                              for t in r["tasks"]]) for r in week_runs(cases=cases)]
+        week = self.week(data_of(runs, cases), store_of(runs))
+        we.render(week, bugs_of([]))
+        card = we.chat_card(week)
+        headers = [s.get("header") for s in card["card"]["sections"]]
+        self.assertEqual(headers, [None, "By area", "Task time", None])
+        self.assertEqual(card_texts(card["card"]["sections"][2]), ["⏱ No timing on record"])
+
+    def test_bars_have_ten_steps_and_only_a_full_score_fills_one(self):
+        self.assertEqual(we.card_bar(0), "▱▱▱▱▱▱▱▱▱▱")
+        self.assertEqual(we.card_bar(37), "▰▰▰▱▱▱▱▱▱▱")
+        self.assertEqual(we.card_bar(96), "▰▰▰▰▰▰▰▰▰▱")
+        self.assertEqual(we.card_bar(100), "▰▰▰▰▰▰▰▰▰▰")
+
+    def test_more_areas_than_shown_collapse_to_the_best(self):
+        week, _ = self.card(timed_runs())
+        with unittest.mock.patch.object(we, "CARD_AREAS_SHOWN", 2):
+            areas = we.chat_card(week)["card"]["sections"][2]
+        self.assertTrue(areas["collapsible"])
+        self.assertEqual(areas["uncollapsibleWidgetsCount"], 2)
+        self.assertTrue(card_texts(areas)[0].startswith("Chat  "))
+
+    def test_names_are_escaped_for_the_cards_html(self):
+        week, _ = self.card(timed_runs())
+        week["rows"][0]["name"] = "A <b> & B"
+        self.assertTrue(card_texts(we.chat_card(week)["card"]["sections"][2])[0].startswith("A &lt;b&gt; &amp; B  "))
+
+    def test_the_message_carries_the_text_as_the_fallback(self):
+        week, card = self.card(timed_runs())
+        body = post_health.Sender.body(we.chat_text(week), card)
+        # The fallback is a notification's plain text: Chat's markup is dropped.
+        self.assertEqual(body["cardsV2"], [card])
+        fallback = body["fallbackText"]
+        self.assertTrue(fallback.startswith("kube-agents weekly health · Oct 12–18\n63% of nightly test runs passed"))
+        self.assertIn("• Observability: 50%, few scenarios, 1 open bug", fallback)
+        self.assertIn("full report · dashboard", fallback)
+        self.assertNotIn("*", fallback)
+        self.assertNotIn("<", fallback)
+        self.assertEqual(post_health.Sender.body("plain"), {"text": "plain"})
 
 
 if __name__ == "__main__":

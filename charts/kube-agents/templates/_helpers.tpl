@@ -161,6 +161,19 @@ Takes a dict: {repository, tag, name (optional), root (the root context)}.
 {{- end }}
 
 {{/*
+Whether the chart renders the A2A gateway's pod admission policy
+(templates/a2a-gateway-pod-admission-policy.yaml): the admission-policy values gate,
+on a cluster where ValidatingAdmissionPolicy is v1. The template renders on this, and
+the operator's A2A_GATEWAY_POD_POLICY is set from it, so an operator feature gated on
+that signal cannot be on where the policy is not rendered.
+*/}}
+{{- define "kube-agents.a2aGatewayPodPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else

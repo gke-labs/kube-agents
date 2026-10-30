@@ -9,9 +9,11 @@ is empty, as it is after a restart:
 
 - a thread parent's change with reply metadata and no ``edited`` returns None;
 - so does one for a parent edited earlier, whose ``edited.ts`` is unchanged
-  from ``previous_message``'s;
-- a user's edit, a second edit, and an edit with no ``previous_message`` still
-  return the normalized message;
+  from ``previous_message``'s, and one for that parent with no
+  ``previous_message``, whose ``edited.ts`` is hours older than the event;
+- a user's edit, a second edit, and an edit or second edit with no
+  ``previous_message`` (or with a ts that is garbled, inf or nan) still return
+  the normalized message;
 - a change to a message already routed to the agent still returns None.
 
 The method is located with ``ast``, so an upstream move is reported, never a
@@ -65,6 +67,12 @@ EDITED_PARENT_METADATA_CHANGE = {
     "previous_message": {**PARENT_METADATA_CHANGE["message"], "reply_count": 3, "edited": EARLIER_EDIT},
 }
 
+#: The same change with no previous_message: only the old `edited.ts` against the event's ts says so.
+EDITED_PARENT_BARE_METADATA_CHANGE = {
+    **{k: v for k, v in EDITED_PARENT_METADATA_CHANGE.items() if k != "previous_message"},
+    "event_ts": PARENT_METADATA_CHANGE["ts"],
+}
+
 #: A user editing an @mention into their message.
 USER_EDIT = {
     "subtype": "message_changed",
@@ -87,6 +95,19 @@ BARE_EDIT = {k: v for k, v in USER_EDIT.items() if k != "previous_message"}
 
 #: A user's edit whose previous_message is malformed: treated as absent, not raised on.
 MALFORMED_PREVIOUS_EDIT = {**USER_EDIT, "previous_message": "garbled"}
+
+#: A second edit delivered without previous_message: its `edited.ts` is the event's own time.
+BARE_SECOND_EDIT = {**BARE_EDIT, "event_ts": EDIT_TS}
+
+#: An edit with no previous_message and no event ts that parses: kept, never dropped for a missing field.
+BARE_EDIT_NO_EVENT_TS = {**BARE_EDIT, "ts": "", "event_ts": "garbled"}
+
+#: Edits whose ts parses to a non-finite float: kept, as a ts that does not parse is.
+NON_FINITE_EDITS = (
+    {**BARE_EDIT, "event_ts": "inf"},
+    {**BARE_EDIT, "event_ts": "nan"},
+    {**BARE_EDIT, "message": {**BARE_EDIT["message"], "edited": {"user": "U1", "ts": "-Infinity"}}},
+)
 
 
 def fail(msg: str) -> None:
@@ -133,6 +154,8 @@ def main() -> int:
         dropped = [
             (PARENT_METADATA_CHANGE, (), "a thread parent's metadata change with no `edited` is routed as a message"),
             (EDITED_PARENT_METADATA_CHANGE, (), "a metadata change on a parent edited earlier is routed as a message"),
+            (EDITED_PARENT_BARE_METADATA_CHANGE, (),
+             "a metadata change with no previous_message on a parent edited earlier is routed as a message"),
             (USER_EDIT, (ROOT_TS,), "an edit to a message already routed to the agent is routed again"),
         ]
         for event, processed, why in dropped:
@@ -141,7 +164,10 @@ def main() -> int:
                 fail(why)
         for event, what in ((USER_EDIT, "a user's edit"), (SECOND_EDIT, "a second edit"),
                             (BARE_EDIT, "an edit with no previous_message"),
-                            (MALFORMED_PREVIOUS_EDIT, "an edit with a malformed previous_message")):
+                            (MALFORMED_PREVIOUS_EDIT, "an edit with a malformed previous_message"),
+                            (BARE_SECOND_EDIT, "a second edit with no previous_message"),
+                            (BARE_EDIT_NO_EVENT_TS, "an edit with no previous_message and no event ts"),
+                            *((e, "an edit with a non-finite ts") for e in NON_FINITE_EDITS)):
             got = run(text, event)
             if got is not RAISED and (not isinstance(got, dict) or got.get("ts") != ROOT_TS):
                 fail(f"{what} is not routed as the edited message: {got!r}")

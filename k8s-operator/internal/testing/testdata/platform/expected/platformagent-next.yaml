@@ -2361,6 +2361,28 @@ metadata:
 ---
 apiVersion: v1
 data:
+  task-signing-public: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  task-signing-seed: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: task-signing-key
+  name: platformagent-a2a-task-signing-key
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
   ca.crt: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
   ca.key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
 kind: Secret
@@ -3354,6 +3376,8 @@ spec:
               value: callout,gateway,bridge,seed,web,console,sys
             - name: A2A_RESERVED_ADDRESSEES
               value: platform
+            - name: A2A_TASK_SIGNING_PUBLIC_KEYS
+              value: <GENERATED_FOR_TESTS>
             - name: A2A_ISSUER_SEED
               valueFrom:
                 secretKeyRef:

@@ -67,6 +67,13 @@ const (
 	// running row is the open one.
 	slackChatStepDone = "✓"
 	slackChatStepOpen = "◌"
+	// slackChatCardRunning is what a waiting item's task card draws, as
+	// slack_status.py's CARD_STATUS does: Slack's task_card takes
+	// in_progress, complete and error only, and refuses the whole message
+	// with invalid_blocks for pending. The card's icon no longer tells a
+	// waiting item from a running one, so the emitter's title carries it
+	// (chat_message.py composes "waiting on you").
+	slackChatCardRunning = chatmsg.StatusInProgress
 	// slackChatRawTextCell is the Slack table cell type that shows its text
 	// as written.
 	slackChatRawTextCell = "raw_text"
@@ -373,17 +380,22 @@ func slackChatTableRow(cells []string) []map[string]any {
 // slackChatPlan is the plan as one top-level task card per item, as
 // slack_status.plan_blocks lays it out: a row's title arrives composed, and
 // its steps are listed under it, each marked done but the last of a running
-// row, which is the open one. Not Slack's plan block: Slack draws that as its
+// row, which is the open one. A pending item draws in_progress
+// (slackChatCardRunning), its steps still all done. Not Slack's plan block: Slack draws that as its
 // title alone, folded, so a fan-out read as one "N cards" line, and allows one
 // per message. The plan's title is the fallback text's, and draws nothing.
 func slackChatPlan(p *chatmsg.Plan) []map[string]any {
 	tasks := make([]map[string]any, 0, len(p.Items))
 	for _, item := range p.Items {
+		status := item.Status
+		if status == chatmsg.StatusPending {
+			status = slackChatCardRunning
+		}
 		card := map[string]any{
 			"type":    "task_card",
 			"task_id": item.ID,
 			"title":   item.Title,
-			"status":  item.Status,
+			"status":  status,
 		}
 		if len(item.Steps) > 0 {
 			steps := make([]map[string]any, 0, len(item.Steps))

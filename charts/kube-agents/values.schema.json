@@ -1406,7 +1406,8 @@
                   "type": "string"
                 },
                 "serviceUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Ignored. Accepted so existing values files still validate; the PlatformAgent CRD has no serviceUrl field, and the adapter takes the service URL from each inbound activity."
                 },
                 "adaptiveCards": {
                   "type": "boolean"

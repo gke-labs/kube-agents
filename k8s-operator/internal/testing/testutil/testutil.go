@@ -394,6 +394,22 @@ func generatedValues(resources []client.Object) *strings.Replacer {
 	return strings.NewReplacer(pairs...)
 }
 
+// redactGeneratedPublicKeys replaces the value of every env var named
+// *_PUBLIC_KEY or *_PUBLIC_KEYS: next mode derives them from seeds it
+// generates on first reconcile (the task-signing key reaches the callout as
+// A2A_TASK_SIGNING_PUBLIC_KEYS), so they differ on every run. The seeds sit in
+// Secrets and are redacted there; a public half rendered as a literal is not.
+func redactGeneratedPublicKeys(containers []corev1.Container) {
+	for i := range containers {
+		for j := range containers[i].Env {
+			env := &containers[i].Env[j]
+			if env.Value != "" && (strings.HasSuffix(env.Name, "_PUBLIC_KEY") || strings.HasSuffix(env.Name, "_PUBLIC_KEYS")) {
+				env.Value = generatedPlaceholder
+			}
+		}
+	}
+}
+
 // CleanAndMarshalResources cleans up volatile runtime fields and marshals objects to a multi-doc YAML string
 func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 	generated := generatedValues(resources)
@@ -409,6 +425,7 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 		switch obj := res.(type) {
 		case *appsv1.Deployment:
 			redactHashAnnotations(t, obj.Spec.Template.Annotations)
+			redactGeneratedPublicKeys(obj.Spec.Template.Spec.Containers)
 		case *appsv1.StatefulSet:
 			redactHashAnnotations(t, obj.Spec.Template.Annotations)
 		case *corev1.ConfigMap:

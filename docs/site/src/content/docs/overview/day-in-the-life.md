@@ -3,7 +3,7 @@ title: A day with kube-agents
 description: Three scenarios from trigger to pull request — a scheduled security audit, a crash loop that ends in a GitOps pull request, and a chat question.
 ---
 
-Each scenario follows one trigger to the chat messages, issues and pull requests it produces. The install runs `spec.mode: today`, has a GitOps repository in `managed_repos`, and has at least one chat platform turned on. Names such as `shop`, `checkout`, `redis` and `prod-east` are placeholders.
+Each scenario follows one trigger to the chat messages, issues and pull requests it produces. The install runs `spec.mode: next`, the first-install default, has a GitOps repository in `managed_repos`, and has at least one chat platform turned on. Under `next` the A2A gateway holds Google Chat when it is enabled and Slack otherwise, and posts to the home channel set at install; with both platforms enabled, Slack stays on the agent pod, as under `today`. Where the two modes show a scenario differently the text says so; [What carries over from `today`](/kube-agents/concepts/chatops/#what-carries-over-from-today) has the full list. Names such as `shop`, `checkout`, `redis` and `prod-east` are placeholders.
 
 ## A scheduled audit finds an exposed database
 
@@ -50,7 +50,9 @@ The Cluster Agent runs its preflight check, then reads the pods, the namespace e
 
 The developer replies "open a PR with that fix". The Planning Agent files a card for the Platform Agent, which opens the pull request through `submit-suggestion`. On Slack a separate message shows the pull request with Open PR and Files changed buttons. The credential broker refuses kubectl and gcloud commands that change state, for every agent in the pod, so the pull request is the only change ([Security & IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do)).
 
-Personal memory works only in a direct message; in a channel, the Planning Agent asks which cluster. Reactions, buttons, the progress plan message and the folded answer are Slack features and need `KAGE_SLACK_UX` on, the default. On Google Chat the bot shows a "Kage is thinking…" card, and progress is `⏳` lines on one edited message. A cluster with no Cluster Agent yet gets one from the hourly reconcile at minute 11; until then the Platform Agent investigates it itself. With no chat platform, use the Hermes CLI in the agent pod or the [admin console](/kube-agents/reference/admin-console/) ([ChatOps → When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled)).
+Personal memory works only in a direct message; in a channel, the Planning Agent asks which cluster. Reactions, buttons, the progress plan message and the folded answer are Slack features and need `KAGE_SLACK_UX` on, the default. On Google Chat under `next` the gateway keeps one status line per task, from `⏳ submitted…` to `✅ completed`, and posts each progress note of the card it files as its own message. Under `today` the bot shows a "Kage is thinking…" card, and progress is `⏳` lines on one edited message. A cluster with no Cluster Agent yet gets one from the hourly reconcile at minute 11; until then the Platform Agent investigates it itself.
+
+With no chat platform, use the A2A console's chat pane, the Hermes CLI in the agent pod or the [admin console](/kube-agents/reference/admin-console/) ([User interfaces](/kube-agents/reference/user-interfaces/), [ChatOps → When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled)).
 
 Without kube-agents, the developer needs cluster credentials, reads the scheduler events, matches the message to the requests in the manifest, and edits the manifest. A developer without that access waits for someone who has it.
 

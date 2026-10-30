@@ -1,0 +1,11 @@
+# gke_dns_endpoint.sh is sourced by hack/ci-env.sh, which runs inside
+# hack/ci-eval-pr.sh, the script that grades every pull request with main's
+# grader. A change to it could take that step out, so it needs the eval-crew
+# approval hack/OWNERS gives that script (#1560 section 6). Every other file
+# here matches no filter and falls through to the root OWNERS.
+filters:
+  '^gke_dns_endpoint\.sh$':
+    approvers:
+    - eval-crew
+options:
+  no_parent_owners: true

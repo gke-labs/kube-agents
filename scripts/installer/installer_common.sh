@@ -247,6 +247,14 @@ readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/
 # the same rule. Keep the three in step (docs/README.md lists them; a test
 # checks all three agree).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# spec.integration.slack.homeChannelPolicy on the PlatformAgent: "auto" (the
+# default, also empty) or "manual". The CRD enum (HomeChannelPolicy in
+# k8s-operator/api/v1alpha1/platformagent_types.go) is the source of the two
+# values and is exact: the API server rejects any other spelling, so the
+# installer matches exactly too, with no trim or case folding. Terraform's
+# slack_home_channel_policy validation holds the same three values.
+readonly SLACK_HOME_CHANNEL_POLICY_AUTO="auto"
+readonly SLACK_HOME_CHANNEL_POLICY_MANUAL="manual"
 # The prefix of a Google Chat space's resource name, the only home channel
 # form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
 # The gateway and the operator hold the same rule; keep the three in step
@@ -2308,6 +2316,21 @@ require_scope_max_projects() {
     fi
   fi
   print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# SLACK_HOME_CHANNEL_POLICY is empty, auto or manual, or the run stops before
+# a file is written and names the key: it renders
+# spec.integration.slack.homeChannelPolicy, whose CRD enum accepts only those
+# two spellings (SLACK_HOME_CHANNEL_POLICY_AUTO, _MANUAL). $1 the value; $2 is
+# "flags" when install.sh's flag can set it too, so the remedy names it.
+require_slack_home_channel_policy() {
+  local value="${1:-}" via="install.env"
+  case "$value" in
+    "" | "$SLACK_HOME_CHANNEL_POLICY_AUTO" | "$SLACK_HOME_CHANNEL_POLICY_MANUAL") return 0 ;;
+  esac
+  [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel-policy"
+  print_error "SLACK_HOME_CHANNEL_POLICY is '${value}', which is not ${SLACK_HOME_CHANNEL_POLICY_AUTO} or ${SLACK_HOME_CHANNEL_POLICY_MANUAL} (empty means ${SLACK_HOME_CHANNEL_POLICY_AUTO}). It sets spec.integration.slack.homeChannelPolicy on the PlatformAgent, whose CRD accepts only those two spellings. Set it in ${via} and run again."
   return 1
 }
 
@@ -4925,6 +4948,10 @@ write_tfvars_from_state() {
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
   require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
+  # Same reason: the CRD accepts two spellings, and Terraform's validation
+  # would name the variable after the interview, or after the Day-2 menu has
+  # rewritten install.env. Every route to Terraform passes here.
+  require_slack_home_channel_policy "${SLACK_HOME_CHANNEL_POLICY:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: the chart refuses to render
   # openai_compatible without these, and upgrade.sh regenerates without
   # install.sh's interview.
@@ -4967,6 +4994,15 @@ write_tfvars_from_state() {
     return 1
   fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
+  # The same reason, with a sharper edge: read as off, a misspelt value
+  # revokes the gateway's role on the serving project at the next apply, and
+  # a long-lived environment's reconcile renders this key from a GitHub
+  # variable a human typed.
+  local vertex_manage_serving_project="${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+  if ! is_bool_spelling "$vertex_manage_serving_project"; then
+    print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
   # regenerate from install.env without install.sh's check, and the variable's
   # validation would otherwise refuse it at plan, naming neither the key nor
@@ -5180,6 +5216,7 @@ write_tfvars_from_state() {
     echo "slack_allowed_users     = $(hcl_csv_list "${SLACK_ALLOWED_USERS:-}")"
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
+    echo "slack_home_channel_policy = $(hcl_str "${SLACK_HOME_CHANNEL_POLICY:-}")"
     echo ""
     # Written only for a GitLab install, so a GitHub one renders the exact
     # lines it always has. GITOPS_REPO is the project's full path there.

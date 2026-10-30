@@ -608,6 +608,25 @@ class StuckDueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
 
+    def test_only_a_hard_failure_unsays_the_post(self):
+        said_at = 1_761_220_000.0
+        landed = (
+            "chat relay partial: the report did not reach googlechat. Delivered — do not re-run to resend.",
+            "chat relay degraded: the report was posted but the Chat Agent turn failed. "
+            "Delivered — do not re-run to resend.",
+            "configured thread_id 12345 was not found; delivered without thread_id",
+            "2 media attachment(s) not delivered to slack (live adapter confirmation timed out)",
+        )
+        for error in landed:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as d:
+                self._store(d, error, "2025-10-23T11:47:10+00:00")
+                self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
+        for error in ("chat relay unreachable: connection refused",
+                      "composed but not delivered to slack; delivered without thread_id"):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as d:
+                self._store(d, error, "2025-10-23T11:47:10+00:00")
+                self.assertTrue(kbh.last_post_undelivered(Path(d), said_at, env={}))
+
     def test_an_unwritable_record_does_not_raise(self):
         with tempfile.TemporaryDirectory() as d:
             blocker = Path(d) / "file"
