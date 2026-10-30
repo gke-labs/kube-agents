@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
 import json
 import logging
 import os
@@ -41,6 +42,11 @@ REGISTRY_MODULE = "gateway.platform_registry"
 #: Prefix of every error the relayed sender returns. Upstream's own, so a
 #: failure reads the same in the session server's log whichever sender ran.
 STANDALONE_ERROR_PREFIX = "Google Chat standalone send"
+
+#: Where Hermes keeps ``send_error``, the standalone senders' error envelope,
+#: which runs the text through its secret redactor before it reaches the model
+#: transcript. Imported lazily: the module pulls in Hermes' ``agent`` package.
+SEND_ERROR_MODULE = "gateway.platforms._shared"
 
 #: ``messages.create``'s option for a post into an existing thread. Without it
 #: the API ignores ``thread.name`` and starts a new thread; FALLBACK rather than
@@ -240,6 +246,21 @@ def _inline_chunks(text: str, *, fenced: bool) -> list[str]:
             head, remaining = remaining[:cut], remaining[cut:].lstrip("\n")
         chunks.append(f"```\n{head}\n```" if fenced else head)
     return chunks
+
+
+def standalone_error(text: str) -> dict[str, Any]:
+    """An error result for the relayed standalone sender, redacted as upstream's are.
+
+    Upstream's senders return ``send_error(...)``; so does this one, wherever
+    Hermes is importable. Without it (these modules' unit tests) the text goes
+    back as given, which carries nothing secret: the relay's own status line, a
+    URLError, a JSON error.
+    """
+    try:
+        send_error = importlib.import_module(SEND_ERROR_MODULE).send_error
+    except Exception:
+        return {"error": text}
+    return send_error(text)
 
 
 def relay_failure_detail(exc: urllib.error.HTTPError) -> str:
@@ -602,7 +623,7 @@ def install() -> None:
             )
             return {"success": True, "platform": PLATFORM_NAME, "skipped": "empty_text"}
         if not chat_id:
-            return {"error": f"{STANDALONE_ERROR_PREFIX}: chat_id (space resource) is required"}
+            return standalone_error(f"{STANDALONE_ERROR_PREFIX}: chat_id (space resource) is required")
         body: dict[str, Any] = {"text": message}
         arguments: dict[str, Any] = {"parent": str(chat_id), "body": body}
         if thread_id:
@@ -616,9 +637,9 @@ def install() -> None:
             operation = RemoteResource().spaces().messages().create(**arguments)
             response = await asyncio.to_thread(operation.execute)
         except urllib.error.HTTPError as exc:
-            return {"error": f"{STANDALONE_ERROR_PREFIX}: {relay_failure_detail(exc)}"}
+            return standalone_error(f"{STANDALONE_ERROR_PREFIX}: {relay_failure_detail(exc)}")
         except Exception as exc:
-            return {"error": f"{STANDALONE_ERROR_PREFIX} failed: {exc}"}
+            return standalone_error(f"{STANDALONE_ERROR_PREFIX} failed: {exc}")
         name = response.get("name") if isinstance(response, dict) else None
         return {"success": True, "message_id": name}
 

@@ -677,6 +677,22 @@ class StandaloneRelaySendTest(unittest.TestCase):
         self.assertTrue(result.get("success"))
         self.assertEqual(1, len(captured))
 
+    def test_a_local_service_account_does_not_keep_the_token_minting_sender(self):
+        # Unlike Slack's: the relayed in-process adapter already ignores a
+        # service-account JSON once the relay is configured, and the two paths
+        # posting under different identities would be worse than either.
+        captured, patched = self._relay([{"name": "spaces/AAA/messages/abc.abc"}])
+        pconfig = types.SimpleNamespace(extra={"service_account_json": '{"type": "service_account"}'})
+        # Set from install through send, so neither the swap nor the send can defer to it.
+        with patched, mock.patch.dict(os.environ, {"GOOGLE_CHAT_SERVICE_ACCOUNT_JSON": '{"type": "service_account"}'}):
+            self.patch.install()
+            entry = self._register()
+            self.assertIsNot(entry.standalone_sender_fn, self.original_standalone_send)
+            result = asyncio.run(entry.standalone_sender_fn(pconfig, "spaces/AAA", "alert"))
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual([], self.original_calls, "the token-minting sender must not run")
+        self.assertEqual([RELAY_URL + "/v1/chat/api"], [url for url, _ in captured])
+
     def test_the_alert_is_posted_through_the_relay(self):
         self.patch.install()
         entry = self._register()
@@ -790,6 +806,19 @@ class StandaloneRelaySendTest(unittest.TestCase):
         self.assertTrue(
             result["error"].startswith("Google Chat standalone send failed:"), result
         )
+
+    def test_an_error_goes_through_hermes_redactor_when_it_is_there(self):
+        # Upstream's senders return send_error(...), which redacts secrets
+        # before the text reaches the model transcript; so must this one.
+        self.patch.install()
+        entry = self._register()
+        shared = types.ModuleType("gateway.platforms._shared")
+        shared.send_error = lambda text: {"error": text.replace("hunter2", "***")}
+        stubs = {"gateway.platforms": types.ModuleType("gateway.platforms"), "gateway.platforms._shared": shared}
+        _, patched = self._relay([urllib.error.URLError("refused, token=hunter2")])
+        with patched, mock.patch.dict(sys.modules, stubs):
+            result = self._send(entry)
+        self.assertEqual({"error": "Google Chat standalone send failed: <urlopen error refused, token=***>"}, result)
 
     def test_a_missing_space_is_refused_before_the_relay(self):
         self.patch.install()
