@@ -28,6 +28,8 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona/render"
 )
 
 // ProfileWorkerConfig is what a profile worker needs beyond Config, which
@@ -45,6 +47,17 @@ type ProfileWorkerConfig struct {
 	// the dispatcher, which offers only to Ready pods, never offers into a
 	// worker that isn't listening yet. Empty disables the listener.
 	ReadyAddr string
+	// PersonaDir is the profile's persona, mounted read-only (/persona,
+	// #3662). It is loaded once, at start, and rendered for the harness into
+	// a fresh CLAUDE_CONFIG_DIR under ConfigRoot for each task, so nothing a
+	// task leaves in its config reaches the next. Empty runs the harness as
+	// configured, which only tests do.
+	PersonaDir string
+	// Harness is the persona adapter to render with (persona.ClaudeCode).
+	Harness persona.Harness
+	// ConfigRoot is where each task's config directory is made (the pod's
+	// scratch).
+	ConfigRoot string
 	// TaskTokenFile is where the confirm's proxy token is written for the
 	// task's lifetime (CREDENTIAL_PROXY_TASK_TOKEN_FILE, a tmpfs emptyDir),
 	// for the kubectl and gcloud shims to send to the broker. Empty skips it.
@@ -90,6 +103,11 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 	defer closeBus()
 
 	w := &profileWorker{cfg: cfg, pw: pw, b: b, msgs: make(chan *nats.Msg, 16)}
+	if pw.PersonaDir != "" {
+		if w.persona, err = renderPersona(pw); err != nil {
+			return err
+		}
+	}
 	sub, err := b.nc.ChanSubscribe(lib.DispatchSubject(cfg.Profile, pw.Tier, cfg.PodName), w.msgs)
 	if err != nil {
 		return fmt.Errorf("subscribe to the dispatch subject: %w", err)
@@ -120,6 +138,45 @@ type profileWorker struct {
 	b     *busConns
 	msgs  chan *nats.Msg
 	ready atomic.Bool
+	// persona is the persona as rendered for the harness, or nil.
+	persona *persona.Output
+}
+
+// renderPersona loads the profile's persona and renders it for the harness.
+// It runs once: the persona is the image's and doesn't change under a
+// running pod, and a persona that doesn't load stops the worker before it
+// takes a task.
+func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
+	adapter, err := render.For(pw.Harness)
+	if err != nil {
+		return nil, err
+	}
+	p, err := persona.Load(pw.PersonaDir)
+	if err != nil {
+		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
+	}
+	out, err := adapter.Render(p, persona.Target{})
+	if err != nil {
+		return nil, fmt.Errorf("rendering the persona: %w", err)
+	}
+	if err := render.CheckOutput(out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// taskConfigDir writes the rendered persona into a fresh config directory
+// for one task and returns it, with what removes it.
+func (w *profileWorker) taskConfigDir(task string) (string, func(), error) {
+	dir, err := os.MkdirTemp(w.pw.ConfigRoot, "config-"+task+"-")
+	if err != nil {
+		return "", nil, err
+	}
+	if err := render.WriteFiles(dir, w.persona.Files); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, err
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
 }
 
 // held is the task the worker has accepted: pending until the confirm, then
@@ -315,6 +372,8 @@ type confirmCredentials struct {
 func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	cfg := w.cfg
 	cfg.TaskID = h.offer.TaskID
+	// A copy: this task's additions must not land in the worker's slice.
+	cfg.HarnessEnv = append([]string(nil), w.cfg.HarnessEnv...)
 	h.done = make(chan turnOutcome, 1)
 	bus, closeTaskBus := w.b, func() {}
 	if h.creds.TaskCredential != "" {
@@ -330,17 +389,34 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		}
 		bus, closeTaskBus = tb, closeTB
 	}
+	removeConfig := func() {}
+	if w.persona != nil {
+		dir, remove, err := w.taskConfigDir(cfg.TaskID)
+		if err != nil {
+			closeTaskBus()
+			w.cfg.Logger.Error("could not write the task's persona config; not running the task", "task", cfg.TaskID, "err", err)
+			h.done <- turnOutcome{err: err}
+			return h.done
+		}
+		removeConfig = remove
+		// The persona's flags (its tool allowlist and denylist, MCP and
+		// setting sources) after the base argv, which carries none.
+		cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
+		cfg.HarnessCommandNoDelegate = nil
+		cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
+	}
 	removeToken := w.writeTaskToken(h.creds.ProxyToken)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin
-	cfg.HarnessEnv = append(append([]string(nil), cfg.HarnessEnv...), taskParameterEnv(h.origin, cfg.Logger)...)
+	cfg.HarnessEnv = append(cfg.HarnessEnv, taskParameterEnv(h.origin, cfg.Logger)...)
 	a := newTaskAdapter(cfg, bus)
 	a.dispatched = true
 	a.abandon = h.abandon
 	go func() {
 		defer closeTaskBus()
 		defer removeToken()
+		defer removeConfig()
 		// Follow-ups and cancels arrive on the task's own .in; the
 		// submission isn't there (it's on PROFILE_SUBMITS), so the reader
 		// opens at the subject's start.

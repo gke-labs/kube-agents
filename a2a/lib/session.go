@@ -69,6 +69,10 @@ const (
 	// EnvProfileWorkerOneShot ends a profile worker after its first task: a
 	// Job's pod. Literal "1" or "true" is on.
 	EnvProfileWorkerOneShot = "PROFILE_WORKER_ONE_SHOT"
+	// EnvProfileHarness names the persona adapter a profile worker renders
+	// its persona with (persona.ClaudeCode is the default and, for now, the
+	// only one written).
+	EnvProfileHarness = "PROFILE_HARNESS"
 	// EnvPrimerFile names the file the spawner mounts the conversation's
 	// transcript primer at (the pod's rehydration-primer annotation, through
 	// the downward API). A pod spawned cold for a conversation that already
@@ -123,3 +127,7 @@ func SessionConsumerName(session, role string) string {
 // /readyz and /healthz on. The operator's readiness probe names it, so the
 // two ends share this number.
 const ProfileWorkerStatusPort = 8080
+
+// ProfilePersonaDir is where a profile pod mounts its persona, read-only
+// (#3662). The operator's profilepod.PersonaMountPath is the same path.
+const ProfilePersonaDir = "/persona"

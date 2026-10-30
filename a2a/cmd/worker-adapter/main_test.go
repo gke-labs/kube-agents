@@ -596,3 +596,21 @@ func TestASessionWithNoClusterViewIsToldNotToSearchThePod(t *testing.T) {
 		t.Errorf("an AgentProfile's pod was told it has no cluster access: prompt = %q", p)
 	}
 }
+
+// A profile worker's base argv carries no tool, MCP or settings flags: the
+// persona's rendering supplies those for each task, and a second allowlist
+// here would leave the harness to choose between two.
+func TestAProfileWorkersBaseArgvLeavesToolsToThePersona(t *testing.T) {
+	t.Setenv("A2A_HARNESS_CMD", "")
+	argv := strings.Join(profileHarnessCommand(), " ")
+	for _, flag := range []string{"--allowedTools", "--disallowedTools", "--mcp-config", "--strict-mcp-config", "--setting-sources", "--append-system-prompt"} {
+		if strings.Contains(argv, flag) {
+			t.Errorf("the profile base argv carries %s: %s", flag, argv)
+		}
+	}
+	for _, want := range []string{"--print", "--output-format stream-json", "--input-format stream-json", "--model", "--max-turns"} {
+		if !strings.Contains(argv, want) {
+			t.Errorf("the profile base argv lacks %s: %s", want, argv)
+		}
+	}
+}

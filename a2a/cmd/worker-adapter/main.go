@@ -46,6 +46,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	workeradapter "github.com/gke-labs/kube-agents/a2a/worker-adapter"
 )
 
@@ -182,10 +183,20 @@ func run() int {
 
 	if os.Getenv(lib.EnvProfileWorker) == "true" {
 		oneShot := os.Getenv(lib.EnvProfileWorkerOneShot)
+		harness := persona.Harness(os.Getenv(lib.EnvProfileHarness))
+		if harness == "" {
+			harness = persona.ClaudeCode
+		}
+		// The persona supplies the tool flags, so the base argv carries none.
+		cfg.HarnessCommand = profileHarnessCommand()
+		cfg.HarnessCommandNoDelegate = nil
 		pw := workeradapter.ProfileWorkerConfig{
-			Tier:      os.Getenv(lib.EnvProfileTier),
-			OneShot:   oneShot == "1" || oneShot == "true",
-			ReadyAddr: fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
+			Tier:       os.Getenv(lib.EnvProfileTier),
+			OneShot:    oneShot == "1" || oneShot == "true",
+			ReadyAddr:  fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
+			PersonaDir: lib.ProfilePersonaDir,
+			Harness:    harness,
+			ConfigRoot: workdir,
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 		}
@@ -422,6 +433,43 @@ func harnessCommand() []string {
 	}
 	if len(prompts) > 0 {
 		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))
+	}
+	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
+		argv = append(argv, strings.Fields(extra)...)
+	}
+	return argv
+}
+
+// profileHarnessCommand is a profile worker's base argv: the harness over the
+// headless stream-json contract, the model and the turn budget, and no tool,
+// MCP or settings flags. The worker appends the persona's rendering of those
+// for each task (worker-adapter/profile.go), and a second copy here would
+// leave the harness to pick between two allowlists. A2A_HARNESS_CMD still
+// overrides it whole, for tests.
+func profileHarnessCommand() []string {
+	if cmd := os.Getenv("A2A_HARNESS_CMD"); cmd != "" {
+		return strings.Fields(cmd)
+	}
+	path := os.Getenv("A2A_HARNESS_PATH")
+	if path == "" {
+		path = workeradapter.DefaultHarnessPath
+	}
+	model := os.Getenv("A2A_MODEL")
+	if model == "" {
+		model = defaultModel
+	}
+	maxTurns := os.Getenv("A2A_MAX_TURNS")
+	if maxTurns == "" {
+		maxTurns = defaultMaxTurns
+	}
+	argv := []string{
+		path,
+		"--print",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--model", model,
+		"--max-turns", maxTurns,
 	}
 	if extra := os.Getenv("A2A_HARNESS_EXTRA_ARGS"); extra != "" {
 		argv = append(argv, strings.Fields(extra)...)

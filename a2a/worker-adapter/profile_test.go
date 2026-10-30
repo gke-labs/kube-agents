@@ -17,6 +17,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 )
 
 const (
@@ -470,5 +471,61 @@ func TestARefusedTaskConnectionRunsNothing(t *testing.T) {
 	}
 	if evs := replayEvents(t, url, pwProfile, task); len(evs) != 0 {
 		t.Errorf("%d events for a task whose task connection was refused", len(evs))
+	}
+}
+
+// The persona is rendered into a fresh CLAUDE_CONFIG_DIR for the task, its
+// flags follow the base argv, and the directory is gone when the task ends.
+func TestTheWorkerRunsEachTaskWithItsPersonaRendered(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+read first || exit 1
+md=no; [ -f "$CLAUDE_CONFIG_DIR/CLAUDE.md" ] && md=yes
+flags=no; case " $* " in *" --allowedTools "*) flags=yes ;; esac
+echo "$CLAUDE_CONFIG_DIR" > "$(dirname "$CLAUDE_CONFIG_DIR")/seen-dir"
+printf '{"type":"result","subtype":"success","result":"md=%s flags=%s"}\n' "$md" "$flags"
+`)
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := profileWorkerConfig(t, url, harness)
+	addr := freeAddr(t)
+	go func() {
+		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
+			Tier: pwTier, ReadyAddr: addr, deadlineMargin: time.Second,
+			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: root,
+		})
+	}()
+	waitReady(t, addr)
+
+	const task = "task-persona"
+	d.offer(task, profileSubmission(t, task, "do the thing", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	if _, final := drainLeases(d, task, 20*time.Second); !final {
+		t.Fatal("no final renewal")
+	}
+	if got := artifactText(foldTask(t, testClient(t, url), pwProfile, task), lib.ArtifactResult); got != "md=yes flags=yes" {
+		t.Errorf("the harness saw %q, want the persona's CLAUDE.md and its tool flags", got)
+	}
+	seen, err := os.ReadFile(filepath.Join(root, "seen-dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(strings.TrimSpace(string(seen))); !os.IsNotExist(err) {
+		t.Errorf("the task's config directory outlived the task: %v", err)
+	}
+}
+
+// A persona that doesn't load stops the worker before it takes a task.
+func TestABrokenPersonaStopsTheWorker(t *testing.T) {
+	url := startServer(t)
+	cfg := profileWorkerConfig(t, url, stub(t, "exit 0"))
+	err := RunProfileWorker(context.Background(), cfg, ProfileWorkerConfig{
+		Tier: pwTier, PersonaDir: t.TempDir(), Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "persona") {
+		t.Errorf("a worker with an empty persona dir = %v, want refused at start", err)
 	}
 }

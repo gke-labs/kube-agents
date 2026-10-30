@@ -17,17 +17,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/render"
-)
-
-const (
-	dirMode  = 0o755
-	fileMode = 0o644
-	execMode = 0o755
 )
 
 func main() {
@@ -126,8 +119,8 @@ func renderCmd(args []string, stdout, stderr io.Writer) error {
 	if err := render.CheckOutput(output); err != nil {
 		return err
 	}
-	if err := write(*out, output.Files); err != nil {
-		return err
+	if err := render.WriteFiles(*out, output.Files); err != nil {
+		return fmt.Errorf("--out %w", err)
 	}
 	for _, w := range output.Warnings {
 		fmt.Fprintln(stderr, "warning:", w)
@@ -135,29 +128,4 @@ func renderCmd(args []string, stdout, stderr io.Writer) error {
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(result{Args: output.Args, Model: output.Model, Warnings: append([]string{}, output.Warnings...)})
-}
-
-// write puts files under out. It refuses a non-empty out: a stale file from
-// an earlier render would load as part of this one.
-func write(out string, files []persona.File) error {
-	if entries, err := os.ReadDir(out); err == nil && len(entries) > 0 {
-		return fmt.Errorf("--out %s is not empty", out)
-	}
-	if err := os.MkdirAll(out, dirMode); err != nil {
-		return err
-	}
-	for _, f := range files {
-		full := filepath.Join(out, filepath.FromSlash(f.Path))
-		if err := os.MkdirAll(filepath.Dir(full), dirMode); err != nil {
-			return err
-		}
-		mode := os.FileMode(fileMode)
-		if f.Executable {
-			mode = execMode
-		}
-		if err := os.WriteFile(full, f.Data, mode); err != nil {
-			return err
-		}
-	}
-	return nil
 }
