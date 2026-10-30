@@ -354,23 +354,18 @@ def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | Non
         (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
 
 
-def _validator_module():
-    """scripts/validate_bench_cases.py, loaded by path: it is a script, not a package."""
+def _parked_cases() -> set[str]:
+    """The validator's FIXTURE_NOT_READY set, loaded by path. A parked case's table
+    rows, dedicated tests and construction test drop out with its roster line:
+    the fleet README's exit for a retired role parks the cases that name it, and
+    their fleet directory could record no slot for a role the catalogue lacks."""
     import importlib.util
 
     validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
     spec = importlib.util.spec_from_file_location("validate_bench_cases_for_verifier_tests", validator)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
-
-
-def _parked_cases() -> set[str]:
-    """The validator's FIXTURE_NOT_READY set, loaded by path. A parked case's table
-    rows, dedicated tests and construction test drop out with its roster line:
-    the fleet README's exit for a retired role parks the cases that name it, and
-    their fleet directory could record no slot for a role the catalogue lacks."""
-    return set(_validator_module().FIXTURE_NOT_READY)
+    return set(module.FIXTURE_NOT_READY)
 
 
 def _live(table: dict) -> dict:
@@ -10031,45 +10026,3 @@ def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
     res = _state_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert res.raw["comments_since_start"] == 2
-
-
-def test_issue_state_validator_refuses_nothing_the_model_accepts():
-    # Two copies of one rule: the model's fires at spec load, after the cluster
-    # lease; the validator's fires in a second. The validator may let a shape
-    # through that the model later refuses (the documented gap), never the
-    # reverse: that would block a case the harness runs.
-    validator = _validator_module()
-
-    def validator_accepts(shape: dict) -> bool:
-        problems: list[str] = []
-        validator._check_assertions({"type": "forge_issue_state", **shape}, "check", problems)
-        return not any(validator.UNBOUND_ISSUE_STATE_REASON in p for p in problems)
-
-    both_accept = [
-        {"state": "closed"},
-        {"state": "open", "min_comments": 1},
-        {"state": "open", "min_comments": "2"},
-        {"state": "open", "min_comments": 1.0},
-        {"state": "open", "min_comments": True},
-    ]
-    for shape in both_accept:
-        verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
-        assert validator_accepts(shape), shape
-    both_refuse = [
-        {"labels": ["status:resolved"]},
-        {"state": "open"},
-        {"state": "open", "min_comments": 0},
-        {"state": "open", "min_comments": "0"},
-        {"state": "open", "min_comments": False},
-        {},
-    ]
-    for shape in both_refuse:
-        with pytest.raises(ValidationError, match="bind the issue to this run"):
-            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
-        assert not validator_accepts(shape), shape
-    # Spellings only the harness can judge: the validator lets them through
-    # and the model's type check, not the binding rule, refuses them.
-    for shape in ({"state": "open", "min_comments": "abc"}, {"state": "open", "min_comments": "yes"}):
-        with pytest.raises(ValidationError, match="int_parsing"):
-            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
-        assert validator_accepts(shape), shape

@@ -2271,8 +2271,9 @@ def _gitlab_path_key(value: str) -> str:
 
     Surrounding slashes off, as `GitHubWritesVerifier` takes them off the
     same variable on GitLab -- a path copied out of a URL often keeps one --
-    and case folded, because GitLab paths compare that way. Only GitLab's
-    callers use it; GitHub reads its repository exactly as given.
+    and case folded, because GitLab paths compare that way, and GitHub's
+    owner/name pairs compare case-insensitively too, so the repository
+    binding of ``forge_issue_state`` uses it on both forges.
     """
     return value.strip().strip("/").lower()
 
@@ -4583,7 +4584,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
         rejected: list[str] = []
         for repo, number in seen:
             slug = f"{repo}#{number}"
-            if repo.strip("/").lower() != gitops_repo.lower():
+            if _gitlab_path_key(repo) != _gitlab_path_key(gitops_repo):
                 rejected.append(
                     f"{slug}: not in the GitOps repository this job grades ({gitops_repo})"
                 )

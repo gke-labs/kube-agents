@@ -571,7 +571,7 @@ that is not a bare YAML boolean, a `resource_property` or `fleet_resource_proper
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
-descent or a script expression is not judged), a `forge_issue_state` check that sets neither `state: closed` nor `min_comments` of at least 1 (nothing then binds the issue it reads to the run), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -643,11 +643,7 @@ The gap is deliberate rather than pending. `make bench-case-check` depends on Py
 so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what
 makes it cheap enough to run on every edit. Importing devops-bench to close these three
 would trade that for a second copy of a schema that already exists. Note the divergence
-when writing a case; do not add the dependency. One model rule is copied here on purpose,
-`forge_issue_state`'s binding rule, because the shape it refuses would otherwise cost a cluster
-lease to discover. The copy refuses only the shapes that bind nothing on any reading, and a
-bench test checks it refuses nothing the harness accepts; a spelling the harness refuses, such
-as a YAML 1.1 `yes` for the count, still passes here.
+when writing a case; do not add the dependency.
 
 ## Changing the format
 

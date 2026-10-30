@@ -548,8 +548,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
-    # No field: the binding rule (`state: closed` or `min_comments` >= 1) is a
-    # clause of its own in _check_assertions, and it is what can fail.
+    # No field: the verifier's own model refuses a spec that binds nothing
+    # (`state: closed` or `min_comments` >= 1 is required), and
+    # bench/tests/test_lane.py parses every shipped case through devops-bench
+    # on every pull request, so an unbound spec never reaches a lease.
     "forge_issue_state": (),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
@@ -654,12 +656,6 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
-# The one run-reading type with a binding rule of its own, below.
-FORGE_ISSUE_STATE_TYPE = "forge_issue_state"
-ISSUE_STATE_CLOSED = "closed"
-UNBOUND_ISSUE_STATE_REASON = "nothing binds the issue it reads to this run"
-# A count written as digits, in the ASCII the harness's loader hands pydantic.
-WHOLE_NUMBER = re.compile(r"[+-]?[0-9]+")
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
 #: booleans; "" is the object root. The rule fires on a pair in this table
 #: and on nothing else, so a string field that shares a name with a boolean
@@ -712,32 +708,6 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 # case's turn too, since the nightly runs every case against one install.
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
-
-
-def _claims_comments(value: Any) -> bool:
-    """Whether ``min_comments`` asks for at least one comment.
-
-    Lenient on purpose: a number below one, an absent value and a digit string
-    that reads as zero are the shapes that bind nothing. Anything else, a
-    spelling the harness's YAML 1.2 loader and pydantic may still refuse
-    included, is left to the harness: this validator must never refuse a case
-    the harness accepts, and the reverse is the documented gap.
-    """
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value >= 1
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return False
-        if WHOLE_NUMBER.fullmatch(text):
-            # No int(): a digit string past Python's conversion limit would
-            # raise here instead of being reported. A non-zero digit is enough.
-            return not text.startswith("-") and any(ch != "0" for ch in text.lstrip("+-"))
-    return True
 
 
 def _populated(value: Any) -> bool:
@@ -1096,23 +1066,6 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
         problems.append(
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
-        )
-
-    # forge_issue_state binds the issue to the run through the close or the
-    # comments posted inside it; `labels` alone, or `state: open` alone, would
-    # pass on an issue an earlier run left behind. The verifier's own model
-    # applies the same rule, but only at spec load, after the cluster lease.
-    # This copy refuses only the shapes that bind nothing on any reading;
-    # bench/tests/test_verifiers.py checks it refuses nothing the model accepts.
-    if (
-        node_type == FORGE_ISSUE_STATE_TYPE
-        and node.get("state") != ISSUE_STATE_CLOSED
-        and not _claims_comments(node.get("min_comments"))
-    ):
-        problems.append(
-            f"{where}: check '{node_type}' sets neither state: {ISSUE_STATE_CLOSED} nor "
-            f"min_comments of at least 1, so {UNBOUND_ISSUE_STATE_REASON} and it would "
-            "pass on an issue an earlier run left behind"
         )
 
     # A quoted boolean against a boolean field never compares equal: the
