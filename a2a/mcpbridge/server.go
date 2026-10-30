@@ -1099,10 +1099,13 @@ func (s *Server) handleDiscoverDeployments(ctx context.Context, rawArgs json.Raw
 		_ = json.Unmarshal(rawArgs, &args)
 	}
 	discovered, discErr := s.cluster.DiscoverDeployments(ctx, args.KubeContext)
-	if len(discovered) > 0 && s.store != nil {
-		if strings.TrimSpace(args.KubeContext) == "" {
+	if s.store != nil {
+		switch {
+		case strings.TrimSpace(args.KubeContext) == "" && (discErr == nil || len(discovered) > 0):
+			// A clean full scan that found nothing (no contexts, or no installs left) still
+			// prunes; unreachable contexts come back as probe failures and keep their profiles.
 			_ = s.store.SyncDiscoveredDeployments(discovered)
-		} else {
+		case len(discovered) > 0:
 			_ = s.store.UpsertDeployments(discovered)
 		}
 	}

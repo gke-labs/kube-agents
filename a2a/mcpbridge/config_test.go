@@ -398,3 +398,31 @@ func TestSelectDeploymentRefusesAnAmbiguousSelector(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoverDeploymentsEmptyFullScanPrunesSavedProfiles(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertDeployments([]DeploymentProfile{
+		{Name: "gone", KubeContext: "ctx-gone", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+		{Name: "direct", DirectMCPURL: "https://mcp.example.com", Ready: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(ServerOptions{Store: store, Cluster: failingClusterAccess{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	if res := srv.CallTool(context.Background(), ToolDiscoverDeployments, json.RawMessage(`{}`)); res.IsError {
+		t.Fatalf("discover_deployments: %+v", res)
+	}
+	snap := store.Snapshot()
+	if _, ok := snap.Deployments["gone"]; ok {
+		t.Fatal("a clean full scan that found no installs kept the old kube profile")
+	}
+	if _, ok := snap.Deployments["direct"]; !ok {
+		t.Fatal("the scan removed a direct-URL profile")
+	}
+}
