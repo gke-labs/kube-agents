@@ -1760,6 +1760,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # kanban-scheduling stage's edits to the same file.
 # See the module docstring in deploy/docker/patches/kanban_fanout_reaper.py.
 #
+# kanban_worker_toolsets: the dispatcher resolves each worker's toolset pin in a
+# short-lived child process instead of inside the gateway. Done in the gateway,
+# each profile got a plugin manager the process kept forever, with that profile's
+# plugins registered there (hermes_otel's span and metric threads among them):
+# about 2.9 MiB and two threads per profile ever dispatched to (#3937). The
+# result is cached per profile while its config, .env, plugins and the managed
+# scope are unchanged. Its verifier needs a real profile layout, so it runs in
+# the hermes-otel step below, against a copy of /opt/defaults.
+# See the module docstring in deploy/docker/patches/kanban_worker_toolsets.py.
+#
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
 # record, the `queued` events) is in the kanban-scheduling stage above, which
@@ -1853,6 +1863,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_fanout_reaper.py \
      deploy/docker/patches/apply_kanban_fanout_reaper.py \
      deploy/docker/patches/verify_kanban_fanout_reaper.py \
+     deploy/docker/patches/kanban_worker_toolsets.py \
+     deploy/docker/patches/apply_kanban_worker_toolsets.py \
+     deploy/docker/patches/verify_kanban_worker_toolsets.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
@@ -1940,6 +1953,10 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     cp /tmp/latency-patches/kanban_fanout_reaper.py /opt/hermes/tools/kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_fanout_reaper.py /opt/hermes && \
     grep -qF '_kanban_reap_overdue_fanout(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    cp /tmp/latency-patches/kanban_worker_toolsets.py /opt/hermes/tools/kanban_worker_toolsets.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_worker_toolsets.py /opt/hermes && \
+    grep -qF '_kanban_worker_toolsets.resolve_worker_toolsets(hermes_home)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    cp /tmp/latency-patches/verify_kanban_worker_toolsets.py /tmp/verify_kanban_worker_toolsets.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -2052,7 +2069,9 @@ COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 ARG HERMES_OTEL_REF=b7ece46a5c883a619686b6c698b0316d9fd50962
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install --ref "${HERMES_OTEL_REF}" briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
-    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
+    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))" && \
+    /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_worker_toolsets.py /opt/defaults && \
+    rm -f /tmp/verify_kanban_worker_toolsets.py
 
 # The two files that name the speaking profile to the shell sandbox on every
 # connection Hermes' backend opens: the ssh client drop-in, and the wrapper that
