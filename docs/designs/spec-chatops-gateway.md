@@ -1588,24 +1588,17 @@ one platform is ever routed.
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
-record's name as `A2A_HOME_CHANNEL_RECORD`, the gateway's own image as `A2A_SELF_IMAGE` and the switch
-that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway. The
-operator reads the record once per reconcile and projects the home channel it stands behind, "the CR,
-else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key `slack_home`
-always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
-in the agent pod at `/etc/kube-agents/chat-home` and in the gateway pod at `/etc/a2a/chat-home`; the
-kubelet refreshes the file in place within about a minute, so a learned channel reaches both pods with
-no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
-The agent's env carries the CR field only, as any CR edit does. The operator admits a recorded channel
-only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
-stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks
-neither before a post. The projection joins the stack's teardown list, and a hand edit of it is
-rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
+record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. In this
+release the agent's env and the `HomeChannelUnset` condition follow `homeChannel` alone. The change
+that makes the operator render the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the
+CR, else the record" and the switch that arms the gateway's learn ship as one, so no release holds a
+signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
 that change merges after the gateway code, never before it. The gateway keeps no copy of the home
-channel. The operator projects the home channel it admitted (the CR field, else the record) into a
-ConfigMap it mounts as a directory in the gateway pod, `/etc/a2a/chat-home`, with one file,
-`slack_home`; the notify route reads that file once per request, in `validate`, and the request posts
+channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
+operator admits (the CR field, else the record), which the operator change that admits the record
+mounts as a directory in the gateway pod; the notify route reads that file once per request, in
+`validate`, and the request posts
 into the channel it read, so a projection that changes while a report posts does not split the report
 across two channels; a value that is not a channel id reads as empty until the operator rewrites it,
 and a directory that is not mounted (an operator older than the projection) reads as absent: no home

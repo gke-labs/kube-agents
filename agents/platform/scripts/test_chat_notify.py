@@ -46,7 +46,6 @@ class HomeFileTest(unittest.TestCase):
     def test_a_projected_channel_routes_slack_and_names_the_home(self):
         self._write("C0FILE\n")
         self.assertEqual(chat_notify.home_file_value(), "C0FILE")
-        self.assertEqual(chat_notify.slack_home_channel(), "C0FILE")
         self.assertEqual(chat_notify.routed_platform(), "slack")
         self.assertTrue(chat_notify.routes("slack"))
 
@@ -54,7 +53,6 @@ class HomeFileTest(unittest.TestCase):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {chat_notify.SLACK_HOME_CHANNEL_ENV: "C0ENV",
                                           chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
-            self.assertEqual(chat_notify.slack_home_channel(), "C0ENV")
             self.assertEqual(chat_notify.routed_platform(), "google_chat")
 
     def test_an_empty_or_absent_file_routes_nothing(self):
@@ -77,11 +75,17 @@ class HomeFileTest(unittest.TestCase):
 
     def test_the_file_is_read_on_every_call(self):
         self._write("C0ONE\n")
-        self.assertEqual(chat_notify.slack_home_channel(), "C0ONE")
+        self.assertEqual(chat_notify.home_file_value(), "C0ONE")
         self._write("C0TWO\n")
-        self.assertEqual(chat_notify.slack_home_channel(), "C0TWO")
+        self.assertEqual(chat_notify.home_file_value(), "C0TWO")
         os.unlink(os.path.join(self.dir, chat_notify.HOME_FILE_KEY))
-        self.assertEqual(chat_notify.slack_home_channel(), "")
+        self.assertEqual(chat_notify.home_file_value(), "")
+
+    def test_a_file_that_is_not_text_reads_as_nothing(self):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "wb") as handle:
+            handle.write(b"\xff\xfe\x00C0")
+        self.assertEqual(chat_notify.home_file(), ("", True))
+        self.assertEqual(chat_notify.routed_platform(), "")
 
     def test_a_missing_directory_reads_as_nothing(self):
         with mock.patch.dict(os.environ, {chat_notify.HOME_FILE_DIR_ENV: os.path.join(self.dir, "absent")}):

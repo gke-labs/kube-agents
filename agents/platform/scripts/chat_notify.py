@@ -125,7 +125,11 @@ def home_file() -> tuple[str, bool]:
     directory = os.environ.get(HOME_FILE_DIR_ENV, HOME_FILE_DIR)
     try:
         with open(os.path.join(directory, HOME_FILE_KEY), encoding="utf-8") as handle:
-            return handle.read().strip(), True
+            try:
+                return handle.read().strip(), True
+            except ValueError:
+                # Not text: mounted, but no channel to read, as the gateway reads it.
+                return "", True
     except OSError:
         return "", False
 
@@ -133,11 +137,6 @@ def home_file() -> tuple[str, bool]:
 def home_file_value() -> str:
     """The Slack home channel the operator projected into the pod, or "" when none."""
     return home_file()[0]
-
-
-def slack_home_channel() -> str:
-    """Slack's home channel: the rendered env when set, else the projected file."""
-    return os.environ.get(SLACK_HOME_CHANNEL_ENV, "").strip() or home_file_value()
 
 
 def routed_platform() -> str:

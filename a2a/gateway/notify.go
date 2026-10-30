@@ -684,7 +684,11 @@ func (n *Notifier) post(job notifyJob) {
 			message, landed, err = n.poster.PostNotify(job.home, thread, chunk)
 		}
 		if err != nil {
-			n.log.Error("notify post failed", "home", job.home, "thread", thread, "chunk", i+1, "err", err, "hint", n.homePostHint(err))
+			hint := ""
+			if job.req.Conversation == "" {
+				hint = n.homePostHint(err)
+			}
+			n.log.Error("notify post failed", "home", job.home, "thread", thread, "chunk", i+1, "err", err, "hint", hint)
 			if !answered {
 				n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
 			}

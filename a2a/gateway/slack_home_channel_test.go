@@ -168,29 +168,33 @@ func TestSlackHomeLearnsFromTheFirstChannelMention(t *testing.T) {
 
 // TestSlackHomeTheFileDecidesWhetherAMentionIsACandidate: a mention learns
 // only while the projection names no home. A file that names a channel (the
-// operator admitted one), a file holding something that is not a channel id
-// (a hand edit the operator rewrites), and a directory that is not mounted
-// (an operator older than the projection) all learn nothing, with no Slack
-// call and no write; an empty file learns.
+// operator admitted one) learns nothing from a mention elsewhere, at the cost
+// of one conversations.info on the home, which Slack still accepts; a file
+// holding something that is not a channel id (a hand edit the operator
+// rewrites) and a directory that is not mounted (an operator older than the
+// projection) learn nothing with no Slack call; none writes. An empty file
+// learns.
 func TestSlackHomeTheFileDecidesWhetherAMentionIsACandidate(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(t *testing.T, dir string)
 		learn bool
+		calls int
 	}{
-		{"the file names a channel", func(t *testing.T, dir string) { writeHomeFile(t, dir, "C0HOME\n") }, false},
-		{"the file holds something that is not a channel id", func(t *testing.T, dir string) { writeHomeFile(t, dir, "general") }, false},
-		{"the directory is not mounted", func(t *testing.T, dir string) { removeHomeDir(t, dir) }, false},
-		{"the file is empty", func(t *testing.T, dir string) { writeHomeFile(t, dir, " \n") }, true},
+		{"the file names a channel", func(t *testing.T, dir string) { writeHomeFile(t, dir, "C0HOME\n") }, false, 1},
+		{"the file holds something that is not a channel id", func(t *testing.T, dir string) { writeHomeFile(t, dir, "general") }, false, 0},
+		{"the directory is not mounted", func(t *testing.T, dir string) { removeHomeDir(t, dir) }, false, 0},
+		{"the file is empty", func(t *testing.T, dir string) { writeHomeFile(t, dir, " \n") }, true, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			a, api, cs, dir := newHomeLearnAdapter(t, nil)
+			api.conversations["C0HOME"] = homeChannelInfo("C0HOME", nil)
 			tc.setup(t, dir)
 			homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U1", "<@UBOT> hi", "15.0", "", true)
 			learned := homeRecordData(t, cs)[homeRecordKeySlack] == "C0AA1"
-			if learned != tc.learn || (api.conversationInfoCalls != 0) != tc.learn || (homePatches(cs) != 0) != tc.learn {
-				t.Errorf("learned %v, conversations.info %d, patches %d; want learn=%v", learned, api.conversationInfoCalls, homePatches(cs), tc.learn)
+			if learned != tc.learn || api.conversationInfoCalls != tc.calls || (homePatches(cs) != 0) != tc.learn {
+				t.Errorf("learned %v, conversations.info %d, patches %d; want learn=%v, calls=%d", learned, api.conversationInfoCalls, homePatches(cs), tc.learn, tc.calls)
 			}
 		})
 	}
@@ -398,12 +402,13 @@ func TestSlackHomeTheWindowAfterALearnAdoptsSilently(t *testing.T) {
 	if len(api.posted) != 1 {
 		t.Errorf("posts = %+v, want the one learned line", api.posted)
 	}
-	// The projection caught up: a mention is not a candidate any more.
+	// The projection caught up: a mention elsewhere is not a candidate any
+	// more; it costs one conversations.info on the home, which still passes.
 	writeHomeFile(t, dir, "C0AA1\n")
 	calls := api.conversationInfoCalls
 	homeMention(t, a, slackChannelTypeChannel, "C0CC3", "U3", "<@UBOT> later", "72.0", "", true)
-	if api.conversationInfoCalls != calls || homePatches(cs) != 1 {
-		t.Errorf("after the file caught up: conversations.info %d (was %d), patches %d; want no call and no write", api.conversationInfoCalls, calls, homePatches(cs))
+	if api.conversationInfoCalls != calls+1 || homePatches(cs) != 1 {
+		t.Errorf("after the file caught up: conversations.info %d (was %d), patches %d; want one check of the home and no write", api.conversationInfoCalls, calls, homePatches(cs))
 	}
 }
 
@@ -478,6 +483,37 @@ func TestSlackHomeRefusedRecordIsReplacedByTheNextMention(t *testing.T) {
 	}
 	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "<#C0BB2>") || api.posted[0].thread != "111.0" {
 		t.Errorf("posts = %+v, want one line naming C0BB2 in the learning thread", api.posted)
+	}
+}
+
+// TestSlackHomeAHomeRefusedSinceTheLearnIsReplacedByTheNextMention: the file
+// names a home, Slack refuses it now (archived since it was learned), and a
+// mention in a channel that passes replaces it; the file alone never ends
+// the learn for a home Slack no longer accepts.
+func TestSlackHomeAHomeRefusedSinceTheLearnIsReplacedByTheNextMention(t *testing.T) {
+	a, api, cs, dir := newHomeLearnAdapter(t, map[string]string{
+		homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage,
+	})
+	writeHomeFile(t, dir, "C0OLD1\n")
+	api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", func(c *slack.Channel) { c.IsArchived = true })
+	homeMention(t, a, slackChannelTypeChannel, "C0NEW2", "U1", "<@UBOT> here now", "120.0", "", true)
+	data := homeRecordData(t, cs)
+	if data[homeRecordKeySlack] != "C0NEW2" || data[homeRecordKeySetBy] != "U1" {
+		t.Fatalf("record after a mention with the home archived = %v, want C0NEW2 by U1", data)
+	}
+	if _, stale := data[homeRecordKeyRefused]; stale {
+		t.Errorf("slack.refused present after the replacement: %v", data)
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "<#C0NEW2>") || api.posted[0].thread != "120.0" {
+		t.Errorf("posts = %+v, want one line naming C0NEW2 in the learning thread", api.posted)
+	}
+	// With the home still accepted, a mention elsewhere changes nothing.
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	writeHomeFile(t, dir, "C0NEW2\n")
+	before := homePatches(cs)
+	homeMention(t, a, slackChannelTypeChannel, "C0THR3", "U1", "<@UBOT> and here", "121.0", "", true)
+	if homePatches(cs) != before || len(api.posted) != 1 {
+		t.Errorf("a mention with an accepted home wrote or posted: patches %d->%d, posts %d", before, homePatches(cs), len(api.posted))
 	}
 }
 

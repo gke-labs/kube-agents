@@ -249,7 +249,7 @@ def routed_platform() -> str:
     try:
         with open(os.path.join(os.environ.get(HOME_FILE_DIR_ENV, HOME_FILE_DIR), HOME_FILE_KEY), encoding="utf-8") as handle:
             return HOME_FILE_PLATFORM if handle.read().strip() else ""
-    except OSError:
+    except (OSError, ValueError):
         return ""
 
 

@@ -96,6 +96,11 @@ class RoutedPlatformFromTheFileTest(unittest.TestCase):
         self.assertTrue(kanban_chat_notify.routes("slack"))
         self.assertIn("slack", kanban_chat_notify.served_platforms())
 
+    def test_a_file_that_is_not_text_routes_nothing(self):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "wb") as handle:
+            handle.write(b"\xff\xfe\x00C0")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
     def test_the_env_wins_and_another_platform_ignores_the_file(self):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):

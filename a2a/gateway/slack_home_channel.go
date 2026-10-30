@@ -206,11 +206,24 @@ func (s *SlackAdapter) learnHome(conversation, channelType, member string) {
 		s.log.Info("slack: home-channel file absent; nothing is learned until the operator mounts its projection", "dir", l.file.dir)
 		return
 	}
-	if home != "" {
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), homeLearnTimeout)
 	defer cancel()
+	if home != "" {
+		// A named home stays the home unless Slack refuses it now (archived
+		// since it was learned, the app removed): then this mention is a
+		// candidate, and recordHome replaces the recorded channel. The
+		// check runs once per top-level mention outside the home; a mention
+		// in the home proves it alive, and a value that is not a channel id
+		// (a hand edit of the projection) is the operator's to rewrite.
+		if channel == home || !slackIsHomeChannelID(home) {
+			return
+		}
+		refused, err := s.checkHomeChannel(ctx, home)
+		if err != nil || refused == "" {
+			return
+		}
+		s.log.Warn("slack: the home channel is refused now; this mention may replace it", "home", home, "reason", refused, "candidate", channel)
+	}
 	refused, err := s.checkHomeChannel(ctx, channel)
 	if err != nil {
 		s.log.Warn("slack: could not check the channel as a home channel; the next mention tries again", "channel", channel, "err", err)
