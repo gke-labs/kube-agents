@@ -77,6 +77,9 @@ type slackClickPayload struct {
 		ID string `json:"id"`
 	} `json:"channel"`
 	Container struct {
+		// Type is "message" for a click on a message and "view" for one
+		// on the Home tab (slack_home_pick.go).
+		Type     string `json:"type"`
 		ThreadTS string `json:"thread_ts"`
 	} `json:"container"`
 	Message struct {
@@ -99,6 +102,9 @@ type slackClickPayload struct {
 		Text     struct {
 			Text string `json:"text"`
 		} `json:"text"`
+		// SelectedConversation is a conversations_select's pick: the Home
+		// tab's channel picker (slack_home_pick.go).
+		SelectedConversation string `json:"selected_conversation"`
 	} `json:"actions"`
 	ActionTS string `json:"action_ts"`
 	// TriggerID opens a modal for the clicker (a 👎's note,
@@ -438,6 +444,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if strings.HasPrefix(action.ActionID, slackBoardActionPrefix) {
 		// A board-health row's Retry or Drop: never a turn (slack_board.go).
 		s.boardClick(p, action.ActionID, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
+	if action.ActionID == slackHomePickAction {
+		// The Home tab's channel picker: never a turn (slack_home_pick.go).
+		s.homePick(p, action.SelectedConversation)
 		return InboundMessage{}, false
 	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
