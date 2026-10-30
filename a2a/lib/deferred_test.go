@@ -243,3 +243,19 @@ func TestAFailedNakStillReleasesTheDelivery(t *testing.T) {
 		t.Fatal("a failed nak left the delivery pending")
 	}
 }
+
+// TestAFailedAckStillReleasesTheDelivery: an ack that can't reach the
+// connection stops the heartbeat and the tracking, as a failed nak does, so
+// the server redelivers the message after AckWait.
+func TestAFailedAckStillReleasesTheDelivery(t *testing.T) {
+	state := &deferredState{pending: map[*deferredDelivery]struct{}{}}
+	beatStopped := false
+	dd := &deferredDelivery{state: state, heldDelivery: &heldDelivery{c: &Client{}}, stopBeat: func() { beatStopped = true }}
+	state.pending[dd] = struct{}{}
+	if err := dd.Ack(); err == nil {
+		t.Fatal("an ack with nowhere to go reported success")
+	}
+	if !beatStopped || len(state.pending) != 0 {
+		t.Fatal("a failed ack left the delivery renewed and pending")
+	}
+}

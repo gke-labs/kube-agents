@@ -875,6 +875,17 @@ func (rec *SessionRecord) relayed(taskID string, seq uint64) bool {
 	return false
 }
 
+// keepRelayed replaces taskID's rendered sequences with seqs: once the task
+// has ended, only its last batch's can come again.
+func (rec *SessionRecord) keepRelayed(taskID string, seqs []uint64) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].RelayedSeqs = slices.Clone(seqs)
+			return
+		}
+	}
+}
+
 // markRelayed records that taskID's event at seq was rendered.
 func (rec *SessionRecord) markRelayed(taskID string, seq uint64) {
 	if seq == 0 {
