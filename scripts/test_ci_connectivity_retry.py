@@ -134,7 +134,16 @@ def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+def gateway_retry_knobs() -> str:
+    """The `readonly EVAL_LITELLM_*` declarations the section's deadline reads, lifted from the script."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    knobs = re.findall(r"^readonly EVAL_LITELLM_[A-Z_]+=.*$", src, re.MULTILINE)
+    if len(knobs) != 2:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"expected the two EVAL_LITELLM_* knobs in {DEPLOY_SCRIPT}, found {knobs}")
+    return "\n".join(knobs)
+
+
+def run_check(succeed_on: int, env_overrides: dict[str, str] | None = None) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
     """Run the lifted section with the curl stub succeeding on attempt N."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="conncheck-"))
     stubs = tmp / "bin"
@@ -152,6 +161,7 @@ def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Pat
             # stop its lease heartbeat (#3129); both are defined in section 2.
             "stop_deploy_heartbeat() { :; }",
             "deploy_exit() { dump_prow_artifacts_on_failure; }",
+            gateway_retry_knobs(),
             connectivity_section(),
             'echo "SECTION COMPLETED"',
         ]
@@ -161,6 +171,7 @@ def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Pat
         PATH=f"{stubs}:{os.environ['PATH']}",
         STUB_LOG=str(tmp),
         CURL_SUCCEED_ON=str(succeed_on),
+        **(env_overrides or {}),
     )
     result = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=False, env=env
@@ -238,13 +249,26 @@ class ConnectivityRetryTest(unittest.TestCase):
             name: int(re.search(rf'readonly EVAL_LITELLM_{name}="\$\{{EVAL_LITELLM_{name}:-(\d+)\}}"', script).group(1))
             for name in ("NUM_RETRIES", "RETRY_AFTER_SECONDS")
         }
+        self.assertGreater(int(match.group(1)), self._waits(gateway, floor), "the waits fit inside one turn at the defaults")
+
+        # The knobs are env overrides; the deadline has to move with them.
+        overridden = {"NUM_RETRIES": 3, "RETRY_AFTER_SECONDS": 45}
+        _, tmp = run_check(
+            succeed_on=1,
+            env_overrides={f"EVAL_LITELLM_{name}": str(value) for name, value in overridden.items()},
+        )
+        match = re.search(r"--max-time\s+(\d+)", (tmp / "curl.args").read_text(encoding="utf-8"))
+        self.assertIsNotNone(match)
+        self.assertGreater(int(match.group(1)), self._waits(overridden, floor), "the waits fit inside one turn under an override")
+
+    @staticmethod
+    def _waits(gateway: dict, floor: dict) -> float:
         agent_calls = AGENT_RATE_LIMIT_RETRIES + 1
         gateway_pauses_per_call = gateway["NUM_RETRIES"] + 1
-        waits = (
+        return (
             agent_calls * gateway_pauses_per_call * gateway["RETRY_AFTER_SECONDS"]
             + AGENT_RATE_LIMIT_RETRIES * floor["FLOOR_MAX_SECONDS"]
         )
-        self.assertGreater(int(match.group(1)), waits, f"{waits}s of waiting fits inside one turn")
 
 
 class FailureDumpArtifactsTest(unittest.TestCase):
