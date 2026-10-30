@@ -593,6 +593,14 @@ litellm:
   # . or .. component, no doubled or trailing slash (the gateway container runs
   # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
+  # Sends a sessionId with each request to a Gemini model on vertex_ai: a hash
+  # of the model and the request's first non-system message, which one agent
+  # session keeps across its calls. Vertex serves every call with the same id
+  # from one machine, where the session's prompt cache lives. The prompt and
+  # the answer do not change. Vertex honours the field only for a project it
+  # has enabled and serves other projects as if it were absent. Claude and
+  # every other model are left alone. The eval installs turn it on.
+  vertexSessionAffinity: false
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for

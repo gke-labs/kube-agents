@@ -1893,6 +1893,11 @@ echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 # the cap it was given without opening the rendered CR.
 echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
 echo "Credential-proxy memory limit for this install: ${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT} (spec.deployment.credentialProxy.resources.limits.memory)"
+# litellm.vertexSessionAffinity: the gateway sends a sessionId with each Gemini
+# request, so Vertex serves an agent session's calls from the machine holding
+# its prompt cache. The eval projects have been put forward for Vertex's
+# session-routing allowlist; until a project is on it Vertex ignores the field.
+# The chart's files/litellm_vertex_session_callback.py says what the id is.
 
 HELM_INSTALL_OUT="$(mktemp)"
 HELM_EXIT=0
@@ -1929,6 +1934,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
     --set "plugins.stockoutInvestigator.applyTuning=false" \
+    --set "litellm.vertexSessionAffinity=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"

@@ -323,6 +323,16 @@ I/O failures log a once-per-path warning to stderr so inference never fails. Off
 default, and the rendered default ConfigMap and rollout checksum are unchanged while
 it is off.
 
+`litellm.vertexSessionAffinity=true` adds `litellm_vertex_session_callback.py` to
+the ConfigMap, mounts it at `/app/litellm_vertex_session_callback.py` and registers
+`litellm_vertex_session_callback.proxy_handler_instance` under
+`litellm_settings.callbacks`. The hook sends a `sessionId` with each chat-completions
+request to a Gemini model on `vertex_ai`, so Vertex serves one session's calls from
+the machine that holds its prompt cache; the site's
+[inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md#prompt-caching)
+says what the id is and when Vertex honours it. Off by default, with the default
+render unchanged.
+
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
 Vertex AI has no API key by default. The gateway calls

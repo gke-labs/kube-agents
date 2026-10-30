@@ -203,6 +203,22 @@
 {{- end }}
 {{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
 {{- end }}
+{{- /*
+  The Vertex session-affinity hook: a sessionId on each vertex_ai Gemini
+  request, so a session's calls reach the serving machine that holds its
+  prompt cache. It leaves every other model's request as sent, and Vertex
+  ignores the field for a project it has not enabled. Its header says what it
+  sends and why.
+*/}}
+{{- $vertexSessionEnabled := default false .Values.litellm.vertexSessionAffinity }}
+{{- $vertexSessionSource := "" }}
+{{- if $vertexSessionEnabled }}
+{{- $vertexSessionSource = .Files.Get "files/litellm_vertex_session_callback.py" }}
+{{- if empty $vertexSessionSource }}
+{{- fail "the chart's files/litellm_vertex_session_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_vertex_session_callback.proxy_handler_instance" }}
+{{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
 {{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
@@ -221,13 +237,14 @@
 {{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  hook, the rule file, the two redaction modules, the OAuth2 hook and the
-  optional trace logger are subPath mounts too, so an edit to any of them has
-  to roll the pods the same way an edit to config.yaml does. With redaction or
-  trace logging off their extras are empty strings, as is the OAuth2 hook's
-  source while the hook is not shipped.
+  hook, the rule file, the two redaction modules, the OAuth2 hook, the
+  optional trace logger and the session-affinity hook are subPath mounts too,
+  so an edit to any of them has to roll the pods the same way an edit to
+  config.yaml does. With redaction, trace logging or session affinity off
+  their extras are empty strings, as is the OAuth2 hook's source while the
+  hook is not shipped.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $vertexSessionSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -255,6 +272,10 @@ data:
   {{- if $traceLogEnabled }}
   llm_trace_logger.py: |
     {{- $traceLogSource | nindent 4 }}
+  {{- end }}
+  {{- if $vertexSessionEnabled }}
+  litellm_vertex_session_callback.py: |
+    {{- $vertexSessionSource | nindent 4 }}
   {{- end }}
   {{- if $oauthHookEnabled }}
   litellm_oauth2_callback.py: |
@@ -533,6 +554,11 @@ spec:
             - name: config-volume
               mountPath: /app/llm_trace_logger.py
               subPath: llm_trace_logger.py
+            {{- end }}
+            {{- if $vertexSessionEnabled }}
+            - name: config-volume
+              mountPath: /app/litellm_vertex_session_callback.py
+              subPath: litellm_vertex_session_callback.py
             {{- end }}
             {{- if and (eq $provider "openai_compatible") $openaiCompatibleCA.name }}
             # The openai_compatible server's CA bundle, read by ssl_verify on its
