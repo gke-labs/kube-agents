@@ -88,6 +88,14 @@ readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=30
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# What a pull request is graded by (the merge target's grader, section 6):
+# this tree at PULL_BASE_SHA, with the change's own cases subdirectory in
+# place of the target's. Both relative to the repository root.
+readonly EVAL_GRADER_TREE="bench"
+readonly EVAL_GRADER_CASES_DIR="tasks"
+# The seeded fleet's catalog inside that tree, which the fleet step reads.
+readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
+
 # A repetition the launcher could not start because GitHub's token endpoint
 # failed transiently (record_unit_not_run, beside run_one_unit). The unit
 # writes a record in place of the run that carries the harness's own
@@ -963,6 +971,45 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # bench/tf/fleet/README.md, "A read-only credential for evaluations".
 # FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
 # use, and a Prow job refuses it: set there it would restore the fallback.
+# ─── Extract the merge target's grader (section 6) ───────────────────────────
+# On a run that grades a change, main's bench/ (with the change's cases) is
+# extracted here, before the fleet step: the fleet catalog maps each fixture
+# role a check reads to a cluster, and the lease scan below imports
+# fixture_drift, so both are part of the grader and come from main.
+# GRADER_BENCH_DIR stays empty on a run that grades HEAD. Section 6, "Grade
+# with the merge target's grader", has the rest: BENCH_DIR, the read check
+# and the verdict's grader SHA.
+grader_pin_applies() { # -> 0 when this run grades a change against a merge target
+  [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
+}
+
+# main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
+# extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
+# is gone, and one it adds is there.
+pin_grader() { # <repo root> <sha> <out>
+  local repo="$1" sha="$2" out="$3"
+  git -C "${repo}" archive "${sha}" "${EVAL_GRADER_TREE}" | tar -x -C "${out}" || return 1
+  [ -d "${out}/${EVAL_GRADER_TREE}" ] || return 1
+  rm -rf "${out:?}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
+  cp -R "${repo}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}" "${out}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
+}
+
+GRADER_BENCH_DIR=""
+if grader_pin_applies; then
+  if [ -z "${PULL_BASE_SHA:-}" ] || ! git -C "${SCRIPT_DIR}/.." cat-file -e "${PULL_BASE_SHA}^{commit}" 2>/dev/null; then
+    echo "ERROR: this run grades a change (PULL_NUMBER or JOB_TYPE=${JOB_TYPE:-unset}) but PULL_BASE_SHA='${PULL_BASE_SHA:-}' names no commit in this checkout, so main's grader cannot be extracted; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  GRADER_ROOT="$(mktemp -d)"
+  if ! pin_grader "${SCRIPT_DIR}/.." "${PULL_BASE_SHA}" "${GRADER_ROOT}"; then
+    echo "ERROR: could not extract ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA} into ${GRADER_ROOT}; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  GRADER_BENCH_DIR="${GRADER_ROOT}/${EVAL_GRADER_TREE}"
+  # Set, not defaulted: a catalog from the job's environment would be one the
+  # change did not have to get past eval-crew.
+  export FLEET_CATALOG="${GRADER_BENCH_DIR}/${EVAL_FLEET_CATALOG}"
+fi
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 _fleet_refuse_opt_in_under_prow || exit 1
@@ -1016,7 +1063,7 @@ scan_lease_fixtures() { # <report path> <published copy path>
   gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
   # Only a role the fresh hourly scan already holds drifted twice can be
   # excused, so wait for convergence only then; otherwise one pass is enough.
-  if ! PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
+  if ! PYTHONPATH="${GRADER_BENCH_DIR:-${SCRIPT_DIR}/../bench}" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
     wait=0
   fi
   ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
@@ -2463,8 +2510,8 @@ fi
 # after that, is what every case on either lane carries beside its own
 # checks (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
-# under the eval-crew alias and lets the nightly file and this script fall
-# through to the root approvers. Each file's header says what belongs in it;
+# under the eval-crew alias and lets the nightly file fall through to the
+# root approvers (this script is under eval-crew too, for the grader pin). Each file's header says what belongs in it;
 # docs/designs/bench-case-format.md "Registration" is the rule.
 #
 # Paths in the files are relative to BENCH_DIR, which is where devops-bench
@@ -2778,6 +2825,124 @@ if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_
   fi
 fi
 
+# ─── Grade with the merge target's grader (#1560, section 6) ─────────────────
+# A pull request is graded by main's grader, not its own: everything under
+# bench/ but bench/tasks/ -- harness, verifiers, bench-gate, the devops-bench
+# pin in pyproject.toml, the fleet and the case stacks under bench/tf/ -- comes from
+# PULL_BASE_SHA, the commit clonerefs merged the change onto, and the cases
+# come from the change. Otherwise a change could edit what grades it. The two
+# trees are joined in a scratch directory, and BENCH_DIR points there for
+# every `uv run` after this, so no call site below needs to know. The
+# nightly, the postsubmit and the release-candidate run grade from HEAD,
+# where the two are the same commit.
+#
+# A case main's grader cannot read -- a check type, check field or top-level
+# key it does not know, a fleet role or stack it does not have -- stops the job red here, before the fan-out,
+# rather than running and losing the check to rung 2 (or a missing stack to
+# infrastructure). The check itself runs after the lane step ("main's grader
+# reads the cases as run"), over the task copies devops-bench is handed. So a grader change lands on main before the case that
+# needs it (decided 2026-10-28). That holds for every case a pull-request job
+# grades: the presubmit roster, and a lane list such as gitlab-cases.txt,
+# which may name a nightly case. A case only the nightly runs is graded from
+# HEAD and is not held to that order.
+#
+# hack/OWNERS puts this script, and the hack/ files it sources, evals or runs
+# before the verdict, under the eval-crew alias, so an edit that would take
+# the pin out needs an eval-crew approval. EVAL_GRADER_SHA names the commit
+# that graded the run; `bench-gate suite` writes it into eval-verdict.json
+# and the verdict markdown, and a grader that predates it ignores the
+# variable. The extraction itself (grader_pin_applies,
+# pin_grader, GRADER_BENCH_DIR) runs at the fleet step, which reads main's
+# fleet catalog.
+
+# One `<task file>: <reason>` line per thing the grader in BENCH_DIR cannot
+# read in the named task files, nothing when it reads them all. Three reads,
+# each the one the run would make: devops-bench's task loader, its
+# verification-spec parser (which skips an entry it cannot parse and lets the
+# run go on), and bench-gate's case loader; then whether each top-level key
+# is in the grader's CASE_KEYS (both loaders drop a key they do not know),
+# whether every fixture_role / fixture_roles a check names is in the fleet
+# catalog the run wrote kubeconfigs from (FLEET_CATALOG, main's on a pinned
+# run; a role it lacks errors the check after the lease), and whether a
+# declared stack is a directory under tf/. A grader from before CASE_KEYS
+# existed has no top-level schema to hold a case to, so that read is skipped
+# under it. Exits non-zero only when the check itself could not run.
+grader_unreadable_cases() { # <task file>... (relative to BENCH_DIR)
+  (cd "${BENCH_DIR}" && uv run python -c '
+import json
+import os
+import sys
+from pathlib import Path
+
+import yaml
+from devops_bench.tasks.loader import FileSystemTaskLoader
+from devops_bench.verification.spec import parse_entries
+from kube_agents_bench import cases
+
+known = getattr(cases, "CASE_KEYS", None)
+catalog = os.environ.get("FLEET_CATALOG")
+fleet_roles = set(json.loads(Path(catalog).read_text(encoding="utf-8")).get("roles") or {}) if catalog else None
+
+
+def named_roles(node, found):
+    if isinstance(node, dict):
+        if isinstance(node.get("fixture_role"), str):
+            found.add(node["fixture_role"])
+        if isinstance(node.get("fixture_roles"), list):
+            found.update(r for r in node["fixture_roles"] if isinstance(r, str))
+        for value in node.values():
+            named_roles(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            named_roles(value, found)
+
+
+for path in sys.argv[1:]:
+    try:
+        tasks = FileSystemTaskLoader().load_tasks(path)
+        cases.load_case(path)
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        print(f"{path}: {exc}")
+        continue
+    for key in sorted(set(raw) - known) if known is not None else []:
+        print(f"{path}: top-level key {key} is not in this grader (kube_agents_bench.cases.CASE_KEYS)")
+    if fleet_roles is not None:
+        found = set()
+        named_roles(raw.get("verification_spec"), found)
+        for role in sorted(found - fleet_roles):
+            print(f"{path}: fixture role {role} is not in the fleet catalog of this grader ({catalog})")
+    for task in tasks:
+        for error in parse_entries(task.verification_spec)[1]:
+            print(path + ": verification entry " + str(error.get("name")) + ": " + str(error.get("reason")))
+        stack = (task.infrastructure or {}).get("stack")
+        if stack:
+            # Resolved and contained: pathlib keeps "..", and an absolute
+            # value discards the root it is joined to, so either could reach
+            # a stack outside the tf/ of this grader, such as one shipped in
+            # the case folder of the change.
+            tf_root = Path(os.environ.get("BENCH_TF_ROOT") or "tf").resolve()
+            stack_dir = (tf_root / str(stack)).resolve()
+            if not (stack_dir != tf_root and stack_dir.is_relative_to(tf_root) and stack_dir.is_dir()):
+                print(f"{path}: its stack {stack} is not a directory under this grader tf/")
+' "$@")
+}
+
+EVAL_GRADER_SHA="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)"
+if [ -n "${GRADER_BENCH_DIR}" ]; then
+  BENCH_DIR="${GRADER_BENCH_DIR}"
+  EVAL_GRADER_SHA="${PULL_BASE_SHA}"
+  echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
+  # The scratch directory has no venv yet, and syncing one fetches over the
+  # network: one retry absorbs a transient failure, so the check below fails
+  # only on itself.
+  if ! (cd "${BENCH_DIR}" && uv sync --quiet) && ! (cd "${BENCH_DIR}" && uv sync --quiet); then
+    echo "ERROR: could not sync main's grader's venv in ${BENCH_DIR} (twice, above); the run does not start." >&2
+    exit 1
+  fi
+fi
+export EVAL_GRADER_SHA
+
 # ─── The lanes' safeguards (#2079) ───────────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
 # the inject door the platform persona (directly under the bridge's cli
@@ -2898,6 +3063,27 @@ unit_task_path() { # <task-path> <task-name>
     echo "$1"
   fi
 }
+
+# ─── main's grader reads the cases as run (section 6) ────────────────────────
+# The read check of "Grade with the merge target's grader", run here, after
+# the lane step, over the file each unit hands devops-bench (unit_task_path):
+# the lane's copy carries the entries of inject-lane-safeguards.yaml, read
+# from the change, which main's parser has to read as well.
+if [ -n "${GRADER_BENCH_DIR}" ]; then
+  GRADER_CHECKED=()
+  for ENTRY in "${TASKS[@]}"; do
+    GRADER_CHECKED+=("$(unit_task_path "${ENTRY}" "$(basename "$(dirname "${ENTRY}")")")")
+  done
+  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${GRADER_CHECKED[@]}")"; then
+    echo "ERROR: could not check that main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) reads this change's cases (above); the run does not start." >&2
+    exit 1
+  fi
+  if [ -n "${GRADER_UNREADABLE}" ]; then
+    echo "ERROR: main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) cannot read these cases: this case needs a grader change that is not on main yet; land the grader change first, then the case." >&2
+    sed 's/^/  /' <<< "${GRADER_UNREADABLE}" >&2
+    exit 1
+  fi
+fi
 
 # ─── The nightly part ────────────────────────────────────────────────────────
 # EVAL_NIGHTLY_PART (validated at the tier switch) applied to TASKS: after

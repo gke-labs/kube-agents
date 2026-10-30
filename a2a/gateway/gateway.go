@@ -1718,6 +1718,13 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		// never that nothing is there.
 		return state, fmt.Errorf("reading task %s on %s: %w", read, addressee, terr)
 	}
+	if chainUsageAsked(ctx) {
+		readTask := task
+		if terr != nil {
+			readTask = nil
+		}
+		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
+	}
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -1741,6 +1748,69 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 	}
 	return state, nil
+}
+
+// chainUsage is what taskID's turns cost, from the usage artifact's parts
+// summed (lib.UsageTotal) per tier. front is the front door's own turns:
+// taskID's stream and, when taskID is a delegation chain's root, every wake
+// that continued it. children is the chain's child tasks, the addressees the
+// front door delegated to (the platform router that files the cards among
+// them). Either is nil when none of its turns published usage. partial
+// reports that a link's stream could not be read, so the sums leave out
+// whatever that link cost. The stream the probe already folded (read,
+// readTask; nil when it found no events) is not read twice.
+func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, read string, readTask *lib.Task) (front, children *lib.Usage, partial bool) {
+	links := []TaskRef{{ID: taskID}}
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		links[0] = ref
+		if ref.Role != taskRoleChild && ref.rootID() == taskID {
+			for _, other := range rec.Tasks {
+				if other.ID != taskID && other.rootID() == taskID {
+					links = append(links, other)
+				}
+			}
+		}
+	}
+	var frontTurns, childTurns []lib.Usage
+	for i, link := range links {
+		folded := readTask
+		if link.ID != read {
+			t, _, err := g.client.TasksGetAttributed(ctx, link.Addressee, link.ID)
+			switch {
+			case err == nil:
+				folded = t
+			case isTaskNotFound(err):
+				folded = nil
+			default:
+				partial = true
+				continue
+			}
+		}
+		if folded == nil {
+			continue
+		}
+		for _, p := range artifactParts(folded, lib.ArtifactUsage) {
+			u, ok := lib.UsageOf(p)
+			if !ok {
+				continue
+			}
+			if i > 0 && link.Role == taskRoleChild {
+				childTurns = append(childTurns, u)
+			} else {
+				frontTurns = append(frontTurns, u)
+			}
+		}
+	}
+	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// usageSum is turns folded by lib.UsageTotal, or nil when there are none.
+func usageSum(turns []lib.Usage) *lib.Usage {
+	if len(turns) == 0 {
+		return nil
+	}
+	total := lib.UsageTotal(turns)
+	return &total
 }
 
 // retireIncarnation deletes the record's lingering session pod before a

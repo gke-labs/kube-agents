@@ -4209,17 +4209,19 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
-// primitive wherever admission does not constrain the PodSpec, and nothing in
-// this repository constrains it here. A gateway that is compromised or
-// prompt-steered into building its own PodSpec can name any ServiceAccount in
-// the namespace — including the platform agent's, whose Workload Identity
-// binding then resolves for that pod — mount any Secret in it, and stamp
-// labels no NetworkPolicy selects. spawn.go declining to do any of that is
-// what the gateway CHOOSES, not what this grant PERMITS, and the two are not
-// the same claim. Narrowing it takes a ValidatingAdmissionPolicy on pod create
-// by this subject (no serviceAccountName, no secret volumes,
-// automountServiceAccountToken false); that policy does not exist yet and is
-// named in this change's PR body as the follow-up it owes.
+// primitive wherever admission does not constrain the PodSpec. A gateway that
+// is compromised or prompt-steered into building its own PodSpec could name
+// any ServiceAccount in the namespace — including the platform agent's, whose
+// Workload Identity binding then resolves for that pod — mount any Secret in
+// it, and stamp labels no NetworkPolicy selects. spawn.go declining to do any
+// of that is what the gateway CHOOSES, not what this grant PERMITS. The
+// ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
+// (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
+// creates to the session pod spawn.go builds: the session ServiceAccount, no
+// automount, the session token audiences, no Secret, the session labels. The
+// chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
+// and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
+// this grant is as wide as written.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
@@ -5237,6 +5239,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
 	}
 
+	// Before the callout, which is rendered with its public half. The seed
+	// is the dispatcher's, and nothing mounts it until a dispatcher does.
+	taskSigningKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure the A2A task-signing key: %w", err)
+	}
+
 	// Before the config and every client: the server mounts the serving pair
 	// and each client mounts the bundle, and a pod started against a Secret
 	// or ConfigMap that does not exist yet waits in ContainerCreating.
@@ -5314,7 +5323,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent)
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public)
 	if err != nil {
 		return state, err
 	}
@@ -6200,6 +6209,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// cleanup pass dies on the map delete, the keys Secret is still standing
 		// to prevent the next pass from early-exiting.
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The task-signing key, before the keys Secret for the same reason
+		// as the map: the keys Secret is the sentinel.
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},

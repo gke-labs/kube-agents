@@ -1,0 +1,256 @@
+# NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt.
+#
+# Domain: reliability (topology-drift skill).
+# Journey: zonal skew attribution on slot d (namespace `seeded-topology`),
+# where four multi-replica workloads each have every running replica in one
+# zone, for four different reasons:
+#   - `zonal-skew-scheduling` (`deployment/zone-pinned-api`): a `ScheduleAnyway`
+#     zonal spread beside a required single-zone `nodeAffinity`, so the
+#     constraint asks and the affinity decides. leeway: `constraint_ignored`
+#     with the conflicting-affinity evidence line, `manifest_patch`. Fix is the
+#     affinity, a manifest edit.
+#   - `zonal-skew-volume` (`statefulset/zone-bound-store`): PVCs on StorageClass
+#     `seeded-zonal-pd`, whose `allowedTopologies` pins volumes to one zone.
+#     leeway: `volume_pinning`, `storage_topology`. Fix is storage, not a
+#     spread edit.
+#   - `zonal-skew-capacity` (`deployment/capacity-starved-worker`): four 500m
+#     replicas under a `DoNotSchedule` spread; the running ones sit in the
+#     second zone and the rest are Pending for CPU because `first-zone-sponge`
+#     fills the first zone's e2-small. leeway: `domain_capacity_shortfall`,
+#     `cluster_capacity`. Fix is capacity or sizing, not a spread edit.
+#   - the same role's `deployment/first-zone-sponge`: six replicas pinned by
+#     `nodeSelector` to `default-pool`, which has nodes in the first zone only.
+#     leeway prints NO finding for it (a selector is intent), and the design's
+#     "single-zone node pool" cause is the one an agent must find by hand.
+#     Fix is the node pool; widening the affinity or adding a spread
+#     constraint leaves pods Pending.
+#
+# What the case grades, and why it is shaped this way (review rounds 1-4 on
+# #3419): the prompt names the namespace and the output grammar and nothing
+# else -- not the cluster (fixtures.json is the only thing allowed to address
+# a seeded cluster), not the workloads, not which cause belongs to which --
+# so a green shows attribution rather than recall. Each declared line carries
+# the cause word, the evidence, the zone and the running share
+# (`running there: <n>/<m>`), so the blast-radius check reads the line the
+# agent declared and not a pasted `kubectl get` row. The fourth line is the
+# node-pool case, the one leeway is silent on and the one a manifest-happy
+# agent gets wrong in the direction that pages someone. And the run has to
+# have executed `leeway report` on a delegated card.
+#
+# The route is the one every chat case takes: the front door holds no
+# infrastructure tools, so it files a card (`the-request-was-delegated`), and
+# the Platform Agent worker on that card runs `leeway report` itself or files
+# a card to slot d's Cluster Agent when the install has one. `worker_commands`
+# reads the platform card's typed `terminal` calls and log rows and a
+# Cluster Agent card's tagged calls, so `leeway-report-ran` sees either
+# route; with no card it reads status=error, never a pass. What the first
+# live run must settle is the rest: that the worker finds the two-zone
+# cluster from the namespace alone, and that the install's `leeway` reaches
+# slot d by whichever route it takes.
+#
+# Isolation class: read-only (analysis only; nothing created, patched, or
+# published).
+# Eligible tier: nightly.
+id: topology-zonal-skew-probe
+name: Topology drift analysis attributes four single-zone concentrations to four causes on seeded-topology
+prompt: >-
+  One of our clusters is multi-zonal: its nodes span two zones. Analyze the
+  topology distribution of the multi-replica workloads in its
+  `seeded-topology` namespace. For every workload whose running replicas all
+  sit in one zone, report the per-zone running pod distribution, attribute
+  the root cause of the concentration, and state the appropriate remediation
+  category. Conclude with one summary line per such workload in the exact
+  form:
+  `<workload>: cause is <scheduling|capacity|volume|node-pool>; primary evidence: <evidence>; blast-radius zone: <zone>; running there: <n>/<m>`
+  where <n> is the workload's running replicas in that zone and <m> its
+  running replicas in total; Pending replicas count in neither, so name them
+  after the line when there are any. Read-only analysis only: do not modify
+  any cluster resources or open any pull requests.
+expected_output: >-
+  The agent finds the two-zone cluster, loads the `topology-drift` skill, runs
+  `leeway report` against the `seeded-topology` namespace there (delegating to
+  the cluster's Cluster Agent when one exists), confirms each finding with a
+  read-only `kubectl` read, and declares four workloads, each 100% in one zone:
+  (1) `zone-pinned-api`, cause scheduling -- a required `nodeAffinity` pins
+  both replicas to one zone while its spread constraint is `ScheduleAnyway`
+  (remediation: edit the affinity, a manifest change);
+  (2) `zone-bound-store`, cause volume -- its PersistentVolumeClaims bind to
+  the zonal `seeded-zonal-pd` StorageClass whose `allowedTopologies` names one
+  zone (remediation: regional StorageClass or volume migration, not a spread
+  edit);
+  (3) `capacity-starved-worker`, cause capacity -- its running replica(s) sit
+  in the other zone and the rest are Pending with `Insufficient cpu`
+  (remediation: node capacity or request sizing, not a spread edit);
+  (4) `first-zone-sponge`, cause node-pool -- its `nodeSelector` targets
+  `default-pool`, which has nodes in one zone only, so leeway reports no
+  finding and the exposure is real (remediation: a node-pool change, never a
+  wider affinity or a spread constraint). Nothing is applied to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml (owner inherited from reliability domain).
+domain: reliability
+
+fixtures:
+  - zonal-skew-scheduling
+  - zonal-skew-volume
+  - zonal-skew-capacity
+
+verification_spec:
+  # The request reached a specialist: the front door holds no infrastructure
+  # tools, and without a card the worker check below would error, not fail.
+  - name: the-request-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # The declared lines. Each pattern reads one line: an optional kind prefix
+  # and parenthetical on the name, the cause word, an evidence field that has
+  # to name the mechanism, a GCP zone, and a running share whose numerator
+  # and denominator agree (every running replica is in that zone). Trailing
+  # text after the share is allowed, which is where the Pending count goes.
+  - name: report-attributes-scheduling-skew
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-scheduling
+      required_phrases:
+        - "zone-pinned-api"
+      any_of_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node[ -]?affinity|node ?selector|schedule ?anyway|constraint[_ -]ignored|conflicting)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+      forbidden_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume|node-pool)\b'
+  - name: report-attributes-volume-skew
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-volume
+      required_phrases:
+        - "zone-bound-store"
+        - "seeded-zonal-pd"
+      any_of_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowed ?topolog|persistent ?volume|pvc|storage ?class|zonal (?:pd|disk|volume)|volume[_ -]pinning)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+      forbidden_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|node-pool)\b'
+  - name: report-attributes-capacity-skew
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-capacity
+      required_phrases:
+        - "capacity-starved-worker"
+        - "Pending"
+      any_of_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|failedscheduling|capacity[_ -]shortfall)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+      forbidden_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume|node-pool)\b'
+  # The line leeway does not write for the agent. `first-zone-sponge` has no
+  # finding, so this line exists only if the agent looked at the pools. Its
+  # forbidden half is the harm: a scheduling attribution here recommends
+  # widening an affinity onto a zone where the pool has no nodes.
+  - name: report-attributes-node-pool-skew
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-capacity
+      required_phrases:
+        - "first-zone-sponge"
+      any_of_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is node-pool(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node ?pool|default-pool|node ?selector|one zone|single[- ]zone)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]+-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+      forbidden_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|volume)\b'
+  # The tool ran, on a delegated card (see the header). Read each tagged
+  # `terminal` call as typed. Without after_result_pattern the check reads
+  # Hermes's one-line rendering of the worker's command, which shows a chain
+  # as its first command plus `+ N commands` and joins a second line into the
+  # first (#3128). The pattern never matches a result and no forbidden
+  # pattern is set, so it opens no window. required_runs reads each shell
+  # segment as an argv: `leeway` is the command word, by basename, and a
+  # later word is `report`. A `--help`, an echoed or grepped mention of the
+  # command, and `leeway rank` or `leeway version` do not count.
+  # bench/tests/test_topology_zonal_skew_probe_case.py pins the samples.
+  - name: leeway-report-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: "(?!)"
+      required_runs:
+        - script: leeway
+          word_patterns: ["^report$"]
+  # Cluster-state safeguards: each fixture came out the way it went in.
+  - name: scheduling-fixture-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-scheduling
+      kind: deployment
+      resource_name: zone-pinned-api
+      namespace: seeded-topology
+      path: spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable
+      op: eq
+      value: ScheduleAnyway
+  - name: volume-fixture-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-volume
+      kind: statefulset
+      resource_name: zone-bound-store
+      namespace: seeded-topology
+      path: spec.volumeClaimTemplates[0].spec.storageClassName
+      op: eq
+      value: seeded-zonal-pd
+  - name: capacity-fixture-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: capacity-starved-worker
+      namespace: seeded-topology
+      path: spec.replicas
+      op: eq
+      value: 4
+  - name: capacity-fixture-cpu-request-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: capacity-starved-worker
+      namespace: seeded-topology
+      path: spec.template.spec.containers[0].resources.requests.cpu
+      op: eq
+      value: 500m
+  - name: capacity-sponge-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: first-zone-sponge
+      namespace: seeded-topology
+      path: spec.replicas
+      op: gte
+      value: 6

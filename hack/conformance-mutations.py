@@ -1286,6 +1286,15 @@ Mutation(
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
     ),
     Mutation(
+        "C5-gateway-pod-policy-any-account",
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ('    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"',
+         '    - expression: "has(object.spec.serviceAccountName)"'),
+        "test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account",
+        "widen the identity rule to any ServiceAccount, which reopens the "
+        "gateway's pod create to every identity in its namespace",
+    ),
+    Mutation(
         "C1-broker-colocation-flag-restored",
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("// buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet\n",
@@ -2244,8 +2253,8 @@ Mutation(
     Mutation(
         "A3-session-writes-its-own-supervisor-subject",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSupervisorSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
         "derive a session a grant on its own supervisor subject -- the "
         "helpful-looking change that lets a worker adapter finalise itself "
@@ -2296,10 +2305,10 @@ Mutation(
     Mutation(
         "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
-        "derive a session pod (and, through the shared executorGrants, an "
+        "derive a session pod (and, through the shared executorTaskGrants, an "
         "AgentProfile pod) a publish grant on the notify subject, so a session "
         "can post its result to the home channel itself. The gateway then "
         "posts as the install's bot for whatever runs in that pod",
@@ -2317,8 +2326,8 @@ Mutation(
     Mutation(
         "A3-session-asks-the-board",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.BoardSubject,\n\t\t},'),
         "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
         "derive a session pod a publish grant on the board request, so "
         "whatever runs in a session pod can make the bridge read session-kv "
@@ -2327,8 +2336,8 @@ Mutation(
     Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskInSubject(addressee, "*"),\n\t\t},'),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
         "widen the session's task-plane grant toward the per-task wildcard the "
         "cards sketched, which puts the executor in its own in-subject writer "
@@ -2337,22 +2346,24 @@ Mutation(
     Mutation(
         "A3-profile-pod-writes-its-own-supervisor-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorGrants(profile, pod)\n",
-         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskSupervisorSubject(profile, \"*\"))\n"),
         "test_A3_the_supervisor_subject_has_exactly_one_writer",
-        "derive an AgentProfile's pods a grant on their profile's supervisor "
-        "subject, the janitor's. A profile pod could then end its own task, or "
-        "a sibling's, and have it read as the janitor declaring it dead",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "grant on its profile's supervisor subject, the janitor's. A profile "
+        "pod could then end its own task, or a sibling's, and have it read as "
+        "the janitor declaring it dead",
     ),
     Mutation(
         "A3-profile-pod-writes-its-own-in-subject",
         "a2a/authcallout/profile_narrowing.go",
-        ("\tg := executorGrants(profile, pod)\n",
-         "\tg := executorGrants(profile, pod)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
+        ("\tg := executorTaskGrants(profile, task, stem)\n",
+         "\tg := executorTaskGrants(profile, task, stem)\n\tg.Publish = append(g.Publish, lib.TaskInSubject(profile, \"*\"))\n"),
         "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
-        "derive an AgentProfile's pods a publish grant on their profile's in "
-        "subject. Every pod of the profile could then steer or cancel any of "
-        "the profile's tasks as if from the requester",
+        "derive an AgentProfile pod's task connection (profileTaskGrants) a "
+        "publish grant on its profile's in subject. Every pod of the profile "
+        "could then steer or cancel any of the profile's tasks as if from the "
+        "requester",
     ),
     Mutation(
         "A3-session-gains-publish-on-anothers-in-subject",

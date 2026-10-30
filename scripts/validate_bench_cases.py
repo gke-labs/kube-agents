@@ -457,6 +457,13 @@ FIXTURE_NOT_READY = {
         "(which the nightly AutoOps triage cases require) and no pool *-infra repository carries "
         "both paths, so no CI tier can run it; run it by hand against such an install"
     ),
+    "incident-triage-open-pr-reminder": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and "
+        "INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 in spec.deployment.env and a GitOps repository "
+        "declaring eval-pr-reminder-workload; every CI eval install leaves "
+        "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
+        "tier can run it; run it by hand against such an install"
+    ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
         "version the cluster's next minor stops serving, which no standing fleet "

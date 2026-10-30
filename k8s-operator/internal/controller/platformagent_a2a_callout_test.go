@@ -124,6 +124,9 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		{"keys Secret", func() error {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-callout-keys", Namespace: "test-ns"}, &corev1.Secret{})
 		}},
+		{"task-signing key Secret", func() error {
+			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-task-signing-key", Namespace: "test-ns"}, &corev1.Secret{})
+		}},
 		{"identity map", func() error {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, &corev1.ConfigMap{})
 		}},
@@ -172,7 +175,7 @@ var rbacBindingKinds = map[string]bool{
 // scope: they take the subject as an argument and have their own coverage.)
 func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T) {
 	agent := a2aTestAgent()
-	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.ServiceAccountName
+	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.ServiceAccountName
 	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.ServiceAccountName
 
 	cases := []struct {

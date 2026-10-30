@@ -1,0 +1,379 @@
+{
+  "schema_version": "leeway.report/v1alpha1",
+  "generated_at": "2026-10-19T12:00:00Z",
+  "clusters": [
+    {
+      "cluster": "prod-central",
+      "source": "gke:my-project/us-central1/prod-central",
+      "status": "ok",
+      "domains": {
+        "topology.kubernetes.io/region": {
+          "us-central1": {
+            "nodes": 2,
+            "ready": 2,
+            "usable": 2,
+            "allocatable_cpu_milli": 2870,
+            "allocatable_mem_bytes": 34359738368
+          }
+        },
+        "topology.kubernetes.io/zone": {
+          "us-central1-a": {
+            "nodes": 1,
+            "ready": 1,
+            "usable": 1,
+            "allocatable_cpu_milli": 940,
+            "allocatable_mem_bytes": 17179869184
+          },
+          "us-central1-b": {
+            "nodes": 1,
+            "ready": 1,
+            "usable": 1,
+            "allocatable_cpu_milli": 1930,
+            "allocatable_mem_bytes": 17179869184
+          }
+        }
+      },
+      "topology_findings": [
+        {
+          "kind": "leeway.contract_violated",
+          "subject": {
+            "kind": "Deployment",
+            "namespace": "shop",
+            "name": "batch-worker"
+          },
+          "topologyKey": "topology.kubernetes.io/zone",
+          "tier": "A",
+          "severity": "critical",
+          "score": {
+            "drift": 0.5,
+            "observedSkew": 1,
+            "minAchievableSkew": 0,
+            "excessSkew": 3,
+            "relocationDistance": 1,
+            "maxDomainShare": 1
+          },
+          "intent": {
+            "source": "topology-spread-constraint",
+            "confidence": "declared",
+            "weighting": "Equal",
+            "maxSkew": 1,
+            "evidence": [
+              "topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=DoNotSchedule labelSelector=app=batch-worker"
+            ]
+          },
+          "domains": [
+            {
+              "domain": "us-central1-a",
+              "actual": 0,
+              "expected": 1,
+              "delta": -1,
+              "readyNodes": 1
+            },
+            {
+              "domain": "us-central1-b",
+              "actual": 1,
+              "expected": 1,
+              "delta": 0,
+              "readyNodes": 1
+            }
+          ],
+          "suspectedCause": "domain_capacity_shortfall",
+          "contributingFactors": [
+            "3 pods Pending with FailedScheduling: 0/2 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match pod topology spread constraints.",
+            "0 pods pinned by zonal volumes"
+          ],
+          "firstSeenAt": "2026-10-19T12:00:00Z",
+          "remediation": {
+            "kind": "cluster_capacity",
+            "summary": "Deficit domain(s) (us-central1-a) lack allocatable capacity to schedule replicas of Deployment/shop/batch-worker; scale node pools in us-central1-a or right-size pod resource requests rather than editing workload spread constraints."
+          }
+        },
+        {
+          "kind": "leeway.placement_drift",
+          "subject": {
+            "kind": "Deployment",
+            "namespace": "shop",
+            "name": "checkout-api"
+          },
+          "topologyKey": "topology.kubernetes.io/zone",
+          "tier": "B",
+          "severity": "warning",
+          "score": {
+            "drift": 0.5,
+            "observedSkew": 2,
+            "minAchievableSkew": 0,
+            "excessSkew": 1,
+            "relocationDistance": 1,
+            "maxDomainShare": 1
+          },
+          "intent": {
+            "source": "topology-spread-constraint",
+            "confidence": "declared",
+            "weighting": "Equal",
+            "maxSkew": 1,
+            "evidence": [
+              "topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=ScheduleAnyway labelSelector=app=checkout-api",
+              "conflicting nodeAffinity/nodeSelector on topology.kubernetes.io/zone restricts placement to 1 domain(s), contradicting the spread constraint on topology.kubernetes.io/zone"
+            ]
+          },
+          "domains": [
+            {
+              "domain": "us-central1-a",
+              "actual": 2,
+              "expected": 1,
+              "delta": 1,
+              "readyNodes": 1
+            },
+            {
+              "domain": "us-central1-b",
+              "actual": 0,
+              "expected": 1,
+              "delta": -1,
+              "readyNodes": 1
+            }
+          ],
+          "suspectedCause": "constraint_ignored",
+          "contributingFactors": [
+            "0 pods pinned by zonal volumes",
+            "whenUnsatisfiable: ScheduleAnyway with maxSkew 1 and observed skew 2"
+          ],
+          "untestedCauses": [
+            "rollout_bias"
+          ],
+          "firstSeenAt": "2026-10-19T12:00:00Z",
+          "remediation": {
+            "kind": "manifest_patch",
+            "summary": "Remove the conflicting nodeAffinity/nodeSelector on topology.kubernetes.io/zone from Deployment/shop/checkout-api so its topologySpreadConstraint can spread replicas across eligible domains.",
+            "command": "kubectl -n shop rollout restart deployment/checkout-api",
+            "yaml": "spec:\n  template:\n    spec:\n      topologySpreadConstraints:\n      - maxSkew: 1\n        topologyKey: topology.kubernetes.io/zone\n        whenUnsatisfiable: ScheduleAnyway\n        labelSelector:\n          matchLabels:\n            app: checkout-api\n        matchLabelKeys:\n        - pod-template-hash"
+          }
+        },
+        {
+          "kind": "leeway.placement_drift",
+          "subject": {
+            "kind": "StatefulSet",
+            "namespace": "shop",
+            "name": "orders-db"
+          },
+          "topologyKey": "topology.kubernetes.io/zone",
+          "tier": "C",
+          "severity": "warning",
+          "score": {
+            "drift": 0.5,
+            "observedSkew": 2,
+            "minAchievableSkew": 0,
+            "excessSkew": 2,
+            "relocationDistance": 1,
+            "maxDomainShare": 1
+          },
+          "domains": [
+            {
+              "domain": "us-central1-a",
+              "actual": 2,
+              "expected": 1,
+              "delta": 1,
+              "readyNodes": 1
+            },
+            {
+              "domain": "us-central1-b",
+              "actual": 0,
+              "expected": 1,
+              "delta": -1,
+              "readyNodes": 1
+            }
+          ],
+          "suspectedCause": "volume_pinning",
+          "contributingFactors": [
+            "2 pods pinned by zonal volumes (subject claims zone-bound volumes)"
+          ],
+          "firstSeenAt": "2026-10-19T12:00:00Z",
+          "remediation": {
+            "kind": "storage_topology",
+            "summary": "Replicas of StatefulSet/shop/orders-db are pinned to specific topology.kubernetes.io/zone domains by PersistentVolume node affinity; do not add DoNotSchedule spread constraints unless volumes are migrated or re-provisioned across us-central1-b."
+          }
+        }
+      ]
+    },
+    {
+      "cluster": "prod-east",
+      "source": "gke:my-project/us-east1/prod-east",
+      "status": "ok",
+      "domains": {
+        "topology.kubernetes.io/region": {
+          "us-east1": {
+            "nodes": 3,
+            "ready": 3,
+            "usable": 3,
+            "allocatable_cpu_milli": 12000,
+            "allocatable_mem_bytes": 51539607552
+          }
+        },
+        "topology.kubernetes.io/zone": {
+          "us-east1-b": {
+            "nodes": 2,
+            "ready": 2,
+            "usable": 2,
+            "allocatable_cpu_milli": 8000,
+            "allocatable_mem_bytes": 34359738368
+          },
+          "us-east1-c": {
+            "nodes": 1,
+            "ready": 1,
+            "usable": 1,
+            "allocatable_cpu_milli": 4000,
+            "allocatable_mem_bytes": 17179869184
+          }
+        }
+      },
+      "topology_findings": [
+        {
+          "kind": "leeway.placement_drift",
+          "subject": {
+            "kind": "Deployment",
+            "namespace": "web",
+            "name": "frontend-web"
+          },
+          "topologyKey": "topology.kubernetes.io/zone",
+          "tier": "B",
+          "severity": "warning",
+          "score": {
+            "drift": 0.5,
+            "observedSkew": 4,
+            "minAchievableSkew": 0,
+            "excessSkew": 0,
+            "relocationDistance": 2,
+            "maxDomainShare": 1
+          },
+          "intent": {
+            "source": "cluster-default-assumed",
+            "confidence": "assumed",
+            "weighting": "Equal",
+            "maxSkew": 5,
+            "evidence": [
+              "ASSUMED cluster default (kube-scheduler PodTopologySpread defaultingType=System; not readable from a managed control plane, see spike S4) — declare --topology-cluster-defaults to replace this guess[1]: topologyKey=topology.kubernetes.io/zone maxSkew=5 whenUnsatisfiable=ScheduleAnyway; applies because the pod declares no topologySpreadConstraints of its own"
+            ]
+          },
+          "domains": [
+            {
+              "domain": "us-east1-b",
+              "actual": 4,
+              "expected": 2,
+              "delta": 2,
+              "readyNodes": 2
+            },
+            {
+              "domain": "us-east1-c",
+              "actual": 0,
+              "expected": 2,
+              "delta": -2,
+              "readyNodes": 1
+            }
+          ],
+          "suspectedCause": "unknown",
+          "contributingFactors": [
+            "0 pods pinned by zonal volumes",
+            "whenUnsatisfiable: ScheduleAnyway with maxSkew 5 and observed skew 4"
+          ],
+          "untestedCauses": [
+            "rollout_bias"
+          ],
+          "firstSeenAt": "2026-10-19T12:00:00Z",
+          "remediation": {
+            "kind": "manifest_patch",
+            "summary": "Add a topologySpreadConstraint on topology.kubernetes.io/zone to Deployment/web/frontend-web so kube-scheduler balances replicas across eligible domains.",
+            "command": "kubectl -n web rollout restart deployment/frontend-web",
+            "yaml": "spec:\n  template:\n    spec:\n      topologySpreadConstraints:\n      - maxSkew: 1\n        topologyKey: topology.kubernetes.io/zone\n        whenUnsatisfiable: ScheduleAnyway\n        labelSelector:\n          matchLabels:\n            app: frontend-web\n        matchLabelKeys:\n        - pod-template-hash"
+          }
+        }
+      ]
+    },
+    {
+      "cluster": "prod-west",
+      "source": "gke:my-project/us-west1/prod-west",
+      "status": "ok",
+      "domains": {
+        "topology.kubernetes.io/region": {
+          "us-west1": {
+            "nodes": 2,
+            "ready": 2,
+            "usable": 1,
+            "allocatable_cpu_milli": 4000,
+            "allocatable_mem_bytes": 17179869184
+          }
+        },
+        "topology.kubernetes.io/zone": {
+          "us-west1-b": {
+            "nodes": 1,
+            "ready": 1,
+            "usable": 1,
+            "allocatable_cpu_milli": 4000,
+            "allocatable_mem_bytes": 17179869184
+          },
+          "us-west1-c": {
+            "nodes": 1,
+            "ready": 1,
+            "usable": 0
+          }
+        }
+      },
+      "topology_findings": [
+        {
+          "kind": "leeway.domain_unavailable",
+          "subject": {
+            "kind": "Domain",
+            "name": "us-west1-c"
+          },
+          "topologyKey": "topology.kubernetes.io/zone",
+          "tier": "B",
+          "severity": "warning",
+          "score": {
+            "drift": 0,
+            "observedSkew": 0,
+            "minAchievableSkew": 0,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0
+          },
+          "domains": [
+            {
+              "domain": "us-west1-c",
+              "actual": 0,
+              "expected": 0,
+              "delta": 0,
+              "readyNodes": 1,
+              "note": "1 node(s) Ready, none schedulable"
+            }
+          ],
+          "suspectedCause": "taint_exclusion",
+          "firstSeenAt": "2026-10-19T12:00:00Z",
+          "remediation": {
+            "kind": "cluster_nodes",
+            "summary": "All Ready nodes in us-west1-c on topology.kubernetes.io/zone are cordoned or tainted; uncordon or remove blocking taints in us-west1-c."
+          }
+        }
+      ]
+    },
+    {
+      "cluster": "staging",
+      "source": "gke:my-project/europe-west4/staging",
+      "status": "error",
+      "error": "build client: Get \"https://10.20.0.2/api/v1/nodes\": dial tcp 10.20.0.2:443: i/o timeout"
+    }
+  ],
+  "summary": {
+    "clusters_total": 4,
+    "clusters_succeeded": 3,
+    "clusters_failed": 1,
+    "topology_findings": 5,
+    "rank_findings": 0,
+    "by_severity": {
+      "critical": 1,
+      "warning": 4
+    },
+    "by_tier": {
+      "A": 1,
+      "B": 3,
+      "C": 1
+    }
+  }
+}
