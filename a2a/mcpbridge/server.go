@@ -1311,19 +1311,37 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		return fmt.Sprintf("Terminated `/session` worker mode on **`%s`** (`console:%s`).\n", entry.Alias, entry.Token), "", "", nil
 
 	case actionDelete, actionRemoveAlias:
+		// Resolve the local entry first, with DeleteConversation's own matching, so the remote
+		// delete names the same conversation the local one removes, and an ambiguous name
+		// deletes nothing anywhere.
 		target := strings.TrimSpace(args.Alias)
-		existing, hasExisting := s.store.LookupConversation(target)
-		needsRemoteStop := hasExisting && (existing.SessionMode || strings.TrimSpace(existing.SessionWorkerID) != "")
+		notFound := fmt.Sprintf("Conversation or session %q was not found, or more than one conversation matches it by name or role; name it by alias or console token.\n", target)
+		existing, found, ambiguous := s.store.ResolveConversation(target)
+		if ambiguous {
+			return notFound, "", "", nil
+		}
+		if !found {
+			// Not in the local table: the server may still hold the name.
+			if sess, err := s.ensureConnected(ctx); err == nil && target != "" {
+				fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": target})
+				if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil); rErr == nil && txt != "" {
+					return txt, title, md, nil
+				}
+			}
+			return notFound, "", "", nil
+		}
+		needsRemoteStop := existing.SessionMode || strings.TrimSpace(existing.SessionWorkerID) != ""
+		fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": existing.Alias})
 		if sess, err := s.ensureConnected(ctx); err == nil {
-			if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, rawArgs, meta, s.store.Snapshot(), nil); rErr != nil && needsRemoteStop {
+			if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil); rErr != nil && needsRemoteStop {
 				return txt, title, md, rErr
 			}
 		} else if needsRemoteStop {
 			return "", "", "", err
 		}
-		deleted, ok := s.store.DeleteConversation(target)
+		deleted, ok := s.store.DeleteConversation(existing.Alias)
 		if !ok {
-			return fmt.Sprintf("Conversation or session %q was not found, or more than one conversation matches it by name or role; name it by alias or console token.\n", target), "", "", nil
+			return notFound, "", "", nil
 		}
 		return fmt.Sprintf("Deleted session **`%s`**.\n", FirstNonEmptyStr(deleted.Alias, target)), "", "", nil
 

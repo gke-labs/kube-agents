@@ -898,6 +898,68 @@ func (s *ConfigStore) SetConversationSessionMode(aliasOrToken string, sessionMod
 	return ConversationEntry{}, fmt.Errorf("conversation %q not found", target)
 }
 
+// ResolveConversation finds the conversation DeleteConversation would delete for aliasOrToken,
+// without changing anything: by alias, then by console token, host conversation ID or session
+// worker ID, then loosely by sanitized alias or subagent role. ambiguous reports that more than
+// one conversation matched at the step that decided, and then ok is false.
+func (s *ConfigStore) ResolveConversation(aliasOrToken string) (entry ConversationEntry, ok, ambiguous bool) {
+	if s == nil {
+		return ConversationEntry{}, false, false
+	}
+	defer s.lockForRead()()
+	key, ambiguous := s.resolveConversationKeyLocked(aliasOrToken)
+	if key == "" {
+		return ConversationEntry{}, false, ambiguous
+	}
+	return s.cfg.Conversations[key], true, false
+}
+
+// resolveConversationKeyLocked is the matching ResolveConversation and DeleteConversation share.
+// It returns "" when nothing, or more than one conversation, matches.
+func (s *ConfigStore) resolveConversationKeyLocked(aliasOrToken string) (key string, ambiguous bool) {
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
+	if target == "" {
+		return "", false
+	}
+	if _, ok := s.cfg.Conversations[target]; ok {
+		return target, false
+	}
+	var exact []string
+	for alias, entry := range s.cfg.Conversations {
+		if entry.Token == target ||
+			strings.TrimSpace(entry.HostConversationID) == target ||
+			strings.TrimSpace(entry.SessionWorkerID) == target {
+			exact = append(exact, alias)
+		}
+	}
+	switch len(exact) {
+	case 0:
+	case 1:
+		return exact[0], false
+	default:
+		return "", true
+	}
+	trimmedSessionPrefix := strings.TrimPrefix(target, "session-")
+	var loose []string
+	for alias, entry := range s.cfg.Conversations {
+		roleSlug := SanitizeAliasSlug(entry.SubagentRole)
+		if (trimmedSessionPrefix != target && alias == trimmedSessionPrefix) ||
+			SanitizeAliasSlug(alias) == target ||
+			"session-"+SanitizeAliasSlug(alias) == target ||
+			(roleSlug != "" && (roleSlug == target || "session-"+roleSlug == target || roleSlug == trimmedSessionPrefix)) {
+			loose = append(loose, alias)
+		}
+	}
+	switch len(loose) {
+	case 1:
+		return loose[0], false
+	case 0:
+		return "", false
+	default:
+		return "", true
+	}
+}
+
 // DeleteConversation removes a conversation entry by alias, console token, or session member name.
 //
 // The alias wins, then an exact identifier (console token, host conversation ID or session
@@ -910,46 +972,9 @@ func (s *ConfigStore) DeleteConversation(aliasOrToken string) (ConversationEntry
 		return ConversationEntry{}, false
 	}
 	defer s.lockForUpdate()()
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
-	if target == "" {
-		return ConversationEntry{}, false
-	}
-	matchKey := ""
-	if _, ok := s.cfg.Conversations[target]; ok {
-		matchKey = target
-	} else {
-		var exact []string
-		for alias, entry := range s.cfg.Conversations {
-			if entry.Token == target ||
-				strings.TrimSpace(entry.HostConversationID) == target ||
-				strings.TrimSpace(entry.SessionWorkerID) == target {
-				exact = append(exact, alias)
-			}
-		}
-		switch len(exact) {
-		case 0:
-		case 1:
-			matchKey = exact[0]
-		default:
-			return ConversationEntry{}, false
-		}
-	}
+	matchKey, _ := s.resolveConversationKeyLocked(aliasOrToken)
 	if matchKey == "" {
-		trimmedSessionPrefix := strings.TrimPrefix(target, "session-")
-		var loose []string
-		for alias, entry := range s.cfg.Conversations {
-			roleSlug := SanitizeAliasSlug(entry.SubagentRole)
-			if (trimmedSessionPrefix != target && alias == trimmedSessionPrefix) ||
-				SanitizeAliasSlug(alias) == target ||
-				"session-"+SanitizeAliasSlug(alias) == target ||
-				(roleSlug != "" && (roleSlug == target || "session-"+roleSlug == target || roleSlug == trimmedSessionPrefix)) {
-				loose = append(loose, alias)
-			}
-		}
-		if len(loose) != 1 {
-			return ConversationEntry{}, false
-		}
-		matchKey = loose[0]
+		return ConversationEntry{}, false
 	}
 	entry := s.cfg.Conversations[matchKey]
 	delete(s.cfg.Conversations, matchKey)

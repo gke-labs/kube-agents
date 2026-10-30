@@ -1,0 +1,91 @@
+package mcpbridge
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+// noCallNamed fails if the gateway receives a call to tool within wait.
+func noCallNamed(t *testing.T, gw *blockingGateway, tool string, wait time.Duration) {
+	t.Helper()
+	deadline := time.After(wait)
+	for {
+		select {
+		case c := <-gw.calls:
+			if c["name"] == tool {
+				t.Fatalf("the gateway received %s %v; want none", tool, c["arguments"])
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+func putConversations(t *testing.T, srv *Server, entries ...ConversationEntry) {
+	t.Helper()
+	if err := srv.Store().WithUpdateLock(func(cfg *PersistentConfig) bool {
+		now := time.Now().UTC()
+		for _, e := range entries {
+			e.CreatedAt, e.LastUsedAt = now, now
+			cfg.Conversations[e.Alias] = e
+		}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManageSessionDeleteRefusesAnAmbiguousNameBeforeTheRemoteDelete(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv,
+		ConversationEntry{Alias: "session-a", Token: MintConversationToken(), SubagentRole: "Reviewer"},
+		ConversationEntry{Alias: "session-b", Token: MintConversationToken(), SubagentRole: "Reviewer"},
+	)
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"session-reviewer"}`))
+	if res.IsError || !strings.Contains(res.Content[0].Text, "more than one conversation matches") {
+		t.Fatalf("ambiguous delete: %+v; want it refused", res)
+	}
+	noCallNamed(t, gw, ToolManageSession, 200*time.Millisecond)
+	for _, alias := range []string{"session-a", "session-b"} {
+		if _, ok := srv.Store().LookupConversation(alias); !ok {
+			t.Fatalf("ambiguous delete removed %s", alias)
+		}
+	}
+}
+
+func TestManageSessionDeleteSendsTheResolvedAliasUpstream(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	token := MintConversationToken()
+	putConversations(t, srv, ConversationEntry{Alias: "c1", Token: token, SessionMode: true})
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"console:`+token+`"}`))
+	if res.IsError {
+		t.Fatalf("delete by token: %+v", res)
+	}
+	if args := nextCallNamed(t, gw, ToolManageSession); args["alias"] != "c1" || args["action"] != "delete" {
+		t.Fatalf("forwarded delete arguments %v; want action delete on alias c1", args)
+	}
+	if _, ok := srv.Store().LookupConversation("c1"); ok {
+		t.Fatal("c1 is still saved after its delete")
+	}
+}
+
+func TestManageSessionDeleteByWorkerIDStopsTheRemoteSessionFirst(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv, ConversationEntry{Alias: "c1", Token: MintConversationToken(), SessionWorkerID: "worker-1"})
+	gw.srv.Close()
+	// DeleteConversation matches worker-1 to c1, whose session worker must be stopped upstream
+	// first: with the gateway gone, nothing is deleted.
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"worker-1"}`))
+	if !res.IsError {
+		t.Fatalf("delete by worker ID with no gateway: %+v; want the remote failure", res)
+	}
+	if _, ok := srv.Store().LookupConversation("c1"); !ok {
+		t.Fatal("c1 was deleted locally though its session worker was never stopped")
+	}
+}
