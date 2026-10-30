@@ -1380,24 +1380,28 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		// Resolve the local entry first, with DeleteConversation's own matching, so the remote
 		// delete names the same conversation the local one removes, and an ambiguous name
 		// deletes nothing anywhere.
+		// A name that resolves to nothing, or to several, is refused as an error.
 		target := strings.TrimSpace(args.Alias)
-		notFound := fmt.Sprintf("Conversation or session %q was not found, or more than one conversation matches it by name or role; name it by alias or console token.\n", target)
+		if target == "" {
+			return "", "", "", errors.New("manage_session delete needs the conversation's alias or console token")
+		}
 		existing, found, ambiguous := s.store.ResolveConversation(target)
 		if ambiguous {
-			return notFound, "", "", nil
+			return "", "", "", fmt.Errorf("more than one conversation matches %q by name or role; name it by alias or console token", target)
 		}
 		if !found {
-			// Not in the local table: the server may still hold the name.
-			if target == "" {
-				return notFound, "", "", nil
+			// Not in the local table: the server may still hold the name, and its answer, or its
+			// refusal, is the result.
+			sess, err := s.ensureConnected(ctx)
+			if err != nil {
+				return "", "", "", fmt.Errorf("conversation %q is not in this bridge's list, and the in-cluster server could not be asked: %w", target, err)
 			}
-			if sess, err := s.ensureConnected(ctx); err == nil {
-				fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": target})
-				if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil); rErr == nil && txt != "" {
-					return txt, title, md, nil
-				}
+			fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": target})
+			txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil)
+			if rErr != nil {
+				return txt, title, md, rErr
 			}
-			return notFound, "", "", nil
+			return FirstNonEmptyStr(txt, fmt.Sprintf("Deleted conversation **`%s`** on the in-cluster server.\n", target)), title, md, nil
 		}
 		needsRemoteStop := existing.SessionMode || strings.TrimSpace(existing.SessionWorkerID) != ""
 		fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": existing.Alias})
@@ -1410,7 +1414,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		}
 		deleted, ok := s.store.DeleteConversation(existing.Alias)
 		if !ok {
-			return notFound, "", "", nil
+			return "", "", "", fmt.Errorf("conversation %q was not found (another bridge process may have deleted it)", existing.Alias)
 		}
 		return fmt.Sprintf("Deleted session **`%s`**.\n", FirstNonEmptyStr(deleted.Alias, target)), "", "", nil
 

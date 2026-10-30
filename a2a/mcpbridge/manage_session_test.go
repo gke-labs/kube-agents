@@ -46,8 +46,8 @@ func TestManageSessionDeleteRefusesAnAmbiguousNameBeforeTheRemoteDelete(t *testi
 		ConversationEntry{Alias: "session-b", Token: MintConversationToken(), SubagentRole: "Reviewer"},
 	)
 	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"session-reviewer"}`))
-	if res.IsError || !strings.Contains(res.Content[0].Text, "more than one conversation matches") {
-		t.Fatalf("ambiguous delete: %+v; want it refused", res)
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "more than one conversation matches") {
+		t.Fatalf("ambiguous delete: %+v; want it refused as an error", res)
 	}
 	noCallNamed(t, gw, ToolManageSession, 200*time.Millisecond)
 	for _, alias := range []string{"session-a", "session-b"} {
@@ -178,12 +178,26 @@ func TestManageSessionNewWithoutAnAliasKeepsTheActiveConversation(t *testing.T) 
 	}
 }
 
+func TestManageSessionDeleteOfANameNobodyHoldsIsAnError(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"ghost"}`))
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "no conversation named ghost") {
+		t.Fatalf("delete of a name neither the bridge nor the server holds: %+v; want the server's refusal as an error", res)
+	}
+	gw.srv.Close()
+	res = srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":"ghost2"}`))
+	if !res.IsError {
+		t.Fatalf("delete of an unknown name with the server unreachable: %+v; want an error", res)
+	}
+}
+
 func TestManageSessionDeleteWithoutAnAliasDoesNotConnect(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)
 	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":" "}`))
-	if res.IsError || !strings.Contains(res.Content[0].Text, "was not found") {
-		t.Fatalf("delete with no alias: %+v", res)
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "needs the conversation's alias") {
+		t.Fatalf("delete with no alias: %+v; want it refused as an error", res)
 	}
 	if srv.IsSessionHealthy() {
 		t.Fatal("a delete with no alias connected to the cluster")

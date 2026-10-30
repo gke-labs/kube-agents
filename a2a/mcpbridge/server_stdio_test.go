@@ -86,6 +86,13 @@ func startBlockingGateway(t *testing.T, blockTool string) *blockingGateway {
 					g.stops <- params.Arguments
 				}
 			}
+			if act, _ := params.Arguments["action"].(string); params.Name == ToolManageSession && act == "delete" && params.Arguments["alias"] == "ghost" {
+				// The server's answer to a delete of a name it does not hold (a2a/mcp sessions.go).
+				_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
+					Content: []TextContent{{Type: contentTypeText, Text: "no conversation named ghost"}}, IsError: true,
+				}))
+				return
+			}
 			if act, _ := params.Arguments["action"].(string); params.Name == ToolManageSession && act == "delte" {
 				// The server's answer to an action it does not have.
 				_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
