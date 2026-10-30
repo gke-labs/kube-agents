@@ -20,6 +20,8 @@ type fakeJobs struct {
 	launchedAt map[string]time.Time
 	launches   []string
 	deletes    []string
+	// pod, if set, is the name Pod reports for every Job.
+	pod string
 }
 
 func newFakeJobs(readyAfter time.Duration) *fakeJobs {
@@ -45,6 +47,9 @@ func (f *fakeJobs) Pod(_ context.Context, _, _, taskID string) (string, bool, er
 	at, ok := f.launchedAt[taskID]
 	if !ok || f.readyAfter < 0 || time.Since(at) < f.readyAfter {
 		return "", false, nil
+	}
+	if f.pod != "" {
+		return f.pod, false, nil
 	}
 	return "job-" + taskID, false, nil
 }
@@ -252,5 +257,55 @@ func TestStoppingKeepsARunningTasksJob(t *testing.T) {
 	stop()
 	if jobs.deleted("task-1") {
 		t.Error("a stopping dispatcher deleted a running task's Job")
+	}
+}
+
+// A Job launched before a restart, for a task whose submission now ends at
+// admission (stopped, or refused), is deleted: never confirmed, its pod would
+// otherwise wait for an offer until its deadline, outside every cap.
+func TestAnUnstartedTasksJobIsDeletedWhenItEndsAtAdmission(t *testing.T) {
+	for name, setup := range map[string]func(b *bus) Verifier{
+		"stopped": func(b *bus) Verifier {
+			withStopStream(b.t, b)
+			b.stop("inv", "task-1")
+			return &fakeVerifier{}
+		},
+		"refused": func(*bus) Verifier { return &fakeVerifier{refuse: map[string]bool{"cap-ok": true}} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "job-task-1")
+			b.ensure("inv", 1, 0, "unattended")
+			jobs := newFakeJobs(0)
+			if err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // before the restart
+				t.Fatal(err)
+			}
+			v := setup(b)
+			b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+			b.runDispatcherWith(testConfig(), unattendedInstall(1, nil), v, jobs)
+			b.waitTerminal("task-1", 10*time.Second)
+			waitFor(t, 5*time.Second, "the unstarted task's Job deleted", func() bool { return jobs.deleted("task-1") })
+		})
+	}
+}
+
+// An offer to the Job's pod that never reaches the bus is not the worker's
+// failure: the task isn't failed, its Job isn't deleted, the breaker doesn't
+// count it, and the submission stays queued for the next pass.
+func TestAnUnsentJobOfferKeepsTheTaskQueued(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	b.ensure("inv", 1, 0, "unattended")
+	jobs := newFakeJobs(0)
+	jobs.pod = "bad pod" // a subject the bus refuses, so the send fails
+	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, func(c *lib.DispatchConfig) { c.BreakerThreshold = 1 }), &fakeVerifier{}, jobs)
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "a second pass", func() bool { return jobs.launchCount() >= 2 })
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Errorf("terminals %+v for a task whose offer was never sent", ts)
+	}
+	if jobs.deleted("task-1") {
+		t.Error("the Job was deleted over an unsent offer")
+	}
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("open breakers %v over an unsent offer", open)
 	}
 }

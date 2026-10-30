@@ -2,12 +2,14 @@ package dispatch
 
 import (
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go"
 )
 
 // withStopStream provisions DISPATCH_STOPS on the test bus as the operator
@@ -316,5 +318,65 @@ func TestAStopWhileTheJobStartsDeletesIt(t *testing.T) {
 	}
 	if open := d.Health().OpenBreakers; len(open) != 0 {
 		t.Errorf("open breakers %v: a stop is not a worker failure", open)
+	}
+}
+
+// With no stop stream the dispatcher says so, in Health and once in its log,
+// rather than taking every task as not stopped in silence.
+func TestAMissingStopStreamIsReported(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 1, 0, "read")
+	b.worker("tse", "read", "tse-0", answerAccept, 200*time.Millisecond)
+	d, _ := b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0"), &fakeVerifier{})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	b.waitTerminal("task-1", 10*time.Second)
+	if h := d.Health(); h.StopStream == "" {
+		t.Error("Health doesn't say the stop stream can't be read")
+	}
+	withStopStream(t, b)
+	d.mu.Lock()
+	d.stopReadRetry = time.Time{} // past the backoff
+	d.mu.Unlock()
+	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	b.waitTerminal("task-2", 10*time.Second)
+	if h := d.Health(); h.StopStream != "" {
+		t.Errorf("Health still reports %q once the stream reads", h.StopStream)
+	}
+}
+
+// After a failed read of the stop stream the dispatcher doesn't read it again
+// for stopReadBackoff: a broken stream or grant costs one read a period, not
+// one (with its timeout) per admission. A responder here answers each direct
+// get with a server error status, and counts them. (A 503 would not do:
+// nats.go turns it into ErrNoResponders, the error path.)
+func TestAFailedStopReadBacksOff(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	b.worker("tse", "read", "tse-0", answerAccept, 100*time.Millisecond)
+	var reads atomic.Int32
+	sub, err := b.admin.Subscribe(directGetPrefix+lib.DispatchStopStream+".>", func(m *nats.Msg) {
+		reads.Add(1)
+		reply := nats.NewMsg(m.Reply)
+		reply.Header.Set("Status", "500")
+		reply.Header.Set("Description", "Internal Server Error")
+		_ = m.RespondMsg(reply)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+	if err := b.admin.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0"), &fakeVerifier{})
+	for _, id := range []string{"task-1", "task-2", "task-3"} {
+		b.submit("tse", "read", lib.SubmitKindTop, id)
+		b.waitTerminal(id, 10*time.Second)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Errorf("%d reads of the stop stream for three admissions inside the backoff, want 1", n)
+	}
+	if d.Health().StopStream == "" {
+		t.Error("Health doesn't report the failed read")
 	}
 }

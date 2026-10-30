@@ -116,8 +116,13 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	if err != nil {
 		return lib.LeaseRecord{}, "", false, err
 	}
-	if taken == offerStopped {
+	switch taken {
+	case offerStopped:
 		return stoppedJob()
+	case offerUnsent:
+		// Not the worker's failure: the submission stays queued, and the
+		// next pass finds this Job by its task.
+		return lib.LeaseRecord{}, "", false, fmt.Errorf("the offer to the task's Job worker %s was not sent", pod)
 	}
 	if taken != offerTaken {
 		return noWorker(fmt.Sprintf("the task's Job worker %s did not take the task", pod))
@@ -135,5 +140,19 @@ func (d *Dispatcher) endJob(ctx context.Context, log *slog.Logger, h *holding) {
 	}
 	if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
 		log.Warn("delete the finished task's Job", "err", err)
+	}
+}
+
+// dropUnstartedJob deletes the Job of a task that ends at admission (stopped,
+// or refused) without ever being confirmed: one launched before a dispatcher
+// restart, whose pod would otherwise wait for an offer until its deadline,
+// outside every cap. A task not in Job mode has none; a Job already gone is
+// no error.
+func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, prof lib.DispatchProfile, hk holdKey) {
+	if d.jobs == nil || len(prof.JobTemplate) == 0 || !d.cfg.unattended(hk.tier) {
+		return
+	}
+	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.taskID); err != nil {
+		log.Warn("delete the Job of a task that ended at admission", "err", err)
 	}
 }

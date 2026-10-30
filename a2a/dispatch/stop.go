@@ -143,24 +143,61 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 	if d.bus == nil { // a Dispatcher not built by New, in tests
 		return false
 	}
+	now := d.now()
+	d.mu.Lock()
+	backingOff := now.Before(d.stopReadRetry)
+	d.mu.Unlock()
+	if backingOff {
+		return false
+	}
 	rctx, cancel := context.WithTimeout(ctx, stopCheckTimeout)
 	defer cancel()
 	subject := lib.DispatchStopSubject(profile, taskID)
 	msg, err := d.bus.Conn().RequestWithContext(rctx, directGetPrefix+lib.DispatchStopStream+"."+subject, nil)
 	switch {
 	case err != nil:
-		log.Warn("read the stop stream; taking the task as not stopped", "err", err)
+		d.stopStreamFailed(log, err.Error())
 		return false
 	case msg.Header.Get("Status") != "":
-		// 404: no record for the task (or no stream yet); anything else is
+		// 404: no record for the task; anything else (503: no stream) is
 		// an error status, read as no stop.
 		if s := msg.Header.Get("Status"); s != "404" {
-			log.Warn("read the stop stream; taking the task as not stopped", "status", s, "description", msg.Header.Get("Description"))
+			d.stopStreamFailed(log, "status "+s+" "+msg.Header.Get("Description"))
+			return false
 		}
-		return false
+	default:
+		got, ok := stopFor(profile, msg.Header.Get("Nats-Subject"), msg.Data)
+		d.stopStreamRead()
+		return ok && got == taskID
 	}
-	got, ok := stopFor(profile, msg.Header.Get("Nats-Subject"), msg.Data)
-	return ok && got == taskID
+	d.stopStreamRead()
+	return false
+}
+
+// stopReadBackoff is how long after a failed read of the stop stream the
+// dispatcher takes queued tasks as not stopped without reading it, so a
+// missing stream or grant costs one stalled read a period, not one per
+// admission.
+const stopReadBackoff = 30 * time.Second
+
+// stopStreamFailed records a failed read of the stop stream: reported in
+// Health and logged as an error, since every stop published while it lasts
+// is missed by any dispatcher that didn't hear it live.
+func (d *Dispatcher) stopStreamFailed(log *slog.Logger, why string) {
+	d.mu.Lock()
+	first := d.stopStreamErr == ""
+	d.stopStreamErr, d.stopReadRetry = why, d.now().Add(stopReadBackoff)
+	d.mu.Unlock()
+	if first {
+		log.Error("cannot read the stop stream; queued tasks are taken as not stopped, and a stop is honoured only if heard live",
+			"stream", lib.DispatchStopStream, "err", why, "retryAfter", stopReadBackoff)
+	}
+}
+
+func (d *Dispatcher) stopStreamRead() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stopStreamErr = ""
 }
 
 // stopQueued ends a submission that was stopped before any worker had it:
@@ -180,6 +217,9 @@ func stopDeadline(cfg lib.DispatchConfig, now time.Time) time.Time { return now.
 // canceled, tombstoned and acked; its Job, if it has one, goes after hold.
 func (d *Dispatcher) stopHeld(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	log.Info("the task didn't stop within the grace; abandoning it", "pod", rec.Pod)
+	// Ended by its requester, not lost by its worker: a half-open breaker
+	// closes as on a finish.
+	d.breakers.finished(h.profile, h.tier)
 	_ = d.send(lib.DispatchSubject(h.profile, h.tier, rec.Pod), lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonStopped})
 	d.failAs(ctx, log, del, h, key, rec, lib.StateCanceled, ReasonStopped,
 		fmt.Sprintf("stopped by the conversation; the worker %s didn't stop within %s", rec.Pod, stopGrace(d.src.Config())))

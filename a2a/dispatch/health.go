@@ -31,6 +31,9 @@ type Health struct {
 	// OpenBreakers are the (profile, tier) pairs, as profile/tier, whose
 	// breaker is refusing new submissions (breaker.go).
 	OpenBreakers []string
+	// StopStream is why the dispatcher can't read the stop stream, or ""
+	// (stop.go): while it is set, a stop counts only if heard live.
+	StopStream string
 }
 
 func (d *Dispatcher) noteWaiting(taskID, durable string, queued time.Time, why string) {
@@ -82,6 +85,7 @@ func (d *Dispatcher) Health() Health {
 	}
 	sort.Strings(h.Stalled)
 	h.OpenBreakers = d.breakers.open(now)
+	h.StopStream = d.stopStreamErr
 	return h
 }
 
@@ -89,6 +93,9 @@ func (d *Dispatcher) logHealth() {
 	h := d.Health()
 	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "oldestWait", h.OldestWait,
 		"droppedAnswers", h.DroppedAnswers)
+	if h.StopStream != "" {
+		d.log.Warn("the stop stream can't be read; a stop counts only if heard live", "err", h.StopStream)
+	}
 	if len(h.Stalled) > 0 {
 		d.log.Warn("admission stalled: submissions waiting over a cap with no admission; a cross-chain cycle holds until the parents' deadlines",
 			"durables", h.Stalled, "stallAfter", d.cfg.StallAfter)

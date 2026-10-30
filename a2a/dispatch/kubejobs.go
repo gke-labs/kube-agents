@@ -124,8 +124,14 @@ func (k *KubeJobs) Pod(ctx context.Context, profile, tier, taskID string) (strin
 		return "", true, nil
 	}
 	for _, c := range job.Status.Conditions {
-		if (c.Type == batchv1.JobFailed || c.Type == batchv1.JobFailureTarget) && c.Status == corev1.ConditionTrue {
-			return "", true, nil
+		// Failed, or already finished: a Job's one pod ran without this
+		// dispatcher's confirm (an abandoned offer it exited on), so it will
+		// never take the task.
+		switch c.Type {
+		case batchv1.JobFailed, batchv1.JobFailureTarget, batchv1.JobComplete, batchv1.JobSuccessCriteriaMet:
+			if c.Status == corev1.ConditionTrue {
+				return "", true, nil
+			}
 		}
 	}
 	pods, err := k.kube.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: jobNameLabel + "=" + name})
@@ -137,7 +143,7 @@ func (k *KubeJobs) Pod(ctx context.Context, profile, tier, taskID string) (strin
 		if !metav1.IsControlledBy(p, job) {
 			continue
 		}
-		if p.Status.Phase == corev1.PodFailed {
+		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
 			return "", true, nil
 		}
 		if p.DeletionTimestamp == nil && podReady(p) && lib.ValidSubjectToken(p.Name) {

@@ -264,3 +264,44 @@ func TestTheBuiltJobMatchesTheAdmissionFixture(t *testing.T) {
 		t.Fatalf("the Job buildJob makes no longer matches %s: rerun with -update-dispatcher-job, then the operator's TestTheDispatcherJobPolicy envtest, which admits it", dispatcherJobFixture)
 	}
 }
+
+// A Job that already finished (its one pod exited, say on an offer a
+// stopping dispatcher abandoned) will never take the task: failed, by the
+// Job's condition or by its Succeeded pod, rather than waited on for the
+// whole start limit.
+func TestAFinishedKubeJobIsFailed(t *testing.T) {
+	for name, finish := range map[string]func(t *testing.T, kube *fake.Clientset, job *batchv1.Job){
+		"complete": func(t *testing.T, kube *fake.Clientset, job *batchv1.Job) {
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+			if _, err := kube.BatchV1().Jobs(job.Namespace).Update(context.Background(), job, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"its pod succeeded": func(t *testing.T, kube *fake.Clientset, job *batchv1.Job) {
+			p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "job-pod", Namespace: job.Namespace, Labels: map[string]string{jobNameLabel: job.Name},
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID, Controller: ptr.To(true)}}},
+				Status: corev1.PodStatus{Phase: corev1.PodSucceeded}}
+			if _, err := kube.CoreV1().Pods(job.Namespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := kubeJobsConfig(t)
+			kube := fake.NewClientset()
+			k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+			ctx := context.Background()
+			if err := k.Launch(ctx, "inv", "unattended", "task-1"); err != nil {
+				t.Fatal(err)
+			}
+			job, err := kube.BatchV1().Jobs("ns-profiles").Get(ctx, JobName("inv", "unattended", "task-1"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			finish(t, kube, job)
+			if _, failed, err := k.Pod(ctx, "inv", "unattended", "task-1"); !failed || err != nil {
+				t.Errorf("failed %v err %v, want failed", failed, err)
+			}
+		})
+	}
+}

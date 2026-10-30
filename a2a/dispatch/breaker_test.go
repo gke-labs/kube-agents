@@ -208,3 +208,42 @@ func TestAHeldSubmissionEndsAtItsQueueTimeout(t *testing.T) {
 		t.Errorf("terminal %+v, want rejected queue-timeout", ts)
 	}
 }
+
+// A half-open breaker's probe that ends at its deadline (its worker renewed
+// to the end) or is stopped by its requester was no worker loss: the breaker
+// closes, as on a finish, rather than serialising the tier until one.
+func TestAHalfOpenProbeEndingWithoutAWorkerLossClosesTheBreaker(t *testing.T) {
+	for name, end := range map[string]func(b *bus, ti *testInstall){
+		"deadline": func(_ *bus, ti *testInstall) {
+			ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = 2 })
+		},
+		"stopped": func(b *bus, ti *testInstall) {
+			withStopStream(b.t, b)
+			ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds = 1 })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "tse-0")
+			b.ensure("tse", 1, 0, "read")
+			w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+			ti := oneProfile("tse", 1, "tse-0")
+			end(b, ti)
+			d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+			d.breakers.expired(lib.DispatchConfig{BreakerThreshold: 1, BreakerCooldownSeconds: 1}, "tse", "read", time.Now())
+			time.Sleep(1200 * time.Millisecond) // past the cooldown: half open
+			b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+			waitFor(t, 10*time.Second, "the probe running", func() bool { return w.startedTask("task-1") })
+			if name == "stopped" {
+				b.stop("tse", "task-1")
+			}
+			if ts := b.waitTerminal("task-1", 15*time.Second); ts.state == lib.StateCompleted {
+				t.Fatalf("terminal %+v: the probe should have been ended by the dispatcher", ts)
+			}
+			waitFor(t, 5*time.Second, "the breaker closed", func() bool {
+				d.breakers.mu.Lock()
+				defer d.breakers.mu.Unlock()
+				return len(d.breakers.m) == 0
+			})
+		})
+	}
+}

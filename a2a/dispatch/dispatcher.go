@@ -205,6 +205,10 @@ type Dispatcher struct {
 	// stopped the stops heard live, by profile/task (stop.go).
 	stopSubs map[string]lib.Subscription
 	stopped  map[string]time.Time
+	// stopStreamErr is why the last read of the stop stream failed ("" once
+	// one succeeds), and stopReadRetry when to read it again (stop.go).
+	stopStreamErr string
+	stopReadRetry time.Time
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -593,6 +597,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	now := d.now()
 	ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
+		d.dropUnstartedJob(ctx, log, prof, hk)
 		d.stopQueued(ctx, log, del, hk)
 		return
 	}
@@ -608,6 +613,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
 		d.clearWaiting(taskID)
+		d.dropUnstartedJob(ctx, log, prof, hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -883,6 +889,8 @@ const (
 	offerNotTaken offerOutcome = iota
 	// offerTaken: accepted, the lease recorded and the confirm sent.
 	offerTaken
+	// offerUnsent: the offer never reached the bus; the pod is free.
+	offerUnsent
 	// offerStopped: the task was stopped (contract addendum 9) before the
 	// confirm. The offer, if sent, is abandoned on the pod, nothing is
 	// recorded, and the task is not offered to anyone else.
@@ -936,7 +944,7 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 	if err := d.send(subject, msg); err != nil {
 		giveUp("")
 		log.Warn("offer not sent", "pod", pod, "err", err)
-		return lib.LeaseRecord{}, "", offerNotTaken, nil
+		return lib.LeaseRecord{}, "", offerUnsent, nil
 	}
 	timer := time.NewTimer(acceptTimeout)
 	var acc lib.DispatchAccept
@@ -1119,6 +1127,9 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			case now.After(rec.Deadline):
 				log.Warn("task passed its deadline; failing it", "pod", rec.Pod, "deadline", rec.Deadline)
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonDeadline})
+				// Its worker renewed to the end, so it was no worker loss:
+				// a half-open breaker closes as on a finish.
+				d.breakers.finished(h.profile, h.tier)
 				d.fail(ctx, log, del, h, key, rec, ReasonDeadlineExceeded,
 					fmt.Sprintf("ran past the profile's %s limit", deadlineLimit(rec)))
 				return
