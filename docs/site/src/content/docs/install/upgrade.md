@@ -509,6 +509,8 @@ gateway.
    - Keep the agent image at the operator's release. A learned home channel reaches the agent through
      a file the operator mounts; an older agent image reads env only and never sees it, while the CR
      shows no condition.
+   - An allowed member moves the home channel later from the app's Home tab (the Home channel panel);
+     the record keeps who moved it and when.
 
 3. Check the board for cards in flight:
 

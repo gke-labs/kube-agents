@@ -1627,7 +1627,12 @@ older gateway or a hand edit, and a learn that adopts or replaces the channel cl
 mention may learn; a record another writer filled first, or the record of a learn the file has not
 caught up with, is adopted after the same check with no line posted, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
-candidate. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
+candidate. The second writer is the Home tab's channel picker (`a2a/gateway/slack_home_pick.go`): a
+`conversations_select` on the admitted Home view, deduped on the member and `action_ts`, admitted by
+`homeAdmitted` after the other-workspace check, checked as a mention is, then one merge patch under the
+read `resourceVersion` with no retry (`moveHome`; a 409 names the winner); the member's view shows the
+move over the projected file for at most two minutes, one line in the new channel names who moved it
+and one in the old says it moved. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
 nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
 patches with the read `resourceVersion` as the precondition are the gateway's contract.
 
