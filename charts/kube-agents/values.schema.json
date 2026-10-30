@@ -199,6 +199,10 @@
             "numRetries": {
               "type": "integer",
               "minimum": 0
+            },
+            "retryAfterSeconds": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         },

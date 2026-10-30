@@ -772,9 +772,9 @@ Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
 neither key), which only openai_compatible passes, and the optional
-dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds
-and numRetries. Every optional input renders nothing when unset, so the default
-render is unchanged.
+dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds,
+numRetries and retryAfterSeconds. Every optional input renders nothing when
+unset, so the default render is unchanged.
 callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
@@ -885,6 +885,10 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- end -}}
 {{- $timeout := int (.timeoutSeconds | default 0) -}}
 {{- $numRetries := int (.numRetries | default 0) -}}
+{{- $retryAfter := int (.retryAfterSeconds | default 0) -}}
+{{- if and (gt $retryAfter 0) (le $numRetries 0) -}}
+{{- fail (printf "litellm.fallback.retryAfterSeconds %d is set without litellm.fallback.numRetries; the pause is between retries the router does not make" $retryAfter) -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -952,7 +956,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -965,6 +969,16 @@ router_settings:
   {{- end }}
   {{- if gt $numRetries 0 }}
   num_retries: {{ $numRetries }}
+  {{- end }}
+  {{- /*
+    The shortest pause before a retry. LiteLLM's own pause is an exponential
+    backoff from 0.5s, so without this a 429 from a per-minute quota is
+    retried inside the same closed minute. LiteLLM also clamps the pause to
+    MAX_RETRY_DELAY (8s unless the environment says otherwise); the Deployment
+    raises that to this value when it is above 8, in templates/litellm.yaml.
+  */}}
+  {{- if gt $retryAfter 0 }}
+  retry_after: {{ $retryAfter }}
   {{- end }}
   {{- if $claude }}
   default_litellm_params:

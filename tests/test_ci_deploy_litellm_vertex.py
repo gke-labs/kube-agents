@@ -47,6 +47,19 @@ class CiDeployLitellmVertexTest(unittest.TestCase):
             "every Vertex call 403s after helm --wait has already passed.",
         )
 
+    def test_the_eval_install_retries_at_the_gateway_half_a_minute_apart(self) -> None:
+        """A Vertex 429 on a per-minute quota names no Retry-After; LiteLLM's
+        stock pause (0.5s doubling, clamped to 8s) retries inside the same
+        closed minute. The eval install sets two retries a half-minute apart;
+        the chart default stays none."""
+        text = _CI_DEPLOY.read_text()
+        self.assertIn('readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"', text)
+        self.assertIn(
+            'readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-30}"', text
+        )
+        self.assertIn('--set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}"', text)
+        self.assertIn('--set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}"', text)
+
     def test_the_litellm_gsa_is_not_the_platform_gsa(self) -> None:
         """The gateway proxies attacker-influenceable content and must hold
         aiplatform.user only — see the site's security-and-iam.md, 'The
