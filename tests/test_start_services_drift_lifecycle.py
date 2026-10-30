@@ -1098,6 +1098,9 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             # Inside Go's range, past the ceiling the watcher's sums need.
             ("normalize_duration", "1000000h1ns", _FALLBACK_DURATION),
             ("normalize_duration", "2562047h", _FALLBACK_DURATION),
+            ("normalize_duration", "3600000000000001us", _FALLBACK_DURATION),
+            # Inside Go's range, but nineteen digits: the pattern's own cap,
+            # which keeps the arithmetic inside bash's int64.
             ("normalize_duration", "9223372036854775807ns", _FALLBACK_DURATION),
         ):
             with self.subTest(value=value):
