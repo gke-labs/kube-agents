@@ -235,12 +235,6 @@ func probeKubeContext(ctx context.Context, kubeCtx string) ([]mcpbridge.Deployme
 		}
 		return nil, fmt.Errorf("listing PlatformAgents: %s", describeAPIError(err, out))
 	}
-	// The AgentProfile list gets its own deadline rather than what the PlatformAgent list left.
-	profCtx, profCancel := context.WithTimeout(ctx, contextProbeTimeout)
-	defer profCancel()
-	profOut, profErr := clientset.Discovery().RESTClient().Get().AbsPath(crdAbsPathAgentProfiles).DoRaw(profCtx)
-	profilesUnknown := profErr != nil && !apierrors.IsNotFound(profErr)
-
 	var paList k8sPlatformAgentList
 	if err := json.Unmarshal(out, &paList); err != nil {
 		return nil, fmt.Errorf("decoding PlatformAgent list: %w", err)
@@ -248,6 +242,13 @@ func probeKubeContext(ctx context.Context, kubeCtx string) ([]mcpbridge.Deployme
 	if len(paList.Items) == 0 {
 		return nil, nil
 	}
+
+	// Only a context with a PlatformAgent pays for the AgentProfile list, which gets its own
+	// deadline rather than what the PlatformAgent list left.
+	profCtx, profCancel := context.WithTimeout(ctx, contextProbeTimeout)
+	defer profCancel()
+	profOut, profErr := clientset.Discovery().RESTClient().Get().AbsPath(crdAbsPathAgentProfiles).DoRaw(profCtx)
+	profilesUnknown := profErr != nil && !apierrors.IsNotFound(profErr)
 
 	profilesByNS := make(map[string][]string)
 	if profErr == nil && len(profOut) > 0 {

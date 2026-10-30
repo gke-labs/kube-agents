@@ -333,3 +333,34 @@ func TestFullScanWithNoKubeconfigFileIsAnErrorNotAnEmptyScan(t *testing.T) {
 		t.Fatalf("full scan of a kubeconfig with no contexts = %v, %v; want a clean empty scan", entries, err)
 	}
 }
+
+func TestProbeSkipsTheAgentProfileListWhenNoPlatformAgentExists(t *testing.T) {
+	// The state helm uninstall leaves: the CRDs stay, with no PlatformAgent.
+	var profileLists atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case crdAbsPathPlatformAgents:
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		case crdAbsPathAgentProfiles:
+			profileLists.Add(1)
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	kc := fmt.Sprintf("apiVersion: v1\nkind: Config\nclusters:\n- name: c\n  cluster:\n    server: %s\ncontexts:\n- name: crds-only\n  context:\n    cluster: c\ncurrent-context: crds-only\n", srv.URL)
+	kcPath := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(kcPath, []byte(kc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", kcPath)
+	entries, err := probeKubeContext(context.Background(), "crds-only")
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("probe of a context with the CRDs and no PlatformAgent = %v, %v; want nothing", entries, err)
+	}
+	if n := profileLists.Load(); n != 0 {
+		t.Fatalf("the probe listed AgentProfiles %d time(s) in a context with no PlatformAgent", n)
+	}
+}
