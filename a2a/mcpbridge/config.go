@@ -82,12 +82,15 @@ type DeploymentProfile struct {
 	ChatPlatform             string    `json:"chatPlatform,omitempty"`
 	MCPService               string    `json:"mcpService,omitempty"`
 	MCPPort                  int       `json:"mcpPort,omitempty"`
-	DirectMCPURL             string    `json:"directMcpUrl,omitempty"`
-	TokenSecretName          string    `json:"tokenSecretName,omitempty"`
-	MCPToken                 string    `json:"-"`
-	Ready                    bool      `json:"ready"`
-	StatusMessage            string    `json:"statusMessage,omitempty"`
-	AgentProfiles            []string  `json:"agentProfiles,omitempty"`
+	// DirectMCPURL, set by hand, reaches the in-cluster a2a-mcp server at this URL instead of
+	// through a port-forward: its base (https://host:port) or its /mcp endpoint, https://, or
+	// http:// on a loopback address only.
+	DirectMCPURL    string   `json:"directMcpUrl,omitempty"`
+	TokenSecretName string   `json:"tokenSecretName,omitempty"`
+	MCPToken        string   `json:"-"`
+	Ready           bool     `json:"ready"`
+	StatusMessage   string   `json:"statusMessage,omitempty"`
+	AgentProfiles   []string `json:"agentProfiles,omitempty"`
 	// AgentProfilesUnknown marks a discovered profile whose AgentProfile list could not be
 	// read (RBAC, timeout), so an empty AgentProfiles is not "none" and the saved list stays.
 	AgentProfilesUnknown bool             `json:"-"`

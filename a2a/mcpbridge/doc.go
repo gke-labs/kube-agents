@@ -19,6 +19,9 @@
 // behind the ClusterAccess interface and is implemented by the sibling package
 // kube (k8s.io/client-go), so this package itself has no Kubernetes dependency.
 // Linux and macOS are supported; process supervision relies on POSIX signals.
+// A deployment profile's directMcpUrl, set by hand in the state file, skips
+// the port-forward: it is the a2a-mcp server's base URL or its /mcp endpoint
+// (either names the same server), https://, or http:// on loopback only.
 //
 // Environment variables:
 //

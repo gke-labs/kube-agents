@@ -396,6 +396,26 @@ func TestValidateDirectMCPURLRejectsNonLoopbackCleartext(t *testing.T) {
 	}
 }
 
+// A directMcpUrl written as the endpoint the docs name (".../mcp") reaches POST /mcp, not
+// /mcp/mcp: the gateway 404s every other path.
+func TestDirectMCPURLEndingInMCPIsPostedToMCP(t *testing.T) {
+	for _, suffix := range []string{"", "/", "/mcp", "/mcp/"} {
+		gw, auth := envTokenGateway(t)
+		srv := envTokenServer(t, gw.URL+suffix, "direct")
+		t.Setenv(EnvMCPToken, envTokenValue)
+		connectAuth(t, srv, auth, "direct")
+		if res := srv.CallTool(context.Background(), ToolConnectionStatus, json.RawMessage(`{}`)); res.IsError {
+			t.Fatalf("directMcpUrl %s%s: connection_status: %+v", gw.URL, suffix, res)
+		}
+	}
+	if got, err := validateDirectMCPURL("https://mcp/mcp"); err != nil || got != "https://mcp" {
+		t.Fatalf("validateDirectMCPURL(https://mcp/mcp) = %q, %v; want https://mcp", got, err)
+	}
+	if got, err := validateDirectMCPURL("https://mcp"); err != nil || got != "https://mcp" {
+		t.Fatalf("validateDirectMCPURL(https://mcp) = %q, %v; want the host named mcp kept", got, err)
+	}
+}
+
 type failingClusterAccess struct {
 	noClusterAccess
 	discoverEntries []DeploymentProfile

@@ -207,12 +207,18 @@ func validateDirectMCPURL(rawURL string) (string, error) {
 	}
 	scheme := strings.ToLower(u.Scheme)
 	host := strings.ToLower(u.Hostname())
+	// The URL is the server's base: requests append remoteMCPPath and its siblings. The
+	// endpoint the docs name (".../mcp") is accepted too, as its base, not posted to /mcp/mcp.
+	base := strings.TrimRight(trimmed, "/")
+	if u.RawQuery == "" && u.Fragment == "" && strings.HasSuffix(strings.TrimRight(u.Path, "/"), remoteMCPPath) {
+		base = strings.TrimRight(strings.TrimSuffix(base, remoteMCPPath), "/")
+	}
 	switch scheme {
 	case "https":
-		return strings.TrimRight(trimmed, "/"), nil
+		return base, nil
 	case "http":
 		if host == "127.0.0.1" || host == "localhost" || host == "::1" {
-			return strings.TrimRight(trimmed, "/"), nil
+			return base, nil
 		}
 		return "", fmt.Errorf("refusing cleartext direct MCP URL %q on non-loopback host %q; use https:// or a loopback address", rawURL, host)
 	default:
