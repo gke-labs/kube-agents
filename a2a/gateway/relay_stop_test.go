@@ -69,7 +69,7 @@ func TestAStoppedGatewayDropsABatchWithOneLine(t *testing.T) {
 // TestAFailedRecordReadGivesTheBatchBack: on a running gateway, a batch
 // whose session record can't be read goes back to the stream after
 // requeueDelay, delivery by delivery, and nothing is acked: the stream, not
-// the process, holds what nobody rendered, and the hold on the durable ends.
+// the process, holds what nobody rendered.
 func TestAFailedRecordReadGivesTheBatchBack(t *testing.T) {
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
@@ -108,5 +108,68 @@ func TestAFailedTaskLookupGivesTheEventBack(t *testing.T) {
 	r.g.relayDelivery(r.g.runCtx, d)
 	if d.acks != 0 || len(d.naks) != 1 || d.naks[0] != requeueDelay {
 		t.Fatalf("acks %d, naks %v: want one nak with requeueDelay and no ack", d.acks, d.naks)
+	}
+}
+
+// closeRecorder is the rig's adapter with a Close that records whether the
+// relay's stop drain had already begun when the gateway closed it.
+type closeRecorder struct {
+	*fakeAdapter
+	g          **Gateway
+	closed     chan struct{}
+	afterDrain bool
+}
+
+func (c *closeRecorder) Close() {
+	f := &(*c.g).relayInFlight
+	f.mu.Lock()
+	c.afterDrain = f.stopping
+	f.mu.Unlock()
+	close(c.closed)
+}
+
+// TestTheGatewayClosesItsAdaptersAfterTheRelayDrain: a batch rendering when
+// the stop begins posts through the adapters, so they close only once the
+// drain is done, not when ingress stops.
+func TestTheGatewayClosesItsAdaptersAfterTheRelayDrain(t *testing.T) {
+	var g *Gateway
+	rec := &closeRecorder{g: &g, closed: make(chan struct{})}
+	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(f *fakeAdapter) Adapter {
+		rec.fakeAdapter = f
+		return rec
+	})
+	g = r.g
+	waitRunning(t, r)
+	r.stop()
+	select {
+	case <-rec.closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the gateway never closed its adapter")
+	}
+	if !rec.afterDrain {
+		t.Fatal("the adapter closed before the relay's stop drain began")
+	}
+}
+
+// TestADeliveryDuringTheStopIsLeftForTheGiveBack: once Run's ctx is
+// cancelled, a delivery the relay receives is neither acked nor nak'd with a
+// delay, so the subscription's stop gives it back in stream order.
+func TestADeliveryDuringTheStopIsLeftForTheGiveBack(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
+	r.stop()
+	waitFor(t, "the gateway stopped", func() bool { return r.g.runCtx.Err() != nil })
+	env := &lib.Envelope{Kind: lib.KindStatusUpdate, TaskID: "task-during-stop"}
+	d := &nakRecorder{fakeDelivery: fakeDelivery{env: env, subj: "a2a.tasks.platform.task-during-stop.events", seq: 11}}
+	r.g.relayDelivery(r.g.runCtx, d)
+	if d.acks != 0 || len(d.naks) != 0 {
+		t.Fatalf("acks %d, naks %v: want the delivery left unsettled for the give-back", d.acks, d.naks)
+	}
+	if strings.Contains(r.logs.String(), "task index lookup failed") {
+		t.Fatalf("the stop read the task index on a cancelled ctx and logged it as a failure:\n%s", r.logs.String())
+	}
+	r.g.giveBackLater(relayItem{env: env, subject: d.subj, d: d})
+	if len(d.naks) != 0 {
+		t.Fatalf("giveBackLater nak'd during the stop: %v", d.naks)
 	}
 }

@@ -361,10 +361,11 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 	return a, nil
 }
 
-// Close is for an adapter that was never run, or needs closing early: Run
-// closes the connection itself once ctx is cancelled, so a caller that also
-// defers Close (or registers it with t.Cleanup) after cancelling is safe —
-// IsClosed makes this idempotent.
+// Close closes the connection. Run closes it itself only when the connection
+// fails; a cancelled ctx stops ingress and leaves the connection open, because
+// the relay may still be rendering onto it, and Gateway.Run calls Close once
+// the relay's stop drain is done. A caller running the adapter on its own
+// closes it after Run returns. IsClosed makes this idempotent.
 func (a *ConsoleAdapter) Close() {
 	if a.nc != nil && !a.nc.IsClosed() {
 		a.closingFlag.Store(true)
@@ -432,7 +433,12 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 		}
 	}
 	_ = sub.Unsubscribe()
-	a.Close()
+	// On a stop the connection stays open: ingress has ended, but the
+	// relay may still be rendering a batch onto it, and the gateway closes
+	// it once that drain is done (Gateway.Run).
+	if runErr != nil {
+		a.Close()
+	}
 	return runErr
 }
 

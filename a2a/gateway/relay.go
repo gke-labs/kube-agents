@@ -199,6 +199,10 @@ func (g *Gateway) giveBackLater(item relayItem) {
 		}()
 		return
 	}
+	if g.runCtx.Err() != nil {
+		// Stopping: the subscription's stop gives it back in stream order.
+		return
+	}
 	if err := item.d.Nak(requeueDelay); err != nil {
 		g.log.Warn("relay: give-back failed", "taskId", item.env.TaskID, "err", err)
 	}
@@ -240,7 +244,16 @@ func (g *Gateway) relayItemIn(ctx context.Context, item relayItem) {
 		g.settle(item)
 		return
 	}
+	if ctx.Err() != nil && item.d != nil {
+		// Stopping: leave the delivery unsettled, so the subscription's stop
+		// gives it back in stream order with the rest.
+		return
+	}
 	sessionKey, err := g.lookupTaskSession(ctx, env.TaskID)
+	if err != nil && ctx.Err() != nil && item.d != nil {
+		// The lookup failed because the stop began during it.
+		return
+	}
 	if err != nil {
 		// A failed lookup isn't "not ours": give it back for a later try
 		// rather than ack away an event this gateway may own.
@@ -296,9 +309,11 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			return
 		}
 		// A transient KV failure on a terminal event must not lose the
-		// result: each event goes back to the stream for a later try, which
-		// also frees its hold on the durable while KV is down. Redelivered,
-		// the batch renders in stream order again.
+		// result: each event goes back to the stream for a later try.
+		// Redelivered, the batch renders in stream order again. A delayed
+		// nak keeps the event in the durable's pending count until it is
+		// redelivered, so an outage long enough to fill relayMaxAckPending
+		// still stalls new events; it no longer loses any.
 		g.log.Error("relay: session record unavailable; giving the batch back", "session", sessionKey, "err", err)
 		for _, item := range batch {
 			g.giveBackLater(item)
@@ -1143,9 +1158,11 @@ func (g *Gateway) dropStoppedBatch(sessionKey string, batch []relayItem) {
 const relayMaxAckPending = 8192
 
 // relayStopDrainTimeout bounds how long a stopping gateway waits for the
-// batches already rendering before it gives the rest back. A batch is bounded
-// by turnTimeout; one that overruns this is given back and may post twice.
-const relayStopDrainTimeout = turnTimeout
+// batches already rendering before it gives the rest back. The gateway pod
+// gets the kubelet's default 30s grace period, and the give-back has to run
+// inside it, or every held event waits out AckWait on the next gateway. A
+// batch that overruns this is given back and may post twice.
+const relayStopDrainTimeout = 15 * time.Second
 
 // inFlight counts the relay batches past their stop check, so a stop can wait
 // for them. Once draining starts, no batch enters.

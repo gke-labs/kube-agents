@@ -619,9 +619,13 @@ func (g *Gateway) Run(ctx context.Context) error {
 	}
 	// The batches already rendering finish first, then the subscription's
 	// stop gives every event not yet rendered back to the stream.
+	// Only then do the adapters close their connections: ingress stopped
+	// when ctx ended, but a batch rendering past its stop check posts
+	// through them.
 	defer func() {
 		g.relayInFlight.drain(relayStopDrainTimeout)
 		sub.Stop()
+		closeAdapter(g.adapter)
 	}()
 
 	go g.reapLoop(ctx)
