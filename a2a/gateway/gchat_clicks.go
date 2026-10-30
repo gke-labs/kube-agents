@@ -116,9 +116,9 @@ type gchatClick struct {
 // answer can rewrite it.
 type gchatQuestion struct {
 	conversation string
-	// thread is the thread a home post is in (createLaidOut's landed,
-	// EditNotifyMessage's thread), "" for a conversation's question, which
-	// its conversation names.
+	// thread is the thread the post landed in (createLaidOut's landed,
+	// EditNotifyMessage's thread; "" for an edit that names its
+	// conversation), read for a home post, whose conversation is empty.
 	thread  string
 	asks    bool
 	layout  gchatChatLayout
@@ -347,6 +347,12 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		// Chat shows, text and buttons.
 		p.text = ev.Message.Text
 		p.links, p.label = gchatMessageButtons(ev.Message, index, p.label)
+		if click.Parameters[gchatChatParamHome] != "" && ev.Message.Thread.Name != "" && (thread != "" || kind == sessionKindDM) {
+			// A home card says so on its buttons (gchatHomeButtons), so its
+			// click binds to the thread the event names, as a remembered
+			// one's does, rather than to a DM's root.
+			bound = gchatConversationID(ev.Space.Name, ev.Message.Thread.Name, kind)
+		}
 	}
 	ux.pending[id] = p
 	ux.waiting[ev.Message.Name] = true

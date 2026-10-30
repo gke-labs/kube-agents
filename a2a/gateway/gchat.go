@@ -556,6 +556,9 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %w", ErrLayoutRefused, err)
 	}
+	if conversation == "" {
+		layout = gchatHomeButtons(layout)
+	}
 	message, landed, err = a.create(space, thread, gchatLayoutBody(layout))
 	if err != nil {
 		return "", "", gchatLayoutError(err, false)
@@ -624,6 +627,9 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, thread, messageID string, 
 				a.forgetAnswer(messageID)
 			}
 			return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+		}
+		if conversation == "" {
+			layout = gchatHomeButtons(layout)
 		}
 	}
 	layout = a.answeredLayout(messageID, m, layout)

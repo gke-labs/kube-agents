@@ -688,6 +688,34 @@ func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
 		t.Fatalf("click = %+v (%q); want it bound to the card's thread", msg, reason)
 	}
+	// The home card's buttons say so, and a conversation's do not.
+	params := func(call relayCall) []any {
+		widgets := call.arguments["body"].(map[string]any)["accessoryWidgets"].([]any)
+		buttons := widgets[0].(map[string]any)["buttonList"].(map[string]any)["buttons"].([]any)
+		return buttons[0].(map[string]any)["onClick"].(map[string]any)["action"].(map[string]any)["parameters"].([]any)
+	}
+	if ps := params(f.call(0)); len(ps) != 3 || ps[2].(map[string]any)["key"] != gchatChatParamHome {
+		t.Fatalf("home button parameters = %v; want the home mark", ps)
+	}
+	if _, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", ask); err != nil {
+		t.Fatal(err)
+	}
+	if ps := params(f.call(1)); len(ps) != 2 {
+		t.Fatalf("conversation button parameters = %v; want no home mark", ps)
+	}
+	// After a restart the adapter remembers nothing; the mark on the
+	// clicked button binds the click to the thread all the same.
+	restarted := newTestGchatAdapterWithRelay(t, f)
+	later := gchatClickEvent(t)
+	later.click.Parameters[gchatChatParamHome] = gchatChatParamHomeValue
+	msg, reason = restarted.classifyClick(later)
+	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
+		t.Fatalf("click after a restart = %+v (%q); want it bound to the card's thread", msg, reason)
+	}
+	unmarked := gchatClickEvent(t)
+	if msg, reason := newTestGchatAdapterWithRelay(t, f).classifyClick(unmarked); reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" {
+		t.Fatalf("an unmarked click after a restart = %+v (%q); want the event's surface, the DM root", msg, reason)
+	}
 	// Edited into the head by its key, the question keeps the thread.
 	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "spaces/_c2fixtureAA/threads/BOT1", "spaces/_c2fixtureAA/messages/BOT1.BOT1", ask); err != nil {
 		t.Fatal(err)

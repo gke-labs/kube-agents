@@ -61,7 +61,9 @@ type NotifyRequest struct {
 	// Blocks, when set, is a Slack Block Kit array posted as one message
 	// with Text as its notification and fallback text (the fleet audit's
 	// report card). Only a backend that renders blocks takes it; any other
-	// refuses the request rather than dropping the blocks.
+	// refuses the request rather than dropping the blocks, and a request
+	// with Blocks and an Update key is refused: the gateway edits chat
+	// messages and text by key, not Block Kit.
 	Blocks json.RawMessage `json:"blocks,omitempty"`
 	// Conversation, with ContextID, aims the request at a conversation the
 	// gateway holds (its session-record key, e.g. "gchat:spaces/A/threads/B")

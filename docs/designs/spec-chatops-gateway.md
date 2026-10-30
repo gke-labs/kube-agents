@@ -1749,8 +1749,10 @@ redelivered click is a duplicate like a redelivered message, and a click or repl
 sender the gateway drops changes
 nothing. A remembered question binds its click to the conversation it was posted in; the
 event's surface binds only a click on one the adapter does not remember. A question posted
-to the home channel (chat.notify) has no conversation at post time, so its click is bound by
-the event and a typed reply in its thread does not answer it; its buttons do. A
+to the home channel (chat.notify) has no conversation at post time, so its click binds to the
+thread the post is in, in the kind the event names (its buttons carry a mark that says it is a
+home card's, so the binding survives a restart), and a typed reply in its thread does not answer
+it; its buttons do. A
 rewrite that fails posts the line in the conversation instead. The questions and answers
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text, its link
