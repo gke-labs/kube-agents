@@ -1162,6 +1162,10 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')
         self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
         self.assertLess(mode_at, call_at)
+        # And the Slack home channel policy, refused outside the same kind of enum.
+        policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
+        self.assertLess(policy_at, call_at)
         # The data volume size likewise: the generator refuses a malformed size.
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
@@ -1171,6 +1175,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
         self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
         self.assertLess(pool_at, call_at)
+        # The serving-project switch likewise: the generator refuses a
+        # misspelt value, and the destroy removes what is in state either way.
+        vertex_at = text.find('export VERTEX_MANAGE_SERVING_PROJECT=""')
+        self.assertNotEqual(vertex_at, -1, "uninstall.sh must blank VERTEX_MANAGE_SERVING_PROJECT")
+        self.assertLess(vertex_at, call_at)
         # And the daily alert ceilings: the generator refuses a value that is
         # not a whole number, and a teardown must not stop on it. The names
         # come from the generator's own list, so a key added there and not

@@ -315,8 +315,15 @@ spec:
       {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replicaCount "selectorLabels" "app: litellm")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- /* Point at "default" when not on vertex_ai: omitting the field lets
+             Helm's three-way merge drop serviceAccountName on a switch away from
+             vertex_ai while Kubernetes back-fills it from the deprecated
+             serviceAccount twin, leaving the live pod template naming the
+             deleted KSA (#3878). */}}
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
+      {{- else }}
+      serviceAccountName: "default"
       {{- end }}
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}

@@ -305,6 +305,7 @@ WATCHED_WORKFLOWS = (
     "Python Unit Tests",
     "Step 0 on bash 3.2",
     "Validate Repo Structure",
+    "k8s-api-proxy Tests",
 )
 
 # How far back in run creation the sweep lists. A re-run keeps its run's

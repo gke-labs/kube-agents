@@ -135,6 +135,7 @@ CONTRACTS = [
     (TASKS / "gitops-drift-noise-filtered-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-deleted-policy-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-load-bearing-change-triage" / "task.yaml", DRIFT_TEMPLATE),
+    (TASKS / "gitops-drift-unmanaged-object-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "autoops-controller-stall-triage" / "task.yaml", STALL_TEMPLATE),
 ]
 CHECK_NAME = "triage-delivers-an-actionable-report"

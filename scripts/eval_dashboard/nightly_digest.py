@@ -17,12 +17,17 @@ the section and the bugs cannot disagree::
                           when the case had an issue or a streak that earned one
     ⚙️ Infra              a part of the nightly lost last night; a case kept
                           from running last night with an infra issue or streak
+    ⏱ Latency            last night's timing against its typical, and the
+                          cases that slowed down (``nightly_latency.py``)
     Owners: reply in this thread ...
 
 Each list holds at most LIST_MAX_LINES lines, the rest behind a link to the
 Nightly page. A night with no new or newly owed bug, no first-night red, no
-recovery, no infra item and no part cut off is one line (QUIET_LINE), which
-counts what is still red.
+recovery, no infra item and no part cut off is one summary line
+(QUIET_LINE), which counts what is still red, followed by the latency
+block. Every form of the section, a night cut off at the deadline included,
+carries the latency block after the infra list when the night carried
+timing.
 
 The header's counts are the Nightly page's (``header_counts``): cases that
 passed every graded repetition, of the cases recorded. The lists' verdicts
@@ -61,11 +66,11 @@ except ImportError:  # build() says so; post_health stays importable without it
     yaml = None
 
 try:
-    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra
+    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra, nightly_latency
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # imported with scripts/eval_dashboard/ on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra
+    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra, nightly_latency
     from eval_dashboard.post_health import NIGHTLY_URL
 
 # The env var holding the GitHub-login -> Chat-user-id map (JSON object).
@@ -276,6 +281,38 @@ class Builder:
             if not ok:
                 raise Skipped(SKIP_BAD_LINK.format(url=url or "empty"))
 
+    def latency_block(self, fields: dict) -> list[str]:
+        """The night line and the slow cases (``nightly_latency.py``), or
+        nothing when last night carried no timing."""
+        # ``last_night``'s night is the newest of these: the same reports,
+        # read further back for the typicals.
+        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        line = nightly_latency.night_line(nights)
+        if not line:
+            return []
+        # The section's own rule: no case off the nightly matrix, with no
+        # task.yaml on this checkout, or marked expected_fail.
+        expected = set(nightly.expected_cases(self.data))
+        listed = {}
+        for each in nights[0].get("cases") or []:
+            case = each.get("case")
+            if not isinstance(case, str) or (expected and case not in expected):
+                continue
+            f = fields.get(case) or nightly_bugs.task_fields(case, self.repo_root)
+            if f and not f["expected_fail"]:
+                listed[case] = f
+        slow, timed = nightly_latency.slow_cases(nights, keep=set(listed))
+        if nightly_latency.is_broad(slow, timed, LIST_MAX_LINES):
+            return [line, nightly_latency.broad_text(slow, timed, self.page())]
+        items = []
+        for entry in slow:
+            case = entry["case"]
+            f = listed[case]
+            _, name = self.domain_of(case, f)
+            owner = self.owner_of(case, f, nightly_bugs.tracking_issue(self.open_issues, case))
+            items.append(((-entry["ratio"], case), nightly_latency.slow_text(entry, name, self.who(owner))))
+        return [line, *self.capped(nightly_latency.SLOW_HEADING, items)]
+
     # ---- the night
 
     def night(self) -> tuple[dict, datetime.date]:
@@ -329,6 +366,9 @@ class Builder:
         if night.get("truncated") or self.run_event(night):
             body = TRUNCATED_BODY if night.get("truncated") else RUN_EVENT_BODY
             lines = [header(body), *(self.capped(INFRA_HEADING, infra) or [INFRA_NONE])]
+            latency = self.latency_block(fields)
+            if latency:
+                lines += ["", *latency]
             self.check_links()
             return Section(lines, quiet=False)
 
@@ -398,14 +438,19 @@ class Builder:
             line = QUIET_LINE.format(glyph=nightly.DIGEST_GLYPH, date=short, passed=passed, recorded=recorded,
                                      ungraded=QUIET_UNGRADED.format(count=ungraded) if ungraded else "",
                                      still=QUIET_STILL.format(count=red) if red else "", page=self.page())
+            lines = [line, *self.latency_block(fields)]
             self.check_links()
-            return Section([line], quiet=True)
+            return Section(lines, quiet=True)
         lines = [header(nightly.SEP.join(notes))]
         for heading, items in ((NEW_HEADING, new), (UNFILED_HEADING, unfiled), (STILL_HEADING, still), (FIRST_HEADING, first), (RECOVERED_HEADING, recovered)):
             block = self.capped(heading, items)
             if block:
                 lines += ["", *block]
-        lines += ["", *(self.capped(INFRA_HEADING, infra) or [INFRA_NONE]), "", FOOTER]
+        lines += ["", *(self.capped(INFRA_HEADING, infra) or [INFRA_NONE])]
+        latency = self.latency_block(fields)
+        if latency:
+            lines += ["", *latency]
+        lines += ["", FOOTER]
         self.check_links()
         return Section(lines, quiet=False)
 

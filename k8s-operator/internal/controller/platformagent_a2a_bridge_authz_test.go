@@ -220,7 +220,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 1, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
-		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
+		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
@@ -471,6 +471,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		// WRITE the blackboard, which is the half an agent would notice.
 		{"a2a.topics.shared.blueprint", `{"kind":"topic-entry"}`},
 		{"a2a.topics.agent.platform.upgrade-readiness", `{"kind":"topic-entry"}`},
+		{"a2a.topics.agent.platform.topology-skew", `{"kind":"topic-entry"}`},
 		{"$JS.API.INFO", ""},
 		{"$JS.API.STREAM.NAMES", ""},
 		{"$JS.API.STREAM.LIST", ""},

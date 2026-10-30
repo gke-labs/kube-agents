@@ -350,6 +350,37 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	}
 }
 
+// TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames (#3871): the legacy
+// cleanup runs on every reconcile in both modes, and a Deployment or
+// ServiceAccount named <agent>-sandbox that this PlatformAgent does not
+// control is somebody else's. It is left as found and the cleanup completes;
+// refusing it stopped everything after this step, the status write included.
+func TestLegacyCleanupSkipsAnUnownedObjectUnderItsNames(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", UID: "agent-uid"}}
+	planted := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns"}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns"}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, planted...)...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	if err := r.deleteLegacyCredentialIsolationResources(ctx, agent); err != nil {
+		t.Fatalf("an unowned object under a legacy name stopped the cleanup: %v", err)
+	}
+	for _, obj := range planted {
+		got := obj.DeepCopyObject().(client.Object)
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), got); err != nil {
+			t.Errorf("the unowned %T is gone: %v", obj, err)
+			continue
+		}
+		if refs := got.GetOwnerReferences(); len(refs) != 0 {
+			t.Errorf("the unowned %T was adopted: owner references %+v", obj, refs)
+		}
+	}
+}
+
 // TestReconcileDoesNotDeleteTheMetadataDenyGuardrail runs a full Reconcile
 // rather than the cleanup helper alone, so the assertion holds no matter which
 // step of Reconcile a future change wires the deletion into.

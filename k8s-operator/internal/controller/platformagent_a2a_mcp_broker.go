@@ -25,9 +25,11 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -72,6 +74,25 @@ const (
 	a2aMCPBrokerTokenKey      = "token"                           // #nosec G101 -- Projected file name, not a credential
 	// One hour, like every broker token.
 	a2aMCPBrokerTokenTTLSeconds = 3600
+
+	// a2aMCPIdentityConditionType is written while the MCP door is on and an
+	// object under one of the MCP server's reserved names, its ServiceAccount
+	// or its token Secret, is not controlled by this PlatformAgent. The
+	// server is not rendered over it, and for the account the broker does
+	// not admit it; the condition says so where the refusal used to stop the
+	// whole next reconcile (#3871). The reason names which object.
+	a2aMCPIdentityConditionType = "A2AMCPServer"
+	a2aMCPIdentityUnownedReason = "UnownedServiceAccount"
+	a2aMCPTokenUnownedReason    = "UnownedTokenSecret" // #nosec G101 -- Condition reason, not a credential
+	// The remedy is deletion. An unowned object carries no owner reference,
+	// so deleting it raises no event this controller watches, and the
+	// clearing pass is the periodic requeue. The message says what a
+	// controller reference would do instead of offering it as a remedy: the
+	// ownership test is IsControlledBy, so a reference anyone adds makes
+	// the operator adopt the object as it stands, annotations and contents
+	// included, which is what not adopting it was for.
+	a2aMCPIdentityUnownedMessageFormat = "ServiceAccount %s/%s is not controlled by this PlatformAgent, so the MCP server is not rendered and the credential broker does not admit that account; delete it (seen on the operator's next pass, within 15 minutes). A controller reference to this PlatformAgent would make the operator adopt the account as it is, annotations included"
+	a2aMCPTokenUnownedMessageFormat    = "Secret %s/%s is not controlled by this PlatformAgent, so the MCP server is not rendered; delete it (seen on the operator's next pass, within 15 minutes). A controller reference to this PlatformAgent would make the operator use the Secret's contents as the token" // #nosec G101 -- Condition message text, not a credential
 )
 
 // a2aMCPBrokerEnabled is the one predicate every MCP broker render asks: the
@@ -167,12 +188,14 @@ func a2aMCPBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.Networ
 }
 
 // a2aMCPBrokerEnv is the broker's side: the audience it confers the mcp role
-// by, and the ServiceAccount bound to it both ways, only when enabled. The
-// role comes from the audience and a pod picks the audience it projects, so
-// without the binding a token minted for the MCP account with the shell
-// audience would get the shell role.
-func a2aMCPBrokerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	if !a2aMCPBrokerEnabled(agent) {
+// by, and the ServiceAccount bound to it both ways, only when enabled and
+// only for an account this PlatformAgent owns (a2aMCPIdentityOwned): an
+// account somebody else holds under the reserved name is never admitted,
+// however the door is set. The role comes from the audience and a pod picks
+// the audience it projects, so without the binding a token minted for the
+// MCP account with the shell audience would get the shell role.
+func a2aMCPBrokerEnv(agent *agentv1alpha1.PlatformAgent, mcpIdentityOwned bool) []corev1.EnvVar {
+	if !a2aMCPBrokerEnabled(agent) || !mcpIdentityOwned {
 		return nil
 	}
 	return []corev1.EnvVar{
@@ -202,37 +225,72 @@ func newA2AMCPServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.Service
 // to today sweeps it with the rest of the MCP server (cleanupA2A's list).
 //
 // An account under the reserved name that this PlatformAgent does not control
-// is treated as removeA2AMCP and ensureA2AMCPToken treat the rest of the MCP
-// objects. With the flag off it is skipped: it is not ours to remove, and this
-// runs on every next reconcile, so refusing would stop the rest of it. With
-// the flag on it is refused rather than adopted: server-side apply would keep
-// every field another manager set, a Workload Identity annotation included,
-// and the MCP pod would run as that identity.
-func (r *PlatformAgentReconciler) reconcileA2AMCPBrokerIdentity(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// is treated as removeA2AMCP treats the rest of the MCP objects and
+// ensureA2AMCPToken treats the token. With the flag off it is skipped: it is
+// not ours to remove, and this runs on every next reconcile. With the flag
+// on it is not adopted: server-side apply would keep every field another
+// manager set, a Workload Identity annotation included, and the MCP pod
+// would run as that identity. It is not an error either: the session quota,
+// the provision Job and the gateway's hold come after this in reconcileA2A,
+// and an opt-in extra must not stop the core stack (#3871). The return says
+// whether the server may be rendered on this pass; false is reported on the
+// CR as a2aMCPIdentityConditionType with a2aMCPIdentityUnownedReason, and
+// the caller removes the server instead.
+func (r *PlatformAgentReconciler) reconcileA2AMCPBrokerIdentity(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	sa := newA2AMCPServiceAccount(agent)
 	existing := &corev1.ServiceAccount{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(sa), existing)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to read the MCP server's ServiceAccount: %w", err)
+		return false, fmt.Errorf("failed to read the MCP server's ServiceAccount: %w", err)
 	}
 	unowned := err == nil && !metav1.IsControlledBy(existing, agent)
 	if !a2aMCPBrokerEnabled(agent) {
-		if unowned {
-			return nil
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, sa, r.Client, nil); err != nil {
+			return false, fmt.Errorf("failed to remove the MCP server's ServiceAccount: %w", err)
 		}
-		if err := r.deleteOwnedA2AObject(ctx, agent, sa, r.Client); err != nil {
-			return fmt.Errorf("failed to remove the MCP server's ServiceAccount: %w", err)
-		}
-		return nil
+		return true, nil
 	}
 	if unowned {
-		return fmt.Errorf("refusing to adopt unowned ServiceAccount %s/%s as the MCP server's identity; delete it, or give it a controller reference to this PlatformAgent", sa.Namespace, sa.Name)
+		logf.FromContext(ctx).Info("not adopting an unowned ServiceAccount as the MCP server's identity; the MCP server is not rendered",
+			"namespace", sa.Namespace, "name", sa.Name)
+		return false, nil
 	}
 	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
-		return err
+		return false, err
 	}
 	if err := r.applyManaged(ctx, agent, sa); err != nil {
-		return fmt.Errorf("failed to apply the MCP server's ServiceAccount: %w", err)
+		return false, fmt.Errorf("failed to apply the MCP server's ServiceAccount: %w", err)
 	}
-	return nil
+	return true, nil
+}
+
+// a2aMCPIdentityOwned is the broker render's question, asked in Reconcile
+// ahead of the credential proxy, which renders before reconcileA2A: may the
+// broker admit the MCP pod's ServiceAccount? True whenever the door is off
+// (nothing is admitted then anyway) or the account is absent (this pass
+// creates it, owned); false only for a present account this PlatformAgent
+// does not control, which reconcileA2AMCPBrokerIdentity then also refuses to
+// render the server over. One cached read: ServiceAccount is an Owns() kind.
+func (r *PlatformAgentReconciler) a2aMCPIdentityOwned(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	if !a2aMCPBrokerEnabled(agent) {
+		return true, nil
+	}
+	existing := &corev1.ServiceAccount{}
+	err := r.Get(ctx, types.NamespacedName{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read the MCP server's ServiceAccount: %w", err)
+	}
+	return metav1.IsControlledBy(existing, agent), nil
+}
+
+// a2aMCPNotRenderedMessage is the condition's text for this agent, by the
+// reason that names the unowned object.
+func a2aMCPNotRenderedMessage(agent *agentv1alpha1.PlatformAgent, reason string) string {
+	if reason == a2aMCPTokenUnownedReason {
+		return fmt.Sprintf(a2aMCPTokenUnownedMessageFormat, agent.Namespace, a2aMCPAccessName(agent))
+	}
+	return fmt.Sprintf(a2aMCPIdentityUnownedMessageFormat, agent.Namespace, a2aMCPServiceAccountName(agent))
 }

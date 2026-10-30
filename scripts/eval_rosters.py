@@ -52,8 +52,9 @@ INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
 # Its mirror (#3263): the cases every lane but the inject one drops, because
 # their premise needs the inject door. Same shape, same reason rule.
 API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
-# The inject lane's safeguards (#2079): the verification_spec entries the
-# script appends to every case it runs on that lane. YAML, so this
+# The lane safeguards (#2079): the verification_spec entries the script
+# appends to every case it runs, on the api and inject lanes alike (#2611;
+# the file keeps the inject lane's name). YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
 # reads it; scripts/test_eval_rosters.py pins its shape.
 INJECT_LANE_SAFEGUARDS_FILE = EVAL_DIR / "inject-lane-safeguards.yaml"

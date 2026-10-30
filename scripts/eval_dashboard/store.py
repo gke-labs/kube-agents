@@ -21,7 +21,7 @@ This reader is the dashboard's, not the gate's: ``bench/kube_agents_bench/
 baselines.py`` reads the same layout to decide admission and must stop on a
 malformed line; this one feeds a page, skips the line with a warning and
 carries on. It imports nothing from ``bench`` on purpose -- the dashboard is
-stdlib plus gsutil (``collect.py``), and the record format is small enough to
+stdlib plus ``gcloud storage`` (``collect.py``), and the record format is small enough to
 re-parse here. What it keeps identical is the one thing that must match: the
 per-case-per-key object cap (``EVAL_BASELINE_MAX_OBJECTS``, default 200)
 and the rule that a record's own ``key`` is the truth and the path only an
@@ -31,7 +31,7 @@ ONE LISTING PER REFRESH, THEN ONLY THE NEW OBJECTS. Objects are immutable
 and the store is append-only, so a record once read is final. ``--prior``
 is the ``store.json`` the last refresh published; every object it already
 holds is kept without a fetch, and only the names the listing shows that it
-does not hold are read (``gsutil cat``, in chunks). A tick therefore costs
+does not hold are read (``gcloud storage cat``, in chunks). A tick therefore costs
 one ``ls`` of the prefix plus last night's objects, whatever the store's
 age. Without a prior, everything inside the window is read once.
 
@@ -116,18 +116,25 @@ DEFAULT_LEAD_DAYS = 14
 #: and the same environment variable (bench/kube_agents_bench/evidence_store.py).
 DEFAULT_MAX_OBJECTS = 200
 MAX_OBJECTS_ENV = "EVAL_BASELINE_MAX_OBJECTS"
-#: Objects per ``gsutil cat``: well under any argv limit, few enough calls
+#: Objects per ``gcloud storage cat``: well under any argv limit, few enough calls
 #: for a cold read of a quarter (about 3,500 objects at 38 cases a night).
 CAT_CHUNK = 100
-#: Concurrent ``gsutil cat`` calls. gsutil fetches the objects of one call
+#: Concurrent ``gcloud storage cat`` calls. One call fetches its objects
 #: serially at close to a second each (38 objects took 30 s on 2026-09-17),
 #: so a cold read of a quarter is three quarters of an hour single-file and
 #: a few minutes at this width; the incremental tick reads one chunk.
 CAT_WORKERS = 8
-#: Seconds before one gsutil call is treated as failed.
-GSUTIL_TIMEOUT_S = 300
-#: What gsutil says about a prefix that holds nothing yet (collect.py reads
-#: the same phrase): an empty store, not an unreachable one.
+#: Every store read is ``gcloud storage ls`` or ``gcloud storage cat``
+#: through this binary (``--gcloud`` overrides it).
+DEFAULT_GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
+#: Seconds before one gcloud storage call is treated as failed.
+GCLOUD_TIMEOUT_S = 300
+#: What ``gcloud storage ls`` says about a prefix that holds nothing yet
+#: (collect.py reads the same phrase): an empty store, not an unreachable
+#: one. ``cat`` says it ("matched no objects or files") of an absent object
+#: too, with exit 1, after printing whichever of the call's other objects
+#: it found.
 NO_OBJECTS = "matched no objects"
 #: An object name: ``<recorded_at with ':' as '-'>-<build>.jsonl``, as
 #: evidence_store.GcsBackend.append writes it. The build is Prow's numeric
@@ -152,16 +159,19 @@ def max_objects_from_env(env: dict | None = None) -> int:
 
 
 # --------------------------------------------------------------------------
-# gsutil
+# gcloud storage
 
 
-def gsutil_call(args: list[str], gsutil: str = "gsutil", runner=None) -> tuple[str | None, str]:
-    """(stdout, stderr) of one gsutil call; stdout None when it failed.
-    ``runner`` defaults to ``subprocess.run`` at call time, so a test that
-    patches it sees every call."""
+def gcloud_storage_call(args: list[str], gcloud: str = DEFAULT_GCLOUD, runner=None) -> tuple[str | None, str]:
+    """(stdout, stderr) of one ``gcloud storage`` call; stdout None when it
+    failed. A ``cat`` of several URLs that found only some of them exits 1
+    with the found ones' text on stdout; that text is dropped with the rest
+    of a failed call, and the caller re-reads the chunk one object at a
+    time. ``runner`` defaults to ``subprocess.run`` at call time, so a test
+    that patches it sees every call."""
     run = runner or subprocess.run
     try:
-        proc = run([gsutil, *args], capture_output=True, text=True, timeout=GSUTIL_TIMEOUT_S, check=False)
+        proc = run([gcloud, STORAGE_GROUP, *args], capture_output=True, text=True, timeout=GCLOUD_TIMEOUT_S, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, str(exc)
     if proc.returncode != 0:
@@ -169,27 +179,28 @@ def gsutil_call(args: list[str], gsutil: str = "gsutil", runner=None) -> tuple[s
     return proc.stdout, (proc.stderr or "")
 
 
-def list_objects(location: str, gsutil: str = "gsutil", runner=None) -> list[str]:
+def list_objects(location: str, gcloud: str = DEFAULT_GCLOUD, runner=None) -> list[str]:
     """Every ``.jsonl`` object URL under ``location``, sorted. An empty prefix
-    is ``[]``; a listing that failed raises ``RuntimeError`` with gsutil's
+    is ``[]``; a listing that failed raises ``RuntimeError`` with gcloud's
     words, so the caller can tell the two apart (module docstring)."""
-    out, err = gsutil_call(["ls", f"{location.rstrip('/')}/**"], gsutil, runner)
+    out, err = gcloud_storage_call(["ls", f"{location.rstrip('/')}/**"], gcloud, runner)
     if out is None:
         if NO_OBJECTS in err.lower():
             return []
-        raise RuntimeError(f"gsutil ls {location}: {err[:400] or 'failed'}")
+        raise RuntimeError(f"gcloud storage ls {location}: {err[:400] or 'failed'}")
     return sorted(
         line.strip() for line in out.splitlines()
         if line.strip().startswith("gs://") and line.strip().endswith(".jsonl")
     )
 
 
-def cat_objects(urls: list[str], gsutil: str = "gsutil", runner=None, chunk: int = CAT_CHUNK, workers: int = CAT_WORKERS):
-    """``(URLs, text or None, error)`` per ``gsutil cat`` call, in URL order;
-    the calls run ``workers`` at a time. gsutil prints the objects in
+def cat_objects(urls: list[str], gcloud: str = DEFAULT_GCLOUD, runner=None, chunk: int = CAT_CHUNK, workers: int = CAT_WORKERS):
+    """``(URLs, text or None, error)`` per ``gcloud storage cat`` call, in URL order;
+    the calls run ``workers`` at a time. ``cat`` prints the objects in
     argument order, each ending in the newline the writer put there, so a
     chunk's text is its lines in order. A chunk whose call failed is read
-    again one object at a time, so one bad object (a 5xx, a 403) costs that
+    again one object at a time, so one bad object (a 5xx, a 403, one deleted
+    since the listing) costs that
     object and not its chunk-mates; each object that still fails is its own
     ``(url, None, error)`` entry, so the caller can name it."""
     parts = [urls[start:start + chunk] for start in range(0, len(urls), chunk)]
@@ -197,14 +208,14 @@ def cat_objects(urls: list[str], gsutil: str = "gsutil", runner=None, chunk: int
         return []
     pool_size = max(1, min(workers, len(parts)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as pool:
-        results = list(pool.map(lambda part: gsutil_call(["cat", *part], gsutil, runner), parts))
+        results = list(pool.map(lambda part: gcloud_storage_call(["cat", *part], gcloud, runner), parts))
     out = []
     for part, (text, err) in zip(parts, results, strict=True):
         if text is not None or len(part) == 1:
             out.append((part, text, err))
             continue
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(part)))) as pool:
-            singles = list(pool.map(lambda url: gsutil_call(["cat", url], gsutil, runner), part))
+            singles = list(pool.map(lambda url: gcloud_storage_call(["cat", url], gcloud, runner), part))
         out.extend(([url], text, err) for url, (text, err) in zip(part, singles, strict=True))
     return out
 
@@ -298,7 +309,7 @@ def select_objects(urls: list[str], location: str, *, now_ms: float, window_days
 
 
 def parse_records(text: str, urls: list[str], location: str, warnings: list[str]) -> list[dict]:
-    """The records in one ``gsutil cat`` output, each with its ``object`` and
+    """The records in one ``gcloud storage cat`` output, each with its ``object`` and
     ``build``. Every line of a single object is that object's; across a
     chunk, lines are matched to objects by order when the counts agree
     (one record per object, the writer's rule), otherwise by the case and
@@ -372,7 +383,7 @@ def now_utc() -> datetime.datetime:
 
 def read_store(location: str, *, prior: dict | None = None, window_days: int = DEFAULT_WINDOW_DAYS,
                lead_days: int = DEFAULT_LEAD_DAYS, max_objects: int | None = None,
-               now: datetime.datetime | None = None, gsutil: str = "gsutil", runner=None,
+               now: datetime.datetime | None = None, gcloud: str = DEFAULT_GCLOUD, runner=None,
                deadline_s: float | None = None, chunk: int = CAT_CHUNK, workers: int = CAT_WORKERS,
                clock=time.monotonic) -> dict:
     """The store.json document for ``location``: one listing, the prior's
@@ -385,7 +396,7 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
     started = clock()
     now = now or now_utc()
     cap = max_objects if max_objects is not None else max_objects_from_env()
-    urls = list_objects(location, gsutil, runner)
+    urls = list_objects(location, gcloud, runner)
     wanted, truncated, older, skipped = select_objects(urls, location, now_ms=now.timestamp() * 1000, window_days=window_days, lead_days=lead_days, max_objects=cap)
     known: dict[str, list[dict]] = {}  # an object's records: one by the writer's rule, every line of it either way
     if prior and prior.get("source") == location.rstrip("/"):
@@ -406,18 +417,18 @@ def read_store(location: str, *, prior: dict | None = None, window_days: int = D
             stopped = True
             break
         wave_started = clock()
-        for part, text, err in cat_objects([url for piece in wave for url in piece], gsutil, runner, chunk=chunk, workers=workers):
+        for part, text, err in cat_objects([url for piece in wave for url in piece], gcloud, runner, chunk=chunk, workers=workers):
             if text is None:
-                warnings.append(f"{part[0]}: gsutil cat failed: {err[:200] or 'failed'}")
+                warnings.append(f"{part[0]}: gcloud storage cat failed: {err[:200] or 'failed'}")
                 continue
             if len(part) > 1 and sum(1 for line in text.splitlines() if line.strip()) != len(part):
                 # An object with more than one line among them (not the
                 # writer's rule, but possible): read them one at a time,
                 # so every record carries its object and the incremental
                 # read keeps all of them next tick.
-                for url, single, single_err in cat_objects(part, gsutil, runner, chunk=1):
+                for url, single, single_err in cat_objects(part, gcloud, runner, chunk=1):
                     if single is None:
-                        warnings.append(f"{url[0]}: gsutil cat failed: {single_err[:200] or 'failed'}")
+                        warnings.append(f"{url[0]}: gcloud storage cat failed: {single_err[:200] or 'failed'}")
                         continue
                     fetched.extend(parse_records(single, url, location, warnings))
                 continue
@@ -452,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lead-days", type=int, default=DEFAULT_LEAD_DAYS, metavar="N", help=f"read N days further back than the window so the first drawn nights' trailing windows are whole (default {DEFAULT_LEAD_DAYS})")
     parser.add_argument("--max-objects", type=int, default=None, metavar="N", help=f"newest objects per case per key (default {MAX_OBJECTS_ENV} or {DEFAULT_MAX_OBJECTS}, the gate's cap)")
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("store.json"))
-    parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
+    parser.add_argument("--gcloud", default=DEFAULT_GCLOUD, help="gcloud binary to invoke; every store read is `gcloud storage ls` or `gcloud storage cat` through it")
     parser.add_argument("--deadline-s", type=float, default=None, metavar="S", help="stop fetching between waves once the next wave would end past S seconds from the start, and write what was read with `partial` set; the rest is read next tick (default: no deadline)")
     parser.add_argument("--fail-with", metavar="REASON", default=None, help="read nothing: write --prior back with `error` set to REASON (the workflow's path when this script was killed or had no time to run); exit 1 without a prior")
     args = parser.parse_args(argv)
@@ -480,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.fail_with is not None:
         return keep_prior(args.fail_with.strip() or "the store was not read this tick")
     try:
-        doc = read_store(args.location, prior=prior, window_days=args.window_days, lead_days=args.lead_days, max_objects=args.max_objects, gsutil=args.gsutil, deadline_s=args.deadline_s)
+        doc = read_store(args.location, prior=prior, window_days=args.window_days, lead_days=args.lead_days, max_objects=args.max_objects, gcloud=args.gcloud, deadline_s=args.deadline_s)
     except RuntimeError as exc:
         return keep_prior(str(exc))
     for warning in doc["warnings"]:

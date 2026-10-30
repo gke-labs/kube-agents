@@ -167,6 +167,36 @@ class SmokeTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(gate.smoke_required([path]))
 
+    def test_a_k8s_api_proxy_only_change_skips_the_smoke(self):
+        """The module ships in no image until a file outside it says so, and that file runs the smoke."""
+        self.assertFalse(gate.smoke_required(["k8s-api-proxy/go.mod", "k8s-api-proxy/pkg/k8sapiproxy/policy.go"]))
+        for files in (
+            ["k8s-api-proxy/go.mod", "deploy/sandbox/Dockerfile"],
+            ["k8s-api-proxy/go.mod", "deploy/kube-proxy/Dockerfile"],
+            ["k8s-api-proxyx/main.go"],
+            ["a2a/k8s-api-proxy/x.go"],
+        ):
+            with self.subTest(files=files):
+                self.assertTrue(gate.smoke_required(files))
+
+    def test_k8s_api_proxy_leaves_the_smoke_skip_once_the_sandbox_uses_it(self):
+        """Once sandbox kubectl can route through the proxy, a proxy-only change alters what the
+        agent runs, so the pull request that wires it in drops the skip (issue #4087)."""
+        root = _HERE.parent
+        wiring = [
+            root / "deploy/sandbox/entrypoint.sh",
+            root / "deploy/sandbox/session-command.sh",
+            root / "agents/platform/scripts/credential_proxy_client.py",
+            *sorted((root / "k8s-operator/internal/controller").glob("*.go")),
+        ]
+        wired = [p for p in wiring if p.is_file() and "KUBE_PROXY_URL" in p.read_text()]
+        if wired:
+            self.assertTrue(
+                gate.smoke_required(["k8s-api-proxy/go.mod"]),
+                f"{wired[0].relative_to(root)} wires in the proxy: remove k8s-api-proxy/ from "
+                "SMOKE_SKIP_RE and from the Prow skip_if_only_changed, then delete this test",
+            )
+
     def test_an_overlong_file_list_needs_the_smoke_and_an_empty_one_does_not(self):
         """Prow skips a `skip_if_only_changed` job when no file changed."""
         self.assertTrue(gate.smoke_required(["docs/a.md"] * gate.FILES_CEILING))

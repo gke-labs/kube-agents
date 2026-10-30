@@ -292,7 +292,7 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
     # Without ``want`` a read carries statuses alone.
     plain = board.read_session_cards(shell, SESSION, 5)
     assert plain is not None
-    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None, "error": None, "block": None}
+    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None, "block": None}
     read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
     assert read is not None and read.session_found
     assert read.total == 2
@@ -302,14 +302,12 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
         "status": "done",
         "result": "three clusters, all healthy",
         "summary": None,
-        "error": None,
         "block": None,
     }
     assert read.cards[CHILD] == {
         "status": "done",
         "result": None,
         "summary": "node pool resized",
-        "error": None,
         "block": None,
     }
     shown = json.loads(read.as_shown(CHILD)["result"])
@@ -565,63 +563,6 @@ def test_read_session_cards_newest_run_empty_summary_does_not_fall_back_to_older
     assert read.cards[FRONT]["summary"] is None
 
 
-def test_read_session_cards_extracts_errors_from_tasks_and_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    build_session_store(tmp_path, created=[FRONT, CHILD])
-    set_card(tmp_path, FRONT, "triage")
-    set_card(tmp_path, CHILD, "triage")
-    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
-        conn.execute("ALTER TABLE task_runs ADD COLUMN error TEXT")
-        conn.execute(
-            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-            ("429 Too Many Requests (failure_reason=rate_limit)", FRONT),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, profile, status, error) VALUES (?, 'platform', 'triage', ?)",
-            (CHILD, "quota exceeded (failure_reason=rate_limit)"),
-        )
-    shell = local_shell(tmp_path, monkeypatch)
-    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
-    assert read is not None
-    assert read.cards[FRONT]["error"] == "429 Too Many Requests (failure_reason=rate_limit)"
-    assert read.cards[CHILD]["error"] == "quota exceeded (failure_reason=rate_limit)"
-
-
-def test_as_shown_keeps_error_distinct_from_summary_and_omits_deliverable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    build_session_store(tmp_path, created=[FRONT, CHILD])
-    set_card(tmp_path, FRONT, "blocked")
-    set_card(tmp_path, CHILD, "done", summary="node pool resized")
-    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
-        conn.execute("ALTER TABLE tasks ADD COLUMN last_failure_error TEXT")
-        conn.execute(
-            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-            ("worker turn failed and the run ended", FRONT),
-        )
-    shell = local_shell(tmp_path, monkeypatch)
-    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
-    assert read is not None
-    entry_front = read.as_shown(FRONT)
-    assert entry_front is not None
-    shown_front = json.loads(entry_front["result"])
-    assert shown_front["runs"] == [{"error": "worker turn failed and the run ended"}]
-    assert "summary" not in shown_front["runs"][0]
-
-    # delivered_results must not treat error text as a delivered result
-    delivered = parsing.delivered_results([entry_front], [FRONT])
-    assert delivered == {}
-
-    entry_child = read.as_shown(CHILD)
-    assert entry_child is not None
-    shown_child = json.loads(entry_child["result"])
-    assert shown_child["runs"] == [{"summary": "node pool resized"}]
-    delivered_child = parsing.delivered_results([entry_child], [CHILD])
-    assert delivered_child == {CHILD: "node pool resized"}
-
-
 # --- a card paused on a question (#4004) ----------------------------------------
 
 QUESTION = "payments-api is OOMKilled against its 64Mi limit. Which fix?\n- raise the limit\n- set a request"
@@ -678,7 +619,7 @@ def test_a_board_without_events_reads_a_blocked_card_with_no_block(
     set_card(tmp_path, FRONT, "blocked")
     read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT], max_want=32)
     assert read is not None
-    assert read.cards[FRONT] == {"status": "blocked", "result": None, "summary": None, "error": None, "block": None}
+    assert read.cards[FRONT] == {"status": "blocked", "result": None, "summary": None, "block": None}
     assert "block" not in json.loads(read.as_shown(FRONT)["result"])["task"]
 
 

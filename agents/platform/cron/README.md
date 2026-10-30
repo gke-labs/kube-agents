@@ -223,7 +223,9 @@ check didn't run today", why, and that an admin needs to fix it, since no retry
 resolves the number) with the reason and the remedy in
 `logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
 ships, and kept in `last-failure.txt` by the kind of failure until the next
-clean tick posts the recovery. A failure a retry may clear (a timeout, a
+clean tick posts the recovery. A roster spelling that is not a project, no GCP
+project at all, a ledger it refuses to overwrite, and an agent image missing the
+report script end the same way. A failure a retry may clear (a timeout, a
 sandbox that failed) says instead that it tries again tomorrow, or at its next
 scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
@@ -425,6 +427,53 @@ the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, and repeated daily like one.
 
+## `session-retention` gives every profile's history an end
+
+Hermes already prunes session history: `sessions.auto_prune` deletes ended
+sessions inactive for `sessions.retention_days`, with their messages and
+transcript files, and VACUUMs when the prune freed more than a quarter of the
+file (`SessionDB.maybe_auto_prune_and_vacuum`). It does so when a CLI or the
+gateway starts, at most once a day per `state.db`. Two stores never get that
+start. One is the machine home's, which only the long-lived gateway opens, at
+construction. The other is a profile that has not run a process since its
+history aged out. So their history grew without bound.
+`session_retention.py` calls the same Hermes method on every profile's store
+once a day, so it keeps Hermes' guarantees: open, pinned and mid-turn sessions
+are never deleted, and there is one maintenance lock per store. Its throttle is
+20 hours rather than Hermes' 24, so a tick starting a few seconds earlier than
+yesterday's still runs. It never VACUUMs: the gateway (on the machine home, or on
+`profiles/platform` when the Platform Agent is the front door) and the workers
+hold these stores while it runs, and a VACUUM rewrites the whole file under them.
+Hermes VACUUMs each store when a process starts on it, and SQLite reuses the pages
+a prune frees in the meantime. It also removes rotated
+Hermes log backups (`<name>.log.<n>`) older than the period; the live log files keep Hermes' size cap, and
+`audit.jsonl` and its rotations are never touched.
+
+The period is the managed scope's `sessions.retention_days`, which the operator
+renders from `spec.harness.retention.sessionDays` (default 90, Hermes' own, so
+an upgrade deletes nothing it would not have deleted anyway, and for now also
+the minimum). It is in the managed scope so that one period covers every
+profile and a profile cannot lengthen its own.
+
+Before each prune it pins every session that another session still names as
+its parent, and unpins the ones it pinned whose children are gone. Some readers
+follow `parent_session_id` back to where a conversation started, a compression
+continuation to its origin among them, and a prune clears that link when it
+deletes the parent. A parent ages only on its own rows, so a conversation still
+going long after it was compressed would otherwise lose its origin. Hermes'
+prune skips pinned rows, the prunes it runs at process start included. The job
+sets the flag on the one row (Hermes' own pin command pins the whole lineage and
+unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
+set by hand is never cleared. A chain unwinds one parent a day once its newest
+session is pruned. A store whose pins cannot be set is not pruned that day.
+
+A blocked kanban card needs no exemption: its worker starts a
+fresh session on every run and reads its context from the card. A chat thread
+whose session ended and then sat idle past the period starts a fresh session
+when someone replies. It runs at 05:50 UTC, after the workspace collector and
+before the morning audits, and prints nothing unless a store could not be
+maintained.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
@@ -493,8 +542,25 @@ title and whether they wait on a person are one row with their count, and past
 `MAX_STUCK_ROWS` rows the rest are counted. A card that holds back todo cards
 (a child waits until every parent is done) names the first of them under its
 row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
-`hermes kanban` commands reach chat; `hermes kanban list` and `show` on the
-agent pod have them.
+`hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
+the agent pod have them.
+
+In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+stuck cards are all a run says, the script leaves a card file beside its record
+(`kanban_board_health.card.json`): each row as printed, with the ids of the
+cards it stands for, and the text it printed. The relay posts that card in
+place of the text, and only for that text
+([cron-report-relay.md](../../../docs/designs/cron-report-relay.md)). The ids ride
+in the buttons' values, unseen. Retry unblocks the row's cards and Drop archives
+them, through session-kv's `POST /v1/board/actions`, which touches only a card
+`blocked` when pressed: a stale button leaves alone a card that has moved on,
+and acts on one that has blocked again. The row is edited in place
+to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
+stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
+press: the Slack adapter's interactive authorization and channel gate under
+today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
+agent turn. Google Chat, and a run that also reports the board's other
+findings, get the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -502,9 +568,11 @@ missed, and a daily repeat of the same list is noise. The ids last said, and
 when, are kept in `profiles/platform/cron/kanban_board_health.json` under the
 agent home; a card that comes unstuck drops out of it, so it is new again if it
 sticks again, and a record that cannot be read says every stuck card again. The
-record is written before the scheduler delivers, so a run that finds a
-`last_delivery_error` on this job's entry stamped after the last post says the
-cards again rather than leaving them unsaid for a week. The
+record is written before the scheduler delivers, so a run that finds a hard
+delivery failure (graded as `chat-delivery-watch` grades it) on this job's
+entry stamped after the last post says the cards again rather than leaving
+them unsaid for a week. A partial or degraded relay, or a note on a report that
+arrived, landed somewhere and is not said again. The
 board's other findings (invariant violations and the engine's other rules) are
 rare and still print on every run that finds them, under
 `kanban board health: attention required`. It fires at 12:35 UTC, half an hour

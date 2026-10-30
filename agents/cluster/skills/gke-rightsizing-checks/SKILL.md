@@ -78,12 +78,18 @@ Calculate per dimension and show both: `nodes_needed = max(ceil(total_cpu_reques
 
 ## Writing the answer
 
-Open your `result` with one line per workload or pool, after at most one bold sentence: its name and the dependency that blocks or limits the cut. For example, `checkout-api: an HPA scales it on CPU, so a lower request adds replicas`, or `batch-worker: Guaranteed QoS, so a lower request is also a lower limit`. Write `no dependency found` when checks 1 to 3 found none. When the Platform Agent summarises several cards, these lines are what it carries to the person. `kanban_complete` refuses, once, a result that does not open with these lines or does not show the five checks.
+Pass `rightsizing` to `kanban_complete`, one entry per workload or pool:
 
-Then, for each workload or pool, in this order:
+- `workload`: its name.
+- `dependency_kind`: `hpa`, `guaranteed_qos`, `pdb_or_pvc`, `shared_file` or `none`, from checks 1 to 4; `not_on_cluster` when your cluster does not run it. If several apply, pick the first in that order and name the others in `dependency`.
+- `dependency`: one sentence on what the dependency means for a cut, for example "a lower request adds replicas" or "a lower request is also a lower limit".
+- `checks`: one finding each for `hpa`, `qos`, `sharing`, `source` and `packing`, with the command or reading behind it. "No HPA targets it" is a finding. Not needed for `not_on_cluster`.
 
-1. **The checks:** the five, one line each: what it found, and the command or reading behind it. "No HPA targets it" is a finding.
-2. **The proposal:** the new figures, or why no cut is safe. A dependency from checks 1 to 3 that makes the cut unsafe is the answer, stated first.
-3. **The arithmetic:** each effect claim with its inputs and its result, in resource units, never in currency.
+Each field is one line of at most 200 characters, with no code fence. The tool renders these entries in your `result`, and the Platform Agent's summary gets the same lines, so the person sees each dependency whatever the summary says. `kanban_complete` refuses, once, a completion without them on a card that names this skill.
+
+In `result` itself, after at most one bold sentence, for each workload or pool:
+
+1. **The proposal:** the new figures, or why no cut is safe. A dependency that makes the cut unsafe is the answer, stated first.
+2. **The arithmetic:** each effect claim with its inputs and its result, in resource units, never in currency.
 
 Hand the change back to the Platform Agent as a proposal. You do not apply it.

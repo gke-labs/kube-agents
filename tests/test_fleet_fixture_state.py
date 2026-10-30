@@ -34,9 +34,11 @@ import importlib.util
 import json
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -128,6 +130,9 @@ if args[:3] == ["container", "clusters", "describe"]:
         sys.exit(1)
     print(json.dumps(doc))
 elif args[:2] == ["container", "get-server-config"]:
+    if world.get("server_config") == "UNREACHABLE":
+        print("ERROR: (gcloud.container.get-server-config) ResponseError: code=503", file=sys.stderr)
+        sys.exit(1)
     print(json.dumps(world.get("server_config", {})))
 else:
     print("unexpected gcloud call: " + " ".join(args), file=sys.stderr)
@@ -405,6 +410,16 @@ def _healthy_world() -> dict:
                 "spec": {"template": {"spec": {"hostNetwork": True, "volumes": [{"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "Directory"}}]}}},
                 "status": {"desiredNumberScheduled": 2, "numberReady": 2},
             },
+            # seeded-scaled-zero: a switched-off environment, nothing running,
+            # and the Gateway status no controller would otherwise write.
+            "deployment/storefront": {"spec": {"replicas": 0}},
+            "deployment/envoy-seeded-scaled-zero-storefront-edge": {"spec": {"replicas": 0}},
+            "gateway/storefront-edge": {"status": {"conditions": [
+                {"type": "Accepted", "status": "True", "reason": "Accepted"},
+                {"type": "Programmed", "status": "False", "reason": "NoResources"},
+            ]}},
+            "pod?app=storefront": {"items": []},
+            "pod?app.kubernetes.io/name=envoy": {"items": []},
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
         },
         "describe": {
@@ -415,8 +430,8 @@ def _healthy_world() -> dict:
         },
         "server_config": {
             "channels": [
-                {"channel": "RAPID", "defaultVersion": "1.35.0-gke.1"},
-                {"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1"},
+                {"channel": "RAPID", "defaultVersion": "1.35.0-gke.1", "validVersions": ["1.35.0-gke.1", "1.34.2-gke.5", "1.33.5-gke.9"]},
+                {"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000", "1.33.4-gke.1000000"]},
             ]
         },
     }
@@ -629,6 +644,65 @@ class EvaluateTest(unittest.TestCase):
         problem = ffs.evaluate(entry, [unchannelled], channel_default=lookup)
         assert problem is not None and "channel unset" in problem
 
+    def test_not_ahead_of_channel_reads_the_clusters_own_channel(self):
+        entry = self._entry("not_ahead_of_channel", path="currentMasterVersion", subject="cluster")
+        valid = {"REGULAR": ["1.35.8-gke.1626001", "1.34.11-gke.1209000", "1.34.11-gke.1102000"], "RAPID": ["1.34.12-gke.1011000"]}
+        lookup = valid.get
+        on_channel = {"currentMasterVersion": "1.34.11-gke.1209000", "releaseChannel": {"channel": "REGULAR"}}
+        assert ffs.evaluate(entry, [on_channel], channel_valid=lookup) is None
+        # #3025/#3269: a RAPID patch newer than every 1.34 patch REGULAR
+        # carries is one minor behind the default and still not the fixture.
+        ahead = dict(on_channel, currentMasterVersion="1.34.12-gke.1011000")
+        problem = ffs.evaluate(entry, [ahead], channel_valid=lookup)
+        assert problem == (
+            'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", '
+            "newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000)"
+        ), problem
+        # A patch REGULAR has moved past is what other upgrades cases read.
+        moved_past = dict(on_channel, currentMasterVersion="1.34.10-gke.1")
+        assert ffs.evaluate(entry, [moved_past], channel_valid=lookup) is None
+        # Numeric, not string, order: 1.34.9 is behind 1.34.11, 1.34.12 is not.
+        assert ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.34.9-gke.9")], channel_valid=lookup) is None
+        # A minor the channel no longer carries at all: behind if anything it
+        # offers is newer, ahead if nothing is.
+        assert ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.33.4-gke.1")], channel_valid=lookup) is None
+        problem = ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.36.0-gke.1")], channel_valid=lookup)
+        assert problem is not None and problem.endswith("newer than every version REGULAR offers"), problem
+        # Read against the cluster's OWN channel: the RAPID patch is on RAPID.
+        assert ffs.evaluate(entry, [dict(ahead, releaseChannel={"channel": "RAPID"})], channel_valid=lookup) is None
+        unchannelled = {"currentMasterVersion": "1.34.11-gke.1209000"}
+        assert "release channel unset" in ffs.evaluate(entry, [unchannelled], channel_valid=lookup)
+        unlisted = dict(on_channel, releaseChannel={"channel": "EXTENDED"})
+        assert "get-server-config lists no EXTENDED channel" in ffs.evaluate(entry, [unlisted], channel_valid=lookup)
+        assert "not a GKE version" in ffs.evaluate(entry, [dict(on_channel, currentMasterVersion="1.34")], channel_valid=lookup)
+        assert ffs.evaluate(entry, [{"releaseChannel": {"channel": "REGULAR"}}], channel_valid=lookup) == (
+            "cluster currentMasterVersion not_ahead_of_channel: observed nothing"
+        )
+        # A roster with no version the operator can order is a failed read,
+        # never "ahead of every version it offers".
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [on_channel], channel_valid={"REGULAR": ["1.34", "latest"]}.get)
+        # One stray entry is enough: ordering against the rest could drop the
+        # newest patch of the minor and read the master as ahead.
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [ahead], channel_valid={"REGULAR": ["1.34.11-gke.1209000", "1.34.13"]}.get)
+
+    def test_not_ahead_of_channel_is_cluster_only_and_takes_no_value(self):
+        def load(entry):
+            path = pathlib.Path(tempfile.mkdtemp()) / "fixtures.json"
+            self.addCleanup(shutil.rmtree, path.parent)
+            path.write_text(json.dumps({"roles": {"r": {"cluster_slot": "b", "namespace": None, "state": [entry]}}}))
+            return ffs.load_assertions(path)
+
+        assert load({"subject": "cluster", "path": "currentMasterVersion", "op": "not_ahead_of_channel"})
+        for bad in (
+            {"subject": "pod?app=x", "path": "v", "op": "not_ahead_of_channel"},
+            {"subject": "cluster", "path": "currentMasterVersion", "op": "not_ahead_of_channel", "value": "REGULAR"},
+            {"subject": "cluster", "op": "not_ahead_of_channel"},
+        ):
+            with self.assertRaises(ffs.CatalogError):
+                load(bad)
+
     def test_node_cpu_spare_ge_sums_what_is_bound_to_each_node(self):
         entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
         nodes = [_pool_node("n1"), _pool_node("n2", allocatable="940m")]
@@ -703,7 +777,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 36 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 37 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -733,7 +807,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "36 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "37 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -754,7 +828,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "35 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "36 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -780,7 +854,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "36 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "37 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -804,7 +878,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "36 role(s) in their designed state" in done.stderr, done.stderr
+        assert "37 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -818,7 +892,7 @@ class PassTest(_Harness):
     def test_the_default_pool_needs_room_for_the_next_fixture(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "36 role(s) in their designed state" in done.stderr, done.stderr
+        assert "37 role(s) in their designed state" in done.stderr, done.stderr
         # The pods are read once, across every namespace, not once per node.
         assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
         # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
@@ -834,7 +908,7 @@ class PassTest(_Harness):
         world = _healthy_world()
         world["kubectl"]["pod?"] = "UNREACHABLE"
         done = self.run_script(world)
-        assert "35 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "36 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
         assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
         assert "default-pool-headroom" not in self.drift_files()
 
@@ -847,7 +921,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "36 role(s) in their designed state" in done.stderr, done.stderr
+        assert "37 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -879,7 +953,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "36 role(s) in their designed state" in done.stderr, done.stderr
+        assert "37 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -1070,7 +1144,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "36 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "37 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -1158,6 +1232,51 @@ class PassTest(_Harness):
         body = self.drift_files()["version-laggard"]
         assert "currentMasterVersion minor_behind_channel_default 1: observed \"1.34.1-gke.1\" against channel default 1.34.1-gke.1" in body, done.stderr
 
+    def test_the_laggard_on_a_patch_ahead_of_its_channel_is_drift(self):
+        # #3025/#3269: one minor behind REGULAR's default, so the minor check
+        # passes, on a patch newer than any REGULAR carries for that minor.
+        world = _healthy_world()
+        world["describe"]["seeded-b"] = _cluster_b(master="1.33.5-gke.9")
+        done = self.run_script(world)
+        assert "1 drifted" in done.stderr, done.stderr
+        body = self.drift_files()["version-laggard"]
+        assert (
+            'cluster currentMasterVersion not_ahead_of_channel: observed "1.33.5-gke.9", '
+            "newer than every 1.33 patch REGULAR offers (newest 1.33.4-gke.1134000)"
+        ) in body, body
+        assert "minor_behind_channel_default" not in body, body
+        # One server-config read serves both channel assertions.
+        assert self.log.read_text().count("get-server-config") == 1
+
+    def test_the_laggard_on_a_patch_its_channel_moved_past_is_not_drift(self):
+        world = _healthy_world()
+        world["describe"]["seeded-b"] = _cluster_b(master="1.33.3-gke.1")
+        done = self.run_script(world)
+        assert "0 drifted" in done.stderr, done.stderr
+        assert self.drift_files() == {}
+
+    def test_a_failed_server_config_read_is_made_once_per_pass(self):
+        world = _healthy_world()
+        world["server_config"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert "version-laggard" not in self.drift_files(), done.stderr
+        assert "1 not checked" in done.stderr, done.stderr
+        assert self.log.read_text().count("get-server-config") == 1, self.log.read_text()
+
+    def test_a_channel_entry_without_valid_versions_leaves_the_laggard_not_checked(self):
+        for roster in (None, []):
+            with self.subTest(roster=roster):
+                world = _healthy_world()
+                for channel in world["server_config"]["channels"]:
+                    if roster is None:
+                        channel.pop("validVersions")
+                    else:
+                        channel["validVersions"] = roster
+                done = self.run_script(world)
+                assert "0 drifted, 1 not checked" in done.stderr, done.stderr
+                assert "carries no validVersions list" in done.stderr, done.stderr
+                assert self.drift_files() == {}
+
     def test_a_lapsed_exclusion_is_drift_before_the_master_moves(self):
         world = _healthy_world()
         world["describe"]["seeded-b"] = _cluster_b(end="2026-01-01T00:00:00Z")
@@ -1193,7 +1312,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "29 role(s) in their designed state, 0 drifted, 7 not checked" in done.stderr
+        assert "30 role(s) in their designed state, 0 drifted, 7 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1238,7 +1357,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "36 role(s) in their designed state" in done.stderr
+        assert "37 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -1358,6 +1477,7 @@ class ReportTest(_Harness):
                 "readiness-pinned-workload": "converged",
                 "readiness-surge-blocked": "converged",
                 "retired-registry-image": "converged",
+                "scaled-zero-gateway": "converged",
                 "stale-client-skew": "converged",
                 "stalled-controller": "converged",
                 "version-laggard": "converged",
@@ -1370,7 +1490,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 33, "drifted": 1, "unchecked": 1})
+        self.assertEqual(doc["summary"], {"converged": 34, "drifted": 1, "unchecked": 1})
         self.assertIn("1 drifted, 1 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):

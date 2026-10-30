@@ -11,15 +11,10 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
 
 ## Before you start
 
-- **The release.** GitLab support starts in release 0.9.0. An earlier release has no
-  `--gitops-forge` flag. The latest release is on
-  [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest). To check a
-  release, run
-  `curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- --help | grep -- --gitops-forge`,
-  or `./install.sh --help | grep -- --gitops-forge` in an unpacked release.
-- **The GitLab version.** GitLab 16.11 or later. Tested with 16.11 and 19.4. On GitLab 16.x,
-  use a release that includes [#2801](https://github.com/gke-labs/kube-agents/pull/2801). An
-  older release cannot show the diff of a merge request on GitLab 16.x.
+- **The release.** GitLab support is in release 0.9.0 and later. The latest release is on
+  [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest).
+- **The GitLab version.** GitLab 16.11 or later. Tested with 16.11 and 19.4. GitLab 16.x needs
+  release 0.12.0 or later: an older release cannot show the diff of a merge request on it.
 - **The project.** Create the GitOps project first. The installer does not create it. Note its
   full path with its nested groups, for example `platform/infra/gitops`. The project needs a
   default branch with at least one commit: the agent opens its merge requests against it.
@@ -80,7 +75,7 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   `gitlab.corp.internal`, so such an instance normally has a private CA. If a private CA signed
   it, give the CA with `--gitops-ca-file`, as
   [A self-managed GitLab with a private CA](#a-self-managed-gitlab-with-a-private-ca) shows.
-  Use a release whose `install.sh --help` lists `--gitops-ca-file`. The certificate must name
+  The flag is in release 0.12.0 and later. The certificate must name
   the host in its subjectAltName. To see it, run this from a machine with a route to the host:
 
   ```bash
@@ -308,8 +303,8 @@ whitespace around the token when it reads it, so a trailing newline does no harm
 A context repository is a repository that the agent only reads, for example a Terraform
 repository that an audit reads for declared intent. The broker never presents the write token
 for it. Without a read-only token, the broker clones a context repository with no credential,
-so a private project refuses the clone. The read-only token needs a release whose
-`install.env.example` lists `GITLAB_READ_TOKEN_FILE`; an older operator does not mount the key.
+so a private project refuses the clone. The read-only token needs release 0.17.0 or
+later; an older operator does not mount the key.
 
 To read a private context repository, store a read-only token in the same Secret as the write
 token, under the key `read-token`. Use a project access token on the context project, or a

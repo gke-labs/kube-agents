@@ -59,7 +59,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 1
 
@@ -133,6 +133,24 @@ KEY_ERROR = "error"
 KEY_SCOPE = "scope"
 SCOPE_POOL = "pool"
 SCOPE_SELECTED = "selected"
+
+# Drift no re-apply of bench/tf/fleet clears (#4005), read off the op in a
+# detail line, which hack/fleet-fixture-state.py writes as `<subject> <path>
+# <op> [<value>]: observed ...`. Keyed on the op, not the role: the role's
+# other assertions are repaired by a re-apply. The age gate passes by itself
+# at the timestamp plus its hours (only the seeded-c `createTime` today); a
+# master ahead of its channel stays there, held by seeded_b_pin.py, until the
+# channel ships a newer patch of its minor. The health bot's advice and
+# hack/fleet_reconcile.py --drifted read these.
+OP_AGE_GATE = "age_hours_ge"
+OP_AHEAD_OF_CHANNEL = "not_ahead_of_channel"
+# An age-gate line that read one timestamp; the age is negative when the
+# scanning host's clock lags the cluster's createTime. An unparseable one ends
+# "not one RFC 3339 timestamp" instead, and no clock clears that.
+AGE_GATE_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AGE_GATE} (?P<hours>\d+(?:\.\d+)?): observed "(?P<when>[^"]+)", -?[\d.]+ hours old')
+# A master-ahead line, the one shape of that op meaning the channel offers
+# nothing as new; an unset channel or an unreadable version is other drift.
+AHEAD_OF_CHANNEL_LINE_RE = re.compile(rf'^\S+ \S+ {OP_AHEAD_OF_CHANNEL}: observed "[^"]+", newer than every ')
 
 # Reasons written when a whole project could not be checked.
 REASON_NO_BINARY = "{binary} is not on PATH, so nothing was checked"
@@ -399,6 +417,37 @@ def drift_map(document: dict | None) -> dict[str, list[str]]:
         if drifted:
             out[project] = drifted
     return out
+
+
+def no_reapply_op(line: str) -> str | None:
+    """OP_AGE_GATE or OP_AHEAD_OF_CHANNEL for a drift line no re-apply
+    clears; None for every other line."""
+    if AGE_GATE_LINE_RE.match(line):
+        return OP_AGE_GATE
+    if AHEAD_OF_CHANNEL_LINE_RE.match(line):
+        return OP_AHEAD_OF_CHANNEL
+    return None
+
+
+def age_gate_clears_at(line: str) -> datetime | None:
+    """When an age-gate line's assertion passes: the timestamp it read plus
+    the hours it wants. None for any other line, and for hours too large for
+    a date (a catalog value no clock reaches), so the advice reads it as
+    unparseable rather than the tick failing."""
+    match = AGE_GATE_LINE_RE.match(line)
+    when = parse_iso(match["when"]) if match else None
+    if not when:
+        return None
+    try:
+        return when + timedelta(hours=float(match["hours"]))
+    except OverflowError:
+        return None
+
+
+def reapply_clears_nothing(lines) -> bool:
+    """True when there are drift lines and no re-apply clears any of them."""
+    lines = list(lines)
+    return bool(lines) and all(no_reapply_op(line) for line in lines)
 
 
 def unread_units(document: dict | None) -> int:

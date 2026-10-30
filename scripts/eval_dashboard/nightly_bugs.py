@@ -132,7 +132,7 @@ LABEL = "nightly-red"
 TRIAGE_LABEL = "needs-triage"
 INFRA_LABEL = "Infra"
 DOMAIN_LABEL = "domain:{slug}"
-OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
+OPEN_ISSUES_PATH = "issues?labels={label}&state=open&per_page=100"
 # Closed ones too, updated since the window's first night: a bug closed
 # after any of the streak's nights started has seen this streak, so it is
 # not filed again until STREAK_NIGHTS failing nights all started after the
@@ -140,7 +140,7 @@ OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
 # nights on record, even one running when it merged, tested the code before
 # it); one handed off as not planned counts only while its close is on
 # record (``still_tracks``), so nothing older is needed.
-CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
+CLOSED_ISSUES_PATH = "issues?labels={label}&state=closed&since={since}&per_page=100"
 # The cross-check on both listings: the same issues read through GraphQL.
 # On 2026-10-22 the REST issue listing (any filter) and the search API both
 # answered 200 with no issues about half the time while the issues existed,
@@ -594,12 +594,12 @@ def infra_issue_part(issue: dict) -> str:
     return next((part for job, part in nightly.PART_JOBS.items() if f"`{job}`" in body), nightly.PART_MAIN)
 
 
-def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: str | None) -> str | None:
-    """Why the REST listings cannot be trusted, or None when GraphQL
-    agrees with them (LISTING_QUERY). A dedupe that reads an empty list
-    files every case again."""
+def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: str | None, label: str = LABEL) -> str | None:
+    """Why the REST listings of ``label`` cannot be trusted, or None when
+    GraphQL agrees with them (LISTING_QUERY). A dedupe that reads an empty
+    list files every case again."""
     owner, _, name = gh.repo.partition("/")
-    variables = {"owner": owner, "name": name, "label": LABEL, "since": since, "closed": bool(since)}
+    variables = {"owner": owner, "name": name, "label": label, "since": since, "closed": bool(since)}
     found = gh.call("POST", GRAPHQL_PATH, {"query": LISTING_QUERY, "variables": variables}, read=True)
     repo = ((found or {}).get("data") or {}).get("repository") if isinstance(found, dict) else None
     if not isinstance(repo, dict) or (found or {}).get("errors"):
@@ -618,23 +618,24 @@ def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: s
     return None
 
 
-def read_listings(gh: ghcli.Gh, since: str | None) -> tuple[list | None, list | None, str | None]:
-    """``(open, closed, doubt)``: the two REST listings (closed ones updated
+def read_listings(gh: ghcli.Gh, since: str | None, label: str = LABEL) -> tuple[list | None, list | None, str | None]:
+    """``(open, closed, doubt)``: the two REST listings of ``label`` (closed ones updated
     since ``since``; none without it), read up to LISTING_ATTEMPTS times
     until GraphQL agrees with them (``listing_doubt``). ``open`` or
     ``closed`` is None when a read failed; ``doubt`` is why the last read is
-    not trusted, None when it is. The filer and the digest's nightly section
-    both read the issues through this."""
+    not trusted, None when it is. The filer, the digest's nightly section
+    and the coverage-gap filer (``coverage_gaps.py``, label
+    `presubmit-gate`) read the issues through this."""
     doubt = None
     for attempt in range(1, LISTING_ATTEMPTS + 1):
-        open_issues = gh.call("GET", gh.path(OPEN_ISSUES_PATH), paginate=True)
-        closed_issues = gh.call("GET", gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True) if since else []
+        open_issues = gh.call("GET", gh.path(OPEN_ISSUES_PATH.format(label=label)), paginate=True)
+        closed_issues = gh.call("GET", gh.path(CLOSED_ISSUES_PATH.format(label=label, since=since)), paginate=True) if since else []
         if open_issues is None or closed_issues is None:
             return open_issues, closed_issues, None
-        doubt = listing_doubt(gh, open_issues, closed_issues, since)
+        doubt = listing_doubt(gh, open_issues, closed_issues, since, label)
         if not doubt:
             break
-        log(f"warning: the nightly-red issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
+        log(f"warning: the {label} issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
         if attempt < LISTING_ATTEMPTS:
             time.sleep(LISTING_RETRY_DELAY_S)
     return open_issues, closed_issues, doubt

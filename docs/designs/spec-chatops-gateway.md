@@ -1138,7 +1138,14 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`); plus the conversation's A2A `contextId`
+  and the progress artifact's latest line (`progress`), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
+  child tasks' usage artifacts summed; `usagePartial` when a link's stream could not be read, so
+  the sums are short of it; and `usage`, the usage
+  artifact's parts summed over the task and, for a delegation chain's root, every wake that
+  continued it, apart from the children; each absent when none of its turns published usage;
+  each executor publishes a turn's before its terminal, so a read that shows the
+  root final carries all of it); plus the
+  conversation's A2A `contextId`
   from its record (absent when there is no record; the bridge's `api` executor names its Hermes
   session after it, which is how the harness finds the kanban cards a turn filed), the
   conversation's last post, the
@@ -2067,7 +2074,9 @@ block whose first row is the column names; then the buttons, choices before link
 what a click sends, its `reply` or else its `text`, and a link button opens its url; action ids
 are the presenter's `kage.choice.<n>` and `kage.link.<n>`. A progress message's `plan` is
 one top-level `task_card` per item, each row's steps listed under it and marked `✓`, the last
-step of an `in_progress` row `◌`; not Slack's `plan` block, which Slack draws as its title alone,
+step of an `in_progress` row `◌`; a `pending` item draws `in_progress` with its steps all `✓`,
+because a `task_card` takes only `in_progress`, `complete` and `error` and Slack refuses the whole
+message with `invalid_blocks` for `pending` (its title already says it waits); not Slack's `plan` block, which Slack draws as its title alone,
 folded, and allows once per message, so the plan's `title` is the fallback text's only. A `tone` colours a side bar (green `#2EB67D`, yellow `#ECB22E`,
 red `#E01E5A`) holding every block under the headline. Slack refuses a `container` inside the
 attachment a side bar is, and an attachment draws after every top-level block, so a message with
@@ -2139,6 +2148,19 @@ answered recomputes who is waiting and reads the board only once the snapshot ha
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
 A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+
+**The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
+chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
+(`actions`, `retry` and `drop`; spec-a2a-payloads.md, "Chat messages"). The renderer lays such a
+row out as its text over an actions block keyed by the row (`kage_board.row.<n>`), labels the
+buttons Retry and Drop itself, and puts the row's ids, joined by commas, in their value
+(`slack_board.go`). A tap is never a turn. It is admitted by the Home tab's rule above, then sent
+over the board route as a request with a body (`lib.BoardAction`), which the Hermes bridge relays
+to session-kv's `POST /v1/board/actions`; that unblocks (Retry) or archives (Drop) the row's cards
+while they are still `blocked`, and answers each card's outcome. The row is then edited in place:
+its buttons give way to "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>", or "No longer
+stuck. <name>, <time>" when the cards had already moved, the time as Slack's date token; a tap that did not land
+keeps the buttons under a line saying so, and so does a row whose edit Slack refused, so a second tap asks again. One tap per row at a time, and one edit of a card at a time, each from the blocks the last one sent, in this process. A message whose rows carry buttons is drawn without its side bar, so every row stays in the message's own blocks where the edit finds it.
 
 ### Answer feedback (added 10/16)
 

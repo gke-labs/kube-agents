@@ -277,14 +277,14 @@ func readMCPToken(t *testing.T, cl client.Client) (*corev1.Secret, error) {
 
 // The token is minted once and never rotated by the operator, so a person can
 // rotate it by editing the Secret; an empty one is filled; an unowned one is
-// refused rather than adopted.
+// left alone and reported rather than adopted.
 func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 	ctx := context.Background()
 	agent := a2aTestAgent()
 
 	t.Run("minted, then kept", func(t *testing.T) {
 		r, cl := mcpTestReconciler(t)
-		if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+		if _, err := r.ensureA2AMCPToken(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
 		first, err := readMCPToken(t, cl)
@@ -294,7 +294,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		if !metav1.IsControlledBy(first, agent) {
 			t.Error("the minted token is not owned by the PlatformAgent")
 		}
-		if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+		if _, err := r.ensureA2AMCPToken(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
 		second, _ := readMCPToken(t, cl)
@@ -313,7 +313,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 				t.Fatal(err)
 			}
 			r, cl := mcpTestReconciler(t, empty)
-			if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+			if _, err := r.ensureA2AMCPToken(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
 			filled, err := readMCPToken(t, cl)
@@ -337,7 +337,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 				t.Fatal(err)
 			}
 			r, cl := mcpTestReconciler(t, held)
-			if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+			if _, err := r.ensureA2AMCPToken(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
 			got, err := readMCPToken(t, cl)
@@ -362,7 +362,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
 			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
 		r, cl := mcpTestReconciler(t, squatter)
-		if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+		if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
 			t.Fatalf("an unowned Secret under the reserved name stopped the reconcile: %v", err)
 		}
 		if got, err := readMCPToken(t, cl); err != nil || string(got.Data[a2aMCPAccessKey]) != "chosen-by-someone-else" {
@@ -370,12 +370,19 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		}
 	})
 
-	t.Run("an unowned Secret is refused", func(t *testing.T) {
+	t.Run("an unowned Secret is not adopted, not fatal, reported", func(t *testing.T) {
 		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
 			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
-		r, _ := mcpTestReconciler(t, squatter)
-		if err := r.ensureA2AMCPToken(ctx, agent); err == nil {
-			t.Error("adopted an unowned Secret as the MCP token")
+		r, cl := mcpTestReconciler(t, squatter)
+		owned, err := r.ensureA2AMCPToken(ctx, agent)
+		if err != nil {
+			t.Fatalf("an unowned Secret under the reserved name stopped the reconcile: %v", err)
+		}
+		if owned {
+			t.Error("an unowned Secret was reported as the MCP token")
+		}
+		if got, err := readMCPToken(t, cl); err != nil || string(got.Data[a2aMCPAccessKey]) != "chosen-by-someone-else" || len(got.OwnerReferences) != 0 {
+			t.Errorf("the unowned Secret was touched: %v %+v", err, got)
 		}
 	})
 }
@@ -398,7 +405,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
 	// The fence is reconcileA2ANetworkFences's; applied here as that pass
@@ -419,7 +426,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aMCPDoorEnvVar, "")
-	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
 		t.Fatal(err)
 	}
 	for name, obj := range map[string]client.Object{
@@ -488,7 +495,7 @@ func TestTheFlagOffMCPRemovalSkipsAnUnownedFence(t *testing.T) {
 	agent := a2aTestAgent()
 	squatter := buildA2AMCPNetworkPolicy(agent)
 	r, cl := mcpTestReconciler(t, squatter)
-	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
 		t.Fatalf("an unowned NetworkPolicy under the fence's name stopped the reconcile: %v", err)
 	}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(squatter), &networkingv1.NetworkPolicy{}); err != nil {

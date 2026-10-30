@@ -316,13 +316,14 @@ class PromotionPipelineWiringTest(unittest.TestCase):
             "GitHub caps a job at six hours whatever this says",
         )
 
-    def test_the_eval_wait_activates_its_credential_for_gsutil(self):
-        """gsutil ignores GOOGLE_GHA_CREDS_PATH; the poller would see an empty bucket.
-
-        Without the explicit `gcloud auth login --cred-file`, every listing the
-        poller makes fails on anonymous credentials, no build is ever found, and
-        the job reports `never_ran` — which reads as a broken eval lane rather
-        than a missing login. ci-health.yml paid forty failed ticks to learn this.
+    def test_the_eval_wait_makes_its_credential_the_active_account(self):
+        """The poller's `gcloud storage` reads run as the active account, which
+        the explicit `gcloud auth login --cred-file` makes the auth step's
+        credential. (The reads were gsutil's until 2026-10, and gsutil ignored
+        GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
+        credentials, no build was ever found, and the job reported `never_ran`,
+        which reads as a broken eval lane rather than a missing login.
+        ci-health.yml paid forty failed ticks to learn this.)
 
         Order is half of it: a login after the poller is a login that changes
         nothing, and the run still reports the same empty bucket.

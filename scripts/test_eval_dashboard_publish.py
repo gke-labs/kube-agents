@@ -347,7 +347,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
                 (dash / "render.py").write_text(record_argv)
                 stubs_dir = pathlib.Path(tmp) / "stubs"
                 stubs_dir.mkdir()
-                write_stub(stubs_dir, "gsutil", "exit 1\n")
+                write_stub(stubs_dir, "gcloud", "exit 1\n")
                 result = run_hook(0, fake_hack, target=target, path_prepend=str(stubs_dir))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 argv = json.loads((dash / "render.py.argv").read_text())
@@ -423,8 +423,8 @@ class PublishHookFailSafeTest(unittest.TestCase):
             self.assertNotIn("--health", argv)
             self.assertNotIn("--health-history", argv)
 
-    def test_gsutil_downloads_health_and_history_for_bucket_target(self):
-        """For a gs:// target, the hook calls gsutil cp to download
+    def test_gcloud_storage_downloads_health_and_history_for_bucket_target(self):
+        """For a gs:// target, the hook calls `gcloud storage cp` to download
         health.json and health-history.jsonl and passes them to render.py."""
         collect_ok = """\
             import json, pathlib, sys
@@ -435,10 +435,10 @@ class PublishHookFailSafeTest(unittest.TestCase):
             "import json, pathlib, sys\n"
             "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
         )
-        fake_gsutil = """\
-            if [[ "$1" == "cp" ]]; then
-                src="$2"
-                dst="$3"
+        fake_gcloud = """\
+            if [[ "$1 $2" == "storage cp" ]]; then
+                src="$3"
+                dst="$4"
                 if [[ "$src" == *"health.json" ]]; then
                     echo '{"state":"GREEN"}' > "$dst"
                     exit 0
@@ -455,7 +455,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             (dash / "render.py").write_text(record_argv)
             stubs_dir = pathlib.Path(tmp) / "stubs"
             stubs_dir.mkdir()
-            write_stub(stubs_dir, "gsutil", textwrap.dedent(fake_gsutil))
+            write_stub(stubs_dir, "gcloud", textwrap.dedent(fake_gcloud))
             result = run_hook(
                 0,
                 fake_hack,
@@ -469,7 +469,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
 
     def test_zero_collected_runs_skip_instead_of_publishing_empty(self):
         """The evidence_store lesson: an unreadable source is not an empty
-        one. collect.py warns-and-continues on gsutil failures and still
+        one. collect.py warns-and-continues on gcloud storage failures and still
         exits 0 with runs: [], so without the floor a 403 on the sweep would
         overwrite a good dashboard with an empty one and log success."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,10 +25,11 @@ each role the runner published it reads the `state` assertions the catalog
 (bench/tf/fleet/fixtures.json) declares -- the crashloop has recorded an
 OOMKilled termination, the healthy workloads are Ready, the idle pool's node is
 Ready and tainted, slot b's control plane is still one minor behind its
-channel, slots a, b and d keep the master authorized-networks block slot c is
-the drift outlier against, and slot c's cluster is past the drift SOP's
-24-hour age gate -- and reports the roles whose fixture is there but not in the shape
-the cases depend on. One role asserts the room the others schedule into:
+channel and on no patch newer than that channel offers, slots a, b and d keep
+the master authorized-networks block slot c is the drift outlier against, and
+slot c's cluster is past the drift SOP's 24-hour age gate -- and reports the
+roles whose fixture is there but not in the shape the cases depend on. One
+role asserts the room the others schedule into:
 `default-pool-headroom` reads seeded-a's default-pool nodes and every pod
 bound to them and fails when the busier node drops below the headroom margin
 the scan keeps for the next fixtures, ten of them at 10m (#3607: a 10m
@@ -141,8 +142,8 @@ PATH_STEP_RE = re.compile(
 )
 
 # Comparison operators, applied to the LIST of values a path matched. `eq`,
-# `ge`, `after_now`, `age_hours_ge` and `minor_behind_channel_default` want
-# exactly one value;
+# `ge`, `after_now`, `age_hours_ge`, `minor_behind_channel_default` and
+# `not_ahead_of_channel` want exactly one value;
 # `any_*` and `none_eq` quantify over however many the path found; `absent`
 # wants none (or, with no path, no objects at all).
 OP_EQ = "eq"
@@ -153,6 +154,14 @@ OP_NONE_EQ = "none_eq"
 OP_ABSENT = "absent"
 OP_AFTER_NOW = "after_now"
 OP_MINOR_BEHIND = "minor_behind_channel_default"
+# `not_ahead_of_channel` wants a version the cluster's own release channel
+# offers, or one it has moved past: some patch of the same minor it offers is
+# newer (or, when it offers none of that minor, some version at all). A
+# version newer than all of those is ahead of the channel. seeded-b ran
+# 1.34.12-gke.1011000, newer than both 1.34 patches REGULAR carried, and agents
+# compared it with them and called it current or ahead (#3025, #3269). A patch
+# the channel has moved past is not drift: upgrades cases read it.
+OP_NOT_AHEAD = "not_ahead_of_channel"
 # `age_hours_ge` wants an RFC 3339 timestamp at least `value` hours in the
 # past. The drift SOP leaves a cluster whose `createTime` is under 24 hours old
 # out of every cohort (agents/platform/governance/fleet_consistency_drift_sop.md
@@ -172,7 +181,7 @@ OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
 OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE})
 # Ops whose `value` must be a number; anything else is a catalog bug.
 OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
-OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW})
+OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
 # Ops that read the subject's objects whole and therefore take no path.
 OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE})
@@ -193,17 +202,24 @@ SECONDS_PER_HOUR = 3600.0
 # RFC 3339's UTC designator, and the offset Python's parser wants for it.
 RFC3339_UTC_SUFFIX = "Z"
 ISO_UTC_OFFSET = "+00:00"
-# Only the cluster subject can be compared against its channel's default.
-CLUSTER_ONLY_OPS = frozenset({OP_MINOR_BEHIND})
+# Only the cluster subject can be compared against its channel's versions.
+CLUSTER_ONLY_OPS = frozenset({OP_MINOR_BEHIND, OP_NOT_AHEAD})
 
-# GKE version strings: `1.33.4-gke.1134000`. Only the minor matters here.
+# GKE version strings: `1.33.4-gke.1134000`. The minor-behind operator reads
+# only the minor; `not_ahead_of_channel` orders whole versions, and refuses
+# anything else rather than misorder it (bench/tf/fleet/seeded_b_pin.py
+# parses the same shape).
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.")
-# Fields of a `clusters describe` document the minor-behind operator reads
-# beside the path it was given.
+GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)-gke\.(\d+)$")
+# The (major, minor) prefix of a parsed version.
+MINOR_PREFIX_LEN = 2
+# Fields of a `clusters describe` document the two channel operators read
+# beside the path they were given, and of the get-server-config channel entry.
 RELEASE_CHANNEL_PATH = "releaseChannel.channel"
 SERVER_CONFIG_CHANNELS = "channels"
 SERVER_CONFIG_CHANNEL = "channel"
 SERVER_CONFIG_DEFAULT = "defaultVersion"
+SERVER_CONFIG_VALID = "validVersions"
 
 # Read ceilings. A fixture read is one API call; anything slower is weather,
 # and the poll loop asks again rather than hanging on it.
@@ -470,8 +486,9 @@ def read_cluster(project: str, name: str, location: str) -> dict:
     return doc
 
 
-def read_channel_default(project: str, location: str, channel: str) -> str | None:
-    """The default version of `channel` at `location`, or None if not listed."""
+def read_channel(project: str, location: str, channel: str) -> dict | None:
+    """`channel`'s entry in get-server-config at `location` (its
+    `defaultVersion` and `validVersions`), or None if not listed."""
     cmd = [
         "gcloud", "container", "get-server-config",
         "--location", location, "--project", project, "--format", "json",
@@ -485,8 +502,7 @@ def read_channel_default(project: str, location: str, channel: str) -> str | Non
         raise Unreadable(f"get-server-config printed something other than JSON: {exc}") from exc
     for entry in (doc.get(SERVER_CONFIG_CHANNELS) or []) if isinstance(doc, dict) else []:
         if isinstance(entry, dict) and entry.get(SERVER_CONFIG_CHANNEL) == channel:
-            default = entry.get(SERVER_CONFIG_DEFAULT)
-            return str(default) if default else None
+            return entry
     return None
 
 
@@ -542,6 +558,13 @@ def _number(value) -> float | None:
 def _minor(version) -> int | None:
     m = VERSION_RE.match(str(version or ""))
     return int(m.group(2)) if m else None
+
+
+def _gke_version(version) -> tuple[int, ...] | None:
+    """`1.34.11-gke.1209000` -> (1, 34, 11, 1209000), so patches order
+    numerically; None for anything else."""
+    m = GKE_VERSION_RE.match(str(version or ""))
+    return tuple(int(n) for n in m.groups()) if m else None
 
 
 def _timestamp(value) -> datetime | None:
@@ -619,11 +642,13 @@ def _describe(values: list) -> str:
     return f"observed {shown}"
 
 
-def evaluate(entry: dict, objects: list, *, channel_default=None, pods_by_node=None) -> str | None:
+def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None) -> str | None:
     """None when the assertion holds; otherwise one line saying what was seen.
 
     `channel_default` is a callable returning the channel default version for
-    the cluster document, used by the minor-behind operator only; it is
+    the cluster document, used by the minor-behind operator only, and
+    `channel_valid` one returning the channel's valid versions (None when the
+    channel is not listed), used by `not_ahead_of_channel` only; both are
     resolved lazily so a role that never needs server-config never pays for it.
     `pods_by_node` is a callable returning {node name: [pod, ...]} for every
     bound pod in the cluster, used by `node_cpu_spare_ge` only, lazy for the
@@ -683,6 +708,34 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, pods_by_node=N
             ok = want is not None and current == _minor(default) - int(want)
             if not ok:
                 return f"{label}: {_describe(values)} against channel default {default}"
+    elif op == OP_NOT_AHEAD:
+        channel = walk(parse_path(RELEASE_CHANNEL_PATH), objects)
+        name = str(channel[0]) if len(channel) == 1 else None
+        if name is None:
+            return f"{label}: {_describe(values)}; release channel unset"
+        valid = channel_valid(name) if channel_valid else None
+        if valid is None:
+            return f"{label}: {_describe(values)}; get-server-config lists no {name} channel"
+        ok = False
+        if len(values) == 1:
+            version = _gke_version(values[0])
+            if version is None:
+                return f"{label}: {_describe(values)}, not a GKE version"
+            # Any entry outside the GKE shape refuses the roster, as
+            # seeded_b_pin.py does: ordering against the rest could drop the
+            # newest patch and read the master as ahead.
+            offered = []
+            for v in valid:
+                key = _gke_version(v)
+                if key is None:
+                    raise Unreadable(f"{name}'s {SERVER_CONFIG_VALID} entry {v!r} is not a GKE version, so nothing can be ordered against the roster")
+                offered.append((key, str(v)))
+            same_minor = [(key, v) for key, v in offered if key[:MINOR_PREFIX_LEN] == version[:MINOR_PREFIX_LEN]]
+            ok = str(values[0]) in valid or any(key > version for key, _ in same_minor or offered)
+            if not ok:
+                line = ".".join(str(n) for n in version[:MINOR_PREFIX_LEN])
+                where = f"every {line} patch {name} offers (newest {max(same_minor)[1]})" if same_minor else f"every version {name} offers"
+                return f"{label}: {_describe(values)}, newer than {where}"
     elif op == OP_NODE_CPU_SPARE:
         if pods_by_node is None:  # pragma: no cover - check_role always supplies it
             raise CatalogError(f"op {op!r} needs the pod reader")
@@ -702,7 +755,7 @@ class Reader:
     """Reads for one pass, with the server-config lookups memoised.
 
     A pass over every catalog role must not pay one get-server-config per assertion;
-    a location's channel defaults do not change between two reads seconds
+    a location's channel versions do not change between two reads seconds
     apart.
     """
 
@@ -710,7 +763,9 @@ class Reader:
         self.directory = directory
         self.project = project
         self.context = context
-        self._defaults: dict[tuple[str, str], str | None] = {}
+        # A failed read is kept too, so the pass pays one get-server-config
+        # per location and channel whichever way it went.
+        self._channels: dict[tuple[str, str], dict | None | Unreadable] = {}
         self._pods: dict[Path, dict[str, list]] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
@@ -727,17 +782,40 @@ class Reader:
             return [read_cluster(self.project, name, location)]
         return read_kubectl(kubeconfig, spec["namespace"], subject)
 
-    def channel_default_for(self, spec: dict):
+    def _channel(self, spec: dict, channel: str) -> dict | None:
         slot = spec["cluster_slot"]
         location = self.context.get(f"{CONTEXT_LOCATION_PREFIX}{slot}")
+        if not location:
+            raise Unreadable(f"{CONTEXT_FILE} records no location for slot {slot!r}")
+        key = (location, channel)
+        if key not in self._channels:
+            try:
+                self._channels[key] = read_channel(self.project, location, channel)
+            except Unreadable as exc:
+                self._channels[key] = exc
+        cached = self._channels[key]
+        if isinstance(cached, Unreadable):
+            raise cached
+        return cached
 
+    def channel_default_for(self, spec: dict):
         def lookup(channel: str) -> str | None:
-            if not location:
-                raise Unreadable(f"{CONTEXT_FILE} records no location for slot {slot!r}")
-            key = (location, channel)
-            if key not in self._defaults:
-                self._defaults[key] = read_channel_default(self.project, location, channel)
-            return self._defaults[key]
+            default = (self._channel(spec, channel) or {}).get(SERVER_CONFIG_DEFAULT)
+            return str(default) if default else None
+
+        return lookup
+
+    def channel_valid_for(self, spec: dict):
+        def lookup(channel: str) -> list[str] | None:
+            entry = self._channel(spec, channel)
+            if entry is None:
+                return None
+            valid = entry.get(SERVER_CONFIG_VALID)
+            # An empty roster is a failed read, as bench/tf/fleet/seeded_b_pin.py
+            # treats it: every master would otherwise read as ahead of it.
+            if not isinstance(valid, list) or not valid:
+                raise Unreadable(f"get-server-config's {channel} entry carries no {SERVER_CONFIG_VALID} list")
+            return [str(v) for v in valid]
 
         return lookup
 
@@ -784,7 +862,13 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
             unreadable.append(f"{subject}: {objects}")
             continue
         try:
-            problem = evaluate(entry, objects, channel_default=reader.channel_default_for(spec), pods_by_node=reader.pods_by_node_for(role))
+            problem = evaluate(
+                entry,
+                objects,
+                channel_default=reader.channel_default_for(spec),
+                channel_valid=reader.channel_valid_for(spec),
+                pods_by_node=reader.pods_by_node_for(role),
+            )
         except Unreadable as exc:
             unreadable.append(f"{subject}: {exc}")
             continue
