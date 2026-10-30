@@ -53,12 +53,14 @@ def required_rule(*names):
     return {"type": rfc.RULE_REQUIRED_STATUS_CHECKS, "parameters": {"required_status_checks": checks, "strict_required_status_checks_policy": False}}
 
 
-def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests", event="pull_request", head_branch=PR_HEAD["ref"], head_repo=PR_HEAD["repo"]["full_name"]):
+def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests", event="pull_request", head_branch=PR_HEAD["ref"], head_repo=PR_HEAD["repo"]["full_name"], workflow_id=None):
     """A workflow run as the runs list returns it; `suite` ties it to its check runs.
-    By default it is the pull request's own: a pull-request event at its head branch and repository."""
+    By default it is the pull request's own: a pull-request event at its head branch and repository.
+    Its workflow is its name unless `workflow_id` says otherwise."""
     return {
         "id": run_id,
         "name": name,
+        "workflow_id": workflow_id or name,
         "check_suite_id": suite,
         "status": status,
         "conclusion": conclusion,
@@ -283,6 +285,29 @@ class PlanTest(unittest.TestCase):
     def test_two_red_check_runs_of_one_name_in_one_run_name_it_once(self):
         plan = rfc.plan_reruns([check(1, "Title", "cancelled", 10), check(2, "Title", "failure", 10)], [run(100, "cancelled", 10)], PR_HEAD, required=frozenset({"Title"}))
         self.assertEqual([(100, ["Title"])], [(e.run["id"], e.check_names) for e in plan.rerun])
+
+    def test_one_run_per_workflow_is_rerun_and_the_rest_wait(self):
+        """Two re-runs of one workflow at one head share its concurrency group; the later would cancel the earlier."""
+        plan = rfc.plan_reruns(
+            [check(1, "Title", "cancelled", 10), check(3, "Title", "failure", 30), check(2, "Title", "success", 20)],
+            [run(100, "cancelled", 10, workflow_id=7), run(300, "failure", 30, workflow_id=7), run(200, "success", 20, workflow_id=7)],
+            PR_HEAD,
+            required=frozenset({"Title"}),
+        )
+        self.assertEqual([100], [entry.run["id"] for entry in plan.rerun])
+        self.assertEqual(["Title"], [entry.name for entry in plan.skipped])
+        self.assertIn("workflow run 300 waits", plan.skipped[0].reason)
+        self.assertIn("/retest again", plan.skipped[0].reason)
+
+    def test_runs_of_different_workflows_are_all_rerun(self):
+        plan = rfc.plan_reruns(
+            [check(1, "Title", "cancelled", 10), check(2, "Build", "cancelled", 20)],
+            [run(100, "cancelled", 10, workflow_id=7), run(200, "cancelled", 20, workflow_id=8)],
+            PR_HEAD,
+            required=frozenset({"Title", "Build"}),
+        )
+        self.assertEqual([200, 100], [entry.run["id"] for entry in plan.rerun])
+        self.assertEqual([], plan.skipped)
 
     def test_one_reason_for_a_required_names_red_runs_is_said_once(self):
         checks = [check(1, "Review", "failure", 10, app="kube-agents-bot"), check(2, "Review", "cancelled", 20, app="kube-agents-bot")]

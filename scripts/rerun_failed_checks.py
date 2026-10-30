@@ -33,6 +33,10 @@ run of the same name green beside it -- still keeps the pull request out of
 the merge queue (#4355). For a required name the script keeps every red check
 run, not the newest of an all-red name, and re-runs each one's workflow run --
 unless a check run of the name is still going, when the name is pending.
+One command re-runs at most one run of each workflow: two re-runs of one
+workflow at one head share its concurrency group, and the later cancels the
+earlier. The rest are named as waiting, and the next `/retest`, after that
+re-run finishes, takes the next.
 The required names come from the base branch's rules; when GitHub refuses
 that read, every name is read the Tide way and the log says so.
 
@@ -154,9 +158,9 @@ class Skipped:
 
 @dataclasses.dataclass
 class Plan:
-    rerun: list  # Rerun, one per workflow run behind a red check name
-    skipped: list  # Skipped, one per red check name left alone, with why
-    pending: int  # check names whose best state is pending
+    rerun: list  # Rerun, one per workflow run behind a red check run, at most one per workflow
+    skipped: list  # Skipped, one per red check run left alone and why, each name and reason once
+    pending: int  # check names still going (`red_check_runs`)
 
 
 def list_runs(api, repo: str, head_sha: str) -> list:
@@ -278,6 +282,7 @@ def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
     by_suite = {run.get("check_suite_id"): run for run in runs}
     plan = Plan(rerun=[], skipped=[], pending=pending)
     by_run = {}
+    by_workflow = {}  # workflow id -> the one run of it this command re-runs
     for name, check_run in ((name, check_run) for name in sorted(red) for check_run in red[name]):
         app = (check_run.get("app") or {}).get("slug")
         if app != ACTIONS_APP_SLUG:
@@ -299,7 +304,14 @@ def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
         if attempt >= RERUN_ATTEMPT_CEILING:
             plan.skipped.append(Skipped(name, f"run {run['id']} is already on attempt {attempt}; a person with Write access decides"))
             continue
+        workflow = run.get("workflow_id", run["id"])
+        if run["id"] not in by_run and workflow in by_workflow:
+            plan.skipped.append(
+                Skipped(name, f"its workflow run {run['id']} waits: re-running {by_workflow[workflow]} of the same workflow now would put both in one concurrency group, where one cancels the other; /retest again once that finishes")
+            )
+            continue
         if run["id"] not in by_run:
+            by_workflow[workflow] = run["id"]
             action = RERUN_FAILED_JOBS if run.get("conclusion") == FAILED_CONCLUSION else RERUN_WHOLE
             by_run[run["id"]] = Rerun(run, action, [])
             plan.rerun.append(by_run[run["id"]])
