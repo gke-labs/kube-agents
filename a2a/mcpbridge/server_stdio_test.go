@@ -84,6 +84,13 @@ func startBlockingGateway(t *testing.T, blockTool string) *blockingGateway {
 					g.stops <- params.Arguments
 				}
 			}
+			if act, _ := params.Arguments["action"].(string); params.Name == ToolManageSession && act == "delte" {
+				// The server's answer to an action it does not have.
+				_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
+					Content: []TextContent{{Type: contentTypeText, Text: "unknown action \"delte\""}}, IsError: true,
+				}))
+				return
+			}
 			_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
 				Content: []TextContent{{Type: contentTypeText, Text: fmt.Sprintf("gateway ran %s", params.Name)}},
 			}))

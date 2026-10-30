@@ -133,3 +133,30 @@ func TestManageSessionActionsTheServerLacksAreHiddenAndRefused(t *testing.T) {
 	}
 	noCallNamed(t, gw, ToolManageSession, 100*time.Millisecond)
 }
+
+func TestManageSessionReturnsTheServersRefusalInsteadOfTheLocalList(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv, ConversationEntry{Alias: "c1", Token: MintConversationToken()})
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delte","alias":"c1"}`))
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "unknown action") {
+		t.Fatalf("misspelled action: %+v; want the server's refusal as an error", res)
+	}
+	res = srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"list"}`))
+	if res.IsError || res.Content[0].Text != "gateway ran manage_session" {
+		t.Fatalf("list with the server up: %+v; want the server's list", res)
+	}
+
+	gw.srv.Close()
+	srv.Close()
+	srv = newStdioTestServer(t, gw)
+	putConversations(t, srv, ConversationEntry{Alias: "c1", Token: MintConversationToken()})
+	res = srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"help"}`))
+	if !res.IsError {
+		t.Fatalf("help with the server down: %+v; want an error, not the local list", res)
+	}
+	res = srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"list"}`))
+	if res.IsError || !strings.Contains(res.Content[0].Text, "c1") || !strings.Contains(res.Content[0].Text, "not the server's") {
+		t.Fatalf("list with the server down: %+v; want the local list, marked as local", res)
+	}
+}

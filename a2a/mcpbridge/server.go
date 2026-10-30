@@ -1369,15 +1369,32 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		return fmt.Sprintf("Debug output set to `%v` for **`%s`**.\n", enable, FirstNonEmptyStr(entry.Alias, "global")), "", "", nil
 	}
 
-	if sess, err := s.ensureConnected(ctx); err == nil {
-		if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, rawArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx)); rErr == nil {
+	// list, help and anything else go to the server, whose answer (or refusal) is the result.
+	// Only list has a local stand-in, used when the server cannot answer, and it says so.
+	sess, err := s.ensureConnected(ctx)
+	if err == nil {
+		var txt, title, md string
+		txt, title, md, err = sess.callRemoteTool(ctx, ToolManageSession, rawArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
+		if err == nil {
 			return txt, title, md, nil
 		}
+		if action != actionList {
+			return txt, title, md, err
+		}
+	} else if action != actionList {
+		return "", "", "", err
 	}
 	snap := s.store.Snapshot()
+	aliases := make([]string, 0, len(snap.Conversations))
+	for alias := range snap.Conversations {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
 	var sb strings.Builder
-	sb.WriteString("## 💬 Kube-Agents Console Conversations\n\n")
-	for alias, c := range snap.Conversations {
+	sb.WriteString("## 💬 Kube-Agents Console Conversations (this bridge's local list)\n\n")
+	fmt.Fprintf(&sb, "⚠️ The in-cluster server's conversation list is not available (%v); these are the names this bridge has saved, not the server's.\n\n", err)
+	for _, alias := range aliases {
+		c := snap.Conversations[alias]
 		fmt.Fprintf(&sb, "- **`%s`** (`console:%s`, sessionMode=`%v`)\n", alias, c.Token, c.SessionMode)
 	}
 	return sb.String(), "", "", nil
