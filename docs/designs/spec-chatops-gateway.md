@@ -1599,8 +1599,8 @@ kubelet refreshes the file in place within about a minute, so a learned channel 
 no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
 The agent's env carries the CR field only, as any CR edit does. The operator admits a recorded channel
 only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
-stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks
-neither before a post. The projection joins the stack's teardown list, and a hand edit of it is
+stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks a
+file-sourced home before each post (below), never the CR field. The projection joins the stack's teardown list, and a hand edit of it is
 rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
 channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
