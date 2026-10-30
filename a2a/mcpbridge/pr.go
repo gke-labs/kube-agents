@@ -258,7 +258,7 @@ func InspectPullRequest(
 			if err != nil {
 				var ghErr *githubHTTPError
 				if errors.As(httpErr, &ghErr) && ghErr.StatusCode == http.StatusNotFound {
-					return nil, fmt.Errorf("pull request %s#%d not found on GitHub (HTTP 404)", repo, num)
+					return nil, prNotFoundError(repo, num, token, err)
 				}
 				if errors.Is(err, exec.ErrNotFound) {
 					return nil, httpErr
@@ -566,6 +566,25 @@ func nextPageURL(link string, current string) string {
 		return next.String()
 	}
 	return ""
+}
+
+// prNotFoundError is the error for a pull request GitHub answered 404 for and gh could not
+// fetch either. GitHub answers 404 for a pull request the caller may not see as well as for
+// one that does not exist, so the error says both and keeps gh's reason, with the token
+// redacted should gh's output ever carry it.
+func prNotFoundError(repo string, num int, token string, ghErr error) error {
+	visibility := "or not visible without a GitHub credential; set GH_TOKEN or GITHUB_TOKEN, or run `gh auth login`"
+	if token != "" {
+		visibility = "or not visible to the GitHub credential in use"
+	}
+	ghText := "the gh CLI is not installed"
+	if !errors.Is(ghErr, exec.ErrNotFound) {
+		ghText = ghErr.Error()
+		if token != "" {
+			ghText = strings.ReplaceAll(ghText, token, "[redacted]")
+		}
+	}
+	return fmt.Errorf("pull request %s#%d not found on GitHub, %s (HTTP 404; gh: %s)", repo, num, visibility, ghText)
 }
 
 func fetchPRViaGHCLI(ctx context.Context, runner CommandRunner, repo string, num int) (*PRInspection, error) {

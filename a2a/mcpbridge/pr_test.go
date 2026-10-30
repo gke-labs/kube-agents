@@ -593,3 +593,26 @@ func TestSanitizePatchFilenameKeepsFlattenedPathsApart(t *testing.T) {
 		t.Errorf("sanitizePatchFilename lost the readable path: %q", got)
 	}
 }
+
+// GitHub answers 404 for a private pull request the caller cannot see: the error says that
+// may be the reason, keeps gh's own reason, and never carries the token.
+func TestInspectPullRequestNotFoundSaysItMayBeAMissingCredential(t *testing.T) {
+	ghServer := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(ghServer.Close)
+	ghLoggedOut := func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("exit status 4 (To get started with GitHub CLI, please run:  gh auth login)")
+	}
+	_, err := InspectPullRequest(context.Background(), ghLoggedOut, ghServer.URL, testPRURL, "", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "not visible without a GitHub credential") || !strings.Contains(err.Error(), "exit status 4") {
+		t.Fatalf("404 with no credential and gh logged out: %v; want the credential hint and gh's reason", err)
+	}
+
+	t.Setenv(envGHToken, "ghp_secret123")
+	ghEchoes := func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("HTTP 404: Not Found (token ghp_secret123)")
+	}
+	_, err = InspectPullRequest(context.Background(), ghEchoes, ghServer.URL, testPRURL, "", t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "not visible to the GitHub credential in use") || strings.Contains(err.Error(), "ghp_secret123") {
+		t.Fatalf("404 with a credential: %v; want the visibility hint without the token", err)
+	}
+}
