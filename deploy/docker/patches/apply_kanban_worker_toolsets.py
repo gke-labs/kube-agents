@@ -5,7 +5,7 @@ Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. One anchored edit
 in ``hermes_cli/kanban_db_dispatch.py`` plus an import trailer:
 ``_resolve_worker_cli_toolsets`` hands the resolution to the module, which runs
 this same function in a child process. In that child the module's flag is set,
-so the function falls through to upstream's body.
+so the function falls through to upstream's body; a multiplexed gateway does too.
 
 Why the change is needed is documented in the module docstring of
 ``deploy/docker/patches/kanban_worker_toolsets.py`` (#3937). Usage::
@@ -36,9 +36,9 @@ BODY_PATCHED = (
     "        return None\n"
     "    # kube-agents patch: resolve in a child process, so the profile's plugins\n"
     "    # are never imported or registered in the gateway (#3937). The child runs\n"
-    "    # this function with the flag set and falls through to upstream's body.\n"
-    "    # See tools/kanban_worker_toolsets.py.\n"
-    "    if not _kanban_worker_toolsets.in_child():\n"
+    "    # this function with the flag set and falls through to upstream's body, as\n"
+    "    # does a multiplexed gateway. See tools/kanban_worker_toolsets.py.\n"
+    "    if not _kanban_worker_toolsets.keep_in_process():\n"
     "        return _kanban_worker_toolsets.resolve_worker_toolsets(hermes_home)\n"
     "    try:\n"
     "        from agent.secret_scope import (\n"

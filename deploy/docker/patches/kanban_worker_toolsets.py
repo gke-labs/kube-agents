@@ -27,22 +27,39 @@ unregister, and its threads and ``atexit`` handlers outlive the manager.
 What this does
 --------------
 The resolution runs upstream's own code in a short-lived child process, with
-the same environment as the gateway, and the gateway keeps only the result, a
-short list of toolset names, per profile home. So no profile's plugins are
-ever imported or registered in the gateway.
+the gateway's environment variables and working directory, and the gateway
+keeps only the result, a short list of toolset names, per profile home. So no
+profile's plugins are ever imported or registered in the gateway.
+
+The child runs with ``python -P``: the gateway's working directory is the
+writable data volume, and ``-c`` would otherwise put it first on the child's
+import path, which the gateway's own path does not have.
+
+Under ``gateway.multiplex_profiles`` the gateway resolves with a per-profile
+secret scope that a child cannot rebuild, so there the hook keeps upstream's
+in-process path. kube-agents does not enable multiplexing.
 
 When the cached result is used, and when it is recomputed
 ---------------------------------------------------------
 The cache is in memory only, so a new gateway process (an image upgrade, any
 change to its environment, a restart) always starts empty. Within one process
-an entry is reused only while the profile's inputs are unchanged, read as a
-stat signature (``mtime_ns`` and size) of:
+an entry is reused only while these inputs are unchanged, read as a stat
+signature (inode, ``mtime_ns``, ``ctime_ns``, size):
 
-- the profile's ``config.yaml`` and ``.env``;
-- every file under the profile's ``plugins/`` directory, which covers the
-  plugin set and its code;
+- the profile's ``config.yaml``, ``.env`` and ``auth.json``;
+- every file and link under the profile's ``plugins/`` directory, following
+  linked plugin directories, which covers the plugin set and its code;
 - every file in the managed scope (``HERMES_MANAGED_DIR``, else ``/etc/hermes``),
   which overrides each profile's config.
+
+Not in the signature, and so read again only by a new gateway process: the
+gateway's own environment variables, plugins installed into the venv, and
+project plugins under the working directory (off unless
+``HERMES_ENABLE_PROJECT_PLUGINS`` is set).
+
+Upstream in-process never re-read a profile's plugins once it had resolved
+it, so a profile whose plugins change is now resolved afresh where upstream
+kept its first answer.
 
 Any difference, including a file appearing or disappearing, recomputes. A
 child that fails, times out or prints something unreadable yields ``None``:
@@ -51,8 +68,8 @@ resolves its toolsets itself at startup. Only a list is cached: upstream also
 answers ``None`` when it swallows an error, so a ``None`` is asked again next
 time. A cached list is never served for a signature it wasn't computed for.
 
-Cost: one child process (about a second of CPU) the first time a profile is
-dispatched to in a gateway's life, and again after its inputs change.
+Cost: one child process, about 2 s at image build, the first time a profile
+is dispatched to in a gateway's life, and again after its inputs change.
 """
 
 from __future__ import annotations
@@ -82,26 +99,31 @@ _cache: dict[str, tuple[tuple, list[str]]] = {}
 _lock = threading.Lock()
 
 
-def _stat(path: Path) -> Optional[tuple[int, int]]:
+def _stat(path: Path) -> Optional[tuple[int, int, int, int]]:
     try:
         st = path.stat()
     except OSError:
         return None
-    return (st.st_mtime_ns, st.st_size)
+    return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
 
 
 def _tree(root: Optional[Path]) -> tuple:
-    """(relative path, mtime_ns, size) for every file under ``root``, sorted."""
+    """(relative path, link target, stat) for every file and link under ``root``, sorted.
+
+    Linked directories are followed, and the link itself is recorded too, so
+    adding or removing a linked plugin changes the signature.
+    """
     if root is None or not root.is_dir():
         return ()
     entries = []
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
         dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
-        for name in sorted(filenames):
+        for name in sorted(dirnames + filenames):
             path = Path(dirpath) / name
-            stat = _stat(path)
-            if stat is not None:
-                entries.append((str(path.relative_to(root)), *stat))
+            target = os.readlink(path) if path.is_symlink() else None
+            if path.is_dir() and target is None:
+                continue
+            entries.append((str(path.relative_to(root)), target, _stat(path)))
     return tuple(entries)
 
 
@@ -119,6 +141,7 @@ def signature(hermes_home: str) -> tuple:
     return (
         ("config", _stat(home / "config.yaml")),
         ("env", _stat(home / ".env")),
+        ("auth", _stat(home / "auth.json")),
         ("plugins", _tree(home / "plugins")),
         ("managed", _tree(_managed_dir())),
     )
@@ -130,7 +153,7 @@ def _resolve_in_child(hermes_home: str) -> tuple[bool, Optional[list[str]]]:
     env[INPROC_ENV] = "1"
     try:
         done = subprocess.run(
-            [sys.executable, "-c", _CHILD_PROGRAM, hermes_home],
+            [sys.executable, "-P", "-c", _CHILD_PROGRAM, hermes_home],
             env=env, capture_output=True, text=True, timeout=CHILD_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
         )
@@ -172,4 +195,15 @@ def resolve_worker_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
 
 def in_child() -> bool:
     return os.environ.get(INPROC_ENV) == "1"
+
+
+def keep_in_process() -> bool:
+    """True where upstream's in-process resolution must stay: this child, or a multiplexed gateway."""
+    if in_child():
+        return True
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return bool(is_multiplex_active())
+    except Exception:
+        return False
 

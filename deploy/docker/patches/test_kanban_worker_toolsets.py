@@ -61,6 +61,7 @@ class ResolveTest(unittest.TestCase):
         changes = [
             lambda: bump(self.home / "config.yaml", "model: {provider: x}\n"),
             lambda: bump(self.home / ".env", "HASS_TOKEN=t\n"),
+            lambda: bump(self.home / "auth.json", "{}\n"),
             lambda: bump(self.home / "plugins" / "hermes_otel" / "plugin.yaml", "name: hermes_otel\nv: 2\n"),
             lambda: (self.home / "plugins" / "new_plugin").mkdir() or bump(
                 self.home / "plugins" / "new_plugin" / "plugin.yaml", "name: new\n"),
@@ -72,6 +73,58 @@ class ResolveTest(unittest.TestCase):
                 change()
                 kwt.resolve_worker_toolsets(str(self.home))
                 self.assertEqual(n, len(self.calls))
+
+    def test_the_key_is_read_before_the_child_runs(self):
+        # A config edit that lands while the child is resolving must not be cached under
+        # the new key with the old answer: the next call recomputes.
+        def child(hermes_home):
+            self.calls.append(hermes_home)
+            if len(self.calls) == 1:
+                bump(self.home / "config.yaml", "edited: mid-resolve\n")
+            return True, ["terminal"]
+        with mock.patch.object(kwt, "_resolve_in_child", side_effect=child):
+            kwt.resolve_worker_toolsets(str(self.home))
+            kwt.resolve_worker_toolsets(str(self.home))
+        self.assertEqual(2, len(self.calls))
+
+    def test_a_same_size_edit_at_the_same_mtime_recomputes(self):
+        config = self.home / "config.yaml"
+        kwt.resolve_worker_toolsets(str(self.home))
+        st = config.stat()
+        config.write_text("model: {x}\n"[: st.st_size].ljust(st.st_size, " "), encoding="utf-8")
+        os.utime(config, ns=(st.st_atime_ns, st.st_mtime_ns))
+        kwt.resolve_worker_toolsets(str(self.home))
+        self.assertEqual(2, len(self.calls))
+
+    def test_a_size_only_change_recomputes(self):
+        config = self.home / "config.yaml"
+        kwt.resolve_worker_toolsets(str(self.home))
+        st = config.stat()
+        with mock.patch.object(kwt, "_stat", side_effect=lambda p, real=kwt._stat: (
+                (*real(p)[:3], real(p)[3] + 1) if p == config and real(p) else real(p))):
+            kwt.resolve_worker_toolsets(str(self.home))
+        self.assertEqual(2, len(self.calls))
+        self.assertEqual(st.st_size, config.stat().st_size)
+
+    def test_bytecode_caches_do_not_recompute(self):
+        kwt.resolve_worker_toolsets(str(self.home))
+        cache = self.home / "plugins" / "hermes_otel" / "__pycache__"
+        cache.mkdir()
+        bump(cache / "x.cpython-313.pyc", "bytecode")
+        kwt.resolve_worker_toolsets(str(self.home))
+        self.assertEqual(1, len(self.calls))
+
+    def test_a_linked_plugin_appearing_recomputes(self):
+        kwt.resolve_worker_toolsets(str(self.home))
+        shared = self.root / "shared-plugin"
+        shared.mkdir()
+        (shared / "plugin.yaml").write_text("name: shared\n", encoding="utf-8")
+        (self.home / "plugins" / "shared").symlink_to(shared, target_is_directory=True)
+        kwt.resolve_worker_toolsets(str(self.home))
+        self.assertEqual(2, len(self.calls))
+        bump(shared / "plugin.yaml", "name: shared\nv: 2\n")
+        kwt.resolve_worker_toolsets(str(self.home))
+        self.assertEqual(3, len(self.calls))
 
     def test_a_stale_entry_is_never_served_when_the_recompute_fails(self):
         self.assertEqual(["terminal", "kanban"], kwt.resolve_worker_toolsets(str(self.home)))
@@ -137,6 +190,36 @@ class ChildTest(unittest.TestCase):
             self.assertEqual((False, None), self.run_child(
                 'import time; time.sleep(3); print(\'{"toolsets": ["late"]}\')'))
 
+    def test_a_nonzero_exit_is_not_ok_even_with_a_good_answer(self):
+        self.assertEqual((False, None), self.run_child(
+            'import sys; print(\'{"toolsets": ["a"]}\'); sys.exit(1)'))
+
+    def test_the_working_directory_is_not_on_the_childs_import_path(self):
+        # The gateway's cwd is the writable data volume; a module planted there must not load.
+        planted = Path(tempfile.mkdtemp())
+        (planted / "planted_kwt.py").write_text("raise SystemExit(9)\n", encoding="utf-8")
+        here = os.getcwd()
+        os.chdir(planted)
+        # The runner's own PYTHONPATH may be relative to the cwd; the gateway's is absolute.
+        env = mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        try:
+            self.assertEqual((True, ["absent"]), self.run_child(
+                'import importlib.util, json\n'
+                'print(json.dumps({"toolsets": ["absent" if importlib.util.find_spec("planted_kwt") is None else "found"]}))'))
+        finally:
+            os.chdir(here)
+
+    def test_a_multiplexed_gateway_keeps_upstreams_in_process_path(self):
+        fake = mock.MagicMock(is_multiplex_active=lambda: True)
+        with mock.patch.dict(sys.modules, {"agent.secret_scope": fake, "agent": mock.MagicMock(secret_scope=fake)}):
+            os.environ.pop(kwt.INPROC_ENV, None)
+            self.assertTrue(kwt.keep_in_process())
+        fake_off = mock.MagicMock(is_multiplex_active=lambda: False)
+        with mock.patch.dict(sys.modules, {"agent.secret_scope": fake_off, "agent": mock.MagicMock(secret_scope=fake_off)}):
+            self.assertFalse(kwt.keep_in_process())
+
     def test_in_child_reads_the_flag(self):
         with mock.patch.dict(os.environ, {kwt.INPROC_ENV: "1"}):
             self.assertTrue(kwt.in_child())
@@ -169,7 +252,7 @@ class ApplyTest(unittest.TestCase):
         apply(target.parent.parent)
         text = target.read_text(encoding="utf-8")
         hook = text.index("return _kanban_worker_toolsets.resolve_worker_toolsets(hermes_home)")
-        self.assertLess(text.index("if not _kanban_worker_toolsets.in_child():"), hook)
+        self.assertLess(text.index("if not _kanban_worker_toolsets.keep_in_process():"), hook)
         self.assertLess(hook, text.index("from agent.secret_scope import ("))
         self.assertIn("from tools import kanban_worker_toolsets as _kanban_worker_toolsets", text)
 
