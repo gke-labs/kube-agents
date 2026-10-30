@@ -220,17 +220,41 @@ func TestChangeRequested_AConfirmReadingStopIsNotAStop(t *testing.T) {
 	})
 }
 
-// The console's confirm button is a frame of kind "confirm".
-func TestConsoleConfirmFrameCarriesTheConfirmIntent(t *testing.T) {
+// The console's confirm button is a frame on chat.console.<token>.confirm:
+// it carries the confirm intent, and the conversation comes from the
+// subject exactly as on .in.
+func TestConsoleConfirmSubjectCarriesTheConfirmIntent(t *testing.T) {
 	r := startConsoleRig(t)
 	r.send(t, "tab-cr", ConsoleInFrame{MessageID: "m1", Text: "do it", Kind: "text"})
-	r.send(t, "tab-cr", ConsoleInFrame{MessageID: "m2", Text: "do it", Kind: consoleKindConfirm})
+	r.sendConfirm(t, "tab-cr", ConsoleInFrame{MessageID: "m2", Text: "do it"})
 	waitFor(t, "both frames", func() bool { return len(r.inbound()) == 2 })
 	for _, m := range r.inbound() {
 		want := map[string]string{"m1": "", "m2": IntentConfirm}[m.MessageID]
 		if m.Intent != want {
 			t.Errorf("frame %s intent = %q, want %q", m.MessageID, m.Intent, want)
 		}
+		if m.Conversation != "console:tab-cr" || m.AuthorID != consoleAuthor || m.Backend != consoleBackend {
+			t.Errorf("frame %s = %+v, want conversation console:tab-cr from the console author", m.MessageID, m)
+		}
+	}
+}
+
+// A frame of kind "confirm" on .in is not a confirm: the subject is the only
+// route to the intent, so the frame is dropped as an unknown kind, logged,
+// and never forwarded (as a confirm or as a typed ask).
+func TestConsoleConfirmKindOnTheInSubjectIsRefused(t *testing.T) {
+	r := startConsoleRig(t)
+	r.send(t, "tab-cr2", ConsoleInFrame{MessageID: "m1", Text: "do it", Kind: "confirm"})
+	// Frames on one subscription are handled in order, so once m2 is in,
+	// m1 has been handled.
+	r.send(t, "tab-cr2", ConsoleInFrame{MessageID: "m2", Text: "a typed ask"})
+	waitFor(t, "the typed frame", func() bool { return len(r.inbound()) == 1 })
+	got := r.inbound()
+	if got[0].MessageID != "m2" || got[0].Intent != "" {
+		t.Errorf("got %+v, want only m2 with no intent", got)
+	}
+	if !strings.Contains(r.logs.String(), `reason="unknown kind" kind=confirm`) {
+		t.Errorf("kind confirm on .in was not dropped as an unknown kind:\n%s", r.logs.String())
 	}
 }
 

@@ -2283,6 +2283,26 @@ Mutation(
         "worker can then start tasks of its own outside the gateway's checks",
     ),
     Mutation(
+        "A3-console-mcp-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"chat.console.*.in",\n\t\t\t"_INBOX.console-mcp.>",',
+         '\t\t\t"chat.console.*.in",\n\t\t\t"chat.console.*.confirm",\n\t\t\t"_INBOX.console-mcp.>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the console MCP server's user the console's confirm door, so "
+        "an IDE agent can confirm the change it just proposed. A model can "
+        "then grant its own task the permit to open a pull request",
+    ),
+    Mutation(
+        "A3-bridge-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.console.*.confirm",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the static bridge publish on the console's confirm door, so the "
+        "platform agent can confirm a card's proposed change itself. A task "
+        "can then grant itself the change permit",
+    ),
+    Mutation(
         "A3-bridge-sends-a-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',

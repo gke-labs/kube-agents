@@ -2313,8 +2313,11 @@ the one every other writer here has.
 **Transport.** Core NATS, no stream. The browser publishes a frame -
 `{"messageId","text","kind"}`, `kind` defaulting to `text`, with an optional `addressee` and
 `parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles") - to
-`chat.console.<token>.in`;
-the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
+`chat.console.<token>.in`, or to `chat.console.<token>.confirm` for a click on a confirm
+button (added 10/30): the same frame, which the adapter delivers with the confirm intent, so
+its task is submitted with `TaskParameters.ChangeRequested`. The subject is the only route to
+the confirm: a frame on `.in` with `kind` `confirm` is dropped as an unknown kind. The
+adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
 protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out
 on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`): once per
@@ -2337,7 +2340,7 @@ frame costs it nothing. It shows the notify frames, which it has no other source
 report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
 subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
 keeps nothing, and the notifier answers the card as posted. This is a known limit of the
-kanban-era route; card reports become bus child results with the profile dispatcher. A console client such as the MCP server reads each task's end from these frames as it happens. `.out` is not on a stream, so a result frame published while the client is not subscribed (a restart, a reconnect) is not replayed. The `console` identity holds TASKS consumer grants, so the client recovers a missed end from the task's own events there. Turn answers to a follow-up inside a live task are not
+kanban-era route; card reports become bus child results with the profile dispatcher. A console client such as the MCP server reads each task's end from these frames as it happens. `.out` is not on a stream, so a result frame published while the client is not subscribed (a restart, a reconnect) is not replayed. The `console` and `console-mcp` identities hold TASKS consumer grants, so the client recovers a missed end from the task's own events there. Turn answers to a follow-up inside a live task are not
 sent; that client reads them from TASKS or waits for the end. An answer past 256 KiB, or one
 whose escaped frame would pass the server's `max_payload`, is cut and says so; TASKS keeps
 it whole. An `.in` frame published
@@ -2349,9 +2352,10 @@ never attaches. A receipt frame on `.out` is the natural follow-up for the page.
 The gateway treats it like any DM: one session per conversation, spawned on the first turn,
 reaped at the idle TTL.
 
-**Identity.** The `console` NATS user is the only principal granted publish on
-`chat.console.*.in` (spec-nats-deployment.md, the console surface). So a frame there is from
-`console`, and the adapter reports that as the author; the gateway resolves it to the fixed
+**Identity.** The `console` NATS user and `console-mcp`, the MCP server's user, are the only
+principals granted publish on `chat.console.*.in`, and `console` alone on
+`chat.console.*.confirm` (spec-nats-deployment.md, the console surface). So a frame on either
+is from a console client, and the adapter reports that as the author; the gateway resolves it to the fixed
 principal `nats:console`, `verifiedBy: nats-grant`, with no mapping table - the mechanism is
 the connect-time grant, which is the same subject-derived identity `identity` was retired in
 favour of. That resolution is bound to the console conversation: the string `console`
@@ -2390,7 +2394,7 @@ A dead chat backend therefore shows as that log line on a Running pod, not as a 
 
 **Bounds.** A frame's text is capped at 16 KiB; over it, the frame is refused with a notice
 naming the cap. Empty, malformed and mis-shaped frames drop with a log line each, as does a
-frame whose `kind` is anything but `text`. At most 8 turns wait behind one console
+frame whose `kind` is anything but `text` (on `.in` or `.confirm`). At most 8 turns wait behind one console
 conversation: a chat platform paces its own senders, but the console credential can publish as
 fast as it likes, so past the cap a frame is dropped. The first drop in each fill logs and posts
 one notice, and the rest are silent until the conversation has room again. A NATS render that predates the console identity,

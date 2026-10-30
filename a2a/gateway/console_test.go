@@ -69,8 +69,19 @@ func (r *consoleRig) inbound() []InboundMessage {
 
 func (r *consoleRig) send(t *testing.T, token string, frame ConsoleInFrame) {
 	t.Helper()
+	r.sendOn(t, "chat.console."+token+".in", frame)
+}
+
+// sendConfirm publishes a frame on the confirm door, chat.console.<token>.confirm.
+func (r *consoleRig) sendConfirm(t *testing.T, token string, frame ConsoleInFrame) {
+	t.Helper()
+	r.sendOn(t, "chat.console."+token+".confirm", frame)
+}
+
+func (r *consoleRig) sendOn(t *testing.T, subject string, frame ConsoleInFrame) {
+	t.Helper()
 	data, _ := json.Marshal(frame)
-	if err := r.browser.Publish("chat.console."+token+".in", data); err != nil {
+	if err := r.browser.Publish(subject, data); err != nil {
 		t.Fatal(err)
 	}
 	_ = r.browser.Flush()
@@ -536,6 +547,46 @@ func TestConsoleLogsARefusedSubscriptionWithTheRemedy(t *testing.T) {
 	}
 }
 
+// The confirm door is a second subscription: a render that grants the
+// gateway chat.console.*.in but not chat.console.*.confirm has its confirm
+// subscribe refused, and the log names the confirm subject, not .in.
+func TestConsoleLogsARefusedConfirmSubscriptionByItsSubject(t *testing.T) {
+	opts := &natsserver.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*natsserver.User{{
+			Username: "gateway", Password: "pw",
+			Permissions: &natsserver.Permissions{
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in"}},
+				Publish:   &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.out"}},
+			},
+		}},
+	}
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go s.Start()
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("server")
+	}
+	t.Cleanup(s.Shutdown)
+	logs := &lockedBuffer{}
+	a, err := NewConsoleAdapter(s.ClientURL(), []nats.Option{nats.UserInfo("gateway", "pw")}, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = a.Run(ctx, func(InboundMessage) {}) }()
+	waitFor(t, "the confirm refusal in the log", func() bool {
+		return strings.Contains(logs.String(), `subject=chat.console.*.confirm`)
+	})
+	if strings.Contains(logs.String(), `subject=chat.console.*.in`) {
+		t.Errorf("the granted .in subscription was logged as refused:\n%s", logs.String())
+	}
+}
+
 // A refused notice publish (the gateway grant lacks chat.console.*.out) is
 // logged as a publish refusal naming the subject, not as a subscription one.
 func TestConsoleLogsARefusedPublishAsAPublish(t *testing.T) {
@@ -617,7 +668,7 @@ func TestConsoleRecoversARefusedSubscriptionOnReconnect(t *testing.T) {
 		Host: "127.0.0.1", Port: port, NoLog: true, NoSigs: true,
 		Users: []*natsserver.User{
 			{Username: "gateway", Password: "pw", Permissions: &natsserver.Permissions{
-				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in"}},
+				Subscribe: &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.in", "chat.console.*.confirm"}},
 				Publish:   &natsserver.SubjectPermission{Allow: []string{"a2a.>", "chat.console.*.out"}},
 			}},
 			{Username: "browser", Password: "pw"},

@@ -48,8 +48,8 @@ func TestConfigFromEnv(t *testing.T) {
 	if s.listen != defaultListen || s.tokenFile != token {
 		t.Errorf("listen %q token %q", s.listen, s.tokenFile)
 	}
-	if s.bus.User != defaultBusUser || s.bus.Password != "pw" {
-		t.Errorf("bus user %q password %q, want the console user and the trimmed file", s.bus.User, s.bus.Password)
+	if s.bus.User != "console-mcp" || s.bus.Password != "pw" {
+		t.Errorf("bus user %q password %q, want the console-mcp user and the trimmed file", s.bus.User, s.bus.Password)
 	}
 	if s.bus.Deployment.Agent != "platform-agent" || s.bus.Deployment.Namespace != "kubeagents-system" {
 		t.Errorf("deployment = %+v", s.bus.Deployment)
@@ -290,5 +290,39 @@ func TestAStopEndsTheRequestsInFlight(t *testing.T) {
 		}
 	case <-time.After(shutdownGrace + 5*time.Second):
 		t.Fatal("serve did not return after the stop")
+	}
+}
+
+// renderedConf is the operator's nats.conf render, the fixture the callout
+// suite starts a server from.
+const renderedConf = "../../authcallout/testdata/rendered-nats.conf"
+
+// A model drives this server, so the user it logs in as by default must be
+// one the operator renders with no grant on the console's confirm door, and
+// the default password file must be that user's key, never the console's.
+// Read off the operator's render rather than restated, so a default moved
+// back to "console" fails here.
+func TestTheDefaultBusUserCannotConfirm(t *testing.T) {
+	raw, err := os.ReadFile(renderedConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := string(raw)
+	start := strings.Index(conf, "user: "+defaultBusUser+"\n")
+	if start < 0 {
+		t.Fatalf("the rendered conf has no %s user", defaultBusUser)
+	}
+	block := conf[start+len("user: "):]
+	if next := strings.Index(block, "user: "); next >= 0 {
+		block = block[:next]
+	}
+	if strings.Contains(block, "chat.console.*.confirm") || strings.Contains(block, "chat.console.>") || strings.Contains(block, "chat.>") {
+		t.Errorf("the default bus user %s can reach the confirm door:\n%s", defaultBusUser, block)
+	}
+	if !strings.Contains(block, `"chat.console.*.in"`) {
+		t.Errorf("the default bus user %s cannot publish a turn on chat.console.*.in", defaultBusUser)
+	}
+	if filepath.Base(defaultPasswordFile) != "console-mcp-password" {
+		t.Errorf("defaultPasswordFile = %q, want the console-mcp password key", defaultPasswordFile)
 	}
 }

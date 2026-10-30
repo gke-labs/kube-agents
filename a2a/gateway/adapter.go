@@ -115,7 +115,8 @@ const IntentCancel = "cancel"
 // submitted with TaskParameters.ChangeRequested, the one way a worker is
 // granted the permit to open a pull request. Free text never expresses it,
 // so a reply that merely says "yes, do it" gets an answer, not a change.
-// The console sends it as a frame of kind "confirm" and the inject door as
+// The console sends it as a frame on chat.console.<token>.confirm, a
+// subject only the human console user may publish on, and the inject door as
 // intent "confirm"; no chat backend has a confirm button yet. A confirm
 // while a task runs is refused rather than steered, since a steer cannot
 // change what the running task was granted.

@@ -605,6 +605,12 @@ Layout:
   upgrade. Same posture as `web` and stated in the same places: static, published to a
   browser by design, port-forward only.
 
+  **Amended 10/30 (#3993):** a confirm has a subject of its own, `chat.console.*.confirm`:
+  a frame there is the same ask as one on `.in`, which the gateway submits with
+  `TaskParameters.ChangeRequested`, the one way a task is granted the permit to make a
+  change. `console` gains publish on it and is its only publisher; the gateway gains the
+  matching subscribe. A frame on `.in` never carries a confirm, whatever its `kind` says.
+
   **Amended 9/24:** the page is served by an operator-rendered console server
   (`<agent>-a2a-console`), which answers the browser on its own port, hands the page the
   `console` password from the creds Secret, and proxies the page's websocket to 9222. It is
@@ -625,10 +631,14 @@ Layout:
 
   **Amended 10/21 (#3653):** a second console client, the MCP server (`a2a/cmd/mcp`), under
   the operator flag `A2A_MCP_DOOR=true` and only then. It runs in its own Deployment
-  (`<agent>-a2a-mcp`, from the console image) holding the `console` password, one key of the
-  creds Secret like the console's, and dials 4222 over TLS as `console`; the NATS fence
-  admits it on 4222 by label and never on 9222. It adds no principal and no grant: what an
-  MCP caller can do on the bus is what the console can. Callers authenticate to the server
+  (`<agent>-a2a-mcp`, from the console image) and dials 4222 over TLS; the NATS fence
+  admits it on 4222 by label and never on 9222. **Amended 10/30 (#3993):** a model drives
+  it, so it logs in as its own static user, `console-mcp`, with its own key in the creds
+  Secret (`console-mcp-password`), and its pod never mounts the `console` password.
+  `console-mcp` holds the console's grants less the confirm door: the same read surface,
+  publish on `chat.console.*.in`, subscribe on `chat.console.*.out`, and nothing on
+  `chat.console.*.confirm` either way; its inbox is `_INBOX.console-mcp.>`. What an MCP
+  caller can do on the bus is what the console can, except confirm a change. Callers authenticate to the server
   with its own bearer token (`<agent>-a2a-mcp-token`, minted by the operator), never with a
   bus credential, and reach it only through `kubectl port-forward`: the Service is ClusterIP
   and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the

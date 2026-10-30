@@ -238,6 +238,13 @@ const (
 	// identity's user name out of this file and no other.
 	a2aConsoleConfUser = "console"
 
+	// a2aConsoleMCPConfUser is the static user the console MCP server
+	// (a2a/cmd/mcp) logs in as: console's grants without the confirm door,
+	// because a model drives that server. The operator renders it into the
+	// server's env, and a2a/cmd/mcp's defaultBusUser spells it again (the
+	// modules cannot import each other). Here for a2aConsoleConfUser's reason.
+	a2aConsoleMCPConfUser = "console-mcp"
+
 	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a
 	// credential: it selects the inbox prefix the client pins, and the grants
 	// come from the callout's answer about the ServiceAccount, not from this.
@@ -396,6 +403,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		seedIdentity(),
 		webIdentity(),
 		consoleIdentity(),
+		consoleMCPIdentity(),
 		sysIdentity(),
 	)
 }
@@ -532,6 +540,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"$KV.session-state.>",
 			"$KV.feedback.>",
 			"chat.console.*.in",
+			// The console's confirm door: the same frame as .in, sent with
+			// the confirm intent. Only the console user publishes here.
+			"chat.console.*.confirm",
 			// Proactive posts from the agent to the home channel, and a
 			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
@@ -1083,16 +1094,23 @@ func webIdentity() a2aIdentity {
 	}
 }
 
-// console: the web console's credential - the read surface plus one narrow
-// publish, the inbound chat subject the gateway's console adapter subscribes.
+// console: the web console's credential - the read surface plus two narrow
+// publishes, the inbound chat subjects the gateway's console adapter
+// subscribes: chat.console.*.in for a typed message and
+// chat.console.*.confirm for a click on a confirm button.
 //
 // STATIC permanently, for web's reason: a browser holds no ServiceAccount
 // token. What makes this credential a chat identity rather than a read
-// credential is the grant on chat.console.*.in: only this user can reach
-// that subject, so the gateway takes a frame there as coming from the
-// principal nats:console with no mapping table in between (the same
-// subject-derived identity every other writer on this bus has). One shared
-// principal is the posture until the account split makes it one per person.
+// credential is the grant on chat.console.*.in: only this user and
+// console-mcp can reach that subject, so the gateway takes a frame there as
+// coming from the principal nats:console with no mapping table in between
+// (the same subject-derived identity every other writer on this bus has).
+// One shared principal is the posture until the account split makes it one
+// per person.
+//
+// chat.console.*.confirm is this user's alone: a frame there is a confirm,
+// the one way a task is granted the permit to make a change (IntentConfirm
+// in a2a/gateway), so it stays off console-mcp, the identity a model drives.
 //
 // The console holds no JetStream verb on any KV_* stream, STREAM.INFO
 // included: STREAM.INFO accepts a subjects_filter in its request body and
@@ -1110,8 +1128,9 @@ func consoleIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    a2aConsoleConfUser,
 		account: a2aAccountApp,
-		comment: "the web console: web's read surface plus one publish, chat.console.*.in,\n" +
-			"which is the gateway's console adapter's inbound subject. STATIC for\n" +
+		comment: "the web console: web's read surface plus two publishes, chat.console.*.in\n" +
+			"and chat.console.*.confirm, the gateway's console adapter's inbound\n" +
+			"subjects; the confirm door is this user's alone. STATIC for\n" +
 			"web's reason. No JetStream verb on any KV_* stream: STREAM.INFO's\n" +
 			"subjects_filter would list every key.",
 		auth:     a2aAuthStatic,
@@ -1136,6 +1155,7 @@ func consoleIdentity() a2aIdentity {
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 			"$JS.API.DIRECT.GET." + a2aProfileSubmitStream + ".>",
 			"chat.console.*.in",
+			"chat.console.*.confirm",
 			"_INBOX.console.>",
 		},
 		subscribe: []string{
@@ -1147,6 +1167,61 @@ func consoleIdentity() a2aIdentity {
 		// verifier's request subject, and any subscriber may join its
 		// queue group and swallow a share of every verify request. This
 		// password is handed to a browser too (console.go's /config.json).
+		denySubscribe: []string{"a2a.cap.>"},
+	}
+}
+
+// console-mcp: the console MCP server's credential (a2a/cmd/mcp,
+// platformagent_a2a_mcp.go). A model drives that server, so it holds the
+// console's grants less the confirm door: the same read surface, the same
+// frame publish on chat.console.*.in (a turn the gateway takes as the console
+// principal's, exactly as a typed message), the same answers on
+// chat.console.*.out, and nothing on chat.console.*.confirm in either
+// direction. A model can ask; it cannot confirm a change. Its inbox is its
+// own (_INBOX.console-mcp, the prefix a2a/mcp derives from its user name),
+// so it cannot read the human console's replies, nor they its.
+//
+// STATIC, for the console's reason in a different shape: the server holds no
+// ServiceAccount token (it never talks to the API server), and its own
+// Deployment mounts this password and never console's.
+func consoleMCPIdentity() a2aIdentity {
+	return a2aIdentity{
+		user:    a2aConsoleMCPConfUser,
+		account: a2aAccountApp,
+		comment: "the console MCP server, which a model drives: console's grants less\n" +
+			"chat.console.*.confirm, so it can send a turn on chat.console.*.in\n" +
+			"and read the answer, and cannot confirm a change. STATIC: the pod\n" +
+			"holds no ServiceAccount token. No JetStream verb on any KV_* stream.",
+		auth:     a2aAuthStatic,
+		credsKey: a2aConsoleMCPPasswordKey,
+		publish: []string{
+			"$JS.API.INFO",
+			"$JS.API.STREAM.INFO.TASKS",
+			"$JS.API.STREAM.INFO.DIRECTORY",
+			"$JS.API.STREAM.INFO.TOPICS-STATE",
+			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.CONSUMER.CREATE.TASKS.>",
+			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+			"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+			"$JS.API.CONSUMER.INFO.TASKS.*",
+			"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"$JS.API.DIRECT.GET." + a2aProfileSubmitStream + ".>",
+			"chat.console.*.in",
+			"_INBOX.console-mcp.>",
+		},
+		subscribe: []string{
+			"a2a.>",
+			"chat.console.*.out",
+			"_INBOX.console-mcp.>",
+		},
+		// web's subtraction, for web's reason.
 		denySubscribe: []string{"a2a.cap.>"},
 	}
 }

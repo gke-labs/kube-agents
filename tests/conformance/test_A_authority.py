@@ -1009,7 +1009,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
+        for user in ("gateway", "agent", "bridge", "web", "console", "console-mcp", "seed", "provision", "verifier"):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
@@ -1118,6 +1118,41 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             self._session_publish_derivation(),
             "the callout derives an executor a publish grant on a stop record; "
             "a worker that can write there can stop other requesters' tasks",
+        )
+
+    CONSOLE_CONFIRM_PROBE = "chat.console.tab-1.confirm"
+    CONSOLE_IN_PROBE = "chat.console.tab-1.in"
+
+    def test_A3_the_console_confirm_subject_has_exactly_one_writer(self) -> None:
+        """A console confirm is written by the human console user and nobody else.
+
+        The gateway takes a frame on `chat.console.<token>.confirm` as a
+        confirm and submits its task with `ChangeRequested`, the one way a
+        task is granted the permit to make a change. The subject is the only
+        route to it, so its writer set is the whole of who can confirm. The
+        console MCP server's user, `console-mcp`, is driven by a model: it
+        writes the same turns on `.in` and must not reach `.confirm`. No
+        session or profile worker derives a grant on any console subject.
+        """
+        grants = self._rendered_publish_grants()
+        writers = sorted(
+            builder
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.CONSOLE_CONFIRM_PROBE) for g in allow)
+        )
+        self.assertEqual(["console"], writers)
+        # Not vacuous: console-mcp is rendered, and does reach the `.in` door.
+        in_writers = sorted(
+            builder
+            for builder, allow in grants.items()
+            if any(self._subject_matches(g, self.CONSOLE_IN_PROBE) for g in allow)
+        )
+        self.assertEqual(["console", "console-mcp"], in_writers)
+        self.assertNotIn(
+            "chat.console",
+            self._session_publish_derivation(),
+            "the callout derives an executor a publish grant on a console subject; "
+            "a worker that can write `.confirm` can grant its own task the change permit",
         )
 
     NOTIFY_PROBE = "chat.notify.gchat"

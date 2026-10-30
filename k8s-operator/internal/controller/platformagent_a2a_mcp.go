@@ -45,9 +45,10 @@ import (
 // install with the operator flag below, like the inject backend and the
 // agent door, and while it is off nothing of it is rendered. It runs in its
 // own pod, not the gateway's, so the only bus credential within its reach is
-// the console password, and the only way in is a kubectl port-forward and
-// the server's own bearer token. A CR field can replace the flag if the
-// server becomes a supported, documented feature.
+// its own console-mcp password (console's grants less the confirm door; the
+// console password is never mounted here), and the only way in is a kubectl
+// port-forward and the server's own bearer token. A CR field can replace the
+// flag if the server becomes a supported, documented feature.
 const (
 	// a2aMCPDoorEnvVar is the operator flag. Anything but "true" is off, the
 	// rule a2aInjectBackendEnabled gives: a typo leaves the door shut.
@@ -73,8 +74,8 @@ const (
 	a2aMCPAccessKey      = "token"
 	a2aMCPAccessVolume   = "mcp-token"
 	a2aMCPAccessMountDir = "/var/run/secrets/a2a-mcp"
-	// The console password, one key of the creds Secret, mounted the way the
-	// console server mounts it.
+	// The console-mcp password, one key of the creds Secret, mounted the way
+	// the console server mounts the console's.
 	a2aMCPBusKeyVolume   = "bus-key"
 	a2aMCPBusKeyMountDir = "/var/run/secrets/a2a-mcp-bus"
 
@@ -191,16 +192,17 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Volumes: []corev1.Volume{{
-						// The console password and nothing else from the creds
-						// Secret. Not optional, unlike the console's: without
-						// it the server cannot reach the bus and refuses to
-						// start, which is the honest failure.
+						// The console-mcp password and nothing else from the
+						// creds Secret: never the console's, whose confirm door
+						// a model must not reach. Not optional, unlike the
+						// console's: without it the server cannot reach the
+						// bus and refuses to start, which is the honest failure.
 						Name: a2aMCPBusKeyVolume,
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 							SecretName: a2aCredsSecretName(agent),
 							Items: []corev1.KeyToPath{{
-								Key:  a2aConsolePasswordKey,
-								Path: a2aConsolePasswordKey,
+								Key:  a2aConsoleMCPPasswordKey,
+								Path: a2aConsoleMCPPasswordKey,
 								Mode: ptr.To(a2aConsoleCredsFileMode),
 							}},
 						}},
@@ -224,8 +226,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							a2aNATSCAFileEnvVar(),
-							{Name: a2aMCPEnvBusUser, Value: a2aConsoleConfUser},
-							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsolePasswordKey)},
+							{Name: a2aMCPEnvBusUser, Value: a2aConsoleMCPConfUser},
+							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsoleMCPPasswordKey)},
 							{Name: a2aMCPEnvAccessFile, Value: path.Join(a2aMCPAccessMountDir, a2aMCPAccessKey)},
 							{Name: a2aMCPEnvListen, Value: fmt.Sprintf(":%d", a2aMCPPort)},
 							{Name: a2aMCPEnvAgent, Value: agent.Name},

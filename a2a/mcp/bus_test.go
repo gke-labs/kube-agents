@@ -17,10 +17,12 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// consolePublish and consoleSubscribe are the console principal's grants as
-// the operator renders them. TestTheGrantsAreTheRenderedOnes holds them to the
-// rendered nats.conf, so a status read that needs more than the console has
-// fails here rather than on a cluster.
+// consolePublish and consoleSubscribe are the console-mcp principal's grants
+// as the operator renders them: the console's less the confirm door
+// (chat.console.*.confirm), with an inbox of its own. This server logs in as
+// console-mcp. TestTheGrantsAreTheRenderedOnes holds them to the rendered
+// nats.conf, so a status read that needs more than console-mcp has fails
+// here rather than on a cluster.
 var consolePublish = []string{
 	"$JS.API.INFO",
 	"$JS.API.STREAM.INFO.TASKS",
@@ -41,12 +43,12 @@ var consolePublish = []string{
 	"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 	"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 	"chat.console.*.in",
-	"_INBOX.console.>",
+	"_INBOX.console-mcp.>",
 }
 
-var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
+var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console-mcp.>"}
 
-// consolePublishDeny and consoleSubscribeDeny are the console's deny lists as
+// consolePublishDeny and consoleSubscribeDeny are console-mcp's deny lists as
 // rendered. A deny the operator adds must be mirrored here, or the test server
 // would grant what the cluster refuses.
 var (
@@ -63,9 +65,9 @@ func TestTheGrantsAreTheRenderedOnes(t *testing.T) {
 		t.Fatal(err)
 	}
 	conf := string(raw)
-	start := strings.Index(conf, "user: console")
+	start := strings.Index(conf, "user: "+testUser+"\n")
 	if start < 0 {
-		t.Fatal("the rendered conf has no console user")
+		t.Fatalf("the rendered conf has no %s user", testUser)
 	}
 	block := conf[start:]
 	// The console user's block ends where the next user's begins.
@@ -121,14 +123,15 @@ func TestTheGrantsAreTheRenderedOnes(t *testing.T) {
 	} {
 		got := list(kindBlock(c.kind), c.field)
 		if strings.Join(got, "\n") != strings.Join(c.want, "\n") {
-			t.Errorf("the rendered console %s %s list is\n  %v\nthe test has\n  %v\nupdate the test's copy", c.kind, c.field, got, c.want)
+			t.Errorf("the rendered %s %s %s list is\n  %v\nthe test has\n  %v\nupdate the test's copy", testUser, c.kind, c.field, got, c.want)
 		}
 	}
 }
 
 const (
-	testUser = "console"
-	testPass = "pw-console"
+	// testUser is the user this server logs in as (cmd/mcp's defaultBusUser).
+	testUser = "console-mcp"
+	testPass = "pw-console-mcp"
 	// directoryMaxConsumers is the cap the operator provisions DIRECTORY
 	// with.
 	directoryMaxConsumers = 64

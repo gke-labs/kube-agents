@@ -55,7 +55,7 @@ const (
 	maxAgentCards = 512
 )
 
-// statusStreams are the streams the console principal may read the info of,
+// statusStreams are the streams the console-mcp principal may read the info of,
 // in the order the status shows them.
 var statusStreams = []string{lib.TasksStream, streamDirectory, lib.StreamTopicsState, lib.StreamTopicsJournal}
 
@@ -92,7 +92,7 @@ type Bus interface {
 	Status(ctx context.Context) BusStatus
 }
 
-// NATSBus is the server's one bus connection, as the console principal.
+// NATSBus is the server's one bus connection, as the console-mcp principal.
 type NATSBus struct {
 	client *lib.Client
 	cfg    BusConfig

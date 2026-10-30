@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -121,8 +122,11 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	if env[a2aNATSCAFileEnv] != a2aNATSCAFile() {
 		t.Errorf("%s = %q, want %q", a2aNATSCAFileEnv, env[a2aNATSCAFileEnv], a2aNATSCAFile())
 	}
-	if env[a2aMCPEnvBusUser] != a2aConsoleConfUser {
-		t.Errorf("bus user = %q, want the console principal", env[a2aMCPEnvBusUser])
+	if env[a2aMCPEnvBusUser] != a2aConsoleMCPConfUser {
+		t.Errorf("bus user = %q, want the console-mcp principal", env[a2aMCPEnvBusUser])
+	}
+	if want := path.Join(a2aMCPBusKeyMountDir, a2aConsoleMCPPasswordKey); env[a2aMCPEnvPasswordFile] != want {
+		t.Errorf("%s = %q, want %q", a2aMCPEnvPasswordFile, env[a2aMCPEnvPasswordFile], want)
 	}
 
 	// Every file the server reads sits in a mount of this pod.
@@ -151,12 +155,12 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	}
 }
 
-// The creds Secret holds every static user's password. The MCP pod gets the
-// console's and nothing else, and its only other Secret is its own token.
+// The creds Secret holds every static user's password. The MCP pod gets
+// console-mcp's and nothing else, and its only other Secret is its own token.
 // With broker access on (A2A_MCP_DOOR=true on a next install) it also holds
 // exactly one projected token, for the broker's mcp audience and nothing else;
 // with it off, none.
-func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
+func TestTheMCPPodHoldsTheConsoleMCPPasswordAndItsOwnTokenOnly(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
 			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
@@ -175,7 +179,7 @@ func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
 			if len(secrets) != 2 {
 				t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
 			}
-			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
+			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsoleMCPPasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
 				src := secrets[name]
 				if src == nil {
 					t.Errorf("no volume from Secret %s", name)
@@ -569,6 +573,80 @@ func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
 			for _, c := range pod.Containers {
 				if len(c.EnvFrom) != 0 {
 					t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
+				}
+			}
+		})
+	}
+}
+
+// A model drives the MCP server, so the console password, whose holder can
+// publish on chat.console.*.confirm, must not be in its pod by any route:
+// a Secret volume item, a projected Secret source, an env value or
+// valueFrom, or an envFrom. Every route is checked on every container,
+// with broker access on and off, rather than trusting the one volume the
+// render writes today.
+func TestTheMCPPodMountsNoConsolePassword(t *testing.T) {
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			agent := a2aTestAgent()
+			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+			names := func(src *corev1.SecretVolumeSource, items []corev1.KeyToPath) bool {
+				// A Secret volume of the creds Secret with no items
+				// projects every key, the console's included.
+				if src != nil && src.SecretName == a2aCredsSecretName(agent) && len(items) == 0 {
+					return true
+				}
+				for _, it := range items {
+					if it.Key == a2aConsolePasswordKey || it.Path == a2aConsolePasswordKey {
+						return true
+					}
+				}
+				return false
+			}
+			for _, v := range pod.Volumes {
+				if v.Secret != nil && names(v.Secret, v.Secret.Items) {
+					t.Errorf("volume %s projects the console password (or the whole creds Secret): %+v", v.Name, v.Secret)
+				}
+				if v.Projected != nil {
+					for _, src := range v.Projected.Sources {
+						if src.Secret == nil {
+							continue
+						}
+						if src.Secret.Name == a2aCredsSecretName(agent) && len(src.Secret.Items) == 0 {
+							t.Errorf("projected volume %s carries the whole creds Secret", v.Name)
+						}
+						for _, it := range src.Secret.Items {
+							if it.Key == a2aConsolePasswordKey || it.Path == a2aConsolePasswordKey {
+								t.Errorf("projected volume %s carries the console password: %+v", v.Name, it)
+							}
+						}
+					}
+				}
+			}
+			all := append(append(slices.Clone(pod.InitContainers), pod.Containers...), func() []corev1.Container {
+				var out []corev1.Container
+				for _, e := range pod.EphemeralContainers {
+					out = append(out, corev1.Container(e.EphemeralContainerCommon))
+				}
+				return out
+			}()...)
+			for _, c := range all {
+				for _, e := range c.Env {
+					if strings.Contains(e.Value, a2aConsolePasswordKey) {
+						t.Errorf("container %s env %s = %q names the console password", c.Name, e.Name, e.Value)
+					}
+					if e.Name == a2aMCPEnvBusUser && e.Value == a2aConsoleConfUser {
+						t.Errorf("container %s logs in as the console user", c.Name)
+					}
+					if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && e.ValueFrom.SecretKeyRef.Key == a2aConsolePasswordKey {
+						t.Errorf("container %s env %s reads the console password", c.Name, e.Name)
+					}
+				}
+				for _, ef := range c.EnvFrom {
+					if ef.SecretRef != nil && ef.SecretRef.Name == a2aCredsSecretName(agent) {
+						t.Errorf("container %s takes the whole creds Secret as env", c.Name)
+					}
 				}
 			}
 		})

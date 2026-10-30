@@ -502,8 +502,11 @@ const (
 	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
 	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
-	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
-	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	// a2aConsoleMCPPasswordKey is console-mcp's, the console MCP server's
+	// own; that pod mounts it and never a2aConsolePasswordKey.
+	a2aConsoleMCPPasswordKey = "console-mcp-password" // #nosec G101 -- Secret key name, not a credential
+	a2aSysPasswordKey        = "sys-password"         // #nosec G101 -- Secret key name, not a credential
+	a2aCalloutPasswordKey    = "callout-password"     // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
 	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
@@ -1604,7 +1607,7 @@ func randomA2APassword() (string, error) {
 // still has a credential.
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
-	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aWebPasswordKey, a2aConsolePasswordKey, a2aConsoleMCPPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 	a2aBridgeActivityKey,
 }
 
