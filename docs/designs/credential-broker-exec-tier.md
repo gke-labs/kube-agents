@@ -224,7 +224,11 @@ example a Service with no endpoints). No request reached a broker then, so nothi
 same reason as §4.3's retry. A failed connect can take the shim's whole connect bound, 10 s
 (`BROKER_CONNECT_TIMEOUT_SECONDS`): a missing egress peer hangs the dial rather than refusing it.
 So the shim writes one stderr line on each fallback, and §5's `broker_tier` audit field is the
-check: exec-role commands on `stateful` while replicas > 0 mean the exec path is broken. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
+check: exec-role commands on `stateful` while replicas > 0 mean the exec path is broken. The Cloud
+API relay client (`ApiSession`) also falls back on a connection error that comes after the request
+was sent, because every relay call is a GET and sending it again is safe; it then stays on the
+stateful broker for the rest of the session, and it retries no busy reply. The command path never
+resends after a send, because a command may have run. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
 (`deploy/sandbox/entrypoint.sh`), so `CREDENTIAL_PROXY_EXEC_URL` is added there. Without that, the
 shim always takes the fallback and nothing reports it.
 

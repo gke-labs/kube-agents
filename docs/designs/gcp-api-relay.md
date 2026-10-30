@@ -282,15 +282,17 @@ class ApiSession:
     """A requests-shaped session whose GETs to a Google API go through the broker."""
 
     def __init__(self, endpoint: str | None = None, http=None) -> None:
-        ...  # endpoint defaults to CREDENTIAL_PROXY_URL; http to a lazily imported requests.Session()
+        ...  # endpoint defaults to the exec tier's URL, else CREDENTIAL_PROXY_URL; http to a lazily imported requests.Session()
 
     def get(self, url: str, *, params=None, timeout=None):
         return self._http.get(self.relay_url(url), params=params,
                               headers=authorization_headers(), timeout=timeout)
 ```
 
-`relay_url` rewrites `https://<host>/<path>?<query>` onto
-`{CREDENTIAL_PROXY_URL}/v1/gcp/<host>/<path>?<query>`. `requests` is imported inside the
+`relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
+where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set, else
+`CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
+has the routing and the fallback). `requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module
 stay free of it; `http` is injectable for tests and for a caller that already holds a session.
 
