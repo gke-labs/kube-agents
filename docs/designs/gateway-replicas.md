@@ -116,8 +116,9 @@ That fences most of a deposed leader's writes, not all of them. Once the new ter
 deposed write is refused on any record the new leader has written. It's also refused on every
 other record, unless the deposed leader read the counter before the new term began and then
 paused before writing. The counter and the record are separate keys, and nothing makes the pair
-atomic. A write that slips through that gap lands on a record the new leader hasn't read yet, so
-the new leader reads it as current state and carries on from it.
+atomic. A write that slips through that gap lands on a record the new leader hasn't written
+yet. The new leader's own next write to that record is conditional on its revision, so it
+re-reads the record and carries on from what the deposed leader left.
 
 The election's identity is the pod name plus a per-process id. client-go lets a process whose
 identity matches the current holder renew without waiting, so a container restarting in the same
@@ -238,7 +239,12 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
   scope `create` to a name, so the operator owns creation, and the gateway's ServiceAccount gets
   only `get` and `update` on that one Lease (`resourceNames`). Nothing else changes in its Role:
   no EndpointSlice grant and no pod patch. The project's tech lead approved this grant for phase
-  one.
+  one. Because the gateway can't recreate the Lease, the operator watches it: the Lease carries
+  the PlatformAgent's owner reference and the controller `Owns` it, so a deleted Lease is
+  recreated within seconds, not at the fifteen-minute requeue. While it's absent, the active
+  replica fails to renew and steps down after `renewDeadline`, both replicas answer their doors
+  with a 503 saying no replica holds the lease, and the next acquisition starts a new term as
+  usual.
 
 ## Build, as follow-ups
 
@@ -260,8 +266,9 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
 3. **The standby's doors:** 503 with the holder and the exact port-forward command, the `hack/`
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
-4. **Operator:** replicas, the readiness probe, the strategy, the PDB, the spread, the Lease and
-   its Role. Its tests pin each.
+4. **Operator:** replicas, the readiness probe, the strategy, the PDB, the spread, the Lease (with
+   its owner reference and an `Owns` watch, so a deletion is undone in seconds) and its Role. Its
+   tests pin each, including recreating a deleted Lease.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.
