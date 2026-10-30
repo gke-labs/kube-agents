@@ -215,12 +215,15 @@ class ConnectivityRetryTest(unittest.TestCase):
         curl_args = (tmp / "curl.args").read_text(encoding="utf-8")
         self.assertIn("--max-time", curl_args)
 
-    def test_the_deadline_outlasts_the_agents_rate_limit_waits(self):
+    def test_the_deadline_outlasts_the_agents_and_the_gateways_rate_limit_waits(self):
         """The ping is one real agent turn. On a 429 that names no reset window
-        the image holds each of the agent's three retries 30-60s
-        (deploy/docker/patches/rate_limit_backoff_floor.py); a deadline inside
-        that cut the turn off mid-retry and started another against the same
-        closed quota."""
+        the gateway holds each of the agent's calls for its own retries
+        (EVAL_LITELLM_NUM_RETRIES + 1 pauses of EVAL_LITELLM_RETRY_AFTER_SECONDS,
+        set in the same script: LiteLLM sleeps before each retry and once more
+        after the last failed one) and the image holds each of the agent's
+        three retries 30-60s (deploy/docker/patches/rate_limit_backoff_floor.py);
+        a deadline inside that sum cut the turn off mid-retry and started
+        another against the same closed quota."""
         _, tmp = run_check(succeed_on=1)
         curl_args = (tmp / "curl.args").read_text(encoding="utf-8")
         match = re.search(r"--max-time\s+(\d+)", curl_args)
@@ -230,7 +233,18 @@ class ConnectivityRetryTest(unittest.TestCase):
             (REPO_ROOT / "deploy" / "docker" / "patches" / "rate_limit_backoff_floor.py").read_text(encoding="utf-8"),
             floor,
         )
-        self.assertGreater(int(match.group(1)), AGENT_RATE_LIMIT_RETRIES * floor["FLOOR_MAX_SECONDS"])
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        gateway = {
+            name: int(re.search(rf'readonly EVAL_LITELLM_{name}="\$\{{EVAL_LITELLM_{name}:-(\d+)\}}"', script).group(1))
+            for name in ("NUM_RETRIES", "RETRY_AFTER_SECONDS")
+        }
+        agent_calls = AGENT_RATE_LIMIT_RETRIES + 1
+        gateway_pauses_per_call = gateway["NUM_RETRIES"] + 1
+        waits = (
+            agent_calls * gateway_pauses_per_call * gateway["RETRY_AFTER_SECONDS"]
+            + AGENT_RATE_LIMIT_RETRIES * floor["FLOOR_MAX_SECONDS"]
+        )
+        self.assertGreater(int(match.group(1)), waits, f"{waits}s of waiting fits inside one turn")
 
 
 class FailureDumpArtifactsTest(unittest.TestCase):

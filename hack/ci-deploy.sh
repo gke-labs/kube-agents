@@ -195,8 +195,9 @@ readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 # a half-minute apart let the gateway ride out a short storm before the agent
 # sees it, and the agent's own 30-60s backoff floor
 # (deploy/docker/patches/rate_limit_backoff_floor.py) covers the long ones.
-# Each gateway response says what it did in x-litellm-attempted-retries.
-# tests/test_ci_deploy_litellm_vertex.py pins the flags and the defaults.
+# Each gateway response says what it did in x-litellm-attempted-retries. To
+# turn the retries off set both to 0: the chart refuses a pause without
+# retries. tests/test_ci_deploy_litellm_vertex.py pins the flags and the defaults.
 readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
 readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-30}"
 
@@ -2591,6 +2592,18 @@ cleanup_pf_and_dump() {
 trap cleanup_pf_and_dump EXIT
 
 CONNECTIVITY_ATTEMPTS=5
+# The ping is one real agent turn, so its deadline has to outlast what the
+# agent may wait inside it on a 429 that names no reset window: the gateway
+# holds each of the agent's four calls for EVAL_LITELLM_NUM_RETRIES + 1
+# pauses of EVAL_LITELLM_RETRY_AFTER_SECONDS (LiteLLM sleeps before each
+# retry and once more after the last failed one: 4 x 3 x 30s = 360s), and the
+# image's rate_limit_backoff_floor patch holds each of the agent's three
+# retries 30-60s (deploy/docker/patches/rate_limit_backoff_floor.py, up to
+# 180s): 540s of waiting before the model latency itself. A deadline inside
+# that cut such a turn off mid-retry, and the next attempt started another
+# one against the same closed quota. scripts/test_ci_connectivity_retry.py
+# holds the deadline above that sum.
+CONNECTIVITY_PING_MAX_TIME_SECONDS=600
 CONNECTIVITY_OK="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
@@ -2612,13 +2625,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
     sleep 1
   done
 
-  # One real turn, so the deadline has to outlast what the agent may wait
-  # inside it: on a 429 that names no reset window the image's
-  # rate_limit_backoff_floor patch holds each of the agent's three retries
-  # 30-60s (deploy/docker/patches/rate_limit_backoff_floor.py), up to 180s
-  # before the model latency itself. 120s cut such a turn off mid-retry, and
-  # the next attempt started another one against the same closed quota.
-  HEALTH_RESP="$(curl -s --max-time 300 -X POST http://localhost:8642/v1/responses \
+  HEALTH_RESP="$(curl -s --max-time "${CONNECTIVITY_PING_MAX_TIME_SECONDS}" -X POST http://localhost:8642/v1/responses \
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/json" \
     -d '{"model": "model-default", "input": "ping"}' || true)"
