@@ -345,17 +345,19 @@ func sanitizePatchFilename(fPath string) string {
 		safeParts = []string{"file"}
 	}
 	joined := strings.Join(safeParts, pathSeparatorReplacement)
+	// Distinct paths can flatten to the same name (`a/b.go` and `a__b.go`, a mapped
+	// character), so every name starts with a short hash of the original path.
+	sum := sha256.Sum256([]byte(fPath))
+	hashPrefix := hex.EncodeToString(sum[:6])
 	const maxBaseLen = 190
 	if len(joined) > maxBaseLen {
-		sum := sha256.Sum256([]byte(fPath))
-		hashPrefix := hex.EncodeToString(sum[:6])
 		lastSeg := safeParts[len(safeParts)-1]
 		if len(lastSeg) > 120 {
 			lastSeg = lastSeg[len(lastSeg)-120:]
 		}
-		joined = hashPrefix + pathSeparatorReplacement + lastSeg
+		joined = lastSeg
 	}
-	return joined + patchExt
+	return hashPrefix + pathSeparatorReplacement + joined + patchExt
 }
 
 func patchNameRune(r rune) rune {

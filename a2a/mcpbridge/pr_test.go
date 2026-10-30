@@ -84,7 +84,7 @@ index 1111111..2222222 100644
 	if _, err := os.Stat(filepath.Join(outDir, "pr-42.diff")); err != nil {
 		t.Errorf("expected pr-42.diff on disk: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(outDir, "files", "clusters__prod__nodepool.yaml.patch")); err != nil {
+	if _, err := os.Stat(filepath.Join(outDir, "files", sanitizePatchFilename("clusters/prod/nodepool.yaml"))); err != nil {
 		t.Errorf("expected per-file patch on disk: %v", err)
 	}
 	summaryBytes, err := os.ReadFile(filepath.Join(outDir, summaryFileName))
@@ -521,7 +521,7 @@ func TestInspectPullRequestCutShortDiffIsNotAdvertised(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(outDir, "pr-42.diff")); !os.IsNotExist(err) {
 				t.Fatalf("pr-42.diff was written from a partial diff (stat err %v)", err)
 			}
-			if _, err := os.Stat(filepath.Join(outDir, filesSubdirName, "a.go.patch")); !os.IsNotExist(err) {
+			if _, err := os.Stat(filepath.Join(outDir, filesSubdirName, sanitizePatchFilename("a.go"))); !os.IsNotExist(err) {
 				t.Fatalf("a per-file patch was written from a partial diff (stat err %v)", err)
 			}
 		})
@@ -557,5 +557,16 @@ func TestInspectPullRequestReportsAnIncompleteFilesListing(t *testing.T) {
 	}
 	if md := FormatPRInspectionMarkdown(insp); !strings.Contains(md, "incomplete") || !strings.Contains(md, "1 of 150") {
 		t.Fatalf("the summary presents the partial listing as whole:\n%s", md)
+	}
+}
+
+func TestSanitizePatchFilenameKeepsFlattenedPathsApart(t *testing.T) {
+	for _, pair := range [][2]string{{"a/b.go", "a__b.go"}, {"x/y", `x\y`}, {"p q.go", "p_q.go"}} {
+		if a, b := sanitizePatchFilename(pair[0]), sanitizePatchFilename(pair[1]); a == b {
+			t.Errorf("%q and %q both flatten to %q", pair[0], pair[1], a)
+		}
+	}
+	if got := sanitizePatchFilename("clusters/prod/nodepool.yaml"); !strings.HasSuffix(got, "__clusters__prod__nodepool.yaml.patch") {
+		t.Errorf("sanitizePatchFilename lost the readable path: %q", got)
 	}
 }
