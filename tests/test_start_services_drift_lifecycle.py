@@ -992,11 +992,12 @@ _PATHOLOGICAL_SECONDS = 5.0
 def _watcher_values_passed(text: str) -> set[str]:
     """Every WATCHER_* name a watcher flag takes its value from.
 
-    Matched on the prefix, not the closing brace, so `"${WATCHER_X:-2m}"`, an
-    unquoted `${WATCHER_X}` and a name carrying a digit are all found: any of
-    them is a ninth tunable added without a normaliser.
+    Matched on the prefix, not the closing brace, and on either separator Go's
+    flag package takes, so `"${WATCHER_X:-2m}"`, an unquoted or prefixed value,
+    `--flag "${WATCHER_X}"`, and a digit in the flag or the name are all found:
+    any of them is a ninth tunable added without a normaliser.
     """
-    return set(re.findall(r'--[a-z-]+="?\$\{?(WATCHER_[A-Z0-9_]+)', text))
+    return set(re.findall(r'--[a-z0-9-]+[= ]"?[^"\s$]*\$\{?(WATCHER_[A-Z0-9_]+)', text))
 
 
 class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
@@ -1141,6 +1142,9 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             ("--new-flag=${WATCHER_NEW}", "WATCHER_NEW"),
             ("--new-flag=$WATCHER_NEW", "WATCHER_NEW"),
             ('--new-flag="${WATCHER_5XX_MIN_COUNT}"', "WATCHER_5XX_MIN_COUNT"),
+            ('--new-flag "${WATCHER_NEW}"', "WATCHER_NEW"),
+            ("--http2-window=${WATCHER_NEW}", "WATCHER_NEW"),
+            ('--new-flag="p${WATCHER_NEW}"', "WATCHER_NEW"),
             ('--settle="${WATCHER_SETTLE}"', "WATCHER_SETTLE"),
         ):
             with self.subTest(line=line):

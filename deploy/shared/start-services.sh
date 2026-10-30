@@ -329,7 +329,7 @@ normalize_duration() {
   fi
 
   printf -v "${name}" '%s' "${fallback}"
-  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s, up to eighteen digits and three decimals per number, at most ${WATCHER_DURATION_MAX_HOURS}h${positive:+, above zero}); using ${fallback}" >&2
+  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s, up to eighteen digits and three decimals per number and sixteen numbers, at most ${WATCHER_DURATION_MAX_HOURS}h${positive:+, above zero}); using ${fallback}" >&2
 }
 
 # Rewrite the *named* variable, in place, to a decimal count the watcher's flag
