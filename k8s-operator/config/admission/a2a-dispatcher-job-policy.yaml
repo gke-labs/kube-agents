@@ -25,6 +25,7 @@
 #     equals the template's exactly, and its pod labels are the template's plus only the ones the
 #     Job controller adds. Exact equality pins every field (images, staging init containers,
 #     volumes, runtimeClassName, resources, securityContext, scheduling) with no list to drift.
+#     Its pod annotations are the template's exactly too.
 #
 # The operator writes a template before listing its ServiceAccount in the index, and unlists it
 # before deleting the template, so the index never names a ServiceAccount whose template is missing.
@@ -32,7 +33,9 @@
 # Roles there hold no podtemplate verb.
 #
 # THE STATIC RULES, for every Job the dispatcher creates, whatever the params say: backoffLimit 0 (a
-# task is never re-run), one pod, a deadline and a TTL; Pod Security "restricted"; and no
+# task is never re-run) and no podFailurePolicy (whose Ignore would re-run it anyway), one pod, a
+# deadline and a TTL, a generated selector (a manual one could adopt other pods), not indexed, not
+# suspended; Pod Security "restricted"; and no
 # tolerations, nodeSelector, affinity or priorityClassName, and the default scheduler. These hold
 # even before a template exists. Which ServiceAccount a Job may run as is the index's to say, not a
 # name pattern: a profile may name its own ServiceAccount (spec.identity).
@@ -43,7 +46,10 @@
 #     Elsewhere the dispatcher's Job create is as wide as its Role.
 #   - It selects the requester by ServiceAccount name: any ServiceAccount named `*-a2a-dispatcher`
 #     creating a Job in `<its namespace>-profiles` is held to it.
-#   - It constrains Job CREATE only. The dispatcher's Role holds no update or patch on jobs.
+#   - It constrains Job CREATE only. The dispatcher's Role holds no update or patch on jobs; it
+#     does hold delete, on any Job in its profile namespace, which is the agent's alone.
+#   - No upper bound on the Job's deadline or TTL: the install's task deadline cap is tunable,
+#     and the dispatcher deletes a Job at its task's deadline.
 #   - A mutating webhook that changes a Job's pod template before validation (some managed
 #     platforms run one) breaks the equality and denies every Job: closed, but an outage. The
 #     live run checks this on GKE Autopilot.
@@ -92,6 +98,10 @@ spec:
       expression: "has(params.template.spec.serviceAccountName) ? params.template.spec.serviceAccountName : ''"
     - name: templateLabels
       expression: "has(params.template.metadata) && has(params.template.metadata.labels) ? params.template.metadata.labels : {}"
+    - name: annotations
+      expression: "has(object.spec.template.metadata) && has(object.spec.template.metadata.annotations) ? object.spec.template.metadata.annotations : {}"
+    - name: templateAnnotations
+      expression: "has(params.template.metadata) && has(params.template.metadata.annotations) ? params.template.metadata.annotations : {}"
     # The labels the Job controller adds to a Job's pod template.
     - name: controllerLabels
       expression: "['batch.kubernetes.io/controller-uid', 'batch.kubernetes.io/job-name', 'controller-uid', 'job-name']"
@@ -108,7 +118,12 @@ spec:
         variables.isIndex || variables.account != variables.templateAccount ||
         (variables.templateLabels.all(k, k in variables.labels && variables.labels[k] == variables.templateLabels[k]) &&
          variables.labels.all(k, k in variables.templateLabels || k in variables.controllerLabels))
-      messageExpression: "'a Job the dispatcher creates must carry exactly the pod labels of its template ' + params.metadata.name + ', plus only the Job controller''s'"
+      messageExpression: "'a Job the dispatcher creates must carry exactly the pod labels of its template ' + params.metadata.name + ', plus only the ones the Job controller adds'"
+      reason: Forbidden
+    # Annotations reach the kubelet and platform webhooks (AppArmor, sandboxing), so they are
+    # the template's too.
+    - expression: "variables.isIndex || variables.account != variables.templateAccount || variables.annotations == variables.templateAnnotations"
+      messageExpression: "'a Job the dispatcher creates must carry exactly the pod annotations of its template ' + params.metadata.name"
       reason: Forbidden
     # The static rules, for every dispatcher Job.
     - expression: >-
@@ -116,8 +131,12 @@ spec:
         (!has(object.spec.parallelism) || object.spec.parallelism == 1) &&
         (!has(object.spec.completions) || object.spec.completions == 1) &&
         has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds > 0 &&
-        has(object.spec.ttlSecondsAfterFinished)
-      message: "a Job the dispatcher creates must have backoffLimit 0, one pod, an activeDeadlineSeconds and a ttlSecondsAfterFinished"
+        has(object.spec.ttlSecondsAfterFinished) &&
+        (!has(object.spec.manualSelector) || !object.spec.manualSelector) &&
+        !has(object.spec.podFailurePolicy) &&
+        (!has(object.spec.completionMode) || object.spec.completionMode == 'NonIndexed') &&
+        (!has(object.spec.suspend) || !object.spec.suspend)
+      message: "a Job the dispatcher creates must have backoffLimit 0, one pod, an activeDeadlineSeconds and a ttlSecondsAfterFinished, and no manual selector, podFailurePolicy, indexed completion or suspend"
       reason: Forbidden
     - expression: >-
         !has(variables.pod.tolerations) && !has(variables.pod.nodeSelector) && !has(variables.pod.affinity) &&

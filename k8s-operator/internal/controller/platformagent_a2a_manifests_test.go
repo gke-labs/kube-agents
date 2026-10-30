@@ -2156,6 +2156,8 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// With the dispatcher on, so its objects are rendered and the cleanup
 	// is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	// And Job mode, so its objects in the profile namespace are rendered too.
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2213,9 +2215,16 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		t.Fatalf("precondition: the Job policy's index param wasn't rendered: %v", err)
 	}
 	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
-		Name: "dispatch-1", Namespace: "test-ns-profiles", Labels: map[string]string{dispatchJobLabel: "true"},
+		Name: "dispatch-1", Namespace: "test-ns-profiles", Labels: dispatchJobLabels(agent),
 	}}); err != nil {
 		t.Fatalf("precondition: create a dispatcher Job: %v", err)
+	}
+	// A Job with the marker but not this agent's labels isn't the
+	// dispatcher's, and stays.
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "someone-elses", Namespace: "test-ns-profiles", Labels: map[string]string{dispatchJobLabel: "true"},
+	}}); err != nil {
+		t.Fatalf("precondition: create a foreign Job: %v", err)
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2294,6 +2303,10 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("Job mode's %T %s in the profile namespace survived the cleanup (err=%v)", tc.obj, tc.name, err)
 		}
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: "someone-elses", Namespace: "test-ns-profiles"}, &batchv1.Job{}); err != nil {
+		t.Errorf("a Job without this agent's labels was deleted: %v", err)
 	}
 
 	// A third pass on the now-empty tree is the exit doing its job.

@@ -443,6 +443,11 @@ type a2aDispatchConfig struct {
 	RestartGraceSeconds  int                  `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int                  `json:"acceptTimeoutSeconds"`
 	Profiles             []a2aDispatchProfile `json:"profiles"`
+	// JobLabels go on every Job the dispatcher creates (lib.DispatchConfig
+	// JobLabels): the agent's, so a teardown deletes only this agent's
+	// Jobs, and dispatchJobLabel. Set only when some profile has a Job
+	// template.
+	JobLabels map[string]string `json:"jobLabels,omitempty"`
 }
 
 type a2aDispatchProfile struct {
@@ -523,6 +528,9 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 		cfg.Profiles = append(cfg.Profiles, dp)
 	}
 	slices.SortFunc(cfg.Profiles, func(a, b a2aDispatchProfile) int { return strings.Compare(a.Name, b.Name) })
+	if len(jobTemplates) > 0 {
+		cfg.JobLabels = dispatchJobLabels(agent)
+	}
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return cfg, err
@@ -617,8 +625,12 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
-	// Job mode: the admission policy's params before the Role that lets the
-	// dispatcher create Jobs against them.
+	// Job mode, only where the chart rendered its admission policy:
+	// elsewhere, what an earlier pass rendered goes. The policy's params
+	// before the Role that lets the dispatcher create Jobs against them.
+	if !dispatcherJobPolicyRendered() {
+		return r.deleteDispatcherJobResources(ctx, agent), nil
+	}
 	if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
 		return err, nil
 	}

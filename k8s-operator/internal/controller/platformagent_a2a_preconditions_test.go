@@ -233,3 +233,34 @@ func TestTheGatewayReadsItsOwnPlatformAgentAndNothingElseOfTheKind(t *testing.T)
 		t.Fatalf("the gateway Role should carry exactly one PlatformAgent read, found %d", reads)
 	}
 }
+
+// The dispatcher Job admission policy's params are PodTemplates in the
+// profile namespace, so whoever can write a PodTemplate there can widen what
+// the dispatcher's Jobs may be. The operator is the sole writer (approved on
+// that condition, #3655 PR 6): its ClusterRole holds the verbs, and no Role
+// or ClusterRole it renders for anyone else reaches a podtemplate write, nor
+// does the one built-in ClusterRole it binds (the callout's
+// system:auth-delegator, which is tokenreviews and subjectaccessreviews).
+// everyRenderedRole is held complete by TestEveryRenderedRoleIsOnThisList, so
+// a new builder can't escape this.
+func TestOnlyTheOperatorWritesPodTemplates(t *testing.T) {
+	writes := []string{"create", "update", "patch", "delete", "deletecollection"}
+	op := operatorClusterRole(t)
+	for _, verb := range []string{"get", "list", "create", "update", "patch", "delete"} {
+		if !slices.ContainsFunc(op.rules, func(r rbacv1.PolicyRule) bool { return ruleReaches(r, "", "podtemplates", verb) }) {
+			t.Errorf("the operator's ClusterRole can't %s podtemplates; it writes the Job policy's params", verb)
+		}
+	}
+	for _, role := range everyRenderedRole(a2aTestAgent()) {
+		for _, rule := range role.rules {
+			for _, verb := range writes {
+				if ruleReaches(rule, "", "podtemplates", verb) {
+					t.Errorf("%s grants %s on podtemplates: only the operator may write the Job policy's params", role.from, verb)
+				}
+			}
+		}
+	}
+	if a2aAuthDelegatorRole != "system:auth-delegator" {
+		t.Errorf("the callout is bound to the built-in ClusterRole %q; check it grants no podtemplate write, then update this test", a2aAuthDelegatorRole)
+	}
+}

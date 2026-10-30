@@ -28,6 +28,7 @@ func unattendedProfile(agent *agentv1alpha1.PlatformAgent, name string) agentv1a
 func jobTemplateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) (*PlatformAgentReconciler, client.Client) {
 	t.Helper()
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, chartProfileNamespace(agent)}, objs...)...).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
@@ -177,5 +178,56 @@ func TestNoDispatcherRoleCanWriteThePolicysParams(t *testing.T) {
 		if v == "update" || v == "patch" || v == "*" {
 			t.Errorf("the Jobs Role grants %s: the policy checks CREATE, so a Job must not be reshaped after it", v)
 		}
+	}
+}
+
+// Job mode needs the chart's signal that it rendered the Job admission
+// policy. Without it there are no Job templates, params or Jobs Role, so the
+// dispatcher's unattended tasks run on the pool; and the signal going away
+// removes what a pass with it rendered.
+func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	pns := profileNamespaceName(agent)
+	rendered := []struct {
+		obj  client.Object
+		name string
+	}{
+		{&corev1.PodTemplate{}, dispatchJobTemplatePrefix + "tse"},
+		{&corev1.PodTemplate{}, dispatchJobIndexName},
+		{&rbacv1.Role{}, a2aDispatcherJobsRoleName(agent)},
+		{&rbacv1.RoleBinding{}, a2aDispatcherJobsRoleName(agent)},
+	}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("with the signal: %v / %v", err, profileErr)
+	}
+	for _, o := range rendered {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: o.name}, o.obj); err != nil {
+			t.Fatalf("precondition: %T %s not rendered with the signal: %v", o.obj, o.name, err)
+		}
+	}
+
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("without the signal: %v / %v", err, profileErr)
+	}
+	for _, o := range rendered {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: o.name}, o.obj); !apierrors.IsNotFound(err) {
+			t.Errorf("%T %s survived the signal going away: %v", o.obj, o.name, err)
+		}
+	}
+	cfg, err := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range cfg.Profiles {
+		if p.JobTemplate != nil {
+			t.Errorf("profile %s has a Job template without the signal", p.Name)
+		}
+	}
+	if cfg.JobLabels != nil {
+		t.Errorf("jobLabels %v without the signal", cfg.JobLabels)
 	}
 }

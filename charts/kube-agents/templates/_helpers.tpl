@@ -174,6 +174,18 @@ true
 {{- end }}
 
 {{/*
+Whether the chart renders the A2A dispatcher's Job admission policy
+(templates/a2a-dispatcher-job-admission-policy.yaml): the same condition. The
+operator's A2A_DISPATCHER_JOB_POLICY is set from it, and the operator runs the
+dispatcher's Job mode only under that signal.
+*/}}
+{{- define "kube-agents.a2aDispatcherJobPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -151,9 +152,25 @@ func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha
 	}
 }
 
+// a2aDispatcherJobPolicyEnvVar is the chart's signal that it rendered the
+// dispatcher Job admission policy (config/admission/a2a-dispatcher-job-policy.yaml),
+// set from the same helper as the policy. Job mode runs only where it is set:
+// without the policy the dispatcher's Job create would be as wide as its Role,
+// so the operator renders no Job templates and no Jobs Role, and unattended
+// tasks run on the pool. It says the policy was rendered, not that it still
+// holds.
+const a2aDispatcherJobPolicyEnvVar = "A2A_DISPATCHER_JOB_POLICY"
+
+func dispatcherJobPolicyRendered() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv(a2aDispatcherJobPolicyEnvVar)), "true")
+}
+
 // dispatchJobTemplates is the Job template of each profile the dispatch
 // config admits that allows the unattended tier, by profile name.
 func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]*corev1.PodTemplateSpec {
+	if !dispatcherJobPolicyRendered() {
+		return nil
+	}
 	out := map[string]*corev1.PodTemplateSpec{}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
@@ -164,6 +181,13 @@ func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		out[p.Name] = buildProfileJobTemplate(agent, p, imageVolumes)
 	}
 	return out
+}
+
+// dispatchJobLabels are the labels on every Job the dispatcher creates.
+func dispatchJobLabels(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	labels := a2aLabels(agent, "dispatcher")
+	labels[dispatchJobLabel] = "true"
+	return labels
 }
 
 // dispatchJobParamLabels are a policy param's labels: the agent's, which
@@ -308,11 +332,15 @@ func (r *PlatformAgentReconciler) applyDispatchJobParam(ctx context.Context, age
 func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	ns := profileNamespaceName(agent)
 	// One by one: the operator holds delete on Jobs, not deletecollection.
+	// Only those with this agent's labels (dispatchJobLabels).
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(ns), client.HasLabels{dispatchJobLabel}); err != nil {
 		return fmt.Errorf("list the dispatcher's Jobs: %w", err)
 	}
 	for i := range jobs.Items {
+		if !agentLabelsMark(&jobs.Items[i], agent) {
+			continue
+		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, &jobs.Items[i],
 			client.PropagationPolicy(metav1.DeletePropagationBackground))); err != nil {
 			return fmt.Errorf("delete the dispatcher's Job %s: %w", jobs.Items[i].Name, err)

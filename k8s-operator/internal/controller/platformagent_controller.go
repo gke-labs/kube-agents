@@ -563,6 +563,14 @@ type PlatformAgentReconciler struct {
 // Without the enumeration verbs a cached Secret read cannot be added by accident.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// `podtemplates` is for the dispatcher's Job mode: the admission policy's params
+// in <ns>-profiles (agentprofile_job_template.go), which the operator alone may
+// write; no Role it renders grants a podtemplate verb. A ClusterRole rule, not a
+// Role: the profile namespace is created at runtime, and RBAC escalation
+// prevention stops the operator granting itself a Role there with verbs it does
+// not already hold. No watch: every read goes through a2aReader(), uncached.
+// Approved by @bnaylor, 2026-10-30 (#3655 PR 6).
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=get;list;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
