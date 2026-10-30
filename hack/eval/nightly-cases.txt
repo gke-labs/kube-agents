@@ -922,6 +922,21 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# A card the AI model's rate limit blocked is not promised a retry: the wake
+# reply says it will not run again on its own and offers to try again (SOUL
+# §2 step 5, #3766). Plants its own card through card_wake.py; one front-door
+# turn, no card round trip, no fixture: +3 units at the 200s default. It runs
+# on the inject lane too: next posts the wake's reply nowhere, but the same
+# SOUL sentence writes it, so the nightly still measures the rule (#4004).
+./tasks/chat-rate-limit-block-promises-no-retry/task.yaml
+
+# A reply typed under a pushed report is answered with the report (#4059):
+# the harness stores the report for the conversation as the kanban notifier
+# would, then sends the reply on it; the hermes-bridge attaches the stored
+# report to the turn. deployer: noop, two front-door turns, reads no cluster;
+# inject lane only (api-lane-exclusions.txt).
+./tasks/chat-reply-under-pushed-report/task.yaml
+
 # The front door routes "which namespaces exist in this cluster?" to the host
 # cluster's agent (or platform) without asking which cluster (#3286).
 # deployer: noop, read-only, one front-door turn plus the card round trip:
@@ -983,6 +998,24 @@
 # not run the waste collector. Red on main before the change, on a dev
 # install. One case, three units. deployer: noop, read-only over the seeded fleet.
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
+
+# gke-labs#2610: a request to propose a fix, delegated to a platform card, is
+# answered in the card's result with the PodDisruptionBudget manifest, and no
+# worker runs submit_suggestion.py, during its run or after kanban_complete.
+# The prompt is the card body the gate's failing repetitions carried. About
+# one gate repetition in 25 failed on main, so a night's three are a sample;
+# on a dev lane main failed 8 of 20 end to end (#4105). deployer: noop, read-only, the no-pdb-workload fixture plus
+# the pool repository's checkout-gateway declaration (#3145); first phase,
+# like obtainability-remediation-proposal. Nightly from its first merge.
+./tasks/delegated-proposal-stays-in-reply/task.yaml
+
+# The findings queue's item-wide decision when a sweep has added a finding to
+# the line since the nudge named it: the named rows are dismissed, the row no
+# message has named stays queued, and the other lines stay open.
+# prebuilt/findings-item plants findings-unnamed.json under its own project
+# through the Session KV server's findings routes and resolves the rows on
+# destroy. No fixture; the host install only.
+./tasks/findings-decision-leaves-unnamed-open/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit

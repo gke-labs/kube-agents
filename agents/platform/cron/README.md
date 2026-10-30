@@ -427,6 +427,53 @@ the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, and repeated daily like one.
 
+## `session-retention` gives every profile's history an end
+
+Hermes already prunes session history: `sessions.auto_prune` deletes ended
+sessions inactive for `sessions.retention_days`, with their messages and
+transcript files, and VACUUMs when the prune freed more than a quarter of the
+file (`SessionDB.maybe_auto_prune_and_vacuum`). It does so when a CLI or the
+gateway starts, at most once a day per `state.db`. Two stores never get that
+start. One is the machine home's, which only the long-lived gateway opens, at
+construction. The other is a profile that has not run a process since its
+history aged out. So their history grew without bound.
+`session_retention.py` calls the same Hermes method on every profile's store
+once a day, so it keeps Hermes' guarantees: open, pinned and mid-turn sessions
+are never deleted, and there is one maintenance lock per store. Its throttle is
+20 hours rather than Hermes' 24, so a tick starting a few seconds earlier than
+yesterday's still runs. It never VACUUMs: the gateway (on the machine home, or on
+`profiles/platform` when the Platform Agent is the front door) and the workers
+hold these stores while it runs, and a VACUUM rewrites the whole file under them.
+Hermes VACUUMs each store when a process starts on it, and SQLite reuses the pages
+a prune frees in the meantime. It also removes rotated
+Hermes log backups (`<name>.log.<n>`) older than the period; the live log files keep Hermes' size cap, and
+`audit.jsonl` and its rotations are never touched.
+
+The period is the managed scope's `sessions.retention_days`, which the operator
+renders from `spec.harness.retention.sessionDays` (default 90, Hermes' own, so
+an upgrade deletes nothing it would not have deleted anyway, and for now also
+the minimum). It is in the managed scope so that one period covers every
+profile and a profile cannot lengthen its own.
+
+Before each prune it pins every session that another session still names as
+its parent, and unpins the ones it pinned whose children are gone. Some readers
+follow `parent_session_id` back to where a conversation started, a compression
+continuation to its origin among them, and a prune clears that link when it
+deletes the parent. A parent ages only on its own rows, so a conversation still
+going long after it was compressed would otherwise lose its origin. Hermes'
+prune skips pinned rows, the prunes it runs at process start included. The job
+sets the flag on the one row (Hermes' own pin command pins the whole lineage and
+unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
+set by hand is never cleared. A chain unwinds one parent a day once its newest
+session is pruned. A store whose pins cannot be set is not pruned that day.
+
+A blocked kanban card needs no exemption: its worker starts a
+fresh session on every run and reads its context from the card. A chat thread
+whose session ended and then sat idle past the period starts a fresh session
+when someone replies. It runs at 05:50 UTC, after the workspace collector and
+before the morning audits, and prints nothing unless a store could not be
+maintained.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is

@@ -5536,8 +5536,9 @@ def relay_cron_report(
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            # Under next a reply cannot bring the report back, so a failed audit
-            # whose folded card did not post goes out whole.
+            # A failed audit whose folded card did not post goes out whole: under
+            # next the hermes-bridge attaches the stored report to a reply, but
+            # the card was the one place the failure line was readable.
             if headline:
                 leg_message = truncation_notice + headline.text
             elif summary:

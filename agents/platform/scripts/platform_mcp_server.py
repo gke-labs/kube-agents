@@ -1276,20 +1276,18 @@ def update_finding(
     the nudge's next run; use 'surfaced' only to end one early. While any
     non-critical finding the nudge named is open and undecided, the nudge adds
     no new findings: one of these three decisions is how the user lets more
-    through. A decision covers the finding's whole item: every other open,
-    undecided finding with the same check, project and cluster (one line in
+    through. A decision covers the named findings of its item: every other
+    'surfaced' finding with the same check, project and cluster (one line in
     the nudge's message) takes it too, and their ids come back in
     `item_rows_decided`. So one call per item the user decided is enough.
     Covering the rest of the item is the decision's design, not a side effect
     to confirm: the nudge prints one id per item and tells the user that a
-    decision on it covers every undecided finding of the item. So apply the
+    decision on it covers the objects counted beside it. So apply the
     decision the user gave, and say in the reply which other findings it
-    covered. The call itself decides any 'queued' finding of the item too, and
-    no message has named a 'queued' finding yet, so the user has not seen it.
-    So before the call, look for one: get_findings(project=..., cluster=...,
-    state='queued') and the same check. If there is one, ask the user instead
-    of calling. A finding that no longer reproduces is not set here: that is a
-    verification outcome.
+    covered. A 'queued' finding of the item, which no message has named yet,
+    keeps its state, and its id comes back in `item_rows_left_open`: say in
+    the reply that it is still open. A finding that no longer reproduces is
+    not set here: that is a verification outcome.
 
     Args:
         finding_id: The finding's id.

@@ -71,9 +71,18 @@ and the report stored against that thread — are reused unchanged.
 
 Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
 than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
-"Proactive posts: the chat.notify route"). The report still lands in a thread, but a
-reply typed into it reaches the gateway, which has no binding to the report, so the
-`incident_context` step above does not apply there.
+"Proactive posts: the chat.notify route"). The report still lands in a thread and the
+same `incidents` row is stored against it, but a reply typed into it reaches the A2A
+gateway and runs through the hermes-bridge's `api` executor, never through the Hermes
+gateway's `incident_context` hook. The bridge makes the hook's by-thread read instead
+(`a2a/hermes-bridge/incident.go`; the hook's other two steps, the recent-reports index for a
+message with no row and the Google Chat first-reply recovery, do not run on the `api`
+executor): before the task's first turn it looks the
+conversation's thread up in the same table, and the row the kanban notifier stores for
+a card's report inviting a reply, posted into a Slack or Google Chat gateway conversation (keyed by the Hermes
+session and the conversation key; a key naming a whole DM or space rather than a thread is not looked
+up), and frames the report ahead of the user's words with the hook's
+notice and token list.
 
 With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
 headline in place of the report (`slack_audit_report.py`, called from
@@ -178,8 +187,10 @@ no GitOps repository (`slack_audit_report.summary_card`) gets the same card, bui
 the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
 the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
 summary's headline, its finding rows, its other lines under them, and "Look at the first
-one" with no link button. Where the card does not post, `headline_from_summary` goes out
-as text, and the fallbacks are those of the ledger card.
+one" with no link button. The label fleet-audit stores above a re-run's summary, when an
+earlier finish published and stopped, is dropped, as the ledger card drops it. Where the
+card does not post, `headline_from_summary` goes out as text, and the fallbacks are those
+of the ledger card.
 
 `kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
 says: the script leaves its rows, each with the ids of the cards it stands for, in a file
@@ -305,7 +316,11 @@ The reason is the scheduler's own, in plain words, or "It hit an error" for one
 the relay does not name, and the scheduler's line goes to the server's log
 (`logs/session_kv_server.log`, which fluent-bit ships). "tomorrow" is for a job
 whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
-any other says "It will try again at its next scheduled run." A failure no
+any other says "It will try again at its next scheduled run." Both degrade
+quietly, so both are pinned at image build
+([`verify_scheduler_failure_line.py`](../../deploy/docker/plugins/verify_scheduler_failure_line.py)):
+each of the scheduler's summarized failure lines still carries the words the relay matches,
+and the image's roster still has a job that reads as daily. A failure no
 retry clears says so instead of promising one: rejected credentials, and the
 scheduler's blocked-configuration line (which it sends once, running the job no
 more until the configuration is fixed), end with "An admin needs to fix this

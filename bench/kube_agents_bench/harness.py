@@ -159,7 +159,7 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, gitops, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -289,6 +289,23 @@ _QUESTION_SECTION = "Question from delegated task {tid}:\n{text}"
 # Appended to the opening turn's message id for the stop a stopped ask sends
 # (stop_hook), so the door's dedupe never answers it with the opening task.
 _INJECT_STOP_SUFFIX = "/stop"
+# A pushed-report reply the door absorbed as a steer (the relay's record
+# still held the opening task) is sent again, under a fresh message id, this
+# many times in all, this long apart.
+_PUSHED_REPLY_ATTEMPTS = 3
+_PUSHED_REPLY_RETRY_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class _InjectFollowUp:
+    """A second message on a conversation this run opened: the opening turn's
+    conversation and identity triple, and the suffix its message id takes."""
+
+    conversation: str
+    run_id: str
+    case_id: str
+    repetition: str
+    suffix: str
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -1920,6 +1937,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if pushed_report.is_reply_under_pushed_report(prompt):
+            return AgentResult.errored(
+                f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
 
     def _execute_api(
@@ -2138,8 +2159,108 @@ class KubeAgentsHarness(AgentHarness):
         _fold_worker_tokens(result.tokens)
         return result
 
+    def _reply_under_pushed_report(
+        self,
+        opening: AgentResult,
+        exchange: inject.Exchange,
+        replay: pushed_report.Replay,
+        *,
+        retry_seconds: float = _PUSHED_REPLY_RETRY_SECONDS,
+    ) -> AgentResult:
+        """Store the replay's report for the conversation, then send its reply there.
+
+        Runs after the opening turn has been classified and graded into
+        ``opening``. An opening turn an executor ended other than
+        ``completed`` is the run as it stands: the reply would land in a
+        conversation whose session never answered, so nothing is stored and
+        nothing is sent. A completed opening the harness read only off the
+        stream, or at its budget, is infrastructure: the deliverable is the
+        reply turn, which cannot be sent on a record the relay still holds,
+        and nothing the agent did is on trial. The row is keyed to the Hermes
+        session the bridge runs the conversation in, read from the door's
+        probe (``contextId``); a door that reports none is infrastructure
+        too, since the row cannot be keyed and the agent would be graded for
+        a read the harness never made possible.
+
+        The reply is a second message on a conversation whose record the
+        relay clears after it acks the opening's terminal; one that lands in
+        that window is absorbed as a steer and the door answers no-task. It
+        is sent again under a fresh message id, :data:`_PUSHED_REPLY_ATTEMPTS`
+        times in all, ``retry_seconds`` apart; a reply still refused after
+        that is infrastructure, as a status turn's is.
+        """
+        if exchange.fold.terminal != inject.STATE_COMPLETED:
+            opening.errors.append(
+                f"{pushed_report.DIRECTIVE}: the opening turn ended "
+                f"{exchange.fold.terminal or exchange.outcome}, so no report was stored and no reply sent"
+            )
+            return opening
+        if exchange.outcome != inject.OUTCOME_TERMINAL:
+            return _infra_failure(
+                f"{pushed_report.DIRECTIVE}: the opening turn on {exchange.conversation} completed but its "
+                f"exchange ended {exchange.outcome}, so the reply could not be sent on its record"
+            )
+        context_id = exchange.probe.context_id if exchange.probe else ""
+        session_id = board.api_session_id(context_id) if context_id else ""
+        if not session_id:
+            return _infra_failure(
+                f"{pushed_report.DIRECTIVE}: the door reported no usable contextId for "
+                f"{exchange.conversation}, so the report cannot be keyed to the conversation's session"
+            )
+        try:
+            payload = pushed_report.plant(
+                _agent_shell, session_id, exchange.conversation, replay.report, _EXEC_TIMEOUT
+            )
+        except pushed_report.PlantUnavailable as exc:
+            return _infra_failure(str(exc))
+        except pushed_report.PlantBroken as exc:
+            return AgentResult.errored(str(exc))
+        entry = pushed_report.plant_entry(session_id, exchange.conversation, payload)
+        for attempt in range(1, _PUSHED_REPLY_ATTEMPTS + 1):
+            suffix = pushed_report.REPLY_SUFFIX if attempt == 1 else f"{pushed_report.REPLY_SUFFIX}-{attempt}"
+            reply = self._execute_inject(
+                replay.reply,
+                follow_up=_InjectFollowUp(
+                    conversation=exchange.conversation,
+                    run_id=str(opening.metadata.get("run_id") or ""),
+                    case_id=str(opening.metadata.get("case_id") or ""),
+                    repetition=str(opening.metadata.get("repetition") or ""),
+                    suffix=suffix,
+                ),
+            )
+            absorbed = (
+                reply.metadata.get("outcome") == inject.OUTCOME_NOT_ACCEPTED
+                and reply.metadata.get("refusal") == inject.REFUSAL_NO_TASK
+            )
+            if not absorbed:
+                break
+            _log.warning(
+                "pushed report: the reply on %s was absorbed as a steer (attempt %d/%d)",
+                exchange.conversation,
+                attempt,
+                _PUSHED_REPLY_ATTEMPTS,
+            )
+            if attempt < _PUSHED_REPLY_ATTEMPTS:
+                time.sleep(retry_seconds)
+        else:
+            return _infra_failure(
+                f"{pushed_report.DIRECTIVE}: the reply on {exchange.conversation} was absorbed as a "
+                f"steer {_PUSHED_REPLY_ATTEMPTS} times; the relay never released the opening task's record"
+            )
+        if reply.metadata.get("outcome") == inject.OUTCOME_NOT_ACCEPTED:
+            # Any other refusal: the door, not the agent.
+            return _infra_failure(f"{pushed_report.DIRECTIVE}: {'; '.join(reply.errors) or 'the reply was refused'}")
+        if reply.metadata.get("infra_failure") is not None:
+            # The reply's exchange was lost in transport or classified as
+            # infrastructure by the door's read: the run is that failure, as
+            # _infra_failure records it (empty output, empty trajectory, the
+            # marker), not a merged record that reads as a completed task
+            # beside an infrastructure failure.
+            return reply
+        return pushed_report.merge(opening, reply, entry)
+
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
-        """Send a planted card's wake and the user's answer.
+        """Send a planted card's wake and the user's answer, or only the wake for a block replay.
 
         The answer goes on the wake's conversation, or on a new one for a
         ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
@@ -2180,9 +2301,10 @@ class KubeAgentsHarness(AgentHarness):
         answer_turn = None
         try:
             wake_turn = self._execute_api(planted.wake, workspace_path, opening_turn=True)
-            if not card_wake.no_reply(wake_turn) and replay.fresh:
+            answers = replay.answered and not card_wake.no_reply(wake_turn)
+            if answers and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
-            elif not card_wake.no_reply(wake_turn):
+            elif answers:
                 answer_turn = self._execute_api(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
@@ -2191,8 +2313,8 @@ class KubeAgentsHarness(AgentHarness):
                 _log.warning("card wake: card %s could not be read", planted.card)
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
-        # A wake turn that errored has no answer turn; it is tagged, since an
-        # errored run is the one whose card and wake are wanted.
+        # A block replay, or a wake turn that errored, has no answer turn; it
+        # is tagged, since the card and wake are wanted either way.
         if answer_turn is None:
             return card_wake.tag(planted, wake_turn, settled)
         return card_wake.merge(planted, wake_turn, answer_turn, settled)
@@ -2226,8 +2348,16 @@ class KubeAgentsHarness(AgentHarness):
         finally:
             _PINNED_RUN_ID.reset(fresh)
 
-    def _execute_inject(self, prompt: str) -> AgentResult:
+    def _execute_inject(self, prompt: str, *, follow_up: _InjectFollowUp | None = None) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.
+
+        ``follow_up`` makes this a second message on a conversation an
+        earlier turn of the same run opened (the reply of a
+        :mod:`pushed_report` replay): it carries that turn's conversation
+        and identity, so nothing is minted anew, plus the message-id suffix
+        the door tells the two apart by. Such a turn parses no directive,
+        writes no turn timing and waits on no delegation; it returns once
+        its own task has ended.
 
         Mirrors ``_execute``'s retry classes. The tunnel to the inject Service
         gets the same bounded establishment retry; an exchange that never
@@ -2279,11 +2409,14 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
-            stop = stop_hook.parse(prompt)
+            stop = None if follow_up else stop_hook.parse(prompt)
+            pushed = None if follow_up else pushed_report.parse(prompt)
         except ValueError as exc:
             return AgentResult.errored(str(exc))
         if stop is not None:
             prompt = stop.prompt
+        if pushed is not None:
+            prompt = pushed.opening
 
         agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
         service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
@@ -2300,7 +2433,10 @@ class KubeAgentsHarness(AgentHarness):
                 f"Read it from the {secret} Secret's `{_INJECT_TOKEN_SECRET_KEY}` key in "
                 f"{os.environ.get('AGENT_NAMESPACE', _DEFAULT_AGENT_NAMESPACE)}"
             )
-        run_id, case_id, repetition = _inject_identity()
+        if follow_up is not None:
+            run_id, case_id, repetition = follow_up.run_id, follow_up.case_id, follow_up.repetition
+        else:
+            run_id, case_id, repetition = _inject_identity()
         # A fresh conversation per case and repetition: the gateway keeps a
         # session record per conversation, so a shared key would have each
         # task inherit the previous task's context and, worse, arrive while
@@ -2309,6 +2445,8 @@ class KubeAgentsHarness(AgentHarness):
         # the door dedupe a retried POST on it.
         conversation = inject.conversation_key(run_id, case_id, repetition)
         message_id = inject.message_id(run_id, case_id, repetition)
+        if follow_up is not None:
+            conversation, message_id = follow_up.conversation, message_id + follow_up.suffix
         identity: dict[str, Any] = {
             "run_id": run_id,
             "case_id": case_id,
@@ -2574,7 +2712,9 @@ class KubeAgentsHarness(AgentHarness):
             message_id=message_id,
         )
         try:
-            exchange = _exchange(task, timeout, opening=True)
+            # A follow-up is a status turn's kind of exchange: a door that
+            # absorbs it as a steer answers no-task, which the caller retries.
+            exchange = _exchange(task, timeout, opening=follow_up is None)
             opening_ended = time.monotonic()
         except inject.BudgetBelowFloor as exc:
             # Configuration, refused before the POST: the same class as a
@@ -2693,7 +2833,8 @@ class KubeAgentsHarness(AgentHarness):
 
         opening_took = opening_ended - opening_accepted[0] if opening_accepted else None
         if (
-            opening_took is not None
+            not follow_up
+            and opening_took is not None
             and opening_took < timeout
             and exchange.outcome == inject.OUTCOME_TERMINAL
             and exchange.fold.terminal == inject.STATE_COMPLETED
@@ -2782,6 +2923,17 @@ class KubeAgentsHarness(AgentHarness):
             except _TransportError as exc:
                 return _infra_failure(str(exc))
             return result
+
+        if follow_up is not None:
+            if exchange.outcome == inject.OUTCOME_NOT_ACCEPTED:
+                result.metadata["refusal"] = task.refusal
+                result.errors.append(
+                    f"{inject.refusal_detail(task.refusal)}, on {exchange.conversation}: {task.note}"
+                )
+            return result
+
+        if pushed is not None:
+            return self._reply_under_pushed_report(result, exchange, pushed)
 
         if delegation_timeout > 0:
             # The seam for delegated work, and it is the case runner's rather

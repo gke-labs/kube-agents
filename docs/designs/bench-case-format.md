@@ -58,9 +58,13 @@ A first line of `[bench:slack-question-wake]` makes the run a replay of the wake
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
-the front door there under `spec.mode: next` too. Under next the reply to that wake is posted
-nowhere, and a `session: fresh` answer carries today's Slack thread context, which next's door
-does not send, so a case that grades either stays in `hack/eval/inject-lane-exclusions.txt`. A
+the front door there under `spec.mode: next` too. A `session: fresh` answer carries today's Slack
+thread context, which next's door does not send, so a case with one stays in
+`hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
+same front door writes it, so a case that grades that reply still runs on the inject lane. A
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
+`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
@@ -68,6 +72,14 @@ prompt an ask the harness stops once it has filed a card
 only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
 `harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
+A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
+lines under it, sends the opening as turn one, stores the report for the conversation in the
+agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
+into a Slack or Google Chat gateway conversation, then sends the reply as a second message on the same conversation
+([`bench/kube_agents_bench/pushed_report.py`](../../bench/kube_agents_bench/pushed_report.py));
+the reply turn's answer is the deliverable, and the harness writes `harness_pushed_report_stored`
+for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
+as well.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -562,7 +574,11 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
 written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
-that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
+compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
+`op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
+nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
+descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -622,7 +638,9 @@ classes of mistake get through it and fail at spec-load, after a cluster lease i
   into the boolean `True`. devops-bench reads them with `ruamel.yaml`'s `YAML(typ="safe")`
   (`devops_bench/tasks/loader.py:41`), which is YAML 1.2 and parses it into the string
   `"yes"` — the exact value the strict-mode note above warns fails validation. By the time
-  the validator sees the field, the trap has already been parsed away.
+  the validator sees the field, the trap has already been parsed away. The same split hides
+  `value: yes` under a property check: PyYAML hands the validator a boolean and devops-bench
+  compares the API's boolean to the string `"yes"`.
 
 A fourth divergence is caught: PyYAML's `safe_load` keeps the last of two equal keys
 silently, where `YAML(typ="safe")` raises `DuplicateKeyError`, so the validator loads with

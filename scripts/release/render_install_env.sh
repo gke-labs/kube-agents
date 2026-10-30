@@ -60,7 +60,9 @@ fi
 # written into it by hand is gone by the next run, and the shipped default is
 # the only answer the environment can give. For every key whose default is
 # false that is the quiet outcome; for ENABLE_DRIFT_DETECTOR, whose default is
-# true, it is a Log Router sink over every cluster in the project. A key being
+# true, it is a Log Router sink over every cluster in the project, and for
+# VERTEX_MANAGE_SERVING_PROJECT, also true, the Vertex AI API enabled and the
+# gateway's role granted on the serving project. A key being
 # in this table is therefore not only how an environment states a non-default
 # choice -- it is the only way it can state one.
 MAPPING="
@@ -72,6 +74,7 @@ MODEL_PROVIDER:MODEL_PROVIDER
 MODEL_DEFAULT_NAME:MODEL_DEFAULT_NAME
 VERTEX_PROJECT_ID:VERTEX_PROJECT_ID
 VERTEX_LOCATION:VERTEX_LOCATION
+VERTEX_MANAGE_SERVING_PROJECT:VERTEX_MANAGE_SERVING_PROJECT
 GEMINI_API_KEY:GEMINI_API_KEY
 ANTHROPIC_API_KEY:ANTHROPIC_API_KEY
 OPENAI_API_KEY:OPENAI_API_KEY
@@ -87,6 +90,7 @@ SLACK_APP_TOKEN:SLACK_APP_TOKEN
 SLACK_ALLOWED_USERS:SLACK_ALLOWED_USERS
 SLACK_HOME_CHANNEL:SLACK_HOME_CHANNEL
 SLACK_HOME_CHANNEL_NAME:SLACK_HOME_CHANNEL_NAME
+SLACK_HOME_CHANNEL_POLICY:SLACK_HOME_CHANNEL_POLICY
 GITOPS_ORG:GITOPS_ORG
 GITOPS_REPO:GITOPS_REPO
 GITHUB_APP_ID:GITHUB_APP_ID

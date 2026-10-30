@@ -199,6 +199,22 @@
       "deliver": "chat"
     },
     {
+      "id": "session-retention",
+      "name": "Session Retention",
+      "schedule": {
+        "kind": "cron",
+        "expr": "50 5 * * *",
+        "display": "50 5 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "session_retention.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "kanban-board-health",
       "name": "Kanban Board Health",
       "schedule": {
