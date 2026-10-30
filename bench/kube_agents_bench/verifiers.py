@@ -135,6 +135,9 @@ __all__ = [
 # procedure posts a handful; a page holds a hundred, and the ``since`` filter
 # already drops everything older than the run.
 _ISSUE_COMMENT_PAGES = 3
+# Tolerance between a forge's stamps and the harness's run-start clock, two
+# different machines; the figure the sibling forge checks use.
+_DEFAULT_CLOCK_SKEW_SEC = 120.0
 
 _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
@@ -2270,6 +2273,46 @@ def _issue_api_url(forge: str, repo: str, number: int) -> str:
     return f"{forges.github_api_root()}/repos/{repo}/issues/{number}"
 
 
+def _issue_comments(
+    api_url: str,
+    token: str,
+    budget: float,
+    forge: str,
+    since: datetime,
+    pages: int = 1,
+) -> list[tuple[datetime | None, str]] | None:
+    """``(created_at, body)`` of an issue's comments; None when they could not be read.
+
+    GitHub's ``since`` filters on a comment's update stamp, which is never
+    earlier than its creation, so it only narrows the pages and the caller
+    decides on ``created_at``. GitLab's notes take no ``since``; they are
+    read newest first, one page, and its system notes (a label or state
+    change) are skipped, since nobody posted those. A non-200 answer or a
+    payload that is not a list is None; transport failures propagate as
+    :class:`OSError`, for the caller to name.
+    """
+    stamp = since.astimezone(timezone.utc).strftime(_GITHUB_SINCE_FORMAT)
+    if forge == forges.FORGE_GITLAB:
+        urls = [f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"]
+    else:
+        first = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={stamp}"
+        urls = [first] + [f"{first}&page={page}" for page in range(2, pages + 1)]
+    comments: list[tuple[datetime | None, str]] = []
+    for url in urls:
+        status_code, payload = _http_get_json(url, token, budget)
+        if status_code != 200 or not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if not isinstance(comment, dict) or comment.get("system"):
+                continue
+            comments.append(
+                (_parse_github_time(comment.get("created_at")), str(comment.get("body") or ""))
+            )
+        if len(payload) < _GITHUB_PAGE_SIZE:
+            break
+    return comments
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Turns every redirect into an ``HTTPError`` instead of following it."""
 
@@ -4059,24 +4102,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         skipped, since the marker is a comment the reset posts.
         """
         closed_at = closed_at.astimezone(timezone.utc)
-        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
-        if forge == forges.FORGE_GITLAB:
-            url = f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"
-        else:
-            url = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}"
         try:
-            status_code, payload = _http_get_json(url, token, budget)
+            comments = _issue_comments(
+                api_url, token, budget, forge, closed_at - _RESET_COMMENT_LOOKBACK
+            )
         except OSError:
             return None
-        if status_code != 200 or not isinstance(payload, list):
+        if comments is None:
             return None
-        for comment in payload:
-            if not isinstance(comment, dict) or comment.get("system"):
-                continue
-            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
-                continue
-            created_at = _parse_github_time(comment.get("created_at"))
-            if created_at is None:
+        for created_at, body in comments:
+            if LEDGER_RESET_MARKER not in body or created_at is None:
                 continue
             if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
                 return True
@@ -4445,8 +4480,10 @@ class ForgeIssueStateVerifier(BaseVerifier):
     binds the issue to THIS run: a previous repetition leaves a closed,
     labelled issue behind, and a reply pointing at it would otherwise pass
     forever. For the same reason a ``closed`` assertion also requires
-    ``closed_at`` inside the window. GitLab's system notes (a label or state
-    change) are not comments and are not counted.
+    ``closed_at`` inside the window, and a spec must set ``state: closed``
+    or ``min_comments`` of at least 1: ``labels`` alone, or ``state: open``
+    alone, binds nothing and is refused at spec load. GitLab's system notes
+    (a label or state change) are not comments and are not counted.
 
     AUTHENTICATION. The runner's read token, as ``ledger_issue_contains``
     documents it, and never the agent's own credential. An absent token is
@@ -4457,55 +4494,18 @@ class ForgeIssueStateVerifier(BaseVerifier):
     state: Literal["open", "closed"] | None = None
     labels: list[str] = Field(default_factory=list)
     min_comments: int = Field(default=0, ge=0)
-    # Tolerance between the forge's stamps and the harness's run-start clock,
-    # two different machines; the figure the sibling forge checks use.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
 
     @model_validator(mode="after")
-    def _asserts_something(self) -> ForgeIssueStateVerifier:
-        if self.state is None and not self.labels and not self.min_comments:
+    def _binds_the_issue_to_the_run(self) -> ForgeIssueStateVerifier:
+        if self.state != "closed" and self.min_comments < 1:
             raise ValueError(
-                "forge_issue_state asserts nothing: set state, labels or min_comments"
+                "forge_issue_state must bind the issue to this run: set state: closed "
+                "(the close must fall inside the run) or min_comments of at least 1 "
+                "(comments posted inside the run); labels alone, or state: open alone, "
+                "would pass on an issue an earlier run left behind"
             )
         return self
-
-    def _comments_since(
-        self,
-        api_url: str,
-        window_start: datetime,
-        token: str,
-        budget: float,
-        forge: str,
-    ) -> int | None:
-        """Comments created at or after ``window_start``; None when unreadable.
-
-        GitHub's ``since`` filters on the comment's update stamp, which is
-        never earlier than its creation, so it only narrows the pages; the
-        count is taken on ``created_at``. GitLab's notes take no ``since``
-        and are read newest first, one page.
-        """
-        since = window_start.strftime(_GITHUB_SINCE_FORMAT)
-        if forge == forges.FORGE_GITLAB:
-            urls = [f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"]
-        else:
-            urls = [
-                f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}&page={page}"
-                for page in range(1, _ISSUE_COMMENT_PAGES + 1)
-            ]
-        count = 0
-        for url in urls:
-            status_code, payload = _http_get_json(url, token, budget)
-            if status_code != 200 or not isinstance(payload, list):
-                return None
-            for comment in payload:
-                if not isinstance(comment, dict) or comment.get("system"):
-                    continue
-                created_at = _parse_github_time(comment.get("created_at"))
-                if created_at is not None and created_at >= window_start:
-                    count += 1
-            if len(payload) < _GITHUB_PAGE_SIZE:
-                break
-        return count
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -4620,7 +4620,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
             comments: int | None = None
             if self.min_comments:
                 try:
-                    comments = self._comments_since(url, window_start, token, budget, forge)
+                    listed = _issue_comments(
+                        url, token, budget, forge, window_start, _ISSUE_COMMENT_PAGES
+                    )
                 except OSError as exc:
                     return done(
                         False,
@@ -4628,13 +4630,17 @@ class ForgeIssueStateVerifier(BaseVerifier):
                         "this check could not be evaluated",
                         status="error",
                     )
-                if comments is None:
+                if listed is None:
                     return done(
                         False,
                         f"the comments of {slug} could not be read ({label} did not "
                         "answer 200 with a list), so this check could not be evaluated",
                         status="error",
                     )
+                comments = sum(
+                    1 for created_at, _ in listed
+                    if created_at is not None and created_at >= window_start
+                )
                 if comments < self.min_comments:
                     faults.append(
                         f"carries {comments} comment(s) posted since this run started, "

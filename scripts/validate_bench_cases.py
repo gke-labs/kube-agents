@@ -508,15 +508,15 @@ KNOWN_JUDGE_ONLY: dict[str, str] = {}
 # the run did.
 #
 # devops-bench's registry is authoritative and rejects an unknown type at
-# spec-load time; this table is the pre-cluster copy. The first three come
-# from the pinned devops-bench SHA in bench/pyproject.toml, the last three
-# from bench/kube_agents_bench/verifiers.py -- a test re-derives those from
-# the entry-point group so a new local verifier fails here rather than
-# drifting silently.
+# spec-load time; this table is the pre-cluster copy. The upstream entries
+# come from the pinned devops-bench SHA in bench/pyproject.toml, the local
+# ones from bench/kube_agents_bench/verifiers.py -- a test re-derives the
+# local ones from the entry-point group so a new local verifier fails here
+# rather than drifting silently.
 #
-# For the first three the named field is also required by the verifier's own
+# For the upstream entries the named field is also required by the verifier's own
 # pydantic model, so this rule only moves the rejection earlier -- from after a
-# cluster lease to now. The rule earns its keep on the last three, where the
+# cluster lease to now. The rule earns its keep on the local ones, where the
 # field is optional and an empty or blank-stringed list is the shape that
 # actually ships: a check that reads as an assertion and can only pass.
 CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
@@ -548,8 +548,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
-    # The issue state, its labels and its in-run comment count; the model
-    # itself refuses a spec that sets none of them.
+    # The issue state, its labels and its in-run comment count. The model
+    # holds the stricter rule: `state: closed` or `min_comments` >= 1, the two
+    # that bind the issue to the run.
     "forge_issue_state": ("state", "labels", "min_comments"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.

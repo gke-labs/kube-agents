@@ -9797,7 +9797,8 @@ def _ticket_api(number=708):
 
 
 def _ticket_comments_api(number=708, page=1):
-    return f"{_ticket_api(number)}/comments?per_page=100&since={_TICKET_SINCE}&page={page}"
+    url = f"{_ticket_api(number)}/comments?per_page=100&since={_TICKET_SINCE}"
+    return url if page == 1 else f"{url}&page={page}"
 
 
 def _state_check(**kw):
@@ -9950,13 +9951,19 @@ def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, 
     assert github.calls == []
 
 
-def test_issue_state_spec_must_assert_something():
+def test_issue_state_spec_must_bind_the_issue_to_the_run():
     from pydantic import ValidationError
 
-    with pytest.raises(ValidationError):
-        verifiers.ForgeIssueStateVerifier(type="forge_issue_state")
+    # Nothing, labels alone and an open state alone would all pass on an issue
+    # an earlier run left behind, so the model refuses them.
+    for unbound in ({}, {"labels": ["status:resolved"]}, {"state": "open"}):
+        with pytest.raises(ValidationError, match="bind the issue to this run"):
+            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **unbound)
     with pytest.raises(ValidationError):
         verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed", bogus=1)
+    # Either binding is enough on its own.
+    verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="closed")
+    verifiers.ForgeIssueStateVerifier(type="forge_issue_state", state="open", min_comments=1)
 
 
 def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
