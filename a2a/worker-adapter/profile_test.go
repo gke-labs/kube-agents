@@ -583,3 +583,52 @@ printf '{"type":"result","subtype":"success","result":"settings=%%s md=%%s state
 		t.Errorf("the harness saw %q, want its settings and instructions refused and its state allowed", got)
 	}
 }
+
+// Each task's harness gets its own config directory, never one an earlier
+// task's model could have touched, and starts fresh rather than resuming.
+func TestEachTaskGetsItsOwnConfigAndAFreshHarness(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	root := t.TempDir()
+	harness := stub(t, fmt.Sprintf(`
+read first || exit 1
+echo "$CLAUDE_CONFIG_DIR $*" >> %s/runs
+echo '{"type":"result","subtype":"success","result":"ok"}'
+`, root))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := profileWorkerConfig(t, url, harness)
+	addr := freeAddr(t)
+	go func() {
+		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
+			Tier: pwTier, ReadyAddr: addr, deadlineMargin: time.Second,
+			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
+		})
+	}()
+	waitReady(t, addr)
+	for _, task := range []string{"task-one", "task-two"} {
+		d.offer(task, profileSubmission(t, task, "go", nil), 5)
+		d.nextAccept(5 * time.Second)
+		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+		if _, final := drainLeases(d, task, 20*time.Second); !final {
+			t.Fatalf("%s: no final renewal", task)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "runs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(runs) != 2 {
+		t.Fatalf("%d harness runs, want 2: %q", len(runs), runs)
+	}
+	dirs := []string{strings.Fields(runs[0])[0], strings.Fields(runs[1])[0]}
+	if dirs[0] == dirs[1] {
+		t.Errorf("both tasks ran with config %s", dirs[0])
+	}
+	for _, r := range runs {
+		if strings.Contains(r, "--resume") {
+			t.Errorf("a harness resumed: %s", r)
+		}
+	}
+}

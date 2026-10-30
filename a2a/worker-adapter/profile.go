@@ -175,13 +175,15 @@ const userSettingsFile = "settings.json"
 // taskConfigDir writes the rendered persona into a fresh config directory
 // for one task and returns it, with what removes it.
 //
-// Everything the worker writes there is read-only to the harness, and an
-// empty settings.json is written read-only too. The directory itself stays
-// writable, for the harness's own session state. The Write tool isn't held
-// to the working directory, so without this a persona granting Write but no
-// shell would let the model add hooks to its own settings, or rewrite its
-// instructions, mid-task. A file write opens and truncates in place, so a
-// 0444 file can't be overwritten that way.
+// What keeps the model from configuring its own harness is that no harness
+// ever reads a config directory after a model could have touched it: each
+// task gets a fresh one, written before that task's only harness start
+// (the profile worker never resumes or restarts a harness on it) and
+// removed after, and the harness takes its hooks and instructions at
+// startup. Everything the worker writes here is also made read-only, with
+// an empty settings.json, as defence in depth. That stops an in-place
+// overwrite, not an unlink or a rename, since the directory itself stays
+// writable for the harness's own session state.
 func (w *profileWorker) taskConfigDir(task string) (string, func(), error) {
 	dir, err := os.MkdirTemp(w.pw.ConfigRoot, "config-"+task+"-")
 	if err != nil {
