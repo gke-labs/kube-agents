@@ -3363,7 +3363,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed.
+		// the single-backend gateway, so at most one platform is routed. Only
+		// the CR's channel travels as env; a channel the gateway learned
+		// reaches the agent through the projection file mounted below
+		// (platformagent_home_channel_record.go), which the agent's readers
+		// take after a non-empty env, so a learn replaces no pod.
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
 		// The agent's own idea of the Slack home channel, as under today: the
 		// audit relay gates its report card on knowing a channel and records
@@ -3552,6 +3556,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		// The home-channel projection (platformagent_home_channel_record.go):
+		// Optional and out of the pod-template hashes, so its content rolls
+		// no pod; the agent's readers follow the file within a kubelet sync.
+		volumes = append(volumes, homeChannelProjectionVolume(agent))
+	}
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 		// Optional here and only here: a2aAgentSurface also holds on the skew
@@ -5312,6 +5322,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
+	}
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME

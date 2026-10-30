@@ -142,7 +142,7 @@ func TestReconcileA2ADeletesSupersededProvisionJobs(t *testing.T) {
 				t.Fatalf("the superseded Job survived the held pass; on a quota at its edge its Pending pod keeps the slot the callout needs, and the hold never lifts")
 			}
 
-			if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 				t.Fatalf("reconcileA2A: %v", err)
 			}
 
@@ -180,7 +180,7 @@ func TestReconcileA2ADeletesSupersededProvisionJobs(t *testing.T) {
 
 			// A second pass has nothing left to sweep and must issue no
 			// Delete: the current Job is the one name the sweep keeps.
-			if _, err := r.reconcileA2A(ctx, agent); err != nil {
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 				t.Fatalf("reconcileA2A, second pass: %v", err)
 			}
 			if len(rec.propagation) != 1 {
@@ -237,7 +237,7 @@ func TestReconcileA2ASupersededProvisionJobFailureDoesNotParkThePhase(t *testing
 	}
 
 	theCalloutIsServing(t, ctx, cl, r, agent) // the current Job's creation waits on it
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
