@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"sync"
 	"testing"
@@ -70,7 +71,9 @@ func (f *fakeJobs) launchCount() int {
 // unattendedInstall is an install with one profile allowing only the
 // unattended tier, with no warm pool.
 func unattendedInstall(concurrency int, edit func(*lib.DispatchConfig)) *testInstall {
-	ti := &testInstall{src: NewStaticSource(testDispatchConfig(6, testProfile("inv", concurrency, "unattended"))), pool: NewStaticPool()}
+	prof := testProfile("inv", concurrency, "unattended")
+	prof.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"worker"}]}}`)
+	ti := &testInstall{src: NewStaticSource(testDispatchConfig(6, prof)), pool: NewStaticPool()}
 	if edit != nil {
 		ti.update(edit)
 	}
@@ -180,6 +183,26 @@ func TestAnUnattendedTaskWithoutJobsUsesThePool(t *testing.T) {
 	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
 	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted || !w.startedTask("task-1") {
 		t.Errorf("terminal %+v, started on the pool %v; want it run by the pool", ts, w.startedTask("task-1"))
+	}
+}
+
+// A profile with no Job template (the chart didn't install the Job
+// admission policy, so the operator rendered none) keeps the pool even with
+// a JobRunner set.
+func TestAProfileWithoutAJobTemplateUsesThePool(t *testing.T) {
+	b := newBus(t, "inv-0")
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "inv-0", answerAccept, 200*time.Millisecond)
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+	ti.pool.Set("inv", "unattended", "inv-0")
+	jobs := newFakeJobs(0)
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted || !w.startedTask("task-1") {
+		t.Errorf("terminal %+v, started on the pool %v; want it run by the pool", ts, w.startedTask("task-1"))
+	}
+	if jobs.launchCount() != 0 {
+		t.Errorf("%d Jobs launched for a profile with no Job template", jobs.launchCount())
 	}
 }
 

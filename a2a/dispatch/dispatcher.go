@@ -627,7 +627,9 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	d.clearWaiting(taskID)
 
-	if h.unattended && d.jobs != nil {
+	// Job mode needs the profile's Job template; without it (the chart
+	// didn't install the Job admission policy) the pool takes the task.
+	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
 		if ended {
@@ -635,6 +637,13 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		}
 	} else {
 		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	}
+	if errors.Is(err, errStopped) {
+		// Stopped while being handed out: ended as one stopped in the
+		// queue is, since no worker ever started it.
+		d.stopQueued(ctx, log, del, hk)
+		d.release(h, ctx.Err() == nil)
+		return
 	}
 	if err != nil || key == "" {
 		d.release(h, false)
@@ -856,8 +865,11 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		if err != nil {
 			return lib.LeaseRecord{}, "", err
 		}
-		if taken == offerTaken {
+		switch taken {
+		case offerTaken:
 			return rec, key, nil
+		case offerStopped:
+			return lib.LeaseRecord{}, "", errStopped
 		}
 	}
 }
@@ -871,6 +883,10 @@ const (
 	offerNotTaken offerOutcome = iota
 	// offerTaken: accepted, the lease recorded and the confirm sent.
 	offerTaken
+	// offerStopped: the task was stopped (contract addendum 9) before the
+	// confirm. The offer, if sent, is abandoned on the pod, nothing is
+	// recorded, and the task is not offered to anyone else.
+	offerStopped
 )
 
 // registerOfferLocked marks pod as h's offer target (busy in memory) and
@@ -904,6 +920,15 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		d.mu.Unlock()
 	}
 
+	stopped := func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return h.stopRequested
+	}
+	if stopped() {
+		giveUp("")
+		return lib.LeaseRecord{}, "", offerStopped, nil
+	}
 	deadline := d.now().Add(seconds(prof.ActiveDeadlineSeconds))
 	msg := lib.DispatchMessage{Type: lib.DispatchOffer, TaskID: h.taskID, Kind: h.kind, Envelope: envelope,
 		Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
@@ -930,6 +955,12 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 	}
 	timer.Stop()
 	switch {
+	case answered && acc.Accepted && stopped():
+		// A stop that came while the offer was out: the pod is told to
+		// drop it, never confirmed, so no worker starts a stopped task.
+		log.Info("stopped before the confirm; abandoning the offer on that pod", "pod", pod)
+		giveUp(abandonStopped)
+		return lib.LeaseRecord{}, "", offerStopped, nil
 	case answered && acc.Accepted:
 		now := d.now()
 		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)

@@ -181,6 +181,11 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	if err != nil {
 		return err
 	}
+	// Job mode for the unattended tier. It runs only for a profile with a
+	// Job template in the config, which the operator renders (with this
+	// dispatcher's Jobs Role) only where the chart installed the Job
+	// admission policy; other profiles keep the pool.
+	d.UseJobs(dispatch.NewKubeJobs(kube, store.Config))
 	pr.setDispatcher(d.Ready)
 	log.Info("dispatching", "configmap", s.configMap, "profileNamespace", profileNS)
 	if err := d.Run(ctx); err != nil {

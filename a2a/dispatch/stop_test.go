@@ -201,3 +201,120 @@ func TestATaskEndingWithinTheStopGraceKeepsItsOwnEnd(t *testing.T) {
 		t.Error("a task that ended within the grace was abandoned")
 	}
 }
+
+// A stop that comes while the offer is out (after admission, before the
+// confirm) abandons the offer on the pod when it accepts: never confirmed,
+// so the worker never starts, and the task ends canceled, tombstoned, not
+// offered to anyone else.
+func TestAStopDuringTheOfferAbandonsThePod(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1")
+	withStopStream(t, b)
+	b.ensure("tse", 1, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	w.acceptDelay = 800 * time.Millisecond // inside the 1s accept window
+	other := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
+	other.acceptDelay = 800 * time.Millisecond
+	b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0", "tse-1"), &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the offer out", func() bool { return w.offerCount()+other.offerCount() == 1 })
+	offered := w
+	if other.offerCount() == 1 {
+		offered = other
+	}
+	b.stop("tse", "task-1")
+
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped", ts)
+	}
+	if w.confirmCount()+other.confirmCount() != 0 || w.startedCount()+other.startedCount() != 0 {
+		t.Errorf("a task stopped before its confirm was confirmed (%d) or started (%d)",
+			w.confirmCount()+other.confirmCount(), w.startedCount()+other.startedCount())
+	}
+	if w.offerCount()+other.offerCount() != 1 {
+		t.Errorf("%d offers; a stopped task is offered to no one else", w.offerCount()+other.offerCount())
+	}
+	waitFor(t, 5*time.Second, "the stopped abandon on the offered pod", func() bool {
+		offered.mu.Lock()
+		defer offered.mu.Unlock()
+		for _, a := range offered.abandons {
+			if a.Reason == abandonStopped {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, 5*time.Second, "task-1's tombstone", func() bool {
+		_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", lib.ProfileLeaseRefusedPod, "task-1")]
+		return ok
+	})
+	b.noRedelivery("tse", "read")
+}
+
+// A stop during an offer that then goes unanswered offers the task to no
+// other pod: it ends canceled where it was found, never put back in the
+// queue.
+func TestAStopDuringAnUnansweredOfferOffersNoOneElse(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1")
+	withStopStream(t, b)
+	b.ensure("tse", 1, 0, "read")
+	w0 := b.worker("tse", "read", "tse-0", answerSilent, time.Hour)
+	w1 := b.worker("tse", "read", "tse-1", answerSilent, time.Hour)
+	b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0", "tse-1"), &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the offer out", func() bool { return w0.offerCount()+w1.offerCount() == 1 })
+	b.stop("tse", "task-1")
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped", ts)
+	}
+	if n := w0.offerCount() + w1.offerCount(); n != 1 {
+		t.Errorf("%d offers; a task stopped during its first offer is offered to no one else", n)
+	}
+	b.noRedelivery("tse", "read")
+}
+
+// noRedelivery fails the test unless the one submission on the (profile,
+// tier) top durable was delivered once: not given back and redelivered.
+// NumRedelivered counts only redeliveries still pending, so this reads the
+// consumer's delivered sequence, which counts every delivery.
+func (b *bus) noRedelivery(profile, tier string) {
+	b.t.Helper()
+	cons, err := b.js.Consumer(b.ctx, lib.ProfileSubmitStream, lib.ProfileDurableName(profile, tier, lib.SubmitKindTop))
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	time.Sleep(time.Second) // a give-back's redelivery comes RetryDelay later
+	if info, err := cons.Info(b.ctx); err != nil || info.Delivered.Consumer != 1 {
+		b.t.Errorf("delivered %d times (%v): a stopped task is ended where it is found, not put back in the queue", info.Delivered.Consumer, err)
+	}
+}
+
+// A stop while the task's Job is still starting ends the wait: the Job is
+// deleted, nothing is offered, and the task ends canceled, not no-worker,
+// and doesn't count against the breaker.
+func TestAStopWhileTheJobStartsDeletesIt(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	withStopStream(t, b)
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, time.Hour)
+	jobs := newFakeJobs(time.Hour)
+	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, func(c *lib.DispatchConfig) { c.BreakerThreshold = 1 }), &fakeVerifier{}, jobs)
+
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the Job launched", func() bool { return jobs.launchCount() == 1 })
+	b.stop("inv", "task-1")
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped", ts)
+	}
+	waitFor(t, 5*time.Second, "the Job deleted", func() bool { return jobs.deleted("task-1") })
+	if w.offerCount() != 0 {
+		t.Errorf("%d offers to a stopped task's Job pod", w.offerCount())
+	}
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("open breakers %v: a stop is not a worker failure", open)
+	}
+}

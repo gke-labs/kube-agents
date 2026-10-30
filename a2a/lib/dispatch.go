@@ -318,7 +318,7 @@ type DispatchConfig struct {
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
 	// BreakerThreshold lease expiries in a row on one (profile, tier) open
-	// its breaker, which refuses new submissions there for
+	// its breaker, which holds new submissions there queued for
 	// BreakerCooldownSeconds. 0 takes the dispatcher's defaults (3 and 300).
 	BreakerThreshold       int `json:"breakerThreshold,omitempty"`
 	BreakerCooldownSeconds int `json:"breakerCooldownSeconds,omitempty"`
@@ -330,6 +330,10 @@ type DispatchConfig struct {
 	// its own after a stop record (contract addendum 9) before the
 	// dispatcher ends it. 0 takes the dispatcher's default (30).
 	StopGraceSeconds int `json:"stopGraceSeconds,omitempty"`
+	// JobLabels go on every Job the dispatcher creates: the operator's
+	// agent labels, by which a teardown deletes only this install's Jobs,
+	// and DispatchJobLabel. Set when some profile has a JobTemplate.
+	JobLabels map[string]string `json:"jobLabels,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -347,7 +351,17 @@ type DispatchProfile struct {
 	// Durables are the shared durables the operator created for it, one
 	// per (tier, kind).
 	Durables []DispatchDurable `json:"durables"`
+	// JobTemplate is the pod template (a core/v1 PodTemplateSpec) the
+	// profile's unattended tasks run on as Jobs, rendered by the operator
+	// only where the chart installed the Job admission policy, which holds
+	// each Job to it exactly. The dispatcher uses it as it is. Absent, the
+	// profile's unattended tasks run on the warm pool.
+	JobTemplate json.RawMessage `json:"jobTemplate,omitempty"`
 }
+
+// DispatchJobLabel marks a Job the dispatcher created (the operator's
+// dispatchJobLabel).
+const DispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
 
 // DispatchDurable names one shared durable on TASKS.
 type DispatchDurable struct {

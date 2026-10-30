@@ -231,3 +231,20 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 		t.Errorf("jobLabels %v without the signal", cfg.JobLabels)
 	}
 }
+
+// The cross-module fixture for Job mode: the dispatch config with an
+// unattended profile's Job template and the Job labels, which a2a/dispatch
+// builds a Job from (TestTheRenderedJobConfigBuildsAJob).
+const dispatchJobConfigFixturePath = "../../../a2a/dispatch/testdata/rendered-dispatch-config-jobs.json"
+
+func TestRenderedDispatchJobFixture(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, dispatchJobConfigFixturePath, cm.Data[a2aDispatchConfigKey])
+}

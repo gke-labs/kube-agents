@@ -43,7 +43,7 @@ type refusal struct {
 
 // errStopped marks a submission with a stop record (stop.go): ended
 // canceled, never run.
-var errStopped = errors.New("stopped before admission")
+var errStopped = errors.New("stopped before it started")
 
 // errHeldBack marks an admission that is neither a verdict nor a stop: the
 // submission stays queued, as over a cap, and comes back (an open breaker,

@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,10 @@ import (
 
 // The policy source the chart's copy is generated from, relative to this package.
 var dispatcherJobPolicyFile = filepath.Join("..", "..", "config", "admission", "a2a-dispatcher-job-policy.yaml")
+
+// The Job a2a/dispatch builds from the operator's rendered config, generated
+// by its TestTheBuiltJobMatchesTheAdmissionFixture.
+var dispatcherJobFixture = filepath.Join("testdata", "a2a-dispatcher-job.json")
 
 // TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate runs the shipped
 // policy in a real API server against params the operator's own builders
@@ -172,6 +177,20 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 			t.Fatalf("the rendered template was not admitted within %s: %v", gatewayPodPolicyActivation, err)
 		}
 		time.Sleep(time.Second)
+	}
+
+	// The Job a2a/dispatch's buildJob makes from the operator's rendered
+	// config, generated there (TestTheBuiltJobMatchesTheAdmissionFixture).
+	built, err := os.ReadFile(dispatcherJobFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var builtJob batchv1.Job
+	if err := json.Unmarshal(built, &builtJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatcher.Create(ctx, &builtJob); err != nil {
+		t.Errorf("the Job the dispatcher builds (%s): refused, want admitted: %v", dispatcherJobFixture, err)
 	}
 
 	// Each case its own Job name, so one wrongly admitted doesn't make

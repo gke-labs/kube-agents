@@ -75,7 +75,19 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	limit := jobStart(snap)
 	until := d.now().Add(limit)
 	var pod string
+	stoppedJob := func() (lib.LeaseRecord, string, bool, error) {
+		if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {
+			log.Warn("delete the stopped task's Job", "err", err)
+		}
+		return lib.LeaseRecord{}, "", false, errStopped
+	}
 	for {
+		d.mu.Lock()
+		stopped := h.stopRequested
+		d.mu.Unlock()
+		if stopped {
+			return stoppedJob()
+		}
 		p, failed, err := d.jobs.Pod(ctx, h.profile, h.tier, h.taskID)
 		switch {
 		case err != nil:
@@ -103,6 +115,9 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 	rec, key, taken, err := d.offerTo(ctx, log, envelope, snap, prof, h, pod, ch, seconds(snap.AcceptTimeoutSeconds))
 	if err != nil {
 		return lib.LeaseRecord{}, "", false, err
+	}
+	if taken == offerStopped {
+		return stoppedJob()
 	}
 	if taken != offerTaken {
 		return noWorker(fmt.Sprintf("the task's Job worker %s did not take the task", pod))
