@@ -544,8 +544,11 @@ type activeStreamingTask struct {
 	ArtifactsDir string
 	InFlight     bool
 	CancelCall   context.CancelFunc
-	StartedAt    time.Time
-	UpdatedAt    time.Time
+	// BridgeCancelled marks an in-flight call the bridge cancelled itself and sent (or is
+	// sending) the stop for, so the cancelled call does not send a second one.
+	BridgeCancelled bool
+	StartedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type callMetaContextKey struct{}
@@ -1556,6 +1559,9 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 
 	if ctxErr != nil {
 		s.mu.Unlock()
+		if entry != nil && entry.BridgeCancelled {
+			return
+		}
 		s.bgWG.Add(1)
 		go func() {
 			defer s.bgWG.Done()
@@ -1631,8 +1637,11 @@ func (s *Server) clearStreamingTask(taskID, convAlias string) {
 	for k, entry := range s.activeStreamingTasks {
 		if (taskID != "" && (k == taskID || k == "task:"+taskID || (entry != nil && sameTaskRef(entry.TaskID, taskID)))) ||
 			(taskID == "" && convAlias != "" && entry != nil && entry.ConvAlias == convAlias) {
-			if entry != nil && entry.CancelCall != nil {
+			if entry != nil && entry.InFlight && entry.CancelCall != nil {
+				// The caller sends the stop; the cancelled call removes its own entry.
+				entry.BridgeCancelled = true
 				entry.CancelCall()
+				continue
 			}
 			delete(s.activeStreamingTasks, k)
 		}
@@ -1689,7 +1698,7 @@ func (s *Server) checkActiveStreamingTasksForCancel(ctx context.Context) {
 			delete(s.activeStreamingTasks, k)
 			continue
 		}
-		if st.HostConvID == "" {
+		if st.HostConvID == "" || st.BridgeCancelled {
 			continue
 		}
 		candidates = append(candidates, candidate{key: k, entry: *st})
@@ -1705,14 +1714,19 @@ func (s *Server) checkActiveStreamingTasksForCancel(ctx context.Context) {
 		}
 		s.mu.Lock()
 		cur := s.activeStreamingTasks[cand.key]
-		if cur == nil {
+		if cur == nil || cur.BridgeCancelled {
 			s.mu.Unlock()
 			continue
 		}
 		cancelFn := cur.CancelCall
 		taskID := cur.TaskID
 		convAlias := cur.ConvAlias
-		delete(s.activeStreamingTasks, cand.key)
+		if cur.InFlight && cancelFn != nil {
+			// The stop below is the only one: the cancelled call removes its own entry.
+			cur.BridgeCancelled = true
+		} else {
+			delete(s.activeStreamingTasks, cand.key)
+		}
 		s.mu.Unlock()
 
 		if cancelFn != nil {

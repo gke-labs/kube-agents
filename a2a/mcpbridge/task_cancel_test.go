@@ -93,3 +93,30 @@ func TestRunningTaskRef(t *testing.T) {
 		t.Error("sameTaskRef does not match a reference to its bare task id, or matches two addressees")
 	}
 }
+
+func TestTaskControlStopDuringASendSendsOneStop(t *testing.T) {
+	gw := startBlockingGateway(t, ToolSendMessage)
+	srv := newStdioTestServer(t, gw)
+	done := make(chan CallToolResult, 1)
+	go func() {
+		done <- srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"look at prod","conversation":"c1"}`))
+	}()
+	select {
+	case <-gw.started:
+	case <-time.After(stdioTestWait):
+		t.Fatal("the gateway never received the send_message")
+	}
+	if res := srv.CallTool(context.Background(), ToolTaskControl, json.RawMessage(`{"action":"stop","conversation":"c1"}`)); res.IsError {
+		t.Fatalf("task_control stop: %+v", res)
+	}
+	select {
+	case <-done:
+	case <-time.After(stdioTestWait):
+		t.Fatal("the stopped send_message did not return")
+	}
+	gw.Release()
+	srv.bgWG.Wait()
+	if n := len(gw.stops); n != 1 {
+		t.Fatalf("a task_control stop during a send sent %d remote stops; want 1", n)
+	}
+}
