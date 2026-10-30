@@ -178,9 +178,13 @@ class TestHook(unittest.TestCase):
         data["extra_body"] = {"sessionId": "caller-chosen"}
         self.assertEqual(self._run(data)["extra_body"]["sessionId"], "caller-chosen")
 
-    def test_no_router_leaves_the_request_alone(self):
+    def test_no_router_leaves_the_request_alone_and_says_so_once(self):
         self.hook._router = lambda: None
-        self.assertEqual(self._run(_request()), _request())
+        with self.assertLogs(_LOGGER, level="WARNING") as logs:
+            self.assertEqual(self._run(_request()), _request())
+            self.assertEqual(self._run(_request()), _request())
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("no LiteLLM router", logs.output[0])
 
     def test_a_failure_inside_the_hook_warns_once_and_never_raises(self):
         self.hook._router = lambda: _BrokenRouter()
@@ -211,8 +215,11 @@ class TestAgainstLiteLLM(unittest.TestCase):
         optional_params = get_optional_params(
             model="gemini-3.1-pro-preview",
             custom_llm_provider="vertex_ai",
+            messages=data["messages"],
+            drop_params=True,
             extra_body=data["extra_body"],
         )
+        self.assertEqual(optional_params["extra_body"]["sessionId"], data["extra_body"]["sessionId"])
         body = transform_request_body(
             messages=data["messages"],
             model="gemini-3.1-pro-preview",

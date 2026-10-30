@@ -17,13 +17,16 @@ v1.106.0 merges ``extra_body`` into the top level of the Vertex request body
 (``_pop_and_merge_extra_body`` in its vertex_ai Gemini transformation), so the
 id goes there. Nothing the model reads changes: the id only picks the machine.
 A session whose context compression rewrites its first message gets a new id
-and pays one cold call.
+and pays one cold call. Sessions that open with the same message (each run of
+one cron prompt) share an id and so a machine; Vertex already sends those to
+one machine today, since their system prompt and first message match too.
 
 Only ``/v1/chat/completions`` traffic, which is what the agents send, and only
 an alias whose every deployment is a vertex_ai Gemini model; Claude on
 vertex_ai, the gemini (AI Studio) provider and every other provider go out as
-sent. A caller's own ``sessionId`` is kept. Any failure leaves the request as
-it was, with one warning in the gateway log.
+sent. A caller's own ``sessionId`` is kept. Any failure, or a proxy with no
+router to resolve aliases with, leaves the request as it was, with one
+warning in the gateway log.
 
 The chart renders this file into the litellm-config ConfigMap only while
 ``litellm.vertexSessionAffinity`` is on; tests/test_litellm_vertex_session.py
@@ -91,7 +94,9 @@ def vertex_gemini_model(model_name: str, router: Any) -> str | None:
 
     None otherwise, and when there is no router: the request then goes out as sent.
     """
-    if router is None or not model_name:
+    if router is None:
+        raise LookupError("no LiteLLM router to resolve aliases with")
+    if not model_name:
         return None
     deployments = router.get_model_list(model_name=model_name) or []
     models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
