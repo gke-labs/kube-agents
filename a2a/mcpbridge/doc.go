@@ -38,7 +38,8 @@
 //	                               token belongs to (<context>/<name> once a
 //	                               same-named install in another context has
 //	                               qualified it; the bare name then names
-//	                               nothing); set, it decides even with one
+//	                               nothing, and a bare name another saved
+//	                               key shares is ambiguous); set, it decides even with one
 //	                               deployment saved, and naming no saved key
 //	                               sends the token nowhere; unset, the token
 //	                               goes to the only saved deployment, or

@@ -594,7 +594,9 @@ var (
 // selector, however many are saved; naming no saved key, the token is sent nowhere. The bare
 // name does not follow a cross-context rename to "<kubeContext>/<name>": after one, the selector
 // names nothing until it is set to the qualified key, so neither a rename nor a prune of one
-// namesake hands the token to another. With the selector unset, the token is the only saved
+// namesake hands the token to another. A bare name that another saved key shares as its base
+// name is ambiguous and names nothing; "<kubeContext>/<name>" also names the profile that kept
+// the bare key (envTokenSelectorKey). With the selector unset, the token is the only saved
 // profile's, and is sent nowhere when several are saved.
 //
 // The token is bound to its profile's saved target, not its name: prof gets it only when it
@@ -631,8 +633,8 @@ func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
 			return name, true
 		}
 	}
-	if _, ok := saved[scope]; scope != "" && ok {
-		return scope, true
+	if key, ok := envTokenSelectorKey(scope, saved); ok {
+		return key, true
 	}
 	envTokenNotSentWarning.Do(func() {
 		if scope == "" {
@@ -641,8 +643,35 @@ func envTokenOwner(saved map[string]DeploymentProfile) (string, bool) {
 			return
 		}
 		slog.Warn(EnvMCPToken+" is not sent to any deployment: "+
-			EnvMCPTokenDeployment+" is not the exact key of a saved deployment (a deployment two kube contexts share a name for is saved as <kube-context>/<name>)", "deployment_selector", scope)
+			EnvMCPTokenDeployment+" does not name exactly one saved deployment: use its saved key, or <kube-context>/<name> when two kube contexts share the name", "deployment_selector", scope)
 	})
+	return "", false
+}
+
+// envTokenSelectorKey returns the saved key scope names, and false when it names none or is
+// ambiguous. A bare name never settles which install gets the credential when another saved key
+// shares that base name; the caller must qualify it as "<kube-context>/<name>", which also names
+// a profile that kept the bare key (its own kube context qualifies it).
+func envTokenSelectorKey(scope string, saved map[string]DeploymentProfile) (string, bool) {
+	if scope == "" {
+		return "", false
+	}
+	if _, ok := saved[scope]; ok && !strings.Contains(scope, "/") {
+		for key, p := range saved {
+			if key != scope && deploymentBaseName(key, p) == scope {
+				return "", false
+			}
+		}
+		return scope, true
+	}
+	if _, ok := saved[scope]; ok {
+		return scope, true
+	}
+	if ctx, name, ok := strings.Cut(scope, "/"); ok {
+		if p, found := saved[name]; found && strings.TrimSpace(p.KubeContext) == ctx {
+			return name, true
+		}
+	}
 	return "", false
 }
 

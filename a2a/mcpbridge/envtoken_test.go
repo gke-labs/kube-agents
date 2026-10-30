@@ -210,25 +210,42 @@ func TestEnvMCPTokenIsNotSentWhenTheCallOverridesTheKubeTarget(t *testing.T) {
 	}
 }
 
-func TestEnvMCPTokenSelectorNamesOnlyTheExactSavedKey(t *testing.T) {
-	gw, auth := envTokenGateway(t)
-	// The second save collides with the first by name from another context, so it is saved as
-	// "ctx-2/cluster-a" while the first keeps "cluster-a".
-	srv := kubeTokenServer(t, gw.URL,
-		[]DeploymentProfile{{Name: "cluster-a", KubeContext: "ctx-1", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}},
-		[]DeploymentProfile{{Name: "cluster-a", KubeContext: "ctx-2", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}},
-	)
-	if _, ok := srv.Store().Snapshot().Deployments["ctx-2/cluster-a"]; !ok {
-		t.Fatalf("setup: want ctx-2/cluster-a saved, have %v", srv.Store().Snapshot().Deployments)
-	}
+func TestEnvMCPTokenBareSelectorSharedByAnotherKeyIsAmbiguous(t *testing.T) {
 	t.Setenv(EnvMCPToken, envTokenValue)
+	// The first install kept the bare key; a second install of the same name in another context
+	// was saved as "<context>/<name>".
+	bare := DeploymentProfile{Name: "cluster-a", KubeContext: "ctx-1", Namespace: testNamespace}
+	qualified := DeploymentProfile{Name: "ctx-2/cluster-a", KubeContext: "ctx-2", Namespace: testNamespace}
+	saved := map[string]DeploymentProfile{bare.Name: bare, qualified.Name: qualified}
+
+	// A bare name another saved key shares as its base name never settles who gets the token.
 	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
-	if got := connectArgsAuth(t, srv, auth, `{"deployment":"cluster-a"}`); got != "Bearer "+envTokenValue {
-		t.Fatalf("cluster-a, the selector's exact key, got Authorization %q; want the env token", got)
+	if got := EnvMCPTokenFor(bare, saved); got != "" {
+		t.Fatalf("an ambiguous bare selector reached the bare-key install as %q; want none", got)
 	}
-	got := connectArgsAuth(t, srv, auth, `{"deployment":"ctx-2/cluster-a"}`)
-	if want := "Bearer " + secretTokenFor("ctx-2", testNamespace); got != want {
-		t.Fatalf("ctx-2/cluster-a, whose base name is the selector, got Authorization %q; want its own Secret's %q", got, want)
+	if got := EnvMCPTokenFor(qualified, saved); got != "" {
+		t.Fatalf("an ambiguous bare selector reached ctx-2/cluster-a as %q; want none", got)
+	}
+	// The qualified form names one install, including the one that kept the bare key.
+	t.Setenv(EnvMCPTokenDeployment, "ctx-1/cluster-a")
+	if got := EnvMCPTokenFor(bare, saved); got != envTokenValue {
+		t.Fatalf("ctx-1/cluster-a: the bare-key install got %q; want the env token", got)
+	}
+	if got := EnvMCPTokenFor(qualified, saved); got != "" {
+		t.Fatalf("ctx-1/cluster-a: ctx-2/cluster-a got %q; want none", got)
+	}
+	t.Setenv(EnvMCPTokenDeployment, "ctx-2/cluster-a")
+	if got := EnvMCPTokenFor(qualified, saved); got != envTokenValue {
+		t.Fatalf("ctx-2/cluster-a: its install got %q; want the env token", got)
+	}
+	if got := EnvMCPTokenFor(bare, saved); got != "" {
+		t.Fatalf("ctx-2/cluster-a: the bare-key install got %q; want none", got)
+	}
+	// With no namesake, a bare selector still names its install.
+	delete(saved, qualified.Name)
+	t.Setenv(EnvMCPTokenDeployment, "cluster-a")
+	if got := EnvMCPTokenFor(bare, saved); got != envTokenValue {
+		t.Fatalf("a bare selector with no namesake got %q; want the env token", got)
 	}
 }
 
