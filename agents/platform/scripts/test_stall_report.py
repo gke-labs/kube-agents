@@ -66,9 +66,26 @@ class FakeResolver(stall_report.NameResolver):
         self.existing = existing
 
 
-def analyze(objects, events=(), existing=None, override=None):
+class FakeReader:
+    """Answers the scaled-to-zero reads from {args tuple: listing}; anything
+    else reads as an empty list. `calls` records every read."""
+
+    def __init__(self, listings=None):
+        self.listings = listings or {}
+        self.calls = []
+
+    def __call__(self, args):
+        self.calls.append(tuple(args))
+        listing = self.listings.get(tuple(args), {"items": []})
+        if isinstance(listing, Exception):
+            raise listing
+        return listing
+
+
+def analyze(objects, events=(), existing=None, override=None, listings=None):
     resolver = FakeResolver(existing or {})
-    return stall_report.analyze(list(objects), list(events), resolver, NOW, override)
+    scale = stall_report.ScaleResolver(reader=FakeReader(listings))
+    return stall_report.analyze(list(objects), list(events), resolver, NOW, override, scale)
 
 
 def healthy_deployment(name="web") -> dict:
@@ -243,6 +260,121 @@ class StaleConditions(unittest.TestCase):
         )
         rows = analyze([route])
         self.assertEqual([r["detail"] for r in rows], ["parents[shared] Accepted=False NotAllowedByListeners"])
+
+
+def workload(kind, name, replicas, labels, namespace=NAMESPACE):
+    return {"kind": kind, "metadata": {"name": name, "namespace": namespace, "labels": labels},
+            "spec": {"replicas": replicas, "template": {"metadata": {"labels": labels}}}}
+
+
+def off_gateway(name="edge", class_name="eg", listener_programmed="True"):
+    return obj(
+        "Gateway",
+        name,
+        spec={"gatewayClassName": class_name, "listeners": [{"name": "http"}]},
+        status={
+            "conditions": [condition("Accepted", "True", 600), condition("Programmed", "False", 600, "NoResources")],
+            "listeners": [{"name": "http", "attachedRoutes": 1, "conditions": [condition("Programmed", listener_programmed, 600, "Invalid")]}],
+        },
+        managed_fields=[managed(600)],
+    )
+
+
+ENVOY = "gateway.envoyproxy.io/gatewayclass-controller"
+ENVOY_SELECTOR = f"gateway.envoyproxy.io/owning-gateway-name=edge,gateway.envoyproxy.io/owning-gateway-namespace={NAMESPACE}"
+
+
+def gateway_class(name, controller):
+    return {("get", "gatewayclasses.gateway.networking.k8s.io", name): {"kind": "GatewayClass", "metadata": {"name": name}, "spec": {"controllerName": controller}}}
+
+
+def envoy_proxy(replicas, namespace="envoy-gateway-system"):
+    """Envoy Gateway's proxy for Gateway edge, in its controller namespace;
+    the Gateway's own namespace holds none."""
+    return {
+        ("get", "deployments", "-l", ENVOY_SELECTOR, "-n", namespace): {"items": [workload("Deployment", f"envoy-{NAMESPACE}-edge-abc", replicas, {}, namespace=namespace)]},
+    }
+
+
+class ScaledToZero(unittest.TestCase):
+    """A Gateway whose in-cluster proxy is scaled to zero on purpose."""
+
+    def test_the_programmed_row_goes_when_the_envoy_proxy_is_at_zero(self):
+        listings = {**gateway_class("eg", ENVOY), **envoy_proxy(0)}
+        self.assertEqual(analyze([off_gateway()], listings=listings), [])
+
+    def test_the_programmed_row_stays_when_the_envoy_proxy_runs(self):
+        listings = {**gateway_class("eg", ENVOY), **envoy_proxy(1)}
+        rows = analyze([off_gateway()], listings=listings)
+        self.assertEqual([r["detail"] for r in rows], ["Programmed=False NoResources"])
+
+    def test_every_other_row_of_the_gateway_stays(self):
+        # A listener that is not programmed, and a missing certificate, are
+        # not what a scale to zero causes.
+        gateway = off_gateway(listener_programmed="False")
+        gateway["spec"]["listeners"][0]["tls"] = {"certificateRefs": [{"name": "edge-tls"}]}
+        listings = {**gateway_class("eg", ENVOY), **envoy_proxy(0)}
+        rows = analyze([gateway], existing={("secrets", NAMESPACE): set()}, listings=listings)
+        self.assertEqual(
+            sorted(r["detail"] for r in rows),
+            ["listeners[0].tls.certificateRefs -> Secret/edge-tls not found", "listeners[http] Programmed=False Invalid"],
+        )
+
+    def test_another_controllers_proxy_is_found_by_the_standard_label_in_the_gateways_namespace(self):
+        listings = {
+            **gateway_class("istio", "istio.io/gateway-controller"),
+            ("get", "deployments", "-l", "gateway.networking.k8s.io/gateway-name=edge", "-n", NAMESPACE): {"items": [workload("Deployment", "edge-istio", 0, {})]},
+        }
+        self.assertEqual(analyze([off_gateway(class_name="istio")], listings=listings), [])
+
+    def test_a_zero_replica_deployment_in_another_namespace_does_not_silence_the_gateway(self):
+        # Only the Gateway's namespace and Envoy Gateway's controller
+        # namespace are read; a look-alike planted elsewhere is never seen.
+        reader = FakeReader({**gateway_class("eg", ENVOY), **envoy_proxy(0, namespace="tenant-b")})
+        rows = stall_report.analyze([off_gateway()], [], FakeResolver({}), NOW, None, stall_report.ScaleResolver(reader=reader))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            sorted(c for c in reader.calls if c[1] == "deployments"),
+            [("get", "deployments", "-l", ENVOY_SELECTOR, "-n", "envoy-gateway-system"), ("get", "deployments", "-l", ENVOY_SELECTOR, "-n", NAMESPACE)],
+        )
+
+    def test_a_gateway_with_no_in_cluster_proxy_keeps_the_row(self):
+        # GKE's managed classes run no proxy Deployment, so none is found.
+        listings = gateway_class("gke-l7-rilb", "networking.gke.io/gateway")
+        self.assertEqual(len(analyze([off_gateway(class_name="gke-l7-rilb")], listings=listings)), 1)
+
+    def test_a_failed_read_keeps_the_row(self):
+        listings = {**gateway_class("eg", ENVOY), ("get", "deployments", "-l", ENVOY_SELECTOR, "-n", NAMESPACE): RuntimeError("forbidden"), **envoy_proxy(0)}
+        with redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(len(analyze([off_gateway()], listings=listings)), 1)
+        self.assertIn("scaled-to-zero check could not read", err.getvalue())
+
+    def test_a_route_is_left_alone(self):
+        route = obj(
+            "HTTPRoute",
+            "web",
+            spec={"parentRefs": [{"name": "edge", "sectionName": "htps"}], "rules": [{"backendRefs": [{"name": "web", "port": 80}]}]},
+            status={"parents": [{"parentRef": {"name": "edge"}, "conditions": [condition("Accepted", "False", 600, "NoMatchingParent")]}]},
+        )
+        reader = FakeReader({**gateway_class("eg", ENVOY), **envoy_proxy(0)})
+        rows = stall_report.analyze([route], [], FakeResolver({}), NOW, None, stall_report.ScaleResolver(reader=reader))
+        self.assertEqual([r["detail"] for r in rows], ["parents[edge] Accepted=False NoMatchingParent"])
+        self.assertEqual(reader.calls, [])
+
+    def test_a_healthy_gateway_costs_no_read(self):
+        gateway = off_gateway()
+        gateway["status"]["conditions"][1] = condition("Programmed", "True", 600)
+        reader = FakeReader()
+        rows = stall_report.analyze([gateway, healthy_deployment()], [], FakeResolver({}), NOW, None, stall_report.ScaleResolver(reader=reader))
+        self.assertEqual((rows, reader.calls), ([], []))
+
+    def test_a_workload_scaled_to_zero_leaves_no_scheduling_rows(self):
+        # Its Pods are deleted, so their FailedScheduling events name no
+        # object in the scan and are not reported.
+        dep = healthy_deployment()
+        dep["spec"]["replicas"] = 0
+        events = [warning("Pod", "web-abc-123", 9, first_ago=60, last_ago=1, reason="FailedScheduling")]
+        self.assertEqual(analyze([dep], events=events), [])
 
 
 class RepeatingWarnings(unittest.TestCase):

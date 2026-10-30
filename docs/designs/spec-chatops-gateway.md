@@ -1165,8 +1165,9 @@ not be silent about it.
   whole budget (`input-required`, say), infrastructure (an executor took it and did not run it);
   `working` at the budget, a graded timeout; and an active
   record whose stream already folds to a terminal, which is the relay's lost record write (the
-  relay acks a terminal before it clears `ActiveTask` and writes the record, and on a key never
-  reused no heal arrives) - graded like a finished run from the fold's result text when the
+  relay acks a terminal once it has rendered it, whether or not the record write after it
+  succeeded, because the posts are out and a redelivery would make them again, and on a key
+  never reused no heal arrives) - graded like a finished run from the fold's result text when the
   terminal is the executor's, infrastructure when it is the supervisor's (an executor that died
   or never ran), and never cancelled. The budget is the harness's own
   (`AGENT_INJECT_TIMEOUT`, 1800 s by default), floored at the grace plus a margin and refused
@@ -1524,7 +1525,7 @@ possibly posted, so the gateway logs it as lost, at error, with its first line. 
 route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
 a third status, nothing posted; the alert path, which has one shot, waits through about
 half a minute of those before giving up. The agent-side callers
-(`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
+(`agents/platform/scripts/chat_notify.py`) switch on `routed_platform()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file; the env is what the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,

@@ -76,10 +76,12 @@ from typing import Any, Callable, Mapping
 from providers import (
     CliTransport,
     HttpTransport,
+    BrokeredCredential,
     Forge,
     ForgeUnsupported,
     IdentityUnknown,
     MAX_PAGE_SIZE,
+    NoCredential,
     Registry,
     Transport,
     pinned_base,
@@ -89,9 +91,12 @@ from providers import (
     validate_number,
     validate_revision,
 )
-from workspace_paths import WorkspaceError
+from providers.credentials import CREDENTIAL_HELPER_KEY
+from workspace_paths import WorkspaceError, validate_path
 
 LOGGER = logging.getLogger("credential-proxy.vcs")
+#: The key in a forge's credentials Secret that holds its read-only token.
+FORGE_READ_TOKEN_KEY = "read-token"
 
 # The same shape of ceiling `content_workspace` applies, for the same reason:
 # the broker's scratch volume is an emptyDir sized for manifests, and a
@@ -99,6 +104,12 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
 DEFAULT_MAX_BUNDLE_BYTES = 64 << 20  # 64 MiB
+# The `snapshot` tar's ceiling, and the variable that overrides it. Below the
+# bundle's: the answer is base64 inside one JSON body, and each of the copies
+# a reply holds (the file, the base64 text, the JSON text, its encoding) is
+# about 4/3 of this. The memory a snapshot takes is not measured yet.
+DEFAULT_MAX_SNAPSHOT_BYTES = 32 << 20  # 32 MiB
+MAX_SNAPSHOT_BYTES_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
 # The in-process API client's bounds when nothing hands it the executor's: the
 # same order as a forge CLI call is given, and a ceiling on one answer that a
 # page of JSON never approaches.
@@ -157,6 +168,77 @@ ISO_UTC_OFFSET = "+00:00"
 # name -- one per workload, reused on every alert -- adds one per round, so the
 # page is the largest a forge serves in one call, and it is still one call.
 PROPOSAL_HISTORY_ON_A_BRANCH = MAX_PAGE_SIZE
+
+# A repository's role, as the broker's ConfigMap lists it: `managed` is in
+# `managed_repos`, whatever else it is in; `context` is in `context_repos`
+# alone; `unregistered` is in neither, or the lists could not be read. Only
+# `snapshot` reads it here, to choose the credential its clone presents.
+ROLE_MANAGED = "managed"
+ROLE_CONTEXT = "context"
+ROLE_UNREGISTERED = "unregistered"
+
+# An empty `credential.helper` in the per-invocation config layer clears every
+# helper git read before it, the URL-scoped ones of the global file included.
+# `snapshot` puts it on every clone that must not ride the ambient write
+# credential: a context repository's, and an unregistered one's.
+HELPER_CLEARED = (CREDENTIAL_HELPER_KEY, "")
+
+# Where `snapshot` puts its two files inside its scratch directory: the bare
+# clone, and the tar `git archive` writes. The tar goes to a file and not to
+# stdout, because the git runner cuts stdout at its output ceiling.
+SNAPSHOT_CLONE_DIR = "repository.git"
+SNAPSHOT_ARCHIVE_FILE = "snapshot.tar"
+# What a snapshot answer says about history: a tar carries none.
+SNAPSHOT_HISTORY = "none"
+# The most `paths` one snapshot request may name. Each is one argv entry.
+MAX_SNAPSHOT_PATHS = 256
+# How often the snapshot clone's size is measured while it runs.
+CLONE_WATCH_SECONDS = 0.5
+# A path entry, and all of them joined: well under the kernel's limits on one
+# argument (128 KiB) and on a command line, so git always starts.
+MAX_SNAPSHOT_PATH_BYTES = 4096
+MAX_SNAPSHOT_PATHS_BYTES = 64 << 10
+# A full object ID, SHA-1 or SHA-256. `ref` names a branch or a tag:
+# `clone --branch` takes no revision, so one is refused by name rather than
+# left to fail as a git error.
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.IGNORECASE)
+# The ref namespaces a `ref` is looked up in after the clone, in the order
+# `clone --branch` itself prefers them.
+SNAPSHOT_REF_NAMESPACES = ("refs/heads/", "refs/tags/")
+# What `git archive` prints when a path names nothing in the tree.
+PATHSPEC_NO_MATCH = "did not match any files"
+# What `snapshot` writes into its bare clone's `info/attributes`, the file
+# that outranks every `.gitattributes` in the tree, before `git archive` runs.
+# Each attribute named here makes `archive` write something other than the
+# committed bytes, and some make it far larger: `export-subst` expands every
+# `$Format:%B$` to the whole commit message, `ident` grows each `$Id$` about
+# twelve times, `working-tree-encoding` can make text four times larger, and
+# `text` adds a CR to each line. With them unset the tar holds the files as
+# they were committed, and the size measured before the archive holds.
+# `export-ignore` is unset too: it leaves files out of the tar with no sign,
+# and a caller would read a partial tree as the whole one.
+SNAPSHOT_ATTRIBUTES_FILE = Path("info") / "attributes"
+SNAPSHOT_ATTRIBUTES = "* -export-subst -export-ignore -ident -text -working-tree-encoding\n"
+# What `git ls-tree` prints for each entry of the revision `snapshot` measures:
+# the mode, the size (`-` for a tree or a submodule) and the path, NUL-ended.
+SNAPSHOT_LISTING_FORMAT = "--format=%(objectmode) %(objectsize) %(path)"
+# The tree entry modes the measure reads: a symbolic link's blob is its
+# target, which goes in the tar header and not after it, and a tree or a
+# submodule is a directory entry whose name ends in `/`.
+GIT_MODE_SYMLINK = "120000"
+GIT_MODES_DIRECTORY = frozenset({"040000", "160000"})
+# The tar `git archive` writes, as the measure counts it: one 512-byte header
+# for each entry and the data padded to 512; a pax header (a header block and
+# its padded record) for a name or a link target longer than the 100 bytes the
+# ustar field holds, with the record's own length, key and newline counted
+# generously; the pax header with the commit ID at the start; two zero blocks
+# at the end, and the whole padded to a 20-block record.
+TAR_BLOCK_BYTES = 512
+TAR_NAME_FIELD_BYTES = 100
+TAR_PAX_RECORD_OVERHEAD_BYTES = 32
+TAR_GLOBAL_HEADER_BYTES = 2 * TAR_BLOCK_BYTES
+TAR_END_BYTES = 2 * TAR_BLOCK_BYTES
+TAR_RECORD_BYTES = 20 * TAR_BLOCK_BYTES
 
 # What git prints when the remote answered the delete and said no for good: a
 # hook, branch rule or ruleset (`[remote rejected] <ref> (... declined)`), a
@@ -269,6 +351,119 @@ def _login_key(login: str) -> str:
     spelling is how the comparison broke in the first place.
     """
     return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
+
+
+def _padded(size: int, unit: int) -> int:
+    """``size`` rounded up to a whole number of ``unit``."""
+    return -(-size // unit) * unit
+
+
+def _pax_bytes(length: int) -> int:
+    """What a pax header for a value of ``length`` bytes adds, or 0 when none is needed."""
+    if length <= TAR_NAME_FIELD_BYTES:
+        return 0
+    return TAR_BLOCK_BYTES + _padded(length + TAR_PAX_RECORD_OVERHEAD_BYTES, TAR_BLOCK_BYTES)
+
+
+def _tar_bytes(listing: str) -> int:
+    """The size of the tar `git archive` writes for ``listing``, a little over and never under.
+
+    ``listing`` is `git ls-tree -r -t -z` in `SNAPSHOT_LISTING_FORMAT`. Every
+    path is counted, so a blob named at a thousand paths is counted a thousand
+    times, as the tar holds it. An entry `export-ignore` drops is counted too.
+    """
+    total = TAR_GLOBAL_HEADER_BYTES
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        mode, size, path = entry.split(" ", 2)
+        name_bytes = len(path.encode("utf-8"))
+        if mode in GIT_MODES_DIRECTORY:
+            name_bytes += 1
+        total += TAR_BLOCK_BYTES + _pax_bytes(name_bytes)
+        if mode == GIT_MODE_SYMLINK:
+            total += _pax_bytes(int(size))
+        elif mode not in GIT_MODES_DIRECTORY:
+            total += _padded(int(size), TAR_BLOCK_BYTES)
+    return _padded(total + TAR_END_BYTES, TAR_RECORD_BYTES)
+
+
+def holds_stored_token(forge: Forge) -> bool:
+    """Whether ``forge`` presents a stored token rather than a minted one.
+
+    A brokered credential is minted per repository and installed for git by
+    the CLI, so the broker's own clones of a managed repository ride it
+    ambiently. A forge whose credential is neither brokered nor absent has
+    nothing ambient behind it, and its clones carry the credential themselves.
+    """
+    credential = getattr(forge, "credential", None)
+    return credential is not None and not isinstance(credential, (BrokeredCredential, NoCredential))
+
+
+def warn_without_read_token(forge: Forge, credential: Any, where: str) -> None:
+    """Say why a context repository's clone presents no credential.
+
+    Only for a forge whose stored token can write: it offers a read-only
+    token only through the `read-token` key, and without one the
+    clone reads a public repository and a private one refuses it. The log line
+    is the operator's only sign of which half is wrong.
+    """
+    if not isinstance(credential, NoCredential) or not holds_stored_token(forge):
+        return
+    if not getattr(forge, "read_token_path", ""):
+        # The forges file came from an operator older than the read token, so
+        # no change to the Secret can help until the operator is upgraded.
+        LOGGER.warning(
+            "%s role=context: the broker's config names no readTokenPath for the "
+            "%s forge (an operator older than the read-only token rendered it), so "
+            "the clone presents none; a private repository will refuse it",
+            where, forge.name,
+        )
+        return
+    LOGGER.warning(
+        "%s role=context: the %s forge has no usable read-only token (key %s in "
+        "its credentials Secret: missing, unreadable, empty, or not one line of "
+        "printable ASCII) and its stored token can write, so the clone presents "
+        "none; a private repository will refuse it",
+        where, forge.name, FORGE_READ_TOKEN_KEY,
+    )
+
+
+def _tree_bytes(root: Path, stop_past: int) -> int:
+    """The bytes of the files under ``root``, counted until the total passes ``stop_past``."""
+    total = 0
+    for directory, _subdirs, filenames in os.walk(root):
+        for filename in filenames:
+            try:
+                total += os.lstat(os.path.join(directory, filename)).st_size
+            except OSError:
+                continue
+            if total > stop_past:
+                return total
+    return total
+
+
+def _snapshot_paths(raw: Any) -> list[str]:
+    """`paths` of a snapshot request: literal repository-relative names, or none.
+
+    Each is checked as the content routes check a name (`validate_path`):
+    no absolute path, no `.` or `..` segment, no `.git` segment, no control
+    character.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not raw:
+        raise WorkspaceError("paths must be a non-empty list of repository-relative paths")
+    if len(raw) > MAX_SNAPSHOT_PATHS:
+        raise WorkspaceError(f"paths names more than {MAX_SNAPSHOT_PATHS} entries")
+    paths = [validate_path(path) for path in raw]
+    # Checked here, before the clone: the names end up on git's command line,
+    # where the kernel refuses an argument or a total past its limits.
+    if any(len(path.encode()) > MAX_SNAPSHOT_PATH_BYTES for path in paths):
+        raise WorkspaceError(f"a path in `paths` is longer than {MAX_SNAPSHOT_PATH_BYTES} bytes")
+    if sum(len(path.encode()) + 1 for path in paths) > MAX_SNAPSHOT_PATHS_BYTES:
+        raise WorkspaceError(f"`paths` is longer than {MAX_SNAPSHOT_PATHS_BYTES} bytes in total")
+    return paths
 
 
 class Binding:
@@ -384,8 +579,22 @@ class VcsBroker:
         started_at: float | None = None,
         mint_write: Callable[[str, str], str] | None = None,
         drop_write: Callable[[str], None] | None = None,
+        mint: Callable[[str, str], str] | None = None,
+        repository_role: Callable[[Forge, str], str] | None = None,
+        bare_name_fallback: Callable[[Any, tuple[Forge, ...]], tuple[str, str, str] | str | None] | None = None,
     ) -> None:
         self.scratch_root = Path(scratch_root)
+        # Which list of the broker's ConfigMap names `repo` on `forge`: one of
+        # the ROLE_* values, or a raise when the lists cannot be read. Only
+        # `snapshot` asks. None answers ROLE_UNREGISTERED for every repository,
+        # so a broker built without it presents no credential on a snapshot.
+        self._repository_role = repository_role
+        # Where `snapshot` reads a bare name, asked before the registry with
+        # the forges this broker built: a host-qualified name to resolve in
+        # its place; or, for a name read from a host the forge table does not
+        # hold, with no credential, the forge label, the repository and the
+        # clone URL; or None, for the registry to resolve the name as given.
+        self._bare_name_fallback = bare_name_fallback
         # git's output to the FORGE_TLS_UNTRUSTED refusal it stands for, or
         # None, for the git runs that read a failure themselves rather than
         # raising it. The broker hands its own, which names a forge's CA
@@ -436,12 +645,17 @@ class VcsBroker:
             "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
         self.max_bundle_bytes = max_bundle_bytes()
+        self.max_snapshot_bytes = _positive_int(MAX_SNAPSHOT_BYTES_ENV, DEFAULT_MAX_SNAPSHOT_BYTES)
         # The refresh operation is configuration in the sense that matters: it
         # is how this install performs a privileged act, and a forge decides
         # whether its credential strategy has any use for one.
         # `mint_write` is the second: the in-memory write token a forge with no
-        # CLI behind it presents itself.
-        self.registry = Registry({"refresh": refresh, "mint_write": mint_write, "drop_write": drop_write})
+        # CLI behind it presents itself. `mint` is the third: the read-only
+        # token a forge's `read_credential` presents for a context repository's
+        # snapshot.
+        self.registry = Registry(
+            {"refresh": refresh, "mint_write": mint_write, "drop_write": drop_write, "mint": mint}
+        )
         # Only the counter. Two requests share nothing else -- each gets its own
         # scratch directory and deletes it -- so serialising whole requests
         # would make a clone of one repository wait on a publish of another for
@@ -509,13 +723,22 @@ class VcsBroker:
         # Read per invocation, not at bind time: a minted credential holds no
         # token until the verb's `ensure` has run, and a token minted later
         # than the bind is the one git must present.
-        allow_http = forge.scheme == "http"
+        return self._git_with(
+            lambda: tuple(forge.credential.git_config(repo)), forge.scheme == "http"
+        )
 
-        def run(cwd: Path, *args: str, check: bool = True):
-            config = tuple(forge.credential.git_config(repo))
+    def _git_with(
+        self, config: Callable[[], tuple[tuple[str, str], ...]], allow_http: bool
+    ) -> Callable[..., Any]:
+        """A git runner that puts `config()` on each invocation's config layer."""
+
+        def run(cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None):
+            extra: dict[str, Any] = {}
             if allow_http:
-                return self._git_runner(["git", *args], cwd, check, config, allow_http=True)
-            return self._git_runner(["git", *args], cwd, check, config)
+                extra["allow_http"] = True
+            if stop is not None:
+                extra["stop"] = stop
+            return self._git_runner(["git", *args], cwd, check, config(), **extra)
 
         return run
 
@@ -536,22 +759,19 @@ class VcsBroker:
         path.mkdir(parents=True)
         return path
 
-    def _enforce_ceiling(self, root: Path, repo: str) -> None:
-        total = 0
-        for directory, _subdirs, filenames in os.walk(root):
-            for filename in filenames:
-                try:
-                    total += os.lstat(os.path.join(directory, filename)).st_size
-                except OSError:
-                    continue
-                if total > self.max_clone_bytes:
-                    raise WorkspaceError(
-                        f"{repo} is larger than the {self.max_clone_bytes}-byte "
-                        "ceiling for a broker-side clone. Name a `branch` to "
-                        "fetch one line of development.",
-                        status=413,
-                        code="CLONE_TOO_LARGE",
-                    )
+    def _enforce_ceiling(
+        self, root: Path, repo: str, remedy: str = "Name a `branch` to fetch one line of development."
+    ) -> None:
+        if _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes:
+            raise self._clone_too_large(repo, remedy)
+
+    def _clone_too_large(self, repo: str, remedy: str) -> WorkspaceError:
+        return WorkspaceError(
+            f"{repo} is larger than the {self.max_clone_bytes}-byte "
+            f"ceiling for a broker-side clone. {remedy}",
+            status=413,
+            code="CLONE_TOO_LARGE",
+        )
 
     @staticmethod
     def _default_branch(git: Callable, root: Path) -> str:
@@ -723,6 +943,255 @@ class VcsBroker:
                 "bundleBase64": blob,
                 "baseBranch": base,
             }
+        )
+
+    def snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One revision's files, as a tar, for a repository of any role.
+
+        The read for a repository this install does not manage: a context
+        repository, or an unregistered public one. A managed repository is
+        served too. The clone is bare, one revision deep and one branch wide,
+        and it is never checked out; `git archive` writes the tree as a tar
+        with no `.git` in it, and the scratch directory is deleted before the
+        answer is composed. A tar carries no history, so the shallow boundary
+        that makes `clone` refuse `depth` does not arise (`history: "none"`).
+
+        The dispatcher resolves the host before this runs, so the host
+        allowlist holds, and does not ask the managed list: the credential is
+        chosen here by the repository's role (`_snapshot_git`). `ref` is a
+        branch or a tag; with none, a pinned base is used, as `clone` does,
+        and then the remote's default branch. `paths` narrows the tar to
+        literal repository-relative paths.
+        """
+        ref = payload.get("ref")
+        if ref is not None:
+            ref = validate_branch(ref, "ref")
+            if _OBJECT_ID.fullmatch(ref):
+                raise WorkspaceError(
+                    "ref names a revision; a snapshot takes a branch or a tag name"
+                )
+        paths = _snapshot_paths(payload.get("paths"))
+        repository, fallback = self.snapshot_source(payload.get("repository"))
+        if fallback is not None:
+            forge_name, repo, url = fallback
+            base = None
+            role = ROLE_UNREGISTERED
+            git = self._git_with(lambda: (HELPER_CLEARED,), False)
+        else:
+            bound = self._bind({"repository": repository})
+            forge_name, repo = bound.forge.name, bound.repo
+            # Before the role and any credential: a host this install names
+            # but serves no credential for refuses here, by name.
+            url = bound.forge.clone_url(repo)
+            base = self._pinned_base(bound.forge, repo)
+            role, git = self._snapshot_git(bound)
+
+        root = self._scratch("snapshot")
+        clone_dir = root / SNAPSHOT_CLONE_DIR
+        archive = root / SNAPSHOT_ARCHIVE_FILE
+        try:
+            target = ref or base
+            if ref is None and base is not None:
+                # Asked before the clone, as `clone` does, so a pinned base
+                # the remote lacks is refused by name and not as a git error.
+                probe = git(
+                    root, "ls-remote", "--exit-code", "--heads", url,
+                    f"refs/heads/{base}", check=False,
+                )
+                if probe.returncode == LS_REMOTE_NO_MATCH_EXIT_CODE:
+                    raise _base_branch_missing(repo, base)
+            argv = [
+                "clone", "--quiet", "--bare", "--depth", "1", "--single-branch",
+                "--no-recurse-submodules",
+            ]
+            if target is not None:
+                argv += ["--branch", target]
+            argv += [url, SNAPSHOT_CLONE_DIR]
+            # Measured while git writes, not only after: the repository can be
+            # anyone's, and a clone that ran to the end could fill the scratch
+            # volume first. Past the ceiling the clone is killed (checked about
+            # every `CLONE_WATCH_SECONDS`). A killed git removes what it wrote,
+            # so the watch's own record, not a second measure, answers the 413.
+            last, stopped = [0.0], [False]
+
+            def over_ceiling() -> bool:
+                now = time.monotonic()
+                if now - last[0] < CLONE_WATCH_SECONDS:
+                    return False
+                last[0] = now
+                stopped[0] = _tree_bytes(clone_dir, self.max_clone_bytes) > self.max_clone_bytes
+                return stopped[0]
+
+            cloned = git(root, *argv, check=False, stop=over_ceiling)
+            # One revision, one branch, no history: no field of the request
+            # makes this clone smaller, and `paths` narrows only the tar.
+            remedy = "The pack of this one revision is over it; no `ref` or `paths` makes the clone smaller."
+            if stopped[0]:
+                raise self._clone_too_large(repo, remedy)
+            if cloned.returncode != 0:
+                raise subprocess.CalledProcessError(cloned.returncode, argv, cloned.stdout, cloned.stderr)
+            self._enforce_ceiling(clone_dir, repo, remedy=remedy)
+            if target is None:
+                target = self._default_branch(git, clone_dir)
+            revision = self._snapshot_revision(git, clone_dir, target)
+            attributes = clone_dir / SNAPSHOT_ATTRIBUTES_FILE
+            attributes.parent.mkdir(parents=True, exist_ok=True)
+            attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
+            self._measure_snapshot(git, clone_dir, revision, paths, repo)
+            # `--literal-pathspecs` is GIT_LITERAL_PATHSPECS as a flag: each
+            # path is a name, never a glob or pathspec magic.
+            argv = [
+                "--literal-pathspecs", "archive", "--format=tar",
+                f"--output={archive}", revision,
+            ]
+            if paths:
+                argv += ["--", *paths]
+            written = git(clone_dir, *argv, check=False)
+            if written.returncode != 0:
+                if paths and PATHSPEC_NO_MATCH in (written.stderr or ""):
+                    # The revision goes with the refusal: a caller that asked
+                    # for an optional folder still learns which commit it read.
+                    raise WorkspaceError(
+                        f"a path in `paths` names nothing in {repo} at {target}",
+                        code="PATH_NOT_FOUND",
+                        revision=revision,
+                    )
+                raise subprocess.CalledProcessError(
+                    written.returncode, argv, written.stdout, written.stderr
+                )
+            size = archive.stat().st_size
+            # The second check: the measure above is the one that keeps a
+            # large tar off the disk.
+            if size > self.max_snapshot_bytes:
+                raise self._snapshot_too_large(repo, size)
+            blob = base64.b64encode(archive.read_bytes()).decode("ascii")
+        finally:
+            _remove_tree(root)
+        return {
+            "forge": forge_name,
+            "repo": repo,
+            "role": role,
+            "ref": target,
+            "revision": revision,
+            "size": size,
+            "archiveBase64": blob,
+            "history": SNAPSHOT_HISTORY,
+        }
+
+    def _snapshot_too_large(self, repo: str, size: int) -> WorkspaceError:
+        return WorkspaceError(
+            f"the snapshot of {repo} is {size} bytes, over the "
+            f"{self.max_snapshot_bytes}-byte ceiling. Name `paths` to "
+            "take part of the tree.",
+            status=413,
+            code="SNAPSHOT_TOO_LARGE",
+        )
+
+    def _measure_snapshot(
+        self, git: Callable, clone_dir: Path, revision: str, paths: list[str], repo: str
+    ) -> None:
+        """Refuse a tree whose tar would pass the ceiling, before `git archive` writes it.
+
+        The clone ceiling measures the pack, and a pack compresses: a few MB
+        of repeated bytes can be GB as a tar, and writing that to the scratch
+        volume is what would get the broker evicted. So the tar is sized from
+        the tree listing (`_tar_bytes`) first. A listing the runner cut short
+        is refused too: a partial sum says nothing about the rest.
+        """
+        argv = ["--literal-pathspecs", "ls-tree", "-r", "-t", "-z", SNAPSHOT_LISTING_FORMAT, revision]
+        if paths:
+            argv += ["--", *paths]
+        listed = git(clone_dir, *argv)
+        if getattr(listed, "truncated", False):
+            raise WorkspaceError(
+                f"the tree of {repo} lists more entries than one answer holds. "
+                "Name `paths` to take part of the tree.",
+                status=413,
+                code="SNAPSHOT_TOO_LARGE",
+            )
+        size = _tar_bytes(listed.stdout or "")
+        if size > self.max_snapshot_bytes:
+            raise self._snapshot_too_large(repo, size)
+
+    def snapshot_source(self, repository: Any) -> tuple[Any, tuple[str, str, str] | None]:
+        """The repository `snapshot` resolves, and the read outside the host table, if any.
+
+        `bare_name_fallback` answers for a bare name: a host-qualified name
+        resolved in its place, or `(forge label, repository, clone URL)` for a
+        read with no credential that is not resolved at all. Asked by
+        `snapshot` and by the HTTP layer, which resolves the first answer and
+        skips its resolve for the second.
+        """
+        if self._bare_name_fallback is None:
+            return repository, None
+        answer = self._bare_name_fallback(repository, self.registry.forges)
+        if isinstance(answer, str):
+            return answer, None
+        return repository, answer
+
+    def _snapshot_git(self, bound: Binding) -> tuple[str, Callable[..., Any]]:
+        """The repository's role, and a git runner that presents its credential.
+
+        - managed: the forge's managed credential, made current, as `clone`
+          presents it;
+        - context: the forge's read-only credential, never the write one, with
+          the ambient helper cleared. A forge with no read-only credential
+          presents none;
+        - unregistered, or lists that cannot be read: no credential, with the
+          ambient helper cleared. A forge token can often read more than the
+          install lists, so a private repository nobody registered fails at
+          the clone rather than being read on it.
+
+        The clear is added here because `NoCredential` presents an empty
+        config, which leaves the ambient helper in place.
+        """
+        forge, repo = bound.forge, bound.repo
+        allow_http = forge.scheme == "http"
+        role = ROLE_UNREGISTERED
+        if self._repository_role is not None:
+            try:
+                role = self._repository_role(forge, repo)
+            except Exception as exc:  # noqa: BLE001 - read as unregistered
+                LOGGER.warning(
+                    "snapshot repo=%s: the repository lists could not be read "
+                    "type=%s; cloning without a credential",
+                    repo,
+                    type(exc).__name__,
+                )
+                role = ROLE_UNREGISTERED
+        LOGGER.info("snapshot credential forge=%s repo=%s role=%s", forge.name, repo, role)
+        if role == ROLE_MANAGED:
+            bound.ensure()
+            return role, bound.git
+        if role == ROLE_CONTEXT:
+            credential = forge.read_credential(repo)
+            warn_without_read_token(forge, credential, f"snapshot credential repo={repo}")
+            credential.ensure(repo)
+            config = tuple(credential.git_config(repo))
+            if HELPER_CLEARED not in config:
+                config = (HELPER_CLEARED, *config)
+            return role, self._git_with(lambda: config, allow_http)
+        return ROLE_UNREGISTERED, self._git_with(lambda: (HELPER_CLEARED,), allow_http)
+
+    @staticmethod
+    def _snapshot_revision(git: Callable, clone_dir: Path, target: str) -> str:
+        """The commit `target` names in a bare single-branch clone.
+
+        Looked up by namespace rather than through HEAD: a bare clone of a tag
+        leaves HEAD on no branch.
+        """
+        for namespace in SNAPSHOT_REF_NAMESPACES:
+            found = git(
+                clone_dir, "rev-parse", "--verify", "--quiet",
+                f"{namespace}{target}^{{commit}}", check=False,
+            )
+            revision = (found.stdout or "").strip()
+            if found.returncode == 0 and revision:
+                return revision
+        raise WorkspaceError(
+            f"the clone holds no branch or tag {target}",
+            status=502,
+            code="GIT_FAILED",
         )
 
     def publish(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1827,11 +2296,19 @@ WRITE_VERBS = frozenset(
 # be refused only because the one shipped credential asked the managed list
 # while refreshing, and a credential that does not refresh -- a static token
 # scoped to a whole group -- would have been spent on any repository in it.
-# Reading a repository this install does not manage needs a credential-less
-# read path, which the design lists as open; until it exists, the managed list
-# is a visibility control as well as a write one, by design rather than by
+# Reading a repository this install does not manage goes through the one
+# verb in ROLE_SELECTED_VERBS below; for every other verb the managed list is
+# a visibility control as well as a write one, by design rather than by
 # accident of one forge.
 UNGATED_VERBS = frozenset({"capabilities"})
+
+# The verbs that serve a repository of any role and choose the credential by
+# that role themselves. The HTTP layer still resolves the repository, so the
+# host allowlist holds, but does not ask the managed list. `snapshot` presents
+# the managed credential for a managed repository, the forge's read-only one
+# for a context repository, and none for any other (`VcsBroker._snapshot_git`).
+# Never a write: a write is what the managed list exists for.
+ROLE_SELECTED_VERBS = frozenset({"snapshot"})
 
 # Every verb `route_table` serves, as a constant: the closed vocabulary the
 # broker's version-control counter labels a request under, so a caller's path
@@ -1841,6 +2318,7 @@ VCS_VERBS = frozenset(
     {
         "capabilities",
         "clone",
+        "snapshot",
         "publish",
         "proposal-create",
         "proposal-list",
@@ -1874,6 +2352,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
     return {
         "capabilities": broker.capabilities,
         "clone": broker.clone,
+        "snapshot": broker.snapshot,
         "publish": broker.publish,
         "proposal-create": broker.proposal_create,
         "proposal-list": broker.proposal_list,
@@ -1901,6 +2380,10 @@ __all__ = [
     "VcsBroker",
     "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
+    "ROLE_CONTEXT",
+    "ROLE_MANAGED",
+    "ROLE_SELECTED_VERBS",
+    "ROLE_UNREGISTERED",
     "UNGATED_VERBS",
     "WRITE_VERBS",
     "max_bundle_bytes",

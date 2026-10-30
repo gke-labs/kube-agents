@@ -108,10 +108,14 @@ LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "exclude
 
 # `branch-view` and `branch-delete` are the broker's rather than a forge's for the
 # reason `publish` is: which refs a remote holds, and removing one, is git
-# against a URL on every forge.
+# against a URL on every forge. `snapshot` is git against a URL too.
 BROKER_VERBS: tuple[str, ...] = (
-    "capabilities", "clone", "publish", "identity", "branch-view", "branch-delete",
+    "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
 )
+# Served to library callers only (`vcs_client.snapshot`), so `capabilities` does
+# not advertise them: no `vcs.py` command runs them, and an advertised verb sends
+# the agent to a command that does not exist.
+LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot"})
 
 
 class ForgeUnsupported(WorkspaceError):
@@ -379,6 +383,7 @@ class Forge:
             # send a caller to a refusal it could have seen here.
             "verbs": sorted(
                 {*BROKER_VERBS, *self.verbs}
+                - LIBRARY_VERBS
                 - (set() if "proposal-list" in self.verbs else {"branch-delete"})
             ),
             "acknowledge": self.acknowledges,

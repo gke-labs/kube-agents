@@ -166,14 +166,17 @@ func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
 
 // Gateway wires the adapter, the session manager, and the bus client.
 type Gateway struct {
-	cfg     *Config
-	client  *lib.Client
-	reg     *Registry
-	adapter Adapter
-	pm      *PrincipalMap
-	ps      *Pseudonymizer
-	log     *slog.Logger
-	spawner spawner // nil until SpawnSessions arms (W4)
+	// relayInFlight counts the relay batches rendering (relayBatch), which a
+	// stop waits for.
+	relayInFlight inFlight
+	cfg           *Config
+	client        *lib.Client
+	reg           *Registry
+	adapter       Adapter
+	pm            *PrincipalMap
+	ps            *Pseudonymizer
+	log           *slog.Logger
+	spawner       spawner // nil until SpawnSessions arms (W4)
 	// usage reads what "/feedback summary" prints (feedback_summary.go);
 	// nil where the gateway has no cluster credentials, and the command then
 	// answers that the summary is unavailable.
@@ -599,17 +602,31 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// it is the only thing that tells a supervisor terminal from an
 	// executor's, and the relay owes the adapter that distinction
 	// (TerminalSource) the same way the heal and the read route give it.
-	sub, err := g.client.SubscribeDurableAttributed(ctx, lib.SubscribeConfig{
-		Stream:    lib.TasksStream,
-		Subjects:  []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
-		Durable:   g.relayDurable,
-		Session:   gatewayParty.Session,
-		Agreement: &agreement,
-	}, func(subject string, env *lib.Envelope) { g.relayEvent(ctx, subject, env) })
+	//
+	// Deferred-ack: each event is acked once it has been rendered, not when it
+	// is queued, and stopping gives every unrendered one back to the stream,
+	// so a gateway that stops with events queued loses none of them.
+	sub, err := g.client.SubscribeDurableDeferred(ctx, lib.SubscribeConfig{
+		Stream:        lib.TasksStream,
+		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:       g.relayDurable,
+		Session:       gatewayParty.Session,
+		Agreement:     &agreement,
+		MaxAckPending: relayMaxAckPending,
+	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}
-	defer sub.Stop()
+	// The batches already rendering finish first, then the subscription's
+	// stop gives every event not yet rendered back to the stream.
+	// Only then do the adapters close their connections: ingress stopped
+	// when ctx ended, but a batch rendering past its stop check posts
+	// through them.
+	defer func() {
+		g.relayInFlight.drain(relayStopDrainTimeout)
+		sub.Stop()
+		closeAdapter(g.adapter)
+	}()
 
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
@@ -1247,7 +1264,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// artifact and the terminal in order from its durable - and the
 		// heal leaves it alone (probeConversation reads the same fold as the
 		// chain running). Past it, the relay's delivery is taken as lost
-		// (an ack on enqueue and a crash, or a failed end-of-batch write),
+		// (a failed end-of-batch write after the render was acked),
 		// and the heal does the relay's work itself rather than leave the
 		// conversation wedged on a turn nothing will release.
 		if since := time.Since(g.relayLagStart(active.TaskID, storedAt, time.Now())); since <= g.relayLagGrace() {

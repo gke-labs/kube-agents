@@ -246,6 +246,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
 # `fleet_scope` tool (`--scope-projects`, `--scope-unread`), one holder per
@@ -359,7 +360,9 @@ REPORT_DATE_FORMAT = "%Y-%m-%d"
 
 GCLOUD_TIMEOUT_S = 120
 KUBECTL_TIMEOUT_S = 120
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 ERROR_EXCERPT_CHARS = 300
 # How much of a message a symptom keeps: enough for the signature and the
 # object it names, short enough that one FailedScheduling does not fill a page.
@@ -6162,10 +6165,11 @@ def _listing_error(project: str, failed_reads: list[str]) -> str:
     return line.split(": ", 1)[-1]
 
 
-def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None, session: SessionFn | None = None, session_factory: Callable[[], SessionFn] | None = None) -> dict:
+def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int | None = None, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None, session: SessionFn | None = None, session_factory: Callable[[], SessionFn] | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
-    configs, the reviews, the re-checks); the default is the figure the
-    sibling collectors pin to the credential proxy's admitted count.
+    configs, the reviews, the re-checks); unset, it is what the credential
+    broker admits at once, less chat headroom, as for the sibling collectors
+    (broker_admission.sweep_width()).
     `discovery` is `discover_fleet`'s answer when the caller resolved it
     already (`main` does, before the lock, so an exit line can name the
     projects); without it the run resolves the projects itself. `clock`
@@ -6176,6 +6180,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     cluster needs it (`main` passes `default_monitoring_session`); with
     neither, every gate that needs the read is pending and no read is made,
     which is what a test without a fake session gets."""
+    max_workers = max_workers or broker_admission.sweep_width()
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish

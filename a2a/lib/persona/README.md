@@ -21,9 +21,10 @@ persona and the `a2a-topics` skill) is a different thing and lives in
 
 `tools` is the allowlist. An entry is a built-in (`read_file`,
 `web_search`, `shell`), an MCP server from `mcp.yaml` (`gke`), or one of
-its tools (`gke.get_cluster`). `parameters` are values each task supplies
-in the dispatcher's preamble, such as the target cluster, so nothing
-cluster-specific is stamped into the image.
+its tools (`gke.get_cluster`). `parameters` are values each task supplies,
+such as the target cluster: the dispatcher states them in the task, and the
+profile worker also exports each as `PROFILE_TASK_<NAME>` in the environment.
+Nothing cluster-specific is stamped into the image.
 
 A persona holds no image references, no credentials and no secrets. Every
 MCP server is a server on the credential broker's MCP relay, which
@@ -60,7 +61,10 @@ cannot express comes back as a warning, never an error.
 `render.For(harness)` picks the adapter by the harness value the worker is
 started with (`claude-code` or `antigravity`).
 
-- **`claude-code`** (`claudecode`): `CLAUDE.md` and `skills/` for the
+- **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
+  tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
+  `shell` → `Bash`, `BashOutput`, `KillShell`; `web_search` → `WebSearch`.
+  It renders `CLAUDE.md` and `skills/` for the
   worker to write into a per-task `CLAUDE_CONFIG_DIR`, and the flags to
   pass:
   - `--allowedTools` for what the persona grants, plus `Skill` when it has
@@ -78,6 +82,12 @@ started with (`claude-code` or `antigravity`).
   no `tools` entry grants is dropped.
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
+
+## An example
+
+[`agents/cluster/persona`](../../../agents/cluster/persona/README.md) is the
+cluster agent in this format: a read-only SRE for the GKE cluster each task
+names, with its skills and the two broker MCP servers it reads.
 
 ## Checking a persona
 

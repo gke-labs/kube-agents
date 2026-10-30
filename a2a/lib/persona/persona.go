@@ -76,8 +76,9 @@ type Manifest struct {
 	Model string `json:"model,omitempty"`
 	// Tools is the allowlist: BuiltinTools and MCP server references.
 	Tools []string `json:"tools,omitempty"`
-	// Parameters are the values each task supplies in the dispatcher's
-	// preamble (the target cluster, say). They are never stamped in.
+	// Parameters are the values each task supplies (the target cluster,
+	// say): the dispatcher states them in the task, and the profile worker
+	// exports each as PROFILE_TASK_<NAME>. They are never stamped in.
 	Parameters []Parameter `json:"parameters,omitempty"`
 	Requires   Requires    `json:"requires,omitempty"`
 	// Harness holds per-harness hints keyed by Harness. An adapter reads its

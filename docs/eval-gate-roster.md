@@ -702,7 +702,8 @@ posts into the conversation under `next`, and a card paused on a question as the
 asks, and those cases grade that outcome rather than the `kanban_create` behind it. The
 card-wake replays run on this lane as well, because under `next` a card's wake reaches the front
 door through the in-pod API server, not the gateway; the question cases grade the reply to the
-user's answer and the card, not the reply to the wake. What stays listed is the
+user's answer and the card, and a block replay grades the reply to the wake, which next posts
+nowhere but the same front door writes. What stays listed is the
 fresh-session question case, whose answer turn carries today's Slack thread context, a turn
 next's door never sends.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
@@ -725,7 +726,10 @@ Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject
 the stopped asks (a `stop` sent on the conversation after the opening turn,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
-into the reply. `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+into the reply, and the reply-under-pushed-report replays (a report stored for the conversation
+after the opening turn, then the reply sent as a second message on it,
+[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
 the cases that request a pull request, with its window marked exclusive like theirs, so a stop
 that fails and lets its card write reds that case whether or not it names the write, and only
@@ -794,8 +798,8 @@ issue), since a chat probe passes the same on either forge and the GitHub run al
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
 (`EVAL_FORGE=gitlab-ce`), since the cases grade the forge and not where it is; a GitHub Enterprise
-Server run (`EVAL_FORGE=ghes`) reads a GHES list of its own, named by `lane_cases_file()` in
-`hack/ci-eval-pr.sh` and refused while the checkout lacks it. `hack/ci-eval-pr.sh` refuses an entry in neither file,
+Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt`, named by `lane_cases_file()` in
+`hack/ci-eval-pr.sh` (below). `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
 ledger case is in the lane (consistency-drift-outlier passes on the GitHub nightlies and holds a
@@ -826,6 +830,24 @@ own is the provider and the forge, which the nightly catches within a day and th
 checks for a pull request that touches the provider. The file needs the normal approvers, like
 `nightly-cases.txt`: it changes what one on-demand lane and the two nightlies run, not what can red
 a pull request.
+
+## The GHES lane
+
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes`
+and, under `spec.mode: next`, `ci-kube-agents-eval-nightly-ghes-next`; `EVAL_FORGE=ghes`,
+[#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
+Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
+on a VM the job stands up per run in front of the leased project's github.com repository
+([`docs/ci-pool-projects.md`](ci-pool-projects.md) 5.8). They run `hack/eval/ghes-cases.txt`, the
+GitLab lane's three cases, under the GitLab lane's rules above: registered cases with a positive
+forge check, the roster intersected with the list, never a blocking presubmit, nothing appended to
+the evidence store, `scripts/test_eval_rosters.py` pinning the set. A pass proves the agent went
+through the host: `pull_request_opened` accepts only a pull request linked on the GHES host, which
+the proxy writes for a request it forwarded, and the grader reads it back from api.github.com. The
+GHES-only case `ghes-pdb-remediation-pr` (the same task with a writes safeguard the inject lane
+appends anyway) stays unregistered, since a nightly registration would run it on the github.com
+nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
+grow a lane-only seat.
 
 ## Demoting a flaky case
 

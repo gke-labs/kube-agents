@@ -234,8 +234,9 @@ the runner holds those streams' locks while it runs; see
 [bench-case-format.md](../docs/designs/bench-case-format.md).
 
 A task whose precondition is an install that leaves some seeded clusters out of its scope
-declares `scope_exclude: {slots: [...]}`, and the runner excludes those slots' clusters for its
-repetitions alone; see [bench-case-format.md](../docs/designs/bench-case-format.md).
+declares `scope_exclude: {slots: [...]}` (with an optional `absent: <n>` for clusters that do not
+exist), and the runner excludes those slots' clusters for its repetitions alone; see
+[bench-case-format.md](../docs/designs/bench-case-format.md).
 
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
@@ -822,7 +823,7 @@ signed that host, also set `BENCH_FORGE_CA_FILE` to the path of the CA certifica
 value in any of these three variables is an error in each check.
 
 The case [`ghes-pdb-remediation-pr`](tasks/ghes-pdb-remediation-pr/task.yaml) uses this mode. Its
-header gives the run recipe. It runs by hand, because no eval lane deploys the proxy.
+header gives the run recipe. It runs by hand: the GHES lane deploys the proxy per run but runs `pdb-remediation-pr` against it, not this copy (`hack/eval/ghes-cases.txt` says why).
 
 ##### Addressing a seeded-fleet fixture by role
 
