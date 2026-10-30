@@ -1325,10 +1325,11 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 	case actionNew:
 		// With no alias the store would re-mint the active conversation in place, dropping
 		// its session state while the server kept the conversation; a new one needs a name.
+		// An alias already in use is refused for the same reason (CreateConversation).
 		if strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args.Alias), ConsoleConvPrefix)) == "" {
 			return "", "", "", errors.New("manage_session new needs an alias for the new conversation")
 		}
-		entry, err := s.store.EnsureConversation(args.Alias, true, args.Description)
+		entry, err := s.store.CreateConversation(args.Alias, args.Description)
 		if err != nil {
 			return "", "", "", err
 		}

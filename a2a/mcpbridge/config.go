@@ -39,6 +39,7 @@ var (
 	errDeploymentAmbiguous = errors.New("more than one saved deployment matches")
 	errNoDeploymentsSaved  = errors.New("no deployments configured or discovered")
 	errNotConnected        = errors.New("not connected to a kube-agents deployment")
+	errConversationExists  = errors.New("alias already exists; pick another or delete it first")
 )
 
 // SessionPodInfo describes a live a2a-session worker pod discovered in Kubernetes.
@@ -827,6 +828,31 @@ func (s *ConfigStore) EnsureConversationWithOptions(aliasOrToken string, forceNe
 	if activate {
 		s.cfg.ActiveConversation = alias
 	}
+	return entry, s.saveLocked()
+}
+
+// CreateConversation creates a conversation named alias with a fresh token and makes it the
+// active one. An alias already in use is refused (errConversationExists) rather than replaced:
+// replacing it would drop the old conversation's session state while the server kept it.
+func (s *ConfigStore) CreateConversation(alias, description string) (ConversationEntry, error) {
+	defer s.lockForUpdate()()
+	alias = strings.TrimPrefix(strings.TrimSpace(alias), ConsoleConvPrefix)
+	if alias == "" {
+		return ConversationEntry{}, errors.New("a new conversation needs an alias")
+	}
+	if _, ok := s.cfg.Conversations[alias]; ok {
+		return ConversationEntry{}, fmt.Errorf("%q: %w", alias, errConversationExists)
+	}
+	now := time.Now().UTC()
+	entry := ConversationEntry{
+		Alias:       alias,
+		Token:       MintConversationToken(),
+		Description: description,
+		CreatedAt:   now,
+		LastUsedAt:  now,
+	}
+	s.cfg.Conversations[alias] = entry
+	s.cfg.ActiveConversation = alias
 	return entry, s.saveLocked()
 }
 

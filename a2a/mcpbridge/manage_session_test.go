@@ -189,3 +189,32 @@ func TestManageSessionDeleteWithoutAnAliasDoesNotConnect(t *testing.T) {
 		t.Fatal("a delete with no alias connected to the cluster")
 	}
 }
+
+func TestManageSessionNewRefusesAnAliasThatExists(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"new","alias":"incident-7"}`))
+	if res.IsError {
+		t.Fatalf("manage_session new incident-7: %+v", res)
+	}
+	existing, ok := srv.Store().LookupConversation("incident-7")
+	if !ok {
+		t.Fatal("setup: incident-7 was not created")
+	}
+	if _, err := srv.Store().SetConversationSessionMode(existing.Alias, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range []string{`{"action":"new","alias":"incident-7"}`, `{"action":"new","alias":"console:incident-7"}`} {
+		res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(args))
+		if !res.IsError || len(res.Content) == 0 {
+			t.Fatalf("manage_session %s: %+v; want it refused", args, res)
+		}
+		text := res.Content[0].Text
+		if !strings.Contains(text, "alias already exists; pick another or delete it first") || !strings.Contains(text, "incident-7") {
+			t.Fatalf("manage_session %s refused with %q; want it to name the alias and say it already exists", args, text)
+		}
+	}
+	if c, _ := srv.Store().LookupConversation("incident-7"); c.Token != existing.Token || !c.SessionMode {
+		t.Fatalf("new with an existing alias replaced the conversation: %+v (was %+v)", c, existing)
+	}
+}
