@@ -29,6 +29,9 @@ SECTION_START = "# ─── 7. Agent API Connectivity Verification"
 # The next section's header: 7b gates on the Pub/Sub platform adapter and has
 # its own test (tests/test_ci_deploy_pubsub_relay_gate.py) and constants.
 SECTION_END = "# ─── 7b. "
+# The agent's default retry count on an API error (Hermes _api_max_retries),
+# each retry preceded by a wait the backoff-floor patch can hold at up to 60s.
+AGENT_RATE_LIMIT_RETRIES = 3
 
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$@" >> "${STUB_LOG}/kubectl.args"
@@ -211,6 +214,23 @@ class ConnectivityRetryTest(unittest.TestCase):
         _, tmp = run_check(succeed_on=1)
         curl_args = (tmp / "curl.args").read_text(encoding="utf-8")
         self.assertIn("--max-time", curl_args)
+
+    def test_the_deadline_outlasts_the_agents_rate_limit_waits(self):
+        """The ping is one real agent turn. On a 429 that names no reset window
+        the image holds each of the agent's three retries 30-60s
+        (deploy/docker/patches/rate_limit_backoff_floor.py); a deadline inside
+        that cut the turn off mid-retry and started another against the same
+        closed quota."""
+        _, tmp = run_check(succeed_on=1)
+        curl_args = (tmp / "curl.args").read_text(encoding="utf-8")
+        match = re.search(r"--max-time\s+(\d+)", curl_args)
+        self.assertIsNotNone(match, curl_args)
+        floor = {}
+        exec(  # noqa: S102 - the module is this repository's own constants file
+            (REPO_ROOT / "deploy" / "docker" / "patches" / "rate_limit_backoff_floor.py").read_text(encoding="utf-8"),
+            floor,
+        )
+        self.assertGreater(int(match.group(1)), AGENT_RATE_LIMIT_RETRIES * floor["FLOOR_MAX_SECONDS"])
 
 
 class FailureDumpArtifactsTest(unittest.TestCase):

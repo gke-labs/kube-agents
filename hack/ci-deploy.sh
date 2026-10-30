@@ -2597,7 +2597,13 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
     sleep 1
   done
 
-  HEALTH_RESP="$(curl -s --max-time 120 -X POST http://localhost:8642/v1/responses \
+  # One real turn, so the deadline has to outlast what the agent may wait
+  # inside it: on a 429 that names no reset window the image's
+  # rate_limit_backoff_floor patch holds each of the agent's three retries
+  # 30-60s (deploy/docker/patches/rate_limit_backoff_floor.py), up to 180s
+  # before the model latency itself. 120s cut such a turn off mid-retry, and
+  # the next attempt started another one against the same closed quota.
+  HEALTH_RESP="$(curl -s --max-time 300 -X POST http://localhost:8642/v1/responses \
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/json" \
     -d '{"model": "model-default", "input": "ping"}' || true)"
