@@ -2053,9 +2053,10 @@ ARG HERMES_OTEL_REF=b7ece46a5c883a619686b6c698b0316d9fd50962
 # root_span_ttl_ms is the plugin's orphan sweep: a turn whose root span is
 # still open past it is closed as `timed_out` and its later spans lose their
 # parent. The plugin's 10-minute default sat under a fleet audit's length, so
-# Cloud Trace showed live runs "cut" at 600 s (#3220). 4 h is a reused session
-# pod's default lifetime (a2a/gateway/config.go defaultSessionMaxLifetime),
-# the longest wall clock in the stack; a turn still open past it is dead.
+# Cloud Trace showed live runs "cut" at 600 s (#3220). Nothing bounds a turn's
+# wall clock in this pod, so 4 h is a chosen ceiling, far above the longest
+# turn observed (1552 s), not a limit derived from anything; it keeps the sweep
+# off live runs while still closing a span whose turn never ends.
 # otel_config.py carries this file into every profile's copy at start.
 ARG HERMES_OTEL_ROOT_SPAN_TTL_MS=14400000
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install --ref "${HERMES_OTEL_REF}" briancaffey/hermes-otel/hermes_otel && \

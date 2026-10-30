@@ -31,15 +31,12 @@ _spec.loader.exec_module(oc)
 
 BAKED = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces"
 # The plugin's orphan-sweep TTL the image bakes (deploy/docker/Dockerfile,
-# HERMES_OTEL_ROOT_SPAN_TTL_MS): 4 h, the session pod lifetime. Pinned here as a
-# literal so a Dockerfile edit that shrinks it back under a fleet audit's length
-# (the plugin's own default is 10 min, #3220) fails this file rather than Cloud Trace.
+# HERMES_OTEL_ROOT_SPAN_TTL_MS): 4 h, a ceiling chosen well above any observed
+# turn. Pinned here as a literal so a Dockerfile edit that shrinks it back under a
+# fleet audit's length (the plugin's own default is 10 min, #3220) fails this file
+# rather than Cloud Trace.
 ROOT_SPAN_TTL_MS = 14_400_000
-_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_DOCKERFILE = _ROOT / "deploy" / "docker" / "Dockerfile"
-# The constant the 4 h is taken from, so the two cannot drift apart unnoticed.
-_GATEWAY_CONFIG = _ROOT / "a2a" / "gateway" / "config.go"
-MS_PER_HOUR = 60 * 60 * 1000
+_DOCKERFILE = pathlib.Path(__file__).resolve().parents[1] / "deploy" / "docker" / "Dockerfile"
 CUSTOM = "http://otel-collector.otel-collector.svc.cluster.local:4318"
 
 
@@ -245,13 +242,10 @@ class BakedSpanTTLTest(unittest.TestCase):
     def setUp(self):
         self.dockerfile = _DOCKERFILE.read_text()
 
-    def test_the_arg_is_the_session_pod_lifetime(self):
+    def test_the_arg_is_pinned(self):
         found = re.search(r"^ARG HERMES_OTEL_ROOT_SPAN_TTL_MS=(\d+)$", self.dockerfile, re.M)
         self.assertIsNotNone(found, "the Dockerfile no longer declares HERMES_OTEL_ROOT_SPAN_TTL_MS")
         self.assertEqual(int(found.group(1)), ROOT_SPAN_TTL_MS)
-        hours = re.search(r"^const defaultSessionMaxLifetime = (\d+) \* time\.Hour$", _GATEWAY_CONFIG.read_text(), re.M)
-        self.assertIsNotNone(hours, "a2a/gateway/config.go no longer declares defaultSessionMaxLifetime in hours")
-        self.assertEqual(int(hours.group(1)) * MS_PER_HOUR, ROOT_SPAN_TTL_MS)
 
     def test_the_plugin_step_writes_and_greps_the_arg(self):
         """The ARG reaches the baked file and is read back, whatever the one-liner's quoting."""
