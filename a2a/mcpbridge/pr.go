@@ -20,58 +20,66 @@ import (
 )
 
 const (
-	githubHost               = "github.com"
-	githubAPIBaseURL         = "https://api.github.com"
-	prStateMerged            = "MERGED"
-	githubPRURLPrefix        = "https://github.com/"
-	githubPRURLFormat        = "https://github.com/%s/pull/%d"
-	githubAPIPRFormat        = "%s/repos/%s/pulls/%d"
-	githubAPIPRFilesFormat   = "%s/repos/%s/pulls/%d/files?per_page=%d"
-	githubAPIPRFilesPerPage  = 100
-	maxPRFilesPages          = 30 // GitHub lists at most 3000 files per pull request
-	linkHeader               = "Link"
-	linkRelNext              = "next"
-	acceptHeader             = "Accept"
-	authHeader               = "Authorization"
-	userAgentHeader          = "User-Agent"
-	userAgentValue           = "kube-agents-mcp/1.0"
-	acceptGitHubJSON         = "application/vnd.github.v3+json"
-	acceptGitHubDiff         = "application/vnd.github.v3.diff"
-	bearerPrefix             = "Bearer "
-	gitCredentialsRelPath    = ".git-credentials"
-	envGHToken               = "GH_TOKEN"
-	envGitHubToken           = "GITHUB_TOKEN"
-	ghBinary                 = "gh"
-	ghCmdPR                  = "pr"
-	ghSubcmdView             = "view"
-	ghSubcmdDiff             = "diff"
-	ghFlagRepo               = "--repo"
-	ghFlagJSON               = "--json"
-	ghJSONFields             = "number,title,state,url,headRefName,baseRefName,additions,deletions,changedFiles,body,author,files"
-	prFetchTimeout           = 15 * time.Second
-	maxInlineDiffBytes       = 3200
-	maxPRDiffReadBytes       = 10 << 20
-	prURLRegexPattern        = `https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)`
-	prShortRefRegexPattern   = `\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b`
-	prNumberOnlyRegexPattern = `^#?(\d+)$`
-	summaryFileName          = "PR_SUMMARY.md"
-	diffFileNameFormat       = "pr-%d.diff"
-	filesSubdirName          = "files"
-	patchExt                 = ".patch"
-	pathSeparatorReplacement = "__"
-	diffHeaderPrefix         = "diff --git "
-	bSidePrefix              = " b/"
-	quotedBSidePrefix        = ` "b/`
-	fileSchemePrefix         = "file://"
-	maxDiffErrorBodyBytes    = 512
-	ghPRDiffHintFormat       = "gh pr diff %d --repo %s"
+	githubHost              = "github.com"
+	githubAPIBaseURL        = "https://api.github.com"
+	prStateMerged           = "MERGED"
+	githubPRURLPrefix       = "https://github.com/"
+	githubPRURLFormat       = "https://github.com/%s/pull/%d"
+	githubAPIPRFormat       = "%s/repos/%s/pulls/%d"
+	githubAPIPRFilesFormat  = "%s/repos/%s/pulls/%d/files?per_page=%d"
+	githubAPIPRFilesPerPage = 100
+	maxPRFilesPages         = 30 // GitHub lists at most 3000 files per pull request
+	linkHeader              = "Link"
+	linkRelNext             = "next"
+	acceptHeader            = "Accept"
+	authHeader              = "Authorization"
+	userAgentHeader         = "User-Agent"
+	userAgentValue          = "kube-agents-mcp/1.0"
+	acceptGitHubJSON        = "application/vnd.github.v3+json"
+	acceptGitHubDiff        = "application/vnd.github.v3.diff"
+	bearerPrefix            = "Bearer "
+	gitCredentialsRelPath   = ".git-credentials"
+	envGHToken              = "GH_TOKEN"
+	envGitHubToken          = "GITHUB_TOKEN"
+	ghBinary                = "gh"
+	ghCmdPR                 = "pr"
+	ghSubcmdView            = "view"
+	ghSubcmdDiff            = "diff"
+	ghFlagRepo              = "--repo"
+	ghFlagJSON              = "--json"
+	ghJSONFields            = "number,title,state,url,headRefName,baseRefName,additions,deletions,changedFiles,body,author,files"
+	prFetchTimeout          = 15 * time.Second
+	maxInlineDiffBytes      = 3200
+	maxPRDiffReadBytes      = 10 << 20
+	// prURLPathRegexPattern matches the path after an exact githubPRURLPrefix, anchored at its
+	// start, so the host is never matched by a regular expression that could find it inside
+	// another host or after arbitrary text.
+	prURLPathRegexPattern = `^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)\b`
+	// prShortRefRegexPattern scans prose (ExtractPRReferences); prExactShortRefRegexPattern is
+	// the whole-input form ParsePRReference accepts, so `a/b/c#12` is refused rather than read
+	// as `b/c#12`.
+	prShortRefRegexPattern      = `\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b`
+	prExactShortRefRegexPattern = `^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)$`
+	prNumberOnlyRegexPattern    = `^#?(\d+)$`
+	summaryFileName             = "PR_SUMMARY.md"
+	diffFileNameFormat          = "pr-%d.diff"
+	filesSubdirName             = "files"
+	patchExt                    = ".patch"
+	pathSeparatorReplacement    = "__"
+	diffHeaderPrefix            = "diff --git "
+	bSidePrefix                 = " b/"
+	quotedBSidePrefix           = ` "b/`
+	fileSchemePrefix            = "file://"
+	maxDiffErrorBodyBytes       = 512
+	ghPRDiffHintFormat          = "gh pr diff %d --repo %s"
 )
 
 var (
-	prURLRegex        = regexp.MustCompile(prURLRegexPattern)
-	prShortRefRegex   = regexp.MustCompile(prShortRefRegexPattern)
-	prNumberOnlyRegex = regexp.MustCompile(prNumberOnlyRegexPattern)
-	errInvalidPRRef   = errors.New("invalid pull request reference; provide a GitHub PR URL, owner/repo#number, or PR number")
+	prURLPathRegex       = regexp.MustCompile(prURLPathRegexPattern)
+	prShortRefRegex      = regexp.MustCompile(prShortRefRegexPattern)
+	prExactShortRefRegex = regexp.MustCompile(prExactShortRefRegexPattern)
+	prNumberOnlyRegex    = regexp.MustCompile(prNumberOnlyRegexPattern)
+	errInvalidPRRef      = errors.New("invalid pull request reference; provide a GitHub PR URL, owner/repo#number, or PR number")
 )
 
 // PRFileChange describes a single file modified in a pull request.
@@ -113,15 +121,23 @@ type PRInspection struct {
 func ExtractPRReferences(text string) []string {
 	var out []string
 	seen := make(map[string]bool)
-	for _, m := range prURLRegex.FindAllStringSubmatch(text, -1) {
-		if len(m) == 3 {
-			num, err := strconv.Atoi(m[2])
-			if err == nil && num > 0 {
-				u := fmt.Sprintf(githubPRURLFormat, m[1], num)
-				if !seen[u] {
-					seen[u] = true
-					out = append(out, u)
-				}
+	for rest := text; ; {
+		i := strings.Index(rest, githubPRURLPrefix)
+		if i < 0 {
+			break
+		}
+		// The prefix must start a URL, not end some other host or scheme
+		// (`notgithub.com/`, `xhttps://`).
+		boundary := i == 0 || !isURLRune(rest[i-1])
+		rest = rest[i+len(githubPRURLPrefix):]
+		if !boundary {
+			continue
+		}
+		if repo, num, ok := matchPRURLPath(rest); ok {
+			u := fmt.Sprintf(githubPRURLFormat, repo, num)
+			if !seen[u] {
+				seen[u] = true
+				out = append(out, u)
 			}
 		}
 	}
@@ -146,13 +162,12 @@ func ParsePRReference(ref string, defaultRepo string) (string, int, error) {
 	if trimmed == "" {
 		return "", 0, errInvalidPRRef
 	}
-	if m := prURLRegex.FindStringSubmatch(trimmed); len(m) == 3 {
-		num, err := strconv.Atoi(m[2])
-		if err == nil && num > 0 {
-			return m[1], num, nil
+	if strings.HasPrefix(trimmed, githubPRURLPrefix) {
+		if repo, num, ok := matchPRURLPath(trimmed[len(githubPRURLPrefix):]); ok {
+			return repo, num, nil
 		}
 	}
-	if m := prShortRefRegex.FindStringSubmatch(trimmed); len(m) == 3 {
+	if m := prExactShortRefRegex.FindStringSubmatch(trimmed); len(m) == 3 {
 		num, err := strconv.Atoi(m[2])
 		if err == nil && num > 0 {
 			return m[1], num, nil
@@ -168,6 +183,27 @@ func ParsePRReference(ref string, defaultRepo string) (string, int, error) {
 		}
 	}
 	return "", 0, fmt.Errorf("%w: %q", errInvalidPRRef, trimmed)
+}
+
+// matchPRURLPath reads `<owner>/<repo>/pull/<number>` at the start of the text following
+// githubPRURLPrefix.
+func matchPRURLPath(path string) (string, int, bool) {
+	m := prURLPathRegex.FindStringSubmatch(path)
+	if len(m) != 3 {
+		return "", 0, false
+	}
+	num, err := strconv.Atoi(m[2])
+	if err != nil || num <= 0 {
+		return "", 0, false
+	}
+	return m[1], num, true
+}
+
+// isURLRune reports whether b can be part of a scheme or host, so a githubPRURLPrefix right
+// after it is inside another URL rather than the start of one.
+func isURLRune(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+		b == '.' || b == '-' || b == '_' || b == '+' || b == '/' || b == ':' || b == '@'
 }
 
 // InspectPullRequest fetches PR metadata and unified diff, writes local diff/patch files

@@ -386,3 +386,41 @@ func TestInspectPullRequestRefusedDiffIsNotAdvertised(t *testing.T) {
 		t.Errorf("expected the gh fallback to record the failed diff fetch, got UnifiedDiff=%q DiffError=%q", ghInsp.UnifiedDiff, ghInsp.DiffError)
 	}
 }
+
+func TestParsePRReferenceAcceptsOnlyWholeReferences(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		repo string
+		num  int
+	}{
+		{"https://github.com/o/r/pull/12", "o/r", 12},
+		{"https://github.com/o/r/pull/12/files", "o/r", 12},
+		{"o/r#12", "o/r", 12},
+		{"#7", "d/r", 7},
+	} {
+		repo, num, err := ParsePRReference(tc.in, "d/r")
+		if err != nil || repo != tc.repo || num != tc.num {
+			t.Errorf("ParsePRReference(%q) = %q, %d, %v; want %q, %d", tc.in, repo, num, err, tc.repo, tc.num)
+		}
+	}
+	for _, in := range []string{
+		"a/b/c#12",
+		"https://github.com/o/r/commit/abc#12",
+		"https://evil.example/https://github.com/o/r/pull/12",
+		"see https://github.com/o/r/pull/12",
+		"https://github.com.evil.example/o/r/pull/12",
+	} {
+		if repo, num, err := ParsePRReference(in, "d/r"); err == nil {
+			t.Errorf("ParsePRReference(%q) = %q, %d; want it refused", in, repo, num)
+		}
+	}
+}
+
+func TestExtractPRReferencesIgnoresTheHostInsideAnotherURL(t *testing.T) {
+	got := ExtractPRReferences("see (https://github.com/o/r/pull/12). Not https://notgithub.com/x/y/pull/3 " +
+		"or xhttps://github.com/x/y/pull/4; also o2/r2#5.")
+	want := []string{"https://github.com/o/r/pull/12", "https://github.com/o2/r2/pull/5"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("ExtractPRReferences = %v; want %v", got, want)
+	}
+}
