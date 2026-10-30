@@ -41,6 +41,10 @@ type refusal struct {
 	detail string
 }
 
+// errStopped marks a submission with a stop record (stop.go): ended
+// canceled, never run.
+var errStopped = errors.New("stopped before admission")
+
 // errHeldBack marks an admission that is neither a verdict nor a stop: the
 // submission stays queued, as over a cap, and comes back (an open breaker,
 // or a half-open one trying the oldest held task first).
@@ -62,6 +66,9 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
 			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
 		}
+	}
+	if d.stopRequested(ctx, d.log, prof.Name, hk.taskID) {
+		return nil, errStopped
 	}
 	// After the age check: a submission a breaker holds still ends at its
 	// queue timeout.

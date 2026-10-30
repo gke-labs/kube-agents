@@ -21,6 +21,7 @@ const (
 	ReasonNoWorker          = "no-worker"
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
+	ReasonStopped           = "stopped"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.

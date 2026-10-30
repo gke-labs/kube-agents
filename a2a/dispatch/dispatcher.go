@@ -100,6 +100,10 @@ type holding struct {
 	pod       string
 	confirmed bool
 	settled   bool
+	// stopRequested is a stop record for the task (stop.go); stopc, made
+	// when hold starts, wakes hold for it.
+	stopRequested bool
+	stopc         chan struct{}
 
 	renewals chan renewal
 	done     chan struct{}
@@ -197,6 +201,10 @@ type Dispatcher struct {
 	// workers (breaker.go), and jobs runs unattended tasks (job.go).
 	breakers *breakers
 	jobs     JobRunner
+	// stopSubs is the live subscription to each profile's stop subject, and
+	// stopped the stops heard live, by profile/task (stop.go).
+	stopSubs map[string]lib.Subscription
+	stopped  map[string]time.Time
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -230,6 +238,8 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		grantedProfiles: map[string]bool{},
 		bindRetry:       map[string]bindBackoff{},
 		breakers:        newBreakers(),
+		stopSubs:        map[string]lib.Subscription{},
+		stopped:         map[string]time.Time{},
 	}, nil
 }
 
@@ -262,6 +272,8 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	defer d.running.Store(false)
 
 	d.syncBindings(ctx)
+	d.syncStops()
+	defer d.stopAllStops()
 	refresh := time.NewTicker(d.cfg.RefreshInterval)
 	defer refresh.Stop()
 	health := time.NewTicker(d.cfg.HealthInterval)
@@ -276,6 +288,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 			return nil
 		case <-refresh.C:
 			d.syncBindings(ctx)
+			d.syncStops()
 		case <-health.C:
 			d.logHealth()
 		case <-sweep.C:
@@ -579,6 +592,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 
 	now := d.now()
 	ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	if errors.Is(err, errStopped) {
+		d.stopQueued(ctx, log, del, hk)
+		return
+	}
 	if errors.Is(err, errHeldBack) {
 		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), waitBreaker)
 		log.Debug("held back at admission; the submission stays queued", "reason", waitBreaker)
@@ -676,8 +693,15 @@ func (d *Dispatcher) followHolder(ctx context.Context, log *slog.Logger, del lib
 // the delivery to come back and be refused again (the terminal's envelope id
 // is fixed, so a repeat is a duplicate the stream drops).
 func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, ref *refusal) {
+	d.endUnstarted(ctx, log, del, hk, lib.StateRejected, ref)
+}
+
+// endUnstarted ends a submission no worker ever held with a terminal in
+// state (rejected for an admission refusal, canceled for a stop), tombstoned
+// under the refused-pod key and terminated.
+func (d *Dispatcher) endUnstarted(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, state lib.TaskState, ref *refusal) {
 	for {
-		err := d.publishTerminal(ctx, hk.profile, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
+		err := d.publishTerminal(ctx, hk.profile, del.Envelope(), state, ref.reason, ref.detail)
 		if err == nil {
 			break
 		}
@@ -1001,6 +1025,11 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 		rec.Deadline = started.Add(seconds(prof.ActiveDeadlineSeconds))
 	}
 	log.Info("re-adopted a started task", "pod", pod, "expiresAt", rec.ExpiresAt, "graceUntil", graceUntil)
+	if d.stopRequested(ctx, log, hk.profile, hk.taskID) {
+		d.mu.Lock()
+		h.stopRequested = true
+		d.mu.Unlock()
+	}
 	d.hold(ctx, log, del, h, rec, key, graceUntil)
 	d.endJob(ctx, log, h)
 }
@@ -1015,8 +1044,21 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 	tick := time.NewTicker(max(h.renew/ticksPerRenewal, minTick))
 	defer tick.Stop()
 	subject := lib.DispatchSubject(h.profile, h.tier, rec.Pod)
+	// A stop gives the executor a grace to end the task itself (stop.go).
+	var stopAt time.Time
+	d.mu.Lock()
+	h.stopc = make(chan struct{}, 1)
+	if h.stopRequested {
+		stopAt = stopDeadline(d.src.Config(), d.now())
+	}
+	d.mu.Unlock()
 	for {
 		select {
+		case <-h.stopc:
+			if stopAt.IsZero() {
+				stopAt = stopDeadline(d.src.Config(), d.now())
+				log.Info("stop requested; the executor has a grace to end the task", "until", stopAt)
+			}
 		case <-ctx.Done():
 			// Stopping: no settlement; the record stays for the next
 			// instance and the lib gives the submission back.
@@ -1040,6 +1082,9 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 		case <-tick.C:
 			now := d.now()
 			switch {
+			case !stopAt.IsZero() && now.After(stopAt):
+				d.stopHeld(ctx, log, del, h, key, rec)
+				return
 			case now.After(rec.Deadline):
 				log.Warn("task passed its deadline; failing it", "pod", rec.Pod, "deadline", rec.Deadline)
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonDeadline})
@@ -1085,8 +1130,14 @@ func deadlineLimit(rec lib.LeaseRecord) time.Duration {
 // can't be published before shutdown the task isn't settled: it comes back
 // to the next instance, whose record says started, and is failed there.
 func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord, reason, detail string) {
+	d.failAs(ctx, log, del, h, key, rec, lib.StateFailed, reason, detail)
+}
+
+// failAs ends a held task with a terminal in state (failed, or canceled for
+// a stop), then settles it: tombstoned, acked, released.
+func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord, state lib.TaskState, reason, detail string) {
 	for {
-		err := d.publishTerminal(ctx, h.profile, del.Envelope(), lib.StateFailed, reason, detail)
+		err := d.publishTerminal(ctx, h.profile, del.Envelope(), state, reason, detail)
 		if err == nil {
 			break
 		}

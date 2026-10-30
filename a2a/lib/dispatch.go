@@ -326,6 +326,10 @@ type DispatchConfig struct {
 	// a Ready worker pod before the task is rejected no-worker. 0 takes the
 	// dispatcher's default (300).
 	JobStartSeconds int `json:"jobStartSeconds,omitempty"`
+	// StopGraceSeconds is how long a running task's executor has to stop on
+	// its own after a stop record (contract addendum 9) before the
+	// dispatcher ends it. 0 takes the dispatcher's default (30).
+	StopGraceSeconds int `json:"stopGraceSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -367,8 +371,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: lease %ds must be at least three renewals of %ds", c.LeaseSeconds, c.RenewSeconds)
 	case c.RestartGraceSeconds < 2*c.RenewSeconds:
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
-	case c.JobStartSeconds < 0:
-		return fmt.Errorf("dispatch config: job start %ds may not be negative", c.JobStartSeconds)
+	case c.JobStartSeconds < 0 || c.StopGraceSeconds < 0:
+		return fmt.Errorf("dispatch config: job start %ds and stop grace %ds may not be negative", c.JobStartSeconds, c.StopGraceSeconds)
 	case c.BreakerThreshold < 0 || c.BreakerCooldownSeconds < 0:
 		return fmt.Errorf("dispatch config: breaker threshold %d and cooldown %ds may not be negative", c.BreakerThreshold, c.BreakerCooldownSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
