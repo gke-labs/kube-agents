@@ -68,10 +68,10 @@ def _kwargs(system: object, tools: list | None = None, turns: int = 1) -> dict:
     for index in range(turns - 1):
         messages.append({"role": "assistant", "content": f"step {index}"})
     return {
-        "model": "model-default",
+        "model": "claude-opus-5-5",
         "messages": messages,
         "optional_params": {"tools": tools if tools is not None else [_tool("kubectl")], "reasoning_effort": "high"},
-        "litellm_params": {"model": "vertex_ai/claude-opus-5-5"},
+        "litellm_params": {"custom_llm_provider": "vertex_ai"},
     }
 
 
@@ -167,7 +167,8 @@ class TestCacheProbeRecord(unittest.TestCase):
         self.assertEqual(record["msgs"], 4)
         self.assertEqual(record["tools"], 1)
         self.assertEqual(record["system_chars"], len(_SYSTEM_SECRET_PHRASE))
-        self.assertEqual(record["model"], "vertex_ai/claude-opus-5-5")
+        self.assertEqual(record["model"], "claude-opus-5-5")
+        self.assertEqual(record["provider"], "vertex_ai")
         self.assertEqual(record["reasoning_effort"], "high")
         self.assertEqual(record["prompt_tokens"], 61000)
         self.assertEqual(record["cache_creation_input_tokens"], 60000)

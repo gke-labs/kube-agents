@@ -14,7 +14,8 @@ nothing of the prompt's text:
 its whole life, and `msgs` the request's message count, which grows with every
 call; together they order one session's calls across both gateway replicas,
 which no per-process counter could. A session whose context compression
-rewrites its first turn shows up under a second `conv` from then on.
+rewrites its first turn shows up under a second `conv` from then on, and
+its `msgs` can drop after compression.
 `tools_hash` covers the tool list,
 `system_hash` the whole system text, and `system_chunks` one short hash per
 fixed-size slice of it, so the first slice that changes says where in the
@@ -187,7 +188,8 @@ def probe_record(kwargs: dict, response_obj: Any) -> dict:
         "system_chars": len(system_text),
         "system_hash": _short_hash(system_text),
         "system_chunks": system_chunk_hashes(system_text),
-        "model": litellm_params.get("model") or kwargs.get("model"),
+        "model": kwargs.get("model"),
+        "provider": litellm_params.get("custom_llm_provider"),
         "reasoning_effort": optional_params.get("reasoning_effort"),
         "thinking": thinking_fields(optional_params.get(THINKING_KEY)),
     }
