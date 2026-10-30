@@ -474,3 +474,32 @@ func TestUpsertQualifiesAThirdSameNamedDeployment(t *testing.T) {
 		t.Fatalf("missing ctxC/platform in %v", snap.Deployments)
 	}
 }
+
+func TestUpsertKeepsAgentProfilesWhenTheScanCouldNotReadThem(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := DeploymentProfile{Name: "d", KubeContext: "ctx", Namespace: "ns", PlatformAgentName: "pa", Ready: true}
+	first := base
+	first.AgentProfiles, first.LastDiscoveredAt = []string{"default"}, time.Now().Add(-time.Hour)
+	if err := store.UpsertDeployments([]DeploymentProfile{first}); err != nil {
+		t.Fatal(err)
+	}
+	unread := base
+	unread.LastDiscoveredAt, unread.AgentProfilesUnknown = time.Now(), true
+	if err := store.UpsertDeployments([]DeploymentProfile{unread}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Snapshot().Deployments["d"].AgentProfiles; len(got) != 1 || got[0] != "default" {
+		t.Fatalf("a scan that could not read AgentProfiles left %v; want [default] kept", got)
+	}
+	none := base
+	none.LastDiscoveredAt = time.Now().Add(time.Second)
+	if err := store.UpsertDeployments([]DeploymentProfile{none}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Snapshot().Deployments["d"].AgentProfiles; len(got) != 0 {
+		t.Fatalf("a scan that read no AgentProfiles left %v; want none", got)
+	}
+}

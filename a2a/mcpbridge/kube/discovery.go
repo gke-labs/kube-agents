@@ -208,7 +208,11 @@ func probeKubeContext(ctx context.Context, kubeCtx string) ([]mcpbridge.Deployme
 		}
 		return nil, fmt.Errorf("listing PlatformAgents: %s", describeAPIError(err, out))
 	}
-	profOut, profErr := clientset.Discovery().RESTClient().Get().AbsPath(crdAbsPathAgentProfiles).DoRaw(probeCtx)
+	// The AgentProfile list gets its own deadline rather than what the PlatformAgent list left.
+	profCtx, profCancel := context.WithTimeout(ctx, contextProbeTimeout)
+	defer profCancel()
+	profOut, profErr := clientset.Discovery().RESTClient().Get().AbsPath(crdAbsPathAgentProfiles).DoRaw(profCtx)
+	profilesUnknown := profErr != nil && !apierrors.IsNotFound(profErr)
 
 	var paList k8sPlatformAgentList
 	if err := json.Unmarshal(out, &paList); err != nil {
@@ -221,7 +225,9 @@ func probeKubeContext(ctx context.Context, kubeCtx string) ([]mcpbridge.Deployme
 	profilesByNS := make(map[string][]string)
 	if profErr == nil && len(profOut) > 0 {
 		var apList k8sAgentProfileList
-		if json.Unmarshal(profOut, &apList) == nil {
+		if json.Unmarshal(profOut, &apList) != nil {
+			profilesUnknown = true
+		} else {
 			for _, item := range apList.Items {
 				if item.Spec.ClusterRef != nil {
 					continue
@@ -295,6 +301,7 @@ func probeKubeContext(ctx context.Context, kubeCtx string) ([]mcpbridge.Deployme
 			Ready:                ready,
 			StatusMessage:        statusMsg,
 			AgentProfiles:        profilesByNS[ns],
+			AgentProfilesUnknown: profilesUnknown,
 			ClustersMonitored:    item.Status.Usage.ClustersMonitored,
 			ToolExecutionsTotal:  item.Status.Usage.ToolExecutionsTotal,
 			RemediationsProposed: item.Status.Usage.RemediationsProposedTotal,

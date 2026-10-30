@@ -56,41 +56,44 @@ type SessionPodInfo struct {
 //
 // MCPToken is held in memory only (json:"-") and is never persisted to disk.
 type DeploymentProfile struct {
-	Name                     string           `json:"name"`
-	KubeContext              string           `json:"kubeContext,omitempty"`
-	Namespace                string           `json:"namespace"`
-	PlatformAgentName        string           `json:"platformAgentName"`
-	Mode                     string           `json:"mode,omitempty"`
-	Version                  string           `json:"version,omitempty"`
-	HelmChartVersion         string           `json:"helmChartVersion,omitempty"`
-	LatestReleaseTag         string           `json:"latestReleaseTag,omitempty"`
-	LatestReleaseCommit      string           `json:"latestReleaseCommit,omitempty"`
-	LatestReleaseURL         string           `json:"latestReleaseUrl,omitempty"`
-	LatestReleasePublishedAt string           `json:"latestReleasePublishedAt,omitempty"`
-	UpgradeAvailable         bool             `json:"upgradeAvailable,omitempty"`
-	CommitsBehind            int              `json:"commitsBehind,omitempty"`
-	VersionCheckedAt         time.Time        `json:"versionCheckedAt,omitempty"`
-	ProjectID                string           `json:"projectId,omitempty"`
-	ClusterName              string           `json:"clusterName,omitempty"`
-	Location                 string           `json:"location,omitempty"`
-	GitHubRepo               string           `json:"githubRepo,omitempty"`
-	ChatPlatform             string           `json:"chatPlatform,omitempty"`
-	MCPService               string           `json:"mcpService,omitempty"`
-	MCPPort                  int              `json:"mcpPort,omitempty"`
-	DirectMCPURL             string           `json:"directMcpUrl,omitempty"`
-	TokenSecretName          string           `json:"tokenSecretName,omitempty"`
-	MCPToken                 string           `json:"-"`
-	Ready                    bool             `json:"ready"`
-	StatusMessage            string           `json:"statusMessage,omitempty"`
-	AgentProfiles            []string         `json:"agentProfiles,omitempty"`
-	ActiveSessionPods        []SessionPodInfo `json:"activeSessionPods,omitempty"`
-	SessionPodsProbedAt      time.Time        `json:"sessionPodsProbedAt,omitempty"`
-	ClustersMonitored        int              `json:"clustersMonitored,omitempty"`
-	ToolExecutionsTotal      int              `json:"toolExecutionsTotal,omitempty"`
-	RemediationsProposed     int              `json:"remediationsProposed,omitempty"`
-	RemediationsMerged       int              `json:"remediationsMerged,omitempty"`
-	LastConnectedAt          time.Time        `json:"lastConnectedAt,omitempty"`
-	LastDiscoveredAt         time.Time        `json:"lastDiscoveredAt,omitempty"`
+	Name                     string    `json:"name"`
+	KubeContext              string    `json:"kubeContext,omitempty"`
+	Namespace                string    `json:"namespace"`
+	PlatformAgentName        string    `json:"platformAgentName"`
+	Mode                     string    `json:"mode,omitempty"`
+	Version                  string    `json:"version,omitempty"`
+	HelmChartVersion         string    `json:"helmChartVersion,omitempty"`
+	LatestReleaseTag         string    `json:"latestReleaseTag,omitempty"`
+	LatestReleaseCommit      string    `json:"latestReleaseCommit,omitempty"`
+	LatestReleaseURL         string    `json:"latestReleaseUrl,omitempty"`
+	LatestReleasePublishedAt string    `json:"latestReleasePublishedAt,omitempty"`
+	UpgradeAvailable         bool      `json:"upgradeAvailable,omitempty"`
+	CommitsBehind            int       `json:"commitsBehind,omitempty"`
+	VersionCheckedAt         time.Time `json:"versionCheckedAt,omitempty"`
+	ProjectID                string    `json:"projectId,omitempty"`
+	ClusterName              string    `json:"clusterName,omitempty"`
+	Location                 string    `json:"location,omitempty"`
+	GitHubRepo               string    `json:"githubRepo,omitempty"`
+	ChatPlatform             string    `json:"chatPlatform,omitempty"`
+	MCPService               string    `json:"mcpService,omitempty"`
+	MCPPort                  int       `json:"mcpPort,omitempty"`
+	DirectMCPURL             string    `json:"directMcpUrl,omitempty"`
+	TokenSecretName          string    `json:"tokenSecretName,omitempty"`
+	MCPToken                 string    `json:"-"`
+	Ready                    bool      `json:"ready"`
+	StatusMessage            string    `json:"statusMessage,omitempty"`
+	AgentProfiles            []string  `json:"agentProfiles,omitempty"`
+	// AgentProfilesUnknown marks a discovered profile whose AgentProfile list could not be
+	// read (RBAC, timeout), so an empty AgentProfiles is not "none" and the saved list stays.
+	AgentProfilesUnknown bool             `json:"-"`
+	ActiveSessionPods    []SessionPodInfo `json:"activeSessionPods,omitempty"`
+	SessionPodsProbedAt  time.Time        `json:"sessionPodsProbedAt,omitempty"`
+	ClustersMonitored    int              `json:"clustersMonitored,omitempty"`
+	ToolExecutionsTotal  int              `json:"toolExecutionsTotal,omitempty"`
+	RemediationsProposed int              `json:"remediationsProposed,omitempty"`
+	RemediationsMerged   int              `json:"remediationsMerged,omitempty"`
+	LastConnectedAt      time.Time        `json:"lastConnectedAt,omitempty"`
+	LastDiscoveredAt     time.Time        `json:"lastDiscoveredAt,omitempty"`
 }
 
 // ConversationEntry tracks a named console conversation token and its mode.
@@ -502,7 +505,7 @@ func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 				p.TokenSecretName = existing.TokenSecretName
 			}
 			freshDiscovery := !p.LastDiscoveredAt.IsZero() && p.LastDiscoveredAt.After(existing.LastDiscoveredAt)
-			if len(p.AgentProfiles) == 0 && len(existing.AgentProfiles) > 0 && !freshDiscovery {
+			if len(p.AgentProfiles) == 0 && len(existing.AgentProfiles) > 0 && (!freshDiscovery || p.AgentProfilesUnknown) {
 				p.AgentProfiles = append([]string(nil), existing.AgentProfiles...)
 			}
 			if p.SessionPodsProbedAt.IsZero() && !existing.SessionPodsProbedAt.IsZero() {
@@ -533,6 +536,7 @@ func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 		}
 		// Never persist in-memory tokens on the stored profile copy.
 		p.MCPToken = ""
+		p.AgentProfilesUnknown = false
 		s.cfg.Deployments[key] = p
 		if s.cfg.ActiveDeployment == "" && p.Ready {
 			s.cfg.ActiveDeployment = key
