@@ -612,14 +612,13 @@ def gen_skill_catalog() -> str:
     def source_dir(group: str) -> str:
         return source_dirs.get(group, SKILLS_DIR).relative_to(REPO).as_posix()
 
-    descriptions = dict(skills)
-    for persona_map in persona_skills.values():
-        descriptions.update(persona_map)
-
     out: list[str] = []
     for group, names in grouped.items():
         if not names:
             continue
+        # A name can live in more than one persona directory with its own
+        # description in each, so each row reads the map its group came from.
+        descriptions = persona_skills.get(group, skills)
         out.append(f"### {group}\n")
         out.append("| Skill | Description |")
         out.append("| ----- | ----------- |")
