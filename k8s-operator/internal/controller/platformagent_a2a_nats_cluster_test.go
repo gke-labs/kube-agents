@@ -1493,6 +1493,10 @@ func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
 		{"one server scaled to 2, field asks 3", 1, 2, []int{0, 1}, ptr.To(3)},
 		{"three servers scaled to 0", 3, 0, nil, nil},
 		{"three servers scaled to 2, field asks 1", 3, 2, []int{0, 1}, ptr.To(1)},
+		// No record (pruned, or a failed first write): the rendered shape,
+		// not the claims a scale to 2 adds.
+		{"one server scaled to 2, no record", 0, 2, []int{0, 1}, nil},
+		{"three servers scaled to 2, no record", 0, 2, []int{0, 1}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -1500,7 +1504,16 @@ func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
 			if tc.spec != nil {
 				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
 			}
-			sts := buildA2ANATSStatefulSet(agent, "h")
+			want := tc.recorded
+			if want == 0 {
+				want = 1
+				if strings.HasPrefix(tc.name, "three") {
+					want = 3
+				}
+			}
+			shaped := agent.DeepCopy()
+			shaped.Status.BusReplicas = want
+			sts := buildA2ANATSStatefulSet(shaped, "h")
 			sts.Spec.Replicas = ptr.To(tc.scaled)
 			objs := []client.Object{agent, sts}
 			for _, o := range tc.claims {
@@ -1513,8 +1526,8 @@ func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
 			if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
-			if agent.Status.BusReplicas != tc.recorded || a2aNATSReplicas(agent) != int(tc.recorded) {
-				t.Errorf("status.busReplicas %d, rendered %d; want the recorded %d", agent.Status.BusReplicas, a2aNATSReplicas(agent), tc.recorded)
+			if agent.Status.BusReplicas != want || a2aNATSReplicas(agent) != int(want) {
+				t.Errorf("status.busReplicas %d, rendered %d; want %d", agent.Status.BusReplicas, a2aNATSReplicas(agent), want)
 			}
 		})
 	}
