@@ -980,6 +980,24 @@ _WATCHER_COUNT_KNOBS = {
 _FALLBACK_DURATION = "2m"
 _FALLBACK_COUNT = "5"
 
+# The most components WATCHER_DURATION_PATTERN admits, and a value far past it:
+# 65,000 of `1s` is 128 KiB, the largest single string execve passes in the
+# environment. Before the cap the loop rescanned the remainder on every pass and
+# took minutes over it; refused by the pattern, it costs one failed match.
+_DURATION_MAX_COMPONENTS = 16
+_PATHOLOGICAL_COMPONENTS = 65000
+_PATHOLOGICAL_SECONDS = 5.0
+
+
+def _watcher_values_passed(text: str) -> set[str]:
+    """Every WATCHER_* name a watcher flag takes its value from.
+
+    Matched on the prefix, not the closing brace, so `"${WATCHER_X:-2m}"`, an
+    unquoted `${WATCHER_X}` and a name carrying a digit are all found: any of
+    them is a ninth tunable added without a normaliser.
+    """
+    return set(re.findall(r'--[a-z-]+="?\$\{?(WATCHER_[A-Z0-9_]+)', text))
+
 
 class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
     """The duration and count normalisers, exercised as bash.
@@ -991,7 +1009,14 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
     literal to Go) were both enough.
     """
 
-    def _resolve(self, helper: str, value: str, *args: str) -> subprocess.CompletedProcess:
+    def _resolve(
+        self, helper: str, value: str, *args: str, repeat: int = 1
+    ) -> subprocess.CompletedProcess:
+        """Run `helper` on `value` repeated `repeat` times, built inside bash.
+
+        Built there rather than passed in because Linux caps one argument at
+        128 KiB, which the pathological case would exceed inside `bash -c`.
+        """
         patterns = "\n".join(
             lift_constant(name, self.text, _SCRIPT)
             for name in (
@@ -1013,7 +1038,8 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             {patterns}
             {self.lift("duration_nanoseconds")}
             {self.lift(helper)}
-            SETTING={shlex.quote(value)}
+            SETTING=""
+            for ((i = 0; i < {repeat}; i++)); do SETTING+={shlex.quote(value)}; done
             {helper} SETTING {" ".join(shlex.quote(a) for a in args)}
             printf "resolved=%s" "${{SETTING}}"
             """
@@ -1108,6 +1134,32 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                 self.assertIn(f"resolved={fallback}", result.stdout)
                 self.assertIn("is not a usable", result.stderr)
 
+    def test_the_unnormalised_value_check_sees_every_spelling_of_a_flag(self) -> None:
+        """The scan behind the last assertion below, on spellings it must not miss."""
+        for line, want in (
+            ('--new-flag="${WATCHER_NEW:-2m}"', "WATCHER_NEW"),
+            ("--new-flag=${WATCHER_NEW}", "WATCHER_NEW"),
+            ("--new-flag=$WATCHER_NEW", "WATCHER_NEW"),
+            ('--new-flag="${WATCHER_5XX_MIN_COUNT}"', "WATCHER_5XX_MIN_COUNT"),
+            ('--settle="${WATCHER_SETTLE}"', "WATCHER_SETTLE"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual({want}, _watcher_values_passed(line))
+
+    def test_a_duration_is_bounded_in_components(self) -> None:
+        many = "1s" * _DURATION_MAX_COMPONENTS
+        result = self._resolve("normalize_duration", many, _FALLBACK_DURATION)
+        self.assertIn(f"resolved={many}", result.stdout)
+        result = self._resolve("normalize_duration", many + "1s", _FALLBACK_DURATION)
+        self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
+
+        started = time.monotonic()
+        result = self._resolve(
+            "normalize_duration", "1s", _FALLBACK_DURATION, repeat=_PATHOLOGICAL_COMPONENTS
+        )
+        self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
+        self.assertLess(time.monotonic() - started, _PATHOLOGICAL_SECONDS)
+
     def test_every_watcher_flag_tunable_is_normalised_against_a_named_default(self) -> None:
         """Declared from a named default, normalised, and passed to the watcher.
 
@@ -1131,7 +1183,7 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                     self.assertIn(f'{flag}="${{{name}}}"', watcher)
 
         # And no WATCHER_* value reaches a duration or count flag unnormalised.
-        passed = set(re.findall(r'--[a-z-]+="\$\{(WATCHER_[A-Z_]+)\}"', watcher))
+        passed = _watcher_values_passed(watcher)
         covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
         self.assertEqual(
             set(),

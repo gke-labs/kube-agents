@@ -159,6 +159,45 @@ DRIFT_DAEMON_POLL_SECONDS="${DRIFT_DAEMON_POLL_SECONDS:-2}"
 # shellcheck disable=SC2034  # read indirectly, as clamp_at_least's default floor name
 readonly MIN_SETTING_VALUE=1
 
+# The shapes the watcher's duration and count flags are allowed to take: a
+# subset of what Go's flag package accepts, so that every value inside a
+# pattern (and, for a duration, inside duration_nanoseconds' range check) is
+# one the binary parses, and a value outside it only ever reaches the
+# fallback. A duration is time.ParseDuration's grammar narrowed five ways: no
+# sign (validate() rejects a negative settle, span or quiet period, and the
+# filter replaces a negative hold with its default anyway); no `µs`, `.5h` or
+# `1.h`; at most eighteen integer and three fraction digits per component,
+# which keeps the arithmetic below inside bash's int64; at most sixteen
+# components, which bounds duration_nanoseconds' loop (it rescans what is left
+# on every pass, so a value of thousands of components would hold PID 1 for
+# minutes before anything listens); and no more than
+# WATCHER_DURATION_MAX_HOURS in all. A count is plain decimal,
+# at most eighteen digits: the flag package reads ints with a base prefix, so
+# `08` is a bad octal literal there and `0x10` is sixteen, and nineteen digits
+# can overflow an int64, which it rejects as out of range.
+readonly WATCHER_DURATION_PATTERN='^(0|([0-9]{1,18}(\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$'
+readonly WATCHER_COUNT_PATTERN='^[0-9]{1,18}$'
+
+# Nanoseconds in one of each unit WATCHER_DURATION_PATTERN admits, and the
+# largest duration Go represents, for the size checks: whether a duration fits
+# Go's int64 of nanoseconds (`3000000h` does not), and whether it is above
+# zero once Go has truncated it to whole nanoseconds (`0.5ns` is not).
+readonly NS_PER_US=1000
+readonly NS_PER_MS=1000000
+readonly NS_PER_S=1000000000
+readonly NS_PER_M=60000000000
+readonly NS_PER_H=3600000000000
+readonly NS_MAX=9223372036854775807
+readonly DECIMAL_BASE=10
+
+# The longest duration a tunable may be, far below Go's limit of about
+# 2562047h. The watcher adds its own constants to two of them (the settle
+# period plus its quiet slack, the scale-up hold plus the staleness window),
+# and either sum wraps negative within minutes of Go's limit. A million hours
+# is over a century, so no tunable meant as one is refused, and the headroom
+# does not depend on what those constants are.
+readonly WATCHER_DURATION_MAX_HOURS=1000000
+
 # Rewrite the *named* variable, in place, to a decimal integer of at least the
 # value held by $2 (default MIN_SETTING_VALUE). By name on both sides because the
 # point is to correct what the rest of the script reads, and because the message
@@ -224,42 +263,6 @@ normalize_boolean() {
       ;;
   esac
 }
-
-# The shapes the watcher's duration and count flags are allowed to take: a
-# subset of what Go's flag package accepts, so that every value inside a
-# pattern (and, for a duration, inside duration_nanoseconds' range check) is
-# one the binary parses, and a value outside it only ever reaches the
-# fallback. A duration is time.ParseDuration's grammar narrowed four ways: no
-# sign (validate() rejects a negative settle, span or quiet period, and the
-# filter replaces a negative hold with its default anyway); no `µs`, `.5h` or
-# `1.h`; at most eighteen integer and three fraction digits per component,
-# which keeps the arithmetic below inside bash's int64; and no more than
-# WATCHER_DURATION_MAX_HOURS in all. A count is plain decimal,
-# at most eighteen digits: the flag package reads ints with a base prefix, so
-# `08` is a bad octal literal there and `0x10` is sixteen, and nineteen digits
-# can overflow an int64, which it rejects as out of range.
-readonly WATCHER_DURATION_PATTERN='^(0|([0-9]{1,18}(\.[0-9]{1,3})?(ns|us|ms|s|m|h))+)$'
-readonly WATCHER_COUNT_PATTERN='^[0-9]{1,18}$'
-
-# Nanoseconds in one of each unit WATCHER_DURATION_PATTERN admits, and the
-# largest duration Go represents, for the size checks: whether a duration fits
-# Go's int64 of nanoseconds (`3000000h` does not), and whether it is above
-# zero once Go has truncated it to whole nanoseconds (`0.5ns` is not).
-readonly NS_PER_US=1000
-readonly NS_PER_MS=1000000
-readonly NS_PER_S=1000000000
-readonly NS_PER_M=60000000000
-readonly NS_PER_H=3600000000000
-readonly NS_MAX=9223372036854775807
-readonly DECIMAL_BASE=10
-
-# The longest duration a tunable may be, far below Go's limit of about
-# 2562047h. The watcher adds its own constants to two of them (the settle
-# period plus its quiet slack, the scale-up hold plus the staleness window),
-# and either sum wraps negative within minutes of Go's limit. A million hours
-# is over a century, so no tunable meant as one is refused, and the headroom
-# does not depend on what those constants are.
-readonly WATCHER_DURATION_MAX_HOURS=1000000
 
 # Set the *named* variable to the whole nanoseconds Go's time.ParseDuration
 # reads $2 as, $2 being a duration WATCHER_DURATION_PATTERN already admitted,
