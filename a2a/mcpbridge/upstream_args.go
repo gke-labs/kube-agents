@@ -119,19 +119,9 @@ func serverSendMessageArgs(args map[string]any) (map[string]any, error) {
 		delete(args, "debug")
 	}
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
-	var wait float64
-	switch v := args["wait_seconds"].(type) {
-	case nil:
-	case float64:
-		wait = v
-	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid wait_timeout_seconds %q: want a number of seconds", v)
-		}
-		wait = f
-	default:
-		return nil, fmt.Errorf("invalid wait_timeout_seconds %v: want a number of seconds", v)
+	wait, err := parseWaitSeconds(args["wait_seconds"])
+	if err != nil {
+		return nil, err
 	}
 	switch {
 	case wait <= 0:
@@ -143,11 +133,33 @@ func serverSendMessageArgs(args map[string]any) (map[string]any, error) {
 	return args, nil
 }
 
+// parseWaitSeconds reads a wait_timeout_seconds value as send_message and task_control both
+// take it: a JSON number, or a string holding one (some hosts quote the schema's integer);
+// absent is 0. Any other value is an error naming the bridge's argument, not the server's.
+func parseWaitSeconds(v any) (float64, error) {
+	switch v := v.(type) {
+	case nil:
+		return 0, nil
+	case float64:
+		return v, nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid wait_timeout_seconds %q: want a number of seconds", v)
+		}
+		return f, nil
+	default:
+		return 0, fmt.Errorf("invalid wait_timeout_seconds %v: want a number of seconds", v)
+	}
+}
+
 // serverTaskControlArgs translates the bridge's task_control arguments to the in-cluster
 // server's (a2a/mcp taskControlArgs): task_id is task, wait_timeout_seconds is wait_seconds,
 // and the cancel action is stop. stopConversation, when set, names the conversation a stop
 // is for, resolved from the bridge's alias or console token to the alias the server knows.
-func serverTaskControlArgs(raw json.RawMessage, stopConversation string) json.RawMessage {
+// The wait is read as send_message's is (parseWaitSeconds) and sent as whole seconds; a value
+// that is not a number is an error.
+func serverTaskControlArgs(raw json.RawMessage, stopConversation string) (json.RawMessage, error) {
 	args := map[string]any{}
 	if len(raw) > 0 {
 		_ = json.Unmarshal(raw, &args)
@@ -157,6 +169,13 @@ func serverTaskControlArgs(raw json.RawMessage, stopConversation string) json.Ra
 	}
 	moveArg(args, "task_id", "task")
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
+	if v, ok := args["wait_seconds"]; ok {
+		wait, err := parseWaitSeconds(v)
+		if err != nil {
+			return nil, err
+		}
+		args["wait_seconds"] = int(wait)
+	}
 	if !upstreamDebug {
 		delete(args, "debug")
 	}
@@ -171,8 +190,7 @@ func serverTaskControlArgs(raw json.RawMessage, stopConversation string) json.Ra
 	if act == taskActionStop && stopConversation != "" {
 		args["conversation"] = stopConversation
 	}
-	out, _ := json.Marshal(args)
-	return out
+	return json.Marshal(args)
 }
 
 // upstreamArgs gates and translates a call to one of the in-cluster server's tools made in the
@@ -219,7 +237,7 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 				return nil, err
 			}
 		}
-		return serverTaskControlArgs(rawArgs, stopConversation), nil
+		return serverTaskControlArgs(rawArgs, stopConversation)
 	case ToolManageSession:
 		var args struct {
 			Action string `json:"action"`

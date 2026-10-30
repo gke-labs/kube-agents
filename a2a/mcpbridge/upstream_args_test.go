@@ -216,6 +216,26 @@ func TestSendMessageRefusesANonNumericWait(t *testing.T) {
 	noCallNamed(t, gw, ToolSendMessage, 100*time.Millisecond)
 }
 
+// task_control reads wait_timeout_seconds as send_message does: a numeric string is its number,
+// and anything else is refused before the call, naming the bridge's argument.
+func TestTaskControlReadsTheWaitAsSendMessageDoes(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	res := srv.CallTool(context.Background(), ToolTaskControl, json.RawMessage(`{"action":"get","task_id":"task-1","wait_timeout_seconds":"30"}`))
+	if res.IsError {
+		t.Fatalf("task_control get with a numeric-string wait: %+v", res)
+	}
+	if args := nextCallNamed(t, gw, ToolTaskControl); args["wait_seconds"] != float64(30) {
+		t.Fatalf("forwarded task_control get arguments %v; want wait_seconds 30 as a number", args)
+	}
+	for _, args := range []string{`{"action":"get","task_id":"task-1","wait_timeout_seconds":"soon"}`, `{"action":"get","task_id":"task-1","wait_timeout_seconds":true}`} {
+		if res := srv.CallTool(context.Background(), ToolTaskControl, json.RawMessage(args)); !res.IsError || !strings.Contains(res.Content[0].Text, "invalid wait_timeout_seconds") {
+			t.Fatalf("task_control %s: %+v; want it refused naming wait_timeout_seconds", args, res)
+		}
+	}
+	noCallNamed(t, gw, ToolTaskControl, 100*time.Millisecond)
+}
+
 // sendModeEnum is the mode enum send_message advertises.
 func sendModeEnum(t *testing.T, srv *Server) []string {
 	t.Helper()

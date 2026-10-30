@@ -1569,6 +1569,10 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 	if taskActionAwaitsServer(act) {
 		return "", "", "", errTaskActionNotSupported(act)
 	}
+	// An unreadable wait is refused here, before the connect, naming the bridge's argument.
+	if _, err := serverTaskControlArgs(rawArgs, ""); err != nil {
+		return "", "", "", err
+	}
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
 		return "", "", "", err
@@ -1584,10 +1588,15 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 			return "", "", "", err
 		}
 		s.clearStreamingTask(taskID, stopAlias)
-		fwd := serverTaskControlArgs(rawArgs, stopAlias)
+		fwd, err := serverTaskControlArgs(rawArgs, stopAlias)
+		if err != nil {
+			return "", "", "", err
+		}
 		return sess.callRemoteTool(ctx, ToolTaskControl, fwd, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
 	}
-	rawArgs = serverTaskControlArgs(rawArgs, "")
+	if rawArgs, err = serverTaskControlArgs(rawArgs, ""); err != nil {
+		return "", "", "", err
+	}
 
 	if (act == taskActionGet || act == taskActionSteer) && taskID != "" {
 		callCtx, cancelCall := context.WithCancel(ctx)
@@ -1838,7 +1847,7 @@ func (s *Server) stopRemoteTaskOnCancel(convAlias, taskID string) {
 		stopArgs["conversation"] = strings.TrimSpace(convAlias)
 	}
 	raw, _ := json.Marshal(stopArgs)
-	raw = serverTaskControlArgs(raw, strings.TrimSpace(convAlias))
+	raw, _ = serverTaskControlArgs(raw, strings.TrimSpace(convAlias))
 	_, _, _, _ = sess.callRemoteTool(stopCtx, ToolTaskControl, raw, CallMeta{}, s.store.Snapshot(), nil)
 	if s.host != nil {
 		s.host.OnKeepAliveTick(stopCtx, s)
