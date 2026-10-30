@@ -3946,22 +3946,34 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // resolveA2ABusReplicas sets status.busReplicas to the server count this pass
-// renders, before anything renders. The field set wins. Unset, the bus keeps
-// what it has, because changing the count empties it (the field's doc and
-// spec-nats-deployment.md): the running StatefulSet's replicas when there is
-// one; failing that, the data claims a bus left behind (a StatefulSet deleted
-// by hand keeps its claims, and the next one must come back at their count, or
-// it would convert them); and three only when there is no bus at all.
+// renders, before anything renders. An existing bus keeps what it has,
+// because changing the count empties it (the field's doc and
+// spec-nats-deployment.md): the running StatefulSet's replicas when they are
+// 1 or 3; for a StatefulSet scaled by hand to anything else, the count last
+// resolved; failing a StatefulSet, the data claims a bus left behind (a
+// StatefulSet deleted by hand keeps its claims, and the next one must come
+// back at their count, or it would convert them). The field decides only for a
+// bus that does not exist yet, and three when it is unset.
 //
-// When the field asks for a count other than the one running, the pass about
-// to convert the bus says so on the PlatformAgent, since the conversion is
-// what empties it.
+// A field that asks an existing bus for another count is refused unless
+// busConversionAllowed (which #4225 sets with the migration): the bus keeps
+// its count, and the refusal is a Warning once and the
+// A2ABusConversionRefused condition. With the gate open, the pass about to
+// convert the bus says so on the PlatformAgent, since the conversion is what
+// empties it.
 func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (converting bool, err error) {
 	running := 0
+	recorded := int(agent.Status.BusReplicas)
 	sts := &appsv1.StatefulSet{}
 	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
-	case err == nil && sts.Spec.Replicas != nil:
+	case err == nil && sts.Spec.Replicas != nil && (*sts.Spec.Replicas == 1 || *sts.Spec.Replicas == 3):
 		running = int(*sts.Spec.Replicas)
+	case err == nil && (recorded == 1 || recorded == 3):
+		// A StatefulSet scaled by hand outside 1 and 3 still holds the bus
+		// last resolved: its count is the record, not the claims, which a
+		// single server scaled to 2 leaves looking like a cluster short one
+		// and a scale to 0 deletes (WhenScaled: Delete).
+		running = recorded
 	case err == nil, errors.IsNotFound(err):
 		for ordinal := a2aNATSMaxReplicas - 1; ordinal >= 0 && running == 0; ordinal-- {
 			pvc := &corev1.PersistentVolumeClaim{}

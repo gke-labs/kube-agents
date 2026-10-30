@@ -224,6 +224,24 @@ spec:
       maxSessions: {{ $tuning.maxSessions }}
       {{- end }}
       {{- if hasKey $tuning "busReplicas" }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it. Pruned, a bus created
+        afterwards takes the default of three, and an existing bus's count
+        cannot change once it runs, so the value would never apply.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "busReplicas") }}
+      {{- fail "platformAgent.harness.tuning.busReplicas is set, but the installed PlatformAgent CRD predates spec.harness.tuning.busReplicas and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
       busReplicas: {{ $tuning.busReplicas }}
       {{- end }}
       {{- with $tuning.default }}

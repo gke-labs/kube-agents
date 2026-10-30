@@ -362,7 +362,10 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 // leaves the field as it was is let through, so a CR the operator already
 // holds to its count can still be edited otherwise.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	if oldObj == nil {
+	// Under today the field is inert and the bus is torn down, so an edit
+	// that flips to today, or edits a today CR whose count is not yet
+	// cleared, converts nothing.
+	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
 		return nil
 	}
 	running := oldObj.Status.BusReplicas

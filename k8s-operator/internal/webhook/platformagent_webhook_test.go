@@ -1299,6 +1299,11 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
 		}
 		pa.Status.BusReplicas = running
+		pa.Spec.Mode = ptr.To("next")
+		return pa
+	}
+	today := func(pa *agentv1alpha1.PlatformAgent) *agentv1alpha1.PlatformAgent {
+		pa.Spec.Mode = ptr.To("today")
 		return pa
 	}
 	for _, tc := range []struct {
@@ -1314,6 +1319,8 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
 		{"no recorded count (pruned, or today)", agent(nil, 0), agent(ptr.To(1), 0), false},
 		{"a create", nil, agent(ptr.To(1), 0), false},
+		{"a flip to today with the field set to the other count", agent(nil, 3), today(agent(ptr.To(1), 3)), false},
+		{"a today CR whose count is not cleared yet", today(agent(nil, 1)), today(agent(ptr.To(3), 1)), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusReplicas(tc.old, tc.new)

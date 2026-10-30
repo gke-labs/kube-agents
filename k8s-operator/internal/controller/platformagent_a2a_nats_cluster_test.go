@@ -1415,16 +1415,18 @@ func TestARefusedConversionIsAConditionThatClears(t *testing.T) {
 	}
 }
 
-// The gate has one way in, and it is not a production one: no non-test file
-// in this package names busConversionAllowed except where the reconciler
-// declares it, so no flag, env var or constructor can turn a conversion on
-// before #4225 brings the migration with it.
+// The gate has one way in, and it is not a production one: in non-test files
+// of this package busConversionAllowed appears only where the reconciler
+// declares it and where resolveA2ABusReplicas reads it, so no flag, env var or
+// constructor can turn a conversion on before #4225 brings the migration with
+// it. A set, a composite-literal key, an address taken (a flag binding) and
+// any further name all fail.
 func TestNothingButTestsAllowsABusConversion(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	declared := 0
+	declared, total := 0, 0
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
 			continue
@@ -1441,22 +1443,79 @@ func TestNothingButTestsAllowsABusConversion(t *testing.T) {
 						declared++
 					}
 				}
-				return false
 			case *ast.KeyValueExpr:
 				if id, ok := n.Key.(*ast.Ident); ok && id.Name == "busConversionAllowed" {
 					t.Errorf("%s sets busConversionAllowed in a composite literal", f)
 				}
 			case *ast.AssignStmt:
 				for _, lhs := range n.Lhs {
-					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "busConversionAllowed" {
-						t.Errorf("%s assigns busConversionAllowed", f)
+					ast.Inspect(lhs, func(ln ast.Node) bool {
+						if sel, ok := ln.(*ast.SelectorExpr); ok && sel.Sel.Name == "busConversionAllowed" {
+							t.Errorf("%s assigns busConversionAllowed", f)
+						}
+						return true
+					})
+				}
+			case *ast.UnaryExpr:
+				if n.Op == token.AND {
+					if sel, ok := ast.Unparen(n.X).(*ast.SelectorExpr); ok && sel.Sel.Name == "busConversionAllowed" {
+						t.Errorf("%s takes the address of busConversionAllowed", f)
 					}
+				}
+			case *ast.Ident:
+				if n.Name == "busConversionAllowed" {
+					total++
 				}
 			}
 			return true
 		})
 	}
-	if declared != 1 {
-		t.Fatalf("found the busConversionAllowed field declared %d times, want 1; this check would be vacuous", declared)
+	if declared != 1 || total != 2 {
+		t.Fatalf("busConversionAllowed is declared %d times and named %d times in non-test files, want 1 declaration and 1 read (2 names); this check would be vacuous or the gate has a new way in", declared, total)
+	}
+}
+
+// A StatefulSet scaled by hand outside 1 and 3 is still the bus last
+// resolved: a single server scaled to 2 (claims -0 and -1, which read like a
+// cluster short one) or to 0 (claims gone) stays one server, and a cluster
+// stays three, so neither the default nor a set field converts it.
+func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		recorded int32
+		scaled   int32
+		claims   []int
+		spec     *int
+	}{
+		{"one server scaled to 2", 1, 2, []int{0, 1}, nil},
+		{"one server scaled to 0", 1, 0, nil, nil},
+		{"one server scaled to 2, field asks 3", 1, 2, []int{0, 1}, ptr.To(3)},
+		{"three servers scaled to 0", 3, 0, nil, nil},
+		{"three servers scaled to 2, field asks 1", 3, 2, []int{0, 1}, ptr.To(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Status.BusReplicas = tc.recorded
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			sts := buildA2ANATSStatefulSet(agent, "h")
+			sts.Spec.Replicas = ptr.To(tc.scaled)
+			objs := []client.Object{agent, sts}
+			for _, o := range tc.claims {
+				objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace,
+					Labels: sts.Spec.VolumeClaimTemplates[0].Labels,
+				}})
+			}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+			if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.recorded || a2aNATSReplicas(agent) != int(tc.recorded) {
+				t.Errorf("status.busReplicas %d, rendered %d; want the recorded %d", agent.Status.BusReplicas, a2aNATSReplicas(agent), tc.recorded)
+			}
+		})
 	}
 }
