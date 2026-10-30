@@ -51,6 +51,8 @@ const (
 	a2aCalloutKeysSuffix = "-keys"
 	a2aNATSTLSSuffix     = "-tls"
 	a2aNATSCASuffix      = "-ca"
+
+	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +79,13 @@ func A2ACalloutName(agentName string) string { return agentName + a2aCalloutName
 // among them the issuer seed that signs every identity the bus accepts.
 func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
+}
+
+// A2ATaskSigningKeySecretName is the Secret holding the task-signing key the
+// dispatcher signs per-task credentials with (#3889). Generated beside the
+// callout's keys; only the dispatcher will mount it, and nothing mounts it yet.
+func A2ATaskSigningKeySecretName(agentName string) string {
+	return agentName + a2aTaskSigningKeySuffix
 }
 
 // A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
@@ -106,6 +115,9 @@ func A2ACredentialSecretNames(agentName string) []string {
 		// a certificate that does the same.
 		A2ANATSTLSSecretName(agentName),
 		A2ANATSCASecretName(agentName),
+		// The task-signing seed: with a worker pod's own token, it scopes
+		// that pod to any task of its profile.
+		A2ATaskSigningKeySecretName(agentName),
 	}
 }
 
@@ -307,13 +319,14 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are five of them:
+// the expensive route and advertise the cheap one. There are six of them:
 // the creds Secret holds the static passwords (`bridge-password` among them),
 // the nats-config Secret holds nats.conf with every one of those passwords
 // inline, the callout-keys Secret holds the issuer seed that signs every
 // identity the bus accepts, which is worth more than any password in the
 // others, and the two TLS Secrets hold the keys that let a pod pass as the
-// bus: the serving key, and the CA key that can mint another.
+// bus: the serving key, and the CA key that can mint another. The sixth holds
+// the dispatcher's task-signing seed.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -454,10 +467,34 @@ type HarnessSpec struct {
 	// +optional
 	Tuning *TuningSpec `json:"tuning,omitempty"`
 
+	// Retention bounds how long the agent keeps its own working data: the session
+	// history in every profile's state.db and its rotated log files. Absent keeps
+	// the operator's default.
+	// +optional
+	Retention *RetentionSpec `json:"retention,omitempty"`
+
 	// Experimental holds opt-in behaviour that is not supported and may change
 	// or disappear in any release.
 	// +optional
 	Experimental *ExperimentalSpec `json:"experimental,omitempty"`
+}
+
+// RetentionSpec sets how long the agent keeps its working data.
+type RetentionSpec struct {
+	// SessionDays is how many days of inactivity an ended session is kept before
+	// Hermes' own pruning deletes it, with its messages and transcript files, in
+	// every profile: the front door's conversations, the Platform Agent's, and each
+	// Cluster Agent's. Rotated log backups older than this are removed too. Open,
+	// pinned and mid-turn sessions are never pruned, and the daily job pins a
+	// session another still points to as its parent before it prunes. Unset uses the operator's default
+	// (defaultSessionRetentionDays in the controller, 90). The minimum is 90 for
+	// now: some readers follow a session's lineage further than the parent guard
+	// has been shown to hold below that. Lowering it deletes the older history at
+	// the next daily prune.
+	// +kubebuilder:validation:Minimum=90
+	// +kubebuilder:validation:Maximum=365
+	// +optional
+	SessionDays *int `json:"sessionDays,omitempty"`
 }
 
 // ExperimentalSpec gathers the unsupported switches. Nothing here carries a
@@ -1015,7 +1052,7 @@ type DeploymentSpec struct {
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
 	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
-	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca, <agent>-a2a-task-signing-key),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -1033,7 +1070,8 @@ type DeploymentSpec struct {
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
 	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
-	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls, <agent>-a2a-nats-ca or
+	// <agent>-a2a-task-signing-key -- and
 	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map
@@ -1103,6 +1141,14 @@ type CredentialProxySpec struct {
 	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
 	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
 	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// The limit a fleet needs grows with the size of its clusters as well as
+	// their number: the broker charges each command about 128Mi, the size of
+	// a listing of a small cluster, and a kubectl listing thousands of objects
+	// holds several hundred Mi on its own, so size the limit to the largest
+	// listing the fleet produces for every command that runs at once (eight
+	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
+	// and Envoy, 128Mi for the content workspace); the broker's child peak and
+	// memory high-water series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a limits
@@ -2142,7 +2188,7 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 

@@ -109,9 +109,10 @@ class D1Attributable(unittest.TestCase):
 
         Outside this assertion: the operator's own ClusterRole holds
         `secrets` write by design (it mints the bus credentials, the callout
-        keys and the inject token), and the gateway's `create` on pods can
-        mount a Secret into a pod it builds, which buildA2AGatewayRole's
-        comment records as the admission policy it owes. Neither is a product
+        keys and the inject token), and the gateway's `create` on pods, which
+        RBAC cannot keep from mounting a Secret; the admission policy
+        kube-agents-a2a-gateway-pod does, where the chart installs it (C5).
+        Neither is a product
         ServiceAccount writing its identity table through RBAC.
         """
         checked = 0

@@ -26,7 +26,12 @@ sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
 from skill_documents import SKILL_ROOT_GLOBS, shipped_skill_documents, shipped_trees, skill_dirs  # noqa: E402
 
 # The trees the agent image ships, which deploy/docker/Dockerfile copies.
-IMAGE_SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
+IMAGE_SKILL_TREES = (
+    "agents/platform/skills",
+    "agents/cluster/skills",
+    "agents/cluster/persona/skills",
+    "a2a/persona/platform/skills",
+)
 
 # A variable run as the program at the start of a span, after a shell join or
 # inside `$(`, and after a shell keyword or a wrapper that runs the next word

@@ -6772,14 +6772,14 @@ class PlatformAgentModeTest(unittest.TestCase):
                  "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\n"),
                 ("--enable-slack --mode=next", "PLATFORM_AGENT_MODE=next SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1",
                  "SLACK_ALLOWED_USERS=U1\nSLACK_HOME_CHANNEL=''\n"
-                 "SLACK_HOME_CHANNEL_NAME=''\nPLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\n"),
+                 "SLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\nPLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\n"),
             ):
                 with self.subTest(flags=flags):
                     path = self._file(tmp, "PROJECT_ID=p\n")
                     proc = self._run(
                         f"parse_args {flags}; {self._CHECK}; export {exports}; record_flags_into_install_env",
                         install_env=path,
-                        extra_env={"SLACK_ENABLED": "", "SLACK_ALLOWED_USERS": "", "SLACK_HOME_CHANNEL": "", "SLACK_HOME_CHANNEL_NAME": ""},
+                        extra_env={"SLACK_ENABLED": "", "SLACK_ALLOWED_USERS": "", "SLACK_HOME_CHANNEL": "", "SLACK_HOME_CHANNEL_NAME": "", "SLACK_HOME_CHANNEL_POLICY": ""},
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
                     self.assertEqual(path.read_text(), "PROJECT_ID=p\n" + expected)
@@ -8842,7 +8842,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         # A developer's own exports must not answer for the file.
         return get_isolated_test_env(overrides=overrides, absent=(
             "SLACK_ENABLED", "GOOGLE_CHAT_ENABLED", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
-            "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME",
+            "SLACK_ALLOWED_USERS", "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME", "SLACK_HOME_CHANNEL_POLICY",
             "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "GOOGLE_CHAT_MODE", "CHAT_TOPIC_NAME",
             "CHAT_SUB_NAME", "PERSIST_SECRETS_ON_DISK",
         ))
@@ -8871,7 +8871,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     # What a toggle recorded true brings with it when the file lacks the
     # integration's settings and nothing in the test exported them.
     _EMPTY_COMPANIONS = {
-        "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\n",
+        "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\n",
         "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_MODE=''\n",
     }
 
@@ -8925,6 +8925,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("SLACK_ALLOWED_USERS=U1\n", "--slack-allowed-users=", "SLACK_ALLOWED_USERS", "--slack-allowed-users=''"),
                 ("SLACK_HOME_CHANNEL=C1\n", "--slack-home-channel=C2", "SLACK_HOME_CHANNEL", "--slack-home-channel=C2"),
                 ("SLACK_HOME_CHANNEL_NAME=\\#a\n", "'--slack-home-channel-name=#b'", "SLACK_HOME_CHANNEL_NAME", "--slack-home-channel-name=\\#b"),
+                ("SLACK_HOME_CHANNEL_POLICY=auto\n", "--slack-home-channel-policy=manual", "SLACK_HOME_CHANNEL_POLICY", "--slack-home-channel-policy=manual"),
                 ("ALLOWED_USERS=a@example.com\n", "--google-chat-allowed-users=b@example.com", "ALLOWED_USERS", "--google-chat-allowed-users=b@example.com"),
                 ("GOOGLE_CHAT_HOME_CHANNEL=spaces/A\n", "--google-chat-home-channel=spaces/B", "GOOGLE_CHAT_HOME_CHANNEL", "--google-chat-home-channel=spaces/B"),
                 # A topic rename is a destroy and re-create of the Pub/Sub topic.
@@ -9079,6 +9080,66 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     path, proc, out = self._check(tmp, f"GOOGLE_CHAT_MODE={mode}\n", f"--google-chat-mode={mode}")
                     self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
 
+    # ── the home channel policy ─────────────────────────────────────────────
+
+    @staticmethod
+    def _policy_check_call():
+        # main()'s own call, so the tests run the line the source carries:
+        # the text of main() from the call on, and the call itself.
+        source = _INSTALL_SH.read_text()
+        main = source[source.index("\nmain() {"):]
+        start = main.index('require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}"')
+        end = main.index("|| exit 1", start) + len("|| exit 1")
+        return main[start:], main[start:end]
+
+    def test_the_policy_flag_is_checked_before_the_file_is_consulted(self):
+        # main() runs require_slack_home_channel_policy before the file check,
+        # so a flag outside the enum is refused as a bad value, not as a
+        # disagreement with the file whose remedy would have the operator
+        # record it. The helper itself is tested in test_installer_common.py.
+        rest, call = self._policy_check_call()
+        self.assertIn("check_flags_against_install_env || exit 1", rest)
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("SLACK_HOME_CHANNEL_POLICY=manual\n", "PROJECT_ID=p\n"):
+                with self.subTest(content=content):
+                    path = self._file(tmp, content)
+                    proc = self._run(
+                        f"parse_args --slack-home-channel-policy=sometimes; {call}; {self._CHECK}", path)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", out)
+                    self.assertIn("--slack-home-channel-policy", out)
+                    self.assertNotIn("gives a different", out)
+                    self.assertNotIn("QUEUED=", out)
+                    self.assertEqual(path.read_text(), content)
+            for value in ("", "auto", "manual"):
+                with self.subTest(value=value):
+                    path, proc, out = self._check(tmp, f"SLACK_HOME_CHANNEL_POLICY={value}\n", f"--slack-home-channel-policy={value}")
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, out)
+
+    def test_a_bad_policy_this_run_did_not_type_is_sent_back_to_the_file(self):
+        # The remedy names --slack-home-channel-policy only when this run typed
+        # it. A flag cannot correct a value the file carries: the enum check
+        # would pass and the file check would refuse the disagreement, two
+        # refusals for one typo. A value from the file, or from the shell, is
+        # sent back to the file.
+        _, call = self._policy_check_call()
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, extra_env in (
+                ("SLACK_HOME_CHANNEL_POLICY=Manual\n", None),
+                ("PROJECT_ID=p\n", {"SLACK_HOME_CHANNEL_POLICY": "Manual"}),
+            ):
+                with self.subTest(content=content, exported=extra_env is not None):
+                    path = self._file(tmp, content)
+                    proc = self._run(f"parse_args; {call}; {self._CHECK}", path, extra_env)
+                    out = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, out)
+                    self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'Manual'", out)
+                    self.assertIn("Set it in install.env and run again", out)
+                    self.assertNotIn("--slack-home-channel-policy", out)
+                    self.assertNotIn("QUEUED=", out)
+                    self.assertEqual(path.read_text(), content)
+
     # ── agreement ───────────────────────────────────────────────────────────
 
     def test_a_flag_that_agrees_with_the_file_changes_nothing(self):
@@ -9168,6 +9229,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-allowed-users", "SLACK_ALLOWED_USERS", "U1,U2"),
                 ("--slack-home-channel", "SLACK_HOME_CHANNEL", "C0123"),
                 ("--slack-home-channel-name", "SLACK_HOME_CHANNEL_NAME", "#gke alerts"),
+                ("--slack-home-channel-policy", "SLACK_HOME_CHANNEL_POLICY", "manual"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
                 ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
@@ -9222,9 +9284,10 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 (
                     "--enable-slack",
                     "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1,U2 SLACK_HOME_CHANNEL=C1 "
-                    "SLACK_HOME_CHANNEL_NAME='#gke alerts' SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed",
+                    "SLACK_HOME_CHANNEL_NAME='#gke alerts' SLACK_HOME_CHANNEL_POLICY=manual "
+                    "SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed",
                     ["SLACK_ALLOWED_USERS=U1\\,U2", "SLACK_HOME_CHANNEL=C1",
-                     "SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts", "SLACK_ENABLED=true"],
+                     "SLACK_HOME_CHANNEL_NAME=\\#gke\\ alerts", "SLACK_HOME_CHANNEL_POLICY=manual", "SLACK_ENABLED=true"],
                     ("xoxb-typed", "xapp-typed"),
                 ),
                 (
@@ -9254,10 +9317,10 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             for content, flags, applied, appended in (
                 # The file's own allowlist stays as written; only the missing keys come.
                 ("SLACK_ALLOWED_USERS=U0\n", "--enable-slack", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U0 SLACK_HOME_CHANNEL=C1",
-                 "SLACK_HOME_CHANNEL=C1\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ENABLED=true\n"),
+                 "SLACK_HOME_CHANNEL=C1\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\nSLACK_ENABLED=true\n"),
                 # A companion typed as a flag is recorded once, not twice.
                 ("PROJECT_ID=p\n", "--enable-slack --slack-allowed-users=U9", "SLACK_ENABLED=true SLACK_ALLOWED_USERS=U9",
-                 "SLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_ALLOWED_USERS=U9\nSLACK_ENABLED=true\n"),
+                 "SLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\nSLACK_ALLOWED_USERS=U9\nSLACK_ENABLED=true\n"),
                 # Off renders nothing of the integration, so nothing beside it is pinned.
                 ("PROJECT_ID=p\n", "--enable-slack=false", "SLACK_ENABLED=false SLACK_ALLOWED_USERS=U1", "SLACK_ENABLED=false\n"),
                 ("PROJECT_ID=p\n", "--enable-google-chat", "GOOGLE_CHAT_ENABLED=false ALLOWED_USERS=a", "GOOGLE_CHAT_ENABLED=false\n"),
@@ -9418,7 +9481,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                         self.assertEqual(
                             path.read_text(),
                             "PROJECT_ID=p\nSLACK_ALLOWED_USERS=U1\nSLACK_HOME_CHANNEL=''\n"
-                            "SLACK_HOME_CHANNEL_NAME=''\nSLACK_ENABLED=true\n",
+                            "SLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\nSLACK_ENABLED=true\n",
                             out,
                         )
                     else:
@@ -9427,7 +9490,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                         self.assertEqual(proc.returncode, 0, out)
                         self.assertNotIn("Recorded ", out)
                         warning = out.index(
-                            f"{path} assigns no SLACK_ALLOWED_USERS, SLACK_HOME_CHANNEL, SLACK_HOME_CHANNEL_NAME, "
+                            f"{path} assigns no SLACK_ALLOWED_USERS, SLACK_HOME_CHANNEL, SLACK_HOME_CHANNEL_NAME, SLACK_HOME_CHANNEL_POLICY, "
                             "SLACK_ENABLED, and pausing here did not record them: a run abandoned at this prompt "
                             "leaves the file as it was."
                         )
@@ -9435,7 +9498,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                             "If you go on to run lifecycle.sh apply by hand, first add these lines to "
                             f"{path}, so a later upgrade.sh renders what you applied:\n"
                             "    SLACK_ALLOWED_USERS=U1\n    SLACK_HOME_CHANNEL=''\n"
-                            "    SLACK_HOME_CHANNEL_NAME=''\n    SLACK_ENABLED=true\n",
+                            "    SLACK_HOME_CHANNEL_NAME=''\n    SLACK_HOME_CHANNEL_POLICY=''\n    SLACK_ENABLED=true\n",
                             out,
                         )
                         self.assertLess(warning, out.index("Provisioning paused by user"))
@@ -10835,6 +10898,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--slack-allowed-users": ("PARAM_SLACK_ALLOWED_USERS", "U123,U456"),
         "--slack-home-channel": ("PARAM_SLACK_HOME_CHANNEL", "C01234567"),
         "--slack-home-channel-name": ("PARAM_SLACK_HOME_CHANNEL_NAME", "#gke-alerts"),
+        "--slack-home-channel-policy": ("PARAM_SLACK_HOME_CHANNEL_POLICY", "manual"),
         "--scope-projects": ("PARAM_SCOPE_PROJECTS", "payments-prod,payments-staging"),
         "--scope-folders": ("PARAM_SCOPE_FOLDERS", "123456789012"),
         "--scope-organizations": ("PARAM_SCOPE_ORGANIZATIONS", "987654321098"),

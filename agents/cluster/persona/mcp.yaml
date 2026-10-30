@@ -1,0 +1,29 @@
+# Both servers are on the credential broker's MCP relay, which applies its own
+# tool policy (agents/platform/scripts/mcp_policy.py). The include lists keep
+# the model's offer to read tools: gke's is the relay's GKE_READ_TOOLS, and
+# developer_knowledge leaves out answer_query, whose small daily quota every
+# agent of an install shares.
+servers:
+  gke:
+    broker: gke
+    include:
+      - check_k8s_auth
+      - describe_k8s_resource
+      - get_cluster
+      - get_k8s_cluster_info
+      - get_k8s_logs
+      - get_k8s_resource
+      - get_k8s_rollout_status
+      - get_k8s_version
+      - get_node_pool
+      - get_operation
+      - list_clusters
+      - list_k8s_api_resources
+      - list_k8s_events
+      - list_node_pools
+      - list_operations
+  developer_knowledge:
+    broker: developer_knowledge
+    include:
+      - search_documents
+      - get_documents

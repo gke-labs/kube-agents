@@ -1,0 +1,111 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: cluster-debugging (Cluster Agent, storage). Journey: a user asks for one cluster's
+# storage audit; the Platform Agent hands it to that cluster's Cluster Agent,
+# which runs the single-pass storage collector SOUL.md §3 names and reports
+# what it printed (#3285).
+#
+# What it catches. Without the collector a Cluster Agent lists PVCs, PVs,
+# StorageClasses and VolumeAttachments one kind at a time and describes PVCs
+# one by one. On main the collector is not staged in the sandbox image and
+# SOUL.md does not name it, so the route check fails there by construction.
+# The checks grade the route: a Cluster Agent did the work, executed
+# `audit_storage.py` (`required_runs` grades execution through the verifier's
+# argv/wrapper reader so reading the file or passing `--help` does not count)
+# alongside a command naming the staged path or `cd /opt/data/scripts` outside
+# `#` comments (`required_patterns`; until #3967 lands single-reader
+# `WorkerRun.script_path` after #3348, the pair guarantees the staged path was
+# named outside comments and some `audit_storage.py` executed, while
+# cross-segment `cp`/`cd` + `/tmp`, bare `cd /opt/data/scripts && audit_storage.py`,
+# quoted-prefix concatenation (`python3 "$PWD"/opt/data/scripts/audit_storage.py`),
+# same-segment argument mention (`python3 /tmp/audit_storage.py /opt/data/scripts/...`),
+# two-command mention-plus-`/tmp`, and parent-dir / redirected-`cd` / `cd --` /
+# `cd ... || exit` / variable-held path or directory / double-slash `//opt` /
+# escaped-slash `\/opt` / `#` inside single-quoted `bash -c 'echo "# x"; ...'` /
+# `pushd` (`cd /opt/data && ...`, `cd /opt/data/scripts 2>/dev/null && ...`,
+# `cd -- /opt/data/scripts && ...`, `cd /opt/data/scripts || exit 1; ...`,
+# `SCRIPTS=/opt/data/scripts; python3 $SCRIPTS/...`, `SCRIPT=/opt/...; python3 "$SCRIPT"`,
+# `python3 //opt/data/scripts/audit_storage.py`, `python3 \/opt/data/scripts/audit_storage.py`,
+# `bash -c 'echo "# x"; python3 /opt/data/scripts/audit_storage.py'`,
+# `pushd /opt/data/scripts && ...`) shapes await #3967), and no later turn's
+# result shows the script missing. The report check requires both storage kinds
+# (PVCs and StorageClasses, CamelCase, spaced, or hyphenated) the collector's
+# summary names.
+#
+# The result check opens its window at the first result any worker call in
+# the card's lineage returns, and grades only calls issued in a later turn.
+# A Cluster Agent runs cluster_preflight.sh before any diagnostics
+# (agents/cluster/SOUL.md), so a missing script shows in the window unless
+# the worker skips preflight, or chains or parallelizes the collector with it
+# in that same first turn. The case also plants no failing kind, so it does
+# not grade that a CLEAN_AUDIT_STOP: NO over an unread kind is reported as
+# unread; the collector's unit tests (agents/platform/scripts/
+# test_domain_auditors.py) pin that output.
+#
+# No planted defect: every seeded cluster has StorageClasses, and the
+# collector reads whatever storage the cluster holds. Isolation class:
+# read-only. Eligible tier: nightly.
+id: cluster-agent-storage-audit-collector
+name: A Cluster Agent runs the single-pass storage collector for a storage audit
+prompt: >-
+  Have the Cluster Agent for the seeded-a cluster audit persistent storage on
+  seeded-a: PersistentVolumeClaims, PersistentVolumes, StorageClasses and
+  VolumeAttachments. Report whether any of them is unhealthy.
+expected_output: >-
+  The Platform Agent delegates the audit to seeded-a's Cluster Agent, which
+  runs /opt/data/scripts/audit_storage.py and reports the summary it printed:
+  PVC, PV, StorageClass and VolumeAttachment counts, the default
+  StorageClass, and the CLEAN_AUDIT_STOP verdict. No change is made to the
+  cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: cluster-debugging
+
+owner: fkc1e100
+
+# No fixtures: the seeded fleet's standing clusters are the target, and every
+# check reads the run's transcript.
+fixtures: []
+
+verification_spec:
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    check:
+      type: worker_agents
+      required_agents: ["cluster-.+"]
+  - name: the-storage-collector-ran-from-the-staged-path
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: '[\s\S]'
+      required_runs:
+        - script: audit_storage.py
+      required_patterns:
+        # Paired with required_runs above (which owns argv/wrapper parsing): guarantees
+        # the standalone staged path or `cd /opt/data/scripts` (quoted, unquoted,
+        # `\"`-escaped inside `bash -c "..."`, or `\`-continued) was named outside `#`
+        # comments (honoring mid-word `#` like `_read_shell_line`) without copying
+        # `_SHELL_EXEC_WRAPPERS`; cross-segment `cp`/`cd` + `/tmp`, bare
+        # `cd /opt/data/scripts && audit_storage.py`, same-segment argument mention
+        # (`python3 /tmp/audit_storage.py /opt/data/scripts/...`), two-command
+        # mention-plus-`/tmp`, and parent-dir / redirected-`cd` / `cd --` /
+        # `cd ... || exit` / variable-held path or directory / double-slash `//opt` /
+        # escaped-slash `\/opt` / `#` inside single-quoted `bash -c 'echo "# x"; ...'` / `pushd`
+        # (`cd /opt/data`, `cd /opt/data/scripts 2>/dev/null`, `cd -- /opt/data/scripts`,
+        # `cd /opt/data/scripts || exit 1;`, `SCRIPTS=/opt/data/scripts; python3 $SCRIPTS/...`,
+        # `SCRIPT=/opt/...; python3 "$SCRIPT"`, `python3 //opt/...`, `python3 \/opt/...`,
+        # `bash -c 'echo "# x"; python3 /opt/...'`, `pushd /opt/data/scripts`) await #3967.
+        - '(?m)^(?:[^#\x27"\\\n]|\\[^\n]|(?<=[^\s<>&|;()])#|\x27[^\x27\n]*\x27|"(?:\\.|[^"\\\n])*")*(?:\x27(?:[^#\x27\n]|(?<=[^\s<>&|;()\x27"])#)*|"(?:\\.|[^#"\\\n]|(?<=[^\s<>&|;()\x27"])#)*)?(?:(?<![^ \t\n\x27"(;|&])(?<!\\[ \t(|;&\x27"])(?<![^ \t\n(;|&]\x27)(?<![^ \t\n(;|&]")(?:/opt/data/scripts/audit_storage\.py\b|\\"/opt/data/scripts/audit_storage\.py\\")|\bcd(?:[ \t]|\\\n)+(?:/opt/data/scripts/?|\x27/opt/data/scripts/?\x27|"/opt/data/scripts/?"|\\"/opt/data/scripts/?\\")(?=(?:[ \t]|\\\n)*(?:&&|;|\n|$)|(?:[ \t]|\\\n)+#))'
+      forbidden_result_patterns:
+        - 'audit_storage\.py[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
+        - "can't open file '[^']*audit_storage\\.py'"
+  - name: report-carries-the-storage-summary
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns: ['(?i)\bpersistent[ -]?volume[ -]?claims?\b|\bpvcs?\b']
+      any_of_patterns: ['(?i)\bstorage[ -]?class(?:es)?\b']

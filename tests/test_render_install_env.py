@@ -290,21 +290,13 @@ class DefaultOnKeysAreRefusableTest(unittest.TestCase):
     """
 
     # Keyed by the install.env name, valued by why MAPPING does not carry it.
-    # Both are pre-existing and neither is this file's to fix; they are listed
-    # so that the next `true` default has to be argued about rather than added.
+    # Listed so that the next `true` default has to be argued about rather
+    # than added.
     _NOT_MAPPED = {
         # Chooses where secrets go -- terraform.tfvars, or TF_VAR_* in the
         # process environment. Provisions nothing either way, so an environment
         # that cannot override it loses no cloud resource by the omission.
         "PERSIST_SECRETS_ON_DISK",
-        # The same shape as the drift key and genuinely unaddressed: the default
-        # enables the Vertex API on the serving project and grants the gateway's
-        # role there, so an omission acts on a project rather than skipping it,
-        # and a long-lived environment has no variable that declines. Narrower
-        # in that nothing happens unless model_provider is vertex_ai. Left as it
-        # was found -- flipping one default is not licence to widen the audit --
-        # and tracked as issue #2269, which is what removes this entry.
-        "VERTEX_MANAGE_SERVING_PROJECT",
     }
 
     def test_every_default_true_boolean_can_be_refused_by_an_environment(self):
@@ -412,6 +404,10 @@ class RenderingTest(unittest.TestCase):
     def test_google_chat_home_channel_is_mapped(self):
         _, _, text = render({**_COORDS, "GOOGLE_CHAT_HOME_CHANNEL": "spaces/TEST12345"})
         self.assertEqual(parse(text)["GOOGLE_CHAT_HOME_CHANNEL"], "spaces/TEST12345")
+
+    def test_slack_home_channel_policy_is_mapped(self):
+        _, _, text = render({**_COORDS, "SLACK_HOME_CHANNEL_POLICY": "manual"})
+        self.assertEqual(parse(text)["SLACK_HOME_CHANNEL_POLICY"], "manual")
 
     def test_the_file_is_not_readable_by_anyone_else(self):
         """It carries the model provider's API key and the Slack tokens."""
