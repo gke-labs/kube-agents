@@ -161,6 +161,10 @@ var requiredPermissions = []requiredPermission{
 	// profile namespace, which the operator alone writes. No watch: read
 	// uncached.
 	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"get", "list", "create", "update", "patch", "delete"}},
+	// The dispatcher Job admission policy and its binding, read by name
+	// before the dispatcher gets its Jobs Role (dispatcherJobPolicyInPlace).
+	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicies"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
+	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicybindings"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
 	// storageclasses: growDataClaim reads a data claim's class by name.

@@ -17,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -408,4 +409,95 @@ func shippedDispatcherJobPolicy(t *testing.T) (*admissionregistrationv1.Validati
 		t.Fatalf("%s holds no policy or no binding", dispatcherJobPolicyFile)
 	}
 	return policy, binding
+}
+
+// Job mode needs the policy in the cluster as the chart renders it, not
+// only the chart's signal: with the binding gone or loosened in any of the
+// ways the policy's guarantee rests on, there are no Job templates in the
+// config, no params and no Jobs Role, and a Role an earlier pass granted is
+// revoked.
+func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
+	for name, loosen := range map[string]func(*admissionregistrationv1.ValidatingAdmissionPolicy, *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (keepPolicy, keepBinding bool){
+		"the binding gone": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, _ *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			return true, false
+		},
+		"the policy gone": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, _ *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			return false, true
+		},
+		"the policy failing open": func(p *admissionregistrationv1.ValidatingAdmissionPolicy, _ *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			p.Spec.FailurePolicy = ptr.To(admissionregistrationv1.Ignore)
+			return true, true
+		},
+		"the binding auditing only": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, b *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			b.Spec.ValidationActions = []admissionregistrationv1.ValidationAction{admissionregistrationv1.Audit}
+			return true, true
+		},
+		"no params allowed": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, b *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			b.Spec.ParamRef.ParameterNotFoundAction = ptr.To(admissionregistrationv1.AllowAction)
+			return true, true
+		},
+		"params by another label": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, b *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			b.Spec.ParamRef.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"x": "y"}}
+			return true, true
+		},
+		"not scoped to profile namespaces": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, b *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			b.Spec.MatchResources = nil
+			return true, true
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			r, c := jobTemplateTestReconciler(t, agent)
+			ctx := context.Background()
+			profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+			pns := profileNamespaceName(agent)
+			if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+				t.Fatalf("in place: %v / %v", err, profileErr)
+			}
+			if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); err != nil {
+				t.Fatalf("precondition: no Jobs RoleBinding with the policy in place: %v", err)
+			}
+			policy, binding := &admissionregistrationv1.ValidatingAdmissionPolicy{}, &admissionregistrationv1.ValidatingAdmissionPolicyBinding{}
+			if err := c.Get(ctx, types.NamespacedName{Name: dispatcherJobPolicyName}, policy); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Get(ctx, types.NamespacedName{Name: dispatcherJobPolicyName}, binding); err != nil {
+				t.Fatal(err)
+			}
+			keepPolicy, keepBinding := loosen(policy, binding)
+			for obj, keep := range map[client.Object]bool{policy: keepPolicy, binding: keepBinding} {
+				var err error
+				if keep {
+					err = c.Update(ctx, obj)
+				} else {
+					err = c.Delete(ctx, obj)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+				t.Fatalf("loosened: %v / %v", err, profileErr)
+			}
+			for _, o := range []struct {
+				obj  client.Object
+				name string
+			}{
+				{&rbacv1.RoleBinding{}, a2aDispatcherJobsRoleName(agent)},
+				{&rbacv1.Role{}, a2aDispatcherJobsRoleName(agent)},
+				{&corev1.PodTemplate{}, dispatchJobTemplatePrefix + "tse"},
+			} {
+				if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: o.name}, o.obj); !apierrors.IsNotFound(err) {
+					t.Errorf("%T %s survived %s: %v", o.obj, o.name, name, err)
+				}
+			}
+			var cm corev1.ConfigMap
+			if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplate"`) {
+				t.Errorf("the dispatch config still carries a Job template with %s", name)
+			}
+		})
+	}
 }

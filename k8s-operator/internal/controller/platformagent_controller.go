@@ -571,6 +571,11 @@ type PlatformAgentReconciler struct {
 // not already hold. No watch: every read goes through a2aReader(), uncached.
 // Approved by @bnaylor, 2026-10-30 (#3655 PR 6).
 // +kubebuilder:rbac:groups="",resources=podtemplates,verbs=get;list;create;update;patch;delete
+// `get` on the dispatcher Job admission policy and its binding: before the
+// dispatcher gets its Jobs Role, the operator checks both are in the cluster
+// as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
+// watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch

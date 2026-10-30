@@ -576,6 +576,16 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// dispatch config and into the admission policy's params, so the two
 	// never differ.
 	jobTemplates := dispatchJobTemplates(agent, profiles, r.imageVolumeSupported(agent))
+	// Signalled, the policy must also be in the cluster as rendered before
+	// the dispatcher gets Job mode: no templates and no Jobs Role otherwise.
+	jobMode := dispatcherJobPolicyRendered()
+	if jobMode {
+		if ok, why := r.dispatcherJobPolicyInPlace(ctx); !ok {
+			jobMode, jobTemplates = false, nil
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
+				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks run on the worker pool", why))
+		}
+	}
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, jobTemplates)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render the dispatch config: %w", err)
@@ -628,7 +638,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// Job mode, only where the chart rendered its admission policy:
 	// elsewhere, what an earlier pass rendered goes. The policy's params
 	// before the Role that lets the dispatcher create Jobs against them.
-	if !dispatcherJobPolicyRendered() {
+	if !jobMode {
 		return r.deleteDispatcherJobResources(ctx, agent), nil
 	}
 	if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
