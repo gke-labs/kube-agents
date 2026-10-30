@@ -609,6 +609,29 @@ def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def token_count(value: Any) -> int | None:
+    """A token bucket's value as a count, or None when it is not one: null,
+    a flag, a float or a negative number."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _tokens_partial(tokens: dict[str, Any]) -> bool:
+    """Whether the record's counts are short of what the run billed: the
+    inject transport could not read a link of the chain (``usage_partial``),
+    a delegated worker's session reported no counts (``workers.unbilled``),
+    or the run delegated and no worker could be billed (``workers`` null:
+    the pod read failed, or every session was unbilled), so nothing of the
+    workers' is in ``total``. A run that delegated nothing has no ``workers``.
+    """
+    if "workers" in tokens and tokens["workers"] is None:
+        return True
+    workers = tokens.get("workers")
+    unbilled = workers.get("unbilled") if isinstance(workers, dict) else None
+    return tokens.get("usage_partial") is True or bool(unbilled)
+
+
 @dataclass(frozen=True)
 class RepResult:
     """One repetition's verdict.
@@ -633,6 +656,12 @@ class RepResult:
     latency: float | None = None
     turn1_s: float | None = None
     total_tokens: int | None = None
+    #: The record's top-level ``input`` and ``output`` buckets, and whether
+    #: its counts are short (:func:`_tokens_partial`), for the build log's
+    #: tokens line. Not in the hand-off: the dashboard reads them from the log.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    tokens_partial: bool = False
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
@@ -1130,6 +1159,9 @@ def classify_rep(
             total_tokens=(
                 record.tokens.get("total") if record and record.tokens else None
             ),
+            input_tokens=token_count(record.tokens.get("input")) if record else None,
+            output_tokens=token_count(record.tokens.get("output")) if record else None,
+            tokens_partial=_tokens_partial(record.tokens) if record else False,
             report=record.output if record else "",
             not_applicable_checks=list(lane.not_applicable) if lane else [],
         )

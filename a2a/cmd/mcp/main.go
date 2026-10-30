@@ -206,7 +206,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		log.Error("mcp listen", "addr", s.listen, "err", err)
 		return err
 	}
-	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log, mcp.WithSwarm(bus, convs)))
 }
 
 // toolsFor is the tools this pod offers: inspect_pr only when it has a

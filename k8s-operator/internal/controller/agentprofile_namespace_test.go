@@ -87,7 +87,7 @@ func TestBuildProfileQuota(t *testing.T) {
 }
 
 // The fence selects every pod in the profile namespace, admits nothing in,
-// and lets out DNS, the bus and LiteLLM only.
+// and lets out DNS, the bus, LiteLLM and the credential broker only.
 func TestBuildProfileNetworkPolicy(t *testing.T) {
 	np := buildProfileNetworkPolicy(a2aTestAgent(), []string{"10.96.0.10"})
 	if np.Namespace != "test-ns-profiles" || np.Name != "test-agent-profile-netpol" {
@@ -102,8 +102,8 @@ func TestBuildProfileNetworkPolicy(t *testing.T) {
 	if len(np.Spec.Ingress) != 0 {
 		t.Errorf("ingress rules %+v, want none", np.Spec.Ingress)
 	}
-	if len(np.Spec.Egress) != 3 {
-		t.Fatalf("egress rules %d, want exactly DNS, NATS and LiteLLM: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	if len(np.Spec.Egress) != 4 {
+		t.Fatalf("egress rules %d, want exactly DNS, NATS, LiteLLM and the credential broker: %+v", len(np.Spec.Egress), np.Spec.Egress)
 	}
 	if p := np.Spec.Egress[0].Ports; len(p) != 2 || p[0].Port.IntVal != a2aDNSPort {
 		t.Errorf("first egress rule ports %+v, want DNS", p)
@@ -128,6 +128,12 @@ func TestBuildProfileNetworkPolicy(t *testing.T) {
 	if len(llm.To) != 1 || llm.To[0].PodSelector.MatchLabels["app"] != "litellm" ||
 		!reflect.DeepEqual(llm.To[0].NamespaceSelector.MatchLabels, map[string]string{"kubernetes.io/metadata.name": "test-ns"}) {
 		t.Errorf("third egress rule %+v, want the LiteLLM pods in the agent's namespace", llm)
+	}
+	broker := np.Spec.Egress[3]
+	if len(broker.Ports) != 1 || broker.Ports[0].Port.IntVal != credentialProxyPort || len(broker.To) != 1 ||
+		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(a2aTestAgent())) ||
+		!reflect.DeepEqual(broker.To[0].NamespaceSelector.MatchLabels, map[string]string{"kubernetes.io/metadata.name": "test-ns"}) {
+		t.Errorf("fourth egress rule %+v, want the broker's pods in the agent's namespace on its credentialed port", broker)
 	}
 }
 

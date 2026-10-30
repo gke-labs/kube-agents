@@ -286,6 +286,7 @@ def test_the_per_repetition_detail_is_printed(kanban_task, tmp_path, capsys):
 
 REPORT_PREFIX = "  rep 1 report: "
 TIMING_PREFIX = "  rep 1 timing: "
+TOKENS_PREFIX = "  rep 1 tokens: "
 
 
 def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
@@ -293,17 +294,18 @@ def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
 ):
     """The dashboard quotes the agent's own words beside the grader's reason,
     and reads them from the build log: one `rep N report:` line under the
-    repetition's grading line (and its timing line), which itself does not
-    change."""
+    repetition's grading line (and its timing and tokens lines), which itself
+    does not change."""
     out = tmp_path / "case.json"
     run_case(kanban_task, [FIXTURE_RUNS / RED_RUNS[0]], out)
     lines = capsys.readouterr().out.splitlines()
     graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: fail -- "))
     assert lines[graded + 1].startswith(TIMING_PREFIX), lines[graded + 1]
-    assert lines[graded + 2].startswith(
+    assert lines[graded + 2].startswith(TOKENS_PREFIX), lines[graded + 2]
+    assert lines[graded + 3].startswith(
         REPORT_PREFIX + "Delegated to the platform agent — the task was created with id "
         "t_bbbebbd5. [Redacted:"
-    ), lines[graded + 2]
+    ), lines[graded + 3]
     # The report never rides in the hand-off; the log is its one channel.
     assert "report" not in payload(out)["reps"][0]
 
@@ -373,13 +375,74 @@ def test_the_timing_line_follows_the_grading_line_and_omits_missing_fields(
     # A record with no latency blocks rather than fails; the line is the same.
     graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: "))
     assert lines[graded + 1] == expected
-    assert lines[graded + 2].startswith(REPORT_PREFIX)
+    assert lines[graded + 2].startswith(TOKENS_PREFIX)
+    assert lines[graded + 3].startswith(REPORT_PREFIX)
 
 
 def test_no_timing_line_when_both_values_are_missing(kanban_task, make_run, tmp_path, capsys):
     run_case(kanban_task, [_timed_run(make_run, None)], tmp_path / "case.json")
     printed = capsys.readouterr().out
     assert "  rep 1: " in printed and TIMING_PREFIX not in printed
+
+
+def _tokened_run(make_run, tokens):
+    def tokened(rec):
+        rec["tokens"] = tokens
+
+    return make_run("kanban_red_1", tokened)
+
+
+# The record shapes the harness writes (bench/kube_agents_bench/harness.py):
+# the api transport's session buckets with the workers folded in under
+# ``front_door``, and the inject transport's front-door counts with the
+# chain's ``children`` and ``usage_partial``.
+_API_TOKENS = {
+    "input": 18, "cached": 128562, "cache_write": 144706, "reasoning": 261, "output": 1867,
+    "total": 275153,
+    "front_door": {"input": 10, "cached": 100, "cache_write": 50, "reasoning": 0, "output": 7, "total": 167},
+    "workers": {"input": 8, "total": 274986, "by_agent": {}, "unbilled": []},
+}
+_INJECT_TOKENS = {
+    "input": 60468, "cached": None, "cache_write": None, "reasoning": None, "output": 79,
+    "total": 151969, "children": {"input": 91204, "output": 218, "total": 91422},
+}
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected"),
+    [
+        (_API_TOKENS, TOKENS_PREFIX + "input=18 output=1867 total=275153"),
+        (_INJECT_TOKENS, TOKENS_PREFIX + "input=60468 output=79 total=151969"),
+        ({**_INJECT_TOKENS, "usage_partial": True}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
+        (
+            {**_API_TOKENS, "workers": {**_API_TOKENS["workers"], "unbilled": [{"session": "s1"}]}},
+            TOKENS_PREFIX + "input=18 output=1867 total=275153 partial=1",
+        ),
+        ({**_INJECT_TOKENS, "workers": None}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
+        ({"input": None, "output": 0, "total": 0}, TOKENS_PREFIX + "output=0 total=0"),
+        ({"input": True, "output": 1.5, "total": 40}, TOKENS_PREFIX + "total=40"),
+    ],
+    ids=["api", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
+)
+def test_the_tokens_line_follows_the_timing_line(kanban_task, make_run, tmp_path, capsys, tokens, expected):
+    """The dashboard reads each repetition's token counts from `rep N
+    tokens:`, a shape the collector's `rep N:` match skips."""
+    run_case(kanban_task, [_tokened_run(make_run, tokens)], tmp_path / "case.json")
+    lines = capsys.readouterr().out.splitlines()
+    graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: "))
+    assert lines[graded + 1].startswith(TIMING_PREFIX)
+    assert lines[graded + 2] == expected
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [{"input": None, "output": None, "total": None, "usage_partial": True}, {}],
+    ids=["all-null", "no-tokens"],
+)
+def test_no_tokens_line_when_the_record_has_no_count(kanban_task, make_run, tmp_path, capsys, tokens):
+    run_case(kanban_task, [_tokened_run(make_run, tokens)], tmp_path / "case.json")
+    printed = capsys.readouterr().out
+    assert "  rep 1: " in printed and TOKENS_PREFIX not in printed
 
 
 @pytest.mark.parametrize(

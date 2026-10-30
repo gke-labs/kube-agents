@@ -152,7 +152,7 @@ with a filed issue naming the exit condition:
   #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
   2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
   `would-demote`. 15 of the 37 were Vertex 429s
-  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), fix open in
+  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), a fix proposed in
   [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
   being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
   still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
@@ -161,8 +161,25 @@ with a filed issue naming the exit condition:
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
   list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal left
   `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
-  consistency-drift-outlier took a roster seat on 2026-10-26 (below). Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
-  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
+  consistency-drift-outlier took a roster seat on 2026-10-26 (below). The agent-side fix landed
+  in [#3609](https://github.com/gke-labs/kube-agents/pull/3609) on 2026-10-23: a named-cluster
+  comparison starts with the drift collector, whose rule reads the leftover block as off, and a
+  second objective grades that the collector ran; #3448 was closed unmerged on 2026-10-26.
+  Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26, agent on
+  Claude): 9/9 scored on the inject lane and 10/10 on the api lane with the route objective
+  graded. Its roster line was withdrawn the same week, on #3975's review thread: with #3609's
+  route reverted the
+  probe still passed 10/10 on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
+  2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
+  current models read the block correctly on their own, so a presubmit seat could not fail when
+  the fix it guards is undone. It stays a nightly case; the domain's seat is
+  consistency-drift-outlier's. No CI lane grades its route check today: the nightly halves run
+  through the inject door since #3783, and since #3969 retired the today-mode nightly the
+  api-lane jobs that remain carry the presubmit list (the GitLab nightly its own list), not the
+  nightly file, so the route is graded only on an api-lane run that carries the case, as #3975's
+  today-lane measuring run did. Enters again only once a CI lane grades that route check (an
+  api-lane job that runs the nightly file, or the case on a list such a job reads) and the record
+  under it holds; #3598 stays open as that tracker, its Gemini-nightly bar retired with the lane.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its

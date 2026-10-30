@@ -201,6 +201,13 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l.Lock()
 	defer l.Unlock()
 
+	// A stopped gateway can't read anything again: its run context is done,
+	// so every read and every retry fails the same way, and a requeue would
+	// spin for the life of the process.
+	if g.runCtx.Err() != nil {
+		g.dropStoppedBatch(sessionKey, batch)
+		return
+	}
 	ctx, cancel := context.WithTimeout(g.runCtx, turnTimeout)
 	defer cancel()
 
@@ -211,12 +218,23 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		return e
 	})
 	if err != nil {
-		// The events stay unrendered but the stream keeps them; requeue the
+		// The gateway may have begun stopping during the read.
+		if g.runCtx.Err() != nil {
+			g.dropStoppedBatch(sessionKey, batch)
+			return
+		}
+		// The events stay unrendered, and they were acked when they were
+		// queued, so the stream won't redeliver them (#4170); requeue the
 		// batch so a transient KV failure on a terminal event cannot wedge
 		// the conversation with the result never posted.
 		g.log.Error("relay: session record unavailable; requeueing batch", "session", sessionKey, "err", err)
 		go func() {
-			time.Sleep(requeueDelay)
+			select {
+			case <-g.runCtx.Done():
+				g.dropStoppedBatch(sessionKey, batch)
+				return
+			case <-time.After(requeueDelay):
+			}
 			for _, item := range batch {
 				g.events.enqueue(sessionKey, item)
 			}
@@ -1011,4 +1029,10 @@ func withRetry(n int, f func() error) error {
 		time.Sleep(time.Duration(i+1) * kvRetryPause)
 	}
 	return err
+}
+
+// dropStoppedBatch records a batch a stopping gateway won't render: the one
+// line that says which conversation lost how many events.
+func (g *Gateway) dropStoppedBatch(sessionKey string, batch []relayItem) {
+	g.log.Warn("relay: gateway stopping; batch not rendered", "session", sessionKey, "events", len(batch))
 }

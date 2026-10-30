@@ -521,7 +521,10 @@
     "zonal-skew-capacity": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
-      "probes": ["deployment/capacity-starved-worker"],
+      "probes": [
+        "deployment/capacity-starved-worker",
+        "deployment/first-zone-sponge"
+      ],
       "fixture": "capacity-starved-worker Deployment, four replicas at 120m CPU each against two e2-small nodes, so some pods run and the rest stay Pending with an insufficient-cpu event",
       "state": [
         {

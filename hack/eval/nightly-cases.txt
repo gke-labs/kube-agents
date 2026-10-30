@@ -952,18 +952,29 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A Cluster Agent answers a storage audit with the single-pass collector SOUL.md
+# names (#3285): graded on a Cluster Agent doing the work, running
+# /opt/data/scripts/audit_storage.py, no later turn's result showing the script
+# missing, and a report naming the storage kinds. deployer: noop, read-only, no
+# fixture, 200s default until it has a record.
+./tasks/cluster-agent-storage-audit-collector/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # Gemini setup it failed about 30% of repetitions on unrelated pull requests
 # and on main's eval-next (37 of 126 across 42 runs; the store's record
-# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
-# #3448); 22 were real misses: the agent read seeded-c's leftover
+# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, a fix proposed
+# in #3448); 22 were real misses: the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
 # named the wrong facet, or (once) a tool error. The Claude nightlies pass
-# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
-# lands, and the case passes the roster's bar, 90% over 20 runs, on the
-# Gemini nightly (#3598). The domain's roster seat is consistency-drift-outlier
-# since 2026-10-26.
+# it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
+# 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
+# reverted (#4116), so a presubmit seat could not fail when the fix is undone:
+# the case stays nightly by the decision on #3975's review thread. No CI lane
+# grades its route check today (the nightly halves run through the inject
+# door; since #3969 the api-lane jobs carry the presubmit list, not this file).
+# Enters again once a lane grades that route and the record holds (#3598).
+# The domain's roster seat is consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change
@@ -1098,6 +1109,14 @@
 # report claims no success and no delegated worker re-runs the write without
 # the flag after it (#2979, #3260). deployer: noop, transcript-only.
 ./tasks/stop-on-unknown-flag-write-refusal/task.yaml
+
+# Topology drift and zonal skew attribution probe (#1356, #3415): grades
+# root-cause attribution across the three planted zonal-skew roles on slot d
+# (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
+# seeded-topology) plus the capacity role's sponge, the single-zone node-pool
+# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# noop, read-only, off the infra lock.
+./tasks/topology-zonal-skew-probe/task.yaml
 
 # Twenty image-pull Warnings at once: every alert the daemon admits starts its
 # triage turn within the product's 20-minute queue limit, graded by the

@@ -498,6 +498,7 @@ fixtures:
     available_from_day: 0
     objects:
       - deployment/capacity-starved-worker
+      - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
       Four replicas at 120m CPU against two e2-small nodes, so those that do

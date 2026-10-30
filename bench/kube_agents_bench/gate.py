@@ -105,6 +105,7 @@ from kube_agents_bench.scoring import (
     grade_suite,
     is_inject_record,
     load_run,
+    token_count,
 )
 
 __all__ = ["main"]
@@ -221,6 +222,14 @@ REP_TIMING_TURN1_KEY = "turn1_s"
 # The line's precision. A value that rounds to zero at it is left out, as the
 # collector reads `0.0` as unknown.
 REP_TIMING_DECIMALS = 1
+# The keys of the `rep N tokens:` line, which the collector
+# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS) parses the same way:
+# the record's top-level counts, and the flag, printed only when set, that
+# says they are short of what the run billed.
+REP_TOKENS_INPUT_KEY = "input"
+REP_TOKENS_OUTPUT_KEY = "output"
+REP_TOKENS_TOTAL_KEY = "total"
+REP_TOKENS_PARTIAL_FIELD = "partial=1"
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
 # kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
@@ -529,8 +538,23 @@ def _cmd_case(args: argparse.Namespace) -> int:
         )
         if timing:
             print(f"  rep {rep.index} timing: {timing}")
-        # The agent's own words, one line under the grading line of every
-        # repetition that did not pass, so the dashboard can quote the report
+        # The record's token counts, for the dashboard's per-repetition
+        # spend. A missing count is left out, and no line at all when every
+        # one is; zero is a count (a record that billed nothing) and is kept.
+        counts = " ".join(
+            f"{key}={value}"
+            for key, value in (
+                (REP_TOKENS_INPUT_KEY, rep.input_tokens),
+                (REP_TOKENS_OUTPUT_KEY, rep.output_tokens),
+                (REP_TOKENS_TOTAL_KEY, token_count(rep.total_tokens)),
+            )
+            if value is not None
+        )
+        if counts:
+            partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
+            print(f"  rep {rep.index} tokens: {counts}{partial}")
+        # The agent's own words, one line under the grading line (after the
+        # timing and tokens lines) of every repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty
         # report (a transport failure's, typically) prints nothing rather
         # than an empty line. Its own shape -- `rep N report:` -- so nothing

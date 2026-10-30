@@ -108,6 +108,9 @@ layout and are collected from the moment they start running.
   `finished.json`'s `revision` and `started.json`'s `repo-commit` (a
   periodic's `finished.json` says `revision: main` and keeps the commit in
   `started.json`); `null` when neither is one.
+- `base_sha` — first 7 chars of the main commit the run was built on, from the
+  base segment of `started.json`'s `repos` map; `null` when absent. Optional:
+  a document written before the collector recorded it has no key.
 - `project` — from the `Successfully leased project: <name>` log line;
   `null` when the log never got that far.
 - `started` / `finished` — `started.json` / `finished.json` timestamps as
@@ -153,8 +156,9 @@ layout and are collected from the moment they start running.
     entry per indented `rep N: <verdict> -- <text>` grading line under the
     task's verdict line, in log order:
     `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
-    plus `"excerpt": <string>` when the log carried one, and `"agent_s"` /
-    `"turn1_s"` when the log carried them (below).
+    plus `"excerpt": <string>` when the log carried one, `"agent_s"` /
+    `"turn1_s"` when the log carried them, and `"tokens"` when the log
+    carried a count (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -186,8 +190,9 @@ layout and are collected from the moment they start running.
       dump stripped, truncated to 300 chars. `null` for passing reps and
       when nothing remains.
     - `excerpt` — **optional, additive**: the agent's own words — the text
-      of the `rep N report: <text>` line `bench-gate case` prints right
-      under the grading line of a repetition that did not pass (since
+      of the `rep N report: <text>` line `bench-gate case` prints under the
+      grading line of a repetition that did not pass, after its timing and
+      tokens lines (since
       2026-09-15): the first 300 characters of the agent's final report
       (`results.json`'s `output`, the "Actual Output" the judge grades),
       whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
@@ -210,7 +215,8 @@ layout and are collected from the moment they start running.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
-      right under the grading line (before any `rep N report:` line), one
+      right under the grading line (before any `rep N tokens:` or
+      `rep N report:` line), one
       decimal each. `agent_s`
       is the agent run's wall clock (`results.json`'s `latency`, which
       devops-bench takes around the harness run: the delegation wait is in
@@ -227,6 +233,32 @@ layout and are collected from the moment they start running.
       when the line did not carry it, when the log has no such line (every
       build graded before it existed), or when the line follows no grading
       line of that repetition: absence means unknown.
+    - `tokens` — **optional, additive**: what the repetition billed, from the
+      `rep N tokens: input=<n> output=<n> total=<n> [partial=1]` line
+      `bench-gate case` prints right under the timing line, as
+      `{"input": <int|null>, "output": <int|null>, "total": <int|null>, "partial": <bool>}`.
+      The counts are `results.json`'s top-level `tokens.input`,
+      `tokens.output` and `tokens.total`. `total` is everything the run
+      billed on both transports: on the api transport the front door's
+      session plus its delegated workers; on the inject transport the front
+      door's turns plus the chain's child tasks plus the workers (and null
+      when the gateway reported no usage, whatever the workers billed).
+      `input` and `output` differ by transport: on the api transport they
+      include the workers and `input` excludes cached reads (unless the
+      front door's session row could not be read); on the inject
+      transport they are the front door's turns alone and `input` counts
+      cached reads. `partial` is true when the record says its counts are
+      short: the inject transport could not read a link of the chain
+      (`tokens.usage_partial`), a worker session reported no counts
+      (`tokens.workers.unbilled`), or the run delegated work whose workers
+      could not be billed at all (`tokens.workers` null), so `total` is the
+      front door's alone. A count the line did not carry, or one
+      that is not a whole number at or above zero, is `null`; zero is a
+      count. The collector consumes the line whole, like the timing line.
+      The key is **absent** when the line carried no count, when the log has
+      no such line (every build graded before it existed, and any record
+      with no token accounting), or when the line follows no grading line
+      of that repetition: absence means unknown.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;

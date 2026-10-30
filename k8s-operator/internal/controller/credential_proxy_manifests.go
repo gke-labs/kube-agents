@@ -348,7 +348,7 @@ func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Ser
 // buildCredentialProxyDeployment is buildCredentialProxyDeploymentForPlugins
 // with no plugins.
 func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHash string) *appsv1.Deployment {
-	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil, true)
+	return buildCredentialProxyDeploymentForPlugins(agent, policyHash, nil, true, credentialProxyProfileConfig{})
 }
 
 // buildCredentialProxyDeploymentForPlugins renders the standalone proxy pod.
@@ -369,8 +369,9 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 //
 // The AgentPlugins resolved for the agent reach the container's environment
 // (buildCredentialProxyEnvForPlugins); buildCredentialProxyDeployment is this
-// with none.
-func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) *appsv1.Deployment {
+// with none. So does the profile role's configuration (credential_proxy_profiles.go):
+// the AgentProfile identities and the task-signing public key.
+func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) *appsv1.Deployment {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		saName = agent.Spec.Security.ServiceAccountName
@@ -429,7 +430,7 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 					Affinity:         affinity,
 					NodeSelector:     nodeSelector,
 					Tolerations:      tolerations,
-					Containers:       []corev1.Container{buildCredentialProxyContainerForPlugins(agent, agentPlugins, mcpIdentityOwned)},
+					Containers:       []corev1.Container{buildCredentialProxyContainerForPlugins(agent, agentPlugins, mcpIdentityOwned, profiles)},
 					Volumes:          buildCredentialProxyRuntimeVolumes(agent),
 				},
 			},
@@ -443,7 +444,7 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 // buildCredentialProxyContainer is buildCredentialProxyContainerForPlugins with
 // no plugins.
 func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
-	return buildCredentialProxyContainerForPlugins(agent, nil, true)
+	return buildCredentialProxyContainerForPlugins(agent, nil, true, credentialProxyProfileConfig{})
 }
 
 // buildCredentialProxyContainerForPlugins is the credential half of the old sidecar: Envoy
@@ -454,7 +455,7 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 // One variant, because the broker has one placement: a Deployment of its own.
 // It shares no pod with the agent, which holds the credentials it mints from,
 // and no pod with the sandbox, which runs model-authored code.
-func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) corev1.Container {
+func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) corev1.Container {
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
@@ -463,7 +464,7 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 	// buildCredentialProxyEnv. 0.0.0.0 because both callers arrive over the
 	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
 	// are hosted in this same process, and one listener serves both.
-	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, mcpIdentityOwned)
+	envVars := buildCredentialProxyEnvForPlugins(agent, agentPlugins, mcpIdentityOwned, profiles)
 	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
