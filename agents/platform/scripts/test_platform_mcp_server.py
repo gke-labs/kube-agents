@@ -1545,20 +1545,17 @@ class TestFindingsQueueTools(unittest.TestCase):
         platform_mcp_server.findings_publication("nudge", "chat", content_hash="h1")
         self.assertEqual(self.captured[-1][2], {"target_kind": "chat", "content_hash": "h1"})
 
-    def test_a_decision_covers_its_item_without_asking_unless_a_row_is_unnamed(self):
+    def test_a_decision_covers_its_named_rows_and_says_what_stays_open(self):
         # The model reads this docstring as the tool's description: without
         # the rule, a careful model asks before a permanent decision that also
         # covers rows the user did not name (findings-decision-covers-item).
-        # 'queued' is the one state no message has named (mark_surfaced moves
-        # every named row out of it), so it is the condition for asking.
+        # The cascade leaves 'queued' (never named) rows open, so the model is
+        # told to report them rather than to look for them first.
         doc = " ".join(platform_mcp_server.update_finding.__doc__.split())
         self.assertIn("Covering the rest of the item is the decision's design, not a side effect to confirm", doc)
         self.assertIn("say in the reply which other findings it covered", doc)
-        self.assertIn("before the call, look for one: get_findings(project=..., cluster=..., state='queued')", doc)
-        self.assertIn("If there is one, ask the user instead of calling", doc)
-        import findings_queue
-
-        self.assertIn("queued", findings_queue.UNDECIDED_STATES)
+        self.assertIn("its id comes back in `item_rows_left_open`: say in the reply that it is still open", doc)
+        self.assertNotIn("ask the user instead of calling", doc)
 
     def test_a_finding_id_cannot_reroute_the_call(self):
         platform_mcp_server.update_finding("../../v1/sessions", state="accepted")
