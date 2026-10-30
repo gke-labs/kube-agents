@@ -547,3 +547,42 @@ func TestEnsureConnectedRefusesToPickAmongSeveralDiscoveredDeployments(t *testin
 		})
 	}
 }
+
+// discover_deployments (which the host also runs to read the kube-agents://deployments
+// resource) must not make one of several installs active, nor may a later scan after a prune,
+// so the send that follows refuses with the ambiguity error instead of picking one.
+func TestDiscoverThenSendRefusesToPickAmongSeveralDeployments(t *testing.T) {
+	two := []DeploymentProfile{
+		{Name: "alpha", KubeContext: "ctx-a", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+		{Name: "beta", KubeContext: "ctx-b", Namespace: "ns", PlatformAgentName: "pa", Ready: true},
+		{Name: "gamma", KubeContext: "ctx-c", Namespace: "ns", PlatformAgentName: "pa", Ready: false},
+	}
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster := &failingClusterAccess{discoverEntries: two, tunnelErr: errors.New("tunnel down")}
+	srv, err := NewServer(ServerOptions{Store: store, Cluster: cluster})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+
+	sendRefuses := func(step, want string) {
+		t.Helper()
+		if res := srv.CallTool(context.Background(), ToolDiscoverDeployments, json.RawMessage(`{}`)); res.IsError {
+			t.Fatalf("%s: discover_deployments: %+v", step, res)
+		}
+		if p, ok := store.ActiveDeployment(); ok {
+			t.Fatalf("%s: discover_deployments made %q active", step, p.Name)
+		}
+		res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"hi"}`))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, errDeploymentAmbiguous.Error()) || !strings.Contains(res.Content[0].Text, want) {
+			t.Fatalf("%s: send_message after discover_deployments = %+v; want the ambiguity error naming %s", step, res, want)
+		}
+	}
+	sendRefuses("fresh store", "alpha, beta, gamma")
+	// A full scan that no longer lists one install prunes it; the two left are still ambiguous.
+	cluster.discoverEntries = two[1:]
+	sendRefuses("after a prune", "beta, gamma")
+}

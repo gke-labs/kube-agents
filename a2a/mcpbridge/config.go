@@ -491,46 +491,28 @@ func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 }
 
 // UpsertDiscoveredForAutoConnect saves a discovery scan made because no deployment was
-// active, and returns the deployment to connect to. One discovered deployment is it; more
-// than one is the same ambiguity error an empty connect_deployment selector gets, and none
-// of them is made active, so the user names one instead of the bridge picking by sort order.
-// A deployment made active meanwhile (another bridge process) is returned as is.
+// active, and returns the deployment to connect to: the active one (another bridge process may
+// have chosen one meanwhile), else the only saved one. Several saved with none active is the
+// same ambiguity error an empty connect_deployment selector gets, naming them, so the user
+// picks one instead of the bridge picking by sort order.
 func (s *ConfigStore) UpsertDiscoveredForAutoConnect(profiles []DeploymentProfile) (DeploymentProfile, error) {
 	defer s.lockForUpdate()()
-	_, wasActive := s.cfg.Deployments[s.cfg.ActiveDeployment]
-	wasActive = wasActive && s.cfg.ActiveDeployment != ""
-	keys := s.upsertDeploymentsLocked(profiles)
-	if !wasActive && len(keys) > 1 {
-		s.cfg.ActiveDeployment = ""
-		_ = s.saveLocked()
-		sort.Strings(keys)
-		return DeploymentProfile{}, fmt.Errorf("%w: no deployment is active; name one of %s", errDeploymentAmbiguous, strings.Join(keys, ", "))
-	}
+	s.upsertDeploymentsLocked(profiles)
 	if err := s.saveLocked(); err != nil {
 		return DeploymentProfile{}, err
 	}
-	p, ok := s.cfg.Deployments[s.cfg.ActiveDeployment]
-	if !ok || s.cfg.ActiveDeployment == "" {
-		return DeploymentProfile{}, errNoDeploymentsSaved
-	}
-	return p, nil
+	_, p, err := s.findDeploymentLocked("")
+	return p, err
 }
 
-// upsertDeploymentsLocked is UpsertDeployments without the save; it returns the distinct
-// saved keys the profiles were merged under.
-func (s *ConfigStore) upsertDeploymentsLocked(profiles []DeploymentProfile) []string {
-	var keys []string
-	seen := make(map[string]bool, len(profiles))
+// upsertDeploymentsLocked is UpsertDeployments without the save.
+func (s *ConfigStore) upsertDeploymentsLocked(profiles []DeploymentProfile) {
 	for _, p := range profiles {
 		if p.Name == "" || p.IsContextProbeFailure() {
 			continue
 		}
 		key := s.resolveDeploymentKeyLocked(p, profiles)
 		p.Name = key
-		if !seen[key] {
-			seen[key] = true
-			keys = append(keys, key)
-		}
 		if existing, ok := s.cfg.Deployments[key]; ok {
 			if p.DirectMCPURL == "" {
 				p.DirectMCPURL = existing.DirectMCPURL
@@ -578,24 +560,20 @@ func (s *ConfigStore) upsertDeploymentsLocked(profiles []DeploymentProfile) []st
 		p.MCPToken = ""
 		p.AgentProfilesUnknown = false
 		s.cfg.Deployments[key] = p
-		if s.cfg.ActiveDeployment == "" && p.Ready {
-			s.cfg.ActiveDeployment = key
-		}
 	}
 	if s.cfg.ActiveDeployment != "" {
 		if _, exists := s.cfg.Deployments[s.cfg.ActiveDeployment]; !exists {
 			s.cfg.ActiveDeployment = ""
 		}
 	}
-	if s.cfg.ActiveDeployment == "" && len(s.cfg.Deployments) > 0 {
-		names := make([]string, 0, len(s.cfg.Deployments))
+	// A deployment becomes active implicitly only when it is the one saved. With several
+	// saved and none active, nothing is elected by readiness, scan order or sort order: every
+	// call that needs a connection gets the ambiguity error until the user names one.
+	if s.cfg.ActiveDeployment == "" && len(s.cfg.Deployments) == 1 {
 		for k := range s.cfg.Deployments {
-			names = append(names, k)
+			s.cfg.ActiveDeployment = k
 		}
-		sort.Strings(names)
-		s.cfg.ActiveDeployment = names[0]
 	}
-	return keys
 }
 
 // SyncDiscoveredDeployments merges a full kubeconfig scan into the store: it upserts the
