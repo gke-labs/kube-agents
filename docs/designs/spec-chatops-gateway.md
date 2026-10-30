@@ -1601,11 +1601,11 @@ only under policy `auto`, when the value is a channel id of at most 32 runes and
 stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks
 neither before a post. The projection joins the stack's teardown list, and a hand edit of it is
 rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
-switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
-that change merges after the gateway code, never before it. The gateway keeps no copy of the home
-channel. The operator projects the home channel it admitted (the CR field, else the record) into a
-ConfigMap it mounts as a directory in the gateway pod, `/etc/a2a/chat-home`, with one file,
-`slack_home`; the notify route reads that file once per request, in `validate`, and the request posts
+switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
+channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
+operator admits (the CR field, else the record), which the operator change that admits the record
+mounts as a directory in the gateway pod; the notify route reads that file once per request, in
+`validate`, and the request posts
 into the channel it read, so a projection that changes while a report posts does not split the report
 across two channels; a value that is not a channel id reads as empty until the operator rewrites it,
 and a directory that is not mounted (an operator older than the projection) reads as absent: no home

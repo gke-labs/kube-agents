@@ -498,8 +498,9 @@ gateway.
      ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
    - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
      reports: `C…`, or `G…` for some private channels. Under `next` the gateway posts the agent's
-     proactive messages to this channel, or, with it empty, to the channel of the first top-level
-     mention of the agent. A home channel set with `/sethome` lives in the Planning Agent's
+     proactive messages to this channel, or, with it empty and `homeChannelPolicy` auto (the
+     default), to the channel of the first top-level mention of the agent. A home channel set with
+     `/sethome` lives in the Planning Agent's
      profile and does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
      notify route, and with it the reports of board cards
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
