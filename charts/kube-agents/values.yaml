@@ -337,6 +337,14 @@ litellm:
   # fallback.reasoningEffort with this on. Chart-only; the kustomize dev base
   # carries no such key.
   dropParams: false
+  # Prompt-caching breakpoints, which the gateway adds on a Claude model only
+  # (see "Prompt caching" on the site's inference-gateway page).
+  promptCache:
+    # Cache TTL of the breakpoint on the system message: "1h" or "5m". A 1h
+    # write costs 2x the input price and a 5m write 1.25x, so 5m is cheaper
+    # whenever the system prefix is rewritten more often than it is read.
+    # The kustomize anthropic overlay reads LITELLM_SYSTEM_CACHE_TTL.
+    systemTTL: 1h
   # A second alias the router retries on when a primary alias fails, at a
   # specified reasoning effort ("low", "medium", or "high"; "minimal" is omitted
   # because Vertex AI Gemini 3.x Flash rejects thinkingLevel: "minimal" with

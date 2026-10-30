@@ -181,6 +181,16 @@
         "dropParams": {
           "type": "boolean"
         },
+        "promptCache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "systemTTL": {
+              "type": "string",
+              "enum": ["5m", "1h"]
+            }
+          }
+        },
         "fallback": {
           "type": "object",
           "additionalProperties": false,

@@ -759,9 +759,9 @@ Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
 neither key), which only openai_compatible passes, and the optional
-dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds
-and numRetries. Every optional input renders nothing when unset, so the default
-render is unchanged.
+dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds,
+numRetries and systemCacheTTL (5m or 1h; absent renders 1h). Every optional
+input renders nothing when unset, so the default render is unchanged.
 callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
@@ -960,7 +960,7 @@ router_settings:
         role: system
         control:
           type: ephemeral
-          ttl: 1h
+          ttl: {{ .systemCacheTTL | default "1h" }}
       - location: message
         index: -3
       - location: message

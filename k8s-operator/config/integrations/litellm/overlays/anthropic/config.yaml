@@ -24,6 +24,8 @@ litellm_settings:
 # profile and cron tick shares it, and a read refreshes the TTL, so half-hourly
 # cron traffic keeps it warm instead of missing a 5m window every time. The two
 # rolling points ride the conversation tail on the default 5m tier.
+# LITELLM_SYSTEM_CACHE_TTL (default 1h, set in k8s-operator/Makefile) picks the
+# system tier; the chart's litellm.promptCache.systemTTL is the same knob.
 #
 # Anthropic allows four breakpoints per request. LiteLLM counts client-supplied
 # ones and never overwrites them, so a caller that sends its own layout still
@@ -36,7 +38,7 @@ router_settings:
         role: system
         control:
           type: ephemeral
-          ttl: 1h
+          ttl: ${LITELLM_SYSTEM_CACHE_TTL}
       - location: message
         index: -3
       - location: message

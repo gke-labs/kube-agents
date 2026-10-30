@@ -250,7 +250,8 @@ On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
 and only a Claude model gets the prompt-caching breakpoints
-([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching)).
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching));
+`litellm.promptCache.systemTTL` (`1h` by default, or `5m`) sets the system breakpoint's tier.
 `litellm.fallback` and `litellm.dropParams` (both off
 by default) add a fallback alias at a specified reasoning effort with
 `router_settings.fallbacks` to it and drop parameters the
