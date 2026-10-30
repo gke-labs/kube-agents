@@ -175,6 +175,26 @@ class TestCacheProbeRecord(unittest.TestCase):
         self.assertEqual(record["ephemeral_1h_input_tokens"], 60000)
         self.assertEqual(record["ephemeral_5m_input_tokens"], 0)
 
+    def test_the_ttl_split_is_read_from_prompt_tokens_details_too(self) -> None:
+        _, record = self._line(
+            _kwargs("s"),
+            _response(
+                prompt_tokens=100,
+                prompt_tokens_details={
+                    "cached_tokens": 0,
+                    "cache_creation_token_details": {"ephemeral_5m_input_tokens": 40, "ephemeral_1h_input_tokens": 60},
+                },
+            ),
+        )
+        self.assertEqual(record["ephemeral_5m_input_tokens"], 40)
+        self.assertEqual(record["ephemeral_1h_input_tokens"], 60)
+
+    def test_thinking_logs_its_type_and_budget_only(self) -> None:
+        kwargs = _kwargs("s")
+        kwargs["optional_params"]["thinking"] = {"type": "enabled", "budget_tokens": 4096}
+        self.assertEqual(self.mod.probe_record(kwargs, {})["thinking"], {"type": "enabled", "budget_tokens": 4096})
+        self.assertIsNone(self.mod.probe_record(_kwargs("s"), {})["thinking"])
+
     def test_usage_is_read_from_an_object_response(self) -> None:
         class Usage:
             def model_dump(self):
@@ -239,7 +259,9 @@ class TestCacheProbeRecord(unittest.TestCase):
             for _ in range(3):
                 asyncio.run(self.mod.proxy_handler_instance.async_log_success_event(bad, None, None, None))
         self.assertEqual(len(captured.records), 1)
-        self.assertIn("record not built", captured.records[0].getMessage())
+        message = captured.records[0].getMessage()
+        self.assertTrue(message.startswith(self.mod.FAILURE_PREFIX), message)
+        self.assertFalse(message.startswith(self.mod.LOG_PREFIX), message)
 
 
 if __name__ == "__main__":

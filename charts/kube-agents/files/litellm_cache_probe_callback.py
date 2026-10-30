@@ -13,7 +13,9 @@ nothing of the prompt's text:
 `conv` is a hash of the first non-system message, which a session keeps for
 its whole life, and `msgs` the request's message count, which grows with every
 call; together they order one session's calls across both gateway replicas,
-which no per-process counter could. `tools_hash` covers the tool list,
+which no per-process counter could. A session whose context compression
+rewrites its first turn shows up under a second `conv` from then on.
+`tools_hash` covers the tool list,
 `system_hash` the whole system text, and `system_chunks` one short hash per
 fixed-size slice of it, so the first slice that changes says where in the
 prompt the change sits (Hermes puts its stable part first and its volatile
@@ -41,6 +43,8 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger("kube_agents.litellm_cache_probe")
 
 LOG_PREFIX = "cache probe: "
+# Distinct from LOG_PREFIX, so a reader splitting on that parses JSON alone.
+FAILURE_PREFIX = "cache probe failed, record not built: "
 # Hex digits kept of each sha256: enough to tell one session's versions of a
 # part apart, too short to be worth reversing.
 HASH_CHARS = 8
@@ -54,6 +58,10 @@ ROLE_KEY = "role"
 CONTENT_KEY = "content"
 TEXT_KEY = "text"
 TOOLS_KEY = "tools"
+# LiteLLM maps reasoning_effort into this for Claude; a change in it re-writes
+# the cached messages, so its type and budget are logged (numbers only).
+THINKING_KEY = "thinking"
+THINKING_FIELDS = ("type", "budget_tokens")
 USAGE_KEY = "usage"
 # Usage fields copied as they come, when the provider returns them.
 USAGE_FIELDS = (
@@ -62,8 +70,10 @@ USAGE_FIELDS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
-# LiteLLM's split of the cache write by TTL tier, when it carries one.
+# LiteLLM's split of the cache write by TTL tier, when it carries one: at the
+# top of usage, or under its prompt_tokens_details, depending on the release.
 CACHE_WRITE_DETAILS_KEY = "cache_creation_token_details"
+PROMPT_DETAILS_KEY = "prompt_tokens_details"
 CACHE_WRITE_TIER_FIELDS = ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
 # The proxy leaves the root logger at WARNING and this logger has no handler
 # of its own, so without these the per-call line never reaches the pod log.
@@ -141,11 +151,20 @@ def usage_fields(response_obj: Any) -> dict:
     """The token counts LiteLLM reports for the call, as it reports them."""
     usage = _as_dict(_get(response_obj, USAGE_KEY))
     fields = {name: usage[name] for name in USAGE_FIELDS if isinstance(usage.get(name), int)}
-    details = _as_dict(usage.get(CACHE_WRITE_DETAILS_KEY))
+    details = _as_dict(usage.get(CACHE_WRITE_DETAILS_KEY)) or _as_dict(
+        _as_dict(usage.get(PROMPT_DETAILS_KEY)).get(CACHE_WRITE_DETAILS_KEY)
+    )
     for name in CACHE_WRITE_TIER_FIELDS:
         if isinstance(details.get(name), int):
             fields[name] = details[name]
     return fields
+
+
+def thinking_fields(thinking: Any) -> dict | None:
+    """The thinking setting's type and budget, or None when there is none."""
+    values = _as_dict(thinking)
+    picked = {name: values[name] for name in THINKING_FIELDS if name in values}
+    return picked or None
 
 
 def probe_record(kwargs: dict, response_obj: Any) -> dict:
@@ -170,6 +189,7 @@ def probe_record(kwargs: dict, response_obj: Any) -> dict:
         "system_chunks": system_chunk_hashes(system_text),
         "model": litellm_params.get("model") or kwargs.get("model"),
         "reasoning_effort": optional_params.get("reasoning_effort"),
+        "thinking": thinking_fields(optional_params.get(THINKING_KEY)),
     }
     record.update(usage_fields(response_obj))
     return record
@@ -187,7 +207,7 @@ class CacheProbe(CustomLogger):
         except Exception as exc:  # noqa: BLE001
             if not _failure_warned:
                 _failure_warned = True
-                logger.warning("cache probe: record not built: %s", exc)
+                logger.warning("%s%s", FAILURE_PREFIX, exc)
             return
         logger.info("%s%s", LOG_PREFIX, line)
 
