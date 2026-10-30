@@ -801,9 +801,10 @@ report_partial_verdict() {
 # was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
 # follows it: a pod replaced mid-run starts a fresh gateway log, and the
 # pod and event watch it stops, the previous containers and the restart
-# record are what say why. collect_litellm_log follows those: the
-# thinking-replay hook's per-request line is in the LiteLLM log alone, so a
-# green run without it cannot say whether the hook touched its traffic.
+# record are what say why. collect_litellm_log follows those: the gateway
+# hooks' per-request lines (thinking replay, cache markers) are in the LiteLLM
+# log alone, so a green run without it cannot say whether they touched its
+# traffic.
 # collect_credential_proxy_evidence follows for the same reason: the broker's
 # admission queue is in its log and its metrics alone, and a green run that
 # kept neither cannot say whether the queue came back.

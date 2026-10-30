@@ -143,8 +143,9 @@
 {{- end }}
 {{- end }}
 {{- /*
-  Rendered as the flow list LiteLLM's config expects, the same callbacks the
-  kustomize base names when otel is on. The redaction callback is a module
+  Rendered as the flow list LiteLLM's config expects, seeded with the
+  exporters the kustomize base names when otel is on; the hooks below are
+  appended to the seed. The redaction callback is a module
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}

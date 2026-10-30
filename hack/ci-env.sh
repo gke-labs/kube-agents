@@ -95,9 +95,10 @@ readonly CREDENTIAL_PROXY_METRICS_SCRAPE='import os, sys, urllib.request; port =
 # ─── LiteLLM log capture ─────────────────────────────────────────────────────
 # collect_litellm_log keeps the inference gateway's log as an artifact of
 # every eval run, green ones included, as litellm.log. It used to be taken
-# only by the failure dump, so a green run kept no record of the
-# thinking-replay hook: its per-request "thinking replay: dropped N" line is
-# the only sign it touched the run's traffic. The 429s, Workload Identity
+# only by the failure dump, so a green run kept no record of the gateway's
+# hooks: the thinking-replay hook's per-request "thinking replay: dropped N"
+# line, and the cache-marker hook's "cache markers: dropped N", are the only
+# sign either touched the run's traffic. The 429s, Workload Identity
 # token fetches and Vertex 403/404s the failure dump took it for are here too.
 # Every replica: the chart runs two, each serving its own share of requests,
 # and `logs deployment/...` reads one of them. Bounded like the gateway log:
