@@ -2584,6 +2584,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "eod-event-watcher-daily-report",
                 "stall-watch",
                 "kanban-workspace-gc",
+                "session-retention",
                 "kanban-board-health",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
