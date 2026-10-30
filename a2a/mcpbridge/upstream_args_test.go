@@ -351,3 +351,57 @@ func TestCallRemoteToolGatesAndTranslatesLikeTheBridgesTools(t *testing.T) {
 		t.Fatalf("CallRemoteTool forwarded task_control cancel arguments %v; want stop on c1", args)
 	}
 }
+
+func TestDebugIsNeitherAdvertisedNorForwarded(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	ctx := context.Background()
+	for _, d := range srv.toolDefinitions() {
+		if d.Name != ToolSendMessage && d.Name != ToolTaskControl && d.Name != ToolManageSession {
+			continue
+		}
+		raw, _ := json.Marshal(d.InputSchema)
+		var schema struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := schema.Properties["debug"]; ok {
+			t.Errorf("%s advertises debug, which nothing reads", d.Name)
+		}
+		for _, a := range schema.Properties["action"].Enum {
+			if a == actionDebugOn || a == actionDebugOff {
+				t.Errorf("%s advertises %s, which nothing reads", d.Name, a)
+			}
+		}
+		if strings.Contains(strings.ToLower(d.Description), "debug") {
+			t.Errorf("%s's description offers debug: %s", d.Name, d.Description)
+		}
+	}
+
+	for _, action := range []string{actionDebugOn, actionDebugOff} {
+		res := srv.CallTool(ctx, ToolManageSession, json.RawMessage(`{"action":"`+action+`"}`))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "not supported by the in-cluster server yet") {
+			t.Errorf("manage_session %s: %+v; want it refused as not supported yet", action, res)
+		}
+		if _, _, _, err := srv.CallRemoteTool(ctx, ToolManageSession, json.RawMessage(`{"action":"`+action+`"}`), CallMeta{}, nil); err == nil {
+			t.Errorf("CallRemoteTool manage_session %s was forwarded; want it refused", action)
+		}
+	}
+
+	if res := srv.CallTool(ctx, ToolSendMessage, json.RawMessage(`{"message":"hello","conversation":"c1","debug":true}`)); res.IsError {
+		t.Fatalf("send_message with debug: %+v", res)
+	}
+	if args := nextCallNamed(t, gw, ToolSendMessage); args["debug"] != nil {
+		t.Errorf("send_message forwarded debug: %v", args)
+	}
+	if res := srv.CallTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"get","task_id":"task-1","debug":true}`)); res.IsError {
+		t.Fatalf("task_control get with debug: %+v", res)
+	}
+	if args := nextCallNamed(t, gw, ToolTaskControl); args["debug"] != nil {
+		t.Errorf("task_control forwarded debug: %v", args)
+	}
+}

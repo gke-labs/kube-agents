@@ -133,10 +133,6 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 						"type":        "integer",
 						"description": fmt.Sprintf("Seconds to wait for the answer before returning the still-running task to read later with task_control (default: %d, at most %d; larger values are clamped to %d).", defaultSendWaitSeconds, maxSendWaitSeconds, maxSendWaitSeconds),
 					},
-					"debug": map[string]any{
-						"type":        "boolean",
-						"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
-					},
 				},
 			},
 		},
@@ -183,18 +179,38 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 			},
 		},
 	}
+	if upstreamDebug {
+		for _, d := range defs {
+			if d.Name == ToolSendMessage {
+				d.InputSchema["properties"].(map[string]any)["debug"] = debugProperty()
+			}
+		}
+	}
 	if s.host != nil {
 		defs = s.host.AugmentToolSchemas(defs)
 	}
 	return defs
 }
 
+// debugProperty is send_message's and task_control's debug argument, advertised only once
+// something reads it (upstreamDebug).
+func debugProperty() map[string]any {
+	return map[string]any{
+		"type":        "boolean",
+		"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
+	}
+}
+
 // manageSessionDefinition is manage_session's schema. transcript and clear_killed, and the
 // debug argument only transcript takes, are advertised only once the in-cluster server offers
 // them (upstreamTranscriptAndClearKilled).
 func manageSessionDefinition() ToolDefinition {
-	description := "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, or toggle debug mode on/off."
-	actions := []string{"list", "new", "switch", "session_on", "session_off", "delete", "debug_on", "debug_off"}
+	description := "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, or delete a conversation/session."
+	actions := []string{"list", "new", "switch", "session_on", "session_off", "delete"}
+	if upstreamDebug {
+		description = "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, or toggle debug mode on/off."
+		actions = append(actions, actionDebugOn, actionDebugOff)
+	}
 	aliasFor := "new/switch/session_on/session_off/delete"
 	props := map[string]any{
 		"description": map[string]any{
@@ -203,12 +219,16 @@ func manageSessionDefinition() ToolDefinition {
 		},
 	}
 	if upstreamTranscriptAndClearKilled {
-		description = "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, clear all killed/terminated sessions, toggle debug mode on/off, or view the conversation transcript."
-		actions = []string{"list", "new", "switch", "session_on", "session_off", "delete", "clear_killed", "debug_on", "debug_off", "transcript"}
+		description = "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, clear all killed/terminated sessions, or view the conversation transcript."
+		actions = []string{"list", "new", "switch", "session_on", "session_off", "delete", "clear_killed", "transcript"}
 		aliasFor = "new/switch/session_on/session_off/delete/transcript"
-		props["debug"] = map[string]any{
-			"type":        "boolean",
-			"description": "Optional debug flag (default: false) to include tool call tables and timings when viewing a transcript.",
+		if upstreamDebug {
+			description = "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, clear all killed/terminated sessions, toggle debug mode on/off, or view the conversation transcript."
+			actions = append(actions, actionDebugOn, actionDebugOff)
+			props["debug"] = map[string]any{
+				"type":        "boolean",
+				"description": "Optional debug flag (default: false) to include tool call tables and timings when viewing a transcript.",
+			}
 		}
 	}
 	props["action"] = map[string]any{
@@ -271,10 +291,9 @@ func taskControlDefinition() ToolDefinition {
 			"type":        "integer",
 			"description": "Optional seconds to wait for an in-flight task to finish when action is 'get'.",
 		},
-		"debug": map[string]any{
-			"type":        "boolean",
-			"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
-		},
+	}
+	if upstreamDebug {
+		props["debug"] = debugProperty()
 	}
 	if upstreamTaskListAndSteer {
 		actions = []string{taskActionGet, actionList, taskActionStatus, taskActionSteer, taskActionStop}

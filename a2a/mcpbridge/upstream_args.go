@@ -54,12 +54,29 @@ const upstreamTranscriptAndClearKilled = false
 // gates.
 var sessionActionsAwaitingServer = map[string]bool{actionTranscript: true, actionClearKilled: true, actionPruneAlias: true}
 
+// upstreamDebug gates the debug argument of send_message and task_control, and manage_session's
+// debug_on and debug_off: nothing reads them yet. The in-cluster server has no debug argument
+// (a2a/mcp sendMessageArgs, taskControlArgs) and refuses debug_on/debug_off, and no bridge or
+// HostIntegration code reads the flag debug_on would store. While false, none of them is
+// advertised, a debug argument is dropped before forwarding, and debug_on/debug_off are refused
+// with errSessionActionNotSupported. A host that reads the flag can advertise it again through
+// AugmentToolSchemas and handle the actions in HandleManageSessionAction.
+const upstreamDebug = false
+
+// debugSessionActions are the manage_session actions upstreamDebug gates.
+var debugSessionActions = map[string]bool{actionDebugOn: true, actionDebugOff: true}
+
 func sessionActionAwaitsServer(action string) bool {
-	return !upstreamTranscriptAndClearKilled && sessionActionsAwaitingServer[action]
+	return (!upstreamTranscriptAndClearKilled && sessionActionsAwaitingServer[action]) ||
+		(!upstreamDebug && debugSessionActions[action])
 }
 
 func errSessionActionNotSupported(action string) error {
-	return fmt.Errorf("manage_session %s is not supported by the in-cluster server yet; use list, new, switch, session_on, session_off, delete, debug_on or debug_off, and read a task with task_control get", action)
+	usable := "list, new, switch, session_on, session_off or delete"
+	if upstreamDebug {
+		usable = "list, new, switch, session_on, session_off, delete, debug_on or debug_off"
+	}
+	return fmt.Errorf("manage_session %s is not supported by the in-cluster server yet; use %s, and read a task with task_control get", action, usable)
 }
 
 func taskActionAwaitsServer(action string) bool {
@@ -94,10 +111,13 @@ const (
 // An omitted or non-positive wait is the bridge's default, and one above the server's ceiling
 // is that ceiling; a numeric string is read as its number, and any other value is an error
 // rather than a silent default. mode is dropped (auto is the only mode the server has). The
-// rest (conversation) keep their names; debug has no server counterpart and is ignored there.
+// rest (conversation) keep their names; debug, which the server lacks, is dropped (upstreamDebug).
 func serverSendMessageArgs(args map[string]any) (map[string]any, error) {
 	moveArg(args, "message", "text")
 	delete(args, "mode")
+	if !upstreamDebug {
+		delete(args, "debug")
+	}
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
 	var wait float64
 	switch v := args["wait_seconds"].(type) {
@@ -137,6 +157,9 @@ func serverTaskControlArgs(raw json.RawMessage, stopConversation string) json.Ra
 	}
 	moveArg(args, "task_id", "task")
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
+	if !upstreamDebug {
+		delete(args, "debug")
+	}
 	act, _ := args["action"].(string)
 	act = strings.ToLower(strings.TrimSpace(act))
 	if act == taskActionCancel {
