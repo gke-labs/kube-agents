@@ -288,6 +288,33 @@ func TestSendMessageSessionTextMarksTheSessionOnlyWhenTheTurnIsTaken(t *testing.
 	}
 }
 
+func TestSendMessageSessionTextFollowsTheGatewaysReading(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, tc := range []struct {
+		before  bool
+		message string
+		want    bool
+	}{
+		{false, "/Session", true},
+		{false, "/session look at prod", true},
+		{true, "/session  off", false},
+		{true, "/session off.", false},
+		{false, "/session stop", false},
+		{true, "/session stop", true},
+		{false, "/sessionx", false},
+	} {
+		putConversations(t, srv, ConversationEntry{Alias: "c1", Token: MintConversationToken(), SessionMode: tc.before})
+		args, _ := json.Marshal(map[string]any{"message": tc.message, "conversation": "c1"})
+		if res := srv.CallTool(context.Background(), ToolSendMessage, args); res.IsError {
+			t.Fatalf("send_message %q: %+v", tc.message, res)
+		}
+		if c, _ := srv.Store().LookupConversation("c1"); c.SessionMode != tc.want {
+			t.Errorf("%q with SessionMode %v left it %v; want %v", tc.message, tc.before, c.SessionMode, tc.want)
+		}
+	}
+}
+
 func TestCallRemoteToolGatesAndTranslatesLikeTheBridgesTools(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)

@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"github.com/gke-labs/kube-agents/a2a/mcpproto"
 )
 
@@ -1251,11 +1252,18 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 	s.finishStreamingCall(streamKey, conv.Alias, callerID, meta.ArtifactsDir, txt, callCtx.Err(), callErr)
 	// A /session or /session off text is a console control turn; the local session flag follows
 	// it only once the server took the turn.
+	// The text is read with the gateway's own matchers (chattext), so a spelling the gateway
+	// takes as off or stop never turns the flag on.
 	if callErr == nil {
-		if strings.EqualFold(trimmedMsg, "/session off") {
-			_, _ = s.store.SetConversationSessionMode(conv.Alias, false)
-		} else if trimmedMsg == "/session" || strings.HasPrefix(trimmedMsg, "/session ") {
-			_, _ = s.store.SetConversationSessionMode(conv.Alias, true)
+		if rest, ok := chattext.IsSessionCommand(trimmedMsg); ok {
+			switch {
+			case chattext.IsSessionOff(rest):
+				_, _ = s.store.SetConversationSessionMode(conv.Alias, false)
+			case chattext.IsStop(rest):
+				// A stop of the running turn; the session state does not change.
+			default:
+				_, _ = s.store.SetConversationSessionMode(conv.Alias, true)
+			}
 		}
 	}
 	return txt, title, md, callErr
