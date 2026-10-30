@@ -149,6 +149,11 @@ func TestDeferredSettleAfterStopIsQuiet(t *testing.T) {
 	if err := c.snapshot()[0].Ack(); err != nil {
 		t.Fatalf("an Ack after the stop's give-back: %v", err)
 	}
+	// The give-back's nak was the delivery's one disposition: the Ack after it
+	// reaches no server, so the message is still pending for the next subscriber.
+	if info := consumerInfo(t, h); info.NumAckPending != 1 {
+		t.Fatalf("ack pending = %d after an Ack on a given-back delivery, want 1", info.NumAckPending)
+	}
 }
 
 func consumerInfo(t *testing.T, h *heldHarness) *jetstream.ConsumerInfo {

@@ -173,3 +173,37 @@ func TestADeliveryDuringTheStopIsLeftForTheGiveBack(t *testing.T) {
 		t.Fatalf("giveBackLater nak'd during the stop: %v", d.naks)
 	}
 }
+
+// TestADrainThatRunsOutMarksTheBatchesStillRenderingAbandoned: only a wait
+// that ran out with a batch inside sets abandoned; one that finished, or had
+// nothing to wait for, doesn't.
+func TestADrainThatRunsOutMarksTheBatchesStillRenderingAbandoned(t *testing.T) {
+	var idle inFlight
+	idle.drain(time.Millisecond)
+	if idle.abandoned() {
+		t.Fatal("a drain with nothing rendering marked a batch abandoned")
+	}
+
+	var finished inFlight
+	if !finished.enter() {
+		t.Fatal("enter refused before any drain")
+	}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		finished.leave()
+	}()
+	finished.drain(5 * time.Second)
+	if finished.abandoned() {
+		t.Fatal("a drain the batch finished inside marked it abandoned")
+	}
+
+	var overrun inFlight
+	if !overrun.enter() {
+		t.Fatal("enter refused before any drain")
+	}
+	overrun.drain(10 * time.Millisecond)
+	if !overrun.abandoned() {
+		t.Fatal("a drain that ran out on a rendering batch didn't mark it abandoned")
+	}
+	overrun.leave()
+}

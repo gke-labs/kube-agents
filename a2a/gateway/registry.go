@@ -18,6 +18,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// relayedSeqCap bounds TaskRef.RelayedSeqs. Only an event rendered and not
+// yet acked can come again, and those are a task's most recent batch's, which
+// a burst of progress events can make long.
+const relayedSeqCap = 256
+
 // ActiveTask is the task currently serializing a session's conversation.
 type ActiveTask struct {
 	TaskID        string `json:"taskId"`
@@ -855,11 +860,6 @@ func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
 	}
 	return recs, nil
 }
-
-// relayedSeqCap bounds TaskRef.RelayedSeqs. Only an event rendered and not
-// yet acked can come again, and those are a task's most recent batch's, which
-// a burst of progress events can make long.
-const relayedSeqCap = 256
 
 // relayed reports whether taskID's event at stream sequence seq was already
 // rendered. A sequence of 0 (no metadata) is never taken as rendered.

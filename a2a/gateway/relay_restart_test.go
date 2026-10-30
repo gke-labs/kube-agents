@@ -307,3 +307,65 @@ func TestADuplicateInOneBatchRendersOnce(t *testing.T) {
 		t.Fatalf("acks: original %d, redelivery %d; want both acked", original.acks, again.acks)
 	}
 }
+
+// TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing: when the stop's wait
+// runs out on a batch still rendering, its deliveries have been given back
+// and the adapters closed, so the batch writes no sequence to the record and
+// acks nothing; the next gateway renders it again rather than finding it
+// recorded as rendered.
+func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
+	const question = "which cluster did you mean, 43?"
+	h := &holdingAdapter{needle: question, entered: make(chan struct{}), release: make(chan struct{})}
+	r, _ := startRigWithSpawnerAdapter(t, "platform", defaultMaxSessions, nil, func(a *fakeAdapter) Adapter {
+		h.fakeAdapter = a
+		return h
+	})
+	waitRunning(t, r)
+	conv := "discord:g1/t-abandoned"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-abandon", Text: "how is the fleet?"}
+	origin := r.awaitTask(t, targetPlatform)
+	payload, err := json.Marshal(lib.StatusUpdate{Status: lib.TaskStatus{State: lib.StateInputRequired,
+		Message: &lib.Message{Role: "agent", Parts: []lib.Part{{Kind: "text", Text: question}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: targetPlatform}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := lib.TaskEventsSubject(targetPlatform, origin.TaskID)
+	d := &fakeDelivery{env: env, subj: subject, seq: 4242}
+	done := make(chan struct{})
+	go func() {
+		r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
+		close(done)
+	}()
+	select {
+	case <-h.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the batch never reached the door")
+	}
+	// The stop's wait runs out while the door holds the post.
+	r.g.relayInFlight.mu.Lock()
+	r.g.relayInFlight.timedOut = true
+	r.g.relayInFlight.mu.Unlock()
+	close(h.release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the batch never returned")
+	}
+	if d.acks != 0 {
+		t.Fatalf("acked %d times; a batch the stop gave up on must leave its deliveries given back", d.acks)
+	}
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v", err)
+	}
+	if rec.relayed(origin.TaskID, 4242) {
+		t.Fatal("the record says the abandoned batch's event was rendered")
+	}
+	if !strings.Contains(r.logs.String(), "left for the next gateway") {
+		t.Fatalf("no log line for the abandoned batch:\n%s", r.logs.String())
+	}
+}

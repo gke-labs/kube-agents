@@ -51,6 +51,21 @@ const (
 	requeueDelay    = 2 * time.Second
 )
 
+// relayMaxAckPending caps the events the relay holds unrendered on its
+// durable. Each is held until its conversation's worker renders it, so a
+// conversation whose door is slow holds its backlog, and at the cap the
+// server stops delivering to every conversation. The server default (1000)
+// is a few minutes of one busy conversation's progress events; this is
+// headroom for one stalled room without lifting the bound.
+const relayMaxAckPending = 8192
+
+// relayStopDrainTimeout bounds how long a stopping gateway waits for the
+// batches already rendering before it gives the rest back. The gateway pod
+// gets the kubelet's default 30s grace period, and the give-back has to run
+// inside it, or every held event waits out AckWait on the next gateway. A
+// batch that overruns this is given back and may post twice.
+const relayStopDrainTimeout = 15 * time.Second
+
 // relayState is the in-memory render state for one task's rolling line. It
 // is cache: a gateway restart loses it, and the terminal path falls back to
 // a stream replay to recover the result — the stream is the record.
@@ -280,9 +295,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	l.Lock()
 	defer l.Unlock()
 
-	// A stopped gateway can't read anything again: its run context is done,
-	// so every read and every retry fails the same way, and a requeue would
-	// spin for the life of the process.
+	// A stopping gateway renders nothing new: its run context is done, so
+	// every read would fail, and the batch's deliveries are left for the
+	// stop's in-order give-back.
 	if g.runCtx.Err() != nil || !g.relayInFlight.enter() {
 		g.dropStoppedBatch(sessionKey, batch)
 		return
@@ -366,8 +381,21 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 		fresh = append(fresh, item)
 	}
 	for i, item := range fresh {
+		if g.relayInFlight.abandoned() {
+			// The stop's wait ran out on this batch: its deliveries have been
+			// given back and the adapters closed, so nothing past here would
+			// post. Writing the record or acking would mark unsent events
+			// rendered; leaving both, the next gateway renders the batch
+			// again, which may repeat what this one already posted.
+			g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", i, "events", len(fresh))
+			return
+		}
 		g.applyEvent(ctx, rec, item, i == len(fresh)-1)
 		rec.markRelayed(item.env.TaskID, item.sequence())
+	}
+	if g.relayInFlight.abandoned() {
+		g.log.Warn("relay: stop drain timed out; batch left for the next gateway", "session", sessionKey, "rendered", len(fresh), "events", len(fresh))
+		return
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
@@ -1149,28 +1177,24 @@ func (g *Gateway) dropStoppedBatch(sessionKey string, batch []relayItem) {
 	g.log.Warn("relay: gateway stopping; batch not rendered", "session", sessionKey, "events", len(batch))
 }
 
-// relayMaxAckPending caps the events the relay holds unrendered on its
-// durable. Each is held until its conversation's worker renders it, so a
-// conversation whose door is slow holds its backlog, and at the cap the
-// server stops delivering to every conversation. The server default (1000)
-// is a few minutes of one busy conversation's progress events; this is
-// headroom for one stalled room without lifting the bound.
-const relayMaxAckPending = 8192
-
-// relayStopDrainTimeout bounds how long a stopping gateway waits for the
-// batches already rendering before it gives the rest back. The gateway pod
-// gets the kubelet's default 30s grace period, and the give-back has to run
-// inside it, or every held event waits out AckWait on the next gateway. A
-// batch that overruns this is given back and may post twice.
-const relayStopDrainTimeout = 15 * time.Second
-
 // inFlight counts the relay batches past their stop check, so a stop can wait
 // for them. Once draining starts, no batch enters.
 type inFlight struct {
 	mu       sync.Mutex
 	n        int
 	stopping bool
+	// timedOut is set when drain gave up waiting: a batch still rendering
+	// then records and acks nothing (relayBatch).
+	timedOut bool
 	idle     chan struct{}
+}
+
+// abandoned reports whether the stop's wait ran out on the batches still
+// rendering.
+func (f *inFlight) abandoned() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.timedOut
 }
 
 func (f *inFlight) enter() bool {
@@ -1208,5 +1232,8 @@ func (f *inFlight) drain(timeout time.Duration) {
 	select {
 	case <-idle:
 	case <-time.After(timeout):
+		f.mu.Lock()
+		f.timedOut = f.n > 0
+		f.mu.Unlock()
 	}
 }

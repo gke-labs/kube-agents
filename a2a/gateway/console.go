@@ -386,9 +386,10 @@ func (a *ConsoleAdapter) subscribed() bool { return a.subscribedFlag.Load() }
 func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
 
 // Run delivers frames as InboundMessages until ctx is done, or until the
-// connection is closed for good, which it reports as an error. It owns the
-// connection's lifecycle from here: on either exit it unsubscribes and
-// closes the connection, so a caller does not leak it by trusting Run alone.
+// connection is closed for good, which it reports as an error. On either
+// exit it unsubscribes. When ctx ends it leaves the connection open, because
+// the relay may still be rendering onto it, and the caller closes it (Close;
+// Gateway.Run does once its relay drain is done).
 //
 // The subscription is plain core NATS with no queue group, so every gateway
 // process holding the console identity answers every frame rather than one
