@@ -500,5 +500,90 @@ class SkipTest(Harness):
         self.assertIn(f"\n{post_health.NIGHTLY_URL}\n🌙 Nightly section skipped: {reason}.\n", text)
 
 
+def timed(t, agent_s, turn1_s=None):
+    """``t`` with every rep carrying the agent run's and the opening turn's seconds."""
+    for rep in t["reps"]:
+        rep["agent_s"] = agent_s
+        if turn1_s is not None:
+            rep["turn1_s"] = turn1_s
+    return t
+
+
+class LatencyBlockTest(Harness):
+    """The latency block (nightly_latency.py) as the section and the
+    one-line fallback carry it."""
+
+    def timed_nights(self, last_agent=100.0, truncated=False):
+        nights = [night(day, [timed(green("case-green"), 100.0, 10.0), timed(green("case-red"), 100.0, 10.0)]) for day in range(13, 20)]
+        nights.append(night(20, [timed(green("case-green"), 100.0, 10.0), timed(green("case-red"), last_agent, 10.0)], truncated=truncated))
+        return data(*nights)
+
+    def test_a_quiet_day_carries_the_night_line(self):
+        section = self.build(self.timed_nights())
+        self.assertTrue(section.quiet)
+        self.assertEqual(section.lines[1], "⏱ *Latency*: turn 1 p50 10.0 s, p95 10.0 s (target p95 < 10 s; typical 10.0 s, 10.0 s) · agent time, median case 100 s (typical 100 s)")
+        self.assertEqual(len(section.lines), 2)
+
+    def test_a_slow_case_is_listed_with_its_owner(self):
+        section = self.build(self.timed_nights(last_agent=400.0))
+        text = "\n".join(section.lines)
+        self.assertIn(nightly_digest.nightly_latency.SLOW_HEADING, text)
+        self.assertIn("• Capacity: case-red 100 s → 400 s (4.0×) · <users/1001>", text)
+
+    def test_a_truncated_night_carries_the_block_over_the_cases_it_ran(self):
+        lines = self.build(self.timed_nights(last_agent=400.0, truncated=True)).lines
+        latency = next(line for line in lines if line.startswith("⏱ *Latency*"))
+        self.assertTrue(latency.endswith("(cut short: over the cases it ran)"))
+        self.assertIn("• Capacity: case-red 100 s → 400 s (4.0×) · <users/1001>", lines)
+
+    def test_the_full_section_puts_it_before_the_footer(self):
+        doc = full_night()
+        for run in doc["runs"]:
+            for t in run["tasks"]:
+                timed(t, 100.0, 10.0)
+        lines = self.build(doc, FULL_ISSUES).lines
+        self.assertTrue(lines[-3].startswith("⏱ *Latency*"))
+        self.assertEqual(lines[-1], nightly_digest.FOOTER)
+
+    def test_a_broad_slowdown_is_one_line_in_place_of_the_list(self):
+        # Seven cases with a task.yaml and no expected_fail, all slow.
+        names = ["case-green", "case-maint", "case-noowner", "case-outsider", "case-red", "case-red-extended", "case-reviewer"]
+        nights = [night(day, [timed(green(name), 100.0, 10.0) for name in names]) for day in range(13, 20)]
+        nights.append(night(20, [timed(green(name), 400.0, 10.0) for name in names]))
+        lines = self.build(data(*nights)).lines
+        broad = [line for line in lines if line.startswith("🐢 *Broad slowdown*: 7 of 7 cases with a typical took at least 2× their typical agent time and 60 s more")]
+        self.assertEqual(len(broad), 1)
+        self.assertTrue(broad[0].endswith(PAGE))
+        self.assertNotIn(nightly_digest.nightly_latency.SLOW_HEADING, lines)
+
+    def test_the_slow_list_leaves_out_the_cases_the_section_leaves_out(self):
+        # case-xfail is marked expected_fail; gone-case has no task.yaml.
+        names = ("case-green", "case-xfail", "gone-case")
+        nights = [night(day, [timed(green(name), 100.0, 10.0) for name in names]) for day in range(13, 20)]
+        nights.append(night(20, [timed(green(name), 400.0, 10.0) for name in names]))
+        lines = self.build(data(*nights, extra_cases=[("gone-case", "capacity")])).lines
+        slow = [line for line in lines if line.startswith("• ") and "→" in line]
+        self.assertEqual(len(slow), 1)
+        self.assertIn("case-green", slow[0])
+
+    def test_a_failing_fallback_line_never_loses_the_digest(self):
+        with mock.patch.object(post_health.nightly_latency, "night_line", side_effect=ValueError("boom")), contextlib.redirect_stderr(io.StringIO()):
+            text = post_health.render_digest({"state": "GREEN", "metrics": {}}, NOW, self.timed_nights(), section="a reason")
+        self.assertIn("Nightly section skipped: a reason.", text)
+        self.assertNotIn("Latency", text)
+
+    def test_the_one_line_fallback_labels_a_partial_night(self):
+        doc = self.timed_nights()
+        reports = nightly.night_reports(doc)
+        for key in ("running_parts", "missing_parts"):
+            partial = [{**reports[0], key: ["main-b"]}, *reports[1:]]
+            with mock.patch.object(post_health.nightly, "night_reports", return_value=partial):
+                self.assertTrue(post_health.nightly_latency_line(doc, NOW).endswith("(partial: over the cases on record)"))
+        self.assertNotIn("partial", post_health.nightly_latency_line(doc, NOW))
+
+    def test_the_one_line_fallback_carries_the_night_line(self):
+        text = post_health.render_digest({"state": "GREEN", "metrics": {}}, NOW, self.timed_nights(), section="a reason")
+        self.assertIn("⏱ *Latency*: turn 1 p50 10.0 s", text)
+
 if __name__ == "__main__":
     unittest.main()

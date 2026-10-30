@@ -2823,6 +2823,35 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         self.assertIn("failurePolicy: Fail", chart)
         self.assertNotIn("failurePolicy: Ignore", chart)
 
+    def test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account(self) -> None:
+        """The A2A gateway's `create` on pods is confined by admission, not by RBAC.
+
+        RBAC cannot see a PodSpec, so buildA2AGatewayRole's grant would let a
+        compromised gateway run a pod as any ServiceAccount in its namespace.
+        kube-agents-a2a-gateway-pod holds those pods to `<name>-a2a-session`
+        and the session token audiences. This is the static half: the policy
+        fails closed, denies, keeps the identity rule, and is tied to the
+        chart copy. k8s-operator's a2a_gateway_pod_policy_envtest_test.go runs
+        it in an API server.
+        """
+        documents = h.yaml_documents("gateway_pod_policy")
+        policy = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicy")
+        binding = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicyBinding")
+        self.assertEqual("Fail", policy["spec"].get("failurePolicy"))
+        self.assertEqual(["Deny"], binding["spec"].get("validationActions"))
+        self.assertEqual(policy["metadata"]["name"], binding["spec"]["policyName"])
+        self.assertTrue(
+            any(
+                "object.spec.serviceAccountName == variables.sessionAccount" in v["expression"]
+                for v in policy["spec"]["validations"]
+            ),
+            "the policy no longer holds the gateway's pods to the session account",
+        )
+        sync = (h.REPO_ROOT / "hack/sync-chart-manifests.sh").read_text()
+        for tied in (h.SOURCES["gateway_pod_policy"].path, h.SOURCES["chart_gateway_pod_policy"].path):
+            self.assertIn(tied, sync, "the sync script no longer ties the chart copy to the source")
+        self.assertNotIn("failurePolicy: Ignore", h.text("chart_gateway_pod_policy"))
+
 
 def _executor():
     """A CommandExecutor over a throwaway state directory.

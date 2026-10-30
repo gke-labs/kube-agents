@@ -139,7 +139,8 @@ for the mechanics.
 ## Roster Admission
 
 <!--
-Only when this PR adds a case to hack/eval/blocking-roster.txt. Otherwise delete this section.
+Required when this PR adds a case to hack/eval/blocking-roster.txt.
+Otherwise write "Not a roster admission."
 The rules are in docs/eval-gate-roster.md, "The five rules a seat meets". Rules (c), (d) and (e)
 are checked by scripts/test_eval_rosters.py; these two are yours to show.
 

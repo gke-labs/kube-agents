@@ -325,28 +325,29 @@ Layout:
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
   exists.
-- **One user per agent identity** inside the account. Permissions are exact subject
-  lists, deny by default: publish only to the subjects its role emits on, subscribe only
-  to its own addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the
-  shared topics it is granted. That is an upper bound, not the shape every principal has:
-  a pull-only principal may hold no task-subject subscribe at all, which is what the
-  session grants do. The addressee token in the task subjects (payload spec
-  0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping still the parked tightening (9/9): the authority work landed
-  the capability envelope, which scopes the task's AUTHORITY per task without narrowing
-  the subject grants, and narrowing those remains separate and unstarted. **Amended
-  10/1:** "deny by default" holds per side, and only while that side has entries in
-  it. An empty allow list is nats-server's spelling of _unrestricted_, not of
-  _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
-  that side's allow or deny list is non-empty, and the two sides are independent), so
-  a rendered entry that lost its publish list would grant the whole subject space on
-  that side while its subscribes stayed narrow. Neither side of a non-narrowed entry
-  may therefore be empty: in the callout identity map the operator refuses such a
-  render and the callout refuses it again at the mint, and in the static `nats.conf`
-  users - which have no validator - a side left empty beside a populated one renders
-  an explicit `deny = [">"]` rather than an absent key. A user with NEITHER side,
-  which is how `sys` ships, still gets no permissions block at all. A principal that
-  must not publish cannot be expressed by omission - there is no deny list in the map
+- **One user per agent identity** inside the account. Permissions are exact subject lists,
+  deny by default: publish only to the subjects its role emits on, subscribe only to its own
+  addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
+  is granted. That is an upper bound, not the shape every principal has: a pull-only
+  principal may hold no task-subject subscribe at all, which is what the session grants do.
+  The addressee token in the task subjects (payload spec 0.4) is what makes these grants
+  expressible - executor-granularity at connect time, with per-task scoping still the parked
+  tightening (9/9): the authority work landed the capability envelope, which scopes the
+  task's AUTHORITY per task without narrowing the subject grants. Narrowing those is staged
+  under #3889: its first PR adds a profile worker's task connection, granted one task's
+  subjects on a dispatcher-signed task credential, and the worker PR removes the pod
+  connection's profile-wide task reach. **Amended 10/1:** "deny by default" holds per side,
+  and only while that side has entries in it. An empty allow list is nats-server's spelling
+  of _unrestricted_, not of _nothing_ (`buildPermissionsFromJwt` builds a side's permission
+  object only when that side's allow or deny list is non-empty, and the two sides are
+  independent), so a rendered entry that lost its publish list would grant the whole subject
+  space on that side while its subscribes stayed narrow. Neither side of a non-narrowed
+  entry may therefore be empty: in the callout identity map the operator refuses such a
+  render and the callout refuses it again at the mint, and in the static `nats.conf` users -
+  which have no validator - a side left empty beside a populated one renders an explicit
+  `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
+  ships, still gets no permissions block at all. A principal that must not publish cannot be
+  expressed by omission - there is no deny list in the map
   - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
@@ -412,8 +413,8 @@ Layout:
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
   `web` user for the read-only web UI, one of the two bus credentials published to a
-  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
-  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` (less `a2a.cap.>`,
+  so it cannot join the verifier's queue group) and its own inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
   ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
@@ -634,7 +635,11 @@ Layout:
   agent pod that holds session-kv's bearer. No other principal holds either subject, and the
   reply namespace is its own for the notify route's reason. The bridge's password is reachable
   from the agent's terminal like every grant in that pod, so a forged board can reach the Home
-  tab of an admitted member; it carries no authority beyond what it shows. Core NATS.
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS. A request
+  with a body is a board-health row's Retry or Drop (spec-chatops-gateway.md, "The board-health
+  card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
+  subjects and grants, and only the gateway may publish the request, so no other principal can
+  ask the bridge to act; session-kv acts only on cards still `blocked`.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
@@ -889,15 +894,18 @@ ServiceAccount, so any container in that pod presenting a token for this audienc
 authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
 copied into the pod verbatim. The operator therefore refuses and strips user-authored
 volumes by SOURCE as well as by name: a projection of this audience under any name, and a
-`secret` volume or projected `secret` source naming one of the three Secrets the bus
-renders. (Those two source fields only - the ones that mount the Secret into the
-container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
-node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
-which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
-interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
-which signs the bus's own tokens. The Secrets are cheaper than the projection, because
-reading one needs no token at all. All of them are closed together, because closing one
-narrows the expensive route, leaves the cheap ones, and names the class while doing it.
+`secret` volume or projected `secret` source naming one of the six Secrets the bus renders
+with a credential or key in it. (Those two source fields only - the ones that mount the
+Secret into the container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef`
+hand it to a node plugin instead, and are not matched.) The first three are
+`<agent>-a2a-nats-creds`, which holds the static users' passwords;
+`<agent>-a2a-nats-config`, whose `nats.conf` interpolates every one of those passwords in
+clear text; and `<agent>-a2a-callout-keys`, which signs the bus's own tokens. The other
+three are `<agent>-a2a-nats-tls` and `<agent>-a2a-nats-ca`, the bus's serving key and the CA
+key that can mint another, and `<agent>-a2a-task-signing-key`, the dispatcher's task-signing
+seed (#3889). The Secrets are cheaper than the projection, because reading one needs no
+token at all. All of them are closed together, because closing one narrows the expensive
+route, leaves the cheap ones, and names the class while doing it.
 
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:

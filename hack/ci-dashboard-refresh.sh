@@ -5,7 +5,7 @@
 # collect -> render -> publish for the live eval dashboard, INCREMENTALLY:
 # download the currently published data.json, hand it to collect.py's
 # --merge-with so the GCS scan only reads builds newer than the newest one on
-# record, then re-render and republish. A cold sweep is ~3 gsutil calls per
+# record, then re-render and republish. A cold sweep is ~3 gcloud storage calls per
 # archived build -- tens of minutes over two weeks of history -- so the
 # watermark is what makes a 15-minute cadence possible at all; only the first
 # armed run (no data.json published yet) pays a sweep, and even that one is
@@ -170,7 +170,7 @@ PRIOR="${WORK}/prior-data.json"
 PRIOR_SRC="${EVAL_DASHBOARD_TARGET%/}/data.json"
 case "${EVAL_DASHBOARD_TARGET}" in
   gs://*)
-    if ! gsutil cp "${PRIOR_SRC}" "${PRIOR}" >>"${REFRESH_LOG}" 2>&1; then
+    if ! gcloud storage cp "${PRIOR_SRC}" "${PRIOR}" >>"${REFRESH_LOG}" 2>&1; then
       rm -f "${PRIOR}"
       echo "no existing data.json at ${PRIOR_SRC} (first armed run, or a transient read failure): falling back to a fresh sweep bounded to ${EVAL_DASHBOARD_SINCE_DAYS} days"
     fi
@@ -198,9 +198,9 @@ HISTORY_PRIOR="${WORK}/health-history.jsonl"
 STORE_PRIOR="${WORK}/store.json"
 case "${EVAL_DASHBOARD_TARGET}" in
   gs://*)
-    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
-    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
-    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/store.json" "${STORE_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${STORE_PRIOR}"
+    gcloud storage cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
+    gcloud storage cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
+    gcloud storage cp "${EVAL_DASHBOARD_TARGET%/}/store.json" "${STORE_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${STORE_PRIOR}"
     ;;
   *)
     [ -f "${EVAL_DASHBOARD_TARGET%/}/health.json" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}"
@@ -210,9 +210,9 @@ case "${EVAL_DASHBOARD_TARGET}" in
 esac
 
 # ─── Steps 2-5: collect (incremental) -> floor -> render -> publish ─────────
-# One timeout over the whole pipeline so a hung gsutil cannot eat the job.
+# One timeout over the whole pipeline so a hung gcloud storage call cannot eat the job.
 # The budget must stay LARGER than the 300s collect.py grants each individual
-# gsutil call (same arithmetic as the hook); 900s covers the incremental path
+# gcloud storage call (same arithmetic as the hook); 900s covers the incremental path
 # with room, and EVAL_DASHBOARD_TIMEOUT raises it from the job config for the
 # first-run sweep if that ever needs it. No `timeout` binary (a laptop)
 # degrades to running unbounded.

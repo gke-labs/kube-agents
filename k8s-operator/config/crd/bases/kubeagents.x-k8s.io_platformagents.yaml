@@ -1187,6 +1187,14 @@ spec:
                             workspace the broker clones into; the proxy's state and /tmp emptyDirs
                             (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
                             defaults, so the kubelet does not evict the pod at the smaller figure.
+                            The limit a fleet needs grows with the size of its clusters as well as
+                            their number: the broker charges each command about 128Mi, the size of
+                            a listing of a small cluster, and a kubectl listing thousands of objects
+                            holds several hundred Mi on its own, so size the limit to the largest
+                            listing the fleet produces for every command that runs at once (eight
+                            at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
+                            and Envoy, 128Mi for the content workspace); the broker's child peak and
+                            memory high-water series give the figure.
                             Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
                             refuses a memory limit below what admits two commands at once, a limits
@@ -1540,7 +1548,8 @@ spec:
                         The same reserved names and reserved sources as SidecarVolumes are refused
                         at admission -- a ServiceAccount token projection for the "a2a-bus"
                         audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
-                        <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+                        <agent>-a2a-callout-keys, <agent>-a2a-nats-tls, <agent>-a2a-nats-ca or
+                        <agent>-a2a-task-signing-key -- and
                         dropped from the render on an install
                         running the A2A surface.
                       items:
@@ -5422,7 +5431,7 @@ spec:
                         ServiceAccount token projection for the "a2a-bus" audience, or a reference
                         to one of the Secrets the operator renders bus credentials into
                         (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
-                        <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
+                        <agent>-a2a-nats-tls, <agent>-a2a-nats-ca, <agent>-a2a-task-signing-key),
                         as either a secret volume or a projected secret source. The refusal is on
                         the name and the shape of the source, not on what a given Secret happens to
                         hold at the time. Reading those Secrets through env is not refused here. On
@@ -10440,7 +10449,8 @@ spec:
                           type: boolean
                         allowedUsers:
                           description: |-
-                            AllowedUsers is a list of allowed Entra ID Object IDs or User Principal Names.
+                            AllowedUsers is a list of allowed Entra ID Object IDs (from.aadObjectId) or Bot Framework
+                            user IDs (from.id). An inbound Teams activity carries no User Principal Name or email.
                             When empty and allowAllUsers is false (default), interactions are rejected.
                           items:
                             type: string
@@ -11602,7 +11612,7 @@ spec:
                 phase:
                   description:
                     Phase is the overall state (Pending, Provisioning, Ready,
-                    Failed).
+                    Degraded, Failed).
                   type: string
                 serviceStatus:
                   description: ServiceStatus holds internal/external endpoints.

@@ -490,11 +490,15 @@ line; a patch is validated by the RC pipeline and released by hand.
    `kube-agents-release-lines` ruleset lets only those two create, push or delete a line. The
    `kube-agents-release-lines-checks` ruleset requires `main`'s status contexts, copied in by
    hand (the list is in `docs/pull-request-workflow.md`, "`main`'s required checks are in a ruleset";
-   `Smoke gate` and `Merge labels` stay off the lines, and any other context added to `main`'s set
-   has to be added to the ruleset too), with the release bot as its only
+   `Smoke gate`, `Merge labels` and, until a line carries the module, `Run k8s-api-proxy Tests`
+   stay off the lines; any other context added to `main`'s set has to be added to the ruleset
+   too), with the release bot as its only
    bypass actor. `Run A2A Module Tests` joined both on 2026-10-13; the lines `release/0.1.0` to
    `release/0.4.0` predate `a2a-test.yml`, so a backport to one of them can never post that context
-   and merges only through the release bot's bypass. The contexts live in a ruleset rather than on the branch
+   and merges only through the release bot's bypass. `Run k8s-api-proxy Tests` joined
+   `main`'s set on 2026-10-28 but not the lines, because no line has
+   `k8sapiproxy-test.yml` or the module, so every backport would need the bypass to merge. It
+   joins the ruleset once a line carries the module (#4125). The contexts live in a ruleset rather than on the branch
    protection rule because a branch protection rule cannot exempt an app from required checks,
    and the tagger's push of a freshly stamped commit, which has had no checks run, was rejected
    by exactly that when it created the first line. Tide is deliberately not a bypass actor of the

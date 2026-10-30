@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -761,19 +762,189 @@ func (f *slowTopicsBus) ListTopics(ctx context.Context) (TopicList, error) {
 }
 
 // The read runs detached from its caller, under its own budget: a caller that
-// has already gone does not cut short the answer the next caller is handed.
+// has already gone is told so, and the read it started still answers the next
+// caller, uncut.
 func TestAReadOutlivesItsCaller(t *testing.T) {
-	f := &fakeTopicsBus{}
+	// The caller that starts a read hangs up mid-read: it gets its context
+	// error, the read runs on with its own budget, and the next caller is
+	// answered from it without a second read.
+	c := newTopicCache(time.Now)
 	ctx, cancel := context.WithCancel(context.Background())
+	var reads atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	readCtxErr := make(chan error, 1)
+	read := func(rctx context.Context) (string, error) {
+		reads.Add(1)
+		close(started)
+		<-release
+		readCtxErr <- rctx.Err()
+		dl, ok := rctx.Deadline()
+		if !ok || time.Until(dl) > topicReadTimeout {
+			return "", fmt.Errorf("the read's budget was %v, want at most %v", time.Until(dl), topicReadTimeout)
+		}
+		return "the answer", nil
+	}
+	gone := make(chan error, 1)
+	go func() { _, err := c.answer(ctx, "list", read); gone <- err }()
+	<-started
 	cancel()
-	if _, err := readTopicsTool(f, time.Now).Call(ctx, []byte(`{"action":"list"}`)); err != nil {
+	if err := <-gone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the caller that hung up got %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := <-readCtxErr; err != nil {
+		t.Fatalf("the read's context ended with its caller: %v", err)
+	}
+	text, err := c.answer(context.Background(), "list", func(context.Context) (string, error) { reads.Add(1); return "", errors.New("read again") })
+	if err != nil || text != "the answer" {
+		t.Fatalf("the next caller got %q, %v; want the hung-up caller's read", text, err)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Errorf("%d reads, want 1", n)
+	}
+}
+
+// blockedRead is a topic read that counts its calls and returns text once
+// release is closed.
+type blockedRead struct {
+	reads   atomic.Int32
+	started chan struct{} // closed by the first call
+	once    sync.Once
+	release chan struct{}
+	ctx     chan context.Context // the first call's context, if buffered
+}
+
+func newBlockedRead() *blockedRead {
+	return &blockedRead{started: make(chan struct{}), release: make(chan struct{}), ctx: make(chan context.Context, 1)}
+}
+
+func (b *blockedRead) read(ctx context.Context) (string, error) {
+	b.reads.Add(1)
+	b.once.Do(func() { b.ctx <- ctx; close(b.started) })
+	<-b.release
+	return "slow answer", nil
+}
+
+// A key with a kept answer is answered at once while another key's read is
+// still running: the lock is not held across a read.
+func TestACachedTopicIsNotQueuedBehindAnotherRead(t *testing.T) {
+	c := newTopicCache(time.Now)
+	if _, err := c.answer(context.Background(), "fast", func(context.Context) (string, error) { return "fast answer", nil }); err != nil {
 		t.Fatal(err)
 	}
-	if f.ctxErr != nil {
-		t.Errorf("the read was handed the caller's cancelled context: %v", f.ctxErr)
+	slow := newBlockedRead()
+	defer close(slow.release)
+	go func() { _, _ = c.answer(context.Background(), "slow", slow.read) }()
+	<-slow.started
+
+	got := make(chan string, 1)
+	go func() {
+		text, _ := c.answer(context.Background(), "fast", func(context.Context) (string, error) { return "", errors.New("read again") })
+		got <- text
+	}()
+	select {
+	case text := <-got:
+		if text != "fast answer" {
+			t.Errorf("cached key answered %q, want the kept answer", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cached key waited behind another key's read")
 	}
-	if f.deadline <= 0 || f.deadline > topicReadTimeout {
-		t.Errorf("the read's budget was %v, want at most %v", f.deadline, topicReadTimeout)
+}
+
+// Concurrent callers of one key share one read.
+func TestConcurrentCallersOfAKeyShareOneRead(t *testing.T) {
+	const callers = 32
+	c := newTopicCache(time.Now)
+	r := newBlockedRead()
+	var ready, done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			text, err := c.answer(context.Background(), "k", r.read)
+			if err == nil && text != "slow answer" {
+				err = fmt.Errorf("answer %q", text)
+			}
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	<-r.started
+	// Give every caller time to reach the in-flight read; a late one is
+	// answered from the kept answer, which is one read either way.
+	time.Sleep(50 * time.Millisecond)
+	close(r.release)
+	done.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if n := r.reads.Load(); n != 1 {
+		t.Errorf("%d concurrent callers of one key read %d times, want 1", callers, n)
+	}
+}
+
+// A waiter whose context ends leaves with an error while the read runs on,
+// and the read's answer is kept for the next caller.
+func TestAWaiterLeavesOnItsDeadlineAndTheReadIsKept(t *testing.T) {
+	c := newTopicCache(time.Now)
+	r := newBlockedRead()
+	go func() { _, _ = c.answer(context.Background(), "k", r.read) }()
+	<-r.started
+	rctx := <-r.ctx
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	left := make(chan error, 1)
+	go func() { _, err := c.answer(ctx, "k", r.read); left <- err }()
+	select {
+	case err := <-left:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("waiter past its deadline got %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(r.release)
+		t.Fatal("a waiter past its deadline did not leave")
+	}
+	if err := rctx.Err(); err != nil {
+		t.Fatalf("the read was cut short when a waiter left: %v", err)
+	}
+	close(r.release)
+	// Wait for the read to finish and be kept, then ask again.
+	for {
+		c.mu.Lock()
+		_, busy := c.inflight["k"]
+		c.mu.Unlock()
+		if !busy {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	text, err := c.answer(context.Background(), "k", func(context.Context) (string, error) { return "", errors.New("read again") })
+	if err != nil || text != "slow answer" {
+		t.Errorf("next caller got %q, %v; want the kept answer", text, err)
+	}
+	if n := r.reads.Load(); n != 1 {
+		t.Errorf("reads = %d, want 1", n)
+	}
+}
+
+// A read that panics fails its waiters and frees its key, rather than leaving
+// every later caller of the key waiting.
+func TestAPanickingTopicReadFreesItsKey(t *testing.T) {
+	c := newTopicCache(time.Now)
+	if _, err := c.answer(context.Background(), "k", func(context.Context) (string, error) { panic("boom") }); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want the panic as an error", err)
+	}
+	text, err := c.answer(context.Background(), "k", func(context.Context) (string, error) { return "ok", nil })
+	if err != nil || text != "ok" {
+		t.Errorf("after a panic the key answered %q, %v; want a fresh read", text, err)
 	}
 }
 
@@ -935,5 +1106,41 @@ func TestAnEmptyStateTopicOpensNoConsumer(t *testing.T) {
 	}
 	if got := topicConsumers(t, js, lib.StreamTopicsState); got != 0 {
 		t.Errorf("%d consumers opened for a topic with no entries, want 0", got)
+	}
+}
+
+// Reads in flight are bounded across keys: with maxTopicReads distinct keys
+// being read, a new key is turned away at once rather than starting another
+// detached read, and a caller already gone starts nothing.
+func TestTopicReadsInFlightAreBounded(t *testing.T) {
+	c := newTopicCache(time.Now)
+	var reads []*blockedRead
+	for i := 0; i < maxTopicReads; i++ {
+		r := newBlockedRead()
+		reads = append(reads, r)
+		go func(key string) { _, _ = c.answer(context.Background(), key, r.read) }(fmt.Sprintf("k%d", i))
+		<-r.started
+	}
+	defer func() {
+		for _, r := range reads {
+			close(r.release)
+		}
+	}()
+	started := false
+	_, err := c.answer(context.Background(), "one-too-many", func(context.Context) (string, error) { started = true; return "", nil })
+	if !errors.Is(err, errTopicReadsBusy) || started {
+		t.Fatalf("a read past the bound: err %v, started %v; want errTopicReadsBusy and no read", err, started)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c2 := newTopicCache(time.Now)
+	ran := make(chan struct{}, 1)
+	if _, err := c2.answer(ctx, "gone", func(context.Context) (string, error) { ran <- struct{}{}; return "", nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a caller already gone: err %v; want context.Canceled", err)
+	}
+	select {
+	case <-ran:
+		t.Fatal("a caller already gone started a read")
+	case <-time.After(300 * time.Millisecond):
 	}
 }

@@ -88,6 +88,14 @@ readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=30
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# What a pull request is graded by (the merge target's grader, section 6):
+# this tree at PULL_BASE_SHA, with the change's own cases subdirectory in
+# place of the target's. Both relative to the repository root.
+readonly EVAL_GRADER_TREE="bench"
+readonly EVAL_GRADER_CASES_DIR="tasks"
+# The seeded fleet's catalog inside that tree, which the fleet step reads.
+readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
+
 # A repetition the launcher could not start because GitHub's token endpoint
 # failed transiently (record_unit_not_run, beside run_one_unit). The unit
 # writes a record in place of the run that carries the harness's own
@@ -258,6 +266,25 @@ readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
 readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
+# scope_exclude_settle (the per-case scope exclusion, #3213): how long a scope
+# edit may take to reach the pod -- the operator's reconcile, the gateway's roll
+# (the scope rides in the config hash) and the kubelet's refresh of the mounted
+# file -- and how often it looks; where the operator mounts the rendered scope
+# (scopeDir and scopeConfigKey in platformagent_manifests.go); and the Cluster
+# Agent reconcile run once the pod reads it, so a profile is pruned or
+# re-created now rather than at the hourly job's next tick. Its
+# --require-create-pass exit 4 is another run holding the lock, which is waited
+# out until the settle's own bound; the attempts count only the other failures.
+# The reconcile lists every cluster in scope, minutes on a large project. A read
+# of the CR is tried EVAL_SCOPE_READ_ATTEMPTS times before it counts as failed.
+readonly EVAL_SCOPE_SETTLE_SECONDS=900
+readonly EVAL_SCOPE_POLL_SECONDS=10
+readonly EVAL_SCOPE_FILE="/etc/kube-agents/scope.json"
+readonly EVAL_SCOPE_RECONCILE_SCRIPT="/opt/data/scripts/cluster_agent_reconcile.py"
+readonly EVAL_SCOPE_RECONCILE_TIMEOUT_SECONDS=600
+readonly EVAL_SCOPE_RECONCILE_ATTEMPTS=5
+readonly EVAL_SCOPE_RECONCILE_BUSY_EXIT=4
+readonly EVAL_SCOPE_READ_ATTEMPTS=3
 # What a unit's lock deadline allows past its delegation timeout, for the
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
@@ -538,7 +565,7 @@ fi
 # MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
 # CONTRACT: the dashboard must never break the job it observes, so every
 # failure mode -- the sibling dashboard PRs not merged yet (no
-# scripts/eval_dashboard/), the IAM grant not applied, a gsutil error, a
+# scripts/eval_dashboard/), the IAM grant not applied, a gcloud storage error, a
 # python crash, a hung upload -- logs exactly ONE
 # "eval-dashboard publish skipped: <reason>" line and never changes the job's
 # exit code.
@@ -624,14 +651,14 @@ publish_eval_dashboard() {
   local dash_tmp dash_rc=0
   dash_tmp="$(mktemp -d)" || { echo "eval-dashboard publish skipped: mktemp -d failed"; return 0; }
   # One timeout over the whole collect -> render -> publish pipeline so a hung
-  # gsutil cannot eat the job's tail. errexit lives inside the child only; out
+  # gcloud storage call cannot eat the job's tail. errexit lives inside the child only; out
   # here any failure becomes the one skip line. The array idiom is the
   # PROFILE_ROWS one above: no `timeout` binary (a laptop) must degrade to
   # running unbounded, not to breaking the trap.
   #
   # The budget must be LARGER than the 300s collect.py grants each individual
-  # gsutil call, or the one hung call the collector is willing to wait out
-  # kills the whole pipeline instead -- and the sweep is 1 + 3N gsutil
+  # gcloud storage call, or the one hung call the collector is willing to wait out
+  # kills the whole pipeline instead -- and the sweep is 1 + 3N gcloud storage
   # processes over every archived build (READ_WORKERS at a time), so it
   # needs real headroom on top. 900s covers both and only ever taxes the
   # nightly's tail (the gate
@@ -644,8 +671,8 @@ publish_eval_dashboard() {
   # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
   # The zero-runs floor between collect and render is the evidence_store
   # lesson (StoreUnreachable vs "empty store"): collect.py WARNS and
-  # continues when a gsutil listing fails, so a total source outage -- a 403
-  # before the read grant lands, no gsutil on PATH -- still yields a
+  # continues when a gcloud storage listing fails, so a total source outage -- a 403
+  # before the read grant lands, no gcloud on PATH -- still yields a
   # well-formed document with runs: [] and exit 0. Publishing that would
   # overwrite a good dashboard with an empty one and log success; the floor
   # turns it into the skip line instead.
@@ -667,9 +694,9 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     # keeps the page on the last read instead of blanking it.
     case "$3" in
       gs://*)
-        gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
-        gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
-        gsutil cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
+        gcloud storage cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
+        gcloud storage cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        gcloud storage cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
         ;;
       *)
         [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true
@@ -804,6 +831,8 @@ profile_and_dump_on_exit() {
   collect_credential_proxy_evidence
   # Defined further down; a run that died before then paused nothing.
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
+  # Without the wait: the next lease's preflight waits for it instead.
+  declare -F scope_exclude_restore >/dev/null && scope_exclude_restore "exit"
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
@@ -942,6 +971,45 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # bench/tf/fleet/README.md, "A read-only credential for evaluations".
 # FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
 # use, and a Prow job refuses it: set there it would restore the fallback.
+# ─── Extract the merge target's grader (section 6) ───────────────────────────
+# On a run that grades a change, main's bench/ (with the change's cases) is
+# extracted here, before the fleet step: the fleet catalog maps each fixture
+# role a check reads to a cluster, and the lease scan below imports
+# fixture_drift, so both are part of the grader and come from main.
+# GRADER_BENCH_DIR stays empty on a run that grades HEAD. Section 6, "Grade
+# with the merge target's grader", has the rest: BENCH_DIR, the read check
+# and the verdict's grader SHA.
+grader_pin_applies() { # -> 0 when this run grades a change against a merge target
+  [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
+}
+
+# main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
+# extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
+# is gone, and one it adds is there.
+pin_grader() { # <repo root> <sha> <out>
+  local repo="$1" sha="$2" out="$3"
+  git -C "${repo}" archive "${sha}" "${EVAL_GRADER_TREE}" | tar -x -C "${out}" || return 1
+  [ -d "${out}/${EVAL_GRADER_TREE}" ] || return 1
+  rm -rf "${out:?}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
+  cp -R "${repo}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}" "${out}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
+}
+
+GRADER_BENCH_DIR=""
+if grader_pin_applies; then
+  if [ -z "${PULL_BASE_SHA:-}" ] || ! git -C "${SCRIPT_DIR}/.." cat-file -e "${PULL_BASE_SHA}^{commit}" 2>/dev/null; then
+    echo "ERROR: this run grades a change (PULL_NUMBER or JOB_TYPE=${JOB_TYPE:-unset}) but PULL_BASE_SHA='${PULL_BASE_SHA:-}' names no commit in this checkout, so main's grader cannot be extracted; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  GRADER_ROOT="$(mktemp -d)"
+  if ! pin_grader "${SCRIPT_DIR}/.." "${PULL_BASE_SHA}" "${GRADER_ROOT}"; then
+    echo "ERROR: could not extract ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA} into ${GRADER_ROOT}; the run does not grade the change with its own." >&2
+    exit 1
+  fi
+  GRADER_BENCH_DIR="${GRADER_ROOT}/${EVAL_GRADER_TREE}"
+  # Set, not defaulted: a catalog from the job's environment would be one the
+  # change did not have to get past eval-crew.
+  export FLEET_CATALOG="${GRADER_BENCH_DIR}/${EVAL_FLEET_CATALOG}"
+fi
 # shellcheck source=hack/fleet-kubeconfigs.sh
 source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
 _fleet_refuse_opt_in_under_prow || exit 1
@@ -995,7 +1063,7 @@ scan_lease_fixtures() { # <report path> <published copy path>
   gcloud storage cat "${EVAL_FIXTURE_STATE_PUBLISHED}" > "${published}" 2>/dev/null || rm -f "${published}"
   # Only a role the fresh hourly scan already holds drifted twice can be
   # excused, so wait for convergence only then; otherwise one pass is enough.
-  if ! PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
+  if ! PYTHONPATH="${GRADER_BENCH_DIR:-${SCRIPT_DIR}/../bench}" python3 -c 'import sys; from pathlib import Path; from kube_agents_bench.fixture_drift import sustained_roles; sys.exit(0 if sustained_roles(Path(sys.argv[1]), sys.argv[2]) else 1)' "${published}" "${PROJECT_ID}" 2>/dev/null; then
     wait=0
   fi
   ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
@@ -2003,6 +2071,208 @@ ready_gateway_pod() { # <context> <namespace> [<wait seconds>]
   done
 }
 
+# The per-case scope exclusion (#3213). A case that declares
+# `scope_exclude: {slots: [...]}` grades an install whose
+# spec.scope.exclude.clusters names those slots' clusters. The fan-out runs its
+# repetitions alone, after every other unit (unit_phase 2): a scope edit rolls
+# the gateway, which would cut every unit beside it, and the reconcile deletes an
+# excluded cluster's Cluster Agent profile, which a case on that slot would miss.
+# bench/kube_agents_bench/scope_exclude.py builds each patch and keeps the scope
+# it replaced on the CR, so a restore needs only the CR: after the case's
+# repetitions, from the EXIT trap, and at lease time (below, before the audits
+# pause), which repairs a project that a run killed past its grace left
+# excluded. A CI install renders no scope block (platformAgent.scope is null), so
+# the next deploy does not undo an edit. Pinned to AGENT_CLUSTER_CONTEXT and
+# refused for a context that does not name PROJECT_ID, as wait_platform_runs is.
+scope_exclude_target() { # <label> -> 0 when the install may be patched
+  local label="$1" ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${TARGET_NAMESPACE:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
+    echo "WARNING: Scope exclusion (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing" >&2
+    return 1
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) return 0 ;;
+  esac
+  echo "WARNING: Scope exclusion (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
+  return 1
+}
+
+# A bare python3, not the bench virtualenv: the lease preflight and the EXIT
+# trap run it, and the patch, restore and clusters subcommands need nothing the
+# standard library lacks, as scan_lease_fixtures reads kube_agents_bench too.
+scope_exclude_helper() { # <subcommand> [args]; stdin and stdout pass through
+  PYTHONPATH="${SCRIPT_DIR}/../bench" python3 -m kube_agents_bench.scope_exclude "$@"
+}
+
+# The PlatformAgent as JSON, read up to EVAL_SCOPE_READ_ATTEMPTS times.
+scope_exclude_cr() {
+  local attempt
+  for attempt in $(seq 1 "${EVAL_SCOPE_READ_ATTEMPTS}"); do
+    scope_exclude_kubectl get platformagent "${AGENT_SERVICE_NAME}" -o json && return 0
+    [ "${attempt}" -lt "${EVAL_SCOPE_READ_ATTEMPTS}" ] && sleep "${EVAL_SCOPE_POLL_SECONDS}"
+  done
+  return 1
+}
+
+scope_exclude_kubectl() { # <kubectl args>; against the install under test
+  kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" "$@"
+}
+
+# Until the pod reads the scope the CR declares, then one reconcile run. The CR's
+# observedGeneration first, so the rollout read is of the workload the operator
+# wrote for this edit; then the gateway's rollout, and the shell sandbox's, which
+# rolls too when the edit adds or removes the scope block
+# (KUBEAGENTS_SCOPE_DECLARED); then the mounted file in a settled pod, which the
+# kubelet refreshes on its own clock.
+scope_exclude_settle() { # <label>
+  local label="$1" deadline=$((SECONDS + EVAL_SCOPE_SETTLE_SECONDS)) left gen generation observed workload="" kind want have pod="" attempt rc out="" summary
+  while :; do
+    gen="$(scope_exclude_kubectl get platformagent "${AGENT_SERVICE_NAME}" -o jsonpath='{.metadata.generation} {.status.observedGeneration}' 2>/dev/null)" || gen=""
+    generation="" observed=""
+    read -r generation observed <<<"${gen}"
+    [ -n "${generation}" ] && [ "${generation}" = "${observed}" ] && break
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "WARNING: Scope exclusion (${label}): the operator has not observed the edit after ${EVAL_SCOPE_SETTLE_SECONDS}s (generation/observed: ${gen:-unreadable})" >&2
+      return 1
+    fi
+    sleep "${EVAL_SCOPE_POLL_SECONDS}"
+  done
+  for kind in deployment statefulset; do
+    if scope_exclude_kubectl get "${kind}/${AGENT_SERVICE_NAME}-gateway" -o name >/dev/null 2>&1; then
+      workload="${kind}/${AGENT_SERVICE_NAME}-gateway"
+      break
+    fi
+  done
+  if scope_exclude_kubectl get "statefulset/${AGENT_SERVICE_NAME}-shell" -o name >/dev/null 2>&1; then
+    workload="${workload:+${workload} }statefulset/${AGENT_SERVICE_NAME}-shell"
+  fi
+  case "${workload}" in
+    *-gateway*) ;;
+    *)
+      echo "WARNING: Scope exclusion (${label}): no ${AGENT_SERVICE_NAME}-gateway workload to wait for" >&2
+      return 1 ;;
+  esac
+  for kind in ${workload}; do
+    left=$((deadline - SECONDS))
+    if [ "${left}" -le 0 ] \
+        || ! out="$(kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE}" rollout status "${kind}" --timeout="${left}s" 2>&1)"; then
+      echo "WARNING: Scope exclusion (${label}): ${kind} did not roll out within ${EVAL_SCOPE_SETTLE_SECONDS}s: ${out:-no time left}" >&2
+      return 1
+    fi
+  done
+  while :; do
+    left=$((deadline - SECONDS))
+    [ "${left}" -gt 0 ] || left=0
+    want="$(scope_exclude_cr 2>/dev/null | scope_exclude_helper clusters 2>/dev/null)" || want=""
+    have=""
+    if pod="$(ready_gateway_pod "${AGENT_CLUSTER_CONTEXT}" "${TARGET_NAMESPACE}" "${left}")"; then
+      have="$(scope_exclude_kubectl exec "${pod}" -c "${EVAL_GATEWAY_CONTAINER}" -- cat "${EVAL_SCOPE_FILE}" 2>/dev/null | scope_exclude_helper clusters 2>/dev/null)" || have=""
+    fi
+    [ -n "${want}" ] && [ "${have}" = "${want}" ] && break
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "WARNING: Scope exclusion (${label}): ${EVAL_SCOPE_FILE} in the gateway still reads ${have:-nothing} after ${EVAL_SCOPE_SETTLE_SECONDS}s, not the CR's ${want:-unreadable}" >&2
+      return 1
+    fi
+    sleep "${EVAL_SCOPE_POLL_SECONDS}"
+  done
+  local bound=(timeout --foreground "${EVAL_SCOPE_RECONCILE_TIMEOUT_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  attempt=0
+  while [ "${attempt}" -lt "${EVAL_SCOPE_RECONCILE_ATTEMPTS}" ]; do
+    rc=0
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE}" exec "${pod}" -c "${EVAL_GATEWAY_CONTAINER}" -- \
+      env HERMES_HOME="${EVAL_GATEWAY_HOME}" "${EVAL_GATEWAY_PYTHON}" "${EVAL_SCOPE_RECONCILE_SCRIPT}" --require-create-pass 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      # Its summary line, not its last: a notification it failed to post can come after.
+      summary="$(printf '%s\n' "${out}" | grep -F 'Done:' | tail -1)" || summary=""
+      [ -n "${summary}" ] || summary="$(printf '%s\n' "${out}" | tail -1)"
+      echo "Scope exclusion (${label}): the gateway reads ${want}; reconcile: ${summary}"
+      return 0
+    fi
+    if [ "${rc}" -eq "${EVAL_SCOPE_RECONCILE_BUSY_EXIT}" ] && [ "${SECONDS}" -lt "${deadline}" ]; then
+      echo "Scope exclusion (${label}): another reconcile holds the lock; waiting for it"
+    else
+      attempt=$((attempt + 1))
+      echo "WARNING: Scope exclusion (${label}): reconcile attempt ${attempt} exited ${rc}: $(printf '%s\n' "${out}" | tail -1)" >&2
+      # The settle's bound holds the retries too: at most one attempt runs past it.
+      if [ "${SECONDS}" -ge "${deadline}" ]; then
+        echo "WARNING: Scope exclusion (${label}): stopped retrying the reconcile at the ${EVAL_SCOPE_SETTLE_SECONDS}s settle bound" >&2
+        return 1
+      fi
+      pod="$(ready_gateway_pod "${AGENT_CLUSTER_CONTEXT}" "${TARGET_NAMESPACE}" "${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}")" || pod=""
+    fi
+    sleep "${EVAL_SCOPE_POLL_SECONDS}"
+  done
+  return 1
+}
+
+# Exclude the slots' clusters for one case, and wait until the pod and the Cluster
+# Agent profiles reflect it. Non-zero means the case must not run.
+scope_exclude_apply() { # <case> <slot>...
+  local name="$1" ops
+  shift
+  scope_exclude_target "${name}" || return 1
+  if [ -z "${BENCH_FLEET_KUBECONFIG_DIR:-}" ] || [ ! -s "${BENCH_FLEET_KUBECONFIG_DIR}/.fleet-context" ]; then
+    echo "WARNING: Scope exclusion (${name}): no .fleet-context under BENCH_FLEET_KUBECONFIG_DIR=${BENCH_FLEET_KUBECONFIG_DIR:-unset}, so slot(s) $* resolve to no cluster" >&2
+    return 1
+  fi
+  if ! ops="$(scope_exclude_cr | scope_exclude_helper patch --fleet-dir "${BENCH_FLEET_KUBECONFIG_DIR}" --slots "$@")" \
+      || ! scope_exclude_kubectl patch platformagent "${AGENT_SERVICE_NAME}" --type json -p "${ops}" >/dev/null; then
+    echo "WARNING: Scope exclusion (${name}): could not patch platformagent/${AGENT_SERVICE_NAME}" >&2
+    return 1
+  fi
+  echo "Scope exclusion (${name}): platformagent/${AGENT_SERVICE_NAME} now excludes slot(s) $*"
+  scope_exclude_settle "${name}"
+}
+
+# Put back the scope a patch saved, when one is saved, in two steps
+# (restore_ops in the helper says why): the scope back, or for a CR that had no
+# block the exclusions emptied; then the annotation removed, with the block when
+# there was none. A reconcile runs between them, so the annotation, the marker
+# the next lease repairs from, outlasts a settle that fails after the first.
+# With `settle` (after a case) each step waits as the apply does, so the
+# profiles are back before anything else runs. `repair` (the lease preflight)
+# does the same and first runs a reconcile under the CR as it stands, since an
+# earlier run may have died between the steps or after the EXIT trap's step.
+# Without either (the EXIT trap) nothing that removes the block or the
+# annotation is applied: no reconcile has run under the restored scope yet.
+# The hourly reconcile and the next lease's preflight do the rest. A CR
+# that cannot be read is a warning, not a failure: there is nothing known to
+# restore, and a lease that stopped on it would stop every run for a read.
+scope_exclude_restore() { # <label> [settle|repair]
+  local label="$1" settle="${2:-}" ops step cr args=(--first-step-only)
+  scope_exclude_target "${label}" 2>/dev/null || return 0
+  [ -z "${settle}" ] || args=()
+  for step in 1 2; do
+    if ! cr="$(scope_exclude_cr)"; then
+      echo "WARNING: Scope exclusion (${label}): could not read platformagent/${AGENT_SERVICE_NAME}; nothing restored" >&2
+      return 0
+    fi
+    if ! ops="$(printf '%s' "${cr}" | scope_exclude_helper restore ${args[@]+"${args[@]}"})"; then
+      echo "WARNING: Scope exclusion (${label}): the scope saved on platformagent/${AGENT_SERVICE_NAME} could not be read back" >&2
+      return 1
+    fi
+    [ -n "${ops}" ] || return 0
+    if [ "${settle}" = repair ] && [ "${step}" = 1 ]; then
+      scope_exclude_settle "${label}" || return 1
+    fi
+    if ! scope_exclude_kubectl patch platformagent "${AGENT_SERVICE_NAME}" --type json -p "${ops}" >/dev/null; then
+      echo "WARNING: Scope exclusion (${label}): could not restore the scope of platformagent/${AGENT_SERVICE_NAME}; the next lease's preflight tries again" >&2
+      return 1
+    fi
+    echo "Scope exclusion (${label}): a restore step applied to platformagent/${AGENT_SERVICE_NAME}: ${ops}"
+    [ -n "${settle}" ] || return 0
+    if ! scope_exclude_settle "${label}"; then
+      # After the last step the CR is restored and the settle only re-checks it.
+      if cr="$(scope_exclude_cr)" && [ -z "$(printf '%s' "${cr}" | scope_exclude_helper restore 2>/dev/null)" ]; then
+        echo "WARNING: Scope exclusion (${label}): the settle after the last restore step failed; the scope is restored, so the run goes on" >&2
+        return 0
+      fi
+      return 1
+    fi
+  done
+}
+
 if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID:-}" 2>/dev/null)" || EVAL_LEDGER_REPO=""
 else
@@ -2011,6 +2281,13 @@ fi
 reset_audit_ledgers "lease"
 reset_agent_pulls "lease" || echo "WARNING: Agent pulls reset (lease): the repository is not clean; every unit of a case that requests a pull request runs its own reset first and does not run when that fails too." >&2
 probe_gitlab_ledger_path "lease" || exit 1
+# A scope a killed run left excluded (scope_exclude_restore, above), put back
+# before anything is graded. A restore that does not settle stops the run: every
+# case on the excluded slots would grade an install without their Cluster Agent.
+scope_exclude_restore "lease" repair || {
+  echo "ERROR: Scope exclusion (lease): an earlier run's exclusion could not be undone; stopping the run (infrastructure, not a case result)" >&2
+  exit 1
+}
 scheduled_audits pause "lease"
 
 # For opentofu provider
@@ -2233,8 +2510,8 @@ fi
 # after that, is what every case on either lane carries beside its own
 # checks (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
-# under the eval-crew alias and lets the nightly file and this script fall
-# through to the root approvers. Each file's header says what belongs in it;
+# under the eval-crew alias and lets the nightly file fall through to the
+# root approvers (this script is under eval-crew too, for the grader pin). Each file's header says what belongs in it;
 # docs/designs/bench-case-format.md "Registration" is the rule.
 #
 # Paths in the files are relative to BENCH_DIR, which is where devops-bench
@@ -2548,6 +2825,124 @@ if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_
   fi
 fi
 
+# ─── Grade with the merge target's grader (#1560, section 6) ─────────────────
+# A pull request is graded by main's grader, not its own: everything under
+# bench/ but bench/tasks/ -- harness, verifiers, bench-gate, the devops-bench
+# pin in pyproject.toml, the fleet and the case stacks under bench/tf/ -- comes from
+# PULL_BASE_SHA, the commit clonerefs merged the change onto, and the cases
+# come from the change. Otherwise a change could edit what grades it. The two
+# trees are joined in a scratch directory, and BENCH_DIR points there for
+# every `uv run` after this, so no call site below needs to know. The
+# nightly, the postsubmit and the release-candidate run grade from HEAD,
+# where the two are the same commit.
+#
+# A case main's grader cannot read -- a check type, check field or top-level
+# key it does not know, a fleet role or stack it does not have -- stops the job red here, before the fan-out,
+# rather than running and losing the check to rung 2 (or a missing stack to
+# infrastructure). The check itself runs after the lane step ("main's grader
+# reads the cases as run"), over the task copies devops-bench is handed. So a grader change lands on main before the case that
+# needs it (decided 2026-10-28). That holds for every case a pull-request job
+# grades: the presubmit roster, and a lane list such as gitlab-cases.txt,
+# which may name a nightly case. A case only the nightly runs is graded from
+# HEAD and is not held to that order.
+#
+# hack/OWNERS puts this script, and the hack/ files it sources, evals or runs
+# before the verdict, under the eval-crew alias, so an edit that would take
+# the pin out needs an eval-crew approval. EVAL_GRADER_SHA names the commit
+# that graded the run; `bench-gate suite` writes it into eval-verdict.json
+# and the verdict markdown, and a grader that predates it ignores the
+# variable. The extraction itself (grader_pin_applies,
+# pin_grader, GRADER_BENCH_DIR) runs at the fleet step, which reads main's
+# fleet catalog.
+
+# One `<task file>: <reason>` line per thing the grader in BENCH_DIR cannot
+# read in the named task files, nothing when it reads them all. Three reads,
+# each the one the run would make: devops-bench's task loader, its
+# verification-spec parser (which skips an entry it cannot parse and lets the
+# run go on), and bench-gate's case loader; then whether each top-level key
+# is in the grader's CASE_KEYS (both loaders drop a key they do not know),
+# whether every fixture_role / fixture_roles a check names is in the fleet
+# catalog the run wrote kubeconfigs from (FLEET_CATALOG, main's on a pinned
+# run; a role it lacks errors the check after the lease), and whether a
+# declared stack is a directory under tf/. A grader from before CASE_KEYS
+# existed has no top-level schema to hold a case to, so that read is skipped
+# under it. Exits non-zero only when the check itself could not run.
+grader_unreadable_cases() { # <task file>... (relative to BENCH_DIR)
+  (cd "${BENCH_DIR}" && uv run python -c '
+import json
+import os
+import sys
+from pathlib import Path
+
+import yaml
+from devops_bench.tasks.loader import FileSystemTaskLoader
+from devops_bench.verification.spec import parse_entries
+from kube_agents_bench import cases
+
+known = getattr(cases, "CASE_KEYS", None)
+catalog = os.environ.get("FLEET_CATALOG")
+fleet_roles = set(json.loads(Path(catalog).read_text(encoding="utf-8")).get("roles") or {}) if catalog else None
+
+
+def named_roles(node, found):
+    if isinstance(node, dict):
+        if isinstance(node.get("fixture_role"), str):
+            found.add(node["fixture_role"])
+        if isinstance(node.get("fixture_roles"), list):
+            found.update(r for r in node["fixture_roles"] if isinstance(r, str))
+        for value in node.values():
+            named_roles(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            named_roles(value, found)
+
+
+for path in sys.argv[1:]:
+    try:
+        tasks = FileSystemTaskLoader().load_tasks(path)
+        cases.load_case(path)
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        print(f"{path}: {exc}")
+        continue
+    for key in sorted(set(raw) - known) if known is not None else []:
+        print(f"{path}: top-level key {key} is not in this grader (kube_agents_bench.cases.CASE_KEYS)")
+    if fleet_roles is not None:
+        found = set()
+        named_roles(raw.get("verification_spec"), found)
+        for role in sorted(found - fleet_roles):
+            print(f"{path}: fixture role {role} is not in the fleet catalog of this grader ({catalog})")
+    for task in tasks:
+        for error in parse_entries(task.verification_spec)[1]:
+            print(path + ": verification entry " + str(error.get("name")) + ": " + str(error.get("reason")))
+        stack = (task.infrastructure or {}).get("stack")
+        if stack:
+            # Resolved and contained: pathlib keeps "..", and an absolute
+            # value discards the root it is joined to, so either could reach
+            # a stack outside the tf/ of this grader, such as one shipped in
+            # the case folder of the change.
+            tf_root = Path(os.environ.get("BENCH_TF_ROOT") or "tf").resolve()
+            stack_dir = (tf_root / str(stack)).resolve()
+            if not (stack_dir != tf_root and stack_dir.is_relative_to(tf_root) and stack_dir.is_dir()):
+                print(f"{path}: its stack {stack} is not a directory under this grader tf/")
+' "$@")
+}
+
+EVAL_GRADER_SHA="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)"
+if [ -n "${GRADER_BENCH_DIR}" ]; then
+  BENCH_DIR="${GRADER_BENCH_DIR}"
+  EVAL_GRADER_SHA="${PULL_BASE_SHA}"
+  echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
+  # The scratch directory has no venv yet, and syncing one fetches over the
+  # network: one retry absorbs a transient failure, so the check below fails
+  # only on itself.
+  if ! (cd "${BENCH_DIR}" && uv sync --quiet) && ! (cd "${BENCH_DIR}" && uv sync --quiet); then
+    echo "ERROR: could not sync main's grader's venv in ${BENCH_DIR} (twice, above); the run does not start." >&2
+    exit 1
+  fi
+fi
+export EVAL_GRADER_SHA
+
 # ─── The lanes' safeguards (#2079) ───────────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
 # the inject door the platform persona (directly under the bridge's cli
@@ -2669,6 +3064,27 @@ unit_task_path() { # <task-path> <task-name>
   fi
 }
 
+# ─── main's grader reads the cases as run (section 6) ────────────────────────
+# The read check of "Grade with the merge target's grader", run here, after
+# the lane step, over the file each unit hands devops-bench (unit_task_path):
+# the lane's copy carries the entries of inject-lane-safeguards.yaml, read
+# from the change, which main's parser has to read as well.
+if [ -n "${GRADER_BENCH_DIR}" ]; then
+  GRADER_CHECKED=()
+  for ENTRY in "${TASKS[@]}"; do
+    GRADER_CHECKED+=("$(unit_task_path "${ENTRY}" "$(basename "$(dirname "${ENTRY}")")")")
+  done
+  if ! GRADER_UNREADABLE="$(grader_unreadable_cases "${GRADER_CHECKED[@]}")"; then
+    echo "ERROR: could not check that main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) reads this change's cases (above); the run does not start." >&2
+    exit 1
+  fi
+  if [ -n "${GRADER_UNREADABLE}" ]; then
+    echo "ERROR: main's grader (${EVAL_GRADER_TREE}/ at ${PULL_BASE_SHA}) cannot read these cases: this case needs a grader change that is not on main yet; land the grader change first, then the case." >&2
+    sed 's/^/  /' <<< "${GRADER_UNREADABLE}" >&2
+    exit 1
+  fi
+fi
+
 # ─── The nightly part ────────────────────────────────────────────────────────
 # EVAL_NIGHTLY_PART (validated at the tier switch) applied to TASKS: after
 # the lane step, which is what names the cases that request a pull request
@@ -2736,7 +3152,7 @@ infra_lock_exempt() { # <task-name>
 # from the others, so this lock does.
 unit_state_lock() { # <task-name>
   case "$1" in
-    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery | bootstrap-inventory-posture-scope) echo "onboarding" ;;
+    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-discovery-capped | bootstrap-inventory-ranking-delivery | bootstrap-inventory-posture-scope) echo "onboarding" ;;
   esac
 }
 
@@ -3287,6 +3703,11 @@ unit_cost_hint() {
     # agent turn is a board read. About 960s a repetition on a dev install on
     # 2026-10-05; 340-520s when it waited only for the fan-out (2026-09-28).
     bootstrap-discovery-fanout) echo 1000 ;;
+    # The same stack and wait under a first-run card cap of 2 (#3702): fewer
+    # Cluster Agent cards, and the sweep's own worker audits the rest, so the
+    # wait shifts to that worker rather than shrinking. Unmeasured; priced
+    # with the fan-out.
+    bootstrap-discovery-capped) echo 1000 ;;
     # Tofu too: the plant files one card and waits for its worker to run the
     # prioritization SOP and end its run (up to the stack's run_wait, 900s),
     # and the agent turn is a board read. Unmeasured; priced below the band
@@ -3581,6 +4002,16 @@ if ! DECLARED_STREAMS="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench
   echo "ERROR: could not read the matrix's audit_streams (kube_agents_bench.audit_streams, above); the fan-out cannot tell which stream locks each unit holds, so the run does not start." >&2
   exit 1
 fi
+# The cases that exclude seeded slots from the install's scope, one
+# `<case> <slot>...` line each (scope_exclude_apply, #3213). unit_phase puts them
+# in a phase of their own, after every other unit; a file that will not read
+# stops the run, since its case would run beside units its scope edit cuts.
+if ! SCOPE_EXCLUDE_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.scope_exclude cases "${TASKS[@]}")"; then
+  echo "ERROR: could not read the matrix's scope_exclude (kube_agents_bench.scope_exclude, above); the fan-out cannot tell which cases edit the install's scope, so the run does not start." >&2
+  exit 1
+fi
+SCOPE_EXCLUDE_NAMES="$(printf '%s\n' "${SCOPE_EXCLUDE_CASES}" | awk 'NF { printf "%s%s", sep, $1; sep = "," }')"
+[ -z "${SCOPE_EXCLUDE_NAMES}" ] || echo "cases that exclude seeded slots from the install's scope, run alone after every other unit: ${SCOPE_EXCLUDE_NAMES}"
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_NAMES+=("${TASK_NAME}")
@@ -4319,7 +4750,16 @@ scheduled_audits pause "fan-out"
 # grades"): unattributed there in the first phase, and charged to the unit
 # in the second, whose window is exclusive (a requesting case's and a stopped
 # ask's alike).
-unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+#
+# A case that excludes seeded slots from the install's scope (SCOPE_EXCLUDE_NAMES)
+# is phase 2, run after both and alone, each case between its own scope edit and
+# restore (scope_exclude_apply); it takes 2 even when it also writes, and then
+# keeps the writer pause but not run_one_unit's per-repetition repository reset,
+# which no scope-excluding case needs today: each of them is read-only.
+unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+  case ",${SCOPE_EXCLUDE_NAMES:-}," in
+    *",$1,"*) echo 2; return ;;
+  esac
   case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
@@ -4448,7 +4888,16 @@ EOF_UNIT_QUEUE
   done
 }
 
-profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
+# Phase 2's cases, each one's repetitions run alone between its scope edit and
+# the restore. Read into an array, not looped over with `read`: a background
+# unit would inherit the loop's stdin.
+SCOPE_EXCLUDE_LINES=()
+while IFS= read -r SCOPE_LINE; do
+  [ -z "${SCOPE_LINE}" ] || SCOPE_EXCLUDE_LINES+=("${SCOPE_LINE}")
+done <<<"${SCOPE_EXCLUDE_CASES:-}"
+SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
+
+profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
@@ -4456,6 +4905,42 @@ if [ "${WRITER_TOTAL}" -gt 0 ]; then
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
+# A scope edit that does not take effect records the case's repetitions as
+# infrastructure rather than grading an install without the exclusion. A case
+# that also writes keeps the writer pause before each repetition. The gateway
+# log is taken first, as the rollback lane takes it: each scope edit replaces
+# the pod, and the log of every other case's repetitions lives only in it.
+[ "${#SCOPE_EXCLUDE_LINES[@]}" -eq 0 ] || collect_gateway_log
+for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
+  read -r SCOPE_CASE SCOPE_SLOTS <<<"${SCOPE_LINE}"
+  SCOPE_IDX=""
+  for i in "${!TASK_NAMES[@]}"; do
+    [ "${TASK_NAMES[i]}" = "${SCOPE_CASE}" ] && SCOPE_IDX="${i}" && break
+  done
+  [ -n "${SCOPE_IDX}" ] || continue
+  SCOPE_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
+    *",${SCOPE_CASE},"*) SCOPE_PAUSE="${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" ;;
+  esac
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, with slot(s) ${SCOPE_SLOTS} excluded from the install's scope"
+  # shellcheck disable=SC2086 # slot letters, one argument each
+  if scope_exclude_apply "${SCOPE_CASE}" ${SCOPE_SLOTS}; then
+    launch_units "$(for REP in $(seq 1 "${EVAL_REPETITIONS}"); do printf '%s 0 %s\n' "${REP}" "${SCOPE_IDX}"; done)" 1 "${SCOPE_PAUSE}"
+    wait
+    # This case's own gateway log, before the restore replaces the pod that
+    # served it: collect_gateway_log runs once, and took the earlier pod.
+    kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE}" logs "deployment/${AGENT_SERVICE_NAME}-gateway" \
+      --tail="${GATEWAY_LOG_TAIL_LINES}" 2>&1 \
+      | last_bytes "${GATEWAY_LOG_MAX_BYTES}" "${ARTIFACT_DIR}/platform-agent-gateway-${SCOPE_CASE}.log" || true
+  else
+    for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+      skip_unit "${TASKS[SCOPE_IDX]}" "${SCOPE_CASE}" "${REP}" "" "" "not run: its scope exclusion did not take effect" \
+        "scope-exclude: slot(s) ${SCOPE_SLOTS} could not be excluded from the install's scope"
+    done
+  fi
+  scope_exclude_restore "${SCOPE_CASE}" settle \
+    || echo "WARNING: Scope exclusion (${SCOPE_CASE}): the restore did not settle; the next lease's preflight repeats it" >&2
+done
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
 # On both lanes, once every unit is done: every pull request and branch

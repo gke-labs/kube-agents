@@ -899,6 +899,14 @@
 # provisioning the preferred tier. deployer: noop, transcript-only.
 ./tasks/autoscaler-zonal-stockout-cooldown-scope-probe/task.yaml
 
+# #3702: the onboarding sweep under a first-run cluster card cap of 2, below the
+# eval fleet's roster so it binds. Cards for the first two Cluster Agents by
+# profile name only, and the raw report shows the rest audited by the sweep
+# itself. The bootstrap-discovery stack, as bootstrap-discovery-fanout runs it
+# with a cap of 2 where the fan-out pins 24; the onboarding lock, so main-a.
+# Priced with the fan-out.
+./tasks/bootstrap-discovery-capped/task.yaml
+
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The
 # bootstrap-ranking stack with a planted report that has no critical finding;
@@ -951,18 +959,29 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A Cluster Agent answers a storage audit with the single-pass collector SOUL.md
+# names (#3285): graded on a Cluster Agent doing the work, running
+# /opt/data/scripts/audit_storage.py, no later turn's result showing the script
+# missing, and a report naming the storage kinds. deployer: noop, read-only, no
+# fixture, 200s default until it has a record.
+./tasks/cluster-agent-storage-audit-collector/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # Gemini setup it failed about 30% of repetitions on unrelated pull requests
 # and on main's eval-next (37 of 126 across 42 runs; the store's record
-# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
-# #3448); 22 were real misses: the agent read seeded-c's leftover
+# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, a fix proposed
+# in #3448); 22 were real misses: the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
 # named the wrong facet, or (once) a tool error. The Claude nightlies pass
-# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
-# lands, and the case passes the roster's bar, 90% over 20 runs, on the
-# Gemini nightly (#3598). The domain's roster seat is consistency-drift-outlier
-# since 2026-10-26.
+# it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
+# 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
+# reverted (#4116), so a presubmit seat could not fail when the fix is undone:
+# the case stays nightly by the decision on #3975's review thread. No CI lane
+# grades its route check today (the nightly halves run through the inject
+# door; since #3969 the api-lane jobs carry the presubmit list, not this file).
+# Enters again once a lane grades that route and the record holds (#3598).
+# The domain's roster seat is consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
 # A request cut on named workloads names the dependency each cut would change
@@ -971,6 +990,16 @@
 # not run the waste collector. Red on main before the change, on a dev
 # install. One case, three units. deployer: noop, read-only over the seeded fleet.
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
+
+# gke-labs#2610: a request to propose a fix, delegated to a platform card, is
+# answered in the card's result with the PodDisruptionBudget manifest, and no
+# worker runs submit_suggestion.py, during its run or after kanban_complete.
+# The prompt is the card body the gate's failing repetitions carried. About
+# one gate repetition in 25 failed on main, so a night's three are a sample;
+# on a dev lane main failed 8 of 20 end to end (#4105). deployer: noop, read-only, the no-pdb-workload fixture plus
+# the pool repository's checkout-gateway declaration (#3145); first phase,
+# like obtainability-remediation-proposal. Nightly from its first merge.
+./tasks/delegated-proposal-stays-in-reply/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
@@ -1086,10 +1115,25 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# A fleet question on an install whose spec.scope.exclude.clusters names
+# seeded-b: the answer names seeded-a and seeded-c and does not report on
+# seeded-b (#3081, #3100). The runner excludes slot b for this case's
+# repetitions alone, after every other unit, and restores the scope after them
+# (scope_exclude, #3213); deployer: noop, read-only.
+./tasks/scope-excluded-cluster-not-listed/task.yaml
+
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
 # the flag after it (#2979, #3260). deployer: noop, transcript-only.
 ./tasks/stop-on-unknown-flag-write-refusal/task.yaml
+
+# Topology drift and zonal skew attribution probe (#1356, #3415): grades
+# root-cause attribution across the three planted zonal-skew roles on slot d
+# (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
+# seeded-topology) plus the capacity role's sponge, the single-zone node-pool
+# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# noop, read-only, off the infra lock.
+./tasks/topology-zonal-skew-probe/task.yaml
 
 # Twenty image-pull Warnings at once: every alert the daemon admits starts its
 # triage turn within the product's 20-minute queue limit, graded by the

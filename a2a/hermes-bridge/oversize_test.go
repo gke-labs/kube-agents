@@ -59,14 +59,19 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 }
 
 // atCapTerminalWait is the at-cap test's own terminal budget. An answer of
-// apiResponseCap bytes takes about 10 s to its terminal under the race
-// detector on an idle machine (0.6 s to read and parse, 6.4 s in the chat
-// fold scanning one 8 MiB line, 3 s publishing the result chunks; 1.3 s
-// without -race), so the shared terminalWait is crossed on a busy CI runner
-// at a two-fold slowdown. The task deadline bounds only the HTTP turn, and
-// the fold runs before finalizeResult opens its publish window, so this
-// budget is the one that decides.
-const atCapTerminalWait = 60 * time.Second
+// apiResponseCap bytes takes about 10 s to
+// its terminal under the race detector on an idle machine (0.6 s to read and
+// parse, 6.4 s in the chat fold scanning one 8 MiB line, 3 s publishing the
+// result chunks; 1.3 s without -race), so the shared terminalWait is crossed
+// on a busy CI runner at a two-fold slowdown, and 58 s to 132 s was
+// measured with the module's packages sharing four starved cores, a
+// thirteen-fold slowdown at worst; the budget is eighteen-fold on the idle
+// figure. The task deadline bounds only the HTTP turn, and the fold runs
+// before finalizeResult opens its publish window, so this budget is the one
+// that decides while the chunks publish inside finalizePublishTimeout; a run
+// that ends failed with bus-publish-failed instead crossed that window, and
+// this budget is not the one to raise.
+const atCapTerminalWait = 180 * time.Second
 
 // resultPublishCall is what the at-cap test's hooks record: when the
 // bridge's chat fold returned, and the deadline of the context resultPublish
@@ -156,7 +161,9 @@ func TestResultPublishFailureCarriesTheCause(t *testing.T) {
 	startAPIBridge(t, url, stub, func(cfg *Config) { cfg.ResultChunkSize = chunk })
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-pubfail", "ctx-pubfail", "answer at length")
-	task := waitTerminal(t, c, "task-pubfail")
+	// A quarter of the at-cap answer: 22 s measured under the load that
+	// took the at-cap test past 100 s, against terminalWait's 20 s.
+	task := waitTerminalFor(t, c, "task-pubfail", 3*terminalWait)
 	if task.State != lib.StateFailed {
 		t.Fatalf("state = %s, want failed", task.State)
 	}

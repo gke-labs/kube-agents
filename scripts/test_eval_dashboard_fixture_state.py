@@ -372,6 +372,15 @@ def healthy_world(*projects):
                 "status": {"desiredNumberScheduled": 2, "numberReady": 2},
             },
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
+            # seeded-scaled-zero: a switched-off environment behind a Gateway.
+            "namespace/seeded-scaled-zero": {"metadata": {"name": "seeded-scaled-zero"}},
+            "deployment/storefront": {"spec": {"replicas": 0}},
+            "deployment/envoy-seeded-scaled-zero-storefront-edge": {"spec": {"replicas": 0}},
+            "service/storefront": {"metadata": {"name": "storefront"}},
+            "gateway/storefront-edge": {"status": {"conditions": [{"type": "Programmed", "status": "False", "reason": "NoResources"}]}},
+            "httproute/storefront": {"metadata": {"name": "storefront"}},
+            "pod?app=storefront": {"items": []},
+            "pod?app.kubernetes.io/name=envoy": {"items": []},
         },
         "describe": {project: {"seeded-a": _peer(), "seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED}, "seeded-d": _peer()} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000"]}]},
@@ -514,10 +523,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 36, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 37, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 36, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 37, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -571,7 +580,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 71, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 73, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
@@ -795,7 +804,7 @@ class Workflow(unittest.TestCase):
         scan = next(step for step in steps if "fixture_state.py" in step.get("run", ""))
         self.assertIn("--prior work/fixture-state-prior.json", scan["run"])
         self.assertIn('--workers "$FIXTURE_STATE_WORKERS"', scan["run"])
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         self.assertIn('"$DASHBOARD_BUCKET/fixture-state.json"', upload["run"])
         import re
 
@@ -812,7 +821,7 @@ class Workflow(unittest.TestCase):
         import sys
 
         steps = self.jobs["fixture-state-scan"]["steps"]
-        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        upload = next(step for step in steps if "cp --cache-control=no-cache work/fixture-state.json" in step.get("run", ""))
         run = upload["run"]
         code = run[run.index("python3 -c '") + len("python3 -c '") :]
         code = code[: code.index("\n'")]
@@ -837,7 +846,7 @@ class Workflow(unittest.TestCase):
     def test_the_tick_reads_the_published_scan(self):
         steps = self.jobs["refresh-and-adjudicate"]["steps"]
         fetch = next(step for step in steps if "fixture-state.json" in step.get("run", "") and "health-prev.json" in step["run"])
-        self.assertIn('gsutil -q cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true', fetch["run"])
+        self.assertIn('gcloud storage cp "$DASHBOARD_BUCKET/fixture-state.json" work/fixture-state.json || true', fetch["run"])
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--fixture-state work/fixture-state.json", adjudicate["run"])
 

@@ -98,16 +98,31 @@ func TestTierSetsMatchTheRetiredRank(t *testing.T) {
 	}
 }
 
-// Every verb the retired table knew is still in some tier's set, and no verb
-// was added: the vocabulary is unchanged.
+// Every verb the retired table knew is still in some tier's set, and every verb
+// added since is named here on purpose: a verb added to the table without
+// being listed fails, so a widening never slips in unnoticed.
+var addedSinceTheRank = map[Verb]string{
+	VerbProfileRun: "#3659: the dispatcher's question to the verifier",
+}
+
 func TestTierSetsKeepTheVocabulary(t *testing.T) {
-	got := Verbs()
-	if len(got) != len(retiredVerbTier) {
-		t.Fatalf("Verbs() = %v, want the %d verbs the retired table named", got, len(retiredVerbTier))
+	have := map[Verb]bool{}
+	for _, v := range Verbs() {
+		have[v] = true
+		_, retired := retiredVerbTier[v]
+		_, added := addedSinceTheRank[v]
+		if !retired && !added {
+			t.Errorf("Verbs() names %q, which neither the retired table nor addedSinceTheRank lists", v)
+		}
 	}
-	for _, v := range got {
-		if _, ok := retiredVerbTier[v]; !ok {
-			t.Errorf("Verbs() names %q, which the retired table did not", v)
+	for v := range retiredVerbTier {
+		if !have[v] {
+			t.Errorf("verb %q from the retired table is in no tier's set", v)
+		}
+	}
+	for v := range addedSinceTheRank {
+		if !have[v] {
+			t.Errorf("addedSinceTheRank lists %q, but no tier's set names it", v)
 		}
 	}
 }

@@ -434,7 +434,10 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// include a STREAM.INFO read.
 		"$KV.cap.root.*",
 		// The Home tab's board request (a2aBoardSubject): an empty body,
-		// answered by the bridge on a2aBoardReplySubjects.
+		// answered by the bridge on a2aBoardReplySubjects; or, with a body, a
+		// board-health row's Retry or Drop, which the bridge relays to
+		// session-kv. This grant being the gateway's alone is what keeps any
+		// other principal from asking the bridge to act.
 		a2aBoardSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
@@ -851,11 +854,13 @@ func bridgeIdentity() a2aIdentity {
 	// because it never delegates onward.
 	publish = append(publish, "a2a.cap.verify."+a2aBridgeAddressee)
 	// The answer to the gateway's board request (a2aBoardSubject), relayed
-	// from session-kv's GET /v1/board. Read-only data, and the bridge
+	// from session-kv's GET /v1/board, or its answer to a board-health
+	// Retry or Drop (POST /v1/board/actions). The bridge
 	// answers rather than the agent container because it already holds
 	// session-kv's bearer. The trust boundary is the pod's, as for every
 	// grant here: the agent's terminal can reach this password, so a board
-	// it forged would show on the Home tab to the members the gateway admits.
+	// it forged would show on the Home tab to the members the gateway admits,
+	// and an outcome it forged on a tapped row; it cannot ask for a tap.
 	publish = append(publish, a2aBoardReplySubjects)
 
 	return a2aIdentity{
@@ -1031,6 +1036,11 @@ func webIdentity() a2aIdentity {
 		// Denying the whole `a2a.cap.>` namespace rather than the verify
 		// subject alone also takes away the reply traffic, which this
 		// credential had no reason to see either.
+		//
+		// TODO(#3889): deny `a2a.dispatch.>` here and on console when the
+		// dispatch subjects land. Neither reads offers, and an offer will
+		// carry a task credential (bound to its pod, so useless copied, but
+		// no reason to hand it to a browser).
 		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
@@ -1088,6 +1098,11 @@ func consoleIdentity() a2aIdentity {
 			"chat.console.*.out",
 			"_INBOX.console.>",
 		},
+		// web's subtraction, for web's reason: `a2a.>` covers the
+		// verifier's request subject, and any subscriber may join its
+		// queue group and swallow a share of every verify request. This
+		// password is handed to a browser too (console.go's /config.json).
+		denySubscribe: []string{"a2a.cap.>"},
 	}
 }
 

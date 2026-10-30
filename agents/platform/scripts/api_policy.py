@@ -24,7 +24,9 @@ built the same way for both doors.
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from command_policy import Decision
@@ -77,6 +79,15 @@ PROJECT = r"(?:[a-z][a-z0-9-]{4,28}[a-z0-9]|[1-9][0-9]{0,18})"
 # spelt as an id, or an id that is not one.
 TRACE_ID = r"[0-9a-f]{32}"
 
+# A GKE location as the API takes it: `-` (every location, the list's wildcard), a
+# region (`us-central1`) or a zone (`us-central1-a`). A cluster name as GKE allows
+# it: lower-case letters, digits and hyphens, starting with a letter, ending with a
+# letter or digit, at most 40 characters. Constraining both segments is what keeps
+# the cluster routes from admitting a child (`clusters/<c>/nodePools`), a custom
+# method spelt into a segment, or a second segment through either position.
+GKE_LOCATION = r"(?:-|[a-z]+-[a-z]+[0-9]{1,2}(?:-[a-z])?)"
+GKE_CLUSTER = r"[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?"
+
 # What a host may look like, in the table and in a request: a lower-case DNS
 # name with at least one dot. No scheme, no port, no path, no user info, no
 # percent-encoding. Exact-match at lookup. Public because the broker's handler
@@ -99,6 +110,58 @@ class ApiRoute:
     method: str  # API_READ_METHOD in this version
     path: re.Pattern  # anchored at both ends, matched against the whole path
     rule_id: str  # what the audit line and the 403 name
+    # What of a 2xx response body the caller is handed, or None to hand back the
+    # upstream's body as it came. A projection returns None for a body it cannot
+    # read, which the broker answers 502 rather than relaying unprojected.
+    project: Callable[[bytes], bytes | None] | None = None
+
+
+# What of a GKE `Cluster` the container routes relay: whether it exists and what it
+# is called, which is all the Cluster Agent reconcile reads (#3703). Everything else
+# is left behind, `masterAuth` included: control-plane auth material stays out of the
+# relay, the boundary the watcher route draws (watcher_policy.project_cluster).
+GKE_CLUSTER_FIELDS = ("name", "location", "status", "id")
+
+
+def _cluster_row(cluster) -> dict | None:
+    if not isinstance(cluster, dict):
+        return None
+    return {k: cluster[k] for k in GKE_CLUSTER_FIELDS if k in cluster}
+
+
+def project_gke_cluster(body: bytes) -> bytes | None:
+    """The relayed form of a `clusters.get` answer, or None if it is not one."""
+    try:
+        row = _cluster_row(json.loads(body))
+    except ValueError:
+        return None
+    return None if row is None else json.dumps(row, separators=(",", ":")).encode()
+
+
+def project_gke_cluster_list(body: bytes) -> bytes | None:
+    """The relayed form of a `clusters.list` answer, or None if it is not one.
+
+    `missingZones` is kept so the answer still says when a list is partial. The
+    reconcile does not need it: it reads a list only as proof that a cluster exists,
+    never as proof of absence, so a partial list cannot delete anything.
+    """
+    try:
+        answer = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(answer, dict):
+        return None
+    clusters = answer.get("clusters", [])
+    if not isinstance(clusters, list):
+        return None
+    rows = [_cluster_row(c) for c in clusters]
+    if any(row is None for row in rows):
+        return None
+    kept: dict = {"clusters": rows}
+    missing = answer.get("missingZones")
+    if isinstance(missing, list) and all(isinstance(z, str) for z in missing):
+        kept["missingZones"] = missing
+    return json.dumps(kept, separators=(",", ":")).encode()
 
 
 API_READ_ROUTES: tuple[ApiRoute, ...] = (
@@ -148,6 +211,24 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         re.compile(rf"^v1/projects/{PROJECT}/traces/{TRACE_ID}$"),
         "gcp.api.cloudtrace.traces-get",
     ),
+    # The Cluster Agent reconcile's two reads (#3703, approved by @bnaylor 10-28 as
+    # exactly these two read-only routes): every cluster in a project, and whether one
+    # cluster still exists. Both answers are projected to name, location, status and
+    # id; node pools, operations and every write stay refused.
+    ApiRoute(
+        "container.googleapis.com",
+        API_READ_METHOD,
+        re.compile(rf"^v1/projects/{PROJECT}/locations/{GKE_LOCATION}/clusters$"),
+        "gcp.api.container.clusters-list",
+        project_gke_cluster_list,
+    ),
+    ApiRoute(
+        "container.googleapis.com",
+        API_READ_METHOD,
+        re.compile(rf"^v1/projects/{PROJECT}/locations/{GKE_LOCATION}/clusters/{GKE_CLUSTER}$"),
+        "gcp.api.container.clusters-get",
+        project_gke_cluster,
+    ),
 )
 
 
@@ -194,12 +275,20 @@ def _validate_routes(routes: tuple[ApiRoute, ...]) -> None:
                 f"{where}: rule_id {route.rule_id!r} is already used; each route names its own"
             )
         seen.add(route.rule_id)
+        if route.project is not None and not callable(route.project):
+            raise TypeError(f"{where}: project must be callable or None")
 
 
 _validate_routes(API_READ_ROUTES)
 
 # Every host the table names, for the "known host, unknown path" answer.
 _ROUTED_HOSTS = frozenset(route.host for route in API_READ_ROUTES)
+_PROJECTIONS = {route.rule_id: route.project for route in API_READ_ROUTES}
+
+
+def response_projection(rule_id: str) -> Callable[[bytes], bytes | None] | None:
+    """The projection the allowed route `rule_id` applies to a 2xx body, if any."""
+    return _PROJECTIONS.get(rule_id)
 
 
 def evaluate(method: str, host: str, path: str, query: str) -> Decision:

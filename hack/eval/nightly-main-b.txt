@@ -64,6 +64,13 @@ monitoring-alert-policy-read
 # and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
 # the retrospective's report store, priced at 600s each; each run applies and
 # tears it down, so the halves may split them. One here, the family case in
-# main-a: the halves read 13300s (main-a) against 12800s; both here they would
-# read 12700s against 13400s, also inside the 1800s the balance test allows.
+# main-a. (The totals quoted when they were placed have since moved with the
+# list; the balance test is the check.)
 upgrades-retrospective-log-volume-gate
+
+# Moved by measured time, not by hint (#3384): on the 2026-10-27 and -28 nights
+# main-a's stack cases (its bootstrap cases included) ran about 7.0h of unit
+# time against main-b's 5.4h, and main-a took 419m then 622m of its 720m. At
+# about 59m a night this case brings them to about 6.0h and 6.4h; the
+# hint-based balance test described in the header still holds.
+autoops-controller-stall-triage

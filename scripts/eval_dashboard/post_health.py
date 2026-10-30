@@ -52,8 +52,8 @@ the same cases -- gate_issue.py files one with the workflow's GitHub token
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
-designed state on two consecutive hourly scans or on three pool projects at
-once, #1550) files one for the fleet owner the same way, unless an open
+designed state on two consecutive hourly scans, #1550) files one for the
+fleet owner the same way, unless an open
 issue already names the drifted roles. A new `pool_drift`
 condition (#1967) files one for the pool owner, with the repair per project,
 unless an open issue's title names every finding. A new `deadline_kill`
@@ -87,6 +87,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -97,7 +98,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli, nightly, periodics
+    from eval_dashboard import gate_issue, ghcli, nightly, nightly_latency, periodics
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
@@ -118,7 +119,7 @@ try:
     )
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli, nightly, periodics
+    from eval_dashboard import gate_issue, ghcli, nightly, nightly_latency, periodics
     from eval_dashboard.health import (
         CAPACITY_ROLES,
         POOL_BREACH,
@@ -224,6 +225,10 @@ SPACE_PREFIX = "spaces/"
 NOT_CONFIGURED = "webhook not configured: set CI_HEALTH_CHAT_SPACE (+ CI_HEALTH_CHAT_TOKEN) or CI_HEALTH_CHAT_WEBHOOK; nothing posted"
 REQUEST_TIMEOUT_S = 30
 USER_AGENT = "kube-agents-ci-health"
+# Chat's text markup, which a card's fallbackText (a notification) shows raw:
+# <url|label> links and *bold*.
+CHAT_LINK_RE = re.compile(r"<[^|<>]+\|([^<>]+)>")
+CHAT_BOLD = "*"
 
 # The digest goes out once per local day (`--digest-tz`, Toronto by
 # default), on the first tick inside [digest_hour:00 - window, digest_hour:00
@@ -339,11 +344,12 @@ POOL_JOB_HISTORY_URL = (
     f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{POOL_PRESSURE_JOB}"
 )
 
-# gsutil is how the state object is read and written; publish.py uses the
-# same header so a reader never gets an hour-stale copy.
-GSUTIL = "gsutil"
+# `gcloud storage` is how the state object is read and written; publish.py
+# sets the same Cache-Control so a reader never gets an hour-stale copy.
+GCLOUD = "gcloud"
+STORAGE_GROUP = "storage"
 GS_PREFIX = "gs://"
-CACHE_CONTROL = "Cache-Control: no-cache"
+CACHE_CONTROL_FLAG = "--cache-control=no-cache"
 
 UTC = timezone.utc
 
@@ -360,7 +366,7 @@ def log(message: str) -> None:
 def read_state(location: str, runner=subprocess.run) -> dict | None:
     """The last posted state, or None when there is none yet."""
     if location.startswith(GS_PREFIX):
-        result = runner([GSUTIL, "-q", "cat", location], capture_output=True, text=True)
+        result = runner([GCLOUD, STORAGE_GROUP, "cat", location], capture_output=True, text=True)
         if result.returncode != 0:
             return None
         text = result.stdout
@@ -383,7 +389,7 @@ def write_state(location: str, state: dict, runner=subprocess.run) -> None:
             handle.write(text)
             name = handle.name
         try:
-            runner([GSUTIL, "-q", "-h", CACHE_CONTROL, "cp", name, location], check=True)
+            runner([GCLOUD, STORAGE_GROUP, "cp", CACHE_CONTROL_FLAG, name, location], check=True)
         finally:
             os.unlink(name)
         return
@@ -1236,12 +1242,60 @@ def _periodic_footer(words: dict, history_url: str) -> str:
     return f"{runbook}Build: {history_url}"
 
 
+def shared_cause_groups(notes: dict[str, dict]) -> list[list[str]]:
+    """The failed jobs, two or more, whose builds ended with the same last log
+    line: one cause, one message. A job with no last line, or alone with
+    its own, is not grouped."""
+    by_line: dict[str, list[str]] = {}
+    for job, note in sorted(notes.items()):
+        if note.get("verdict") == periodics.VERDICT_FAILED and note.get(periodics.KEY_LAST_LINE):
+            by_line.setdefault(note[periodics.KEY_LAST_LINE], []).append(job)
+    return [jobs for jobs in by_line.values() if len(jobs) > 1]
+
+
+def render_shared_cause(jobs: list[str], notes: dict[str, dict]) -> str:
+    """One block for jobs whose builds died on the same log line: where and
+    the line, then each job as its own block would say it (what it does, its
+    run, its detail lines, its own node and Warning pod event), the effects,
+    a footer per job."""
+    words = {job: _job_words(job, notes[job]) for job in jobs}
+    places = " and ".join(dict.fromkeys(words[job]["place"] for job in jobs))
+    lines = [
+        f"🟠 *{places}: {len(jobs)} jobs failed on the same log line.*",
+        f"Each build's log ends on the same line, `{notes[jobs[0]][periodics.KEY_LAST_LINE]}`; one place to look first.",
+    ]
+    for job in jobs:
+        note = notes[job]
+        does = f"`{job}` {words[job]['does']}." if words[job].get("does") else f"`{job}`."
+        dry = " (a dry run: nothing was applied)" if note.get("dry_run") else ""
+        how = f": {note['summary']}" if note.get("summary") else ""
+        lines.append(f"{does} Its {clock(parse_iso(note.get('finished_at')))} run (build {note['build']}){dry} failed{how}.")
+        lines.extend(f"- {line}" for line in note.get("detail") or [])
+        # The shared line is in the header; the node and the event are this job's.
+        own = periodics.cause_text({key: value for key, value in note.items() if key != periodics.KEY_LAST_LINE})
+        if own:
+            lines.append(f"- how it died: {own}")
+    effects = " ".join(dict.fromkeys(words[job]["effect"] for job in jobs if words[job].get("effect")))
+    lines.append(" ".join(part for part in ("Effect:", effects, periodics.SCOPE_LINE) if part))
+    lines.extend(f"`{job}`: {_periodic_footer(words[job], notes[job]['history_url'])}" for job in jobs)
+    return "\n".join(lines)
+
+
 def render_periodic(health: dict, prev: dict | None) -> str:
     """One block per job with news, four lines each: where and what stopped
-    happening; which job, what it does, which run and how it failed; what that
-    costs and the scope; the runbook and the build."""
+    happening; which job, what it does, which run and how it failed (and how
+    the build died: the log line that says so, the node and a Warning pod
+    event, when read); what that costs and the scope; the runbook and the
+    build. Failed jobs whose builds died on the same log line share one block."""
+    news = periodic_news(health, prev)
     blocks = []
-    for job, note in sorted(periodic_news(health, prev).items()):
+    grouped: set[str] = set()
+    for jobs in shared_cause_groups(news):
+        blocks.append(render_shared_cause(jobs, news))
+        grouped.update(jobs)
+    for job, note in sorted(news.items()):
+        if job in grouped:
+            continue
         when = clock(parse_iso(note.get("finished_at")))
         words = _job_words(job, note)
         does = f"`{job}` {words['does']}." if words.get("does") else f"`{job}`."
@@ -1267,6 +1321,9 @@ def render_periodic(health: dict, prev: dict | None) -> str:
         how = f": {note['summary']}" if note.get("summary") else ""
         lines = [f"🟠 *{words['place']}: {words['absence']}.*", f"{does} Its {when} run (build {note['build']}){dry} failed{how}."]
         lines.extend(f"- {line}" for line in note.get("detail") or [])
+        cause = periodics.cause_text(note)
+        if cause:
+            lines.append(f"- how it died: {cause}")
         lines.append(effect)
         lines.append(footer)
         blocks.append("\n".join(lines))
@@ -1366,7 +1423,8 @@ def periodic_digest_lines(health: dict, now: datetime | None = None) -> list[str
         elif note.get("verdict") == periodics.VERDICT_TOKEN:
             lines.append(f"🟡 {words['place']}: {words['absence']} (build {note['build']} passed {dated_clock(parse_iso(note.get('finished_at')), now)}; {'; '.join(note.get('detail') or [])}); {note['history_url']}")
         else:
-            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}); {note['history_url']}")
+            cause = periodics.cause_text(note)
+            lines.append(f"🟠 {words['place']}: {words['absence']} (build {note['build']} failed {dated_clock(parse_iso(note.get('finished_at')), now)}{f'; {cause}' if cause else ''}); {note['history_url']}")
     return lines
 
 
@@ -1560,6 +1618,23 @@ def pool_digest_line(pool: dict) -> str:
     )
 
 
+def nightly_latency_line(data: dict, now: datetime) -> str | None:
+    """The latency block's night line (nightly_latency.py) for the one-line
+    nightly summary: last night only, when it carried timing; the line says
+    so when the night is cut short or partial. It runs on the morning the
+    section failed, so a failure of its own is no line, never a lost
+    digest."""
+    try:
+        night, _ = nightly.last_night(data, now)
+        if night is None:
+            return None
+        return nightly_latency.night_line(nightly.night_reports(data, running=nightly.running_nights(data, now)))
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: nightly latency line skipped")
+        return None
+
+
 def render_digest(health: dict, now: datetime, data: dict | None = None, section=None, coverage=()) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- last night's nightly run. ``section`` is what
@@ -1568,7 +1643,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     the one line on the night with a link to its report -- the counts, what
     is newly failing against the night before, the opening chat turn's p50
     and p95 when the reps carried it, and the wall clock, or that the night
-    was truncated or missing -- and a reason adds a line saying why the
+    was truncated or missing -- then the latency block's night line
+    (nightly_latency.py) when last night carried timing, and a reason adds
+    a line saying why the
     section is missing. ``coverage`` is ``coverage_lines``'s: one line per
     domain with no blocking presubmit seat, none while every domain has one."""
     metrics = health.get("metrics") or {}
@@ -1611,6 +1688,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
             lines.append("")
     elif data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
+        latency = nightly_latency_line(data, now)
+        if latency:
+            lines.append(latency)
         lines.append(NIGHTLY_URL)
         if isinstance(section, str):
             lines.append(NIGHTLY_SKIPPED.format(reason=section))
@@ -1667,6 +1747,8 @@ class Sender:
         self.token = token.strip()
         self.webhook = webhook.strip()
         self.opener = opener
+        # The last send's HTTP status; None when no response came back.
+        self.status: int | None = None
 
     @classmethod
     def from_env(cls, environ=os.environ, opener=urllib.request.urlopen) -> Sender:
@@ -1688,8 +1770,17 @@ class Sender:
             return f"chat api (space set, {TOKEN_ENV} missing)"
         return "webhook" if self.webhook else "unconfigured"
 
-    def request(self, text: str) -> urllib.request.Request:
-        body = json.dumps({"text": text}).encode("utf-8")
+    @staticmethod
+    def body(text: str, card: dict | None = None) -> dict:
+        """The message: ``text``, or with a cardsV2 ``card`` the card and
+        ``text`` as its fallback (what a notification or a client without
+        cards shows; Chat would print a ``text`` above the card as well)."""
+        if card is None:
+            return {"text": text}
+        return {"fallbackText": CHAT_LINK_RE.sub(r"\1", text).replace(CHAT_BOLD, ""), "cardsV2": [card]}
+
+    def request(self, text: str, card: dict | None = None) -> urllib.request.Request:
+        body = json.dumps(self.body(text, card)).encode("utf-8")
         headers = {"Content-Type": "application/json; charset=UTF-8", "User-Agent": USER_AGENT}
         if self.space and self.token:
             url = f"{CHAT_API_ROOT}/{CHAT_MESSAGES_PATH.format(space=self.space)}"
@@ -1698,12 +1789,15 @@ class Sender:
             url = self.webhook
         return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, card: dict | None = None) -> bool:
         """POST once. True on 2xx; a failure is logged without the URL."""
+        self.status = None
         try:
-            with self.opener(self.request(text), timeout=REQUEST_TIMEOUT_S) as response:
+            with self.opener(self.request(text, card), timeout=REQUEST_TIMEOUT_S) as response:
                 status = getattr(response, "status", 200)
+            self.status = status
         except urllib.error.HTTPError as exc:
+            self.status = exc.code
             log(f"post failed: HTTP {exc.code} from {self.describe()}")
             return False
         except (urllib.error.URLError, OSError) as exc:

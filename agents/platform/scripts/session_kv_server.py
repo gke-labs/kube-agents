@@ -34,11 +34,13 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_health_card
 import board_snapshot
 import chat_notify
 import cron_schedule
 import findings_queue
 import gitops_workspace
+import kanban_board_health
 import slack_audit_report
 import slack_blocks_post
 import slack_presenter
@@ -874,6 +876,25 @@ INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
 # arriving together cannot both find no anchor and both open a triage. The
 # route is a sync def served on a threadpool, so they can.
 _WORKLOAD_FOLD_LOCK = threading.Lock()
+# A workload that breaks again while the fix for its last incident waits for
+# review (_open_fix_pull_request): the event is recorded against that incident
+# with the pull request's URL instead of opening a second investigation. A pull
+# request a card opened is a `pr_opened` event on that card in kanban.db
+# (agents/platform/plugins/pr_opened). Same pattern as that plugin's
+# PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
+# forge.call takes, then the number.
+PR_OPENED_EVENT_KIND = "pr_opened"
+PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_OPEN_STATE = "open"
+# How many of the workload's most recent incidents are searched for a fix.
+FIX_PR_INCIDENTS_SCANNED = 5
+# The forge lookup's budget for the whole search; past it the event is
+# announced as a new incident, the same answer as no fix at all.
+FIX_PR_LOOKUP_TIMEOUT_S = 8.0
+# session_metadata key on the held incident's session: when its thread was last
+# reminded that the fix is waiting, so it is reminded at most once per window.
+FIX_PR_REMINDED_AT_KEY = "fix_pr_reminded_at"
+FIX_PR_REMINDER_SEND_TIMEOUT_S = 30.0
 
 # The `kind` a drift record carries, set by the drift detector
 # (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
@@ -1327,6 +1348,12 @@ def init_db() -> None:
                 # Deployment's pod, or a non-Pod object's own name. Empty on
                 # every row that can neither fold nor anchor.
                 ("fold_key", "fold_key TEXT NOT NULL DEFAULT ''"),
+                # The workload an incident's fix belongs to (_incident_branch_workload),
+                # which, unlike fold_key, nothing clears: the search for an open
+                # fix reaches back past restarts (_open_fix_pull_request).
+                ("workload_key", "workload_key TEXT NOT NULL DEFAULT ''"),
+                # The open pull request a row was held for; '' on every other row.
+                ("pull_request", "pull_request TEXT NOT NULL DEFAULT ''"),
                 # When the row's turn was dispatched: stamped by the dispatcher
                 # as it creates the gateway session, on every path, and by the
                 # carding of a drift-backlog row. created_at is the row's
@@ -1535,6 +1562,8 @@ def record_intercepted_event(
     session_id: str = "",
     duplicate_of: Optional[int] = None,
     fold_key: str = "",
+    workload_key: str = "",
+    pull_request: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
 
@@ -1580,8 +1609,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id, duplicate_of, fold_key) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "occurrences, notified, session_id, duplicate_of, fold_key, workload_key, pull_request) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -1596,6 +1625,8 @@ def record_intercepted_event(
                         session_id,
                         duplicate_of,
                         fold_key,
+                        workload_key,
+                        pull_request,
                     ),
                 )
                 return cursor.lastrowid
@@ -1691,6 +1722,182 @@ def mark_triage_state(event_row_id: Optional[int], state: str) -> None:
                 )
     except Exception as exc:
         logger.error(f"Failed to record triage state {state} for ledger row {event_row_id}: {exc}")
+
+
+class FixPullRequest(NamedTuple):
+    """An incident whose fix is open for review: its ledger row, its session, and the pull request."""
+
+    anchor_id: int
+    session_id: str
+    url: str
+
+
+def _incident_pull_request_urls(session_id: str) -> list[str]:
+    """The pull requests cards filed in an incident's own session opened, newest first.
+
+    The card the front door files in the incident's own session
+    (INCIDENT_TRIAGE_OPEN_PULL_REQUEST; Hermes stamps the filing session on
+    `tasks.session_id`) opens the fix, and a card that opened one has a
+    `pr_opened` event (agents/platform/plugins/pr_opened). Not the cards
+    subscribed to the incident's thread: anything asked for in the thread
+    files one, so a pull request found that way need not be the fix.
+    Best-effort: an unreadable board, or one without a table or column these
+    read, contributes nothing.
+    """
+    sql = (
+        "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = ? AND t.session_id = ? ORDER BY e.created_at DESC, e.id DESC"
+    )
+    urls: list[str] = []
+    try:
+        with closing(_read_only(_kanban_db_path())) as conn:
+            for (payload,) in conn.execute(sql, (PR_OPENED_EVENT_KIND, session_id)).fetchall():
+                try:
+                    data = json.loads(payload) if isinstance(payload, str) else payload
+                except ValueError:
+                    continue
+                url = data.get("url") if isinstance(data, dict) else None
+                if isinstance(url, str) and PROPOSAL_URL_RE.match(url) and url not in urls:
+                    urls.append(url)
+    except Exception as exc:
+        logger.warning(f"Could not read the board for session {session_id}'s pull requests: {exc!r}")
+    return urls
+
+
+def _proposal_state(url: str, timeout: float) -> Optional[str]:
+    """The forge's state for the pull request at `url`, or None when it cannot say in time."""
+    match = PROPOSAL_URL_RE.match(url)
+    if match is None or timeout <= 0:
+        return None
+    # A daemon thread, not a ThreadPoolExecutor: a forge call that outlives the
+    # budget is abandoned, and an executor's worker would hold a restart until
+    # it ends (forge's own hop allows FORWARD_TIMEOUT_S an attempt).
+    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _view() -> None:
+        try:
+            import forge
+
+            view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
+            answer.put((True, view))
+        except Exception as exc:
+            answer.put((False, exc))
+
+    threading.Thread(target=_view, name="fix-pr-lookup", daemon=True).start()
+    try:
+        ok, result = answer.get(timeout=timeout)
+    except queue.Empty:
+        logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+        return None
+    if not ok:
+        logger.warning(f"Could not read the state of {url}: {result!r}")
+        return None
+    proposal = (result.get("proposal") if isinstance(result, dict) else None) or {}
+    state = proposal.get("state") if isinstance(proposal, dict) else None
+    return state if isinstance(state, str) else None
+
+
+def _open_fix_pull_request(
+    cluster: str, namespace: str, object_kind: str, workload_key: str, reason: str, severity: str
+) -> Optional[FixPullRequest]:
+    """The workload's latest incident whose fix pull request is still open, or None.
+
+    Searches the workload's most recent admitted incidents (same cluster,
+    namespace, kind, workload_key and reason), newest first, for a pull request a card
+    opened for it (_incident_pull_request_urls) that the forge still reports
+    open. A merged or closed one is not a fix in review: a merged fix that did
+    not hold, or a rejected one, is a new incident. A Critical event is held
+    only by a Critical incident, as the fold holds it (_workload_incident_anchor).
+    The event's reason has to be one the incident showed, its own or one folded
+    into it (a cascade such as `Failed` then `BackOff` is one fault): another
+    reason is another fault, which the open fix may not touch, so it is triaged
+    rather than reminded.
+
+    Fails open: an unreadable ledger or board, a forge that refuses or is slow
+    past FIX_PR_LOOKUP_TIMEOUT_S for the whole search, all answer None, and the
+    event is announced as a new incident.
+    """
+    if INCIDENT_WORKLOAD_DEDUP_SECONDS <= 0 or not workload_key:
+        return None
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            incidents = conn.execute(
+                "SELECT id, session_id FROM intercepted_events "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? "
+                "AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) "
+                "AND (? != ? OR severity = ?) "
+                "AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' "
+                "ORDER BY id DESC LIMIT ?",
+                (
+                    cluster,
+                    namespace,
+                    object_kind,
+                    workload_key,
+                    reason,
+                    reason,
+                    severity,
+                    CRITICAL_SEVERITY,
+                    CRITICAL_SEVERITY,
+                    FIX_PR_INCIDENTS_SCANNED,
+                ),
+            ).fetchall()
+    except Exception as exc:
+        logger.error(f"Failed to look up {namespace}/{workload_key}'s incidents for an open fix: {exc}")
+        return None
+    deadline = time.monotonic() + FIX_PR_LOOKUP_TIMEOUT_S
+    for anchor_id, session_id in incidents:
+        for url in _incident_pull_request_urls(session_id):
+            if _proposal_state(url, deadline - time.monotonic()) == PROPOSAL_OPEN_STATE:
+                return FixPullRequest(int(anchor_id), session_id, url)
+            if time.monotonic() >= deadline:
+                return None
+    return None
+
+
+def _claim_fix_pull_request_reminder(session_id: str) -> bool:
+    """Whether the held incident's thread may be reminded now; records the reminder when it may.
+
+    At most once per INCIDENT_WORKLOAD_DEDUP_SECONDS per incident, so a workload
+    that keeps breaking while its fix waits reminds the thread once a window
+    rather than once an event. The check and the stamp share one transaction.
+    """
+    now = time.time()
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            meta = json.loads(row[0] or "{}")
+            last = meta.get(FIX_PR_REMINDED_AT_KEY)
+            if isinstance(last, (int, float)) and now - last < INCIDENT_WORKLOAD_DEDUP_SECONDS:
+                conn.rollback()
+                return False
+            meta[FIX_PR_REMINDED_AT_KEY] = now
+            conn.execute(
+                "UPDATE session_metadata SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (json.dumps(meta), session_id),
+            )
+            conn.commit()
+            return True
+    except Exception as exc:
+        logger.warning(f"Could not claim a fix reminder for session {session_id}: {exc!r}")
+        return False
+
+
+def _remind_fix_pull_request(session_id: str, workload: str, reason: str, url: str) -> None:
+    """Remind the held incident's thread that its fix is still waiting for review.
+
+    Background task. Nothing when the incident has no thread (an install with
+    no chat platform), or when the thread was reminded within the window.
+    """
+    platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not (platform and thread_id) or not _claim_fix_pull_request_reminder(session_id):
+        return
+    message = f"`{workload}` is still failing ({reason}). The fix is waiting for review: {url}"
+    if _send_to_chat(platform, message, chat_id, thread_id, timeout=FIX_PR_REMINDER_SEND_TIMEOUT_S) is None:
+        logger.warning(f"Could not remind session {session_id}'s thread that {url} is waiting for review")
 
 
 def mark_triage_not_started(event_row_id: Optional[int]) -> None:
@@ -4761,6 +4968,41 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
     return text
 
 
+def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) -> dict | None:
+    """With ``KAGE_SLACK_UX`` on, the board-health card the report was said with (:mod:`board_health_card`).
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the job is ``kanban-board-health``, and its card file was written
+    for this very report. Never raises: a card that cannot be read posts as
+    text.
+    """
+    if platform != SLACK_PLATFORM or job_id != kanban_board_health.JOB_ID or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    try:
+        return board_health_card.load(kanban_board_health.agent_home(), report)
+    except Exception as exc:  # noqa: BLE001 - the report still posts, as text
+        logger.warning(f"Relay for {job_id}: board-health card unreadable, posting text: {exc!r}")
+        return None
+
+
+def _post_board_health_card(
+    profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Post the board-health card; where it landed, or None to post the report as text.
+
+    Block Kit through the Slack relay, or under ``spec.mode: next`` a chat
+    message through the gateway, with the outcomes of :func:`_post_audit_card`.
+    """
+    routed = chat_notify.routes(SLACK_PLATFORM)
+    if not (routed or slack_blocks_post.configured()):
+        return None
+    built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
+    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
     """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
 
@@ -5262,7 +5504,14 @@ def relay_cron_report(
         summary = None
         # A truncated report keeps its notice, which the blocks have no place for,
         # and the rest of it.
-        if headline and not truncation_notice:
+        board = None if truncation_notice else _board_health_card(platform, report, leg_chat_id, job_id)
+        if board is not None:
+            # The stuck tasks alone, as a card with Retry and Drop on each row;
+            # where it does not post, the report goes out as written.
+            posted = _post_board_health_card(
+                profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+            )
+        elif headline and not truncation_notice:
             posted = _post_audit_blocks(
                 profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
@@ -6281,13 +6530,31 @@ def inject_message(
     #
     # The workload fold comes between the two for the same reason: a duplicate
     # is never going to post, so it must not spend a budget either.
+    #
+    # Past the fold window, a workload whose last incident's fix pull request is
+    # still open for review is held against that incident too
+    # (_open_fix_pull_request): the fault is diagnosed and its fix waits on a
+    # human, so a second investigation would only repeat the first. The forge
+    # lookup is made before the lock, and only when no fold applies, because it
+    # can take seconds and a burst inside the window never needs it.
     quota_denied = False
     suppressed_today = 0
     anchor_id = None
+    held_for: Optional[FixPullRequest] = None
+    fold_key = _fold_key(object_kind, object_name)
+    workload_key = _incident_branch_workload(object_kind, object_name) if object_name else ""
+    fix: Optional[FixPullRequest] = None
+    if (
+        not suppressed
+        and INCIDENT_WORKLOAD_DEDUP_SECONDS > 0
+        and _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label) is None
+    ):
+        fix = _open_fix_pull_request(event_cluster, namespace, object_kind, workload_key, event_reason, severity_label)
     with _WORKLOAD_FOLD_LOCK if INCIDENT_WORKLOAD_DEDUP_SECONDS > 0 else nullcontext():
-        fold_key = _fold_key(object_kind, object_name)
         if not suppressed:
             anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label)
+            if anchor_id is None and fix is not None:
+                anchor_id, held_for = fix.anchor_id, fix
         if not suppressed and anchor_id is None:
             allowed, suppressed_today = _claim_alert_quota(severity_label)
             quota_denied = not allowed
@@ -6311,7 +6578,19 @@ def inject_message(
             session_id=session_id,
             duplicate_of=anchor_id,
             fold_key=fold_key,
+            workload_key=workload_key,
+            pull_request=held_for.url if held_for is not None else "",
         )
+
+    if held_for is not None:
+        # Answered "folded" for the reason the fold is: the watcher keeps its
+        # entry, so the pod is not re-offered while the fix waits.
+        logger.info(
+            f"Held {severity_label} event {event_reason} for {namespace}/{object_kind}/{object_name} against "
+            f"ledger row {anchor_id}, whose fix {held_for.url} is open for review (no new triage session)"
+        )
+        background_tasks.add_task(_remind_fix_pull_request, held_for.session_id, clean_name, event_reason, held_for.url)
+        return {"status": FEED_STATUS_FOLDED, "duplicate_of": str(anchor_id), "pull_request": held_for.url}
 
     if anchor_id is not None:
         # Neither "filtered" nor "suppressed", both of which reopen. The watcher
@@ -7010,7 +7289,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -7040,6 +7319,7 @@ def list_intercepted_events(
             ),
             "message": row["message"],
             "duplicate_of": row["duplicate_of"],
+            "pull_request": row["pull_request"],
         }
         for row in rows[:limit]
     ]
@@ -8890,6 +9170,124 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         ", deadline reached" if budget.hit else "",
     )
     return result
+
+
+# --------------------------------------------------------------------------
+# Retry and Drop on the board-health card (kanban_board_health.py,
+# board_health_card.py). Each row of the stuck-task card carries the ids of
+# the cards it stands for, and a tap on either button reaches here: from the
+# Slack adapter's click handler under today (slack_ux_clicks.py), and from the
+# gateway through the hermes-bridge's board route under next
+# (a2a/hermes-bridge/board.go). Who may press is decided before this call, by
+# whichever of the two the click came through; this route checks the card.
+#
+# Only a card still `blocked` is touched, so a stale button does not retry a
+# card that finished or archive one that is running again. Retry is Hermes'
+# `unblock_task`, which checks the card is blocked inside its own write and
+# returns it to `ready` for the dispatcher. Drop is the card stop's
+# `_archive_card`, Hermes' `archive_task` with our worker kill; the blocked
+# check is the read just before it, so a card unblocked and claimed in that
+# instant would be archived as a running card, its worker killed, as a card
+# stop would. Nothing here writes a card's status itself. Every card is
+# started inside the card stop's deadline, and one the deadline leaves
+# unstarted answers `failed`, so the answer comes before the callers give up.
+# --------------------------------------------------------------------------
+
+BOARD_ACTION_RETRY = "retry"
+BOARD_ACTION_DROP = "drop"
+BOARD_ACTIONS = frozenset({BOARD_ACTION_RETRY, BOARD_ACTION_DROP})
+# The one status either button acts on.
+BOARD_ACTION_STUCK_STATUS = "blocked"
+# A row is one card, or the cards sharing its title; the card caps its rows.
+BOARD_ACTION_MAX_TASKS = 50
+BOARD_ACTION_TASK_ID_MAX_CHARS = 64
+# Who pressed, for the log line: a display name or a member id.
+BOARD_ACTION_BY_MAX_CHARS = 200
+# Each card's outcome in the answer.
+BOARD_OUTCOME_DONE = "done"
+BOARD_OUTCOME_MOVED = "moved"
+BOARD_OUTCOME_GONE = "gone"
+BOARD_OUTCOME_FAILED = "failed"
+
+
+def _board_action_one(kanban_db, conn: sqlite3.Connection, action: str, task_id: str, budget: _Budget) -> Dict[str, Any]:
+    """One card's Retry or Drop: its outcome, title and the status it holds now."""
+    row = conn.execute("SELECT title, status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row[1] == "archived":
+        return {"id": task_id, "outcome": BOARD_OUTCOME_GONE}
+    entry: Dict[str, Any] = {"id": task_id, "title": row[0] or "", "status": row[1]}
+    if row[1] != BOARD_ACTION_STUCK_STATUS:
+        return {**entry, "outcome": BOARD_OUTCOME_MOVED}
+    if action == BOARD_ACTION_RETRY:
+        if kanban_db.unblock_task(conn, task_id):
+            return {**entry, "status": "ready", "outcome": BOARD_OUTCOME_DONE}
+    else:
+        outcome, _detail = _archive_card(kanban_db, conn, task_id, budget)
+        if outcome == "stopped":
+            return {**entry, "status": "archived", "outcome": BOARD_OUTCOME_DONE}
+        if outcome == "gone":
+            return {"id": task_id, "outcome": BOARD_OUTCOME_GONE}
+    after = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return {**entry, "status": after[0] if after else None, "outcome": BOARD_OUTCOME_MOVED}
+
+
+@app.post("/v1/board/actions", dependencies=[Depends(verify_api_key)])
+def board_action(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Retry or Drop the stuck cards one row of the board-health card names; see the section comment.
+
+    Body: ``action`` (``retry`` or ``drop``), ``tasks`` (the row's card ids)
+    and ``by`` (who pressed, logged). Answers each card's ``outcome``:
+    ``done``, ``moved`` (no longer blocked: someone or something got there
+    first), ``gone`` (no such card, or archived) or ``failed`` (Hermes raised;
+    the message stays in this log). A board that is not there answers every
+    card ``gone``.
+    """
+    action = str(request_data.get("action") or "").strip().lower()
+    tasks = request_data.get("tasks")
+    by = str(request_data.get("by") or "").strip()[:BOARD_ACTION_BY_MAX_CHARS]
+    if action not in BOARD_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"action must be one of {sorted(BOARD_ACTIONS)}")
+    if (
+        not isinstance(tasks, list)
+        or not tasks
+        or len(tasks) > BOARD_ACTION_MAX_TASKS
+        or not all(isinstance(t, str) and t.strip() and len(t) <= BOARD_ACTION_TASK_ID_MAX_CHARS for t in tasks)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"tasks must be 1 to {BOARD_ACTION_MAX_TASKS} card ids of at most {BOARD_ACTION_TASK_ID_MAX_CHARS} characters",
+        )
+    ids = list(dict.fromkeys(t.strip() for t in tasks))
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return {"action": action, "results": [{"id": i, "outcome": BOARD_OUTCOME_GONE} for i in ids]}
+    try:
+        kanban_db, connect_tracked = _hermes_kanban()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
+    budget = _Budget()
+    results = []
+    try:
+        conn = _card_stop_connect(connect_tracked, board)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+    with closing(conn):
+        for task_id in ids:
+            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+                continue
+            try:
+                results.append(_board_action_one(kanban_db, conn, action, task_id, budget))
+            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest untried
+                logger.error("board action: %s on %s failed: %s", action, task_id, exc)
+                results.append({"id": task_id, "outcome": BOARD_OUTCOME_FAILED})
+    logger.info(
+        "board action %s by %s: %s",
+        action,
+        by or "someone",
+        ", ".join(f"{r['id']} {r['outcome']}" for r in results),
+    )
+    return {"action": action, "results": results}
 
 
 # --------------------------------------------------------------------------

@@ -32,7 +32,7 @@ or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
 Two read state instead. ``bootstrap_fanout`` reads the agent pod's board and
-profiles. ``fleet_resource_property`` reads a fleet cluster, and exists
+profiles (and, for its past-cap requirement, the shell sandbox's raw report). ``fleet_resource_property`` reads a fleet cluster, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -3513,7 +3513,7 @@ class BootstrapFanoutVerifier(BaseVerifier):
     """Checks the cluster cards filed for the onboarding discovery sweep.
 
     The onboarding gate, a cron job, files the sweep card and one card per
-    Cluster Agent, so neither the transcript nor the harness's delegation
+    Cluster Agent up to the first-run cap, so neither the transcript nor the harness's delegation
     capture sees them; this reads the sweep, the ``bootstrap-inventory-cluster-*``
     cards created at or after it, and the Cluster Agent roster off the agent's
     disk (:mod:`kube_agents_bench.discovery`).
@@ -3525,14 +3525,49 @@ class BootstrapFanoutVerifier(BaseVerifier):
       ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
       profile name, and no such card went anywhere else.
 
+    The first-run cap (#3702) has the gate file cards for only the first
+    ``cap`` Cluster Agents by profile name and leave the rest to the sweep's
+    own worker. Two requirements grade it, each with ``cap`` set to the value
+    the case's stack wrote. The carded set is the one the sweep marker's
+    ``carded=`` records, the agents the sweep card listed when it was filed; a
+    marker without one (an older build) falls back to the first ``cap`` of the
+    roster by profile name. A profile scaffolded after the filing can sort
+    first and still be the sweep's.
+
+    - ``cards_for_first_cap_profiles``: exactly the carded profiles got one
+      card each, assigned to and keyed by the profile; no other profile got
+      one, and no card went anywhere else. A build without the cap files a
+      card for every profile, which fails here.
+    - ``past_cap_clusters_sweep_audited``: every roster cluster outside the
+      carded set is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
+      itself: a Coverage row whose card is the sweep (or the hand-off's "the
+      sweep audited it itself" gap line), not a row from a card of its own and
+      not the gap line for a fleet cluster no audit reported on. The cap's
+      risk is a cluster nobody audits, which reads as clean; this is the half
+      that catches it. It reads a second pod, so it is a requirement of its own
+      and a broken report does not hide behind, or get blamed on, the cards.
+
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, a sweep card the board does not know, or an empty roster is
-    ``status="error"``. A ``fail`` from an earlier poll outranks a final read
-    that errors.
+    ``status="error"``; so, for the two capped requirements, is a roster no
+    longer than ``cap``, where the cap files every card and the case cannot
+    tell a capped build from one without the cap, and an unreadable sandbox.
+    A ``fail`` from an earlier poll outranks a final read that errors.
     """
 
     type: Literal["bootstrap_fanout"]
-    require: Literal["one_card_per_cluster_agent"]
+    require: Literal["one_card_per_cluster_agent", "cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"]
+    # The first-run cap the case's stack wrote; only the capped requirements take it.
+    cap: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _cap_matches_require(self) -> BootstrapFanoutVerifier:
+        if self.require == "one_card_per_cluster_agent":
+            if self.cap is not None:
+                raise ValueError("cap applies only to cards_for_first_cap_profiles and past_cap_clusters_sweep_audited")
+        elif self.cap is None:
+            raise ValueError(f"{self.require} needs cap: the first-run cluster card cap the case's stack wrote")
+        return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
@@ -3582,6 +3617,8 @@ class BootstrapFanoutVerifier(BaseVerifier):
                 + (f" (profiles whose scaffold did not finish: {not_ready})" if not_ready else ""),
                 payload,
             )
+        if self.require != "one_card_per_cluster_agent":
+            return self._capped(payload, where, roster, cards, read_timeout)
         expected = {(r["profile"], r["key"]) for r in roster}
         filed = [(c.get("assignee"), c.get("key")) for c in cards]
         missing = sorted(expected - set(filed))
@@ -3597,6 +3634,125 @@ class BootstrapFanoutVerifier(BaseVerifier):
                 parts.append(f"card(s) matching no Cluster Agent: {stray}")
             return "fail", "; ".join(parts), payload
         return "pass", f"{where}: one card for each of {len(roster)} Cluster Agent(s)", payload
+
+    def _capped(
+        self,
+        payload: dict[str, Any],
+        where: str,
+        roster: list[dict[str, Any]],
+        cards: list[dict[str, Any]],
+        read_timeout: float,
+    ) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        cap = int(self.cap or 0)
+        # The gate's own order (bootstrap_scan_gate.cluster_agents sorts by profile name).
+        ordered = sorted(roster, key=lambda r: r["profile"])
+        if len(ordered) <= cap:
+            return (
+                "error",
+                f"{where}: roster of {len(ordered)} is not above the cap of {cap}; the case cannot tell a capped "
+                f"build from one without the cap ({[r['profile'] for r in ordered]})",
+                payload,
+            )
+        carded = payload.get("carded")
+        if carded is not None:
+            keys = set(carded)
+            first = [r for r in ordered if r["key"] in keys]
+            rest = [r for r in ordered if r["key"] not in keys]
+            chosen = "the profiles the sweep marker lists as carded"
+            # The marker is the gate's own record, so grading against it alone
+            # would pass a gate that carded too few or named a profile that is
+            # not there. (a) every carded key is a roster profile; (b) the set
+            # is the cap's worth, or the whole roster when that is smaller. A
+            # profile scaffolded after filing raises the roster without
+            # changing the set, which can make (b) strict where the roster was
+            # under the cap at filing; with the roster above the cap, as this
+            # check requires, it cannot. Whether the set is the first by
+            # profile name at filing needs the profiles' scaffold times, which
+            # the follow-up issue covers.
+            unknown = sorted(keys - {r["key"] for r in ordered})
+            if unknown:
+                return "fail", f"{where}: the sweep marker lists carded key(s) for no roster profile: {unknown}", payload
+            want = min(cap, len(ordered))
+            if len(keys) != want:
+                return (
+                    "fail",
+                    f"{where}: the sweep marker lists {len(keys)} carded profile(s); a cap of {cap} over a roster "
+                    f"of {len(ordered)} cards {want}",
+                    payload,
+                )
+        else:
+            first, rest = ordered[:cap], ordered[cap:]
+            chosen = f"the first {cap} by profile name"
+        if self.require == "cards_for_first_cap_profiles":
+            expected = {(r["profile"], r["key"]) for r in first}
+            past = {(r["profile"], r["key"]) for r in rest}
+            filed = [(c.get("assignee"), c.get("key")) for c in cards]
+            missing = sorted(expected - set(filed))
+            duplicated = sorted({f for f in filed if filed.count(f) > 1})
+            over = sorted(set(filed) & past)
+            stray = sorted(set(filed) - expected - past)
+            if missing or duplicated or over or stray:
+                parts = [
+                    f"{where} filed {len(cards)} cluster card(s) for a roster of {len(ordered)} under a cap of {cap}"
+                ]
+                if over:
+                    parts.append(f"card(s) for profile(s) past the cap: {[p for p, _ in over]}")
+                if missing:
+                    parts.append(f"no card for {[p for p, _ in missing]}, among {chosen}")
+                if duplicated:
+                    parts.append(f"more than one card for {[p for p, _ in duplicated]}")
+                if stray:
+                    parts.append(f"card(s) matching no Cluster Agent: {stray}")
+                return "fail", "; ".join(parts), payload
+            if carded is not None:
+                return (
+                    "pass",
+                    f"{where}: one card for each of the {len(first)} of {len(ordered)} Cluster Agent(s) the sweep "
+                    "marker lists as carded, and none past the cap",
+                    payload,
+                )
+            return (
+                "pass",
+                f"{where}: one card for each of the first {cap} of {len(ordered)} Cluster Agent(s) by profile name, "
+                "and none past the cap",
+                payload,
+            )
+        read = onboarding.read_raw_coverage(onboarding.sandbox_shell, read_timeout)
+        pod, raw_file = onboarding.sandbox_pod(), onboarding.RAW_FILE
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", payload
+        raw = {"fanout": payload, "raw": read}
+        if read.get("raw") == "absent":
+            return "fail", f"{where}: there is no {raw_file} on {pod}, so no cluster past the cap is shown audited", raw
+        if read.get("rows") is None:
+            return "fail", f"{where}: {raw_file} on {pod}: {read.get('error')}", raw
+        sweep_id = str((payload.get("sweep") or {}).get("id") or "")
+        audited_by_line = {tuple(p) for p in read.get("sweep_audited") or []}
+        unreported = {tuple(p) for p in read.get("unreported") or []}
+        problems = []
+        for r in rest:
+            ident = (r.get("cluster"), r.get("project"))
+            label = f"{r['profile']} ({ident[0]} in {ident[1]})"
+            rows = [row for row in read["rows"] if (row.get("cluster"), row.get("project")) == ident]
+            if ident in unreported:
+                problems.append(f"{label} is listed in the fleet but no audit reported on it")
+            elif any(row.get("card") == sweep_id for row in rows) or ident in audited_by_line:
+                continue
+            elif rows:
+                problems.append(f"{label} was audited on card(s) {[row.get('card') for row in rows]}, not by the sweep")
+            else:
+                problems.append(f"{label} has no Coverage row and no line saying the sweep audited it")
+        if problems:
+            return (
+                "fail",
+                f"{where}: of the {len(rest)} Cluster Agent(s) past the cap of {cap}, in {raw_file}: " + "; ".join(problems),
+                raw,
+            )
+        return (
+            "pass",
+            f"{where}: all {len(rest)} cluster(s) past the cap of {cap} are in {raw_file} as audited by the sweep",
+            raw,
+        )
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:

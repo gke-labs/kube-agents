@@ -539,6 +539,9 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 		},
 	}
 
+	if err := ctrl.SetControllerReference(agent, partial, scheme); err != nil {
+		t.Fatal(err)
+	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, partial).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
@@ -721,19 +724,21 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
 	sub := rest[strings.Index(rest, "subscribe"):]
-	var got, gotSub []string
-	for _, line := range strings.Split(pub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			got = append(got, strings.Trim(line, `"`))
-		}
+	subDeny := ""
+	if i := strings.Index(sub, "deny"); i >= 0 {
+		sub, subDeny = sub[:i], sub[i:]
 	}
-	for _, line := range strings.Split(sub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			gotSub = append(gotSub, strings.Trim(line, `"`))
+	quoted := func(block string) []string {
+		var out []string
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+			if strings.HasPrefix(line, `"`) {
+				out = append(out, strings.Trim(line, `"`))
+			}
 		}
+		return out
 	}
+	got, gotSub, gotSubDeny := quoted(pub), quoted(sub), quoted(subDeny)
 	want := []string{
 		"$JS.API.INFO",
 		"$JS.API.STREAM.INFO.TASKS",
@@ -761,6 +766,10 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
+	}
+	// web's subtraction: `a2a.>` covers the verifier's queue group.
+	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
 	// body lists every key. Nor the KV data plane.
@@ -1209,7 +1218,7 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if workerEnv != mirror+"/a2a-worker:0.3.0" {
 		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
-	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
+	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
 	}
@@ -1672,7 +1681,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
@@ -1757,7 +1766,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "")
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
@@ -2322,9 +2331,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 }
 
 // TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender pins Shape 2 of #2216:
-// A render that died on write 7 (after writing the calloutKeys Secret, the
-// TLS Secrets and bundle, and the authMap ConfigMap, before writing the config
-// Secret or StatefulSet), followed by a
+// A render that died on write 8 (after writing the calloutKeys Secret, the
+// task-signing key Secret, the TLS Secrets and bundle, and the authMap
+// ConfigMap, before writing the config Secret or StatefulSet), followed by a
 // cleanup pass that deletes calloutKeys Secret and dies on deleting authMap
 // ConfigMap.
 func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
@@ -2334,7 +2343,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	today.Spec.Mode = nil
 
 	writes := 0
-	stopAt := 7
+	stopAt := 8
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(next.DeepCopy()).
@@ -2759,11 +2768,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsThirteenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsThirteenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2787,7 +2796,7 @@ func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Twelve sentinel Gets and nothing else: no per-object walk, and in
+	// Thirteen sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
@@ -2802,15 +2811,18 @@ func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	// fence did, for the console fence's reason (#3653), and 11 -> 12 when
 	// the profile namespace's fence did (#3655: it is the first write of the
 	// fence pass, and carries no owner reference, so a pass that dies after
-	// it leaves it alone); the fences are NetworkPolicies, so those eight
-	// reads come from the cache and only the two Secrets are uncached.
+	// it leaves it alone), and 12 -> 13 when the broker's task-signing key
+	// Secret did (#3889: the broker's reconcile writes it before
+	// reconcileA2A, so a render that dies between them leaves it alone); the
+	// fences are NetworkPolicies, so those eight reads come from the cache
+	// and only the three Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 12 {
-		t.Errorf("Gets = %d, want 12 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 13 {
+		t.Errorf("Gets = %d, want 13 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -3681,7 +3693,7 @@ func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 	for i, key := range a2aCredsKeys {
 		data[key] = []byte(strings.Repeat(nibble, 31) + fmt.Sprintf("%x", i))
 	}
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "test-agent-a2a-nats-creds",
 			Namespace:       "test-ns",
@@ -3689,6 +3701,12 @@ func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 		},
 		Data: data,
 	}
+	// Controlled by the test agent, as the operator creates it: the operator
+	// refuses a credentials Secret it doesn't own.
+	if err := ctrl.SetControllerReference(a2aTestAgent(), secret, setupScheme()); err != nil {
+		panic(err)
+	}
+	return secret
 }
 
 // a2aPasswordDigestNeedles returns, for one password, every form of it that
@@ -5910,7 +5928,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
 		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
-		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
+		"callout Deployment": buildA2ACalloutDeployment(agent, "").Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
@@ -7195,7 +7213,7 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	}
 	// The callout too: it is the provision Job's authentication path, and a
 	// quota that refused it would leave the Job's creation held for good.
-	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
 	// The verifier too, and it is the one with the sharpest consequence: an

@@ -26,7 +26,9 @@ plus one line, once per episode, when the gate is slow without being broken
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
-([below](#the-watched-periodics)).
+([below](#the-watched-periodics)). Once a week, from 9 AM Toronto time on
+Monday, `scripts/eval_dashboard/weekly_chat.py` posts the weekly health
+summary to the same space ([below](#the-weekly-health-email)).
 The digest also carries a section on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected), built by
 `scripts/eval_dashboard/nightly_digest.py`; [The nightly section](#the-nightly-section)
@@ -37,6 +39,7 @@ turn's p50 and p95 as advice beside the p95 < 10 s target
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
 grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
+the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
 the section was skipped. A night can be the builds of up to three periodics
 (the main job, the main-b job when the main part runs as two halves, and the
@@ -157,14 +160,18 @@ runs that finished in the last 2 hours, #1225 / #1214), a delegation-ceiling
 wave (15+ repetitions across 3+ pull requests, among the runs that finished in
 the last 2 hours, ended at the harness's delegation wait with the worker still
 running, #1874; the dispatcher stall of #1879 is its usual cause, and it ranks
-below a storm because a 429-starved worker hits the same wait), or setup
+below a storm because a 429-starved worker hits the same wait; the storm
+also needs the pool's peak hourly Vertex 429 share to clear 10 % over the hours
+those runs spent on their calls, when the 429 reading below covers them; a
+reading that does not, and no reading, leaves the runs to decide and the
+evidence says the storm is unconfirmed), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
 fixture drift (the hourly scan found the same fixture role out of its designed
-state on the same pool project on two consecutive scans, or on 3+ projects in
-one scan; #1550, below), or pool drift (the same rule over the pool-state scan's
-findings; #1967, below). A zero-task run
+state on the same pool project on two consecutive scans; #1550, below), or pool
+drift (the same over the pool-state scan's findings, or a finding on 3+
+projects in one scan; #1967, below). A zero-task run
 is at most one of a lost pod, a conflicted merge (below), a deadline kill
 (above) and a setup death, in that order: a lost pod is never a setup death,
 whatever its duration. When more
@@ -198,15 +205,20 @@ recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds and infra reds (setup deaths, lost pods and deadline kills that
-graded nothing are folded into the infra count), the typical run length and the typical wait before a run starts,
+PR-caused reds (by rule 4's test, below) and infra reds (setup deaths, lost
+pods and deadline kills that graded nothing are folded into the infra count),
+the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
 `metrics` keeps the rest — green rate, wall clock p50/p90, `queue_wait_p50_s`
 and whether it was read at all, the infra-rep rate, `setup_deaths`,
 `lost_pods`, `deadline_kills`, `ceiling_reps`.
 
-A case failing on exactly one pull request while passing elsewhere is that pull
-request's problem and moves no state; the message lists it as "PR-caused".
+A case failing on exactly one pull request is that pull request's problem and
+moves no state; the message lists it as "PR-caused" when the evidence rules out
+a flake and a moving main: the case passed on another pull request's run built
+on the same main commit, or it failed on two or more of that pull request's
+runs (a retest counts) while passing on another pull request. One red run with
+no same-base pass gets no line.
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
@@ -346,6 +358,32 @@ still pass, they just start late, and DEGRADED would tell people to retest,
 which lengthens the queue being reported. Unlike the slow note it is **not**
 held back outside GREEN — a different job reading different data cannot be
 this incident's own symptom.
+
+The same artifact carries `held`, which project each Boskos lease holder has
+at the read (`{project: {owner, state, since}}`), read from Boskos's own
+resource objects through the API server as the job's pod. The seeded-fleet
+rule reads it to tell a project the fleet reconcile is applying from one that
+drifted (below). The pod's service account needs the Boskos namespace's
+`boskos-crd-reader` role bound to it, once, by someone with cluster access:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: boskos-crd-reader-prowjob
+  namespace: boskos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: boskos-crd-reader
+subjects:
+  - kind: ServiceAccount
+    name: prowjob-default-sa
+    namespace: test-pods
+```
+
+Until it is, `held` is `null` and `held_error` says why, and the fleet rule
+reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
@@ -498,8 +536,20 @@ interrupted in, each with its reason and its one next step, then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
-did. `periodics_runs` carries every read
-job's latest build and its summary, which is what the recovery message says. A
+did. For a failed build the note also carries how it died, read from what
+Prow wrote beside it: the node its pod ran on and a Warning pod event when
+the pod recorded one (`podinfo.json`; a run that outlives the event window
+has none), and the line of its log that says so (from the tail of
+`build-log.txt`: the script's last line that starts or ends like an error,
+else the message of Prow's own entrypoint line when the build hit its
+timeout, else the last line of all when the build wrote no report, which is a
+script that died before its summary), each left out when it cannot be read.
+The quoted line has credential shapes scrubbed and control characters and
+Chat markup dropped first, because it leaves the job's bucket: the same words
+ride the evidence into the tracking issues that quote it, and `health.json`
+is public. `periodics_runs`
+carries every read job's latest build and its summary, which is what the
+recovery message says. A
 job with no reading writes no note and ends none: that is the bot losing sight
 of the job, not the job recovering.
 
@@ -510,15 +560,21 @@ last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
 reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
-messages are four lines, the failed one with the report's detail lines under its
-second: a headline naming where and what stopped happening ("Eval GitOps repos:
+messages are four lines, the failed one with the report's detail lines and a
+"how it died" line (the log line that says so, the node, a Warning pod event)
+under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
 leftover pull requests from eval runs are not being cleaned up"); the job, what
 it does and how often, which run and how it failed; the effect and the scope
-("CI eval infrastructure only"); the runbook link and the build link. The
+("CI eval infrastructure only"); the runbook link and the build link. Failed
+jobs whose builds died on the same log line, when both are news in the same
+tick, are one message: the places and the shared last line (the same line,
+which is one place to look first, not proof of one cause), then each job as
+its own block would say it (its node and pod event included), the effects, a
+footer per job. The
 recovery is one line naming the run and what it did ("closed 241 pull request(s)
-across 12 project(s)"). The digest carries one line per open note, and one per
-reconcile job's latest run: when, which build, passed or failed, dry run or
-not, and what it did. Nothing here
+across 12 project(s)"). The digest carries one line per open note (with how a failed build died,
+when that was read), and one per reconcile job's latest run: when, which
+build, passed or failed, dry run or not, and what it did. Nothing here
 files an issue: the recovery is a person's, and the failed and stopped messages
 link the runbook section (`docs/ci-pool-projects.md`, 5.5 and 6.2).
 
@@ -889,16 +945,32 @@ Nightly report's.
 - **⚙️ Infra:** each part of the nightly lost last night, with its run and issue,
   and each case kept from running last night that has an open infra issue or a
   3-night streak (`nightly_infra.py`); "none last night" otherwise.
+- **⏱ Latency:** last night's opening chat turn (p50 and p95, beside the
+  p95 < 10 s target) and agent time (the median of the cases' agent p50),
+  each against its typical: the median of the same number over the last 7
+  earlier whole nights that carry it (not cut short, no part missing or still
+  running), with at least 3 of them. A number at 1.5× its typical or more gets a 🐢 mark. Under it,
+  **🐢 Slow cases**: a case whose agent p50 is at least 2× its own typical
+  (its last 7 earlier nights with timing, at least 3) and at least 60 s more,
+  largest ratio first, with its owner; "sustained N nights" when it was slow
+  on 2 or more of its nights in a row (its nights with timing, so a night it
+  did not run in does not break the streak). A slowdown that lasts about four
+  nights becomes the case's typical, and the case drops off the list. When more than a quarter of the cases
+  with timing and a typical are slow, and more than 5, one "broad slowdown" line replaces the
+  list: a shift that wide has one cause. A night cut off at the deadline,
+  or with a part missing or still running, carries the block too, labelled as
+  covering only the cases or parts on record. It is advisory and moves no
+  state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - A footer asking owners to reply in the thread.
 
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
 report. A night with no new bug, no case owed a bug for the first time, no
 case red for the first night (a tracked case red again after a green night
 counts), no recovery, no infra item and no part cut off, missing or still running is
-one line instead: the date, the pass count and how many were not graded, "no
-new reds, nothing recovered", and how many are still red. A night whose main part was cut
+one summary line instead: the date, the pass count and how many were not graded, "no
+new reds, nothing recovered", and how many are still red, followed by the latency block. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
-counted, and only the infra list follows; a writers part cut off, missing or still running is named in
+counted, and only the infra list and the latency block follow; a writers part cut off, missing or still running is named in
 the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from
@@ -1009,21 +1081,26 @@ is a dry run; `--live` writes.
 `scripts/eval_dashboard/weekly_email.py` renders a one-page summary of the
 nightly tier for leadership and the team. Its step runs after the bug filer, so
 a bug filed that tick counts, and publishes it as `health-email.html` beside
-`data.json`. Nothing sends it yet: the mail route,
-the sending account and the chat line that links to it are still to be decided.
+`data.json`. Nothing mails it yet: the mail route and the sending account are
+still to be decided. Its summary is posted to the CI-health Chat space once a
+week (below).
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
-when none of its parts was cut off at the job deadline, it has a main part, and
-it is not a night on which nearly every graded case failed; two counted nights
+when none of its parts was cut off at the job deadline, it has both halves of
+the main matrix it owed (the main part, and the main-b part once that job runs;
+the digest withholds its verdict on a night without either), and it is not a
+night on which nearly every graded case failed; two counted nights
 on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
-weeks; a scenario graded in only one week is left out and counted in the
-closing note.
+weeks; a scenario graded in only one week, or no longer in the suite (no
+`task.yaml` on the checkout, or no `domain:` line, so no area), is left out and
+counted in the closing note.
 
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
-the compared scenarios' graded repetitions), a "Needs attention" box, one row per area with
+the compared scenarios' graded repetitions with its 90th percentile, "the
+slowest 10%"), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1033,7 +1110,7 @@ each reason and exits 1, the step logs a warning, and the last published copy
 stays. The checks:
 
 - **Same cases.** Both weeks' numbers are over one set of scenarios, and the
-  counts shown add up to it.
+  tile and the area rows' scenario counts add up to it.
 - **Truncated nights.** No counted night was cut off.
 - **Not enough data.** With fewer than 4 counted nights in either week, the
   intro says so and nothing is called up, down or steady.
@@ -1060,9 +1137,39 @@ stays. The checks:
   footer names those models and the two weeks' dates; a week that changed model
   says so in the intro.
 
+The weekly Chat post is the same week as a Chat card: the pass rate with its
+change from last week (or why no change is called: how many nights counted and
+why the rest were left out), the "Needs attention" areas with their open-bug
+counts and a button to each area's open bugs (the section is left out when no
+area needs attention), every area's pass rate as a ten-step bar, best first
+(collapsed to the first three), the task time (the median, the 90th percentile
+and the area with the slowest median), buttons to the page, the dashboard and
+all open nightly bugs, and the models the week ran. The message carries the
+same week in a few lines of text, without Chat's markup, as the card's
+fallback for notifications; that text also names the three strongest areas and
+the median's change when the week has a trend. If Chat refuses the card (HTTP
+400, so nothing was posted), the step posts that text, with its links, instead.
+The
+render step writes both (`--chat-out`) only when the page passes, from the
+numbers the page printed, so the two cannot disagree and a refused week posts
+nothing. The next step, `scripts/eval_dashboard/weekly_chat.py`, posts it on
+the first tick at or after 9 AM Toronto time on the Monday after the week ends,
+through the poster's app identity and token, and records the week in
+`weekly-chat-state.json` beside `data.json`, so later ticks and re-runs post
+nothing more for that week. The week is recorded before the post, so it goes
+out at most once: a Monday missed (a refused render, a state object it cannot
+read or write) is retried each tick until the week rolls over at 00:00 UTC
+Monday (Sunday evening in Toronto), but a post that fails after the record is
+written is not: the step logs an error and that week's summary is missed
+(deleting `weekly-chat-state.json` posts it on the next tick). `CI_HEALTH_MUTE=true`
+skips it and records nothing; a state object it cannot read posts nothing that
+tick.
+
 Locally,
-`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html`
-renders against any downloaded pair (it reads the issues with `gh`).
+`python3 scripts/eval_dashboard/weekly_email.py --data data.json --store store.json --out health-email.html --chat-out weekly-chat.json`
+renders against any downloaded pair (it reads the issues with `gh`), and
+`python3 scripts/eval_dashboard/weekly_chat.py --message weekly-chat.json --state weekly-chat-state.json --dry-run`
+prints the message body it would post.
 
 ## The seeded-fleet scan
 
@@ -1130,12 +1237,19 @@ Until the grant is in place the scan pre-flights one token mint per project,
 fails it, and records every role as "not checked" with gcloud's own words.
 
 **The condition.** `health.py`'s `fixture_drift` fires when the same role is
-drifted on the same project in two consecutive scans, or on 3 or more projects
-in one scan. One scan on one project is not enough: in #1278's retest sweep the
-crashloop fixture lagged the node repair by about 40 minutes on one project (it
-needs its first restart before OOMKilled evidence exists), and one hourly scan
-can land inside that window. Three projects at once is the fleet-wide shape
-(#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
+drifted on the same project in two consecutive scans. A project the fleet
+reconcile holds in Boskos within 65 minutes of the scan (the pool-pressure
+artifact's `held`, above) is being applied, not drifted: its reading is left
+out of that scan and cannot make the next scan's a repeat, and the evidence
+says so. One scan is not enough,
+however many projects it covers: in #1278's retest sweep the crashloop fixture
+lagged the node repair by about 40 minutes on one project (it needs its first
+restart before OOMKilled evidence exists), and one hourly scan can land inside
+that window; and a reconcile rolling a patch in batches of four holds each
+batch half-applied for about an hour, which one scan reads as drift on four
+projects at once. The fleet-wide shape (#1278 was all 30) waits for the
+second scan like any other; the daily reconcile could not have repaired it
+sooner. It is DEGRADED, ranked below every
 run-based condition (the presubmit runs the same check on its own lease and
 records the cases that need a drifted role as infrastructure under
 `fixture-drift:<role>` rather than running them, so a fixture the lease's own
@@ -1236,6 +1350,27 @@ without naming one: `detail` is then what it saw), and a repair that removes
 something starts with `# confirm first:`. `previous` is the
 prior scan's `scanned_at` and its `{project: [finding ids]}` map.
 
+**The 429 reading.** Rule 2's evidence is read by the same identity, each tick,
+from Cloud Monitoring: per pool project, Vertex AI calls by response code in
+ten-minute buckets over the last six hours (`serviceruntime.googleapis.com/api/request_count`
+on the `consumed_api` resource; the rule's two-hour window, the three hours
+of calls a run makes before it finishes, and an hour for the tick's own clock
+gap), read on `data.json`'s clock so the window ends where the runs' does,
+summed pool-wide into `work/vertex-429.json` and published beside
+`health.json` as `vertex-429.json`. A read that reaches no project keeps the
+previous tick's reading when that one reached a project, so a storm the last
+reading denied is not re-declared on a blind tick; a kept reading may trail
+the runs' window by up to an hour at either edge. `health.json`'s `vertex_429` reports it every tick
+(`read`, `projects_read`, `projects_failed`, `read_at`, and the peak hourly
+share with its `requests` and `hour_end`), so a broken grant shows before a
+storm needs it; the share judges only when the repetitions would fire. It
+needs `roles/monitoring.viewer` on each pool project, the same loop as below
+with that one role. A project that refuses the read is recorded in the
+reading's `errors` and the rest are summed. The reading confirms nothing, and
+the runs decide, when it covered no project, is older than three hours, does
+not reach the hours the hit runs spent on their calls, or has no hour of 200
+or more calls; `reason` says which.
+
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
 `roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
@@ -1320,7 +1455,7 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `open_conditions`, `stale`, `slow`, `pool`, `fixture_state`,
+`evidence`, `advice`, `recovering`, `open_conditions`, `vertex_429`, `stale`, `slow`, `pool`, `fixture_state`, `fixture_holds`,
 `pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
 `periodics_since`, `metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line
@@ -1371,8 +1506,8 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_SA` override them. The off switch is the repository variable
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
-step on pull requests is skipped, the nightly bug filer and the coverage-gap
-filer run dry, and the refresh, the verdict and the
+step on pull requests and the weekly summary are skipped, the nightly bug
+filer and the coverage-gap filer run dry, and the refresh, the verdict and the
 `health.json` upload carry on. It exits before writing `health-state.json`
 too, so what the poster remembers stands still while muted: an alert already
 sent stays sent. The dashboard is unaffected — the pool episode's start rides

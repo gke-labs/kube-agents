@@ -3034,12 +3034,18 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// reaching a container that never restarts. (On a Slack-armed next install
 	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
 	// stamps.)
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned)
+	// The profile role (#3889): the AgentProfile identities and the
+	// task-signing public key, or nothing on an install without profiles.
+	profiles, err := r.credentialProxyProfileConfigFor(ctx, agent)
+	if err != nil {
+		return err
+	}
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned, profiles)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
 	objs = append(objs, proxy)
-	objs = append(objs, credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
+	objs = append(objs, withCredentialProxyProfilePeer(credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace), agent, profiles))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -5688,13 +5694,18 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its
-				// operator-created ServiceAccount (a foreign one under that
-				// name keeps it out: agentProfileServiceAccountIsForeign),
-				// and that ServiceAccount is the profile's, not the agent's,
-				// so Owns() above never fires for it.
+				// operator-created ServiceAccounts (a foreign one under
+				// such a name keeps it out: agentProfileServiceAccountIsForeign),
+				// and those are the profile's, not the agent's, so Owns()
+				// above never fires for them. They live in the profile
+				// namespace, which maps to the agent beside it.
 				&corev1.ServiceAccount{},
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+					agentNS, ok := agentNamespaceOfProfileServiceAccount(obj.GetNamespace())
+					if !ok {
+						return nil
+					}
+					return enqueueAgentsInNamespace(ctx, agentNS)
 				}),
 				builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
 					return strings.HasPrefix(obj.GetName(), agentProfileServiceAccountPrefix)

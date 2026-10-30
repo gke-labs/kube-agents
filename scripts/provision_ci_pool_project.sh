@@ -789,6 +789,12 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     # the nightly's, and to the CI health bot, so this apply also grants each of
     # them impersonation on seeded-fleet-reader. Do not pass it with -var; variables.tf says why
     # every apply has to carry the same value.
+    # Two applies: the scaled-zero gateway fixture's kubernetes_manifest
+    # resources read the Gateway API CRDs at plan time, and those exist only
+    # once GKE has created seeded-a with gateway_api_config. The first apply
+    # creates that cluster on its own; on a project that has it, it changes
+    # nothing.
+    tofu apply -auto-approve -var="project_id=${PROJECT_ID}" -target=google_container_cluster.seeded_a
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else
