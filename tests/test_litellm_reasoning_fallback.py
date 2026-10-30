@@ -143,7 +143,11 @@ litellm:
         self.assertTrue(config["litellm_settings"]["drop_params"])
         self.assertEqual(
             config["litellm_settings"]["callbacks"],
-            ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"],
+            [
+                "prometheus",
+                "litellm_thinking_replay_callback.proxy_handler_instance",
+                "litellm_cache_control_strip_callback.proxy_handler_instance",
+            ],
         )
         router = config["router_settings"]
         primaries = ["model-default", "hermes-agent", _MODEL]
