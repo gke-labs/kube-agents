@@ -3636,6 +3636,256 @@ class SlackRelay:
         return content
 
 
+TEAMS_EVENT_QUEUE_MAXSIZE = 500
+TEAMS_MAX_DELIVERY_ATTEMPTS = 3
+TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
+TEAMS_OAUTH_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+# Case-insensitive, and percent-escapes and backslashes are refused in a
+# segment, because the Bot Connector routes case-insensitively on the decoded
+# path: `/activities/History` or `/activities/%68istory` would otherwise reach
+# Send Conversation History.
+TEAMS_ALLOWED_ACTIVITY_PATH_RE = re.compile(
+    r"^v3/conversations/[^/?#%\\]+/activities(?:/(?!history$)[^/?#%\\]+)?$",
+    re.IGNORECASE,
+)
+
+
+def is_trusted_teams_service_url(service_url: str) -> bool:
+    """Return True if service_url is HTTPS on an official Bot Framework host."""
+    if not service_url or not isinstance(service_url, str):
+        return False
+    if "?" in service_url or "#" in service_url:
+        return False
+    parsed = urllib.parse.urlparse(service_url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        host in TEAMS_TRUSTED_SERVICE_HOSTS
+        or host == "botframework.com"
+        or host.endswith(".botframework.com")
+    )
+
+
+def extract_teams_tenant_id(activity: dict[str, Any]) -> str | None:
+    """Extract the Entra tenant ID from channelData.tenant.id or conversation.tenantId."""
+    if not isinstance(activity, dict):
+        return None
+    channel_data = activity.get("channelData")
+    if isinstance(channel_data, dict):
+        tenant = channel_data.get("tenant")
+        if isinstance(tenant, dict):
+            tid = tenant.get("id")
+            if isinstance(tid, str) and tid.strip():
+                return tid.strip()
+    conv = activity.get("conversation")
+    if isinstance(conv, dict):
+        tid = conv.get("tenantId")
+        if isinstance(tid, str) and tid.strip():
+            return tid.strip()
+    return None
+
+
+def validate_teams_activity(activity: dict[str, Any]) -> None:
+    """Validate structural types of an inbound Bot Framework activity."""
+    if not isinstance(activity, dict):
+        raise ValueError("Teams activity payload must be a JSON object")
+    for field_name in ("channelData", "from", "conversation"):
+        val = activity.get(field_name)
+        if val is not None and not isinstance(val, dict):
+            raise ValueError(f"Teams activity '{field_name}' must be an object")
+    channel_data = activity.get("channelData")
+    if isinstance(channel_data, dict):
+        tenant = channel_data.get("tenant")
+        if tenant is not None and not isinstance(tenant, dict):
+            raise ValueError("Teams activity 'channelData.tenant' must be an object")
+    text = activity.get("text")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("Teams activity 'text' must be a string")
+    service_url = activity.get("serviceUrl")
+    if service_url is not None and not is_trusted_teams_service_url(service_url):
+        raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
+
+
+class _TeamsNoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse 3xx redirects so the bot's Bearer token is never forwarded cross-host."""
+
+    def redirect_request(
+        self,
+        req: Any,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Any:
+        raise ValueError(f"Teams API redirect refused (HTTP {code})")
+
+
+_TEAMS_OPENER = urllib.request.build_opener(_TeamsNoRedirectHandler())
+
+
+class TeamsRelay:
+    """Credentialed Microsoft Teams / Bot Framework activity and API transport."""
+
+    def __init__(
+        self,
+        app_id: str,
+        app_password: str,
+        tenant_id: str | None = None,
+    ) -> None:
+        if not app_id or not app_password:
+            raise ValueError("Teams app ID and app password are required")
+        self.app_id = app_id.strip()
+        self.app_password = app_password.strip()
+        self.tenant_id = tenant_id.strip() if tenant_id and tenant_id.strip() else None
+        self._token: str | None = None
+        self._token_expires_at: float = 0.0
+        self._events: queue.Queue[dict[str, Any]] = queue.Queue(
+            maxsize=TEAMS_EVENT_QUEUE_MAXSIZE
+        )
+        self._receipts: dict[str, dict[str, Any]] = {}
+        self._attempts: dict[int, int] = {}
+        self._lock = threading.Lock()
+        self._token_lock = threading.Lock()
+
+    def is_tenant_authorized(self, activity: dict[str, Any]) -> bool:
+        """Verify activity tenant against configured TEAMS_TENANT_ID if set."""
+        if not self.tenant_id:
+            return True
+        activity_tenant = extract_teams_tenant_id(activity)
+        if not activity_tenant:
+            return False
+        return activity_tenant.lower() == self.tenant_id.lower()
+
+    def _get_access_token(self) -> str:
+        # Hold _token_lock rather than _lock so an identity-provider call never
+        # stalls pull() or settle() on the event receipt map.
+        with self._token_lock:
+            now = time.time()
+            if self._token and now < self._token_expires_at - 60:
+                return self._token
+
+            tenant = self.tenant_id if self.tenant_id else "botframework.com"
+            token_url = TEAMS_OAUTH_URL_TEMPLATE.format(tenant=tenant)
+            data = urllib.parse.urlencode(
+                {
+                    "grant_type": "client_credentials",
+                    "client_id": self.app_id,
+                    "client_secret": self.app_password,
+                    "scope": "https://api.botframework.com/.default",
+                }
+            ).encode("utf-8")
+
+            req = urllib.request.Request(
+                token_url,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self._open_url(req, timeout=20) as resp:
+                result = json.load(resp)
+
+            token = result.get("access_token")
+            if not token:
+                raise RuntimeError("no access_token returned by Microsoft identity provider")
+            expires_in = int(result.get("expires_in", 3600))
+            self._token = str(token)
+            self._token_expires_at = time.time() + expires_in
+            return self._token
+
+    @staticmethod
+    def _open_url(req: urllib.request.Request, *, timeout: float) -> Any:
+        return _TEAMS_OPENER.open(req, timeout=timeout)
+
+    def enqueue_event(self, event: dict[str, Any]) -> bool:
+        validate_teams_activity(event)
+        if not self.is_tenant_authorized(event):
+            raise PermissionError("Teams activity tenant is not authorized")
+        try:
+            self._events.put_nowait(event)
+            return True
+        except queue.Full:
+            LOGGER.warning("Teams event queue is full; dropping activity")
+            return False
+
+    def pull(self, timeout_seconds: int = 20) -> dict[str, Any] | None:
+        try:
+            event = self._events.get(timeout=max(timeout_seconds, 1))
+        except queue.Empty:
+            return None
+        receipt = str(uuid.uuid4())
+        with self._lock:
+            self._receipts[receipt] = event
+        return {"event": event, "receipt": receipt}
+
+    def settle(self, receipt: str, acknowledge: bool) -> bool:
+        with self._lock:
+            event = self._receipts.get(receipt)
+            if event is None:
+                return False
+            event_key = id(event)
+            if not acknowledge:
+                attempts = self._attempts.get(event_key, 1)
+                if attempts >= TEAMS_MAX_DELIVERY_ATTEMPTS:
+                    self._attempts.pop(event_key, None)
+                    del self._receipts[receipt]
+                    LOGGER.warning(
+                        "Teams activity exceeded %d delivery attempts; dropping",
+                        TEAMS_MAX_DELIVERY_ATTEMPTS,
+                    )
+                    return True
+                try:
+                    self._events.put_nowait(event)
+                except queue.Full:
+                    LOGGER.warning("Teams event queue is full; cannot requeue activity")
+                    return False
+                self._attempts[event_key] = attempts + 1
+            else:
+                self._attempts.pop(event_key, None)
+            del self._receipts[receipt]
+            return True
+
+    def api_call(
+        self,
+        service_url: str,
+        path: str,
+        method: str = "POST",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not service_url or not path:
+            raise ValueError("service_url and path are required")
+        if not is_trusted_teams_service_url(service_url):
+            raise ValueError(f"invalid or untrusted Bot Framework service URL: {service_url}")
+        upper_method = (method or "").strip().upper()
+        if upper_method != "POST":
+            raise ValueError(f"Teams relay refuses HTTP method: {method}")
+        clean_path = path.lstrip("/")
+        if ".." in clean_path.split("/") or not TEAMS_ALLOWED_ACTIVITY_PATH_RE.match(clean_path):
+            raise ValueError(f"Teams relay refuses endpoint: {path}")
+
+        token = self._get_access_token()
+        url = f"{service_url.rstrip('/')}/{clean_path}"
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+        with self._open_url(req, timeout=30) as resp:
+            content = resp.read()
+            if content:
+                try:
+                    return json.loads(content.decode("utf-8"))
+                except Exception:
+                    pass
+            return {"status": "ok", "statusCode": resp.status}
+
+
 @dataclass(frozen=True)
 class Rule:
     rule_id: str
@@ -9232,6 +9482,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # credential and an install may arm either one alone.
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    teams_relay: TeamsRelay | None = None
     # The read-only Cloud API relay's credential and transport. Armed by
     # serve() unconditionally, like the exec route: the shell role always
     # exists. None only in a test that has not set it, where the route
@@ -9461,6 +9712,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
             return
+        if self.path.startswith("/v1/chat/teams/events"):
+            if self.teams_relay is None:
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams relay disabled"}
+                )
+                return
+            try:
+                self._json(HTTPStatus.OK, {"event": self.teams_relay.pull()})
+            except Exception as exc:
+                LOGGER.warning("Teams event pull failed: %s", type(exc).__name__)
+                self._json(
+                    HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams event pull failed"}
+                )
+            return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
@@ -9503,6 +9768,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
+            return
+        if self.path.startswith("/v1/chat/teams/"):
+            self._handle_teams_post()
             return
         if self.path.startswith("/v1/chat/"):
             self._handle_chat_post()
@@ -11501,6 +11769,64 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             LOGGER.debug("request not answered type=%s", type(exc).__name__)
 
+    def _handle_teams_post(self) -> None:
+        if self.teams_relay is None:
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Teams relay disabled"}
+            )
+            return
+        try:
+            payload = self._read_json_body()
+            if self.path == "/v1/chat/teams/events":
+                ok = self.teams_relay.enqueue_event(payload)
+                self._json(
+                    HTTPStatus.ACCEPTED if ok else HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"status": "accepted" if ok else "queue_full"},
+                )
+                return
+            if self.path == "/v1/chat/teams/events/ack":
+                ok = self.teams_relay.settle(str(payload.get("receipt", "")), True)
+                self._json(
+                    HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok}
+                )
+                return
+            if self.path == "/v1/chat/teams/events/nack":
+                ok = self.teams_relay.settle(str(payload.get("receipt", "")), False)
+                self._json(
+                    HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok}
+                )
+                return
+            if self.path == "/v1/chat/teams/api":
+                service_url = str(payload.get("serviceUrl", ""))
+                endpoint = str(payload.get("endpoint", ""))
+                method = str(payload.get("method", "POST"))
+                body = payload.get("payload")
+                result = self.teams_relay.api_call(
+                    service_url=service_url,
+                    path=endpoint,
+                    method=method,
+                    payload=body,
+                )
+                self._json(HTTPStatus.OK, {"response": result})
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+        except PermissionError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:
+            safe_detail = redact_credentials(str(exc))
+            LOGGER.warning(
+                "Teams relay operation failed path=%s type=%s error=%s",
+                _sanitize_for_logging(self.path),
+                type(exc).__name__,
+                _sanitize_for_logging(safe_detail, max_length=256),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "Teams operation failed", "detail": safe_detail},
+            )
+
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         # send_response calls this for every response this listener writes --
         # the 401 an unauthenticated caller gets, the relay's direct writes and
@@ -11944,6 +12270,20 @@ def serve(args: argparse.Namespace) -> None:
                     )
 
         threading.Thread(target=initialize_slack_relay, daemon=True).start()
+    teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
+    teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
+    teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
+    if teams_app_id and teams_app_password:
+        CredentialProxyHandler.teams_relay = TeamsRelay(
+            app_id=teams_app_id,
+            app_password=teams_app_password,
+            tenant_id=teams_tenant_id,
+        )
+        LOGGER.info(
+            "Teams relay enabled app_id=%s tenant=%s",
+            teams_app_id,
+            teams_tenant_id or "common",
+        )
     if role == "combined":
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()

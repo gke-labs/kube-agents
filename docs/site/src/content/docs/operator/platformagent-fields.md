@@ -168,7 +168,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `integration.teams.appIdSecretRef` | `corev1.SecretKeySelector` | no |  |  | AppIdSecretRef securely references a Secret containing the Microsoft App (Client) ID. |
 | `integration.teams.appPasswordSecretRef` | `corev1.SecretKeySelector` | no |  |  | AppPasswordSecretRef securely references a Secret containing the Microsoft App Client Secret. |
 | `integration.teams.tenantId` | `string` | no |  |  | TenantId is the Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down. |
-| `integration.teams.allowedUsers` | `[]string` | no |  |  | AllowedUsers is a list of allowed Entra ID Object IDs or User Principal Names. When empty and allowAllUsers is false (default), interactions are rejected. |
+| `integration.teams.allowedUsers` | `[]string` | no |  |  | AllowedUsers is a list of allowed Entra ID Object IDs (from.aadObjectId) or Bot Framework user IDs (from.id). An inbound Teams activity carries no User Principal Name or email. When empty and allowAllUsers is false (default), interactions are rejected. |
 | `integration.teams.allowAllUsers` | `boolean` | no | `false` |  | AllowAllUsers allows any authenticated tenant user to interact with the bot. When false (default), users not listed in allowedUsers are rejected. |
 | `integration.teams.homeChannel` | `string` | no |  |  | HomeChannel is the default channel ID for scheduled messages. |
 | `integration.teams.homeChannelName` | `string` | no |  |  | HomeChannelName is the human-readable name for the home channel. |

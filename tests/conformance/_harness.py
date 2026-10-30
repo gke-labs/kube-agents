@@ -231,6 +231,14 @@ SOURCES: dict[str, Source] = {
         "charts/kube-agents/templates/agent-rbac-admission-policy.yaml",
         ("policyName",),
     ),
+    "gateway_pod_policy": Source(
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ("kube-agents-a2a-gateway-pod", "failurePolicy", "variables.sessionAccount"),
+    ),
+    "chart_gateway_pod_policy": Source(
+        "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
+        ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
+    ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
         "k8s-operator/internal/controller/shell_sandbox_manifests.go",

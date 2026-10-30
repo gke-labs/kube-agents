@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 import unittest
@@ -2291,6 +2292,226 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                     "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
                     (f"-{seconds} seconds", row_id),
                 )
+
+    # --- held for an open fix (_open_fix_pull_request) ----------------------
+
+    FIX_URL = "https://github.com/acme/fleet/pull/7"
+
+    def _board(self, cards=(), subs=()):
+        """A kanban board with `cards` (task_id, session_id, pr_url or None) and `subs` (task_id, chat_id, thread_id)."""
+        import sqlite3
+        board = os.path.join(tempfile.mkdtemp(), "kanban.db")
+        with sqlite3.connect(board) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            conn.execute(
+                "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
+                "payload TEXT, created_at INTEGER)"
+            )
+            conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
+            for task_id, session_id, url in cards:
+                conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+                if url:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, 1)",
+                        (task_id, json.dumps({"url": url, "number": 7, "title": "fix"})),
+                    )
+            for task_id, chat_id, thread_id in subs:
+                conn.execute("INSERT INTO kanban_notify_subs VALUES (?, 'slack', ?, ?)", (task_id, chat_id, thread_id))
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", board)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _first_incident(self, pod, reason="BackOff"):
+        """Inject `pod`'s event, then age its row past the fold window; returns (row id, session id)."""
+        self.assertEqual(self._inject(pod, reason=reason)["status"], "injected")
+        workload = pod.rsplit("-", 2)[0]
+        row_id = self._rows(workload)[-1][0]
+        self._age(row_id, self.WINDOW + 60)
+        return row_id, f"sess-{pod}-{reason}"
+
+    def test_a_workload_that_breaks_again_while_its_fix_is_open_is_held(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request") as remind:
+            anchor_id, session = self._first_incident("heldfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            reply = self._inject("heldfix-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+        self.assertEqual(self.trigger.call_count, 1, "a second investigation started")
+        self.assertEqual([r[3] for r in self._rows("heldfix-api")], [None, anchor_id])
+        remind.assert_called_once_with(session, "heldfix-api", "BackOff", self.FIX_URL)
+        events = [
+            e for e in self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
+            if e["name"] == "heldfix-api"
+        ]
+        self.assertEqual([e["pull_request"] for e in events], [self.FIX_URL, ""])
+
+    def test_a_pull_request_from_a_card_only_subscribed_to_the_thread_does_not_hold(self):
+        # Anything asked for in the incident's thread files a card carrying the
+        # thread's subscription, so its pull request need not be the fix.
+        import sqlite3
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            _anchor, session = self._first_incident("threadfix-api-6cfdb6b98b-aaaaa")
+            with sqlite3.connect(temp_db_path) as conn, conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.1"})),
+                )
+            self._board(cards=[("t-label", "a2a-elsewhere", self.FIX_URL)], subs=[("t-label", "C1", "1700.1")])
+            self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_merged_or_closed_fix_or_none_starts_a_new_incident(self):
+        for state, prefix in (("merged", "mergedfix"), ("closed", "closedfix"), (None, "nofix")):
+            with self.subTest(state=state), \
+                    patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                    patch.object(session_kv_server, "_proposal_state", return_value=state):
+                _anchor, session = self._first_incident(f"{prefix}-api-6cfdb6b98b-aaaaa")
+                self._board(cards=[("t-pr", session, self.FIX_URL)])
+                self.assertEqual(self._inject(f"{prefix}-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_an_incident_with_no_pull_request_on_the_board_starts_a_new_one(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _anchor, session = self._first_incident("nopr-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-triage", session, None)])
+            self.assertEqual(self._inject("nopr-api-6cfdb6b98b-bbbbb")["status"], "injected")
+        state.assert_not_called()
+
+    def test_a_critical_is_not_held_by_a_warning_incident_with_an_open_fix(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"):
+            _anchor, session = self._first_incident("critfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            self.assertEqual(self._inject("critfix-api-6cfdb6b98b-bbbbb", reason="CrashLoopBackOff")["status"], "injected")
+
+    def test_another_reason_is_a_new_incident_while_the_fix_is_open(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _anchor, session = self._first_incident("reasonfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            self.assertEqual(self._inject("reasonfix-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "injected")
+        state.assert_not_called()
+
+    def test_a_reason_folded_into_the_incident_is_held_too(self):
+        # A cascade: the incident's BackOff, then another replica's Unhealthy
+        # folded into it inside the window. A replacement pod replays both.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            self.assertEqual(self._inject("cascade-api-6cfdb6b98b-aaaaa")["status"], "injected")
+            self.assertEqual(self._inject("cascade-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "folded")
+            anchor_id = self._rows("cascade-api")[0][0]
+            self._age(anchor_id, self.WINDOW + 60)
+            self._board(cards=[("t-pr", "sess-cascade-api-6cfdb6b98b-aaaaa-BackOff", self.FIX_URL)])
+            reply = self._inject("cascade-api-6cfdb6b98b-ccccc", reason="Unhealthy")
+        self.assertEqual(reply["status"], "folded")
+        self.assertEqual(reply["duplicate_of"], str(anchor_id))
+
+    def test_with_folding_off_nothing_is_held_or_looked_up(self):
+        with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")
+            self.assertEqual(self._inject("offfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+        state.assert_not_called()
+
+    def test_the_thread_is_reminded_at_most_once_a_window(self):
+        import sqlite3
+        session = "sess-remind"
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.2"})),
+            )
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_send_to_chat", return_value="1700.2") as send:
+            session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            self.assertEqual(send.call_count, 1)
+            platform, message, chat_id, thread_id = send.call_args.args
+            self.assertEqual((platform, chat_id, thread_id), ("slack", "C1", "1700.2"))
+            self.assertIn(self.FIX_URL, message)
+            self.assertIn("still failing", message)
+            with patch.object(session_kv_server.time, "time", return_value=time.time() + self.WINDOW + 1):
+                session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            self.assertEqual(send.call_count, 2)
+
+    def test_an_incident_with_no_thread_is_not_reminded(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_send_to_chat") as send:
+            session_kv_server._remind_fix_pull_request("sess-headless-nothread", "x", "BackOff", self.FIX_URL)
+        send.assert_not_called()
+
+    def test_the_newest_incident_with_an_open_fix_holds_it(self):
+        older_url, newer_url = self.FIX_URL, "https://github.com/acme/fleet/pull/8"
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _older, older_session = self._first_incident("newest-api-6cfdb6b98b-aaaaa")
+            newer, newer_session = self._first_incident("newest-api-6cfdb6b98b-bbbbb")
+            self._board(cards=[("t-old", older_session, older_url), ("t-new", newer_session, newer_url)])
+            reply = self._inject("newest-api-6cfdb6b98b-ccccc")
+        self.assertEqual(reply["duplicate_of"], str(newer))
+        self.assertEqual(reply["pull_request"], newer_url)
+        self.assertEqual(state.call_args_list[0].args[0], newer_url)
+
+    def test_the_search_stops_at_its_deadline(self):
+        def slow_closed(_url, _timeout):
+            time.sleep(0.1)
+            return "closed"
+
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "FIX_PR_LOOKUP_TIMEOUT_S", 0.05), \
+                patch.object(session_kv_server, "_proposal_state", side_effect=slow_closed) as state:
+            _older, older_session = self._first_incident("deadline-api-6cfdb6b98b-aaaaa")
+            _newer, newer_session = self._first_incident("deadline-api-6cfdb6b98b-bbbbb")
+            self._board(cards=[("t-old", older_session, self.FIX_URL), ("t-new", newer_session, self.FIX_URL)])
+            self.assertEqual(self._inject("deadline-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(state.call_count, 1)
+
+    def test_the_forge_is_asked_for_the_pull_request_and_its_state_read(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(self.FIX_URL, 5), "open")
+            forge.call.assert_called_once_with(
+                "proposal-view", {"number": 7}, "https://github.com/acme/fleet", retry_transient=True
+            )
+            forge.call.reset_mock()
+            mr = "https://gitlab.example.com/acme/fleet/-/merge_requests/12"
+            self.assertEqual(session_kv_server._proposal_state(mr, 5), "open")
+            self.assertEqual(forge.call.call_args.args[1:], ({"number": 12}, "https://gitlab.example.com/acme/fleet"))
+
+    def test_a_forge_that_fails_or_overruns_reads_as_no_state(self):
+        forge = MagicMock()
+        with patch.dict(sys.modules, {"forge": forge}):
+            forge.call.side_effect = RuntimeError("forge down")
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 5))
+            forge.call.side_effect = lambda *a, **k: time.sleep(0.5) or {"proposal": {"state": "open"}}
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+            forge.call.reset_mock()
+            self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
+            forge.call.assert_not_called()
+
+    def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
+        release = threading.Event()
+        forge = MagicMock()
+        forge.call.side_effect = lambda *a, **k: release.wait(5) and {}
+        self.addCleanup(release.set)
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+        workers = [t for t in threading.enumerate() if t.name == "fix-pr-lookup"]
+        self.assertTrue(workers, "the overrunning call has no thread left to inspect")
+        self.assertTrue(all(t.daemon for t in workers), "a non-daemon worker is joined at interpreter exit")
+
+    def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
+        plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("pr_opened_constants", plugin_path)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(session_kv_server.PR_OPENED_EVENT_KIND, plugin.PR_OPENED_KIND)
+        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, plugin.OPEN_STATE)
+        self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
     def test_off_by_default(self):
         self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)

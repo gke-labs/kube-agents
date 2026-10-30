@@ -1286,6 +1286,15 @@ Mutation(
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
     ),
     Mutation(
+        "C5-gateway-pod-policy-any-account",
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ('    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"',
+         '    - expression: "has(object.spec.serviceAccountName)"'),
+        "test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account",
+        "widen the identity rule to any ServiceAccount, which reopens the "
+        "gateway's pod create to every identity in its namespace",
+    ),
+    Mutation(
         "C1-broker-colocation-flag-restored",
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("// buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet\n",

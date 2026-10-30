@@ -952,6 +952,13 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A Cluster Agent answers a storage audit with the single-pass collector SOUL.md
+# names (#3285): graded on a Cluster Agent doing the work, running
+# /opt/data/scripts/audit_storage.py, no later turn's result showing the script
+# missing, and a report naming the storage kinds. deployer: noop, read-only, no
+# fixture, 200s default until it has a record.
+./tasks/cluster-agent-storage-audit-collector/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # Gemini setup it failed about 30% of repetitions on unrelated pull requests
 # and on main's eval-next (37 of 126 across 42 runs; the store's record

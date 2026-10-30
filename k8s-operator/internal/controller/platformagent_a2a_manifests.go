@@ -4209,17 +4209,19 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
-// primitive wherever admission does not constrain the PodSpec, and nothing in
-// this repository constrains it here. A gateway that is compromised or
-// prompt-steered into building its own PodSpec can name any ServiceAccount in
-// the namespace — including the platform agent's, whose Workload Identity
-// binding then resolves for that pod — mount any Secret in it, and stamp
-// labels no NetworkPolicy selects. spawn.go declining to do any of that is
-// what the gateway CHOOSES, not what this grant PERMITS, and the two are not
-// the same claim. Narrowing it takes a ValidatingAdmissionPolicy on pod create
-// by this subject (no serviceAccountName, no secret volumes,
-// automountServiceAccountToken false); that policy does not exist yet and is
-// named in this change's PR body as the follow-up it owes.
+// primitive wherever admission does not constrain the PodSpec. A gateway that
+// is compromised or prompt-steered into building its own PodSpec could name
+// any ServiceAccount in the namespace — including the platform agent's, whose
+// Workload Identity binding then resolves for that pod — mount any Secret in
+// it, and stamp labels no NetworkPolicy selects. spawn.go declining to do any
+// of that is what the gateway CHOOSES, not what this grant PERMITS. The
+// ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
+// (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
+// creates to the session pod spawn.go builds: the session ServiceAccount, no
+// automount, the session token audiences, no Secret, the session labels. The
+// chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
+// and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
+// this grant is as wide as written.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
