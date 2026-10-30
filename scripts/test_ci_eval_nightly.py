@@ -1058,13 +1058,18 @@ class ProducerIntoGrepQuietTest(unittest.TestCase):
     module lifts out of it), so nothing in it may feed `grep -q` through a
     pipeline."""
 
-    # One pipe (not `||`), then grep, then any arguments on the same line
-    # up to a quiet spelling: `-q` anywhere in a short-option cluster, or
-    # the long forms. The argument walk stops at `|`, `;`, `&` and a
-    # closing paren, so a `-eq` after `$(... | grep -c .)` is not read as
-    # grep's.
+    # One pipe (`|` or `|&`, not `||`), optionally a newline (bash lets a
+    # pipeline continue on the next line), then grep under any of its
+    # spellings (`command grep`, an env assignment in front, `egrep`,
+    # `fgrep`), then any arguments up to a quiet spelling: `-q` anywhere
+    # in a short-option cluster, or the long forms. The argument walk
+    # crosses a quoted token whole, so `-E '(a|b)' -q` is read to its `-q`,
+    # and otherwise stops at `|`, `;`, `&` and a closing paren, so a `-eq`
+    # after `$(... | grep -c .)` is not read as grep's.
     PIPE_INTO_GREP_QUIET = re.compile(
-        r"(?<!\|)\|(?!\|)[ \t]*grep(?:[ \t]+[^|;&()\s]+)*?[ \t]+(?:-[a-zA-Z]*q[a-zA-Z]*|--quiet|--silent)(?=[\s;)]|$)"
+        r"(?<!\|)\|(?!\|)&?\s*(?:command[ \t]+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*[ef]?grep"
+        r"(?:[ \t]+(?:'[^']*'|\"[^\"]*\"|[^|;&()\s]+))*?"
+        r"[ \t]+(?:-[a-zA-Z]*q[a-zA-Z]*|--quiet|--silent)(?=[\s;)]|$)"
     )
 
     def test_the_script_pipes_no_producer_into_grep_q(self):
@@ -1093,6 +1098,15 @@ class ProducerIntoGrepQuietTest(unittest.TestCase):
             "echo \"${#TASKS[@]} tasks\" | grep -q x",
             "sed 's/#.*$//' f | grep -q x",
             "v=\"$(printf x | grep -q .)\"",
+            # The #4357 line one reflow away: the pipe ends its line.
+            "if ! printf '%s\\n' \"$a\" \"$b\" |\n  grep -qxF -- \"$e\"; then",
+            "x |& grep -q y",
+            "x | grep -E '(a|b)' -q",
+            "x | grep -F \"$(f)\" -q",
+            "x | command grep -q y",
+            "x | LC_ALL=C grep -q y",
+            "x | egrep -q y",
+            "x | fgrep -q y",
         )
         passed = (
             "cmd || grep -qxF -- x <<< y",
@@ -1102,6 +1116,10 @@ class ProducerIntoGrepQuietTest(unittest.TestCase):
             "x | grep -c foo",
             "x | grep foo | wc -q",
             "[ \"$(printf x | grep -c .)\" -eq 1 ]",
+            "[ \"$(printf x | grep -c '(a|b)')\" -eq 1 ]",
+            "x |& grep -c y",
+            "case $x in a|b) grep -q y <<< \"$z\" ;; esac",
+            "x |\n  grep -c y",
         )
         for line in flagged:
             with self.subTest(flagged=line):
