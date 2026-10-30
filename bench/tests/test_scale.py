@@ -1143,3 +1143,12 @@ def test_every_test_cluster_s_credentials_are_refreshed(monkeypatch, tmp_path):
     run.ensure_clusters(2)
     # A cluster created again under an old name keeps no stale endpoint.
     assert fetched == ["scale-01", "scale-02"]
+
+
+def test_kubectl_requests_time_out_except_streaming_ones(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kube, "run", lambda args, **kwargs: calls.append(args) or "")
+    kube.kubectl("ctx", "get", "nodes", timeout=60)
+    kube.kubectl("ctx", "exec", "pod", "--", "true", timeout=60)
+    assert "--request-timeout=60s" in calls[0]
+    assert not any(arg.startswith("--request-timeout") for arg in calls[1])
