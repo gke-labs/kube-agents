@@ -967,6 +967,14 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# The silence case for a deliberate scale to zero (#4098): an in-cluster
+# gateway whose proxy and backend are both at replicas 0 reports
+# Programmed=False, and the stall check must not report it. Reads the
+# scaled-zero-gateway role on seeded-a (`deployer: noop`, read-only), graded
+# on the contracted "stalled resources: 0" line with two safeguards against
+# scaling the environment back up. Red on main without the rule, green with it.
+./tasks/cluster-agent-scaled-zero-gateway-silence/task.yaml
+
 # A Cluster Agent answers a storage audit with the single-pass collector SOUL.md
 # names (#3285): graded on a Cluster Agent doing the work, running
 # /opt/data/scripts/audit_storage.py, no later turn's result showing the script
@@ -1016,6 +1024,17 @@
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# A fleet audit on an install whose scope excludes as many clusters as it
+# manages runs, rather than cancelling with "every managed cluster is
+# excluded" (#3933). The runner excludes slots b and d plus one cluster that
+# does not exist (scope_exclude, absent: 1): three excluded against the three
+# a pool install still manages. One stream by its SOP (compliance-audit), so
+# the session runs it and the report store shows the outcome. Not reproduced
+# on demand (three passes on main on a dev install); a red is #3933 evidence
+# only when its answer reads the managed clusters as excluded (the case header
+# says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
+./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit

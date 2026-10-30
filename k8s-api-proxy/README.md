@@ -18,8 +18,14 @@ credential minting, assigning pods to nodes, and the token and access review API
 redaction on, Secret subresources and Secret `update` and `patch` are refused in every mode,
 since even a dry-run patch can reveal a value. Redaction covers what the Secrets API returns, not
 what a workload prints: in `read-write`, a pod that echoes a Secret exposes it through its log.
-The handler does not redact responses yet, so with redaction on it also refuses Secret `get`,
-`list`, `watch`, `delete` and `deletecollection`, whose responses carry values even for a dry run.
+To redact, the handler asks the API server for a Secret's metadata only (or the `Table` kubectl
+requests), then rebuilds the Secret the caller asked for with each value replaced by base64 of
+`REDACTED`, and drops any annotation holding a copy of the Secret. Keys come from `managedFields`,
+so a Secret whose managers recorded none comes back without `data`; its `type` is not in its
+metadata and is absent unless the caller asked for a `Table`. The handler never receives a value, so
+it cannot tell an empty one from a set one: `kubectl describe secret` prints every key as 8 bytes,
+the placeholder's size, and an empty key looks the same as a populated one. A response the handler
+cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event.
 
 It is a self-contained Go module, and nothing outside this directory builds it. Run its checks
 from this directory:

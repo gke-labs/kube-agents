@@ -166,7 +166,10 @@ excludes nothing, and loses it only after a reconcile has run under that block: 
 reads a missing block as "keep the last exclusions". The scope it replaced is saved on the CR
 (`bench/kube_agents_bench/scope_exclude.py`), so the EXIT trap and the next lease can restore it
 after a run that died first; the annotation stays until a reconcile has run under the restored scope. A repetition whose exclusion did not take effect is recorded as
-infrastructure. The validator refuses a slot the catalogue does not declare and a list that
+infrastructure. `absent: <n>` beside the slots (at most `MAX_ABSENT` in `scope_exclude.py`) also excludes n clusters that do not
+exist, named like the first slot's cluster with a letter past the catalogue's last slot, in its
+project and location, so a case can exclude as many clusters as the install manages; the
+reconcile prunes nothing for them. The validator refuses a slot the catalogue does not declare and a list that
 excludes every slot. devops-bench ignores the key.
 
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
@@ -579,7 +582,7 @@ compares a known boolean field such as `spec.suspend` to the string `"true"` or 
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
 descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
-does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
+does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters and an optional `absent` from 1 to `MAX_ABSENT`, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
 refuses (a key that overrides one merged in with `<<:` is not a repeat). It
