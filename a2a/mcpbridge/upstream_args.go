@@ -179,6 +179,7 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 	case ToolTaskControl:
 		var args struct {
 			Action       string `json:"action"`
+			TaskID       string `json:"task_id"`
 			Conversation string `json:"conversation"`
 		}
 		if len(rawArgs) > 0 {
@@ -190,7 +191,10 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 		}
 		stopConversation := ""
 		if act == taskActionStop || act == taskActionCancel {
-			stopConversation = s.ReadOnlyConversationFor(ctx, args.Conversation).Alias
+			var err error
+			if stopConversation, err = s.stopConversationAlias(ctx, args.Conversation, strings.TrimSpace(args.TaskID)); err != nil {
+				return nil, err
+			}
 		}
 		return serverTaskControlArgs(rawArgs, stopConversation), nil
 	case ToolManageSession:

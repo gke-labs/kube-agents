@@ -261,11 +261,11 @@ func taskControlDefinition() ToolDefinition {
 		},
 		"task_id": map[string]any{
 			"type":        "string",
-			"description": "Task ID to inspect when action is 'get'.",
+			"description": "Task ID to inspect when action is 'get'. With 'stop' and no conversation, the stop goes to the conversation that started this task (refused if this bridge is not tracking it).",
 		},
 		"conversation": map[string]any{
 			"type":        "string",
-			"description": "Conversation alias or token whose running task to stop when action is 'stop' (defaults to the active conversation).",
+			"description": "Conversation alias or token whose running task to stop when action is 'stop' (defaults to task_id's conversation when task_id is given, else the active conversation).",
 		},
 		"wait_timeout_seconds": map[string]any{
 			"type":        "integer",

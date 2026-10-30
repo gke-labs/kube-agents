@@ -1479,8 +1479,12 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 	callerID := FirstNonEmptyStr(strings.TrimSpace(conv.HostConversationID), strings.TrimSpace(meta.ConversationID))
 
 	if act == taskActionStop || act == taskActionCancel {
-		s.clearStreamingTask(taskID, conv.Alias)
-		fwd := serverTaskControlArgs(rawArgs, conv.Alias)
+		stopAlias, err := s.stopConversationAlias(ctx, args.Conversation, taskID)
+		if err != nil {
+			return "", "", "", err
+		}
+		s.clearStreamingTask(taskID, stopAlias)
+		fwd := serverTaskControlArgs(rawArgs, stopAlias)
 		return sess.callRemoteTool(ctx, ToolTaskControl, fwd, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
 	}
 	rawArgs = serverTaskControlArgs(rawArgs, "")
@@ -1614,6 +1618,25 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 
 // taskOwnerConversation is the conversation alias a tracked streaming task was started on (a
 // send_message that returned taskID still running), or "" when the bridge does not know it.
+// errStopNeedsConversation refuses a stop by task id whose owning conversation the bridge does
+// not know: the server stops a conversation's running task, so stopping the caller's active
+// one instead could stop a different turn.
+var errStopNeedsConversation = errors.New("stop needs the task's conversation: this bridge is not tracking that task; pass conversation")
+
+// stopConversationAlias is the conversation a task_control stop goes to: the one named; with
+// only a task_id, the conversation that owns that task (refused when unknown); with neither,
+// the caller's bound or active conversation.
+func (s *Server) stopConversationAlias(ctx context.Context, conversation, taskID string) (string, error) {
+	if strings.TrimSpace(conversation) == "" && taskID != "" {
+		owner := s.taskOwnerConversation(taskID)
+		if owner == "" {
+			return "", errStopNeedsConversation
+		}
+		return owner, nil
+	}
+	return s.ReadOnlyConversationFor(ctx, conversation).Alias, nil
+}
+
 func (s *Server) taskOwnerConversation(taskID string) string {
 	if s == nil || taskID == "" {
 		return ""

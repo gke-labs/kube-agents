@@ -3,6 +3,8 @@ package mcpbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -118,5 +120,60 @@ func TestTaskControlStopDuringASendSendsOneStop(t *testing.T) {
 	srv.bgWG.Wait()
 	if n := len(gw.stops); n != 1 {
 		t.Fatalf("a task_control stop during a send sent %d remote stops; want 1", n)
+	}
+}
+
+func TestTaskControlStopByTaskIDGoesToTheTasksConversation(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	ctx := context.Background()
+	track := func() {
+		// platform/task-1 was returned still running by a send_message on c1; the active
+		// conversation is another one.
+		srv.mu.Lock()
+		srv.activeStreamingTasks["task:platform/task-1"] = &activeStreamingTask{TaskID: "platform/task-1", ConvAlias: "c1", UpdatedAt: time.Now()}
+		srv.mu.Unlock()
+	}
+	nextStop := func(path string) map[string]any {
+		t.Helper()
+		select {
+		case stop := <-gw.stops:
+			return stop
+		case <-time.After(stdioTestWait):
+			t.Fatalf("%s: the gateway received no stop", path)
+		}
+		return nil
+	}
+	if active := srv.ReadOnlyConversationFor(ctx, "").Alias; active == "c1" {
+		t.Fatalf("the active conversation is already c1; the test needs another")
+	}
+
+	track()
+	if res := srv.CallTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"stop","task_id":"task-1"}`)); res.IsError {
+		t.Fatalf("task_control stop by task_id: %+v", res)
+	}
+	if conv := nextStop("task_control")["conversation"]; conv != "c1" {
+		t.Fatalf("task_control stop of c1's task stopped conversation %v; want c1", conv)
+	}
+	track()
+	if _, _, _, err := srv.CallRemoteTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"stop","task_id":"task-1"}`), CallMeta{}, nil); err != nil {
+		t.Fatalf("CallRemoteTool stop by task_id: %v", err)
+	}
+	if conv := nextStop("CallRemoteTool")["conversation"]; conv != "c1" {
+		t.Fatalf("CallRemoteTool stop of c1's task stopped conversation %v; want c1", conv)
+	}
+
+	// A task the bridge is not tracking: refused, not sent to the active conversation.
+	if res := srv.CallTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"stop","task_id":"task-9"}`)); !res.IsError ||
+		!strings.Contains(res.Content[0].Text, "stop needs the task's conversation") {
+		t.Fatalf("task_control stop of an untracked task: %+v; want it refused", res)
+	}
+	if _, _, _, err := srv.CallRemoteTool(ctx, ToolTaskControl, json.RawMessage(`{"action":"stop","task_id":"task-9"}`), CallMeta{}, nil); !errors.Is(err, errStopNeedsConversation) {
+		t.Fatalf("CallRemoteTool stop of an untracked task: %v; want it refused", err)
+	}
+	select {
+	case stop := <-gw.stops:
+		t.Fatalf("a stop of an untracked task was sent: %v", stop)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
