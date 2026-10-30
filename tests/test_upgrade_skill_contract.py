@@ -79,6 +79,14 @@ REFUSAL_OUTCOME = "keep an anonymized local draft"
 NO_WRITE_FOR_REGULAR_USERS = (
     "Regular users must not open or modify issue tickets, even for p0 failures or after approving a post"
 )
+# A refused requester keeps the draft and is told where to send it: the tracker,
+# where they open the issue themselves, and the feedback form, the only path for
+# an enterprise-managed account. A draft with no destination stays on the laptop.
+HANDOVER_SENTENCE = re.compile(rf"hand over the draft with{WITHIN_SENTENCE}{SENTENCE_END}")
+DRAFT_DESTINATIONS = (
+    "https://github.com/gke-labs/kube-agents/issues",
+    "https://gke-labs.github.io/kube-agents/feedback",
+)
 
 # (c) Consent attaches to the act, not to the repository. The user sees the
 # payload before every post, and is asked before the first upgrade report is
@@ -234,6 +242,12 @@ class ReportingContractTest(unittest.TestCase):
                 self.assertIn(condition, refusal, f"{condition!r} no longer leads to a refusal")
         self.assertIn(REFUSAL_OUTCOME, refusal, "a refusal no longer ends in a local draft")
         self.assert_stated(NO_WRITE_FOR_REGULAR_USERS, "a regular user may now write, or an exception was added")
+
+    def test_a_refused_requester_is_told_where_to_send_the_draft(self) -> None:
+        handover = self.sentence(HANDOVER_SENTENCE, 0, "a refused requester no longer learns where to send the draft")
+        for destination in DRAFT_DESTINATIONS:
+            with self.subTest(destination=destination):
+                self.assertIn(destination, handover, f"{destination!r} is no longer offered for the draft")
 
     def test_the_payload_is_shown_before_every_post(self) -> None:
         self.assert_stated(PAYLOAD_SHOWN_BEFORE_EVERY_POST, "the user sees the payload only when an ask happens")

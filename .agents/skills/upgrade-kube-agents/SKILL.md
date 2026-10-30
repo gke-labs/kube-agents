@@ -37,8 +37,12 @@ Use this skill when asked to upgrade the `kube-agents` Platform Agent or operato
   administrator credentials. If identity is unverified, no authoritative source qualifies the
   requester, or required eligibility checks cannot complete, keep an anonymized local draft and
   explain the restriction. Regular users must not open or modify issue tickets, even for p0
-  failures or after approving a post. Eligibility does not grant missing GitHub API permissions;
-  handle denied writes with the draft/partial-write fallback below.
+  failures or after approving a post. In each of these cases, hand over the draft with the two
+  places the user can send it: the tracker at <https://github.com/gke-labs/kube-agents/issues>,
+  where they open the issue themselves, and the feedback form at
+  <https://gke-labs.github.io/kube-agents/feedback>, which needs no GitHub account and is the only
+  path for an enterprise-managed account. Eligibility does not grant missing GitHub API
+  permissions; handle denied writes with the draft/partial-write fallback below.
 - Search `gke-labs/kube-agents` issues, open **and closed**, using the distinctive error, affected
   component and root cause. Use anonymized search terms; do not send raw client diagnostics.
   Do not filter by `upgrade-failure`: older matching issues may lack it.
