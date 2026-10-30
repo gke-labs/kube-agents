@@ -186,6 +186,8 @@ func run() int {
 			Tier:      os.Getenv(lib.EnvProfileTier),
 			OneShot:   oneShot == "1" || oneShot == "true",
 			ReadyAddr: fmt.Sprintf(":%d", lib.ProfileWorkerStatusPort),
+			// The broker's task-token file (#3889's proxy confinement).
+			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)

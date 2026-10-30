@@ -3,15 +3,18 @@ package workeradapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -351,5 +354,121 @@ func TestAProfileWorkerDeclinesAMismatchedOffer(t *testing.T) {
 	d.offer("task-z", other, 2)
 	if a := d.nextAccept(5 * time.Second); a.Accepted || !strings.HasPrefix(a.Reason, "mismatch") {
 		t.Errorf("an envelope for another profile = %+v, want declined", a)
+	}
+}
+
+// waitReady waits until the worker at addr answers /readyz.
+func waitReady(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, err := http.Get("http://" + addr + "/readyz"); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the worker never became ready")
+}
+
+// The confirm's credentials (addendum 8): with a task credential, the task's
+// consumers are the task connection's (<pod>_<task>-in), and the proxy token
+// is in the shims' file only while the task runs.
+func TestAConfirmsCredentialsReachTheTaskAndOnlyWhileItRuns(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	tokenFile := filepath.Join(t.TempDir(), "task-token")
+	harness := stub(t, fmt.Sprintf(`
+read first || exit 1
+sleep 1.5
+printf '{"type":"result","subtype":"success","result":"token=%%s"}\n' "$(cat %s)"
+`, tokenFile))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := profileWorkerConfig(t, url, harness)
+	addr := freeAddr(t)
+	go func() {
+		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, ReadyAddr: addr, TaskTokenFile: tokenFile, deadlineMargin: time.Second})
+	}()
+	waitReady(t, addr)
+
+	const task = "task-creds"
+	d.offer(task, profileSubmission(t, task, "use the cluster", nil), 5)
+	d.nextAccept(5 * time.Second)
+	confirm, err := json.Marshal(map[string]string{
+		"type": lib.DispatchConfirm, "taskId": task,
+		"taskCredential": "cred-for-test", "proxyToken": "proxy-token-for-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.nc.Publish(lib.DispatchSubject(pwProfile, pwTier, pwPod), confirm); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, testClient(t, url), pwProfile, task, lib.StateWorking)
+
+	// The task's input consumer is the task connection's, not the pod's.
+	js, err := jetstream.New(d.nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := js.Stream(context.Background(), lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	lister := stream.ConsumerNames(context.Background())
+	for n := range lister.Name() {
+		names = append(names, n)
+	}
+	want := lib.SessionConsumerName(lib.TaskConsumerStem(pwPod, task), lib.SessionConsumerIn)
+	if !slices.Contains(names, want) {
+		t.Errorf("consumers %v, want the task connection's %s", names, want)
+	}
+	if slices.Contains(names, lib.SessionConsumerName(pwPod, lib.SessionConsumerIn)) {
+		t.Errorf("consumers %v include the pod's own input consumer", names)
+	}
+
+	if _, final := drainLeases(d, task, 20*time.Second); !final {
+		t.Fatal("no final renewal")
+	}
+	if got := artifactText(foldTask(t, testClient(t, url), pwProfile, task), lib.ArtifactResult); got != "token=proxy-token-for-test" {
+		t.Errorf("the harness read %q from the token file, want the confirm's proxy token", got)
+	}
+	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
+		t.Errorf("the proxy token file outlived its task: %v", err)
+	}
+}
+
+// A task connection that can't be opened fails closed: nothing runs on the
+// pod connection's wider grants, no terminal and no final renewal go out,
+// and the dispatcher's lease expiry fails the task.
+func TestARefusedTaskConnectionRunsNothing(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := profileWorkerConfig(t, url, stub(t, `read first; echo '{"type":"result","subtype":"success","result":"ran"}'`))
+	startProfileWorker(t, ctx, cfg, false)
+	// The pod connection is up; the task connection, which reads the
+	// token afresh, now can't.
+	if err := os.Remove(cfg.BusTokenFile); err != nil {
+		t.Fatal(err)
+	}
+
+	const task = "task-refused-conn"
+	d.offer(task, profileSubmission(t, task, "anything", nil), 5)
+	d.nextAccept(5 * time.Second)
+	confirm, _ := json.Marshal(map[string]string{"type": lib.DispatchConfirm, "taskId": task, "taskCredential": "cred"})
+	if err := d.nc.Publish(lib.DispatchSubject(pwProfile, pwTier, pwPod), confirm); err != nil {
+		t.Fatal(err)
+	}
+	if _, final := drainLeases(d, task, 3*time.Second); final {
+		t.Error("a final renewal for a task that never ran")
+	}
+	if evs := replayEvents(t, url, pwProfile, task); len(evs) != 0 {
+		t.Errorf("%d events for a task whose task connection was refused", len(evs))
 	}
 }

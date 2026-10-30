@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -44,6 +45,10 @@ type ProfileWorkerConfig struct {
 	// the dispatcher, which offers only to Ready pods, never offers into a
 	// worker that isn't listening yet. Empty disables the listener.
 	ReadyAddr string
+	// TaskTokenFile is where the confirm's proxy token is written for the
+	// task's lifetime (CREDENTIAL_PROXY_TASK_TOKEN_FILE, a tmpfs emptyDir),
+	// for the kubectl and gcloud shims to send to the broker. Empty skips it.
+	TaskTokenFile string
 	// deadlineMargin is how long before the offer's deadline the harness is
 	// stopped, so the worker's own deadline-exceeded terminal and its final
 	// renewal reach the bus before the dispatcher's abandon. Zero is
@@ -128,6 +133,9 @@ type held struct {
 	renewDone chan struct{}
 	// abandon reaches the running task's supervise loop.
 	abandon chan string
+	// creds are the confirm's task credentials, when the dispatcher holds a
+	// task-signing key (addendum 8).
+	creds confirmCredentials
 	// done carries the task's outcome once execute returns.
 	done chan turnOutcome
 }
@@ -207,6 +215,7 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					continue
 				}
 				cur.running, acceptTimer = true, nil
+				_ = json.Unmarshal(msg.Data, &cur.creds)
 				taskDone = w.start(ctx, cur)
 
 			case lib.DispatchAbandon:
@@ -291,26 +300,73 @@ func (w *profileWorker) publish(subject string, v any) error {
 	return w.b.nc.Publish(subject, data)
 }
 
+// confirmCredentials are the two credentials a confirm carries (contract
+// addendum 8). They're decoded by name here until lib.DispatchMessage has
+// the fields, which the dispatcher's mint adds.
+type confirmCredentials struct {
+	TaskCredential string `json:"taskCredential,omitempty"`
+	ProxyToken     string `json:"proxyToken,omitempty"`
+}
+
 // start runs the confirmed task through execute and returns where its
-// outcome arrives.
+// outcome arrives. With a task credential, the task's events and input go
+// on a task connection that reaches only that task; without one (a
+// dispatcher with no signing key), on the pod connection.
 func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	cfg := w.cfg
 	cfg.TaskID = h.offer.TaskID
+	h.done = make(chan turnOutcome, 1)
+	bus, closeTaskBus := w.b, func() {}
+	if h.creds.TaskCredential != "" {
+		cfg.TaskStem = lib.TaskConsumerStem(cfg.PodName, cfg.TaskID)
+		tb, closeTB, err := dialTaskBus(ctx, cfg, h.creds.TaskCredential)
+		if err != nil {
+			// Fail closed: nothing runs on the pod connection's wider
+			// grants, renewals stop when the loop releases the task, and
+			// the dispatcher fails it as lease-expired.
+			w.cfg.Logger.Error("the task connection was refused; not running the task", "task", cfg.TaskID, "err", err)
+			h.done <- turnOutcome{err: err}
+			return h.done
+		}
+		bus, closeTaskBus = tb, closeTB
+	}
+	removeToken := w.writeTaskToken(h.creds.ProxyToken)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin
 	cfg.HarnessEnv = append(append([]string(nil), cfg.HarnessEnv...), taskParameterEnv(h.origin, cfg.Logger)...)
-	a := newTaskAdapter(cfg, w.b)
+	a := newTaskAdapter(cfg, bus)
 	a.dispatched = true
 	a.abandon = h.abandon
-	h.done = make(chan turnOutcome, 1)
 	go func() {
+		defer closeTaskBus()
+		defer removeToken()
 		// Follow-ups and cancels arrive on the task's own .in; the
 		// submission isn't there (it's on PROFILE_SUBMITS), so the reader
 		// opens at the subject's start.
 		h.done <- a.execute(ctx, h.origin, 0, turnPlan{})
 	}()
 	return h.done
+}
+
+// writeTaskToken writes the proxy token where the shims read it, for the
+// task's lifetime, and returns what removes it. A task with no token (no
+// target, or no signing key) leaves no file, so the broker gives its calls
+// no cluster.
+func (w *profileWorker) writeTaskToken(token string) func() {
+	path := w.pw.TaskTokenFile
+	if path == "" {
+		return func() {}
+	}
+	_ = os.Remove(path)
+	if token == "" {
+		return func() {}
+	}
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
+		w.cfg.Logger.Error("could not write the proxy token; the task's cluster calls will be refused", "path", path, "err", err)
+		return func() {}
+	}
+	return func() { _ = os.Remove(path) }
 }
 
 // finish sends the final renewal for a task whose terminal went out. A task

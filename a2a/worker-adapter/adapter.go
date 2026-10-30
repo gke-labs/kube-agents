@@ -163,6 +163,11 @@ type Config struct {
 	// disables the listener, and the harness has no way to delegate.
 	DelegateSocket string
 
+	// TaskStem names the consumers of a profile worker's task connection
+	// (lib.TaskConsumerStem), which the callout grants instead of the pod's.
+	// Empty for every other run.
+	TaskStem string
+
 	Logger *slog.Logger
 }
 
@@ -181,6 +186,9 @@ func (c Config) Addressee() string {
 // (the callout's profile narrowing grants exactly <pod>-<role>). Without a pod
 // name, which is the by-hand static-credential path, it is the addressee.
 func (c Config) consumerStem() string {
+	if c.TaskStem != "" {
+		return c.TaskStem
+	}
 	if c.Session != "" {
 		return c.Session
 	}
@@ -464,6 +472,22 @@ type busConns struct {
 
 // dialBus opens the pod's two bus connections with its credential.
 func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
+	return dialBusWith(ctx, cfg, nil)
+}
+
+// dialTaskBus opens a profile worker's task connections (#3889): the pod's
+// bus token with the dispatcher's task credential, under the task's stem.
+func dialTaskBus(ctx context.Context, cfg Config, credential string) (*busConns, func(), error) {
+	auth, err := lib.TaskCredentialNATSOptions(cfg.BusTokenFile, credential, cfg.PodName, cfg.TaskID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dialBusWith(ctx, cfg, auth)
+}
+
+// dialBusWith is dialBus with auth replacing the credential cfg names, when
+// it's set.
+func dialBusWith(ctx context.Context, cfg Config, auth []nats.Option) (*busConns, func(), error) {
 	log := cfg.Logger
 	natsOpts := []nats.Option{
 		nats.Name("worker-adapter-" + cfg.Addressee()),
@@ -492,6 +516,8 @@ func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
 		}),
 	}
 	switch {
+	case auth != nil:
+		natsOpts = append(natsOpts, auth...)
 	case cfg.BusTokenFile != "":
 		// The pod-bound credential. The inbox owner is the pod name: for a
 		// session pod validate() has checked it against A2A_SESSION, and a
