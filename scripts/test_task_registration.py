@@ -535,6 +535,7 @@ class TestTheValidatorItself(unittest.TestCase):
             {"type": "forge_issue_state", "state": "open", "min_comments": "2"},
             {"type": "forge_issue_state", "state": "open", "min_comments": 1.0},
             {"type": "forge_issue_state", "state": "open", "min_comments": "1e3"},
+            {"type": "forge_issue_state", "state": "open", "min_comments": "1" * 5000},
             {"type": "forge_issue_state", "state": "closed", "labels": ["status:resolved"], "min_comments": 2},
         ):
             problems = []

@@ -548,10 +548,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
-    # The issue state, its labels and its in-run comment count; the binding
-    # rule (`state: closed` or `min_comments` >= 1) is a clause of its own in
-    # _check_assertions.
-    "forge_issue_state": ("state", "labels", "min_comments"),
+    # No field: the binding rule (`state: closed` or `min_comments` >= 1) is a
+    # clause of its own in _check_assertions, and it is what can fail.
+    "forge_issue_state": (),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
@@ -735,7 +734,9 @@ def _claims_comments(value: Any) -> bool:
         if not text:
             return False
         if WHOLE_NUMBER.fullmatch(text):
-            return int(text) >= 1
+            # No int(): a digit string past Python's conversion limit would
+            # raise here instead of being reported. A non-zero digit is enough.
+            return not text.startswith("-") and any(ch != "0" for ch in text.lstrip("+-"))
     return True
 
 

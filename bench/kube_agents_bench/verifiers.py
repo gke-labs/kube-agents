@@ -132,8 +132,8 @@ __all__ = [
 ]
 
 # Pages of issue comments ``forge_issue_state`` reads per issue. One run's
-# procedure posts a handful; a page holds a hundred, and the ``since`` filter
-# already drops everything older than the run.
+# procedure posts a handful, a page holds a hundred, and GitHub's ``since``
+# narrows the pages to comments updated since the run.
 _ISSUE_COMMENT_PAGES = 3
 # Tolerance between a forge's stamps and the harness's run-start clock, two
 # different machines. The cap keeps the window short of the previous
@@ -4484,6 +4484,13 @@ class ForgeIssueStateVerifier(BaseVerifier):
     The check passes when one named issue satisfies every assertion, and the
     reason says why each other one did not.
 
+    WHICH REPOSITORY. Only the GitOps repository this job grades, read from
+    ``BENCH_GITOPS_REPO`` as ``github_writes`` reads it (``hack/ci-eval-pr.sh``
+    exports it on both lanes). The procedure under test works the ticket in
+    the repository the install manages; an issue anywhere else, however
+    well it matches, was not worked by that procedure and is rejected before
+    it is read. An unset variable is ``status="error"``.
+
     WHAT IS ASSERTED, all from the API response. ``state``, when set.
     ``labels``, every one present. ``min_comments`` comments created at or
     after the run started, less ``max_clock_skew_sec``. That window is what
@@ -4566,12 +4573,21 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 "candidates to resolve",
             )
 
+        gitops_repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+        if not gitops_repo or "/" not in gitops_repo:
+            return done(False, _NO_GITOPS_REPO_REASON, status="error")
+
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         window_start = started - timedelta(seconds=self.max_clock_skew_sec)
         budget = single_call_timeout(timeout_sec)
         rejected: list[str] = []
         for repo, number in seen:
             slug = f"{repo}#{number}"
+            if repo.strip("/").lower() != gitops_repo.lower():
+                rejected.append(
+                    f"{slug}: not in the GitOps repository this job grades ({gitops_repo})"
+                )
+                continue
             url = _issue_api_url(forge, repo, number)
             try:
                 status_code, payload = _http_get_json(url, token, budget)
