@@ -702,7 +702,8 @@ posts into the conversation under `next`, and a card paused on a question as the
 asks, and those cases grade that outcome rather than the `kanban_create` behind it. The
 card-wake replays run on this lane as well, because under `next` a card's wake reaches the front
 door through the in-pod API server, not the gateway; the question cases grade the reply to the
-user's answer and the card, not the reply to the wake. What stays listed is the
+user's answer and the card, and a block replay grades the reply to the wake, which next posts
+nowhere but the same front door writes. What stays listed is the
 fresh-session question case, whose answer turn carries today's Slack thread context, a turn
 next's door never sends.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
@@ -725,7 +726,10 @@ Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject
 the stopped asks (a `stop` sent on the conversation after the opening turn,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
-into the reply. `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+into the reply, and the reply-under-pushed-report replays (a report stored for the conversation
+after the opening turn, then the reply sent as a second message on it,
+[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
 the cases that request a pull request, with its window marked exclusive like theirs, so a stop
 that fails and lets its card write reds that case whether or not it names the write, and only

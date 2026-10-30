@@ -169,7 +169,10 @@ one shared key, restored everywhere and saved only on main — so editing the ma
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
 clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs that loop against a
-stub pip.
+stub pip. The artifact download in `python-tests.yml`'s join gets a second attempt a minute after a
+failed first one, because the action's own retries ran out twice with every shard uploaded;
+`test_the_join_downloads_the_shards_coverage_twice` in `scripts/test_integration_contracts.py` holds
+that shape.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
@@ -658,7 +661,9 @@ commit for it to merge: `cla/google`, `actionlint`, `build`, `prettier`, `valida
 requires conversation resolution, but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
 checks. A reader who checks the repository settings for the review requirement therefore finds
 nothing and concludes wrongly. Only these checks block a merge: a red or cancelled check outside
-the list does not, and `AI Review` is not in it.
+the list does not, and `AI Review` is not in it. `Run Python Unit Tests` is a join: it also needs
+`Run Bench Harness Tests`, so a red bench job holds the merge through it even though the bench
+job is not in the list itself.
 
 `Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
 `Agent instructions cite assets that exist` joined the set on 2026-09-02,

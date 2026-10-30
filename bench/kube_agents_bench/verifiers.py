@@ -7590,7 +7590,10 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     the Session KV server's own ``GET /v1/findings`` in the agent container
     (:mod:`kube_agents_bench.findings`). Passes when every row in
     ``finding_ids`` is in ``state``; a row in any other state fails, and the
-    reason names the state of each row not in ``state``.
+    reason names the state of each row not in ``state``. With ``not_state``
+    instead, passes when no row is in it, for a property a single state cannot
+    say: "not dismissed" holds while the install's own nudge moves a queued
+    row to surfaced. Exactly one of the two is set.
 
     A listed row the queue does not hold is ``status="error"``: the case's plant
     is missing, so there is nothing to grade. An unreadable pod or a queue that
@@ -7600,7 +7603,14 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     type: Literal["findings_item_state"]
     project: str = Field(min_length=1)
     finding_ids: list[str] = Field(min_length=1)
-    state: FindingState
+    state: FindingState | None = None
+    not_state: FindingState | None = None
+
+    @model_validator(mode="after")
+    def _one_state(self) -> "FindingsItemStateVerifier":
+        if (self.state is None) == (self.not_state is None):
+            raise ValueError("set exactly one of state and not_state")
+        return self
 
     @field_validator("finding_ids")
     @classmethod
@@ -7625,6 +7635,20 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 "error",
                 f"the findings queue holds no row {missing} under project {self.project!r}: "
                 "the case's plant is missing, so there is nothing to grade",
+                raw,
+            )
+        if self.not_state is not None:
+            hit = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] == self.not_state}
+            if hit:
+                return (
+                    "fail",
+                    f"{len(hit)} of {len(self.finding_ids)} row(s) are {self.not_state}: " + ", ".join(hit),
+                    raw,
+                )
+            return (
+                "pass",
+                f"none of {len(self.finding_ids)} row(s) are {self.not_state}; "
+                + ", ".join(f"{finding_id} is {state}" for finding_id, state in raw["states"].items()),
                 raw,
             )
         wrong = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] != self.state}

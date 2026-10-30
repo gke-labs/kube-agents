@@ -101,6 +101,7 @@ GOVERNANCE_AUDITS_HEADER = (
 NO_CADENCE_GLOSS = "—"
 SKILLS_DIR = REPO / "agents/platform/skills"
 CLUSTER_SKILLS_DIR = REPO / "agents/cluster/skills"
+TSE_SKILLS_DIR = REPO / "agents/tse/skills"
 IMAGES_JSON = REPO / "images.json"
 
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
@@ -305,9 +306,21 @@ SKILL_GROUPS: dict[str, list[str]] = {
 # rather than folded into the groups above: what distinguishes them to a reader is
 # which persona runs them, not which area they cover.
 CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
+# The GKE Support Agent's skills ship in the image as the optional `tse`
+# profile template, scaffolded when KUBE_AGENTS_ENABLED_PROFILES names it. One
+# persona-scoped heading, after the Cluster Agent's, for the same reason.
+TSE_SKILL_GROUP = "GKE Support Agent (tse)"
+# The persona-scoped groups, in catalogue order after the Platform Agent's
+# editorial groups, each with the directory its skills are read from and
+# linked to. A new persona is one more row here.
+PERSONA_SKILL_GROUPS: tuple[tuple[str, Path], ...] = (
+    (CLUSTER_SKILL_GROUP, CLUSTER_SKILLS_DIR),
+    (TSE_SKILL_GROUP, TSE_SKILLS_DIR),
+)
 
 CRON_CADENCE = {
     "40 5 * * *": "Daily 05:40",
+    "50 5 * * *": "Daily 05:50",
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
     "50 8 * * *": "Daily 08:50",
@@ -566,37 +579,47 @@ def _read_skills(skills_dir: Path) -> dict[str, str]:
     return skills
 
 
-def group_skills(skills: dict[str, str], cluster_skills: dict[str, str]) -> dict[str, list[str]]:
-    """Return {group: skill names} in catalogue order; empty groups are kept."""
+def group_skills(
+    skills: dict[str, str], persona_skills: dict[str, dict[str, str]]
+) -> dict[str, list[str]]:
+    """Return {group: skill names} in catalogue order; empty groups are kept.
+
+    ``skills`` is the Platform Agent's map, sorted into the editorial groups;
+    ``persona_skills`` is ``{group: map}`` for the persona-scoped groups, each
+    appended after them in ``PERSONA_SKILL_GROUPS`` order so the editorial
+    order is untouched.
+    """
     grouped = {g: [] for g in SKILL_GROUPS}
     grouped["Other"] = []
     for name in sorted(skills):
         group = next((g for g, members in SKILL_GROUPS.items() if name in members), "Other")
         grouped[group].append(name)
-    # Every Cluster Agent skill goes in one persona-scoped group, appended last so
-    # the Platform Agent's editorial order above is untouched.
-    grouped[CLUSTER_SKILL_GROUP] = sorted(cluster_skills)
+    for group, _ in PERSONA_SKILL_GROUPS:
+        grouped[group] = sorted(persona_skills.get(group, {}))
     return grouped
+
+
+def read_persona_skills() -> dict[str, dict[str, str]]:
+    """Return {group: {skill name: description}} for every persona-scoped group."""
+    return {group: _read_skills(skills_dir) for group, skills_dir in PERSONA_SKILL_GROUPS}
 
 
 def gen_skill_catalog() -> str:
     skills = _read_skills(SKILLS_DIR)
-    cluster_skills = _read_skills(CLUSTER_SKILLS_DIR)
-    grouped = group_skills(skills, cluster_skills)
+    persona_skills = read_persona_skills()
+    grouped = group_skills(skills, persona_skills)
+    source_dirs = dict(PERSONA_SKILL_GROUPS)
 
     def source_dir(group: str) -> str:
-        return (
-            "agents/cluster/skills"
-            if group == CLUSTER_SKILL_GROUP
-            else "agents/platform/skills"
-        )
-
-    descriptions = {**skills, **cluster_skills}
+        return source_dirs.get(group, SKILLS_DIR).relative_to(REPO).as_posix()
 
     out: list[str] = []
     for group, names in grouped.items():
         if not names:
             continue
+        # A name can live in more than one persona directory with its own
+        # description in each, so each row reads the map its group came from.
+        descriptions = persona_skills.get(group, skills)
         out.append(f"### {group}\n")
         out.append("| Skill | Description |")
         out.append("| ----- | ----------- |")
@@ -671,7 +694,7 @@ def gen_capabilities() -> str:
         "| Area | Skills |",
         "| ---- | ------ |",
     ]
-    grouped = group_skills(_read_skills(SKILLS_DIR), _read_skills(CLUSTER_SKILLS_DIR))
+    grouped = group_skills(_read_skills(SKILLS_DIR), read_persona_skills())
     for group, names in grouped.items():
         if names:
             out.append(f"| {group} | {', '.join(f'`{n}`' for n in names)} |")

@@ -4209,17 +4209,19 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
-// primitive wherever admission does not constrain the PodSpec, and nothing in
-// this repository constrains it here. A gateway that is compromised or
-// prompt-steered into building its own PodSpec can name any ServiceAccount in
-// the namespace — including the platform agent's, whose Workload Identity
-// binding then resolves for that pod — mount any Secret in it, and stamp
-// labels no NetworkPolicy selects. spawn.go declining to do any of that is
-// what the gateway CHOOSES, not what this grant PERMITS, and the two are not
-// the same claim. Narrowing it takes a ValidatingAdmissionPolicy on pod create
-// by this subject (no serviceAccountName, no secret volumes,
-// automountServiceAccountToken false); that policy does not exist yet and is
-// named in this change's PR body as the follow-up it owes.
+// primitive wherever admission does not constrain the PodSpec. A gateway that
+// is compromised or prompt-steered into building its own PodSpec could name
+// any ServiceAccount in the namespace — including the platform agent's, whose
+// Workload Identity binding then resolves for that pod — mount any Secret in
+// it, and stamp labels no NetworkPolicy selects. spawn.go declining to do any
+// of that is what the gateway CHOOSES, not what this grant PERMITS. The
+// ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
+// (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
+// creates to the session pod spawn.go builds: the session ServiceAccount, no
+// automount, the session token audiences, no Secret, the session labels. The
+// chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
+// and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
+// this grant is as wide as written.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
@@ -6316,8 +6318,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Twelve reads answer it instead of walking every object
-	// in the teardown sequence (the eleven below, and the profile namespace's
+	// cost for a no-op. Thirteen reads answer it instead of walking every object
+	// in the teardown sequence (the twelve below, and the profile namespace's
 	// fence, which is tested by this agent's labels):
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
@@ -6372,11 +6374,16 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//   - the config Secret, which held that role before the callout existed.
 	//     Kept for the install whose partial render predates the keys Secret:
 	//     an operator upgraded across this change and then flipped to `today`
-	//     would otherwise step over a config Secret no later object accompanies.
+	//     would otherwise step over a config Secret no later object accompanies,
+	//   - the task-signing key Secret, which reconcileCredentialProxy ensures
+	//     (credentialProxyProfileConfigFor) in step 11, ahead of every write
+	//     of reconcileA2A and of the fence pass, whenever a profile is bound.
+	//     A next render that dies between the broker and reconcileA2A leaves
+	//     it alone, and nothing on the today path but this walk removes it.
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first nine are Owns kinds and free; the two Secret reads
+	// property. The first nine are Owns kinds and free; the three Secret reads
 	// are uncached and happen only when the free nine all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
@@ -6388,13 +6395,15 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// reconcile of a today install through the walk for nothing -- the shape
 	// a next CR deleted and re-created under the same name in today mode
 	// takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at eleven
+	// Ownership is read off the fetched object, so the exit stays at twelve
 	// Gets, plus one for the profile namespace's fence below, which carries
 	// no owner reference and is tested by this agent's labels instead.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
 	// reconcileA2ANetworkFences ahead of its first write (the profile fence,
-	// then the NATS fence), means adding it here.
+	// then the NATS fence), or an A2A object written by an earlier step
+	// (the broker's task-signing key), means adding it here.
+	// TestTheFlipToTodayRemovesALoneTaskSigningKey reds without the last.
 	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
@@ -6416,6 +6425,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}
 	anyPresent := false
 	for _, s := range sentinels {

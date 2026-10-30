@@ -5184,3 +5184,30 @@ def test_settle_delegated_worker_rate_limit_with_failed_log_read_stays_graded(
         board_messages=[rate_limit_text],
     )
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+_BLOCK_REPLAY_PROMPT = """[bench:card-block-wake]
+title: Health check for checkout-gateway on seeded-a
+kind: transient
+reason: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429
+"""
+
+
+def test_a_block_wake_sends_only_the_wake_and_grades_its_reply(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", _replay_shell(scripts))
+    reply = "I couldn't finish the check: the AI model's usage limit was reached. Want me to try again?"
+    stub_agent.turns = [_turn(_text(reply))]
+
+    result = KubeAgentsHarness().run(_BLOCK_REPLAY_PROMPT)
+
+    assert not result.has_errors()
+    assert [r["input"] for r in stub_agent.requests] == [_REPLAY_WAKE]
+    assert result.output == reply
+    assert transcript.get().final_message == reply
+    assert [s["name"] for s in result.trajectory] == [card_wake.SETTLED_ENTRY]
+    assert "answer_reply" not in result.trajectory[-1]["args"]
+    assert result.metadata["question_wake"]["card"] == _REPLAY_CARD
+    assert _archived(scripts)

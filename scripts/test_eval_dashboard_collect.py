@@ -1465,6 +1465,16 @@ class TestNightlySource(_MergeBase):
         self.assertTrue(cases["compliance-rbac-overgrant"]["active"])
         self.assertTrue(cases["compliance-rbac-overgrant"]["nightly_active"], "a presubmit case is a nightly case too")
 
+    def test_base_sha_is_the_base_segment_of_started_repos(self):
+        self.assertEqual(collect.parse_base_sha({"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}), "147b063")
+        self.assertEqual(collect.parse_base_sha({"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43"}), "147b063", "a periodic: the base alone")
+        for absent in (None, {}, {"gke-labs/kube-agents": "main"}, {"gke-labs/kube-agents": 5}, "main:abc", {"a-org/extra": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43"}):
+            self.assertIsNone(collect.parse_base_sha(absent), absent)
+        # An extra_ref sorting first is not the base: only this repo's entry is.
+        self.assertEqual(collect.parse_base_sha({"a-org/extra": "main:0000000e2c0f60738adb93da1ae93a2569e5ce43", "gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}), "147b063")
+        run = collect.build_run("1", {"finished.json": json.dumps({"timestamp": 1, "passed": False, "result": "FAILURE"}), "started.json": json.dumps({"timestamp": 0, "repos": {"gke-labs/kube-agents": "main:147b063e2c0f60738adb93da1ae93a2569e5ce43,1118:7db690bc3322921efc793056e9d1760b2ef3e75c"}}), "build-log.txt": ""}.get, pr_hint=1118)
+        self.assertEqual(run["base_sha"], "147b063")
+
     def test_head_sha_falls_back_to_the_started_commit_for_a_periodic(self):
         """Prow writes `revision: main` in a periodic's finished.json and the
         commit in started.json's repo-commit."""
@@ -1606,7 +1616,7 @@ class TestContractShape(unittest.TestCase):
         # carries; the pod_* trio appears only when podinfo.json was read.
         self.assertEqual(
             list(data["runs"][0]),
-            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "has_build_log"],
+            ["build_id", "tier", "job", "pr", "head_sha", "base_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "has_build_log"],
         )
         self.assertEqual(
             list(data["runs"][0]["tasks"][0]),
@@ -2463,7 +2473,7 @@ class TestNotEvaluatedRun(unittest.TestCase):
         self.assertEqual(by_name["reliability-pdb-probe"]["result"], "pass")
         self.assertEqual(
             list(run),
-            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "eval_outcome", "not_evaluated", "has_build_log"],
+            ["build_id", "tier", "job", "pr", "head_sha", "base_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "eval_outcome", "not_evaluated", "has_build_log"],
         )
 
     def test_the_verdict_file_is_read_once_and_only_when_the_line_says_so(self):

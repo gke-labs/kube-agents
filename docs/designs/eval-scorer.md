@@ -154,7 +154,7 @@ can carry the delegated workers' tagged entries and token counts. The scorer sti
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
-door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`, a stopped ask's) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
+door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`: a stopped ask's, and a pushed-report replay's plant entry) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
@@ -188,7 +188,8 @@ on a persona that made no call fails there as it would on the api transport. A m
 not carry every call the persona made (the door's cap or the executor's budget dropped some, a
 part or a count could not be read, a wrapper's input was truncated and its nested names with it,
 or the read that ended the wait carried no trace and the fold holds an earlier read's), and such a
-record is treated as blind like one with no marker (`_inject_trace_vouched()`), since grading over
+record is treated as blind like one with no marker (`_inject_trace_vouched()`; a record of more
+than one task, a pushed-report replay's, needs a clean marker per task), since grading over
 it could fail a call that happened or pass a safeguard over one. One exception runs the other way:
 a `none`-wrapped check ("this tool was never called", `CaseSpec.negated_trace_blind_checks`) that
 _failed_ on a record carrying the marker stays graded whatever the loss, because the trace shows

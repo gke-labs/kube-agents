@@ -380,7 +380,6 @@ including `/v1`) are required, and the render fails without them. Set
   endpoint and no other.
 - **Egress.** The gateway's `litellm-policy` gets one rule derived from
   `apiBase`:
-
   - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
     `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
     and a two-label host such as `openrouter.ai` is a hostname, not
@@ -1038,10 +1037,10 @@ Exactly one owner creates the broker's KSA, depending on
   does not create it — the **chart** renders it instead, so a default install
   still starts.
 
-### Agent-RBAC admission policies
+### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs two cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings, generated from
+`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1049,14 +1048,27 @@ check the rules of a role a binding _references_ — CEL cannot read another
 object — and the content policy only selects manifests carrying the
 `kube-agents/tier` label; see that file's header.
 
-The template checks `.Capabilities.KubeVersion` as well as this value, so on a
+The third, `kube-agents-a2a-gateway-pod`, is generated from
+`k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
+the A2A gateway's ServiceAccount creates to the session pod shape: the session
+ServiceAccount, no automount, the session token audiences, no Secret or host
+access, Pod Security "restricted", and exactly the session labels. Where it is
+rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
+signal for operator features that must run only where this policy is installed.
+Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
+
+The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
 renders nothing instead of failing the install. `Chart.yaml` accepts `>=1.29.0-0`,
 so that case is inside the supported range and has to work.
 
 Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
 that already has them: the objects are cluster singletons with fixed names, so
-Helm refuses the second install on ownership rather than duplicating them.
+Helm refuses the second install on ownership rather than duplicating them. The
+first release's gateway pod policy also holds the second release's gateway,
+since it derives the install's name from the requester, but the second release's
+operator does not get `A2A_GATEWAY_POD_POLICY`, so features gated on it stay off
+there.
 
 ### Quota preflight
 

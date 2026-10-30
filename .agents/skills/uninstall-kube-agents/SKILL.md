@@ -42,7 +42,9 @@ The engine is `lifecycle.sh destroy` in `terraform/examples/full-install`, run a
 install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix
 `kube-agents/<cluster>` — derived from the coordinates, so a fresh clone finds it). Before
 `terraform destroy` it handles the asymmetries a bare destroy trips over: it forgets the
-undeletable KMS resources from state (kept usable in GCP, re-adopted on the next apply), deletes
+undeletable KMS key rings and keys from state (kept usable in GCP, re-adopted on the next
+apply), and the cluster key's grant to the GKE service agent, which other installs that use
+the key share; it deletes
 the `PlatformAgent` CR and force-clears its finalizer if the operator is wedged, uninstalls the
 Helm releases with the `helm` CLI on a cluster the install did not create, purges every
 backup the GKE BackupPlan owns, and clears the cluster's deletion protection.

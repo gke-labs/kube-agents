@@ -14,6 +14,7 @@ An `AgentProfile` is not a Hermes profile on its own: the platform and cluster t
 - **Short Name**: `apr`
 - **Source**: [`k8s-operator/api/v1alpha1/agentprofile_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/agentprofile_types.go)
 - **Samples**: [`k8s-operator/examples/agentprofile-chat.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-chat.yaml), [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml)
+- **Fields**: [AgentProfile fields](/kube-agents/operator/agentprofile-fields/), every `spec` and `status` field with its type, default and constraints, generated from the Go API types.
 
 ## Specification
 
@@ -84,7 +85,9 @@ Writing an `AgentProfile` grants a bus identity, so treat create and update on `
 
 `allowedTiers` lists the tiers the profile may run at, `read` and `unattended`. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
 
-Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates on a `mode: next` install. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy that lets its pods reach DNS, the bus and LiteLLM and nothing else, and only then admits that namespace on the bus's and LiteLLM's own policies. LiteLLM is reached without a key, so anyone who can create a pod in that namespace can use the install's model credentials. Treat pod create there like pod create in the agent's own namespace.
+Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates on a `mode: next` install. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
+
+Only once that policy is in place does the operator admit the namespace on the bus's and LiteLLM's own policies. The broker admits it on its own policy once a bound profile has a ServiceAccount for it to serve. LiteLLM is reached without a key, so anyone who can create a pod in that namespace can use the install's model credentials. Treat pod create there like pod create in the agent's own namespace.
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
@@ -92,9 +95,9 @@ Nothing runs a pod from a profile yet. The dispatcher and the warm workers come 
 
 ## Status
 
-| Field                       | Meaning                                                                                                                                                                                                                                        |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `status.agentRef`           | The PlatformAgent the profile is bound to.                                                                                                                                                                                                     |
-| `status.serviceAccountName` | The ServiceAccounts its pods run as, one per tier, comma-separated.                                                                                                                                                                            |
-| `IdentityReady` condition   | The ServiceAccount and bus identity are rendered, or why not (`ModeNotNext`, `ModeNotRecognized`, `NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`). |
-| `CardPublished` condition   | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same mode and binding reasons as `IdentityReady`).                                                          |
+[AgentProfile fields → Status](/kube-agents/operator/agentprofile-fields/#status) lists the status fields. The two conditions carry the detail:
+
+| Condition                 | Meaning                                                                                                                                                                                                                                        |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`ModeNotNext`, `ModeNotRecognized`, `NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`). |
+| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same mode and binding reasons as `IdentityReady`).                                                          |

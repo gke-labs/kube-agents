@@ -67,3 +67,10 @@ jobs:
       # days before anyone noticed.
       - name: Agent instruction files fit the context budget
         run: make docs-check-context-budget
+
+      # A template section that says "otherwise delete this section" draws a
+      # description thread on every pull request that obeys it, because the
+      # readers hold a body to every heading (.agents/rules/pre_pr_review.md).
+      # A conditional section names the one-line answer the rest write instead.
+      - name: Every pull-request template section is answerable
+        run: make docs-check-pr-template
