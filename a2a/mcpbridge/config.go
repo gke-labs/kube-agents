@@ -40,6 +40,10 @@ var (
 	errNoDeploymentsSaved  = errors.New("no deployments configured or discovered")
 	errNotConnected        = errors.New("not connected to a kube-agents deployment")
 	errConversationExists  = errors.New("alias already exists; pick another or delete it first")
+	// errSubagentConversation is the refusal to make a dedicated subagent/session conversation
+	// (IsDedicatedSubagentConversation) the active one: the bridge never keeps one active, and
+	// a restart would move the active conversation off it.
+	errSubagentConversation = errors.New("names a dedicated subagent/session conversation (an alias starting \"session-\", \"s-\" or \"chat-\", or one a host subagent owns), which can't be the active conversation; pass it as `conversation` on each call instead, or pick another alias")
 )
 
 // SessionPodInfo describes a live a2a-session worker pod discovered in Kubernetes.
@@ -842,7 +846,7 @@ func (s *ConfigStore) EnsureConversationWithOptions(aliasOrToken string, forceNe
 		LastUsedAt:  now,
 	}
 	s.cfg.Conversations[alias] = entry
-	if activate {
+	if activate && !IsDedicatedSubagentConversation(entry) {
 		s.cfg.ActiveConversation = alias
 	}
 	return entry, s.saveLocked()
@@ -859,6 +863,9 @@ func (s *ConfigStore) CreateConversation(alias, description string) (Conversatio
 	}
 	if _, ok := s.cfg.Conversations[alias]; ok {
 		return ConversationEntry{}, fmt.Errorf("%q: %w", alias, errConversationExists)
+	}
+	if IsDedicatedSubagentConversation(ConversationEntry{Alias: alias}) {
+		return ConversationEntry{}, fmt.Errorf("a new conversation becomes the active one, and %q %w", alias, errSubagentConversation)
 	}
 	now := time.Now().UTC()
 	entry := ConversationEntry{

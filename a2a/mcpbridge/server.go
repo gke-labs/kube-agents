@@ -1406,7 +1406,24 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		return fmt.Sprintf("Created conversation **`%s`** (token `console:%s`).\n", entry.Alias, entry.Token), "", "", nil
 
 	case actionSwitch:
+		alias := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args.Alias), ConsoleConvPrefix))
+		if alias == "" {
+			return "", "", "", errors.New("manage_session switch needs the alias of the conversation to make active")
+		}
+		if IsDedicatedSubagentConversation(ConversationEntry{Alias: alias}) {
+			// Refused before ConversationFor, which would create a conversation of that name.
+			return "", "", "", fmt.Errorf("cannot switch to %q: it %w", alias, errSubagentConversation)
+		}
 		entry := s.ConversationFor(ctx, args.Alias, rawArgs)
+		if entry.Alias != alias && entry.Token != alias {
+			return "", "", "", fmt.Errorf("could not switch to conversation %q: the active conversation is still %q", alias, entry.Alias)
+		}
+		if IsDedicatedSubagentConversation(entry) {
+			return "", "", "", fmt.Errorf("cannot switch to %q: it %w", entry.Alias, errSubagentConversation)
+		}
+		if active := s.store.Snapshot().ActiveConversation; active != entry.Alias {
+			return "", "", "", fmt.Errorf("could not switch to conversation %q: the active conversation is still %q", entry.Alias, active)
+		}
 		return fmt.Sprintf("Switched active conversation to **`%s`** (token `console:%s`).\n", entry.Alias, entry.Token), "", "", nil
 
 	case actionSessionOn, actionSessionStartAlias:

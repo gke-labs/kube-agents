@@ -242,3 +242,53 @@ func TestManageSessionNewRefusesAnAliasThatExists(t *testing.T) {
 		t.Fatalf("new with an existing alias replaced the conversation: %+v (was %+v)", c, existing)
 	}
 }
+
+// A dedicated subagent/session conversation can't be the active one: switch and new refuse
+// it with the reason instead of answering "Switched" while nothing changed, and nothing the
+// bridge does makes one active, so a restart has no reason to move the active conversation.
+func TestManageSessionSwitchRefusesADedicatedSubagentConversation(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv,
+		ConversationEntry{Alias: "c1", Token: MintConversationToken()},
+		ConversationEntry{Alias: "c2", Token: MintConversationToken()},
+		ConversationEntry{Alias: "session-1", Token: MintConversationToken()},
+		ConversationEntry{Alias: "reviewer", Token: MintConversationToken(), SubagentRole: "Reviewer"},
+	)
+	call := func(args string) CallToolResult {
+		return srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(args))
+	}
+	if res := call(`{"action":"switch","alias":"c1"}`); res.IsError || !strings.Contains(res.Content[0].Text, "Switched active conversation to **`c1`**") {
+		t.Fatalf("switch c1: %+v", res)
+	}
+	for _, alias := range []string{"session-1", "reviewer", "s-new", "chat-new"} {
+		res := call(`{"action":"switch","alias":"` + alias + `"}`)
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "dedicated subagent/session conversation") || strings.Contains(res.Content[0].Text, "Switched") {
+			t.Errorf("switch %s: %+v; want it refused, saying why", alias, res)
+		}
+		if got := srv.Store().Snapshot().ActiveConversation; got != "c1" {
+			t.Errorf("switch %s moved the active conversation to %q", alias, got)
+		}
+	}
+	for _, alias := range []string{"s-new", "chat-new"} {
+		if _, ok := srv.Store().LookupConversation(alias); ok {
+			t.Errorf("a refused switch created %s", alias)
+		}
+	}
+	if res := call(`{"action":"new","alias":"session-9"}`); !res.IsError || !strings.Contains(res.Content[0].Text, "dedicated subagent/session conversation") {
+		t.Errorf("new session-9: %+v; want it refused, saying why", res)
+	}
+	if _, ok := srv.Store().LookupConversation("session-9"); ok {
+		t.Error("a refused new created session-9")
+	}
+	// A turn tool naming a new session- conversation creates it without making it active.
+	if _, err := srv.Store().EnsureConversation("session-10", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.Store().Snapshot().ActiveConversation; got != "c1" {
+		t.Errorf("creating session-10 made %q active; want c1 kept", got)
+	}
+	if res := call(`{"action":"switch","alias":"c2"}`); res.IsError || srv.Store().Snapshot().ActiveConversation != "c2" {
+		t.Fatalf("switch c2: %+v, active %q", res, srv.Store().Snapshot().ActiveConversation)
+	}
+}
