@@ -160,3 +160,32 @@ func TestManageSessionReturnsTheServersRefusalInsteadOfTheLocalList(t *testing.T
 		t.Fatalf("list with the server down: %+v; want the local list, marked as local", res)
 	}
 }
+
+func TestManageSessionNewWithoutAnAliasKeepsTheActiveConversation(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	active := srv.Store().ActiveConversation()
+	if _, err := srv.Store().SetConversationSessionMode(active.Alias, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range []string{`{"action":"new"}`, `{"action":"new","alias":"  "}`} {
+		if res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(args)); !res.IsError {
+			t.Fatalf("manage_session %s: %+v; want it refused", args, res)
+		}
+	}
+	if c, _ := srv.Store().LookupConversation(active.Alias); c.Token != active.Token || !c.SessionMode {
+		t.Fatalf("new without an alias replaced the active conversation: %+v (was %+v)", c, active)
+	}
+}
+
+func TestManageSessionDeleteWithoutAnAliasDoesNotConnect(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"delete","alias":" "}`))
+	if res.IsError || !strings.Contains(res.Content[0].Text, "was not found") {
+		t.Fatalf("delete with no alias: %+v", res)
+	}
+	if srv.IsSessionHealthy() {
+		t.Fatal("a delete with no alias connected to the cluster")
+	}
+}

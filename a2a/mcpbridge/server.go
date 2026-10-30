@@ -1296,6 +1296,11 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 
 	switch action {
 	case actionNew:
+		// With no alias the store would re-mint the active conversation in place, dropping
+		// its session state while the server kept the conversation; a new one needs a name.
+		if strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args.Alias), ConsoleConvPrefix)) == "" {
+			return "", "", "", errors.New("manage_session new needs an alias for the new conversation")
+		}
 		entry, err := s.store.EnsureConversation(args.Alias, true, args.Description)
 		if err != nil {
 			return "", "", "", err
@@ -1352,7 +1357,10 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		}
 		if !found {
 			// Not in the local table: the server may still hold the name.
-			if sess, err := s.ensureConnected(ctx); err == nil && target != "" {
+			if target == "" {
+				return notFound, "", "", nil
+			}
+			if sess, err := s.ensureConnected(ctx); err == nil {
 				fwd, _ := json.Marshal(map[string]any{"action": actionDelete, "alias": target})
 				if txt, title, md, rErr := sess.callRemoteTool(ctx, ToolManageSession, fwd, meta, s.store.Snapshot(), nil); rErr == nil && txt != "" {
 					return txt, title, md, nil
