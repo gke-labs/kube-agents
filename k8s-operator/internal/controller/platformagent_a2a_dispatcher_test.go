@@ -503,3 +503,40 @@ func TestHandleDeletionRemovesTheDispatchersPodReadRBAC(t *testing.T) {
 		}
 	}
 }
+
+// The task credential lifetime ceiling is one value for the minter and both
+// verifiers. A dispatcher minting longer than the callout or the broker
+// allows has every credential refused, which fails every profile task.
+func TestTheCredentialLifetimeIsOneValueForMinterAndVerifiers(t *testing.T) {
+	withDispatcher(t)
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{
+		Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)},
+	}}
+	profile := testAgentProfile(agent.Namespace, "auditor")
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, &profile, profileNamespaceObject(agent)).Build()
+	cfg, err := (&PlatformAgentReconciler{Client: cl, Scheme: scheme}).credentialProxyProfileConfigFor(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifetime := func(env []corev1.EnvVar) string {
+		for _, e := range env {
+			if e.Name == credentialProxyTaskCredentialMaxLifetimeEnvVar {
+				return e.Value
+			}
+		}
+		return "(absent)"
+	}
+	got := map[string]string{
+		"callout":    lifetime(buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env),
+		"broker":     lifetime(credentialProxyProfileEnv(cfg)),
+		"dispatcher": lifetime(buildA2ADispatcherDeployment(agent).Spec.Template.Spec.Containers[0].Env),
+	}
+	for who, v := range got {
+		if v != "15m0s" {
+			t.Errorf("the %s's credential lifetime = %s, want the install's 900s cap (15m0s); all three: %v", who, v, got)
+		}
+	}
+}

@@ -175,6 +175,38 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 	}
 }
 
+// The dispatcher signs task credentials (#3889, contract addendum 8) with the
+// task-signing seed from #4130's Secret, mounted into its container alone:
+// read-only, mode 0400, by file and not by env, and with no Secret read in its
+// RBAC. Nothing else in the install mounts or references that key
+// (TestOnlyTheDispatcherHoldsTheTaskSigningSeed).
+const (
+	a2aTaskSigningSeedFileEnvVar = "A2A_TASK_SIGNING_SEED_FILE"
+	a2aTaskSigningSeedVolume     = "task-signing-seed"
+	a2aTaskSigningSeedMountPath  = "/var/run/kube-agents/task-signing"
+	a2aTaskSigningSeedFile       = "seed"
+)
+
+func a2aTaskSigningSeedVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: a2aTaskSigningSeedVolume,
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  a2aTaskSigningKeyName(agent),
+			Items:       []corev1.KeyToPath{{Key: a2aTaskSigningSeedKey, Path: a2aTaskSigningSeedFile}},
+			DefaultMode: ptr.To(int32(0o400)),
+		}},
+	}
+}
+
+// a2aTaskCredentialMaxLifetimeEnv is the one lifetime ceiling the minter and
+// both verifiers read: the dispatcher mints no credential past it, and the
+// callout and the broker refuse one that is. Rendered from one resolver for
+// all three, because a dispatcher minting longer than a verifier allows has
+// every credential refused, which fails every profile task.
+func a2aTaskCredentialMaxLifetimeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
+	return corev1.EnvVar{Name: credentialProxyTaskCredentialMaxLifetimeEnvVar, Value: resolveProfileMaxTaskDeadline(agent).String()}
+}
+
 func buildA2ADispatcherServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
@@ -229,9 +261,12 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 								FieldPath: "metadata.namespace",
 							}}},
 							{Name: "DISPATCH_CONFIGMAP", Value: a2aDispatchConfigName(agent)},
+							{Name: a2aTaskSigningSeedFileEnvVar, Value: a2aTaskSigningSeedMountPath + "/" + a2aTaskSigningSeedFile},
+							a2aTaskCredentialMaxLifetimeEnv(agent),
 						},
-						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()},
-						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
+						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount(),
+							{Name: a2aTaskSigningSeedVolume, MountPath: a2aTaskSigningSeedMountPath, ReadOnly: true}},
+						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aDispatcherStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aDispatcherStatusPort),
@@ -250,7 +285,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							a2aDispatcherCPULimit, a2aDispatcherMemoryLimit),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)},
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
 				},
 			},
 		},
@@ -562,6 +597,12 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 				"AgentProfile %s: spec.lifecycle.activeDeadlineSeconds %d is clamped to %ds by the install's task deadline cap (spec.harness.tuning.profiles.maxTaskDeadlineSeconds), so its tasks end at %ds",
 				profiles[i].Name, profiles[i].Spec.Lifecycle.ActiveDeadlineSeconds, d, d))
 		}
+	}
+	// The task-signing key before the Deployment that mounts its seed: the
+	// pod can't start on a Secret that isn't there. #4130 made the key; this
+	// only ensures it exists.
+	if _, err := r.ensureA2ATaskSigningKeySecret(ctx, agent); err != nil {
+		return nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
 	// The identity before the Deployment that mounts a token for it, and the
 	// config and its Role before the pod that watches them.

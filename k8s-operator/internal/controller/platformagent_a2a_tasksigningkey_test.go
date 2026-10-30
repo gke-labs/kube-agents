@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -26,6 +27,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -257,6 +259,104 @@ func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
 		}
 		if strings.Contains(string(raw), key.Seed) {
 			t.Errorf("a rendered %T carries the task-signing seed", list)
+		}
+	}
+}
+
+// With a dispatcher, its Deployment is the one object in the namespace that
+// references the task-signing Secret: a Secret volume of the seed alone, mode
+// 0400, mounted read-only by the dispatcher container and nothing else, with
+// the seed's file path in its env. Nothing else names the Secret or holds the
+// seed.
+func TestOnlyTheDispatcherHoldsTheTaskSigningSeed(t *testing.T) {
+	withDispatcher(t)
+	r, cl, agent := taskSigningTestReconciler(t)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	letTheGatewayThrough(t, ctx, cl, r, req, agent)
+	secretName := a2aTaskSigningKeyName(agent)
+	secret := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: secretName, Namespace: agent.Namespace}, secret); err != nil {
+		t.Fatalf("the task-signing Secret: %v", err)
+	}
+	key, ok := readA2ATaskSigningKey(secret)
+	if !ok {
+		t.Fatal("the task-signing Secret does not read back")
+	}
+
+	dispatcher := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}, dispatcher); err != nil {
+		t.Fatalf("the dispatcher was not rendered, so the walk would pass on its absence: %v", err)
+	}
+	spec := dispatcher.Spec.Template.Spec
+	var seedVolumes int
+	for _, v := range spec.Volumes {
+		if v.Secret == nil || v.Secret.SecretName != secretName {
+			continue
+		}
+		seedVolumes++
+		if len(v.Secret.Items) != 1 || v.Secret.Items[0].Key != a2aTaskSigningSeedKey || v.Secret.DefaultMode == nil || *v.Secret.DefaultMode != 0o400 {
+			t.Errorf("the dispatcher's seed volume %+v, want the seed key alone at mode 0400", v.Secret)
+		}
+	}
+	if seedVolumes != 1 {
+		t.Errorf("the dispatcher has %d volumes of the task-signing Secret, want 1", seedVolumes)
+	}
+	for _, c := range append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...) {
+		for _, m := range c.VolumeMounts {
+			if m.Name != a2aTaskSigningSeedVolume {
+				continue
+			}
+			if c.Name != a2aDispatcherContainerName || !m.ReadOnly {
+				t.Errorf("container %s mounts the seed (readOnly=%v); only the dispatcher container may, read-only", c.Name, m.ReadOnly)
+			}
+		}
+		for _, e := range c.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && e.ValueFrom.SecretKeyRef.Name == secretName {
+				t.Errorf("container %s takes the task-signing Secret as env %s; the seed is a file", c.Name, e.Name)
+			}
+		}
+	}
+
+	// Everything else in the namespace, the dispatcher excepted.
+	for _, list := range []client.ObjectList{
+		&appsv1.DeploymentList{}, &appsv1.StatefulSetList{}, &batchv1.JobList{}, &corev1.PodList{}, &corev1.ConfigMapList{},
+	} {
+		if err := cl.List(ctx, list, client.InNamespace(agent.Namespace)); err != nil {
+			t.Fatalf("list %T: %v", list, err)
+		}
+		if deps, isDeps := list.(*appsv1.DeploymentList); isDeps {
+			kept := deps.Items[:0]
+			for _, d := range deps.Items {
+				if d.Name != dispatcher.Name {
+					kept = append(kept, d)
+				}
+			}
+			deps.Items = kept
+		}
+		raw, err := json.Marshal(list)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), secretName) || strings.Contains(string(raw), key.Seed) {
+			t.Errorf("a rendered %T other than the dispatcher references the task-signing Secret or holds its seed", list)
+		}
+	}
+	// And the dispatcher reads no Secret through its RBAC.
+	for _, role := range []string{a2aDispatcherName(agent)} {
+		r := &rbacv1.Role{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: role, Namespace: agent.Namespace}, r); err != nil {
+			t.Fatalf("the dispatcher's Role: %v", err)
+		}
+		for _, rule := range r.Rules {
+			if slices.Contains(rule.Resources, "secrets") {
+				t.Errorf("the dispatcher's Role %s reaches Secrets: %+v", role, rule)
+			}
 		}
 	}
 }
