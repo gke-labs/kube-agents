@@ -1573,20 +1573,26 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 	if _, err := serverTaskControlArgs(rawArgs, ""); err != nil {
 		return "", "", "", err
 	}
+	taskID := strings.TrimSpace(args.TaskID)
+	isStop := act == taskActionStop || act == taskActionCancel
+	stopAlias := ""
+	if isStop {
+		// A stop of a task the bridge is not tracking is refused before the connect, as
+		// CallRemoteTool's is (upstreamArgs).
+		var err error
+		if stopAlias, err = s.stopConversationAlias(ctx, args.Conversation, taskID); err != nil {
+			return "", "", "", err
+		}
+	}
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
 		return "", "", "", err
 	}
-	taskID := strings.TrimSpace(args.TaskID)
 	meta := CallMetaFromContext(ctx)
 	conv := s.ReadOnlyConversationFor(ctx, args.Conversation)
 	callerID := FirstNonEmptyStr(strings.TrimSpace(conv.HostConversationID), strings.TrimSpace(meta.ConversationID))
 
-	if act == taskActionStop || act == taskActionCancel {
-		stopAlias, err := s.stopConversationAlias(ctx, args.Conversation, taskID)
-		if err != nil {
-			return "", "", "", err
-		}
+	if isStop {
 		s.clearStreamingTask(taskID, stopAlias)
 		fwd, err := serverTaskControlArgs(rawArgs, stopAlias)
 		if err != nil {

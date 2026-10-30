@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -211,5 +212,22 @@ func TestAFinalGetDropsTheTaskUnderItsOtherSpelling(t *testing.T) {
 	srv.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("after a get found task-1 done, %d tracked entr(ies) remain; want none", n)
+	}
+}
+
+// A stop of an untracked task is refused before the bridge connects: no scan, no dial.
+func TestTaskControlStopOfAnUntrackedTaskRefusesBeforeConnecting(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(ServerOptions{Store: store, Cluster: failingClusterAccess{discoverErr: errors.New("the stop scanned the kubeconfig")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	res := srv.CallTool(context.Background(), ToolTaskControl, json.RawMessage(`{"action":"stop","task_id":"task-9"}`))
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "stop needs the task's conversation") || strings.Contains(res.Content[0].Text, "scanned") {
+		t.Fatalf("task_control stop of an untracked task with no session: %+v; want the refusal, before any connect", res)
 	}
 }
