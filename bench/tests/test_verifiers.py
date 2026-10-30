@@ -9899,6 +9899,18 @@ def test_issue_state_reads_a_second_page_when_the_first_is_full(token, github):
     assert res.raw["comments_since_start"] == 2
 
 
+def test_issue_state_without_a_run_clock_is_an_error_about_the_issue(token, github):
+    # No start time, no window to place the close and the comments in: an
+    # error, not a grade, and a reason that names the issue this check reads.
+    _stash_report(final_message=_TICKET_REPLY, started_at=0.0)
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert "no start time" in res.reason
+    assert "issue this run closed or commented on" in res.reason
+    assert "ledger" not in res.reason
+    assert github.calls == []
+
+
 def test_issue_state_fails_a_reply_with_no_issue_url(token, github):
     _stash_report(final_message="Issue #708 was transitioned to status:resolved.")
     res = _state_check().verify(5.0)

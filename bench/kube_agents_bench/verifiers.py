@@ -2141,6 +2141,13 @@ _NO_PR_RUN_CLOCK_REASON = (
     "is unset), so this check cannot tell a pull request this run opened from "
     "one left behind by a previous run, and refuses to grade it"
 )
+# The same absence, said for the issue forge_issue_state reads: without the
+# run's start there is no window to place its close and its comments in.
+_NO_ISSUE_RUN_CLOCK_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check cannot tell an issue this run closed or commented "
+    "on from one an earlier run left behind, and refuses to grade it"
+)
 
 _NO_PR_URL_REASON = (
     "the run's report names no github.com pull request URL, so no fix was "
@@ -4529,7 +4536,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
         if snap is None:
             return done(False, _NO_TRANSCRIPT_REASON, status="error")
         if not snap.started_at:
-            return done(False, _NO_RUN_CLOCK_REASON, status="error")
+            return done(False, _NO_ISSUE_RUN_CLOCK_REASON, status="error")
         try:
             forge = forges.forge_name()
         except forges.UnknownForge as exc:
