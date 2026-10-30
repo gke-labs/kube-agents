@@ -116,6 +116,18 @@ const (
 	// replicas: the broker is one pod by design
 	// (docs/designs/credential-proxy-single-pod.md).
 	//
+	// What the per-request figure does not cover is cluster size. 102Mi is a
+	// listing of a small cluster; kubectl builds the whole list before it
+	// prints, and the image's kubectl held 432Mi listing 4,000 pods as JSON
+	// and 1.3Gi as YAML (#2025). The budget cannot see that growth, so on a
+	// fleet with thousands of objects per cluster the limit has to hold the
+	// largest listing the fleet produces for every command that may run at
+	// once, plus the two fixed reserves (320Mi): eight 500Mi listings need
+	// about 4.2Gi, not the 2Gi below. The broker measures this itself
+	// (kubeagents_credential_proxy_child_peak_rss_bytes and its memory
+	// high-water log lines), and that is what a large fleet's override is
+	// sized from (#4315).
+	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
 	// 512Mi at least whatever this line says; the request is declared on or

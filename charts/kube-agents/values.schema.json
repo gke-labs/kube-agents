@@ -787,6 +787,17 @@
                 }
               }
             },
+            "retention": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sessionDays": {
+                  "type": ["integer", "null"],
+                  "minimum": 90,
+                  "maximum": 365
+                }
+              }
+            },
             "stallWatch": {
               "type": "object",
               "additionalProperties": false,

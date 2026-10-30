@@ -942,7 +942,8 @@ host, method and path against the code allowlist in
 `agents/platform/scripts/api_policy.py`, forwards it on its own identity with
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
-unchanged under a response cap and a deadline. The shell role alone may call it;
+unchanged under a response cap and a deadline (a route with a projection, the GKE
+cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.

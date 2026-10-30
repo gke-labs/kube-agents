@@ -702,7 +702,8 @@ posts into the conversation under `next`, and a card paused on a question as the
 asks, and those cases grade that outcome rather than the `kanban_create` behind it. The
 card-wake replays run on this lane as well, because under `next` a card's wake reaches the front
 door through the in-pod API server, not the gateway; the question cases grade the reply to the
-user's answer and the card, not the reply to the wake. What stays listed is the
+user's answer and the card, and a block replay grades the reply to the wake, which next posts
+nowhere but the same front door writes. What stays listed is the
 fresh-session question case, whose answer turn carries today's Slack thread context, a turn
 next's door never sends.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in

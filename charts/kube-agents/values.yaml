@@ -947,6 +947,14 @@ platformAgent:
       # minStallAgeMinutes: 30
       # Replaces the default kind list; ["all"] scans every namespaced kind.
       # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
+    # How long the agent keeps its working data: ended sessions in every
+    # profile's state.db (with their transcript files) and rotated log backups.
+    # Hermes prunes on its own schedule and the session-retention cron job runs
+    # it daily. Empty keeps the operator's default (90 days, Hermes' own), which
+    # is also the minimum for now. A value lowered later deletes the older
+    # history at the next daily prune. A change rolls the agent pod.
+    retention: {}
+      # sessionDays: 180
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every

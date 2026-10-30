@@ -178,8 +178,10 @@ no GitOps repository (`slack_audit_report.summary_card`) gets the same card, bui
 the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
 the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
 summary's headline, its finding rows, its other lines under them, and "Look at the first
-one" with no link button. Where the card does not post, `headline_from_summary` goes out
-as text, and the fallbacks are those of the ledger card.
+one" with no link button. The label fleet-audit stores above a re-run's summary, when an
+earlier finish published and stopped, is dropped, as the ledger card drops it. Where the
+card does not post, `headline_from_summary` goes out as text, and the fallbacks are those
+of the ledger card.
 
 `kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
 says: the script leaves its rows, each with the ids of the cards it stands for, in a file
@@ -305,7 +307,11 @@ The reason is the scheduler's own, in plain words, or "It hit an error" for one
 the relay does not name, and the scheduler's line goes to the server's log
 (`logs/session_kv_server.log`, which fluent-bit ships). "tomorrow" is for a job
 whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
-any other says "It will try again at its next scheduled run." A failure no
+any other says "It will try again at its next scheduled run." Both degrade
+quietly, so both are pinned at image build
+([`verify_scheduler_failure_line.py`](../../deploy/docker/plugins/verify_scheduler_failure_line.py)):
+each of the scheduler's summarized failure lines still carries the words the relay matches,
+and the image's roster still has a job that reads as daily. A failure no
 retry clears says so instead of promising one: rejected credentials, and the
 scheduler's blocked-configuration line (which it sends once, running the job no
 more until the configuration is fixed), end with "An admin needs to fix this

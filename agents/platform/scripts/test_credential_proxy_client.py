@@ -403,6 +403,41 @@ class TestKubectlContextFlagNamesTheCluster(ContextLessTestCase):
         self.assertNotIn("kubeconfigContext", payload)
 
 
+class TestGetCredentialsWithFlagsBetweenItsWords(ContextLessTestCase):
+    """A flag between the command words is still get-credentials to the shim."""
+
+    GET_CREDENTIALS = [
+        "gcloud", "container", "clusters", "--location", "us-central1-a",
+        "get-credentials", "seeded-a",
+    ]
+
+    def test_the_file_is_asked_for_and_lands(self):
+        captured, _ = self.fetch(self.environ())
+        self.assertEqual(0, captured["exit_code"])
+        self.assertTrue(captured["payload"]["wantsKubeconfig"])
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+
+    def test_the_detector_reads_the_words_past_the_flags(self):
+        cases = [
+            (["gcloud", "container", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "--location=l", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "--location", "l", "get-credentials", "c"], True),
+            (["gcloud", "container", "--project=p", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "--project", "p", "container", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+            (["gcloud", "beta", "container", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "describe", "get-credentials"], False),
+            (["gcloud", "container", "clusters", "list", "--location", "l"], False),
+            (["gcloud", "container", "clusters", "get-credentials"][:3], False),
+            (["kubectl", "container", "clusters", "get-credentials"], False),
+            ([], False),
+        ]
+        for argv, want in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+
 class TestAShellFollowsItsOwnGetCredentials(ContextLessTestCase):
     """gcloud's "just fetched is current", for the rest of one command line only."""
 

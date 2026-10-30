@@ -3285,6 +3285,85 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(200, status, body)
 
 
+class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):
+    """get-credentials with flags between its command words goes through the
+    get-credentials path, the same as the plain spelling, for the session and
+    the shell. command_policy reads the command words past its flag walk, so
+    every spelling below is allowed as get-credentials; the executor has to
+    agree on what it is running."""
+
+    post_as = SessionRoleExecutableTest.post_as
+
+    def setUp(self):
+        SessionRoleExecutableTest.setUp(self)
+        stub = Path(self.temp_dir.name) / "bin" / "gcloud"
+        stub.write_text("#!/bin/bash\necho ran-$0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(stub)
+
+    SPELLINGS = (
+        # The plain spelling, as the control.
+        ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l", "--project=p"],
+        # A flag before `get-credentials`, attached and separate value.
+        ["gcloud", "container", "clusters", "--location=l", "get-credentials", "c", "--project=p"],
+        ["gcloud", "container", "clusters", "--location", "l", "get-credentials", "c", "--project", "p"],
+        # A flag before `clusters`, attached and separate value.
+        ["gcloud", "container", "--project=p", "clusters", "get-credentials", "c", "--location=l"],
+        ["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c", "--location", "l"],
+        # Both at once, with a boolean flag between them.
+        ["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"],
+    )
+
+    def _routed(self, role, argv):
+        executor = CredentialProxyHandler.executor
+        result = credential_proxy.ExecutionResult(
+            exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False
+        )
+        with mock.patch.object(executor, "_execute_get_credentials", return_value=result) as fetch, \
+                mock.patch.object(executor, "_execute", return_value=result) as plain:
+            status, body = self.post_as(role, {"argv": argv})
+        self.assertEqual(200, status, body)
+        return fetch.call_count, plain.call_count
+
+    def test_every_spelling_goes_through_the_get_credentials_path(self):
+        for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_SHELL):
+            for argv in self.SPELLINGS:
+                with self.subTest(role=role, argv=argv):
+                    self.assertTrue(credential_proxy.command_policy.evaluate(argv).allowed)
+                    fetches, plain = self._routed(role, argv)
+                    self.assertEqual(1, fetches)
+                    self.assertEqual(0, plain)
+
+    def test_a_plain_gcloud_read_does_not(self):
+        argv = ["gcloud", "container", "--project=p", "clusters", "list", "--location", "l"]
+        for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_SHELL):
+            with self.subTest(role=role):
+                fetches, plain = self._routed(role, argv)
+                self.assertEqual(0, fetches)
+                self.assertEqual(1, plain)
+
+    def test_the_detector_reads_the_words_past_the_flags(self):
+        for argv, want in (
+            *((argv, True) for argv in self.SPELLINGS),
+            # A release track ahead of the words is looked past.
+            (["gcloud", "beta", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+            # A flag value that spells a command word is not one.
+            (["gcloud", "container", "--project", "clusters", "list"], False),
+            (["gcloud", "container", "clusters", "--format", "get-credentials", "list"], False),
+            # Unreadable (a flag of unknown arity) but carrying the verb.
+            (["gcloud", "container", "--no-such-flag", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "list"], False),
+            # The verb as a positional of another command is that command.
+            (["gcloud", "container", "clusters", "describe", "get-credentials", "--zone", "z"], False),
+            (["gcloud", "container", "clusters", "list", "get-credentials"], False),
+            # An argv the walk can't read is routed only if it carries the verb.
+            (["gcloud", "container", "--no-such-flag", "clusters", "list"], False),
+            (["kubectl", "container", "clusters", "get-credentials"], False),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy._is_get_credentials(argv))
+
+
 class ChildMemoryBudgetDerivationTest(unittest.TestCase):
     """Where the broker learns its memory limit (design §2.4)."""
 
@@ -4543,6 +4622,7 @@ class CommandExecutorTest(unittest.TestCase):
 
         process = mock.Mock(spec=subprocess.Popen)
         process.pid = 4242
+        process.returncode = None
         process.poll.return_value = None
         with (
             mock.patch.object(credential_proxy, "time", clock),
@@ -4601,6 +4681,7 @@ class CommandExecutorTest(unittest.TestCase):
 
         process = mock.Mock(spec=subprocess.Popen)
         process.pid = 4242
+        process.returncode = None
         process.poll.return_value = None
         with (
             mock.patch.object(credential_proxy, "time", clock),
@@ -14495,6 +14576,7 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         roles = {
             "shell-token": credential_proxy.CALLER_ROLE_SHELL,
             "chat-token": credential_proxy.CALLER_ROLE_CHAT,
+            "session-token": credential_proxy.CALLER_ROLE_SESSION,
         }
         caller = self.CALLER
 
@@ -14705,6 +14787,63 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual([], self.upstream_requests)
         self.assertFalse(any("api request_id=" in r.getMessage() for r in logs.records),
                          "a caller the role table turns away never opens an api line")
+
+    # -- the GKE cluster routes (#3703): projected, shell only ------------
+
+    CLUSTER_GET = "/v1/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-central1-a/clusters/seeded-a"
+    CLUSTER_LIST = "/v1/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/-/clusters"
+    CREDENTIAL_MASTER_AUTH = {"clusterCaCertificate": "Q0E=", "fieldOne": "REDACTED-TEST-VALUE-1",
+                              "fieldTwo": "REDACTED-TEST-VALUE-2", "fieldThree": "REDACTED-TEST-VALUE-3",
+                              "fieldFour": "REDACTED-TEST-VALUE-4"}
+
+    def _cluster(self, name):
+        return {"name": name, "location": "us-central1-a", "status": "RUNNING", "id": "abc123",
+                "endpoint": "34.1.2.3", "masterAuth": dict(self.CREDENTIAL_MASTER_AUTH),
+                "nodePools": [{"name": "default-pool"}]}
+
+    def test_a_cluster_get_comes_back_projected_with_no_master_auth(self):
+        self.reply.update(body=json.dumps(self._cluster("seeded-a")).encode())
+        status, _, body = self._request(self.CLUSTER_GET)
+        self.assertEqual(200, status)
+        self.assertEqual({"name": "seeded-a", "location": "us-central1-a", "status": "RUNNING", "id": "abc123"},
+                         json.loads(body))
+        for secret in (b"REDACTED-TEST-VALUE", b"masterAuth"):
+            self.assertNotIn(secret, body)
+
+    def test_a_cluster_list_comes_back_projected_per_item_and_keeps_missing_zones(self):
+        self.reply.update(body=json.dumps({"clusters": [self._cluster("a"), self._cluster("b")],
+                                           "missingZones": ["us-east1-b"]}).encode())
+        status, _, body = self._request(self.CLUSTER_LIST)
+        self.assertEqual(200, status)
+        got = json.loads(body)
+        self.assertEqual(["a", "b"], [c["name"] for c in got["clusters"]])
+        self.assertEqual(["us-east1-b"], got["missingZones"])
+        for secret in (b"REDACTED-TEST-VALUE", b"masterAuth", b"34.1.2.3"):
+            self.assertNotIn(secret, body)
+
+    def test_a_cluster_answer_the_projection_cannot_read_is_502_not_relayed(self):
+        self.reply.update(body=b"[" + json.dumps(self.CREDENTIAL_MASTER_AUTH).encode() + b"]")
+        status, _, payload = self._json_request(self.CLUSTER_GET)
+        self.assertEqual(502, status)
+        self.assertEqual("UPSTREAM_UNEXPECTED", payload["code"])
+        self.assertNotIn("REDACTED-TEST-VALUE", json.dumps(payload))
+
+    def test_a_cluster_not_found_passes_through_for_the_reconcile_to_read(self):
+        not_found = b'{"error":{"code":404,"message":"Not found: cluster seeded-z","status":"NOT_FOUND"}}'
+        self.reply.update(status=404, body=not_found)
+        status, _, body = self._request(self.CLUSTER_GET)
+        self.assertEqual((404, not_found), (status, body))
+
+    def test_the_cluster_routes_refuse_the_chat_and_session_roles(self):
+        for path in (self.CLUSTER_GET, self.CLUSTER_LIST):
+            for role in (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_SESSION):
+                with self.subTest(path=path, role=role):
+                    self.assertNotIn(role, credential_proxy.required_roles(path))
+            for token in ("chat-token", "session-token"):
+                with self.subTest(path=path, token=token):
+                    status, _, payload = self._json_request(path, token=token)
+                    self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, payload["code"]))
+        self.assertEqual([], self.upstream_requests)
 
     def test_an_unauthenticated_caller_is_401(self):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):

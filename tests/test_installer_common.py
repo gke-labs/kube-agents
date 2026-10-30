@@ -1359,6 +1359,31 @@ class InstallerCommonTest(unittest.TestCase):
                     if absent:
                         self.assertNotIn(absent, content)
 
+    def test_tfvars_refuse_a_misspelt_vertex_manage_serving_project(self):
+        # Read as off, a typo would revoke the gateway's grant on the serving
+        # project, so the generator names the key and writes nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "flase", "managed"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"VERTEX_MANAGE_SERVING_PROJECT='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+            for value, expected in (("False", "false"), ("yes", "true")):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": value},
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(f"vertex_manage_serving_project = {expected}", dest.read_text())
+
     def test_tfvars_refuse_scoped_sa_pool_values_terraform_cannot_take(self):
         # upgrade.sh regenerates from install.env without install.sh's checks,
         # so the generator names the key and writes nothing; a misspelt switch
@@ -5848,6 +5873,65 @@ class SourcedFromAFunctionTest(unittest.TestCase):
                                       env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("n=25 [C0HOME] [D0DM]", proc.stdout, proc.stderr)
+
+
+class SlackHomeChannelPolicyTest(unittest.TestCase):
+    """SLACK_HOME_CHANNEL_POLICY renders spec.integration.slack.homeChannelPolicy,
+    whose CRD enum is exact (auto, manual; absent reads as auto). The generator
+    refuses any other spelling before a file is written, so every route to
+    Terraform (install.sh's run, --dry-run, the Day-2 menu, upgrade.sh --plan and
+    apply) stops with the key named rather than inside `terraform plan`."""
+
+    _run = InstallerCommonTest._run
+
+    def _check(self, value, flags=""):
+        return self._run(f'require_slack_home_channel_policy {shlex.quote(value)} {flags}; echo "rc=$?"')
+
+    def test_the_three_accepted_values_pass_silently(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertNotIn("SLACK_HOME_CHANNEL_POLICY", proc.stdout + proc.stderr)
+
+    def test_any_other_spelling_is_refused_as_the_crd_would(self):
+        # Exact, as the API server is: no trim, no case folding.
+        for value in ("Auto", " auto", "manual ", "MANUAL", "sometimes"):
+            with self.subTest(value=value):
+                proc = self._check(value)
+                out = proc.stdout + proc.stderr
+                self.assertIn("rc=1", proc.stdout, out)
+                self.assertIn(f"SLACK_HOME_CHANNEL_POLICY is '{value}', which is not auto or manual (empty means auto)", out)
+                self.assertIn("spec.integration.slack.homeChannelPolicy", out)
+                self.assertIn("Set it in install.env and run again", out)
+                self.assertNotIn("--slack-home-channel-policy", out)
+
+    def test_the_remedy_names_the_flag_when_install_sh_can_set_it(self):
+        proc = self._check("sometimes", "flags")
+        self.assertIn("Set it in install.env or --slack-home-channel-policy and run again", proc.stdout + proc.stderr)
+
+    def _tfvars(self, env):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", **env},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            return proc, (dest.read_text() if dest.exists() else None)
+
+    def test_the_generator_renders_the_policy_beside_the_other_slack_keys(self):
+        for value in ("", "auto", "manual"):
+            with self.subTest(value=value):
+                proc, content = self._tfvars({"SLACK_HOME_CHANNEL_POLICY": value})
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn(f'slack_home_channel_name = ""\nslack_home_channel_policy = "{value}"\n', content)
+
+    def test_the_generator_refuses_a_policy_outside_the_enum_with_no_file_written(self):
+        proc, content = self._tfvars({"SLACK_HOME_CHANNEL_POLICY": "sometimes"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
+        self.assertIsNone(content, "the file must be left untouched")
 
 if __name__ == "__main__":
     unittest.main()

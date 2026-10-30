@@ -185,8 +185,13 @@ class SpecToolRegistryTest(unittest.TestCase):
     # evidence of them. Evidence of each is the agent text that tells the agent
     # to use it, backticked or called
     # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
-    HERMES_CORE_TOOLS = {"skill_view"}
-    CORE_TOOL_EVIDENCE = ("agents/platform/skills/github-issue-resolver/SKILL.md",)
+    # `terminal` is the tool a worker's shell commands go through, which
+    # delegated-proposal-stays-in-reply's safeguard reads (#2610).
+    HERMES_CORE_TOOLS = {"skill_view", "terminal"}
+    CORE_TOOL_EVIDENCE = (
+        "agents/platform/skills/github-issue-resolver/SKILL.md",
+        "agents/platform/AGENTS.md",
+    )
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,

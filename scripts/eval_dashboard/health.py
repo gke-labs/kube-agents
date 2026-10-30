@@ -267,9 +267,10 @@ REPLAY_ERROR_RE = re.compile(
     r"|ReplayMismatch"
     r"|failure wake:"
     r"|question wake:"
+    r"|block wake:"
     r"|thread context:"
     r"|replay declares"
-    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    r"|\[bench:(?:card-failure|slack-question|card-block)-wake\]",
     re.IGNORECASE,
 )
 

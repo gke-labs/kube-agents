@@ -2139,7 +2139,7 @@ class KubeAgentsHarness(AgentHarness):
         return result
 
     def _execute_card_wake(self, replay: card_wake.Replay, workspace_path: Path | None) -> AgentResult:
-        """Send a planted card's wake and the user's answer.
+        """Send a planted card's wake and the user's answer, or only the wake for a block replay.
 
         The answer goes on the wake's conversation, or on a new one for a
         ``session: fresh`` replay (:meth:`_execute_fresh_answer`); for an
@@ -2180,9 +2180,10 @@ class KubeAgentsHarness(AgentHarness):
         answer_turn = None
         try:
             wake_turn = self._execute_api(planted.wake, workspace_path, opening_turn=True)
-            if not card_wake.no_reply(wake_turn) and replay.fresh:
+            answers = replay.answered and not card_wake.no_reply(wake_turn)
+            if answers and replay.fresh:
                 answer_turn = self._execute_fresh_answer(replay, planted, wake_turn, workspace_path)
-            elif not card_wake.no_reply(wake_turn):
+            elif answers:
                 answer_turn = self._execute_api(planted.answer(replay), workspace_path, opening_turn=False)
         finally:
             _PINNED_RUN_ID.reset(pinned)
@@ -2191,8 +2192,8 @@ class KubeAgentsHarness(AgentHarness):
                 _log.warning("card wake: card %s could not be read", planted.card)
             elif not settled.archived:
                 _log.warning("card wake: card %s was not archived", planted.card)
-        # A wake turn that errored has no answer turn; it is tagged, since an
-        # errored run is the one whose card and wake are wanted.
+        # A block replay, or a wake turn that errored, has no answer turn; it
+        # is tagged, since the card and wake are wanted either way.
         if answer_turn is None:
             return card_wake.tag(planted, wake_turn, settled)
         return card_wake.merge(planted, wake_turn, answer_turn, settled)

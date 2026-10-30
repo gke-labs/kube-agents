@@ -5455,6 +5455,50 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 	}
 }
 
+// Session retention rides the managed scope, so it applies to every profile in the pod (the
+// front door, the Platform Agent and each Cluster Agent) and a profile cannot lengthen its own
+// (#3704). auto_prune is pinned true; retention_days is the CR's value or the operator default.
+// The tests read defaultSessionRetentionDays rather than a literal, so flipping the default is a
+// one-line change.
+func TestSessionRetentionIsPinnedInTheManagedScope(t *testing.T) {
+	managedSessions := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		sessions, ok := managed["sessions"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no sessions block, got:\n%v", managed)
+		}
+		if got := sessions["auto_prune"]; got != true {
+			t.Errorf("sessions.auto_prune = %v, want true", got)
+		}
+		return sessions
+	}
+
+	if got := managedSessions(t, newTestPlatformAgent())["retention_days"]; fmt.Sprint(got) != fmt.Sprint(defaultSessionRetentionDays) {
+		t.Errorf("unset retention_days = %v, want the operator default %d", got, defaultSessionRetentionDays)
+	}
+	for _, want := range []int{defaultSessionRetentionDays + 1, 365} {
+		if want == defaultSessionRetentionDays {
+			t.Fatalf("test value %d must differ from the default to prove the override", want)
+		}
+		agent := newTestPlatformAgent()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Retention: &agentv1alpha1.RetentionSpec{SessionDays: ptr.To(want)}}
+		if got := managedSessions(t, agent)["retention_days"]; fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("retention_days = %v, want the CR's %d", got, want)
+		}
+	}
+	// One route only: an overlay copy would be merged into a profile's config.yaml and then
+	// overruled by the pin, and would outlive the CR field.
+	for key, overlay := range buildConfigMapData(newTestPlatformAgent(), nil) {
+		if key != managedConfigKey && strings.Contains(overlay, "retention_days") {
+			t.Errorf("%s must not carry retention_days; it belongs to the managed scope alone", key)
+		}
+	}
+}
+
 // The cap has exactly one route. A copy in the default profile's overlay as well would be
 // merged into the agent's config.yaml and then overruled by the pin, which is the
 // "nothing the operator renders may appear in both" rule buildConfigMapData states. The

@@ -2384,6 +2384,12 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 # real worker process started as the dispatcher starts one; see its module
 # docstring.
 #
+# verify_scheduler_failure_line.py rides along for the same two reasons: the
+# layer budget, and session_kv_server.py. It is the half of
+# verify_chat_relay.py's check 11 that needs the relay and the image's cron
+# roster as well as the scheduler: each failure line the scheduler writes still
+# carries the words the relay matches, and the roster still reads as daily.
+#
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
 # image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
@@ -2394,6 +2400,7 @@ COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
      deploy/docker/patches/verify_card_stop.py \
+     deploy/docker/plugins/verify_scheduler_failure_line.py \
      deploy/docker/check_skill_commands.py \
      deploy/docker/skill_documents.py \
      /tmp/platform-config/
@@ -2409,6 +2416,7 @@ assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.ma
 assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_scheduler_failure_line.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \

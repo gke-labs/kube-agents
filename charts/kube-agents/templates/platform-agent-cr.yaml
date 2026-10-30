@@ -187,6 +187,28 @@ spec:
     stallWatch:
       {{- $stallWatchFields | nindent 6 }}
     {{- end }}
+    {{- $retention := .Values.platformAgent.harness.retention | default dict }}
+    {{- /*
+      Rendered only when an install sets sessionDays: the operator renders its own
+      default (defaultSessionRetentionDays) when the block is absent. The same CRD
+      guard as stallWatch's above, for the same reason.
+    */}}
+    {{- if $retention.sessionDays }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $harnessProps := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if .storage }}
+    {{- $harnessProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $harnessProps "retention") }}
+    {{- fail "platformAgent.harness.retention is set, but the installed PlatformAgent CRD predates spec.harness.retention and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- end }}
+    retention:
+      sessionDays: {{ $retention.sessionDays }}
+    {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
     {{- $stockout := (.Values.plugins | default dict).stockoutInvestigator | default dict }}
     {{- if and $stockout.enabled (ne $stockout.applyTuning false) }}
