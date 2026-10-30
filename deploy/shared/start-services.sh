@@ -225,17 +225,59 @@ normalize_boolean() {
   esac
 }
 
-# The shapes Go's flag package accepts for the watcher's duration and count
-# flags, narrowed to what a tunable here can mean. A duration is
-# time.ParseDuration's grammar without the sign (every duration the watcher
-# takes rejects a negative in validate()) and without `µs`, a spelling nobody
-# types for a span of minutes; either way a value outside the pattern only
-# reaches the fallback, never the binary. A count is plain decimal, at most
+# The shapes the watcher's duration and count flags are allowed to take: a
+# subset of what Go's flag package accepts, so that every value inside a
+# pattern is one the binary parses, and a value outside it only ever reaches
+# the fallback. A duration is time.ParseDuration's grammar narrowed four ways:
+# no sign (validate() rejects a negative settle, span or quiet period, and the
+# filter replaces a negative hold with its default anyway); no `µs`, `.5h` or
+# `1.h`; at most five integer and three fraction digits per component; and at
+# most four components. The last two are what keep it inside Go's int64 of
+# nanoseconds, about 2562047h, which a bare `3000000h` overflows; four
+# components of 99999.999h is under 400000h. A count is plain decimal, at most
 # eighteen digits: the flag package reads ints with a base prefix, so `08` is a
-# bad octal literal there, and nineteen digits can overflow an int64, which it
-# rejects as out of range.
-readonly WATCHER_DURATION_PATTERN='^(0|([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+)$'
+# bad octal literal there and `0x10` is sixteen, and nineteen digits can
+# overflow an int64, which it rejects as out of range.
+readonly WATCHER_DURATION_PATTERN='^(0|([0-9]{1,5}(\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,4})$'
 readonly WATCHER_COUNT_PATTERN='^[0-9]{1,18}$'
+
+# Nanoseconds in one of each unit WATCHER_DURATION_PATTERN admits, for the one
+# check that has to know a duration's size: whether it is above zero once Go
+# has truncated it to whole nanoseconds.
+readonly NS_PER_US=1000
+readonly NS_PER_MS=1000000
+readonly NS_PER_S=1000000000
+readonly NS_PER_M=60000000000
+readonly NS_PER_H=3600000000000
+readonly DECIMAL_BASE=10
+
+# The whole nanoseconds Go's time.ParseDuration reads a duration the pattern
+# already admitted as, printed to stdout. Each component's fraction is
+# truncated as Go truncates it, so `0.5ns` is 0 here as it is there. The digit
+# caps on the pattern keep every product inside bash's int64.
+duration_nanoseconds() {
+  local rest="$1"
+  local total=0 whole fraction unit per
+  while [[ "${rest}" =~ ^([0-9]+)(\.([0-9]+))?(ns|us|ms|s|m|h)([0-9].*)?$ ]]; do
+    whole="${BASH_REMATCH[1]}"
+    fraction="${BASH_REMATCH[3]}"
+    unit="${BASH_REMATCH[4]}"
+    rest="${BASH_REMATCH[5]}"
+    case "${unit}" in
+      ns) per=1 ;;
+      us) per="${NS_PER_US}" ;;
+      ms) per="${NS_PER_MS}" ;;
+      s) per="${NS_PER_S}" ;;
+      m) per="${NS_PER_M}" ;;
+      h) per="${NS_PER_H}" ;;
+    esac
+    total=$((total + 10#${whole} * per))
+    if [[ -n "${fraction}" ]]; then
+      total=$((total + 10#${fraction} * per / DECIMAL_BASE ** ${#fraction}))
+    fi
+  done
+  printf '%s' "${total}"
+}
 
 # Rewrite the *named* variable, in place, to a duration the watcher's flag
 # parser and validate() both accept, or to $2 if it is not one. The same
@@ -252,9 +294,9 @@ normalize_duration() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
 
-  # Zero is a value with no non-zero digit in it: `0`, `0s`, `0m0.0s`. The
-  # units carry no digits, so the test reads only the numbers.
-  if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && { [[ -z "${positive}" ]] || [[ "${value}" =~ [1-9] ]]; }; then
+  # Zero is measured in nanoseconds rather than read off the digits: `0.5ns`
+  # has a non-zero digit and is still zero to the watcher.
+  if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && { [[ -z "${positive}" ]] || [[ "$(duration_nanoseconds "${value}")" -gt 0 ]]; }; then
     printf -v "${name}" '%s' "${value}"
     return 0
   fi

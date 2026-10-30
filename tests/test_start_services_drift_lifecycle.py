@@ -994,12 +994,22 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
     def _resolve(self, helper: str, value: str, *args: str) -> subprocess.CompletedProcess:
         patterns = "\n".join(
             lift_constant(name, self.text, _SCRIPT)
-            for name in ("WATCHER_DURATION_PATTERN", "WATCHER_COUNT_PATTERN")
+            for name in (
+                "WATCHER_DURATION_PATTERN",
+                "WATCHER_COUNT_PATTERN",
+                "NS_PER_US",
+                "NS_PER_MS",
+                "NS_PER_S",
+                "NS_PER_M",
+                "NS_PER_H",
+                "DECIMAL_BASE",
+            )
         )
         return _run_bash(
             f"""
             set -u
             {patterns}
+            {self.lift("duration_nanoseconds")}
             {self.lift(helper)}
             SETTING={shlex.quote(value)}
             {helper} SETTING {" ".join(shlex.quote(a) for a in args)}
@@ -1021,8 +1031,8 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
 
     def test_a_value_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
         # 120: no unit. -5m: validate() refuses a negative. 00: ParseDuration
-        # only special-cases a bare 0.
-        for value in ("120", "2", "-5m", "abc", "00", "2 m", "5min"):
+        # only special-cases a bare 0. 3000000h: past int64 nanoseconds.
+        for value in ("120", "2", "-5m", "abc", "00", "2 m", "5min", "3000000h"):
             with self.subTest(value=value):
                 result = self._resolve("normalize_duration", value, _FALLBACK_DURATION)
                 self.assertIn(f"resolved={_FALLBACK_DURATION}", result.stdout)
@@ -1030,14 +1040,17 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                 self.assertIn("is not a usable duration", result.stderr)
 
     def test_the_positive_form_refuses_every_spelling_of_zero(self) -> None:
-        for value in ("0", "0s", "0m0s", "0.0h"):
+        # 0.5ns has a non-zero digit, and Go truncates it to 0 all the same.
+        for value in ("0", "0s", "0m0s", "0.0h", "0.5ns", "0.9ns0.0s"):
             with self.subTest(value=value):
                 result = self._resolve("normalize_duration", value, "24h", "positive")
                 self.assertIn("resolved=24h", result.stdout)
                 self.assertIn("above zero", result.stderr)
-        result = self._resolve("normalize_duration", "30m", "24h", "positive")
-        self.assertIn("resolved=30m", result.stdout)
-        self.assertEqual("", result.stderr)
+        for value in ("30m", "1ns", "1.5ns", "0.001us", "0.5s"):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_duration", value, "24h", "positive")
+                self.assertIn(f"resolved={value}", result.stdout)
+                self.assertEqual("", result.stderr)
 
     def test_a_count_is_rewritten_as_decimal(self) -> None:
         for value, want in (("5", "5"), ("08", "8"), ("007", "7"), (" 3 ", "3"), ("0", "0")):
@@ -1048,11 +1061,35 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
 
     def test_a_count_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
         # Nineteen digits can overflow the int64 the flag package parses into.
-        for value in ("abc", "-1", "1.5", "3x", "0x10", "1234567890123456789"):
+        for value in ("abc", "1.5", "3x", "1234567890123456789"):
             with self.subTest(value=value):
                 result = self._resolve("normalize_count", value, _FALLBACK_COUNT)
                 self.assertIn(f"resolved={_FALLBACK_COUNT}", result.stdout)
                 self.assertIn("is not a usable count", result.stderr)
+
+    def test_spellings_go_accepts_but_a_tunable_does_not_need_land_on_the_default(self) -> None:
+        """Narrowed on purpose, and safe because it is a fallback, never a crash.
+
+        The flag package reads `0x10` as sixteen and `+5m` as five minutes, and
+        validate() lets a negative count through to the filter's default; none
+        is a way anyone sets a debounce or a window, and passing one through
+        would mean copying more of Go's grammar for no tunable's benefit.
+        """
+        for helper, value, fallback in (
+            ("normalize_count", "0x10", _FALLBACK_COUNT),
+            ("normalize_count", "-1", _FALLBACK_COUNT),
+            ("normalize_count", "+3", _FALLBACK_COUNT),
+            ("normalize_count", "1_000", _FALLBACK_COUNT),
+            ("normalize_duration", "+5m", _FALLBACK_DURATION),
+            ("normalize_duration", ".5h", _FALLBACK_DURATION),
+            ("normalize_duration", "1.h", _FALLBACK_DURATION),
+            ("normalize_duration", "1h1m1s1ms1us", _FALLBACK_DURATION),
+            ("normalize_duration", "100000h", _FALLBACK_DURATION),
+        ):
+            with self.subTest(value=value):
+                result = self._resolve(helper, value, fallback)
+                self.assertIn(f"resolved={fallback}", result.stdout)
+                self.assertIn("is not a usable", result.stderr)
 
     def test_every_watcher_flag_tunable_is_normalised_against_a_named_default(self) -> None:
         """Declared from a named default, normalised, and passed to the watcher.
