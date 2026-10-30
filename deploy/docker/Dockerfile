@@ -1419,11 +1419,12 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # that half-writes btree pages, and #610 met that corruption on a gVisor gofer
 # mount. The operator's fix for that mount is the DELETE pin (renderConfigYAML)
 # and the entrypoint's step 1.7; this is the belt for any database that stays
-# in WAL. Ordered before the two above only because it is independent of them.
+# in WAL. Ordered before kanban_guardrail_exit and the two rate-limit patches
+# only because it is independent of them.
 # See the module docstring in deploy/docker/patches/apply_state_db_synchronous_full.py.
 #
 # mcp_toolset_names rides the same COPY and RUN too, one statement in cli.py
-# that shares nothing with the three above: the CLI's pre-discovery toolset check
+# that shares nothing with the patches above: the CLI's pre-discovery toolset check
 # excludes configured MCP servers by their bare name while a profile lists
 # them by their registry alias (mcp-<server>), so every MCP toolset printed as
 # unknown on stdout ahead of the answer, which under `hermes chat -Q` is the
