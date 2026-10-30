@@ -794,3 +794,49 @@ func TestAChangeRequestWithNoClusterGetsNoProxyToken(t *testing.T) {
 		t.Errorf("%d mints, want 1", ml.count())
 	}
 }
+
+// A retry whose replacement submission turns ChangeRequested off gets no
+// permit, even though the verifier's cached permit for the same capability
+// and cluster still applies and admission does not ask the verifier again:
+// whether a change is asked for is read from the delivery being admitted,
+// never from what was cached with the permit.
+func TestARetryThatDropsTheChangeRequestMintsNoPermit(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
+	ti := oneProfile("tse", 1, "tse-0")
+	ti.pool.SetUID("tse", "read", "tse-0", "uid-0")
+	kp, pub := signingKey(t)
+	v := &fakeVerifier{}
+	b.runKeyedWith(ti, kp, 0, v, nil)
+
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-1", "cap-ok", clusterParams)
+	waitFor(t, 10*time.Second, "task-1 confirmed", func() bool { return w.confirmCount() == 1 })
+	// task-2 asks for a change, is admitted, and waits over the profile's
+	// concurrency of 1 while task-1 runs.
+	b.submitChange("tse", "read", lib.SubmitKindTop, "task-2", clusterParams)
+	waitFor(t, 10*time.Second, "task-2 admitted", func() bool { return len(v.callList()) == 2 })
+	// Replaced by the same capability and cluster, no longer asking.
+	b.submitWith("tse", "read", lib.SubmitKindTop, "task-2", "cap-ok", clusterParams)
+
+	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("task-2 terminal %+v, want completed", ts)
+	}
+	if calls := v.callList(); len(calls) != 2 {
+		t.Fatalf("verifier calls %v; want two, so the replacement was admitted on the cached permit", calls)
+	}
+	confirms := confirmsOf(w)
+	if len(confirms) != 2 {
+		t.Fatalf("%d confirms, want two", len(confirms))
+	}
+	c := verifyAs(t, confirms[1].ProxyToken, pub, taskcred.AudienceCredentialProxy)
+	if c.Task != "task-2" {
+		t.Fatalf("second confirm is for %s", c.Task)
+	}
+	if c.Permits != nil {
+		t.Errorf("task-2's proxy token carries permits %v after its replacement dropped the change request", c.Permits)
+	}
+	if keys := natsClaimKeys(t, confirms[1].ProxyToken); slices.Contains(keys, "permits") {
+		t.Errorf("task-2's proxy token claims %v include permits", keys)
+	}
+}

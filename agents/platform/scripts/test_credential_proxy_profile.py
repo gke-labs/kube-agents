@@ -1404,6 +1404,47 @@ class ProfileRouteTableTest(unittest.TestCase):
         self.assertEqual(frozenset({"kubectl", "gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_PROFILE])
 
 
+# The install's own forge login, and the repository every ownership case is on.
+AGENT_LOGIN = "kube-agents[bot]"
+OWNED_REPO = "acme/infra"
+
+
+def _proposal(number, source, author=AGENT_LOGIN, source_repo=OWNED_REPO, state="open"):
+    """A proposal as the providers translate one (the neutral shape)."""
+    return {
+        "number": number, "source": source, "sourceRepo": source_repo, "author": author,
+        "state": state, "url": f"https://github.com/{OWNED_REPO}/pull/{number}",
+    }
+
+
+class _OwnershipForge:
+    """The two reads require_agent_proposal makes: proposal-view and proposal-list."""
+
+    verbs = ("proposal-view", "proposal-list")
+
+    def __init__(self, proposals):
+        self.proposals = dict(proposals)
+
+    def proposal_view(self, api, repo, payload):
+        return {"proposal": self.proposals[payload["number"]]}
+
+    def proposal_list(self, api, repo, query):
+        return {
+            "proposals": [
+                item for item in self.proposals.values()
+                if item["source"] == query.get("source") and item["state"] == query.get("state")
+            ]
+        }
+
+
+def _ownership_broker(forge, viewer):
+    """What VcsBroker.require_agent_proposal reads off self: _bind and _viewer."""
+    bound = type("Bound", (), {"forge": forge, "repo": OWNED_REPO, "api": staticmethod(lambda *a, **k: None)})()
+    return type(
+        "OwnershipBroker", (), {"_bind": lambda self, payload: bound, "_viewer": lambda self, b: viewer}
+    )()
+
+
 # The profile role's version-control verbs (#3993), spelled out here rather
 # than read off the broker's table, so a change to either side is a red test.
 PROFILE_VCS_READS = frozenset(
@@ -1422,7 +1463,10 @@ class ProfileVcsRouteTest(unittest.TestCase):
     managed list answers what each test says.
     """
 
-    PAYLOAD = {"repository": "https://github.com/acme/infra", "number": 7, "branch": "fix", "title": "t", "body": "b"}
+    PAYLOAD = {
+        "repository": "https://github.com/acme/infra", "number": 7, "branch": "platform-agent/fix",
+        "title": "t", "body": "b",
+    }
 
     setUp_base = ProfileRouteTest.setUp
     _restore = ProfileRouteTest.__dict__["_restore"]
@@ -1446,6 +1490,14 @@ class ProfileVcsRouteTest(unittest.TestCase):
         patcher = mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value=self.routes)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The ownership bar runs the real VcsBroker.require_agent_proposal
+        # against a stand-in forge: proposal 7, on platform-agent/fix, is the
+        # install's own.
+        self.forge = _OwnershipForge({7: _proposal(7, "platform-agent/fix")})
+        self.ownership = _ownership_broker(self.forge, viewer=AGENT_LOGIN)
+        vcs.require_agent_proposal = mock.Mock(
+            side_effect=lambda verb, payload: vcs_broker.VcsBroker.require_agent_proposal(self.ownership, verb, payload)
+        )
         self.managed = mock.Mock(return_value=True)
         patcher = mock.patch.object(credential_proxy, "repository_is_managed", self.managed)
         patcher.start()
@@ -1558,7 +1610,109 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 self.assertEqual("CALLER_VERB_FORBIDDEN", body["code"])
                 self.routes[verb].assert_not_called()
 
+    # -- ownership (the permit does not reach a person's proposal) -----------------
+
+    def assert_ownership_refused(self, verb, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual("PROPOSAL_NOT_OURS", body.get("code"), body)
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_OWNERSHIP, body["rule"])
+        self.routes[verb].assert_not_called()
+
+    def post_with(self, verb, **fields):
+        return self.post({**self.PAYLOAD, **fields}, token=PERMIT["token"], path=f"/v1/vcs/{verb}")
+
+    def test_proposal_update_runs_on_the_installs_own_proposal(self):
+        status, body = self.post_with("proposal-update")
+        self.assertEqual(200, status, body)
+        self.routes["proposal-update"].assert_called_once()
+
+    def test_proposal_update_is_refused_on_a_proposal_that_is_not_the_installs(self):
+        cases = {
+            "a person's proposal": _proposal(8, "platform-agent/fix-2", author="alice"),
+            "the install's login, off the branch namespace": _proposal(8, "release-1.2"),
+            # A fork's head ref can read platform-agent/... and its author be
+            # the install's login; its head repository is still the fork.
+            "a fork, with the install's login and a platform-agent/ branch": _proposal(
+                8, "platform-agent/fix", source_repo="kube-agents/infra"
+            ),
+            "a same-name repository under another owner": _proposal(
+                8, "platform-agent/fix", source_repo="other-owner/infra"
+            ),
+            "a deleted fork (no head repository)": _proposal(8, "platform-agent/fix", source_repo=""),
+        }
+        for name, proposal in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.forge.proposals[8] = proposal
+                status, body = self.post_with("proposal-update", number=8)
+                self.assert_ownership_refused("proposal-update", status, body)
+
+    def test_proposal_update_is_refused_when_the_credential_cannot_name_itself(self):
+        self.ownership = _ownership_broker(self.forge, viewer="")
+        status, body = self.post_with("proposal-update")
+        self.assert_ownership_refused("proposal-update", status, body)
+
+    def test_publish_is_refused_off_the_branch_namespace(self):
+        for branch in ("fix", "main", "release-1.2", "platform-agentx/fix"):
+            with self.subTest(branch=branch):
+                self.reset()
+                status, body = self.post_with("publish", branch=branch)
+                self.assert_ownership_refused("publish", status, body)
+
+    def test_publish_runs_under_the_branch_namespace(self):
+        status, body = self.post_with("publish", branch="platform-agent/new-change")
+        self.assertEqual(200, status, body)
+        self.routes["publish"].assert_called_once()
+
+    def test_advance_runs_onto_the_installs_own_proposal_branch(self):
+        status, body = self.post_with("publish", advance=True)
+        self.assertEqual(200, status, body)
+        self.routes["publish"].assert_called_once()
+
+    def test_advance_is_refused_onto_a_branch_whose_proposal_is_not_the_installs(self):
+        cases = {
+            "a person's proposal": _proposal(9, "platform-agent/theirs", author="alice"),
+            "a fork's proposal": _proposal(9, "platform-agent/theirs", source_repo="kube-agents/infra"),
+            "another owner's same-name repository": _proposal(9, "platform-agent/theirs", source_repo="other-owner/infra"),
+        }
+        for name, proposal in cases.items():
+            with self.subTest(case=name):
+                self.reset()
+                self.forge.proposals[9] = proposal
+                status, body = self.post_with("publish", branch="platform-agent/theirs", advance=True)
+                self.assert_ownership_refused("publish", status, body)
+        # And a branch with the install's proposal beside a person's.
+        self.reset()
+        self.forge.proposals[9] = _proposal(9, "platform-agent/fix", author="alice")
+        status, body = self.post_with("publish", advance=True)
+        self.assert_ownership_refused("publish", status, body)
+
+    def test_advance_is_refused_onto_a_branch_with_no_open_proposal(self):
+        status, body = self.post_with("publish", branch="platform-agent/nothing-open", advance=True)
+        self.assert_ownership_refused("publish", status, body)
+
+    def test_proposal_create_is_not_held_to_an_existing_proposal(self):
+        status, body = self.post_with("proposal-create", source="platform-agent/new", target="main")
+        self.assertEqual(200, status, body)
+
     # -- the platform agent is unchanged ------------------------------------------
+
+    def test_the_shell_is_not_held_to_the_ownership_bar(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
+        )
+        self.forge.proposals[8] = _proposal(8, "release-1.2", author="alice")
+        for verb, fields in (
+            ("proposal-update", {"number": 8}),
+            ("publish", {"branch": "feature/person"}),
+            ("publish", {"branch": "release-1.2", "advance": True}),
+        ):
+            with self.subTest(verb=verb, fields=fields):
+                self.reset()
+                status, body = self.post({**self.PAYLOAD, **fields}, token=None, path=f"/v1/vcs/{verb}")
+                self.assertEqual(200, status, body)
+                self.routes[verb].assert_called_once_with({**self.PAYLOAD, **fields})
+        CredentialProxyHandler.vcs.require_agent_proposal.assert_not_called()
 
     def test_the_shell_reaches_every_verb_with_no_task_credential(self):
         CredentialProxyHandler.authenticator = _StubAuthenticator(

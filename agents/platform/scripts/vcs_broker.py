@@ -298,6 +298,21 @@ def _remove_tree(path: Path) -> None:
 _AUTOMATION_MARKING = re.compile(r"\[[^\]]*\]$")
 
 
+def _as_pull_request(agent_forge: Any, proposal: Mapping[str, Any]) -> Any:
+    """A translated proposal as `forge.PullRequest`, the fields its ownership test reads.
+
+    The same mapping `forge.ForgeProvider.list_open_prs` makes from the same
+    neutral proposal: `source` is the head ref, `sourceRepo` the repository it
+    lives in (empty for a deleted fork, which reads as not ours).
+    """
+    return agent_forge.PullRequest(
+        number=int(proposal.get("number") or 0),
+        head_ref=str(proposal.get("source") or ""),
+        author=str(proposal.get("author") or ""),
+        head_repo=str(proposal.get("sourceRepo") or ""),
+    )
+
+
 def _short_ref(branch: str) -> str:
     """`refs/heads/x` and `heads/x` name the branch `x`; compare them as `x`."""
     short = branch.strip()
@@ -351,6 +366,19 @@ def _login_key(login: str) -> str:
     spelling is how the comparison broke in the first place.
     """
     return _AUTOMATION_MARKING.sub("", (login or "").strip()).casefold()
+
+
+class ProposalNotOurs(WorkspaceError):
+    """A profile caller's write names a proposal or branch this install does not own.
+
+    Raised only by `VcsBroker.require_agent_proposal`, which the credential
+    proxy calls for the profile role alone; the HTTP layer answers it 403 under
+    its own rule. Its own type so that layer can tell an ownership refusal from
+    a forge fault, which keeps the forge's own status.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, status=403, code="PROPOSAL_NOT_OURS")
 
 
 def _padded(size: int, unit: int) -> int:
@@ -1970,6 +1998,81 @@ class VcsBroker:
                 code="CLONED_BRANCH",
             )
 
+    def require_agent_proposal(self, verb: str, payload: dict[str, Any]) -> None:
+        """Refuse a profile caller's write unless what it touches is this install's own.
+
+        Called by the credential proxy for the profile role only (#3993), after
+        the permit and the managed list and before the verb runs; the shell's
+        `publish` and `proposal-update` never come through here. The permit
+        says the requester asked for a change, not which proposal, so this
+        holds the change to proposals and branches the install itself made:
+
+          * `proposal-update`: the proposal must be the install's own by
+            `forge.is_agent_pull_request` -- opened by the credential's login,
+            from a branch under `AGENT_BRANCH_PREFIX`, in this repository rather
+            than a fork. Read through the forge's own proposal view, and the
+            login through `_viewer`. Without it a profile worker under the
+            permit could retitle a person's proposal or strip its hold label.
+          * `publish`: the branch must be under `AGENT_BRANCH_PREFIX`, the rule
+            `branch-delete` applies. With `advance`, every open proposal on the
+            branch must pass the same `is_agent_pull_request` bar, so a profile
+            worker cannot push onto a person's proposal branch. The bar
+            `_require_open_proposal` keeps for the shell -- an open proposal,
+            the author compared only when the credential can name itself -- is
+            weaker on purpose there and is left as it is.
+
+        A credential that cannot name itself refuses: `is_agent_pull_request`
+        answers no for an empty viewer. A lookup that failed is the forge's
+        error, raised with its own status, never read as "not ours".
+        """
+        # Imported here: forge.py is the agent-side forge module, and this is
+        # the one place the broker borrows its ownership predicate, so the two
+        # sides share one definition of "the agent's own proposal".
+        import forge as agent_forge
+
+        bound = self._bind(payload)
+        if verb == "publish":
+            branch = _short_ref(validate_branch(payload.get("branch")))
+            if not branch.startswith(AGENT_BRANCH_PREFIX):
+                raise ProposalNotOurs(
+                    f"{branch} is not under {AGENT_BRANCH_PREFIX}, the namespace this "
+                    "install publishes in; a profile task publishes only a branch of "
+                    "its own there."
+                )
+            if not payload.get("advance"):
+                return
+            viewer = self._viewer(bound)
+            answer = bound.forge.proposal_list(
+                bound.api,
+                bound.repo,
+                {"state": "open", "source": branch, "limit": OPEN_PROPOSALS_ON_A_BRANCH},
+            )
+            proposals = answer.get("proposals") or []
+            strangers = [
+                item for item in proposals
+                if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, item), bound.repo, viewer)
+            ]
+            if not proposals or strangers:
+                named = (strangers[0].get("url") or "#%s" % (strangers[0].get("number"),)) if strangers else "none"
+                raise ProposalNotOurs(
+                    f"`advance` onto {branch} needs every open proposal on it to be this "
+                    f"install's own, from this repository; it is not ({named})."
+                )
+            return
+        if verb == "proposal-update":
+            number = validate_number(payload.get("number"))
+            viewer = self._viewer(bound)
+            view = bound.forge.proposal_view(bound.api, bound.repo, {"number": number})
+            proposal = view.get("proposal") or {}
+            if not agent_forge.is_agent_pull_request(_as_pull_request(agent_forge, proposal), bound.repo, viewer):
+                raise ProposalNotOurs(
+                    f"proposal #{number} is not this install's own (opened by its login, "
+                    f"from a branch under {AGENT_BRANCH_PREFIX}, in this repository), so a "
+                    "profile task does not update it."
+                )
+            return
+        raise ProposalNotOurs(f"{verb} is not a write this check knows, so it is refused")
+
     def _viewer(self, bound: Binding) -> str:
         """The login this credential authenticates as, or "" when it cannot say.
 
@@ -2380,6 +2483,7 @@ __all__ = [
     "VcsBroker",
     "VCS_VERBS",
     "AGENT_BRANCH_PREFIX",
+    "ProposalNotOurs",
     "ROLE_CONTEXT",
     "ROLE_MANAGED",
     "ROLE_SELECTED_VERBS",

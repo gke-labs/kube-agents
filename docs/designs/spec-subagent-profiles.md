@@ -398,7 +398,14 @@ What the operator renders per profile, as built (amended 10/6):
     claim is a closed list of strings, allowed only on the `credential-proxy` audience: an
     unknown permit, a malformed list or a `permits` key on a `nats` credential refuses the
     token, in both verifiers. The permit names no repository; the managed list bounds where
-    every verb lands, a permitted write included. Every other verb is refused: `snapshot` and
+    every verb lands, a permitted write included. Under the permit the writes are still held
+    to the install's own work (`VcsBroker.require_agent_proposal`, profile role only, rule
+    `caller.vcs-ownership`): `proposal-update` only on a proposal `forge.is_agent_pull_request`
+    calls the install's (opened by the credential's login, from a branch under
+    `platform-agent/`, in this repository rather than a fork), `publish` only to a branch
+    under `platform-agent/`, and `publish` with `advance` only onto a branch whose open
+    proposals all pass that same test. A credential that cannot name its login is refused.
+    The shell keeps its own, weaker `advance` bar. Every other verb is refused: `snapshot` and
     `capabilities`, which skip the managed list, and every other write, `branch-delete`
     among them. The shim sends the credential on these calls as it does on an exec. Known
     limits: a task that names no cluster gets no `proxyToken`, so it reaches no

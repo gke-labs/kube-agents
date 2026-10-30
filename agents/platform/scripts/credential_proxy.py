@@ -907,6 +907,9 @@ RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 # A profile caller at the version-control routes without a task credential,
 # or at a write verb without the permit its credential must carry (#3993).
 RULE_CALLER_VCS_PERMIT = "caller.vcs-permit"
+# A profile caller's permitted write that names a proposal or branch this
+# install does not own (VcsBroker.require_agent_proposal, #3993).
+RULE_CALLER_VCS_OWNERSHIP = "caller.vcs-ownership"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -1253,6 +1256,14 @@ VCS_PROPOSAL_CREATE_PERMIT = "vcs:proposal-create"
 # structured confirm sets, so a profile worker the model drives to publish on
 # its own initiative is refused here however the call is spelled.
 PROFILE_PERMIT_GATED_VCS_VERBS = frozenset({"publish", "proposal-create", "proposal-update"})
+
+# The profile writes that act on something that may already exist, and so are
+# further held to the install's own (VcsBroker.require_agent_proposal): an
+# update only of a proposal the install opened from its own branch here, a
+# publish only under AGENT_BRANCH_PREFIX, and an `advance` only onto a branch
+# whose open proposals are the install's. proposal-create opens a new one, from
+# a branch publish already held to the namespace.
+PROFILE_OWNERSHIP_GATED_VCS_VERBS = frozenset({"publish", "proposal-update"})
 
 
 def vcs_verb_permitted(role: str, verb: str) -> bool:
@@ -12693,6 +12704,30 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         # not be read: the first is a refusal, the second a fault.
                         if self.repository_refusal_status == HTTPStatus.SERVICE_UNAVAILABLE:
                             return TOOL_STATUS_ERROR
+                        return TOOL_STATUS_BLOCKED
+                # The profile role's ownership bar (#3993), after the managed
+                # list and before the verb: under the permit it still updates
+                # only the install's own proposals and publishes only under the
+                # install's branch namespace. The shell never comes here.
+                if role == CALLER_ROLE_PROFILE and verb in PROFILE_OWNERSHIP_GATED_VCS_VERBS:
+                    try:
+                        self.vcs.require_agent_proposal(verb, payload)
+                    except vcs_broker.ProposalNotOurs as exc:
+                        LOGGER.warning(
+                            "vcs write refused for a profile caller verb=%s rule=%s reason=%s",
+                            _sanitize_for_logging(verb),
+                            RULE_CALLER_VCS_OWNERSHIP,
+                            _sanitize_for_logging(str(exc), max_length=256),
+                        )
+                        self._json(
+                            HTTPStatus.FORBIDDEN,
+                            {
+                                "status": "blocked",
+                                "error": str(exc),
+                                "code": exc.fields.get("code"),
+                                "rule": RULE_CALLER_VCS_OWNERSHIP,
+                            },
+                        )
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
