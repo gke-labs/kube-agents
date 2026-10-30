@@ -58,6 +58,9 @@ const (
 	// conversation has a task running, which would otherwise be steered
 	// into that task with the profile dropped.
 	noticeProfileWhileRunning = "a task is still running here; stop it or wait for it before asking an agent profile"
+	// noticeConfirmWhileRunning refuses a confirm (IntentConfirm) while
+	// the conversation has a task running, which a steer can't grant.
+	noticeConfirmWhileRunning = "a task is still running here; stop it or wait for it before confirming a change"
 	// noticeProfileNoCapability refuses a profile task whose grant couldn't
 	// be minted: its grant carries the tier and target the dispatcher checks.
 	noticeProfileNoCapability = "⚠️ not started: could not mint this task's capability"
@@ -100,12 +103,15 @@ func (g *Gateway) mintTaskCapability(ctx context.Context, taskID, addressee stri
 }
 
 // submissionPayload is the submission's message: the text, and for a profile
-// route with parameters, the taskParameters part beside it.
-func submissionPayload(text, taskID, contextID string, route *profileRoute) ([]byte, error) {
-	if route == nil || len(route.Params) == 0 {
+// route with parameters or a change requested, the taskParameters part
+// beside it. A task addressed to platform or a session carries no part: the
+// dispatcher is its only reader, and the entry keeps changeRequested for
+// the profile children such a task delegates.
+func submissionPayload(text, taskID, contextID string, route *profileRoute, changeRequested bool) ([]byte, error) {
+	if route == nil || (len(route.Params) == 0 && !changeRequested) {
 		return messagePayload(text, taskID, contextID)
 	}
-	params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params})
+	params, err := lib.TaskParametersPart(lib.TaskParameters{Parameters: route.Params, ChangeRequested: changeRequested})
 	if err != nil {
 		return nil, err
 	}

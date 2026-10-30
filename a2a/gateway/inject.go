@@ -329,6 +329,11 @@ type injectRequest struct {
 	// nothing (injectResponse.Deduplicated), which is what makes a retry of
 	// a dropped POST safe.
 	MessageID string `json:"messageId,omitempty"`
+	// Intent is empty for a typed message, or "confirm" (IntentConfirm)
+	// for the click on a confirm button that a chat backend would send:
+	// the turn's task is submitted with a change requested. Anything else
+	// is refused.
+	Intent string `json:"intent,omitempty"`
 }
 
 // injectResponse is the POST /inject reply.
@@ -1354,6 +1359,10 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("text is longer than %d runes", injectMaxTextRunes))
 		return
 	}
+	if req.Intent != "" && req.Intent != IntentConfirm {
+		injectError(w, http.StatusBadRequest, fmt.Sprintf("intent is empty or %q", IntentConfirm))
+		return
+	}
 
 	a.handlerMu.RLock()
 	handler := a.handler
@@ -1424,6 +1433,7 @@ func (a *InjectAdapter) handleInject(w http.ResponseWriter, r *http.Request) {
 		AuthorID:     req.Author,
 		MessageID:    messageID,
 		Text:         req.Text,
+		Intent:       req.Intent,
 		// Stamped rather than inferred: this door can be armed beside a real
 		// backend, and the authority block has to name the door the message
 		// came through rather than the backend the process was configured

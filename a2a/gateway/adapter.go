@@ -101,7 +101,7 @@ type InboundMessage struct {
 	Shortcut bool
 }
 
-// IntentCancel is the only Intent today: stop the conversation's running
+// IntentCancel stops the conversation's running
 // task. A chat message cannot express it -- a human types "stop" and the
 // text matcher reads it -- but a program should not have to spell a phrase
 // to reach a control path, and a phrase that changes meaning is a class of
@@ -109,6 +109,17 @@ type InboundMessage struct {
 // Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
 // as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
+
+// IntentConfirm confirms a change the agent proposed: the message is a new
+// ask, as any other, and its task (and every child it delegates) is
+// submitted with TaskParameters.ChangeRequested, the one way a worker is
+// granted the permit to open a pull request. Free text never expresses it,
+// so a reply that merely says "yes, do it" gets an answer, not a change.
+// The console sends it as a frame of kind "confirm" and the inject door as
+// intent "confirm"; no chat backend has a confirm button yet. A confirm
+// while a task runs is refused rather than steered, since a steer cannot
+// change what the running task was granted.
+const IntentConfirm = "confirm"
 
 // Adapter is the five-operation backend interface from the gateway design:
 // inbound message with verified sender, conversation and thread identity

@@ -263,6 +263,12 @@ type TaskRef struct {
 	// written before the mint existed, which render `grants: null` — the
 	// same block a pre-mint gateway sent, and no executor checks a cancel.
 	Capability *capability.Ref `json:"capability,omitempty"`
+	// ChangeRequested is the value the task was submitted with
+	// (TaskParameters.ChangeRequested): true only for a turn that arrived
+	// with IntentConfirm, and for the children and wakes of its chain,
+	// which copy it from here rather than from anything the session wrote.
+	// False on entries written before it existed.
+	ChangeRequested bool `json:"changeRequested,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
 	// set only after the publish succeeded, so a true here means the cancel
 	// is on the stream. It is what lets a supervisor path reached long

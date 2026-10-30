@@ -132,9 +132,14 @@ const (
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
 )
 
-// ConsoleInFrame is what the browser publishes. Kind is empty or "text";
-// it is the seam for gateway-side commands later, and a frame of any other
-// kind is dropped (logged, no notice) rather than forwarded as an ask.
+// consoleKindConfirm is the in-frame kind a confirm button sends.
+const consoleKindConfirm = "confirm"
+
+// ConsoleInFrame is what the browser publishes. Kind is empty or "text"
+// for a typed message, or "confirm" for a click on a confirm button: the
+// same ask, sent with IntentConfirm, so its task may make the change it
+// confirms. A frame of any other kind is dropped (logged, no notice) rather
+// than forwarded as an ask.
 type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
@@ -469,7 +474,7 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		return InboundMessage{}, "", false
 	}
 	// kind is sender-chosen too, so it is logged bounded, by the same cap.
-	if f.Kind != "" && f.Kind != "text" {
+	if f.Kind != "" && f.Kind != "text" && f.Kind != consoleKindConfirm {
 		a.log.Warn("console frame dropped", "reason", "unknown kind", "kind", truncateRunes(f.Kind, consoleMessageIDCap), "conversation", conversation, "messageId", f.MessageID)
 		return InboundMessage{}, "", false
 	}
@@ -493,6 +498,9 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		Conversation: conversation, Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: f.MessageID,
 		Profile: f.Addressee, Parameters: f.Parameters,
+	}
+	if f.Kind == consoleKindConfirm {
+		msg.Intent = IntentConfirm
 	}
 	if len(text) > consoleTextCap {
 		a.log.Warn("console frame dropped", "reason", "oversize", "conversation", conversation, "messageId", f.MessageID, "bytes", len(text))
