@@ -145,6 +145,9 @@ resource "google_project_iam_member" "agent_roles" {
 # and tests/test_agent_iam_ceiling.py pins, and this is a switch beside it.
 # The role id is fixed, one per project like the service account, and
 # scripts/verify_ci_pool_project.py names a pool project's by this id.
+# The title names what the role grants; the id keeps the kubeAgents prefix
+# because custom role ids share one namespace per project, and a generic id
+# could collide with a role the project already holds.
 locals {
   calendar_mode_advice_role_id = "kubeAgentsCalendarModeAdvice"
 }
@@ -154,8 +157,8 @@ resource "google_project_iam_custom_role" "calendar_mode_advice" {
 
   project     = var.project_id
   role_id     = local.calendar_mode_advice_role_id
-  title       = "Kube-Agents calendar-mode advice (read-only)"
-  description = "compute.advice.calendarMode alone, so the kube-agents platform agent can ask the AdviceService for future capacity windows. No reservation writes."
+  title       = "Calendar Mode Advice (read-only)"
+  description = "compute.advice.calendarMode alone, to ask the AdviceService for future capacity windows. No reservation writes. The kube-agents platform agent uses it."
   permissions = ["compute.advice.calendarMode"]
 }
 

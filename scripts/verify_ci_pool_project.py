@@ -268,7 +268,7 @@ REPAIR_CALENDAR_MODE_ROLE = (
     "gcloud iam roles undelete {role_id} --project={project_id} >/dev/null 2>&1; "
     "gcloud iam roles describe {role_id} --project={project_id} >/dev/null 2>&1 "
     "|| gcloud iam roles create {role_id} --project={project_id} "
-    '--title="Kube-Agents calendar-mode advice (read-only)" --permissions={permission} --stage=GA; '
+    '--title="Calendar Mode Advice (read-only)" --permissions={permission} --stage=GA; '
     'gcloud projects add-iam-policy-binding {project_id} --member="{member}" --role={role} '
     "# docs/ci-pool-projects.md section 3"
 )

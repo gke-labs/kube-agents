@@ -3677,7 +3677,7 @@ def _calendar_role(project_id="kube-agents-evals-3", permissions=None, deleted=F
     permission, live, unless a test says otherwise."""
     doc = {
         "name": f"projects/{project_id}/roles/{checker.PLATFORM_GSA_CALENDAR_MODE_ROLE_ID}",
-        "title": "Kube-Agents calendar-mode advice (read-only)",
+        "title": "Calendar Mode Advice (read-only)",
         "stage": stage,
         "includedPermissions": sorted(
             {checker.PLATFORM_GSA_CALENDAR_MODE_PERMISSION} if permissions is None else permissions
