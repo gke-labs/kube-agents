@@ -194,8 +194,9 @@ type Dispatcher struct {
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their
-	// workers (breaker.go).
+	// workers (breaker.go), and jobs runs unattended tasks (job.go).
 	breakers *breakers
+	jobs     JobRunner
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -609,7 +610,15 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	d.clearWaiting(taskID)
 
-	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	if h.unattended && d.jobs != nil {
+		var ended bool
+		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
+		if ended {
+			return
+		}
+	} else {
+		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	}
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
@@ -628,6 +637,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.mu.Unlock()
 	log.Info("task confirmed to a worker", "pod", rec.Pod)
 	d.hold(ctx, log, del, h, rec, key, time.Time{})
+	d.endJob(ctx, log, h)
 }
 
 // holder is the holding for a submission, if this process has one.
@@ -978,6 +988,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if released {
 		log.Info("re-adopted a task its worker had already finished; settling it", "pod", pod)
 		d.settle(ctx, log, del, h, key, rec)
+		d.endJob(ctx, log, h)
 		return
 	}
 	if rec.Deadline.IsZero() {
@@ -991,6 +1002,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	}
 	log.Info("re-adopted a started task", "pod", pod, "expiresAt", rec.ExpiresAt, "graceUntil", graceUntil)
 	d.hold(ctx, log, del, h, rec, key, graceUntil)
+	d.endJob(ctx, log, h)
 }
 
 // hold keeps a running task's submission held (the lib sends the in-progress
