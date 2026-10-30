@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -89,6 +90,38 @@ func TestAStopMissedLiveIsFoundOnTheStream(t *testing.T) {
 	ts := b.waitTerminal("task-1", 10*time.Second)
 	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
 		t.Errorf("terminal %+v, want canceled stopped", ts)
+	}
+	if w.offerCount() != 0 {
+		t.Errorf("a task stopped before admission was offered %d times", w.offerCount())
+	}
+}
+
+// A stop heard live counts even when the stream can't be read: here there
+// is no stop stream at all, so the record reaches the dispatcher's
+// subscription and nowhere else, and the submission that follows is
+// canceled from what it heard.
+func TestAStopHeardLiveCountsWithoutTheStream(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 1, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0"), &fakeVerifier{})
+	time.Sleep(500 * time.Millisecond) // its stop subscription
+	body, err := json.Marshal(lib.DispatchStop{V: 1, TaskID: "task-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.admin.Publish(lib.DispatchStopSubject("tse", "task-1"), body); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.admin.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped from the stop heard live", ts)
 	}
 	if w.offerCount() != 0 {
 		t.Errorf("a task stopped before admission was offered %d times", w.offerCount())
