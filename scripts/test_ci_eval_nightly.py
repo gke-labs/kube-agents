@@ -1026,28 +1026,46 @@ class ApiLaneExclusionTest(unittest.TestCase):
         self.assertNotIn("runs on the inject lane only", result.stdout)
 
 
+# Where bash lets a word begin, so where a `#` starts a comment: after
+# whitespace or after one of the operator characters `;`, `&`, `|`, `(`, `)`.
+COMMENT_CAN_FOLLOW = frozenset(" \t;&|()")
+
+
 def shell_without_comments(text: str) -> str:
-    """`text` with every comment cut: a `#` at the start of a line or after
-    whitespace, outside single and double quotes, to the end of its line.
-    `${#arr[@]}` and a `#` inside a sed script survive, since neither follows
-    whitespace outside quotes."""
+    """`text` with every comment cut: a `#` that begins a word (at the start
+    of a line, after whitespace, or after `;`, `&`, `|`, `(` or `)`), outside
+    single and double quotes, to the end of its line. `${#arr[@]}` and a `#`
+    inside a sed script survive, since neither begins a word. Inside `$'...'`
+    a backslash escapes the next character, so `$'a\\' # b'` is one word and
+    not a comment.
+
+    The scan is per line: quote state does not carry over a newline, because a
+    heredoc body (the script feeds python3 two) can hold an unbalanced quote
+    that would desynchronise everything after it. So a `#` on a later line of
+    a multi-line quoted program (the awk program in `ledger_audit_id_for_task`, whose
+    `(#|$)` sits on its own line) is cut as a comment. That costs this guard
+    nothing: it only loses text that is not shell, and the pipe it looks for
+    cannot hide inside a quoted program."""
     kept = []
     for line in text.splitlines():
-        in_double = in_single = False
+        in_double = in_single = ansi_c = dollar_before = False
         cut = None
         i = 0
         while i < len(line):
             char = line[i]
-            if char == "\\" and not in_single:
+            if char == "\\" and (not in_single or ansi_c):
                 i += 2
+                dollar_before = False
                 continue
             if char == '"' and not in_single:
                 in_double = not in_double
             elif char == "'" and not in_double:
                 in_single = not in_single
-            elif char == "#" and not in_double and not in_single and (i == 0 or line[i - 1].isspace()):
+                ansi_c = in_single and dollar_before
+            elif char == "#" and not in_double and not in_single and (i == 0 or line[i - 1] in COMMENT_CAN_FOLLOW):
                 cut = i
                 break
+            dollar_before = char == "$" and not in_single and not in_double
             i += 1
         kept.append(line if cut is None else line[:cut])
     return "\n".join(kept)
@@ -1065,11 +1083,15 @@ class ProducerIntoGrepQuietTest(unittest.TestCase):
     # in a short-option cluster, or the long forms. The argument walk
     # crosses a quoted token whole, so `-E '(a|b)' -q` is read to its `-q`,
     # and otherwise stops at `|`, `;`, `&` and a closing paren, so a `-eq`
-    # after `$(... | grep -c .)` is not read as grep's.
+    # after `$(... | grep -c .)` is not read as grep's. Each token is a run
+    # of quoted strings and bare characters, and a bare character is never
+    # a quote, so `""` reads one way only and the walk cannot backtrack
+    # exponentially over a run of them (CodeQL's inefficient-regex alert);
+    # the short-option cluster names its first `q` for the same reason.
     PIPE_INTO_GREP_QUIET = re.compile(
         r"(?<!\|)\|(?!\|)&?\s*(?:command[ \t]+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*[ef]?grep"
-        r"(?:[ \t]+(?:'[^']*'|\"[^\"]*\"|[^|;&()\s]+))*?"
-        r"[ \t]+(?:-[a-zA-Z]*q[a-zA-Z]*|--quiet|--silent)(?=[\s;)]|$)"
+        r"(?:[ \t]+(?:'[^']*'|\"[^\"]*\"|[^|;&()\s'\"])+)*?"
+        r"[ \t]+(?:-[a-pr-zA-Z]*q[a-zA-Z]*|--quiet|--silent)(?=[\s;)]|$)"
     )
 
     def test_the_script_pipes_no_producer_into_grep_q(self):
@@ -1107,6 +1129,11 @@ class ProducerIntoGrepQuietTest(unittest.TestCase):
             "x | LC_ALL=C grep -q y",
             "x | egrep -q y",
             "x | fgrep -q y",
+            # `$'a\\' # b'` is one word (the backslash escapes the quote), so
+            # the pipe after it is not in a comment.
+            "printf $'a\\' # b' | grep -q x",
+            "x | grep -F\"$(f)\" -q",
+            "x | grep --file=\"$f\" -q",
         )
         passed = (
             "cmd || grep -qxF -- x <<< y",
@@ -1120,6 +1147,12 @@ class ProducerIntoGrepQuietTest(unittest.TestCase):
             "x |& grep -c y",
             "case $x in a|b) grep -q y <<< \"$z\" ;; esac",
             "x |\n  grep -c y",
+            # A `#` after `;`, `&`, `|`, `(` or `)` begins a word, so a comment.
+            "echo done;# never printf | grep -q here",
+            "echo done &# never printf | grep -q here",
+            "(echo done)# never printf | grep -q here",
+            # The CodeQL input: a run of empty strings, then no quiet flag.
+            "x |grep\t" + '""\t' * 40 + "y",
         )
         for line in flagged:
             with self.subTest(flagged=line):
