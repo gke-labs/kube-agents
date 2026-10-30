@@ -96,6 +96,8 @@ const (
 	remoteMCPSwarmPath          = "/mcp/swarm"
 	remoteMCPHealthPath         = "/healthz"
 	StreamingStepContinuePrefix = "⏳ **[STREAMING_STEP_CONTINUE]**"
+	// staleStreamingTaskAge is how long a tracked task no call has touched is kept.
+	staleStreamingTaskAge = 10 * time.Minute
 )
 
 type (
@@ -1622,6 +1624,24 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 		knownTaskID = entry.TaskID
 	}
 	delete(s.activeStreamingTasks, key)
+	// The same task may be tracked under its other spelling ("task:<addressee>/<id>" from a
+	// send, "task:<id>" from a get): this answer supersedes those entries too. Only the call's
+	// own task and the server's running-task line count, not any "task-" the text mentions.
+	refs := []string{runningTaskRef(responseText)}
+	if entry != nil {
+		refs = append(refs, entry.TaskID)
+	}
+	for k, st := range s.activeStreamingTasks {
+		if st == nil || st.InFlight {
+			continue
+		}
+		for _, ref := range refs {
+			if sameTaskRef(st.TaskID, ref) {
+				delete(s.activeStreamingTasks, k)
+				break
+			}
+		}
+	}
 
 	if ctxErr != nil {
 		s.mu.Unlock()
@@ -1762,11 +1782,31 @@ func (s *Server) stopRemoteTaskOnCancel(convAlias, taskID string) {
 	}
 }
 
-func (s *Server) checkActiveStreamingTasksForCancel(ctx context.Context) {
-	if s == nil || s.host == nil || ctx.Err() != nil {
+// sweepStaleStreamingTasks drops tracked tasks no call has touched for staleStreamingTaskAge,
+// with or without a HostIntegration, so a long-lived bridge neither grows the table nor keeps
+// answering taskOwnerConversation for tasks long finished. An in-flight call's entry is left
+// to the call, which removes it when it returns.
+func (s *Server) sweepStaleStreamingTasks(now time.Time) {
+	if s == nil {
 		return
 	}
-	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, st := range s.activeStreamingTasks {
+		if st == nil || (!st.InFlight && now.Sub(st.UpdatedAt) > staleStreamingTaskAge) {
+			delete(s.activeStreamingTasks, k)
+		}
+	}
+}
+
+func (s *Server) checkActiveStreamingTasksForCancel(ctx context.Context) {
+	if s == nil || ctx.Err() != nil {
+		return
+	}
+	s.sweepStaleStreamingTasks(time.Now())
+	if s.host == nil {
+		return
+	}
 	type candidate struct {
 		key   string
 		entry activeStreamingTask
@@ -1776,10 +1816,6 @@ func (s *Server) checkActiveStreamingTasksForCancel(ctx context.Context) {
 	s.mu.Lock()
 	for k, st := range s.activeStreamingTasks {
 		if st == nil {
-			delete(s.activeStreamingTasks, k)
-			continue
-		}
-		if now.Sub(st.UpdatedAt) > 10*time.Minute {
 			delete(s.activeStreamingTasks, k)
 			continue
 		}

@@ -177,3 +177,39 @@ func TestTaskControlStopByTaskIDGoesToTheTasksConversation(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestTrackedTasksAreSweptWithoutAHost(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	if srv.host != nil {
+		t.Fatal("the test server has a HostIntegration; the bare binary has none")
+	}
+	srv.mu.Lock()
+	srv.activeStreamingTasks["task:platform/task-old"] = &activeStreamingTask{TaskID: "platform/task-old", ConvAlias: "c1", UpdatedAt: time.Now().Add(-staleStreamingTaskAge - time.Minute)}
+	srv.activeStreamingTasks["task:platform/task-new"] = &activeStreamingTask{TaskID: "platform/task-new", ConvAlias: "c1", UpdatedAt: time.Now()}
+	srv.mu.Unlock()
+	srv.checkActiveStreamingTasksForCancel(context.Background())
+	if owner := srv.taskOwnerConversation("task-old"); owner != "" {
+		t.Fatalf("a task untouched for over %v still answers with owner %q in a bridge with no host", staleStreamingTaskAge, owner)
+	}
+	if owner := srv.taskOwnerConversation("task-new"); owner != "c1" {
+		t.Fatalf("the sweep dropped a fresh task (owner %q)", owner)
+	}
+}
+
+func TestAFinalGetDropsTheTaskUnderItsOtherSpelling(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	// A send on c1 left platform/task-1 running; a later get spells it task-1 and finds it done.
+	srv.mu.Lock()
+	srv.activeStreamingTasks["task:platform/task-1"] = &activeStreamingTask{TaskID: "platform/task-1", ConvAlias: "c1", UpdatedAt: time.Now()}
+	srv.mu.Unlock()
+	srv.registerStreamingCallStart("task:task-1", "task-1", "c1", "", "", func() {})
+	srv.finishStreamingCall("task:task-1", "c1", "", "", "Task `platform/task-1`: **completed**\n\nDone.\n", nil, nil)
+	srv.mu.Lock()
+	n := len(srv.activeStreamingTasks)
+	srv.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("after a get found task-1 done, %d tracked entr(ies) remain; want none", n)
+	}
+}
