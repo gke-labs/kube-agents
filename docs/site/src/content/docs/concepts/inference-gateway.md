@@ -111,7 +111,11 @@ model_list:
 litellm_settings:
   drop_params: true
   callbacks:
-    ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"]
+    [
+      "prometheus",
+      "litellm_thinking_replay_callback.proxy_handler_instance",
+      "litellm_cache_control_strip_callback.proxy_handler_instance",
+    ]
 router_settings:
   fallbacks:
     - model-default: ["gemini-3.8-flash-low"]
@@ -166,6 +170,8 @@ The agent cannot do this itself, and that is the point of putting it here. It as
 The system prompt takes the 1h tier because it is the largest static span, every profile and cron tick shares it, and a read refreshes the TTL — so a half-hourly cron schedule keeps it warm instead of missing a 5-minute window every time. The two rolling points ride the conversation tail on the default 5-minute tier. Anthropic allows four breakpoints per request; LiteLLM counts any the caller supplied and never overwrites them, so a client with its own layout still wins.
 
 Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into Vertex explicit context caching: before every model call it lists the project's cached contents, and it creates a new cache whenever the cached prefix is new. A create that Vertex is slow to finish fails the whole turn: in one case it surfaced as a 401 after a stall of more than ten minutes. Gemini's implicit caching needs no markers and still serves a repeated prefix from cache. The chart reads the same provider and model name as the sampling-key drop above, with one difference: a Claude model behind `sap` gets the drop and no breakpoints. Switching `MODEL_PROVIDER` re-renders both. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
+
+A caller can also bring its own markers. Claude Code marks its prompt-cache breakpoints itself, and the A2A worker adapter points it at the gateway without telling it which model is behind `model-default`. On a Gemini model LiteLLM would turn those markers into the same explicit-caching create, and `gemini-4-argon`, which has no explicit caching, answers every such request 400. The chart loads a pre-call hook that removes a caller's `cache_control` markers from a request bound for a Gemini model and leaves a request to any other model as sent. The gateway log records each request it changed, as `kube_agents.litellm_cache_control_strip INFO cache markers: dropped N cache_control marker(s)`. The kustomize dev copy does not load it.
 
 ### Gemini's thoughts
 

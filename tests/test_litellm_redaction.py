@@ -40,7 +40,11 @@ _CONFIGMAP_KEYS = ("redaction.yaml", "redactor.py", "litellm_redaction_callback.
 # What every render carries whether redaction is on or off: the config and the
 # thinking-replay hook (tests/test_litellm_thinking_replay.py).
 _ALWAYS_KEYS = ("config.yaml", "litellm_thinking_replay_callback.py")
-_ALWAYS_CALLBACKS = ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"]
+_ALWAYS_CALLBACKS = [
+    "prometheus",
+    "litellm_thinking_replay_callback.proxy_handler_instance",
+    "litellm_cache_control_strip_callback.proxy_handler_instance",
+]
 _MOUNT_DIR = "/app"
 # The ConfigMap volume. The container also mounts an emptyDir scratch
 # directory that carries no subPath, so mounts are read by volume, not by

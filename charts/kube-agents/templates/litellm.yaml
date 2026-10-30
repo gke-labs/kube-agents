@@ -159,6 +159,17 @@
 {{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
 {{- end }}
 {{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
+{{- /*
+  The cache-marker hook runs on every install too: it drops a caller's own
+  cache_control markers from a request bound for a Gemini model, which LiteLLM
+  would otherwise turn into a Vertex explicit-caching create (a 400 on
+  gemini-4-argon, which has none). Its header says which caller sends them.
+*/}}
+{{- $cacheControlStripSource := .Files.Get "files/litellm_cache_control_strip_callback.py" }}
+{{- if empty $cacheControlStripSource }}
+{{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
@@ -241,6 +252,8 @@ data:
     {{- $config | nindent 4 }}
   litellm_thinking_replay_callback.py: |
     {{- $thinkingReplaySource | nindent 4 }}
+  litellm_cache_control_strip_callback.py: |
+    {{- $cacheControlStripSource | nindent 4 }}
   {{- if $redactionEnabled }}
   redaction.yaml: |
     {{- $redactionConfig | nindent 4 }}
@@ -506,6 +519,9 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_thinking_replay_callback.py
               subPath: litellm_thinking_replay_callback.py
+            - name: config-volume
+              mountPath: /app/litellm_cache_control_strip_callback.py
+              subPath: litellm_cache_control_strip_callback.py
             {{- if $oauthHookEnabled }}
             - name: config-volume
               mountPath: /app/litellm_oauth2_callback.py
