@@ -241,7 +241,7 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
   no EndpointSlice grant and no pod patch. The project's tech lead approved this grant for phase
   one. Because the gateway can't recreate the Lease, the operator watches it: the Lease carries
   the PlatformAgent's owner reference and the controller `Owns` it, so a deleted Lease is
-  recreated within seconds, not at the fifteen-minute requeue. While it's absent, the active
+  recreated within seconds, not at the fifteen-minute requeue. The operator's ClusterRole already holds every Lease verb this needs. While it's absent, the active
   replica fails to renew and steps down after `renewDeadline`, both replicas answer their doors
   with a 503 saying no replica holds the lease, and the next acquisition starts a new term as
   usual.
