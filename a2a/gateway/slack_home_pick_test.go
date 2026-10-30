@@ -38,15 +38,27 @@ func newHomePickAdapter(t *testing.T, data map[string]string) (*SlackAdapter, *f
 // payload with a view container, no channel and no message.
 func homePickPayload(t *testing.T, user, team, channel, actionTS string) json.RawMessage {
 	t.Helper()
-	raw, err := json.Marshal(map[string]any{
+	return homePickPayloadIn(t, user, team, channel, actionTS, slackContainerView, "")
+}
+
+// homePickPayloadIn is homePickPayload with the container type and the
+// message channel chosen: a message click carrying the picker's action id.
+func homePickPayloadIn(t *testing.T, user, team, channel, actionTS, container, msgChannel string) json.RawMessage {
+	t.Helper()
+	payload := map[string]any{
 		"type":      "block_actions",
 		"user":      map[string]any{"id": user, "team_id": team},
 		"team":      map[string]any{"id": "T1"},
-		"container": map[string]any{"type": "view", "view_id": "V1"},
+		"container": map[string]any{"type": container, "view_id": "V1"},
 		"view":      map[string]any{"id": "V1", "type": "home"},
 		"actions": []any{map[string]any{"type": "conversations_select", "action_id": slackHomePickAction,
 			"block_id": "home", "selected_conversation": channel, "action_ts": actionTS}},
-	})
+	}
+	if msgChannel != "" {
+		payload["channel"] = map[string]any{"id": msgChannel}
+		payload["message"] = map[string]any{"ts": "50.0"}
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +133,11 @@ func TestSlackHomePickViewStates(t *testing.T) {
 	if text := lastView(t, api, "U2"); !strings.Contains(text, slackHomeDenied) || strings.Contains(text, slackHomePickAction) {
 		t.Errorf("the denied view changed:\n%s", text)
 	}
+	// The production wait for the file is the pending TTL; the fixture
+	// shortens it after SetHomeLearner.
+	if d, _, _, _ := newHomeLearnAdapter(t, nil); d.homeLearn.followUp != slackHomePickPendingTTL {
+		t.Errorf("followUp default = %s, want %s", d.homeLearn.followUp, slackHomePickPendingTTL)
+	}
 	// Not armed: no record client (the CR field set, policy manual, or an
 	// operator older than the projection all leave it nil).
 	b, bapi, _ := homeAdapter(t, homeBoardFixture(), nil)
@@ -134,7 +151,7 @@ func TestSlackHomePickViewStates(t *testing.T) {
 // publishes "Checking" then the outcome to the member, posts the two lines,
 // and the view shows the new channel before the file catches up (E7).
 func TestSlackHomePickMovesTheHome(t *testing.T) {
-	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage, homeRecordKeyRefused: homeRefusedArchived})
 	writeHomeFile(t, dir, "C0OLD1\n")
 	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
 	a.publishHome("U1", false)
@@ -145,8 +162,17 @@ func TestSlackHomePickMovesTheHome(t *testing.T) {
 	if data[homeRecordKeySlack] != "C0NEW2" || data[homeRecordKeySetBy] != "U1" || data[homeRecordKeyWriter] != homeTestImage || homePatches(cs) != 1 {
 		t.Fatalf("record after the pick = %v (patches %d), want C0NEW2 by U1 in one write", data, homePatches(cs))
 	}
-	if got := viewsFor(api, "U1") - before; got < 2 {
+	if _, stale := data[homeRecordKeyRefused]; stale {
+		t.Errorf("the move kept a stale refusal: %v", data)
+	}
+	if got := viewsFor(api, "U1") - before; got < 2 || !anyView(t, api, "U1", "Checking <#C0NEW2>") {
 		t.Errorf("views to the picker = %d, want the Checking publish and the outcome", got)
+	}
+	a.home.mu.Lock()
+	armed := a.home.timer != nil
+	a.home.mu.Unlock()
+	if !armed {
+		t.Error("no republish armed for the other viewers")
 	}
 	if !anyView(t, api, "U1", "Recorded <#C0NEW2> as the home channel") || !anyView(t, api, "U1", "may still land in <#C0OLD1>") {
 		t.Errorf("outcome status missing from the picker's views")
@@ -201,7 +227,7 @@ func TestSlackHomePickRefusals(t *testing.T) {
 		wantViews     bool
 		wantInfoCalls int
 	}{
-		{"a foreign team id with a listed id (E1)", "U1", "T9", "C0NEW2", nil, "", false, 0},
+		{"a foreign team id with a listed id (E1)", "U1", "T9", "C0NEW2", nil, slackHomePickGuest, true, 0},
 		{"a member not admitted", "U2", "T1", "C0NEW2", nil, slackHomeDenied, true, 0},
 		{"admission undecided (E5)", "UX", "T1", "C0NEW2", func(a *SlackAdapter, api *fakeSlackAPI) { delete(api.users, "UX") }, "", false, 0},
 		{"the recorded channel (E4)", "U1", "T1", "C0OLD1", nil, "already the home channel", true, 1},
@@ -324,15 +350,16 @@ func TestSlackHomePickDedupeAndShutdown(t *testing.T) {
 	a, api, cs, dir := newHomePickAdapter(t, nil)
 	writeHomeFile(t, dir, "")
 	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	api.conversations["C0THR3"] = homeChannelInfo("C0THR3", nil)
 	pick(t, a, "U1", "T1", "C0NEW2", "205.1")
 	pick(t, a, "U1", "T1", "C0NEW2", "205.1")
-	if homePatches(cs) != 1 {
-		t.Fatalf("a redelivered pick wrote again: patches %d", homePatches(cs))
+	if homePatches(cs) != 1 || api.conversationInfoCalls != 1 {
+		t.Fatalf("a redelivered pick ran again: patches %d, conversations.info %d", homePatches(cs), api.conversationInfoCalls)
 	}
 	a.closeHomeLearn()
-	pick(t, a, "U1", "T1", "C0NEW2", "206.1")
-	if homePatches(cs) != 1 {
-		t.Errorf("a pick after close wrote: patches %d", homePatches(cs))
+	pick(t, a, "U1", "T1", "C0THR3", "206.1")
+	if homePatches(cs) != 1 || api.conversationInfoCalls != 1 {
+		t.Errorf("a pick after close ran: patches %d, conversations.info %d", homePatches(cs), api.conversationInfoCalls)
 	}
 }
 
@@ -340,8 +367,8 @@ func TestSlackHomePickDedupeAndShutdown(t *testing.T) {
 // action id, or a pick with no channel, is dropped before any call.
 func TestSlackHomePickNotAHomeTabAction(t *testing.T) {
 	a, api, cs, _ := newHomePickAdapter(t, nil)
-	raw := clickPayload(t, "U1", "T1", "C1", "", slackHomePickAction, "x", "C0NEW2", "207.1")
-	a.interactive(raw)
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	a.interactive(homePickPayloadIn(t, "U1", "T1", "C0NEW2", "207.1", "message", "C1"))
 	a.homeLearn.wg.Wait()
 	pick(t, a, "U1", "T1", "", "208.1")
 	if homePatches(cs) != 0 || api.conversationInfoCalls != 0 || len(api.views) != 0 {

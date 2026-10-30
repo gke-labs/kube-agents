@@ -510,7 +510,9 @@ gateway.
      a file the operator mounts; an older agent image reads env only and never sees it, while the CR
      shows no condition.
    - An allowed member moves the home channel later from the app's Home tab (the Home channel panel);
-     the record keeps who moved it and when.
+     the record keeps who moved it and when. On a rollback to a gateway without the panel, a published
+     Home view keeps the picker until the member reopens the tab; the old gateway drops a pick and
+     writes nothing.
 
 3. Check the board for cards in flight:
 

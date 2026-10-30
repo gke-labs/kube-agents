@@ -680,7 +680,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
      kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
      ```
    - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition, its "Hermes" name included — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
-   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
+   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way (except `sethome` under `next` with Slack on the gateway, which the agent answers with a pointer to the Home tab), because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts. Under `spec.mode: next` with Slack on the gateway, neither command sets it: pick the channel on the app's Home tab instead.
 

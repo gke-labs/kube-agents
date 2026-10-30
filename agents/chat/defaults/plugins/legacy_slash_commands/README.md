@@ -34,15 +34,15 @@ Hermes' Slack adapter already unwraps this form: `_handle_slash_command` maps
 _registered_ `/hermes` slash works. The plugin performs the same unwrapping one
 layer earlier, on the inbound `MessageEvent`, so both paths behave identically:
 
-| Typed message              | Dispatched as                                                                                                             |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `/hermes sethome`          | `/sethome`; `sethome` as a plain question when `A2A_NOTIFY_CONVERSATIONS` is `slack` (the gateway holds the home channel) |
-| `/hermes model gpt-5`      | `/model gpt-5`                                                                                                            |
-| `/hermes compact`          | `/compress`                                                                                                               |
-| `/hermes`                  | `/help`                                                                                                                   |
-| `/hermes what's deployed?` | `what's deployed?` (text)                                                                                                 |
-| `/sethome`, `hello`, …     | unchanged                                                                                                                 |
-| `/undo [N]`                | `undo [N]` (text; below)                                                                                                  |
+| Typed message              | Dispatched as                                                                                                                                         |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/hermes sethome`          | `/sethome`; when `A2A_NOTIFY_CONVERSATIONS` is `slack` (the gateway holds the home channel), a question that names the Home tab as the way to move it |
+| `/hermes model gpt-5`      | `/model gpt-5`                                                                                                                                        |
+| `/hermes compact`          | `/compress`                                                                                                                                           |
+| `/hermes`                  | `/help`                                                                                                                                               |
+| `/hermes what's deployed?` | `what's deployed?` (text)                                                                                                                             |
+| `/sethome`, `hello`, …     | unchanged                                                                                                                                             |
+| `/undo [N]`                | `undo [N]` (text; below)                                                                                                                              |
 
 The unknown-subcommand row matters: the prefix is **stripped** rather than
 passed through, because passing it through is exactly what produces the

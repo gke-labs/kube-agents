@@ -26,6 +26,11 @@ const (
 	slackContainerView = "view"
 	// slackHomePickVia tells a Home tab move from a typed one in the log.
 	slackHomePickVia = "home-tab"
+	// slackHomePickSeenPrefix keys a pick in the adapter's seen ring.
+	slackHomePickSeenPrefix = "home:"
+	// The picker's filter: Slack's list of what to offer, never the gate.
+	slackHomePickFilterPublic  = "public"
+	slackHomePickFilterPrivate = "private"
 	// slackHomePickPendingTTL bounds how long a pick is drawn over the
 	// projected file: the file follows within one reconcile and one kubelet
 	// sync, and after this the file is the truth whatever it says.
@@ -50,6 +55,7 @@ const (
 	slackHomePickArchived    = "<#%s> is archived."
 	slackHomePickShared      = "A channel shared through Slack Connect cannot be the home channel."
 	slackHomePickMalformed   = "That is not a channel."
+	slackHomePickGuest       = "Only a member of this workspace can move the home channel."
 
 	// homePickedLine goes into the new home; homeMovedLine into the old one.
 	// Posted raw, as homeLearnedLine is: the ids are checked channel ids.
@@ -132,7 +138,7 @@ func (s *SlackAdapter) homeChannelBlocks(member string) []slack.Block {
 	picker := slack.NewOptionsSelectBlockElement(slack.OptTypeConversations,
 		slack.NewTextBlockObject(slack.PlainTextType, slackHomePickPlaceholder, false, false), slackHomePickAction)
 	// The filter is Slack's list, not the gate: checkHomeChannel decides.
-	picker.Filter = &slack.SelectBlockElementFilter{Include: []string{"public", "private"}, ExcludeExternalSharedChannels: true}
+	picker.Filter = &slack.SelectBlockElementFilter{Include: []string{slackHomePickFilterPublic, slackHomePickFilterPrivate}, ExcludeExternalSharedChannels: true}
 	blocks = append(blocks, slack.NewSectionBlock(mrk(slackHomePickIntro), nil, slack.NewAccessory(picker)))
 	line := slackHomeLineNoHome
 	if home := s.homeForView(); home != "" {
@@ -175,7 +181,7 @@ func (s *SlackAdapter) homePick(p slackClickPayload, channel string) {
 		s.log.Info("slack: dropping a home pick that is not a Home tab action", "member", member, "channel", p.Channel.ID, "container", p.Container.Type)
 		return
 	}
-	if s.alreadySeen("home:" + member + "/" + actionTS) {
+	if s.alreadySeen(slackHomePickSeenPrefix + member + "/" + actionTS) {
 		return
 	}
 	l := &s.homeLearn
@@ -190,8 +196,13 @@ func (s *SlackAdapter) homePick(p slackClickPayload, channel string) {
 		s.log.Info("slack: a home pick arrived while a change runs", "member", member, "channel", channel)
 		s.setPickStatus(member, slackHomePickBusy)
 		// Admission runs again (republish=false): the member may have left
-		// the allowlist since they opened the tab.
-		s.goSession(func() { s.publishHome(member, false) })
+		// the allowlist since they opened the tab. Under the wait group, so
+		// the publish does not outlive Run.
+		l.wg.Add(1)
+		s.goSession(func() {
+			defer l.wg.Done()
+			s.publishHome(member, false)
+		})
 		return
 	}
 	l.busy = true
@@ -208,7 +219,7 @@ func (s *SlackAdapter) homePick(p slackClickPayload, channel string) {
 		if moved == "" {
 			return
 		}
-		if applied, closed := s.awaitHomeFile(moved); !applied && !closed {
+		if applied, stopped := s.awaitHomeFile(moved); !applied && !stopped {
 			s.log.Warn("slack: the projected home channel did not follow the move", "channel", moved, "waited", l.followUp)
 			s.setPickStatus(member, slackHomePickNotApplied)
 			s.publishHome(member, true)
@@ -222,6 +233,8 @@ func (s *SlackAdapter) homePick(p slackClickPayload, channel string) {
 func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (moved string) {
 	if s.otherWorkspace(team) {
 		s.log.Info("slack: home pick refused: another workspace's member", "member", member, "team", team, "channel", channel)
+		s.setPickStatus(member, slackHomePickGuest)
+		s.publishHome(member, true)
 		return ""
 	}
 	admitted, decided := s.homeAdmitted(member)
@@ -262,6 +275,10 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 		return ""
 	case errors.As(err, &conflict):
 		s.log.Info("slack: home pick lost to a concurrent change", "member", member, "channel", channel, "winner", conflict.winner, "by", conflict.by)
+		if conflict.winner == "" {
+			finish(slackHomePickNoAPI)
+			return ""
+		}
 		finish(fmt.Sprintf(slackHomePickConflict, conflict.winner, slackMemberOrSomeone(conflict.by)))
 		return ""
 	case err != nil:
@@ -319,9 +336,9 @@ func (s *SlackAdapter) postHomeLine(channel, text string) {
 
 // awaitHomeFile waits, up to the learner's followUp, for the projected file
 // to name channel: the operator's pass and one kubelet sync. applied is true
-// when it did; closed is true when the learner shut down first, so Run never
-// waits on the kubelet.
-func (s *SlackAdapter) awaitHomeFile(channel string) (applied, closed bool) {
+// when it did; stopped is true when the learner shut down first (Run never
+// waits on the kubelet) or a later move superseded this one.
+func (s *SlackAdapter) awaitHomeFile(channel string) (applied, stopped bool) {
 	l := &s.homeLearn
 	deadline := time.Now().Add(l.followUp)
 	for {
@@ -329,9 +346,12 @@ func (s *SlackAdapter) awaitHomeFile(channel string) (applied, closed bool) {
 			return true, false
 		}
 		l.mu.Lock()
-		closed = l.closed
+		closed := l.closed
 		l.mu.Unlock()
-		if closed {
+		s.home.mu.Lock()
+		superseded := s.home.pending == nil || s.home.pending.channel != channel
+		s.home.mu.Unlock()
+		if closed || superseded {
 			return false, true
 		}
 		if time.Now().After(deadline) {

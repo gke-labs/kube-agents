@@ -40,7 +40,8 @@ class RewriteLegacyHermesCommandTest(unittest.TestCase):
         # Under next the home channel is the operator's record, moved from the
         # app's Home tab; Hermes' /sethome would write a file nothing reads.
         with mock.patch.dict(os.environ, {plugin._GATEWAY_CONVERSATIONS_ENV: "slack"}):
-            self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "sethome")
+            self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), plugin._SETHOME_NEXT_QUESTION)
+            self.assertIn("Home tab", plugin._SETHOME_NEXT_QUESTION)
             self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes model gpt-5"), "/model gpt-5")
         with mock.patch.dict(os.environ, {plugin._GATEWAY_CONVERSATIONS_ENV: ""}):
             self.assertEqual(plugin.rewrite_legacy_hermes_command("/hermes sethome"), "/sethome")
