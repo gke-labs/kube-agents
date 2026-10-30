@@ -28,6 +28,9 @@ type Health struct {
 	// DroppedAnswers counts worker answers for tasks they don't hold that
 	// were dropped over a pod's budget, since start.
 	DroppedAnswers int64
+	// OpenBreakers are the (profile, tier) pairs, as profile/tier, whose
+	// breaker is refusing new submissions (breaker.go).
+	OpenBreakers []string
 }
 
 func (d *Dispatcher) noteWaiting(taskID, durable string, queued time.Time, why string) {
@@ -78,6 +81,7 @@ func (d *Dispatcher) Health() Health {
 		}
 	}
 	sort.Strings(h.Stalled)
+	h.OpenBreakers = d.breakers.open(now)
 	return h
 }
 
@@ -88,6 +92,9 @@ func (d *Dispatcher) logHealth() {
 	if len(h.Stalled) > 0 {
 		d.log.Warn("admission stalled: submissions waiting over a cap with no admission; a cross-chain cycle holds until the parents' deadlines",
 			"durables", h.Stalled, "stallAfter", d.cfg.StallAfter)
+	}
+	if len(h.OpenBreakers) > 0 {
+		d.log.Warn("breakers open: refusing new submissions where tasks kept losing their workers", "open", h.OpenBreakers)
 	}
 }
 

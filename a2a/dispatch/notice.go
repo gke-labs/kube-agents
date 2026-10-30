@@ -21,6 +21,7 @@ const (
 	ReasonNoWorker          = "no-worker"
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
+	ReasonBreakerOpen       = "breaker-open"
 )
 
 const (

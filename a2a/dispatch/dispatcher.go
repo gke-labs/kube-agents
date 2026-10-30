@@ -193,6 +193,9 @@ type Dispatcher struct {
 	droppedAnswers atomic.Int64
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
+	// breakers refuse a (profile, tier) whose tasks keep losing their
+	// workers (breaker.go).
+	breakers *breakers
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -225,6 +228,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 
 		grantedProfiles: map[string]bool{},
 		bindRetry:       map[string]bindBackoff{},
+		breakers:        newBreakers(),
 	}, nil
 }
 
@@ -574,6 +578,12 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 
 	now := d.now()
 	ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	if errors.Is(err, errHeldBack) {
+		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), ReasonBreakerOpen)
+		log.Debug("held back at admission; the submission stays queued", "reason", ReasonBreakerOpen)
+		_ = del.Nak(d.cfg.RetryDelay)
+		return
+	}
 	if err != nil {
 		return // stopping: the lib gives the delivery back
 	}
@@ -972,6 +982,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			}
 			if r.final {
 				log.Info("task finished", "pod", rec.Pod)
+				d.breakers.finished(h.profile, h.tier)
 				d.settle(ctx, log, del, h, key, rec)
 				return
 			}
@@ -996,6 +1007,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// A worker that is alive but unheard must not go on with a
 				// task that has failed.
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonLeaseExpired})
+				d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
 				d.fail(ctx, log, del, h, key, rec, ReasonLeaseExpired,
 					fmt.Sprintf("worker %s stopped renewing at %s", rec.Pod, rec.RenewedAt.UTC().Format(time.RFC3339)))
 				return

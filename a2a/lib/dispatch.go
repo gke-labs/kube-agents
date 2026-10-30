@@ -317,6 +317,11 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// BreakerThreshold lease expiries in a row on one (profile, tier) open
+	// its breaker, which refuses new submissions there for
+	// BreakerCooldownSeconds. 0 takes the dispatcher's defaults (3 and 300).
+	BreakerThreshold       int `json:"breakerThreshold,omitempty"`
+	BreakerCooldownSeconds int `json:"breakerCooldownSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -358,6 +363,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: lease %ds must be at least three renewals of %ds", c.LeaseSeconds, c.RenewSeconds)
 	case c.RestartGraceSeconds < 2*c.RenewSeconds:
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
+	case c.BreakerThreshold < 0 || c.BreakerCooldownSeconds < 0:
+		return fmt.Errorf("dispatch config: breaker threshold %d and cooldown %ds may not be negative", c.BreakerThreshold, c.BreakerCooldownSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
 	}

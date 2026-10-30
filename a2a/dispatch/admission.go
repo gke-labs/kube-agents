@@ -41,6 +41,11 @@ type refusal struct {
 	detail string
 }
 
+// errHeldBack marks an admission that is neither a verdict nor a stop: the
+// submission stays queued, as over a cap, and comes back (a half-open
+// breaker trying one task first).
+var errHeldBack = errors.New("held back at admission")
+
 // admit runs the admission checks in order, cheapest first: the tier, the
 // queue age, the parameters, then the verifier. A nil refusal admits. The
 // verifier's permit is reused for verifiedFor across the same submission's
@@ -52,6 +57,11 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	tier := hk.tier
 	if !allowsTier(prof, tier) {
 		return &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
+	}
+	if ref, wait := d.breakers.admit(prof.Name, tier, now, d.inFlight(prof.Name, tier)); wait {
+		return nil, errHeldBack
+	} else if ref != nil {
+		return ref, nil
 	}
 	if rec := del.Received(); !rec.IsZero() {
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
