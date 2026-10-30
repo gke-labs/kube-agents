@@ -135,7 +135,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 					},
 					"wait_timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Seconds to wait for task completion while live-streaming thinking & tool progress before returning a snapshot (default: 150).",
+						"description": fmt.Sprintf("Seconds to wait for the answer before returning the still-running task to read later with task_control (default: %d, at most %d; larger values are clamped to %d).", defaultSendWaitSeconds, maxSendWaitSeconds, maxSendWaitSeconds),
 					},
 					"debug": map[string]any{
 						"type":        "boolean",

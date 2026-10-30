@@ -182,3 +182,24 @@ func TestCallRemoteToolMetaCarriesOnlyTheCalledConversation(t *testing.T) {
 		t.Fatalf("_meta of a call naming no conversation carries %v", meta["conversations"])
 	}
 }
+
+func TestSendMessageForwardsTheSchemasWaitDefaultAndCeiling(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, tc := range []struct {
+		args string
+		want float64
+	}{
+		{`{"message":"hello"}`, 150},
+		{`{"message":"hello","wait_timeout_seconds":0}`, 150},
+		{`{"message":"hello","wait_timeout_seconds":900}`, 300},
+		{`{"message":"hello","wait_timeout_seconds":300}`, 300},
+	} {
+		if res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(tc.args)); res.IsError {
+			t.Fatalf("send_message %s: %+v", tc.args, res)
+		}
+		if got := nextCallNamed(t, gw, ToolSendMessage)["wait_seconds"]; got != tc.want {
+			t.Fatalf("send_message %s forwarded wait_seconds %v; want %v", tc.args, got, tc.want)
+		}
+	}
+}

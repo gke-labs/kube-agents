@@ -42,13 +42,30 @@ func moveArg(args map[string]any, from, to string) {
 	args[to] = v
 }
 
+// The bridge's send_message wait: its schema's default, and the in-cluster server's ceiling
+// (a2a/mcp maxWaitSeconds). The server's own default (60s) never applies to a bridge call: the
+// bridge always sends wait_seconds.
+const (
+	defaultSendWaitSeconds = 150
+	maxSendWaitSeconds     = 300
+)
+
 // serverSendMessageArgs translates the bridge's send_message arguments to the in-cluster
 // server's (a2a/mcp sendMessageArgs): message is text, wait_timeout_seconds is wait_seconds.
-// The rest (conversation) keep their names; mode and debug have no server counterpart and
-// are ignored there.
+// An omitted or non-positive wait is the bridge's default, and one above the server's ceiling
+// is that ceiling. The rest (conversation) keep their names; mode and debug have no server
+// counterpart and are ignored there.
 func serverSendMessageArgs(args map[string]any) map[string]any {
 	moveArg(args, "message", "text")
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
+	wait, _ := args["wait_seconds"].(float64)
+	switch {
+	case wait <= 0:
+		wait = defaultSendWaitSeconds
+	case wait > maxSendWaitSeconds:
+		wait = maxSendWaitSeconds
+	}
+	args["wait_seconds"] = int(wait)
 	return args
 }
 
