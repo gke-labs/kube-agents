@@ -235,7 +235,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-The rest read what the run produced, from this repository
+The run-reading types come from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -315,7 +315,7 @@ is not checked, and a missing command is
 `status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
 trajectory holds no worker terminal call).
 
-Thirteen read the install under test, nine of them from that file. `bootstrap_fanout` compares the
+The cluster-reading types read the install under test, most of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -571,7 +571,7 @@ that is not a bare YAML boolean, a `resource_property` or `fleet_resource_proper
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts
 nothing; the judged fields are the validator's `BOOLEAN_FIELD_PAIRS` table, and a path with recursive
-descent or a script expression is not judged), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
+descent or a script expression is not judged), a `forge_issue_state` check that sets neither `state: closed` nor `min_comments` of at least 1 (nothing then binds the issue it reads to the run), an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a `scope_exclude:` that is not `{slots: [...]}` with distinct slot letters, names a slot
 `bench/tf/fleet/fixtures.json` does not declare, or excludes every slot, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -643,7 +643,9 @@ The gap is deliberate rather than pending. `make bench-case-check` depends on Py
 so it runs in a checkout with no `bench/` virtualenv and no harness install, which is what
 makes it cheap enough to run on every edit. Importing devops-bench to close these three
 would trade that for a second copy of a schema that already exists. Note the divergence
-when writing a case; do not add the dependency.
+when writing a case; do not add the dependency. One model rule is copied here on purpose,
+`forge_issue_state`'s binding rule, because the shape it refuses would otherwise cost a cluster
+lease to discover; a bench test holds the two copies to one answer.
 
 ## Changing the format
 

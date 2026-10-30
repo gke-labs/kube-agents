@@ -657,6 +657,7 @@ EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
 # The one run-reading type with a binding rule of its own, below.
 FORGE_ISSUE_STATE_TYPE = "forge_issue_state"
+ISSUE_STATE_CLOSED = "closed"
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
 #: booleans; "" is the object root. The rule fires on a pair in this table
 #: and on nothing else, so a string field that shares a name with a boolean
@@ -709,6 +710,24 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 # case's turn too, since the nightly runs every case against one install.
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
+
+
+def _whole_number(value: Any) -> int | None:
+    """``value`` as the integer pydantic's lax mode reads it, or None.
+
+    A bool, an integral float and a digit string all load as an int on the
+    harness side, so the validator must count them the same way or refuse a
+    case the harness accepts.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    return None
 
 
 def _populated(value: Any) -> bool:
@@ -1072,15 +1091,20 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
     # forge_issue_state binds the issue to the run through the close or the
     # comments posted inside it; `labels` alone, or `state: open` alone, would
     # pass on an issue an earlier run left behind. The verifier's own model
-    # refuses the shape too, but only at spec load, after the cluster lease.
-    min_comments = node.get("min_comments")
-    if node_type == FORGE_ISSUE_STATE_TYPE and node.get("state") != "closed" and not (
-        isinstance(min_comments, int) and not isinstance(min_comments, bool) and min_comments >= 1
+    # applies the same rule, but only at spec load, after the cluster lease;
+    # bench/tests/test_verifiers.py holds the two copies to one answer, so the
+    # count is read the way the model reads it, as a whole number in any YAML
+    # spelling.
+    comments = _whole_number(node.get("min_comments"))
+    if (
+        node_type == FORGE_ISSUE_STATE_TYPE
+        and node.get("state") != ISSUE_STATE_CLOSED
+        and (comments is None or comments < 1)
     ):
         problems.append(
-            f"{where}: check '{node_type}' sets neither state: closed nor "
-            "min_comments of at least 1, so nothing binds the issue it reads to "
-            "this run and it would pass on an issue an earlier run left behind"
+            f"{where}: check '{node_type}' sets neither state: {ISSUE_STATE_CLOSED} nor "
+            "min_comments of at least 1 (a whole number), so nothing binds the issue it "
+            "reads to this run and it would pass on an issue an earlier run left behind"
         )
 
     # A quoted boolean against a boolean field never compares equal: the

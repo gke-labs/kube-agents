@@ -135,8 +135,9 @@ __all__ = [
 # procedure posts a handful; a page holds a hundred, and the ``since`` filter
 # already drops everything older than the run.
 _ISSUE_COMMENT_PAGES = 3
-# Tolerance between a forge's stamps and the harness's run-start clock, two
-# different machines.
+# Tolerance between a forge's or a report's time stamps and the harness's
+# run-start clock, two different machines; every check that compares them
+# defaults to it.
 _DEFAULT_CLOCK_SKEW_SEC = 120.0
 
 _NO_TRANSCRIPT_REASON = (
@@ -1068,7 +1069,7 @@ class ReportTimesInWindowVerifier(BaseVerifier):
 
     type: Literal["report_times_in_window"]
     label_patterns: list[str]
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
     scope: Literal["final", "full"] = "final"
 
     @field_validator("label_patterns")
@@ -4078,7 +4079,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # margin and is orders of magnitude below the gap between two runs of the
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
 
     def _closed_by_the_reset(
         self,
@@ -5114,7 +5115,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # Tolerance between GitHub's creation stamp and the harness's run-start
     # clock, which are two different machines. Small on purpose: every second
     # of it is a second of a previous rep's pull request reading as this one's.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
     # Also require that the pull request's branch is one a pull request closed
     # during this run already used -- the second proposal on a spent name. A
     # worker refused the name can open the same change on a fresh branch and
@@ -6422,7 +6423,7 @@ class GitHubWritesVerifier(BaseVerifier):
     exclusive_window: bool = False
     # Tolerance between GitHub's stamps and the harness's run-start clock,
     # two different machines. Small on purpose, as on pull_request_opened.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -7985,7 +7986,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     required_finding_phrases: list[str] = Field(default_factory=list)
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
-    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0)
 
     def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
         snap = transcript.get()

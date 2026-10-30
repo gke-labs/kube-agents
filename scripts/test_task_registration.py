@@ -521,15 +521,19 @@ class TestTheValidatorItself(unittest.TestCase):
             {"type": "forge_issue_state", "labels": ["status:resolved"]},
             {"type": "forge_issue_state", "state": "open"},
             {"type": "forge_issue_state", "state": "open", "min_comments": 0},
-            {"type": "forge_issue_state", "state": "open", "min_comments": True},
+            {"type": "forge_issue_state", "state": "open", "min_comments": "0"},
         ):
             problems = []
             validator._check_assertions(unbound, "check 'x'", problems)
             self.assertEqual(len(problems), 1, (unbound, problems))
             self.assertIn("binds the issue", problems[0])
+        # The count is read as the harness reads it: a digit string, an
+        # integral float and a bool all load as an int there.
         for bound in (
             {"type": "forge_issue_state", "state": "closed"},
             {"type": "forge_issue_state", "state": "open", "min_comments": 1},
+            {"type": "forge_issue_state", "state": "open", "min_comments": "2"},
+            {"type": "forge_issue_state", "state": "open", "min_comments": 1.0},
             {"type": "forge_issue_state", "state": "closed", "labels": ["status:resolved"], "min_comments": 2},
         ):
             problems = []

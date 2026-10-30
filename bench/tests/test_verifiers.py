@@ -354,18 +354,23 @@ def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | Non
         (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
 
 
-def _parked_cases() -> set[str]:
-    """The validator's FIXTURE_NOT_READY set, loaded by path. A parked case's table
-    rows, dedicated tests and construction test drop out with its roster line:
-    the fleet README's exit for a retired role parks the cases that name it, and
-    their fleet directory could record no slot for a role the catalogue lacks."""
+def _validator_module():
+    """scripts/validate_bench_cases.py, loaded by path: it is a script, not a package."""
     import importlib.util
 
     validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
     spec = importlib.util.spec_from_file_location("validate_bench_cases_for_verifier_tests", validator)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return set(module.FIXTURE_NOT_READY)
+    return module
+
+
+def _parked_cases() -> set[str]:
+    """The validator's FIXTURE_NOT_READY set, loaded by path. A parked case's table
+    rows, dedicated tests and construction test drop out with its roster line:
+    the fleet README's exit for a retired role parks the cases that name it, and
+    their fleet directory could record no slot for a role the catalogue lacks."""
+    return set(_validator_module().FIXTURE_NOT_READY)
 
 
 def _live(table: dict) -> dict:
@@ -9992,3 +9997,35 @@ def test_issue_state_gitlab_skips_system_notes(monkeypatch, github):
     res = _state_check().verify(5.0)
     assert res.status == "pass", res.reason
     assert res.raw["comments_since_start"] == 2
+
+
+def test_issue_state_binding_rule_agrees_between_model_and_validator():
+    # Two hand-kept copies of one rule: the model's, which fires at spec load
+    # after the cluster lease, and the validator's, which fires in a second.
+    # This table is what holds them to one answer, coercions included.
+    from pydantic import ValidationError
+
+    validator = _validator_module()
+    shapes = [
+        ({"state": "closed"}, True),
+        ({"state": "open", "min_comments": 1}, True),
+        ({"state": "open", "min_comments": "2"}, True),
+        ({"state": "open", "min_comments": 1.0}, True),
+        ({"state": "open", "min_comments": True}, True),
+        ({"labels": ["status:resolved"]}, False),
+        ({"state": "open"}, False),
+        ({"state": "open", "min_comments": 0}, False),
+        ({"state": "open", "min_comments": "0"}, False),
+        ({}, False),
+    ]
+    for shape, bound in shapes:
+        try:
+            verifiers.ForgeIssueStateVerifier(type="forge_issue_state", **shape)
+            model_bound = True
+        except ValidationError:
+            model_bound = False
+        problems: list[str] = []
+        validator._check_assertions({"type": "forge_issue_state", **shape}, "check", problems)
+        validator_bound = not any("binds the issue" in p for p in problems)
+        assert model_bound == bound, (shape, "model")
+        assert validator_bound == bound, (shape, "validator", problems)
