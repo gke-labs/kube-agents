@@ -140,32 +140,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 				},
 			},
 		},
-		{
-			Name:        ToolManageSession,
-			Description: "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, clear all killed/terminated sessions, toggle debug mode on/off, or view the conversation transcript.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"action": map[string]any{
-						"type":        "string",
-						"enum":        []string{"list", "new", "switch", "session_on", "session_off", "delete", "clear_killed", "debug_on", "debug_off", "transcript"},
-						"description": "Session management action to perform.",
-					},
-					"alias": map[string]any{
-						"type":        "string",
-						"description": "Conversation alias (e.g. 'upgrade-triage', 'default') for new/switch/session_on/session_off/delete/transcript.",
-					},
-					"description": map[string]any{
-						"type":        "string",
-						"description": "Optional human-readable description when creating or switching a conversation.",
-					},
-					"debug": map[string]any{
-						"type":        "boolean",
-						"description": "Optional debug flag (default: false) to include tool call tables and timings when viewing a transcript.",
-					},
-				},
-			},
-		},
+		manageSessionDefinition(),
 		taskControlDefinition(),
 		{
 			Name:        ToolReadTopics,
@@ -212,6 +187,47 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 		defs = s.host.AugmentToolSchemas(defs)
 	}
 	return defs
+}
+
+// manageSessionDefinition is manage_session's schema. transcript and clear_killed, and the
+// debug argument only transcript takes, are advertised only once the in-cluster server offers
+// them (upstreamTranscriptAndClearKilled).
+func manageSessionDefinition() ToolDefinition {
+	description := "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, or toggle debug mode on/off."
+	actions := []string{"list", "new", "switch", "session_on", "session_off", "delete", "debug_on", "debug_off"}
+	aliasFor := "new/switch/session_on/session_off/delete"
+	props := map[string]any{
+		"description": map[string]any{
+			"type":        "string",
+			"description": "Optional human-readable description when creating or switching a conversation.",
+		},
+	}
+	if upstreamTranscriptAndClearKilled {
+		description = "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, clear all killed/terminated sessions, toggle debug mode on/off, or view the conversation transcript."
+		actions = []string{"list", "new", "switch", "session_on", "session_off", "delete", "clear_killed", "debug_on", "debug_off", "transcript"}
+		aliasFor = "new/switch/session_on/session_off/delete/transcript"
+		props["debug"] = map[string]any{
+			"type":        "boolean",
+			"description": "Optional debug flag (default: false) to include tool call tables and timings when viewing a transcript.",
+		}
+	}
+	props["action"] = map[string]any{
+		"type":        "string",
+		"enum":        actions,
+		"description": "Session management action to perform.",
+	}
+	props["alias"] = map[string]any{
+		"type":        "string",
+		"description": "Conversation alias (e.g. 'upgrade-triage', 'default') for " + aliasFor + ".",
+	}
+	return ToolDefinition{
+		Name:        ToolManageSession,
+		Description: description,
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": props,
+		},
+	}
 }
 
 // sendModeProperty is send_message's mode argument. Only auto is advertised until the in-cluster

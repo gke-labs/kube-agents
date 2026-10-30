@@ -43,6 +43,24 @@ func errSendModeNotSupported(mode string) error {
 	return fmt.Errorf("send_message mode %q is not supported by the in-cluster server yet; omit mode (or use auto), and start a /session worker with manage_session session_on", mode)
 }
 
+// upstreamTranscriptAndClearKilled gates the manage_session actions the in-cluster server
+// refuses (a2a/mcp droppedActions): transcript, and clear_killed (prune). While false, they are
+// neither advertised nor forwarded, and a call to one is refused with
+// errSessionActionNotSupported.
+const upstreamTranscriptAndClearKilled = false
+
+// sessionActionsAwaitingServer are the manage_session actions upstreamTranscriptAndClearKilled
+// gates.
+var sessionActionsAwaitingServer = map[string]bool{actionTranscript: true, actionClearKilled: true, actionPruneAlias: true}
+
+func sessionActionAwaitsServer(action string) bool {
+	return !upstreamTranscriptAndClearKilled && sessionActionsAwaitingServer[action]
+}
+
+func errSessionActionNotSupported(action string) error {
+	return fmt.Errorf("manage_session %s is not supported by the in-cluster server yet; use list, new, switch, session_on, session_off, delete, debug_on or debug_off, and read a task with task_control get", action)
+}
+
 func taskActionAwaitsServer(action string) bool {
 	return !upstreamTaskListAndSteer && taskActionsAwaitingServer[action]
 }
@@ -121,7 +139,8 @@ func serverTaskControlArgs(raw json.RawMessage, stopConversation string) json.Ra
 
 // upstreamArgs gates and translates a call to one of the in-cluster server's tools made in the
 // bridge's argument names (CallRemoteTool): a mode or action the server does not offer yet is
-// refused, and the arguments are renamed as send_message and task_control rename theirs. A stop
+// refused (send_message modes, task_control and manage_session actions), and the arguments are
+// renamed as send_message and task_control rename theirs. A stop
 // names the conversation alias the bridge resolves, as task_control's does.
 func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json.RawMessage) (json.RawMessage, error) {
 	switch toolName {
@@ -156,6 +175,16 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 			stopConversation = s.ReadOnlyConversationFor(ctx, args.Conversation).Alias
 		}
 		return serverTaskControlArgs(rawArgs, stopConversation), nil
+	case ToolManageSession:
+		var args struct {
+			Action string `json:"action"`
+		}
+		if len(rawArgs) > 0 {
+			_ = json.Unmarshal(rawArgs, &args)
+		}
+		if act := strings.ToLower(strings.TrimSpace(args.Action)); sessionActionAwaitsServer(act) {
+			return nil, errSessionActionNotSupported(act)
+		}
 	}
 	return rawArgs, nil
 }

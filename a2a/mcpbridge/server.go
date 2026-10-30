@@ -1269,6 +1269,9 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			return txt, title, md, err
 		}
 	}
+	if sessionActionAwaitsServer(action) {
+		return "", "", "", errSessionActionNotSupported(action)
+	}
 
 	switch action {
 	case actionNew:

@@ -89,3 +89,47 @@ func TestManageSessionDeleteByWorkerIDStopsTheRemoteSessionFirst(t *testing.T) {
 		t.Fatal("c1 was deleted locally though its session worker was never stopped")
 	}
 }
+
+func TestManageSessionActionsTheServerLacksAreHiddenAndRefused(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, d := range srv.toolDefinitions() {
+		if d.Name != ToolManageSession {
+			continue
+		}
+		raw, _ := json.Marshal(d.InputSchema)
+		var schema struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range schema.Properties["action"].Enum {
+			if a == actionTranscript || a == actionClearKilled {
+				t.Fatalf("manage_session advertises %s; the in-cluster server refuses it", a)
+			}
+		}
+		if _, ok := schema.Properties["debug"]; ok {
+			t.Fatal("manage_session advertises debug, an argument only transcript takes")
+		}
+		if strings.Contains(d.Description, "transcript") || strings.Contains(d.Description, "killed") {
+			t.Fatalf("manage_session's description offers a gated action: %s", d.Description)
+		}
+	}
+	for _, action := range []string{"transcript", "clear_killed", "prune"} {
+		res := srv.CallTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"`+action+`","alias":"c1"}`))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "not supported by the in-cluster server yet") {
+			t.Fatalf("manage_session %s: %+v; want it refused as not supported yet", action, res)
+		}
+		if _, _, _, err := srv.CallRemoteTool(context.Background(), ToolManageSession, json.RawMessage(`{"action":"`+action+`"}`), CallMeta{}, nil); err == nil ||
+			!strings.Contains(err.Error(), "not supported by the in-cluster server yet") {
+			t.Fatalf("CallRemoteTool manage_session %s: err %v; want it refused", action, err)
+		}
+	}
+	if srv.IsSessionHealthy() {
+		t.Fatal("a refused manage_session action connected")
+	}
+	noCallNamed(t, gw, ToolManageSession, 100*time.Millisecond)
+}
