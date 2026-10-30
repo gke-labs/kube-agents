@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,10 +113,30 @@ type a2aCardParty struct {
 	Profile string `json:"profile,omitempty"`
 }
 
-// a2aAgentCard is the card payload: the profile's name and its routing blurb.
+// a2aAgentCard is the card payload: the profile's name, its routing blurb, and
+// what the gateway routes on (contract on #3655, addendum 1): the tiers it may
+// run at, the cluster it is pinned to if any, and the task parameters it
+// declares. The JSON names are lib.AgentCard's; this module can't import that
+// one, so the card fixture the a2a contract test decodes holds them equal.
 type a2aAgentCard struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Tiers       []string           `json:"tiers,omitempty"`
+	ClusterRef  *a2aCardClusterRef `json:"clusterRef,omitempty"`
+	Parameters  []a2aCardParameter `json:"parameters,omitempty"`
+}
+
+// a2aCardClusterRef is lib.ClusterRef.
+type a2aCardClusterRef struct {
+	ProjectID string `json:"projectId"`
+	Location  string `json:"location"`
+	Cluster   string `json:"cluster"`
+}
+
+// a2aCardParameter is lib.ProfileParameter.
+type a2aCardParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
 }
 
 // agentCardSubject is the profile's directory subject.
@@ -125,7 +146,14 @@ func agentCardSubject(profile string) string {
 
 // desiredAgentCard is the card the profile's spec renders.
 func desiredAgentCard(p *agentv1alpha1.AgentProfile) a2aAgentCard {
-	return a2aAgentCard{Name: p.Name, Description: p.Spec.Description}
+	card := a2aAgentCard{Name: p.Name, Description: p.Spec.Description, Tiers: p.AllowedTierList()}
+	if ref := p.Spec.ClusterRef; ref != nil {
+		card.ClusterRef = &a2aCardClusterRef{ProjectID: ref.ProjectID, Location: ref.Location, Cluster: ref.Cluster}
+	}
+	for _, param := range p.Spec.Parameters {
+		card.Parameters = append(card.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
+	}
+	return card
 }
 
 // renderDirectoryEnvelope builds a card (card != nil) or a tombstone for one
@@ -170,7 +198,7 @@ type directoryEntry struct {
 
 // current reports whether the entry is exactly the card the profile renders.
 func (d directoryEntry) current(want a2aAgentCard) bool {
-	return d.present && d.kind == a2aKindAgentCard && d.card == want
+	return d.present && d.kind == a2aKindAgentCard && reflect.DeepEqual(d.card, want)
 }
 
 // cardPublisher is the operator's view of the directory, behind an interface so
@@ -180,6 +208,9 @@ type cardPublisher interface {
 	Read(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string) (directoryEntry, error)
 	// Publish writes a card (card != nil) or a tombstone.
 	Publish(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, card *a2aAgentCard) error
+	// SyncDurables makes the profile's shared durables exactly want, and
+	// deletes the rest this operator made (agentprofile_durables.go).
+	SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable) error
 }
 
 // natsCardPublisher holds one bus connection per PlatformAgent, opened on first

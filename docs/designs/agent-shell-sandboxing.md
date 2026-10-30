@@ -2687,7 +2687,19 @@ role. It names the account only while the operator controls it; an account someb
 `mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
-allowlist. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
+allowlist. `/v1/vcs/` admits it too, and every verb there needs a valid task credential:
+`ROLE_VCS_VERBS` gives it the reads (`clone`, `proposal-view`, `proposal-list`,
+`proposal-commits`, `branch-view`, `identity`, `issue-list`, `issue-view`) and three writes,
+`publish`, `proposal-create` and `proposal-update`. Those three also need the
+`vcs:proposal-create` permit in the credential, which the dispatcher mints only for a
+submission that asked for a change. Both checks run before the body is read, and the managed
+list still bounds which repository any verb reaches. Under the permit, `proposal-update`
+reaches only a proposal the install opened from its own `platform-agent/` branch in this
+repository, `publish` only a `platform-agent/` branch, and onto one carrying open proposals
+only when they are all the install's, and `proposal-create` only from the install's own
+`platform-agent/` branch of this repository (rule `caller.vcs-ownership`; the shell is not
+held to this). No
+other write is the profile role's. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
 profile tier's ServiceAccount to its (profile, tier), and that account may present only the
 profile audience. Each call also carries the dispatcher's signed task credential in
 `X-Kube-Agents-Task-Credential`, bound to the caller's pod, and is confined to that

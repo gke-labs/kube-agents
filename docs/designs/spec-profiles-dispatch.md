@@ -248,16 +248,28 @@ Gaps on main that the build closes (#3659):
    2. it checks that the target is in scope (`spec.scope`, including `exclude.clusters`);
    3. it mints the task's grant against the **resolved** profile, with the requester's tier
       and the target cluster in the grant's scope;
-   4. it publishes the submission on `a2a.tasks.<profile>.<tier>.<kind>.<task>.submit`, where
-      `<kind>` is `top` for a task a client asked for and `child` for a task another task
-      started. The target cluster is a task parameter rather than a subject token, so queues are
+   4. it publishes the submission on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the
+      `PROFILE_SUBMITS` stream, where `<kind>` is `top` for a task a client asked for and
+      `child` for a task another task started. The target cluster is a task parameter rather than a subject token, so queues are
       per profile, tier and kind, never per cluster.
 
-**Subjects (decided 2026-10-22).** Only new submissions use the `.submit` subject, and only it
-carries the tier and kind tokens, because they exist to route queues. Follow-ups and cancels
+**Subjects (decided 2026-10-22).** Only new submissions use the submission subject, and only
+it carries the tier and kind tokens, because they exist to route queues. Follow-ups and cancels
 for a running task stay on the task's own `a2a.tasks.<profile>.<task>.in`, read by the
 task's per-task reader, and `.events` and `.supervisor` keep their per-task shape. Addressees
 that aren't profiles (`platform`, sessions) keep today's subjects.
+
+**Amended 10/28 (#4121): submissions have their own stream.** They were first planned as
+`a2a.tasks.<profile>.<tier>.<kind>.<task>.submit` on TASKS. On TASKS, any principal that can
+create consumers there (the bridge, the gateway, and the `web` and `console` credentials a
+browser is handed) could create a consumer that pulls a profile's submissions, or rewrite
+the operator's durable in place, because JetStream carries a consumer's settings in the
+request body where a subject grant can't see them. `PROFILE_SUBMITS` on `a2a.submit.>`
+closes that: the operator is the only principal with a consumer verb on it, the dispatcher
+holds only fetch and ack on the durables it is configured for, the gateway holds only
+publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so it can show
+a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
+is #4173.
 
 ### Admission and holding
 
@@ -265,7 +277,8 @@ that aren't profiles (`platform`, sessions) keep today's subjects.
 paths:
 
 - There is **one shared durable consumer per (profile, tier, kind)** on
-  `a2a.tasks.<profile>.<tier>.<kind>.*.submit`, created and owned by the operator. The
+  `a2a.submit.<profile>.<tier>.<kind>.*`, on `PROFILE_SUBMITS`, created and owned by the
+  operator. The
   dispatcher is its only reader. `max_ack_pending` is per consumer, so each durable caps its own
   in-flight count, and a `child` durable has its own cap separate from its profile's `top`
   durable.
@@ -291,8 +304,103 @@ paths:
   sets the effective value, which never exceeds `spec.concurrency`. An install-wide ceiling on
   the PlatformAgent caps the total across profiles, and reserves `max(1, ceil(ceiling / 3))`
   slots for interactive tiers, so unattended work cannot starve users. Caps must be dynamic,
-  from 10 clusters to 10,000.
-- Each durable counts against the TASKS consumer budget (#2077), so that formula includes them.
+  from 10 clusters to 10,000. Amended 10/28 (#3655): a child reserve keeps waiting parents
+  from holding every slot; the reserves are disjoint, filled child first, and leave at least
+  one slot for top-level unattended work, so at a ceiling that can't fit both (1, 2 and 4
+  with the default reserves) not every reserve is honoured in full, and the PlatformAgent
+  carries a `ProfileReservesShort` warning saying which and the smallest ceiling that does.
+  At a ceiling of 2 there is a child reserve and no interactive one. At a ceiling of 1 there
+  is neither: every task runs alone, so a parent can never start a child.
+- ~~Each durable counts against the TASKS consumer budget (#2077), so that formula includes
+  them.~~ Amended 10/28: the durables live on `PROFILE_SUBMITS`, whose `max_consumers` is
+  their allowance (64, so 16 profiles with both tiers). They take no TASKS slot.
+
+**As built (amended 10/29, #3655).** The dispatcher is its own Deployment,
+`<agent>-a2a-dispatcher`: one replica, replaced with `Recreate`, since two at once would each
+enforce the ceiling against half the in-flight count. The mechanics the decisions above
+leave open:
+
+- **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
+  `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
+  dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
+  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  (default 90), `renewSeconds` (20; a lease is at least three renewals),
+  `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
+  offers. A task already handed out keeps the intervals its offer carried.
+- **Hand-off.** The dispatcher offers the task to a free warm pod on
+  `a2a.dispatch.<profile>.<tier>.<pod>` and waits `acceptTimeoutSeconds` for its `.accept`.
+  On an accept it writes the task's lease record, which starts the lease, and then sends
+  `confirm` on that pod's subject; the worker starts only on the confirm (contract addendum
+  5). An accept is a core publish, so it can be lost or late: an offer that times out is
+  abandoned on its pod before the task goes to the next one, and any accept no live offer
+  waits on, a late one included, is answered with `abandon`. A lost confirm costs the task,
+  which fails `lease-expired`, never a second run. Nothing is written while an offer is out:
+  the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
+  dispatches the task afresh. With no free pod the submission waits over its cap and is
+  redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
+  long expired that no held submission has (its submission aged off the stream). Answers a pod
+  sends for tasks it doesn't hold are held to a small budget per pod.
+- **Task credentials.** With a task-signing key (a cluster seed, read from the file
+  `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
+  mints for the confirmed pod once the lease record is written (contract addendum 8, #3889).
+  `taskCredential` (audience `nats`) is the password of the worker's task connection.
+  `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
+  admission, and a task that names no cluster gets none. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993); otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
+  tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
+  offer's deadline plus the callout's 30s clock skew, and never later than
+  `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
+  never carries either, and renewals mint nothing. A pod with no UID in the pool isn't
+  offered the task. A pod whose UID changed by the confirm isn't confirmed, and the task
+  fails `lease-expired`. With the variable unset, confirms carry neither, workers keep their
+  pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
+  or holds another key type stops the dispatcher at startup. The dispatcher logs a
+  credential's `jti`, never the token.
+- **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
+  the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
+  `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
+  has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
+  The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
+  it turns the record into a tombstone, acks the submission, waits for the server to confirm
+  the ack, then frees the slot. An expired lease or a passed deadline also tells the worker
+  to abandon the task.
+- **Tombstones.** `PROFILE_SUBMITS` keeps acked submissions for its 72h max age (limits
+  retention), so a durable re-created with DeliverAll replays every task it ever held. Every
+  outcome the dispatcher sees or writes is final: a `final` renewal, a `lease-expired` or
+  `deadline-exceeded` failure, a refusal at admission. On each it writes a tombstone before
+  it acks: the lease record under the same key with `finishedAt` set
+  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`.
+  A submission that finds a tombstone is acked and nothing else: it is never offered,
+  adopted or given a second terminal, so a grant given since never runs a task once refused.
+  A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
+  running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
+  re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
+  once it is older than the stream's retention plus an hour (`lib.ProfileSubmitRetention`
+  until the dispatch config carries the stream's max age).
+- **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
+  fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
+  intervals its offer did, so a re-adopted task keeps them whatever the config says now.
+- **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
+  name each durable and each profile's `.supervisor`. When the config adds a durable or a profile
+  the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
+  it holds keep running across the reconnect, which drains the old connection so answers it
+  had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
+  amendments of 10/28 ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same
+  from the bus's side.
+- **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
+  is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
+  identity for one.
+- **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
+  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
+  once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
+  the gateway's relay already reads `.supervisor` beside `.events`. The codes are
+  `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
+  admission, and `lease-expired` and `deadline-exceeded` while it holds.
 
 ### Execution
 
@@ -343,12 +451,12 @@ The build PRs amend these; this list is what they must cover.
   format replacing per-profile SOUL files, the allowed-tiers list on the CR, the worker
   namespace separate from the CR's (the binding rule itself is unchanged), and the CRD doc
   comments (persona contents, `clusterRef` usage, lifecycle on warm pools).
-- **`spec-nats-deployment.md`:** the shared durables per (profile, tier, kind) on the `.submit`
-  subjects, operator-created and read only by the dispatcher, replacing per-pod consumer
+- **`spec-nats-deployment.md`:** the `PROFILE_SUBMITS` stream, and the shared durables per
+  (profile, tier, kind) on it, operator-created and read only by the dispatcher, replacing per-pod consumer
   narrowing for new submissions, and their `max_ack_pending`; and a KV bucket for per-task
   liveness leases.
 - **`spec-a2a-payloads.md`:** the new submission subject
-  `a2a.tasks.<profile>.<tier>.<kind>.<task>.submit`, with follow-ups and cancels staying on
+  `a2a.submit.<profile>.<tier>.<kind>.<task>`, with follow-ups and cancels staying on
   the per-task `.in`; children of a profile task are gateway-minted (the gateway stays the only
   author of submissions); a child's terminal is delivered to its parent task.
 - **`spec-chatops-gateway.md`:** delegation to any profile (not only `platform`), multiple

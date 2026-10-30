@@ -207,6 +207,14 @@ const DelegateTextCap = 16 * 1024
 // these message fields authoritative. They never ride the authority block.
 type TaskParameters struct {
 	Parameters map[string]string `json:"parameters"`
+	// ChangeRequested says the requester asked for a change (a pull
+	// request) rather than an answer, and so whether the dispatcher grants
+	// the worker the permit to open one. Only the gateway sets it, and only
+	// true for a turn that arrived as a structured confirm action, never
+	// from free text or from a delegation's arguments, which are the
+	// model's; a child carries its parent's value from the gateway's own
+	// record. Absent means false.
+	ChangeRequested bool `json:"changeRequested,omitempty"`
 }
 
 // The bounds ValidateTaskParameters holds a parameter set to. A name is a
@@ -628,9 +636,34 @@ type ArtifactUpdate struct {
 	LastChunk bool     `json:"lastChunk,omitempty"`
 }
 
-// AgentCard carries only the field validation needs.
+// AgentCard is the directory card on a2a.agents.<name>. Validation needs
+// only Name; the rest is what the gateway routes a profile on (#3655), all
+// optional so a card without them still parses.
 type AgentCard struct {
 	Name string `json:"name"`
+	// Description is the routing blurb, a sentence a router can read.
+	Description string `json:"description,omitempty"`
+	// Tiers are the tiers the profile may run at (its allowedTiers).
+	Tiers []string `json:"tiers,omitempty"`
+	// ClusterRef pins a profile to one cluster; absent on a profile that
+	// takes its target as task parameters.
+	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
+	// Parameters are the task parameters the profile's persona declares.
+	Parameters []ProfileParameter `json:"parameters,omitempty"`
+}
+
+// ClusterRef names one GKE cluster.
+type ClusterRef struct {
+	ProjectID string `json:"projectId"`
+	Location  string `json:"location"`
+	Cluster   string `json:"cluster"`
+}
+
+// ProfileParameter is one task parameter a profile declares: its name, as
+// TaskParameterNameRE, and whether a submission must carry it.
+type ProfileParameter struct {
+	Name     string `json:"name"`
+	Required bool   `json:"required,omitempty"`
 }
 
 func protocolErrf(format string, args ...any) error {
