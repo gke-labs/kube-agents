@@ -1026,14 +1026,48 @@ class ApiLaneExclusionTest(unittest.TestCase):
         self.assertNotIn("runs on the inject lane only", result.stdout)
 
 
-class LiftedShellTest(unittest.TestCase):
-    """The blocks this module lifts run under `set -o pipefail`, in the job
-    and here, so none of them may feed `grep -q` through a pipeline."""
+def shell_without_comments(text: str) -> str:
+    """`text` with every comment cut: a `#` at the start of a line or after
+    whitespace, outside single and double quotes, to the end of its line.
+    `${#arr[@]}` and a `#` inside a sed script survive, since neither follows
+    whitespace outside quotes."""
+    kept = []
+    for line in text.splitlines():
+        in_double = in_single = False
+        cut = None
+        i = 0
+        while i < len(line):
+            char = line[i]
+            if char == "\\" and not in_single:
+                i += 2
+                continue
+            if char == '"' and not in_single:
+                in_double = not in_double
+            elif char == "'" and not in_double:
+                in_single = not in_single
+            elif char == "#" and not in_double and not in_single and (i == 0 or line[i - 1].isspace()):
+                cut = i
+                break
+            i += 1
+        kept.append(line if cut is None else line[:cut])
+    return "\n".join(kept)
 
-    PRODUCER_INTO_GREP_Q = re.compile(r"\|\s*grep\s+-[a-zA-Z]*q")
-    COMMENT_LINE = re.compile(r"^\s*#.*$", re.MULTILINE)
 
-    def test_no_lifted_block_pipes_a_producer_into_grep_q(self):
+class ProducerIntoGrepQuietTest(unittest.TestCase):
+    """The script runs under `set -o pipefail` (and so does every block this
+    module lifts out of it), so nothing in it may feed `grep -q` through a
+    pipeline."""
+
+    # One pipe (not `||`), then grep, then any arguments on the same line
+    # up to a quiet spelling: `-q` anywhere in a short-option cluster, or
+    # the long forms. The argument walk stops at `|`, `;`, `&` and a
+    # closing paren, so a `-eq` after `$(... | grep -c .)` is not read as
+    # grep's.
+    PIPE_INTO_GREP_QUIET = re.compile(
+        r"(?<!\|)\|(?!\|)[ \t]*grep(?:[ \t]+[^|;&()\s]+)*?[ \t]+(?:-[a-zA-Z]*q[a-zA-Z]*|--quiet|--silent)(?=[\s;)]|$)"
+    )
+
+    def test_the_script_pipes_no_producer_into_grep_q(self):
         """`grep -q` exits at its first match. A producer still writing on
         the other side of the pipe then takes SIGPIPE, pipefail makes the
         pipeline's status the producer's, and a `! ... | grep -q` reads a
@@ -1041,26 +1075,40 @@ class LiftedShellTest(unittest.TestCase):
         check did exactly that once in CI over the ~10 KB roster text
         (kube-agents#4357). A here-string (`grep -q ... <<< "$text"`) is
         filled by bash before grep runs, so nothing is left writing when
-        grep exits; every membership check in these blocks takes that form."""
-        for name, block in (
-            ("roster_constants", roster_constants()),
-            ("lane_constants", lane_constants()),
-            ("matrix_section", matrix_section()),
-            ("roster_block", roster_block()),
-            ("part_check", part_check()),
-            ("exclusions_block", exclusions_block()),
-            ("half_constants", half_constants()),
-            ("part_step", part_step()),
-            ("api_lane_block", api_lane_block()),
-        ):
-            with self.subTest(block=name):
-                shell = self.COMMENT_LINE.sub("", block)
-                hit = self.PRODUCER_INTO_GREP_Q.search(shell)
-                if hit is not None:
-                    self.fail(
-                        f"{name} pipes a producer into grep -q ({shell[max(hit.start() - 60, 0) : hit.end()]!r} ...); "
-                        "feed grep from a here-string instead"
-                    )
+        grep exits; every membership check in the script takes that form."""
+        shell = shell_without_comments(SCRIPT.read_text(encoding="utf-8"))
+        hits = [f"line {shell.count(chr(10), 0, m.start()) + 1}: {m.group(0)!r}" for m in self.PIPE_INTO_GREP_QUIET.finditer(shell)]
+        self.assertEqual(hits, [], f"{SCRIPT.name} pipes a producer into grep -q; feed grep from a here-string instead:\n" + "\n".join(hits))
+
+    def test_the_grammar_reads_every_quiet_spelling_and_no_false_pipe(self):
+        """The lines the lint must flag and the lines it must not, so a
+        later edit to the pattern cannot quietly narrow it."""
+        flagged = (
+            "if ! printf '%s\\n' \"$a\" \"$b\" | grep -qxF -- \"$e\"; then",
+            "x | grep -x -q -- y",
+            "x | grep --quiet y",
+            "x | grep -e pat -q",
+            "x | grep -Eq 'y'",
+            "x | grep -qs 'y'",
+            "echo \"${#TASKS[@]} tasks\" | grep -q x",
+            "sed 's/#.*$//' f | grep -q x",
+            "v=\"$(printf x | grep -q .)\"",
+        )
+        passed = (
+            "cmd || grep -qxF -- x <<< y",
+            "grep -qxF -- \"${ENTRY}\" <<< \"${PRESUBMIT_ENTRIES}\"$'\\n'\"${NIGHTLY_ENTRIES}\"",
+            "foo <<< \"$x\"  # not printf | grep -q",
+            "# A here-string, never `printf ... | grep -q`",
+            "x | grep -c foo",
+            "x | grep foo | wc -q",
+            "[ \"$(printf x | grep -c .)\" -eq 1 ]",
+        )
+        for line in flagged:
+            with self.subTest(flagged=line):
+                self.assertIsNotNone(self.PIPE_INTO_GREP_QUIET.search(shell_without_comments(line)))
+        for line in passed:
+            with self.subTest(passed=line):
+                self.assertIsNone(self.PIPE_INTO_GREP_QUIET.search(shell_without_comments(line)))
 
 
 if __name__ == "__main__":
