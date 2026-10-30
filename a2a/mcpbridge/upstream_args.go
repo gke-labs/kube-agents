@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -91,13 +92,27 @@ const (
 // serverSendMessageArgs translates the bridge's send_message arguments to the in-cluster
 // server's (a2a/mcp sendMessageArgs): message is text, wait_timeout_seconds is wait_seconds.
 // An omitted or non-positive wait is the bridge's default, and one above the server's ceiling
-// is that ceiling. mode is dropped (auto is the only mode the server has). The rest
-// (conversation) keep their names; debug has no server counterpart and is ignored there.
-func serverSendMessageArgs(args map[string]any) map[string]any {
+// is that ceiling; a numeric string is read as its number, and any other value is an error
+// rather than a silent default. mode is dropped (auto is the only mode the server has). The
+// rest (conversation) keep their names; debug has no server counterpart and is ignored there.
+func serverSendMessageArgs(args map[string]any) (map[string]any, error) {
 	moveArg(args, "message", "text")
 	delete(args, "mode")
 	moveArg(args, "wait_timeout_seconds", "wait_seconds")
-	wait, _ := args["wait_seconds"].(float64)
+	var wait float64
+	switch v := args["wait_seconds"].(type) {
+	case nil:
+	case float64:
+		wait = v
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid wait_timeout_seconds %q: want a number of seconds", v)
+		}
+		wait = f
+	default:
+		return nil, fmt.Errorf("invalid wait_timeout_seconds %v: want a number of seconds", v)
+	}
 	switch {
 	case wait <= 0:
 		wait = defaultSendWaitSeconds
@@ -105,7 +120,7 @@ func serverSendMessageArgs(args map[string]any) map[string]any {
 		wait = maxSendWaitSeconds
 	}
 	args["wait_seconds"] = int(wait)
-	return args
+	return args, nil
 }
 
 // serverTaskControlArgs translates the bridge's task_control arguments to the in-cluster
@@ -156,8 +171,11 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 		if mode = strings.ToLower(strings.TrimSpace(mode)); sendModeAwaitsServer(mode) {
 			return nil, errSendModeNotSupported(mode)
 		}
-		out, err := json.Marshal(serverSendMessageArgs(args))
-		return out, err
+		fwd, err := serverSendMessageArgs(args)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(fwd)
 	case ToolTaskControl:
 		var args struct {
 			Action       string `json:"action"`

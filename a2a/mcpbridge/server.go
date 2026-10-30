@@ -1228,6 +1228,11 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 	args["conversation"] = conv.Alias
 	msgText, _ := args["message"].(string)
 	trimmedMsg := strings.TrimSpace(msgText)
+	fwdArgs, err := serverSendMessageArgs(args)
+	if err != nil {
+		return "", "", "", err
+	}
+	updatedArgs, _ := json.Marshal(fwdArgs)
 
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
@@ -1240,7 +1245,6 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 
 	streamKey := "send:" + FirstNonEmptyStr(callerID, conv.Alias, DefaultConvAlias)
 	s.registerStreamingCallStart(streamKey, "", conv.Alias, callerID, meta.ArtifactsDir, cancelCall)
-	updatedArgs, _ := json.Marshal(serverSendMessageArgs(args))
 	txt, title, md, callErr := sess.callRemoteTool(callCtx, ToolSendMessage, updatedArgs, meta, s.store.Snapshot(), progressCallbackFromContext(ctx))
 	s.finishStreamingCall(streamKey, conv.Alias, callerID, meta.ArtifactsDir, txt, callCtx.Err(), callErr)
 	// A /session or /session off text is a console control turn; the local session flag follows

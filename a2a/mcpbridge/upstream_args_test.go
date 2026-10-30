@@ -194,6 +194,7 @@ func TestSendMessageForwardsTheSchemasWaitDefaultAndCeiling(t *testing.T) {
 		{`{"message":"hello","wait_timeout_seconds":0}`, 150},
 		{`{"message":"hello","wait_timeout_seconds":900}`, 300},
 		{`{"message":"hello","wait_timeout_seconds":300}`, 300},
+		{`{"message":"hello","wait_timeout_seconds":"30"}`, 30},
 	} {
 		if res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(tc.args)); res.IsError {
 			t.Fatalf("send_message %s: %+v", tc.args, res)
@@ -202,6 +203,17 @@ func TestSendMessageForwardsTheSchemasWaitDefaultAndCeiling(t *testing.T) {
 			t.Fatalf("send_message %s forwarded wait_seconds %v; want %v", tc.args, got, tc.want)
 		}
 	}
+}
+
+func TestSendMessageRefusesANonNumericWait(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, args := range []string{`{"message":"hello","wait_timeout_seconds":"soon"}`, `{"message":"hello","wait_timeout_seconds":true}`} {
+		if res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(args)); !res.IsError || !strings.Contains(res.Content[0].Text, "invalid wait_timeout_seconds") {
+			t.Fatalf("send_message %s: %+v; want it refused", args, res)
+		}
+	}
+	noCallNamed(t, gw, ToolSendMessage, 100*time.Millisecond)
 }
 
 // sendModeEnum is the mode enum send_message advertises.
